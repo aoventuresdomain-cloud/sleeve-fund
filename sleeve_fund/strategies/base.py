@@ -99,6 +99,7 @@ class LongFlatStrategy(Strategy):
         self._last_bar_ts = 0
         self._last_close = None
         self._last_tick_ns = 0
+        self._mark_warned = False
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -178,7 +179,7 @@ class LongFlatStrategy(Strategy):
             self.close_all_positions(self._cfg.instrument_id)
 
     def _buy_all(self, bar: Bar) -> None:
-        account = self.portfolio.account(self._cfg.instrument_id.venue)
+        account = self._account()
         if account is None:
             self.log.warning("no account yet; skipping buy")
             return
@@ -213,10 +214,16 @@ class LongFlatStrategy(Strategy):
             return px.as_double()
         return self._last_close or 0.0
 
+    def _account(self):
+        account = self.portfolio.account(self._cfg.instrument_id.venue)
+        if account is None:  # live sandbox: ask the cache directly
+            account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
+        return account
+
     def _mark(self) -> tuple[float, float, float, float]:
         """(equity, cash, coin qty, price) in the quote currency."""
         price = self._price()
-        account = self.portfolio.account(self._cfg.instrument_id.venue)
+        account = self._account()
         if account is None or self.instrument is None:
             return 0.0, 0.0, 0.0, price
         cash_m = account.balance_total(self.instrument.quote_currency)
@@ -230,6 +237,14 @@ class LongFlatStrategy(Strategy):
         try:
             equity, cash, qty, price = self._mark()
             if price <= 0 or equity <= 0:
+                # Still alive, just can't value the book yet: heartbeat, and say why once.
+                self.runtime.store.heartbeat(self.runtime.name)
+                if not self._mark_warned:
+                    self._mark_warned = True
+                    why = (f"account={'missing' if self._account() is None else 'ok'} "
+                           f"price={price} cash={cash} qty={qty}")
+                    self.log.warning(f"cannot mark sleeve yet: {why}")
+                    self.runtime.store.event(self.runtime.name, "warning", "mark_unavailable", why)
                 return
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
