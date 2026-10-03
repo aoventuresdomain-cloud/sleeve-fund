@@ -20,7 +20,7 @@
       <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>Portfolio</a>
       <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>Trades</a>
       <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>Orders</a>
-      <a href="/alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
+      <a href="/alerts" data-live="nav-alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
       <button type="button" class="more-btn" aria-haspopup="dialog" aria-controls="more" data-open="more">More</button>
     </nav>
     {# Everything else: listed in the rail on wider screens, in the More sheet on phones. #}
@@ -47,8 +47,9 @@
       <span class="mode">{{ 'Live trading' if shell.mode == 'live' else 'Paper trading' }}</span>
       <span class="wide">{{ 'Live trading locked until G2 is approved' if shell.live_locked else 'Live trading enabled' }}</span>
       <span class="sep"></span>
-      <span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} sleeves running{% endif %}</span>
+      <span data-live="health"><span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} sleeves running{% endif %}</span></span>
       <span class="wide">Prices: Kraken live feed</span>
+      <span class="live" id="live" hidden aria-live="polite"></span>
       <span class="clock" id="clock" data-now="{{ shell.now.isoformat() }}">{{ shell.now.strftime('%H:%M') }} UTC</span>
     </div>
     <main>
@@ -101,6 +102,7 @@
   if (sheet.querySelector("[aria-current]")) btn.setAttribute("aria-current", "page");
 })();
 </script>
+<script src="/static/live.js" defer></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

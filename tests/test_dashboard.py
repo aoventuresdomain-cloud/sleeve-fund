@@ -593,3 +593,24 @@ def test_new_sleeve_form_is_one_step_at_a_time_with_javascript_and_whole_without
     assert page.count('<fieldset class="panel step">') == 5  # all present in the HTML; the script shows one at a time
     js = c.get("/static/console.js", auth=AUTH).text
     assert "function wizard(form)" in js
+
+
+@pytest.mark.parametrize("path", ["/", "/sleeves/btc-test", "/trades", "/orders", "/alerts", "/risk"])
+def test_pages_update_live_without_a_reload(client, path):
+    c, store = client
+    _new(c)
+    page = c.get(path, auth=AUTH).text
+    assert '<script src="/static/live.js" defer></script>' in page and 'id="live"' in page
+    assert 'data-live="health"' in page and 'data-live="nav-alerts"' in page
+    # Regions the script swaps are keyed by the server's own markup, so a fresh render matches.
+    assert page.count('aria-labelledby="') + page.count('data-live="') >= 3
+
+
+def test_sleeve_page_marks_its_status_banners_and_dialogs_live(client):
+    c, store = client
+    _new(c)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    for key in ('data-live="head"', 'data-live="banners"', 'data-live="dialogs" data-live-forms'):
+        assert key in page
+    js = c.get("/static/live.js", auth=AUTH).text
+    assert "Not updating since" in js and "visibilitychange" in js

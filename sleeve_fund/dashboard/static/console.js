@@ -5,18 +5,28 @@ window.Console = (() => {
   const day = (t) => new Date(t).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "2-digit", timeZone: "UTC"});
   const minute = (t) => new Date(t).toLocaleString("en-GB", {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "UTC"});
 
+  // Listeners sit on the document, so they keep working after live updates replace a panel.
+  const once = (key, fn) => { if (!document.documentElement.dataset[key]) { document.documentElement.dataset[key] = "1"; fn(); } };
+
   function dialogs() {
-    document.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => {
-      const d = document.getElementById(b.dataset.open);
-      if (d && d.showModal) { d.showModal(); d.querySelector("input")?.focus(); }
+    once("dialogsBound", () => document.addEventListener("click", (e) => {
+      const open = e.target.closest("[data-open]");
+      if (open) {
+        const d = document.getElementById(open.dataset.open);
+        if (d && d.showModal && !d.open) { d.showModal(); d.querySelector("input")?.focus(); }
+        return;
+      }
+      const close = e.target.closest("dialog [data-close]");
+      if (close) close.closest("dialog").close();
     }));
-    document.querySelectorAll("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
   }
 
   // "Why" buttons open the detail row that follows: the journaled reason and signal values.
   function whys() {
-    document.querySelectorAll("[data-why]").forEach((b) => b.addEventListener("click", (ev) => {
-      ev.stopPropagation();
+    once("whysBound", () => document.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-why]");
+      if (!b) return;
+      e.stopPropagation();
       const row = document.getElementById(b.dataset.why);
       if (!row) return;
       row.hidden = !row.hidden;
@@ -25,27 +35,35 @@ window.Console = (() => {
     }));
   }
 
+  function sortBy(table, i, dir) {
+    const heads = [...table.querySelectorAll("thead th")];
+    const th = heads[i];
+    if (!th) return;
+    heads.forEach((h) => h.removeAttribute("aria-sort"));
+    th.setAttribute("aria-sort", dir);
+    const body = table.tBodies[0];
+    const val = (r) => {
+      const c = r.cells[i];
+      const v = c ? (c.dataset.v ?? c.textContent.trim()) : "";
+      return th.dataset.sort === "num" ? parseFloat(v) || 0 : v.toLowerCase();
+    };
+    [...body.rows].sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * (dir === "ascending" ? 1 : -1))
+      .forEach((r) => body.appendChild(r));
+  }
+
   function sortable() {
-    document.querySelectorAll("table.sortable").forEach((table) => {
-      const heads = [...table.querySelectorAll("thead th")];
-      heads.forEach((th, i) => {
-        if (!th.dataset.sort) return;
-        th.tabIndex = 0;
-        const go = () => {
-          const dir = th.getAttribute("aria-sort") === "descending" ? "ascending" : "descending";
-          heads.forEach((h) => h.removeAttribute("aria-sort"));
-          th.setAttribute("aria-sort", dir);
-          const body = table.tBodies[0];
-          const rows = [...body.rows];
-          const val = (r) => {
-            const v = r.cells[i].dataset.v ?? r.cells[i].textContent.trim();
-            return th.dataset.sort === "num" ? parseFloat(v) || 0 : v.toLowerCase();
-          };
-          rows.sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * (dir === "ascending" ? 1 : -1));
-          rows.forEach((r) => body.appendChild(r));
-        };
-        th.addEventListener("click", go);
-        th.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    const prep = () => document.querySelectorAll("table.sortable thead th[data-sort]").forEach((th) => { th.tabIndex = 0; });
+    prep();
+    document.addEventListener("live:swap", prep);
+    const go = (th) => {
+      const table = th.closest("table");
+      sortBy(table, [...th.parentElement.children].indexOf(th), th.getAttribute("aria-sort") === "descending" ? "ascending" : "descending");
+    };
+    once("sortBound", () => {
+      document.addEventListener("click", (e) => { const th = e.target.closest("table.sortable thead th[data-sort]"); if (th) go(th); });
+      document.addEventListener("keydown", (e) => {
+        const th = e.target.closest?.("table.sortable thead th[data-sort]");
+        if (th && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); go(th); }
       });
     });
   }
@@ -150,7 +168,8 @@ window.Console = (() => {
       });
       note.hidden = !note.childElementCount;
     };
-    const render = (d) => {
+    let current = "";
+    const render = (d, keepView = false) => {
       data = d;
       chart.applyOptions({timeScale: {timeVisible: d.interval < 1440, secondsVisible: false}});
       candles.setData(d.candles);
@@ -159,10 +178,10 @@ window.Console = (() => {
       lines.forEach((l) => candles.removePriceLine(l));
       lines = d.lines.map((l) => candles.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : css("--accent")}));
-      chart.timeScale().fitContent();
+      if (!keepView) chart.timeScale().fitContent();
       $(".pc-source").hidden = d.source !== "marks";
       $(".pc-empty").hidden = d.candles.length > 0;
-      showNote([]);
+      if (!keepView) showNote([]);
       const tabs = $(".pc-intervals");
       if (tabs && d.intervals) {
         tabs.replaceChildren(...d.intervals.map((k) => {
@@ -171,10 +190,13 @@ window.Console = (() => {
         }));
       }
     };
-    const load = (interval) => {
+    const load = (interval, keepView = false) => {
       if (typeof src !== "string") { render(src); return; }
-      fetch(src + (interval ? `?interval=${interval}` : "")).then((r) => r.json()).then(render);
+      current = interval;
+      return fetch(src + (interval ? `?interval=${interval}` : ""), {cache: "no-store"}).then((r) => r.json()).then((d) => render(d, keepView));
     };
+    // A sleeve's chart follows the market: new candles and fills appear without a reload.
+    if (typeof src === "string") setInterval(() => { if (!document.hidden) load(current, true).catch(() => {}); }, 30000);
     chart.subscribeCrosshairMove((p) => {
       const bar = p.seriesData && p.seriesData.get(candles);
       $(".pc-legend").textContent = bar ? `O ${fmt(bar.open)}  H ${fmt(bar.high)}  L ${fmt(bar.low)}  C ${fmt(bar.close)}` : "";
@@ -342,5 +364,5 @@ window.Console = (() => {
     show(0, false);
   }
 
-  return {sortable, dialogs, whys, strategyPicker, priceChart, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();
