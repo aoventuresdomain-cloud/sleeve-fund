@@ -297,9 +297,9 @@ class LongFlatStrategy(Strategy):
         step = self.instrument.size_increment.as_decimal()
         return self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
 
-    def _coin(self, free: bool = False) -> Decimal:
-        """Coin held, read from the account rather than positions, so a book restored from the
-        journal after a restart (a coin balance with no position object) is still recognised."""
+    def _position_qty(self, free: bool = False) -> Decimal:
+        """Quantity held, read from the account rather than positions, so a book restored from the
+        journal after a restart (a balance with no position object) is still recognised."""
         account = self._account()
         if account is None:
             return Decimal(0)
@@ -312,11 +312,11 @@ class LongFlatStrategy(Strategy):
         return total
 
     def _is_long(self) -> bool:
-        return self._coin() >= self._min_qty()
+        return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
         step = self.instrument.size_increment.as_decimal()
-        qty = self._coin(free=True).quantize(step, rounding=ROUND_DOWN)
+        qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
         self._submit(OrderSide.SELL, qty, intent, reason, dict(values or {}))
@@ -342,7 +342,7 @@ class LongFlatStrategy(Strategy):
         return account
 
     def _mark(self) -> tuple[float, float, float, float]:
-        """(equity, cash, coin qty, price) in the quote currency."""
+        """(equity, cash, position qty, price) in the quote currency."""
         price = self._price()
         account = self._account()
         if account is None or self.instrument is None:

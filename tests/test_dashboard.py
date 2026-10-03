@@ -136,7 +136,7 @@ def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
     store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
     store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
     page = c.get("/", auth=AUTH).text
-    for text in ("Book equity", "Month to date", "In the market", "Where the money is", "price feed quiet"):
+    for text in ("Book equity", "Month to date", "Gross exposure", "Where the money is", "price feed quiet"):
         assert text in page
     alert = store.alerts()[0]
     r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
@@ -371,7 +371,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
 
 
 @pytest.mark.parametrize("query, msg", [
-    ("instrument=nonsense", "COIN/CURRENCY"),
+    ("instrument=nonsense", "BASE/QUOTE"),
     ("instrument=BTC/USD&starting_balance=5", "capital"),
     ("instrument=BTC/USD&p_trend_filter__fast=30&p_trend_filter__slow=10", "fast"),
 ])

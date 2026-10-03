@@ -232,9 +232,9 @@ window.Console = (() => {
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
       const items = [
-        `Trade ${pair || "a pair"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${$("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
+        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${$("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
-        `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the coin"}.`,
+        `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}.`,
         `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
       const sl = $("stop_loss_pct").value, tp = $("take_profit_pct").value, rpt = $("risk_per_trade_pct").value;
@@ -264,7 +264,7 @@ window.Console = (() => {
         const f = (x, digits = 1) => (x === null || x === undefined ? "n/a" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(digits)}%`);
         const n = (x) => (x === null || x === undefined ? "n/a" : x.toFixed(2));
         box.innerHTML = `<div class="chart" style="height:150px"><canvas id="pv"></canvas></div>
-          <table class="compact"><thead><tr><th></th><th class="num">These settings</th><th class="num">Holding</th></tr></thead><tbody>
+          <table class="compact"><thead><tr><th></th><th class="num">These settings</th><th class="num">Buy-and-hold</th></tr></thead><tbody>
           <tr><td>Return</td><td class="num">${f(d.strategy.total_return)}</td><td class="num">${f(d.hold.total_return)}</td></tr>
           <tr><td>Sharpe</td><td class="num">${n(d.strategy.sharpe)}</td><td class="num">${n(d.hold.sharpe)}</td></tr>
           <tr><td>Worst drawdown</td><td class="num">${f(d.strategy.max_drawdown)}</td><td class="num">${f(d.hold.max_drawdown)}</td></tr>
@@ -276,7 +276,7 @@ window.Console = (() => {
           type: "line",
           data: {labels: d.t.map(day), datasets: [
             {label: "These settings", data: d.equity, borderColor: css("--accent"), borderWidth: 1.6, pointRadius: 0},
-            {label: "Holding", data: d.benchmark, borderColor: css("--muted"), borderWidth: 1.1, borderDash: [4, 3], pointRadius: 0}]},
+            {label: "Buy-and-hold", data: d.benchmark, borderColor: css("--muted"), borderWidth: 1.1, borderDash: [4, 3], pointRadius: 0}]},
           options: {maintainAspectRatio: false, animation: false, interaction: {mode: "index", intersect: false},
             plugins: {legend: {labels: {color: css("--text"), boxWidth: 12, boxHeight: 2}}},
             scales: {x: {ticks: {color: css("--muted"), maxTicksLimit: 4, maxRotation: 0}, grid: {display: false}},

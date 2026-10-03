@@ -54,7 +54,7 @@ class SleeveRuntime:
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
                              f"book restored from {self.book['fills']} journal fills: "
-                             f"cash {self.book['cash']:,.2f}, coin {self.book['qty']:g}")
+                             f"cash {self.book['cash']:,.2f}, position {self.book['qty']:g}")
         self.store.event(self.name, "info", "start", f"sleeve started ({self.profile.name} risk profile)")
 
     def on_stop(self) -> None:
@@ -138,7 +138,7 @@ class SleeveRuntime:
         cash_tol = 0.01 * (1 + 2 * book["fills"])
         d_cash, d_qty = cash - book["cash"], qty - book["qty"]
         detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
-                  f"engine coin {qty:g} vs journal {book['qty']:g} ({book['fills']} fills)")
+                  f"engine position {qty:g} vs journal {book['qty']:g} ({book['fills']} fills)")
         if abs(d_cash) <= cash_tol and abs(d_qty) <= qty_tolerance:
             self.store.event(self.name, "info", "reconcile", "engine matches journal: " + detail)
             return True

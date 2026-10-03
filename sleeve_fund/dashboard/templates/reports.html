@@ -11,10 +11,10 @@
     <div class="panel-head"><h2 id="m-h">Book by month</h2><span class="hint">newest first</span></div>
     {% if m.rows %}
     <table class="responsive" data-hide-lg="7 8">
-      <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Holding</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
+      <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Benchmark</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
       <tbody>{% for r in m.rows %}
       <tr><td><strong>{{ r.month }}</strong></td><td class="num" data-m="right">{{ money_signed(r.pnl) }}</td><td class="num" data-label="Return">{{ signed(r.ret) }}</td>
-        <td class="num" data-m="right" data-label="Holding">{{ r.bench_ret|pct }}</td><td class="num" data-m="hide">{{ r.worst_dd|pct1 }}</td><td class="num" data-m="hide">{{ r.fees|money }}</td>
+        <td class="num" data-m="right" data-label="Benchmark">{{ r.bench_ret|pct }}</td><td class="num" data-m="hide">{{ r.worst_dd|pct1 }}</td><td class="num" data-m="hide">{{ r.fees|money }}</td>
         <td class="num" data-m="hide">{{ r.fills }}</td><td class="num" data-m="hide">{{ r.turnover|money }}</td><td class="num" data-m="hide">{{ r.equity|money }}</td></tr>
       {% endfor %}</tbody>
     </table>
@@ -31,7 +31,7 @@
       <tr><th scope="row">Daily equity and positions</th><td class="num"><a data-dl href="/exports/equity.csv">equity.csv</a></td></tr>
       <tr><th scope="row">Decision log</th><td class="num"><a href="/decisions.csv">decisions.csv</a></td></tr>
     </table>
-    <p class="muted" style="margin:10px 0 0;font-size:12px">Amounts are in each pair's quote currency (USD for */USD pairs). Pound values and UK capital gains are not included yet.</p>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">Amounts are in each instrument's quote currency (USD for */USD instruments). Pound values and UK capital gains are not included yet.</p>
   </section>
 </div>
 {% if m.grid %}

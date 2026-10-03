@@ -30,7 +30,7 @@
   <section class="panel flush span-7" aria-labelledby="rp-h">
     <div class="panel-head"><h2 id="rp-h">Risk profiles</h2><span class="hint">chosen per sleeve</span></div>
     <table>
-      <thead><tr><th>Profile</th><th class="num">Halt at drawdown</th><th class="num">Pause at daily loss</th><th class="num">Max in the market</th></tr></thead>
+      <thead><tr><th>Profile</th><th class="num">Halt at drawdown</th><th class="num">Pause at daily loss</th><th class="num">Max exposure</th></tr></thead>
       <tbody>{% for p in profiles.values() %}<tr><td><strong>{{ p.name|capitalize }}</strong></td><td class="num">{{ p.max_drawdown|pct0 }}</td><td class="num">{{ p.daily_loss|pct0 }}</td><td class="num">{{ p.max_position_pct|pct0 }}</td></tr>{% endfor %}</tbody>
     </table>
     <p class="muted" style="margin:0;padding:8px 14px 12px;font-size:12px">A halt flattens the sleeve and waits for you. A daily-loss pause flattens and resumes after 24 hours.</p>

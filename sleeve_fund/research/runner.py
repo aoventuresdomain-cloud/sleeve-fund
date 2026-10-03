@@ -24,7 +24,7 @@ class BacktestResult:
     strategy: str
     params: dict
     equity: pd.Series  # quote-currency equity at each bar close
-    exposure: pd.Series  # fraction of equity in the coin at each bar close
+    exposure: pd.Series  # fraction of equity in the position at each bar close
     fills: pd.DataFrame
     fees_paid: float
     starting_capital: float
@@ -110,11 +110,11 @@ def _mark_to_market(
     base: str,
     starting_capital: float,
 ) -> tuple[pd.Series, pd.Series]:
-    """Forward-fill account balances onto bar closes and value the coin at the close."""
+    """Forward-fill account balances onto bar closes and value the position at the close."""
     idx = prices.index
     if account.empty:
         cash = pd.Series(starting_capital, index=idx)
-        coin = pd.Series(0.0, index=idx)
+        held = pd.Series(0.0, index=idx)
     else:
         acct = account.copy()
         acct.index = pd.to_datetime(acct.index, utc=True)
@@ -122,10 +122,10 @@ def _mark_to_market(
         by_ccy = acct.pivot_table(index=acct.index, columns="currency", values="total", aggfunc="last")
         by_ccy = by_ccy.reindex(by_ccy.index.union(idx)).sort_index().ffill()
         cash = by_ccy.get(quote, pd.Series(0.0, index=by_ccy.index)).reindex(idx).fillna(starting_capital)
-        coin = by_ccy.get(base, pd.Series(0.0, index=by_ccy.index)).reindex(idx).fillna(0.0)
-    coin_value = coin * prices["close"]
-    equity = cash + coin_value
-    exposure = (coin_value / equity).clip(lower=0.0)
+        held = by_ccy.get(base, pd.Series(0.0, index=by_ccy.index)).reindex(idx).fillna(0.0)
+    position_value = held * prices["close"]
+    equity = cash + position_value
+    exposure = (position_value / equity).clip(lower=0.0)
     return equity.rename("equity"), exposure.rename("exposure")
 
 

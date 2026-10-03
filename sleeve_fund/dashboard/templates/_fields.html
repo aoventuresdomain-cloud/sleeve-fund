@@ -1,7 +1,7 @@
 {# Form sections shared by the new-sleeve form and the backtest page, so a backtest's settings
    carry straight into a sleeve. `pre` holds values to prefill (from the query string). #}
 {% macro pair_field(instruments, pre) %}
-<div class="field"><label for="instrument">Kraken pair</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument', 'BTC/USD') }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off" aria-describedby="pair-hint"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist><p class="hint" id="pair-hint">Any spot pair Kraken lists, written COIN/CURRENCY.</p></div>
+<div class="field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument', 'BTC/USD') }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off" aria-describedby="pair-hint"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist><p class="hint" id="pair-hint">Symbol as BASE/QUOTE, for example BTC/USD. The venue is Kraken spot for now.</p></div>
 {% endmacro %}
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
