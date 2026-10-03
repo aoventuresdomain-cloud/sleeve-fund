@@ -442,3 +442,12 @@ table.heat th.row a { color: var(--text); }
 .wiz-buttons [hidden] { display: none; }
 ul.checklist.cols { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); column-gap: 20px; }
 fieldset.step[hidden] { display: none; }
+
+/* live updates */
+.strip .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.strip .live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--gain); }
+.strip .live[data-state="stale"] { color: var(--warn, var(--loss)); font-weight: 600; }
+.strip .live[data-state="stale"]::before { background: var(--loss); }
+.strip .live[hidden] { display: none; }
+@keyframes flash { from { background: color-mix(in srgb, var(--accent) 22%, transparent); } to { background: transparent; } }
+.flash { animation: flash 1.2s ease-out; border-radius: 3px; }

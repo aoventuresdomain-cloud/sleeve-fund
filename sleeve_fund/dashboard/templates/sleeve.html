@@ -4,7 +4,7 @@
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Sleeve Fund{% endblock %}
 {% block content %}
-<div class="page-head">
+<div class="page-head" data-live="head">
   <h1>{{ s.name }}</h1> {{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>
   <div class="actions">
     {% if s.desired_state == 'running' %}
@@ -18,6 +18,7 @@
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
 </div>
 
+<div data-live="banners">
 {% if archived %}<div class="banner" role="status">Archived: hidden from the home page's sleeve list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
@@ -26,6 +27,7 @@
 </div>
 {% endif %}
 {% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the sleeve to pick up ({{ pending|map(attribute='command')|join(', ') }}). Sleeves check about every 30 seconds.</div>{% endif %}
+</div>
 
 <section class="ledger" aria-label="Sleeve figures">
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
@@ -161,6 +163,7 @@
   'restore': ('Restore ' ~ s.name, 'Puts it back in the sleeve list on the home page. It stays stopped until you start it.', 'Restore sleeve', ''),
   'start': ('Start ' ~ s.name, 'Starts the sleeve process. It picks up its journal and reconciles before trading.', 'Start sleeve', ''),
 } %}
+<div data-live="dialogs" data-live-forms>
 <datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
 <dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
@@ -173,6 +176,7 @@
   </form>
 </dialog>
 {% endfor %}
+</div>
 {% endblock %}
 
 {% block scripts %}
