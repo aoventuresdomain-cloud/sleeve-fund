@@ -1,2 +1,5 @@
 # One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
-classifier
+# Strategies 1+2 (vwap_day) wait for the classifier verdict, per the doc's testing order.
+mtf
+sweep
+pairs

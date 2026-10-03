@@ -15,3 +15,5 @@ logs/
 data/*.db
 data/*.db-*
 data/minute/
+research/results/
+research/idea_ledger.jsonl

@@ -84,3 +84,32 @@ def test_a_clean_trend_day_is_classified_trend_and_continues():
     so = classifier_test.session_outcomes(b, anchor="utc", decide_at=60)
     row = so[so["session"] == last].iloc[0]
     assert row["label"] == blocks.TREND_UP and row["cont_session"] > 0
+
+
+def test_vwap_day_strategies_trade_long_only_without_shorts_and_book_costs():
+    from sleeve_fund.lab import sim, vwap_day
+
+    b = data.resample(_walk(120, seed=9), 5)
+    p = vwap_day.Params(use_classifier=False)
+    both = sim.trades_frame(vwap_day.run(b, p, cost="zero").trades)
+    longs = sim.trades_frame(vwap_day.run(b, p, cost="zero", long_only=True).trades)
+    assert len(both) > 20 and (both["side"] < 0).any()
+    assert len(longs) and (longs["side"] > 0).all()
+    costly = sim.trades_frame(vwap_day.run(b, p, cost="kraken_pro_taker").trades)
+    assert costly["fees"].sum() > 0 and costly["ret"].mean() < both["ret"].mean()
+    # Each trade risks about 0.5% of equity: a full stop-out loses roughly that much before costs.
+    stops = both[both["exit_why"] == "stop"]
+    assert stops["ret"].min() > -0.02
+
+
+def test_vwap_day_signals_do_not_change_when_future_bars_are_removed():
+    from sleeve_fund.lab import sim, vwap_day
+
+    b = data.resample(_walk(90, seed=4), 5)
+    p = vwap_day.Params(use_classifier=False)
+    full = sim.trades_frame(vwap_day.run(b, p, cost="zero").trades)
+    cut = b.index[len(b) * 2 // 3]
+    part = sim.trades_frame(vwap_day.run(b[b.index <= cut], p, cost="zero").trades)
+    early = full[pd.to_datetime(full["exit_time"]) < cut - pd.Timedelta(hours=1)]
+    assert len(early) > 5
+    assert list(early["entry_time"]) == list(part["entry_time"][: len(early)])
