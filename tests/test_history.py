@@ -1,0 +1,114 @@
+"""The price-history store: whole minutes, quiet minutes kept, bars stamped at their close."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from sleeve_fund import venues
+from sleeve_fund.history import HistoryStore, refresh, trades_to_minutes
+
+
+def _minutes(start, n, price=100.0):
+    idx = pd.date_range(start, periods=n, freq="1min", tz="UTC")
+    c = price + np.arange(n, dtype=float)
+    return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c, "volume": 1.0}, index=idx)
+
+
+def test_daily_bars_are_complete_and_stamped_at_the_close(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append("X", "ABC/USD", _minutes("2026-01-01", 3 * 1440 + 10), cursor="c1")
+    days = store.read("X", "ABC/USD", 1440)
+    # Three complete days, each stamped when it closed; the 10 minutes of 4 Jan are not a day.
+    assert list(days.index) == [pd.Timestamp(d, tz="UTC") for d in ("2026-01-02", "2026-01-03", "2026-01-04")]
+    first = days.iloc[0]
+    assert first["open"] == 100.0 and first["close"] == 100.0 + 1439 and first["volume"] == 1440.0
+    hours = store.read("X", "ABC/USD", 60)
+    assert hours.index[0] == pd.Timestamp("2026-01-01 01:00", tz="UTC")  # 00:00-01:00 is known at 01:00
+
+
+def test_appends_continue_across_months_and_fill_quiet_minutes(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append("X", "ABC/USD", _minutes("2026-01-31 23:50", 5), cursor="a")
+    later = _minutes("2026-02-01 00:10", 5, price=200.0)  # nothing traded 23:55 to 00:09
+    cov = store.append("X", "ABC/USD", later, cursor="b")
+    assert cov.cursor == "b" and cov.first == pd.Timestamp("2026-01-31 23:50", tz="UTC")
+    rep = store.report("X", "ABC/USD")
+    assert rep["missing"] == 0 and rep["duplicates"] == 0 and rep["minutes"] == 25
+    one = store.read("X", "ABC/USD", 1)
+    quiet = one.loc["2026-02-01 00:00":"2026-02-01 00:09"]  # stamped at close
+    assert (quiet["volume"] == 0).all() and (quiet["close"] == 104.0).all()
+    assert sorted(p.name for p in (tmp_path / "X" / "ABC-USD").glob("*.npz")) == ["2026-01.npz", "2026-02.npz"]
+
+
+def test_merge_combines_a_minute_split_across_pages(tmp_path):
+    store = HistoryStore(tmp_path)
+    t = pd.Timestamp("2026-03-01 12:00", tz="UTC")
+    page1 = trades_to_minutes(pd.DataFrame({"price": [10.0, 12.0], "volume": [1.0, 2.0]},
+                                           index=[t, t + pd.Timedelta("20s")]))
+    page2 = trades_to_minutes(pd.DataFrame({"price": [9.0, 11.0, 11.5], "volume": [1.0, 1.0, 1.0]},
+                                           index=[t + pd.Timedelta("40s"), t + pd.Timedelta("50s"),
+                                                  t + pd.Timedelta("70s")]))
+    store.append("X", "ABC/USD", page1, cursor="1", merge=True)
+    store.append("X", "ABC/USD", page2, cursor="2", merge=True)
+    bar = store.read("X", "ABC/USD", 1).iloc[0]
+    assert (bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]) == (10.0, 12.0, 9.0, 11.0, 5.0)
+
+
+def test_rejects_bars_that_would_corrupt_a_backtest(tmp_path):
+    store = HistoryStore(tmp_path)
+    bad = _minutes("2026-01-01", 3)
+    bad.iloc[1, bad.columns.get_loc("high")] = 1.0
+    with pytest.raises(ValueError, match="impossible"):
+        store.append("X", "ABC/USD", bad, cursor="")
+    naive = _minutes("2026-01-01", 3).tz_localize(None)
+    with pytest.raises(ValueError, match="UTC"):
+        store.append("X", "ABC/USD", naive, cursor="")
+    with pytest.raises(KeyError):
+        store.read("X", "NONE/USD")
+
+
+def test_kraken_refresh_pages_through_trade_history(tmp_path):
+    t0 = pd.Timestamp("2026-04-01", tz="UTC").timestamp()
+    trades = [[str(100 + i % 7), "0.5", t0 + i * 7.0, "b", "m", "", i] for i in range(2500)]
+    calls = []
+
+    def get_json(url):
+        if "AssetPairs" in url:
+            return {"result": {"XXBTZUSD": {"wsname": "XBT/USD"}}}
+        since = float(url.split("since=")[1].split("&")[0])
+        page = [r for r in trades if r[2] * 1e9 > since][:1000]
+        calls.append(since)
+        return {"error": [], "result": {"XXBTZUSD": page, "last": str(int(page[-1][2] * 1e9)) if page else str(int(since))}}
+
+    venues._KRAKEN_KEYS.clear()
+    profile = venues.VenueProfile(**{**venues.KRAKEN.__dict__,
+                                     "minute_loader": lambda pair, cur: venues.kraken_minutes(pair, cur, get_json)})
+    store = HistoryStore(tmp_path)
+    out = refresh(store, profile, "BTC/USD", sleep=lambda s: None, log=lambda m: None)
+    assert out["pages"] == 3 and calls[0] == 0
+    rep = store.report("KRAKEN", "BTC/USD")
+    assert rep["missing"] == 0 and rep["duplicates"] == 0
+    total = store.read("KRAKEN", "BTC/USD", 1)["volume"].sum()
+    last_minute = pd.Timestamp(t0 + 2499 * 7.0, unit="s", tz="UTC").floor("1min")
+    in_last = sum(1 for r in trades if pd.Timestamp(r[2], unit="s", tz="UTC").floor("1min") == last_minute)
+    assert total == pytest.approx(0.5 * (2500 - in_last))  # every trade once; the forming minute held back
+    again = refresh(store, profile, "BTC/USD", sleep=lambda s: None, log=lambda m: None)
+    assert again["pages"] == 1 and store.read("KRAKEN", "BTC/USD", 1)["volume"].sum() == pytest.approx(total)
+
+
+def test_backtest_page_reads_the_store_once_it_has_caught_up(tmp_path, monkeypatch):
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path)
+    store = HistoryStore(tmp_path)
+    now = pd.Timestamp.now(tz="UTC").floor("1min")
+    store.append("KRAKEN", "ABC/USD", _minutes(now - pd.Timedelta(days=100), 100 * 1440), cursor="x")
+    monkeypatch.setattr(venues.KRAKEN, "daily_history", lambda pair: pytest.fail("should read the store"))
+    preview._history.clear()
+    assert len(preview.history("ABC/USD")) >= 98
+
+    stale = HistoryStore(tmp_path)
+    stale.append("KRAKEN", "OLD/USD", _minutes("2017-01-01", 100 * 1440), cursor="x")
+    monkeypatch.setattr(venues.KRAKEN, "daily_history", lambda pair: "recent candles")
+    assert preview.history("OLD/USD") == "recent candles"  # still backfilling: use the venue's recent candles

@@ -26,6 +26,18 @@ services:
         required: false
     command: sh -c "python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run"
 
+  # Keeps every instrument's minute history current from its venue, into the shared store that
+  # research and the backtest page read. Public market data only, no keys.
+  history:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+      HISTORY_DIR: /data/history
+    volumes: [history:/data/history]
+    command: python -m sleeve_fund.history run
+
   dashboard:
     build: .
     restart: unless-stopped
@@ -33,6 +45,8 @@ services:
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
+      HISTORY_DIR: /data/history
+    volumes: [history:/data/history:ro]
     command: uvicorn --factory sleeve_fund.dashboard.app:create_app --host 0.0.0.0 --port 8000 --proxy-headers
 
   caddy:
@@ -47,5 +61,6 @@ services:
       - caddy_data:/data
 
 volumes:
+  history:
   pgdata:
   caddy_data:

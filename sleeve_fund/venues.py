@@ -35,6 +35,10 @@ class VenueProfile:
     asset_codes: Callable[..., tuple[str, str]] = lambda pair, fetch=None: tuple(pair.split("/"))  # type: ignore[assignment]
     # () -> (factory, config) for the live market data client; None if paper can't run here yet
     data_client: Callable[[], tuple] | None = None
+    # (pair, cursor) -> (1-minute bars by open time, next cursor, caught_up), for the history store
+    minute_loader: Callable[[str, str], tuple] | None = None
+    merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
+    request_interval: float = 1.0  # seconds between loader requests, within the venue's rate limit
     calendar: str = "24/7"
 
     @property
@@ -92,6 +96,31 @@ def _norm(code: str) -> str:
     return _ALIASES.get(code, code)
 
 
+_KRAKEN_KEYS: dict[str, str] = {}  # pair -> Kraken's pair id, looked up once per process
+
+
+def kraken_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame, str, bool]:
+    """One page (up to 1,000 trades) of Kraken's full trade history after `cursor`, as 1-minute
+    bars. Kraken's API keeps every trade since a pair listed, unlike its 720-candle OHLC endpoint,
+    so this is how the store gets complete minute history. The cursor is Kraken's own `last`."""
+    from sleeve_fund.data import KRAKEN_API, _get_json, kraken_pair_key
+    from sleeve_fund.history import trades_to_minutes
+
+    get_json = get_json or _get_json
+    key = _KRAKEN_KEYS.get(pair) or _KRAKEN_KEYS.setdefault(pair, kraken_pair_key(pair, get_json))
+    data = get_json(f"{KRAKEN_API}/Trades?pair={key}&since={cursor or 0}&count=1000")
+    if data.get("error"):
+        raise ValueError(f"Kraken: {'; '.join(data['error'])}")
+    result = data["result"]
+    rows = next((v for k, v in result.items() if k != "last"), [])
+    nxt = str(result.get("last", cursor))
+    if not rows:
+        return pd.DataFrame(), cursor, True
+    trades = pd.DataFrame({"price": [float(r[0]) for r in rows], "volume": [float(r[1]) for r in rows]},
+                          index=pd.to_datetime([float(r[2]) for r in rows], unit="s", utc=True))
+    return trades_to_minutes(trades), nxt, len(rows) < 1000
+
+
 def kraken_asset_codes(pair: str, fetch=None) -> tuple[str, str]:
     """(base, quote) as Kraken's instrument data names them, e.g. SUI/USD -> (SUI, ZUSD).
 
@@ -138,4 +167,6 @@ KRAKEN = register(VenueProfile(
     ohlc_history=_kraken_ohlc,
     asset_codes=kraken_asset_codes,
     data_client=_kraken_data_client,
+    minute_loader=kraken_minutes,
+    merge_minutes=True,
 ))
