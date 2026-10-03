@@ -4,39 +4,40 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Multi-Strategy Fund{% endblock %}</title>
-  <link rel="preload" href="/static/fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232c64c9'/%3E%3Cpath d='M3 11l3-3 2 2 5-5' stroke='white' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
+{% macro icon(d) %}<svg viewBox="0 0 24 24" aria-hidden="true">{{ d|safe }}</svg>{% endmacro %}
 <div class="app">
   <aside class="rail" aria-label="Main">
-    <a class="brand" href="/">Multi-Strategy Fund<small>Systematic strategies, one book</small></a>
+    <a class="brand" href="/"><svg class="mark" viewBox="0 0 26 26" aria-hidden="true"><defs><linearGradient id="bm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8592FF"/><stop offset="1" stop-color="#2EBD85"/></linearGradient></defs><rect width="26" height="26" rx="7" fill="url(#bm)"/><path d="M6 17l4.5-4.5 3 3L20 9" stroke="#0B0D12" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Multi-Strategy Fund<small>Systematic trading</small></span></a>
     {% set here = request.url.path %}
     {% set is_sleeve = here.startswith('/sleeves/') and here != '/sleeves/new' %}
     <a class="button rail-new" href="/sleeves/new">+ New strategy</a>
     {# Primary destinations: on phones these are the bottom tab bar. #}
     <nav aria-label="Primary">
-      <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>Portfolio</a>
-      <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>Trades</a>
-      <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>Orders</a>
-      <a href="/alerts" data-live="nav-alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
-      <button type="button" class="more-btn" aria-haspopup="dialog" aria-controls="more" data-open="more">More</button>
+      <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>{{ icon('<path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>') }}<span>Portfolio</span></a>
+      <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>{{ icon('<path d="M7 7h13l-4-4M17 17H4l4 4"/>') }}<span>Trades</span></a>
+      <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>{{ icon('<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>') }}<span>Orders</span></a>
+      <a href="/alerts" data-live="nav-alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>{{ icon('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>') }}<span>Alerts</span>{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
+      <button type="button" class="more-btn" aria-haspopup="dialog" aria-controls="more" data-open="more">{{ icon('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>') }}<span>More</span></button>
     </nav>
     {# Everything else: listed in the rail on wider screens, in the More sheet on phones. #}
     <nav class="secondary" aria-label="More">
       <div class="group">Risk and operations</div>
-      <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>Risk</a>
-      <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
+      <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>{{ icon('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>') }}<span>Risk</span></a>
+      <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>{{ icon('<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>') }}<span>Operations</span></a>
       <div class="group">Research</div>
-      <a href="/backtest" {{ 'aria-current=page' if here.startswith('/backtest') }}>Backtest</a>
-      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>Models</a>
+      <a href="/backtest" {{ 'aria-current=page' if here.startswith('/backtest') }}>{{ icon('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>') }}<span>Backtest</span></a>
+      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>{{ icon('<path d="M9 3h6M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3"/><path d="M7 15h10"/>') }}<span>Models</span></a>
       <div class="group">Records</div>
-      <a href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
-      <a href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
+      <a href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>{{ icon('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 15l2 2 4-4"/>') }}<span>Decisions</span></a>
+      <a href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>{{ icon('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>') }}<span>Reports</span></a>
       <div class="group">Setup</div>
-      <a href="/accounts" {{ 'aria-current=page' if here.startswith('/accounts') }}>Accounts</a>
-      <a href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>Settings</a>
+      <a href="/accounts" {{ 'aria-current=page' if here.startswith('/accounts') }}>{{ icon('<path d="M3 21h18M5 21V10M19 21V10M9 21V10M15 21V10M2 10l10-7 10 7z"/>') }}<span>Accounts</span></a>
+      <a href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>{{ icon('<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>') }}<span>Settings</span></a>
     </nav>
     <div class="rail-foot">
       <div class="meta">Version {{ shell.version }}</div>
