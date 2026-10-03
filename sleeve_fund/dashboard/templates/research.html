@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Research · Sleeve Fund{% endblock %}
+{% block content %}
+<h1>Research</h1>
+<p class="sub">Tear sheets from the research loop. G1 asks for a higher out-of-sample Sharpe than buy-and-hold after fees.</p>
+<div class="tiles">
+  <div class="tile"><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div><div class="s">stop and rethink after 15 to 20 with no pass</div></div>
+  <div class="tile"><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div><div class="s">raises the bar for every result</div></div>
+</div>
+<h2>Tear sheets</h2>
+<div class="panel">
+{% for s in sheets %}<p style="margin:4px 0"><a href="/research/{{ s }}">{{ s }}</a></p>{% else %}<p class="muted">No tear sheets yet.</p>{% endfor %}
+</div>
+{% endblock %}

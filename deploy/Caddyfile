@@ -1,0 +1,5 @@
+# Automatic HTTPS. SITE_ADDRESS can be a domain, or <server-ip>.sslip.io if you have none.
+{$SITE_ADDRESS} {
+    encode gzip
+    reverse_proxy dashboard:8000
+}

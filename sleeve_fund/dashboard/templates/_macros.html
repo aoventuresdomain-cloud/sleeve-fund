@@ -1,0 +1,3 @@
+{% macro chip(status) %}<span class="chip {{ status }}">{{ status|capitalize }}</span>{% endmacro %}
+{% macro signed(x) %}<span class="{{ 'good' if x >= 0 else 'bad' }}">{{ x|pct }}</span>{% endmacro %}
+{% macro usage(f) %}<span class="bar {{ 'high' if f >= 0.8 else ('mid' if f >= 0.5 else '') }}"><i style="width: {{ (f * 100)|round(0) }}%"></i></span>{% endmacro %}

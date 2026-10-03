@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, signed, usage %}
+{% block content %}
+<h1>Portfolio</h1>
+<p class="sub">
+  {% if book.attention %}<span class="bad">{{ book.attention }} sleeve{{ 's' if book.attention != 1 }} need{{ 's' if book.attention == 1 }} you.</span>
+  {% elif book.unhealthy %}<span class="bad">{{ book.unhealthy }} sleeve{{ 's' if book.unhealthy != 1 }} not reporting.</span>
+  {% else %}All sleeves healthy.{% endif %}
+  Paper money only; prices are live from Kraken.
+</p>
+<div class="tiles">
+  <div class="tile"><div class="k">Paper equity</div><div class="v">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
+  <div class="tile"><div class="k">Return</div><div class="v">{{ signed(book.ret) }}</div><div class="s">buy-and-hold {{ book.bench_ret|pct }}</div></div>
+  <div class="tile"><div class="k">Sleeves running</div><div class="v">{{ book.running }} / {{ book.sleeves }}</div><div class="s">{{ book.attention }} halted or in error</div></div>
+</div>
+
+<h2>Sleeves</h2>
+<div class="panel">
+{% if summaries %}
+<table>
+  <tr><th>Sleeve</th><th>Status</th><th>Strategy</th><th class="num">Equity</th><th class="num">Return</th><th class="num">vs buy-and-hold</th><th>Drawdown vs limit</th><th>Reporting</th></tr>
+  {% for x in summaries %}
+  <tr>
+    <td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a><div class="muted" style="font-size:12px">{{ x.sleeve.instrument }} · {{ x.sleeve.bar_spec.split('-')[0] }} {{ x.sleeve.bar_spec.split('-')[1]|lower }}</div></td>
+    <td>{{ chip(x.sleeve.status) }}</td>
+    <td>{{ x.sleeve.strategy }}</td>
+    <td class="num">{{ x.equity|money }}</td>
+    <td class="num">{{ signed(x.ret) }}</td>
+    <td class="num">{{ signed(x.ret - x.bench_ret) }}</td>
+    <td>{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct0 }} / {{ x.profile.max_drawdown|pct0 }}</span></td>
+    <td>{% if x.healthy %}<span class="good">live</span>{% elif x.sleeve.desired_state == 'stopped' %}<span class="muted">stopped</span>{% else %}<span class="bad">silent</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No sleeves yet. <a href="/sleeves/new">Start a paper sleeve</a>.</p>
+{% endif %}
+</div>
+
+<h2>Alerts</h2>
+{% for a in alerts %}
+<div class="alert {{ a.level }}"><span class="when">{{ a.ts|ts }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</span><br>{{ a.message }}</div>
+{% else %}
+<p class="muted">Nothing needs you.</p>
+{% endfor %}
+{% endblock %}

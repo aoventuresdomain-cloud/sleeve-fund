@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Sleeve Fund{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/">Sleeve Fund</a>
+  <nav>
+    <a href="/">Portfolio</a>
+    <a href="/sleeves/new">New paper sleeve</a>
+    <a href="/research">Research</a>
+    <a href="/decisions">Decisions</a>
+  </nav>
+  <span class="paper-badge">PAPER TRADING</span>
+</div></header>
+<main class="wrap">
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>
