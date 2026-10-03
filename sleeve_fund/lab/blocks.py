@@ -78,6 +78,9 @@ def sessions(df: pd.DataFrame, anchor: str) -> pd.DataFrame:
     return s
 
 
+CROSS_SAMPLE_MIN = 15
+
+
 def with_session_blocks(df: pd.DataFrame, anchor: str = "utc", opening_range_min: int = 30,
                         relvol_sessions: int = 20) -> pd.DataFrame:
     """Adds session VWAP and sigma bands, the prior session's levels and ATR, the opening range,
@@ -115,7 +118,12 @@ def with_session_blocks(df: pd.DataFrame, anchor: str = "utc", opening_range_min
     # VWAP side and crossings.
     side = np.sign(out["close"] - out["vwap"])
     out["above_share"] = (side > 0).astype(float).groupby(sid.values).cumsum() / g.cumcount().add(1)
-    flips = (side != side.groupby(sid.values).shift()) & side.groupby(sid.values).shift().notna() & (side != 0)
+    # Crossings are counted on the VWAP side sampled every 15 minutes, so the count means the same
+    # thing whatever the bar size (on 1-minute bars noise around VWAP would otherwise count as crosses).
+    on_grid = (out["elapsed"] % CROSS_SAMPLE_MIN == 0) & (side != 0)
+    sampled = side.where(on_grid)
+    prev = sampled.groupby(sid.values).ffill().groupby(sid.values).shift()
+    flips = on_grid & prev.notna() & (sampled != prev)
     out["vwap_crosses"] = flips.astype(int).groupby(sid.values).cumsum()
     # Relative volume: session volume so far vs the same elapsed time over the previous N sessions.
     k = out["elapsed"]

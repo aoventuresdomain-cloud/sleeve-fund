@@ -48,13 +48,25 @@ def _fmt(x, pct=False, d=2):
     return f"{x:.0%}" if pct else f"{x:.{d}f}"
 
 
+# Classifier threshold sets. "doc" is the strategy doc's rules; "relaxed" is the one revision tried after
+# the first run called trend on only 2-6% of sessions (counted in the idea ledger like any other try).
+CLASSIFIER_VARIANTS = {
+    "doc": {},
+    "relaxed": {"side_share": 0.7, "trend_slope": 0.10, "relvol_min": 1.0},
+}
+
+
 def cmd_classifier(args) -> None:
-    bars = [5] if args.quick else [1, 5, 15]
+    bars = [5] if args.quick else [5, 15]
     anchors = ["utc", "us_open"]
-    decide = [60] if args.quick else [30, 60, 90]
+    decide = [60] if args.quick else [60, 90]
     rows, spans = [], {}
+    for f in RESULTS.glob("classifier_sessions_*"):  # superseded per-session dumps (they included the holdout)
+        f.unlink()
     for inst in args.instruments:
         m = data.load(inst, DATA)
+        _, end = dev_window(m)
+        m = m[m.index < end]  # the holdout year stays untouched
         spans[inst] = data.span(m)
         for bar in bars:
             b = data.resample(m, bar)
@@ -62,33 +74,33 @@ def cmd_classifier(args) -> None:
                 for d in decide:
                     if d % bar:
                         continue
-                    so = ct.session_outcomes(b, anchor=anchor, decide_at=d)
-                    for horizon in ("4h", "session"):
-                        s = ct.summarise(so, horizon)
-                        rows.append({"instrument": inst, "bar": bar, "anchor": anchor, "decide_at": d,
-                                     "horizon": horizon, **s})
-                    so["instrument"] = inst
-                    so.to_csv(RESULTS / f"classifier_sessions_{inst.replace('/', '-')}_{bar}m_{anchor}_{d}.csv.gz",
-                              index=False)
-                    print(f"{inst} {bar}m {anchor} @{d}: {rows[-1]['verdict']}", flush=True)
+                    for vname, th in CLASSIFIER_VARIANTS.items():
+                        so = ct.session_outcomes(b, anchor=anchor, decide_at=d, **th)
+                        for horizon in ("4h", "session"):
+                            s = ct.summarise(so, horizon)
+                            rows.append({"instrument": inst, "variant": vname, "bar": bar, "anchor": anchor,
+                                         "decide_at": d, "horizon": horizon, **s})
+                        print(f"{inst} {vname} {bar}m {anchor} @{d}: {rows[-1]['verdict']}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (RESULTS / "classifier.json").write_text(json.dumps({"run": stamp, "spans": spans, "rows": rows}, default=str,
                                                         indent=1))
     lines = [f"# Classifier test ({stamp})", "",
              "Does the day-type classifier tell trending sessions from balanced ones, using only bars closed by the "
              "decision time? Continuation is the move after the decision in the trend's direction, in daily ATR; "
-             "the 95% range is a bootstrap. Move is the absolute move. t compares trend and balance moves.", "",
+             "the 95% range is a bootstrap. Move is the absolute move. t compares trend and balance moves. "
+             "Development history only (the most recent year is held back). Variants: "
+             + "; ".join(f"{k} {v or 'as the doc'}" for k, v in CLASSIFIER_VARIANTS.items()) + ".", "",
              "## History used", "", "| Instrument | From | To | Years | Missing minutes |", "|---|---|---|---|---|"]
     for k, v in spans.items():
         lines.append(f"| {k} | {v.get('start')} | {v.get('end')} | {v.get('years')} | {v.get('missing_pct')}% |")
     lines += ["", "## Results", "",
-              "| Instrument | Bar | Session | Decide | Horizon | Sessions | Trend share | Balance share | Continuation (95% range) "
-              "| Hit | Move trend | Move balance | t | Verdict |", "|" + "---|" * 14]
+              "| Instrument | Variant | Bar | Session | Decide | Horizon | Sessions | Trend share | Balance share "
+              "| Continuation (95% range) | Hit | Move trend | Move balance | t | Verdict |", "|" + "---|" * 15]
     for r in rows:
         c = r.get("trend_continuation_atr") or (float("nan"),) * 3
         sh = r.get("share", {})
         lines.append(
-            f"| {r['instrument']} | {r['bar']}m | {r['anchor']} | {r['decide_at']}m | {r['horizon']} | {r['sessions']} "
+            f"| {r['instrument']} | {r['variant']} | {r['bar']}m | {r['anchor']} | {r['decide_at']}m | {r['horizon']} | {r['sessions']} "
             f"| {_fmt(sh.get('trend_up', 0) + sh.get('trend_down', 0), True)} | {_fmt(sh.get('balance'), True)} "
             f"| {_fmt(c[0])} ({_fmt(c[1])} to {_fmt(c[2])}) | {_fmt(r.get('trend_continuation_hit'), True)} "
             f"| {_fmt(r.get('move_trend_atr'))} | {_fmt(r.get('move_balance_atr'))} | {_fmt(r.get('move_t_trend_vs_balance'), d=1)} "
@@ -98,7 +110,7 @@ def cmd_classifier(args) -> None:
     for r in rows:
         c = r.get("trend_continuation_atr") or (0,)
         ledger.record(idea="day_type_classifier", family="classifier",
-                      params={"bar": r["bar"], "anchor": r["anchor"], "decide_at": r["decide_at"], "horizon": r["horizon"]},
+                      params={"variant": r["variant"], **CLASSIFIER_VARIANTS[r["variant"]], "bar": r["bar"], "anchor": r["anchor"], "decide_at": r["decide_at"], "horizon": r["horizon"]},
                       dataset=f"binance_1m:{r['instrument']}", stage="diagnostic",
                       sharpe=float(c[0]) if c[0] == c[0] else 0.0)
     print(f"wrote {RESULTS / 'classifier.md'}")
