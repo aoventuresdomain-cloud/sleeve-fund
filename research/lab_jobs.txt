@@ -1,0 +1,2 @@
+# One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
+classifier

@@ -1,0 +1,57 @@
+name: lab
+# Strategy lab: downloads public minute history and runs research backtests. Research only:
+# no secrets, no orders. Results and the idea ledger are committed to the lab-results branch.
+on:
+  push:
+    branches: ["claude/lab*"]
+    paths: ["sleeve_fund/lab/**", "scripts/lab.py", "research/lab_jobs.txt", ".github/workflows/lab.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: lab
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "numpy>=1.26" "pandas>=2.2"
+      - name: Restore minute history
+        uses: actions/cache/restore@v4
+        with:
+          path: data/minute
+          key: lab-minute-${{ github.run_id }}
+          restore-keys: lab-minute-
+      - name: Bring in the ledger and earlier results
+        run: |
+          git fetch origin lab-results:lab-results || true
+          if git rev-parse --verify lab-results >/dev/null 2>&1; then
+            git checkout lab-results -- research/idea_ledger.jsonl research/results 2>/dev/null || true
+          fi
+      - name: Update minute history
+        run: python scripts/lab.py data
+      - name: Save minute history
+        uses: actions/cache/save@v4
+        with:
+          path: data/minute
+          key: lab-minute-${{ github.run_id }}
+      - name: Run lab jobs
+        run: |
+          set -e
+          grep -v '^\s*#' research/lab_jobs.txt | grep -v '^\s*$' | while read -r job; do
+            echo "::group::$job"; python scripts/lab.py $job; echo "::endgroup::"
+          done
+      - name: Publish results to lab-results
+        run: |
+          set -e
+          mkdir -p /tmp/out && cp -r research/results research/idea_ledger.jsonl /tmp/out/
+          git config user.name "sleeve-fund lab"; git config user.email "lab@users.noreply.github.com"
+          if git rev-parse --verify lab-results >/dev/null 2>&1; then git checkout -f lab-results; else git checkout --orphan lab-results; git rm -rf -q . || true; fi
+          mkdir -p research && rm -rf research/results && cp -r /tmp/out/results research/results && cp /tmp/out/idea_ledger.jsonl research/
+          echo "${GITHUB_SHA}" > research/results/SOURCE_COMMIT
+          git add research
+          git commit -q -m "lab results from ${GITHUB_SHA::8} (run ${GITHUB_RUN_ID})" || echo "no changes"
+          git push origin lab-results

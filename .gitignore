@@ -14,3 +14,4 @@ logs/
 .pytest_cache/
 data/*.db
 data/*.db-*
+data/minute/
