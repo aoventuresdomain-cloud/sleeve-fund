@@ -57,6 +57,8 @@ def _cell(v):
     # Spreadsheet formula injection: a reason typed as "=HYPERLINK(...)" must stay text.
     if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + v
+    if isinstance(v, float):
+        return float(f"{v:.12g}")  # drop binary noise such as 57651.420000000006
     return v.isoformat() if hasattr(v, "isoformat") else v
 
 

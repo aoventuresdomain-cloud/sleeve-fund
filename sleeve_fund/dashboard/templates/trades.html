@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle %}
+{% block title %}Trades · Sleeve Fund{% endblock %}
+{% block content %}
+{% set st = h.stats %}
+<div class="page-head">
+  <h1>Positions and trades</h1>
+  <div class="actions">
+    <form class="inline" method="get" action="/trades">
+      <label class="sr-only" for="t-sleeve">Sleeve</label>
+      <select id="t-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All sleeves</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <noscript><button>Show</button></noscript>
+    </form>
+    <a class="button secondary" href="/exports/trades.csv{{ '?sleeve=' ~ sleeve if sleeve }}">Download CSV</a>
+  </div>
+  <p class="lede">What is held now and every closed round trip, after fees. Open <strong>Why</strong> on any row for the signal the strategy acted on, recorded when it sent the order.</p>
+</div>
+
+<section class="ledger" aria-label="Trade figures">
+  <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div><div class="s">{{ h.exposure|money }} in coins</div></div>
+  <div><div class="k">Open P&amp;L</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
+  <div><div class="k">Closed trades</div><div class="v">{{ st.trades }}</div><div class="s">{{ st.wins }} won, {{ st.losses }} lost</div></div>
+  <div><div class="k">Win rate</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>
+  <div><div class="k">Realised P&amp;L</div><div class="v">{{ money_signed(st.pnl) }}</div><div class="s">after {{ st.fees|money }} fees</div></div>
+  <div><div class="k">Average win</div><div class="v">{{ st.avg_win|pctn }}</div><div class="s">loss {{ st.avg_loss|pctn }}</div></div>
+  <div><div class="k">Expectancy</div><div class="v">{{ st.expectancy|pctn }}</div><div class="s">per trade</div></div>
+  <div><div class="k">Profit factor</div><div class="v">{{ st.profit_factor|numn }}</div><div class="s">gross won ÷ lost</div></div>
+</section>
+
+<section class="panel flush" aria-labelledby="pos-h">
+  <div class="panel-head"><h2 id="pos-h">Open positions</h2><span class="hint">marked to the last Kraken price</span></div>
+  {% if h.positions %}
+  <table class="responsive">
+    <thead><tr><th>Sleeve</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Value</th><th class="num">Unrealised</th><th class="num">Held</th><th class="num">Stop / target</th><th></th></tr></thead>
+    <tbody>{% for p in h.positions %}{% set rid = 'pos-' ~ loop.index %}
+    <tr><td><a href="/sleeves/{{ p.sleeve }}"><strong>{{ p.sleeve }}</strong></a> <span class="muted">{{ p.pair }}</span></td>
+      <td class="num" data-m="hide">{{ '%.6g'|format(p.qty) }} {{ p.pair.split('/')[0] }}</td>
+      <td class="num" data-m="hide">{{ p.entry_px|px }}</td><td class="num" data-m="hide">{{ p.price|px }}</td>
+      <td class="num" data-m="hide">{{ p.value|money }} <span class="muted">{{ p.weight|pct0 }}</span></td>
+      <td class="num" data-m="right">{{ money_signed(p.unrealised) }} <span class="muted">{{ p.unrealised_ret|pct1s }}</span></td>
+      <td class="num" data-label="Held">{{ p.held|held }}</td>
+      <td class="num" data-m="hide">{{ p.stop_px|px if p.stop_px else '–' }} / {{ p.target_px|px if p.target_px else '–' }}</td>
+      <td data-m="right">{{ why_toggle(rid) }}</td></tr>
+    <tr class="detail" id="{{ rid }}" hidden><td colspan="9"><div class="why-grid">{{ why('Why it was bought' ~ (' · ' ~ p.opened|ts if p.opened else ''), p.why, p.sig) }}</div></td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 14px 14px">All in cash. A position appears here as soon as a sleeve buys.</p>{% endif %}
+</section>
+
+<section class="panel flush" aria-labelledby="tr-h">
+  <div class="panel-head"><h2 id="tr-h">Closed trades</h2><span class="hint">entry to exit, after both fees, newest first</span></div>
+  {% if h.trades %}
+  <table class="responsive">
+    <thead><tr><th>Closed</th><th>Sleeve</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th>Exit</th><th></th></tr></thead>
+    <tbody>{% for t in h.trades %}{% set rid = 'tr-' ~ loop.index %}
+    <tr><td data-m="hide">{{ t.closed|ts }}</td><td><a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a></td>
+      <td class="num" data-m="hide">{{ '%.6g'|format(t.qty) }} {{ t.pair.split('/')[0] }}</td>
+      <td class="num" data-m="hide">{{ t.entry_px|px }}<div class="sub">{{ t.opened|ts }}</div></td>
+      <td class="num" data-m="hide">{{ t.exit_px|px }}<div class="sub">{{ t.closed|ts }}</div></td>
+      <td class="num" data-m="hide">{{ t.held|held }}</td><td class="num" data-m="hide">{{ t.fees|money }}</td>
+      <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td>
+      <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td>
+      <td data-m="right">{{ why_toggle(rid) }}</td></tr>
+    <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
+      {{ why('Entry · ' ~ t.opened|ts ~ ' at ' ~ t.entry_px|px, t.entry_why, t.entry_items) }}
+      {{ why(t.reason ~ ' · ' ~ t.closed|ts ~ ' at ' ~ t.exit_px|px, t.exit_why, t.exit_items) }}
+    </div></td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 14px 14px">No closed trades yet. A trade appears here once a sleeve has bought and sold back to cash.</p>{% endif %}
+</section>
+{% endblock %}
+{% block scripts %}<script src="/static/console.js"></script><script>Console.whys();</script>{% endblock %}

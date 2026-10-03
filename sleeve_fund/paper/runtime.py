@@ -36,6 +36,8 @@ class SleeveRuntime:
         self.last_reconciled = None
         self._day = None
         self._day_open = None
+        # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
+        self.flatten_why: tuple[str, str] | None = None
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -88,21 +90,23 @@ class SleeveRuntime:
             self._day, self._day_open = now.date(), equity
 
         flatten = False
+        self.flatten_why = None
         if self.status == "running":
             breach = risk.check(self.profile, equity, self.peak, self._day_open)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume")
-                flatten = True
+                flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
             elif breach and breach.action == "pause_day":
                 until = now + timedelta(hours=24)
                 self._set("paused", breach.reason, until)
                 self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours")
-                flatten = True
+                flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
         for cmd in self.store.pending_commands(self.name):
             if cmd["command"] == "flatten":
                 flatten = True
+                self.flatten_why = self.flatten_why or ("pm_flatten", f"Flattened by PM: {cmd['reason']}")
                 if self.status != "halted":  # never downgrade a halt
                     self._set("paused", f"flattened by PM: {cmd['reason']}")
             elif cmd["command"] == "pause":
@@ -144,9 +148,22 @@ class SleeveRuntime:
                          "from the journal, or resume once you have checked.")
         return False
 
+    # --- orders -------------------------------------------------------------------
+
+    def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict) -> None:
+        """Journal an order and why it was sent, before it goes to the venue."""
+        self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
+                                signal=signal, ts=self.now())
+
+    def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
+        self.store.update_order(order_id, status=status, message=message)
+        if status in ("rejected", "denied"):
+            self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}")
+
     def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str) -> None:
         self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
                                trade_id=trade_id)
+        self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
         self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}")
 
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:

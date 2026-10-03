@@ -84,3 +84,16 @@ class RsiPullback(LongFlatStrategy):
         if entry:
             self._peak = close
         return entry
+
+    def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
+        c, close = self.c, bar.close.as_double()
+        rsi, vol, avg = self.rsi.value * 100, bar.volume.as_double(), self._prev_vol_avg or 0.0
+        values = {"rsi": rsi, f"ema_{c.ema_period}": self.ema.value, "volume_x": vol / avg if avg else None,
+                  "atr": self.atr.value}
+        if target:
+            return (f"RSI {rsi:.1f} below {c.rsi_entry:g}, close {close:,.6g} above the {c.ema_period}-bar EMA "
+                    f"{self.ema.value:,.6g}, volume {vol / avg:.2f}x normal (needs {c.vol_mult:g}x)", values)
+        stop = (self._peak or close) - c.atr_mult * self.atr.value
+        values.update(peak=self._peak, trail_stop=stop)
+        return (f"Trailing stop: close {close:,.6g} fell below {stop:,.6g} (peak {self._peak or close:,.6g} minus "
+                f"{c.atr_mult:g} x ATR {self.atr.value:,.4g})", values)
