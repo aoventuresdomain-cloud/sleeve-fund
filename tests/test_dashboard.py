@@ -693,3 +693,20 @@ def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, mon
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
     page = c.get(q.replace("ETH/USD", "SOL/USD"), auth=AUTH).text
     assert "0 of 1 as maker" in page and "assumed to miss and is charged the taker fee" in page
+
+
+def test_backtest_page_says_when_the_risk_guard_halted(client, monkeypatch):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from test_backtest import _path
+
+    c, _ = client
+    preview._history.clear()
+    falling = _path(synthetic_ohlcv(days=200, seed=3), [2_000.0] * 20 + [2_000.0 * 0.98**i for i in range(1, 46)] + [2_000.0 * 0.98**45] * 60)
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: falling)
+    q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&risk_profile=conservative"
+    page = c.get(q, auth=AUTH).text
+    assert "The risk guard halted this strategy on" in page and "drawdown" in page
+    preview._history.clear()
+    page = c.get(q.replace("conservative", "aggressive"), auth=AUTH).text  # a 60% fall at a 50% cap is a 30% drawdown, short of 35%
+    assert "The risk guard halted" not in page

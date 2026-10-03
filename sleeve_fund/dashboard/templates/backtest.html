@@ -36,6 +36,7 @@
         <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a></div>
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
+      {% if result.risk.note %}<p class="banner {{ 'warn' if result.risk.halted else '' }}" style="margin:0 0 10px">{{ result.risk.note }}</p>{% endif %}
       {% if result.execution.note %}<p class="{{ 'banner warn' if result.execution.matched_on is none else 'muted' }}" style="margin:0 0 10px;font-size:12.5px">{{ result.execution.note }}</p>{% endif %}
       <table class="compare">
         <thead><tr><th></th><th class="num">Model</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>

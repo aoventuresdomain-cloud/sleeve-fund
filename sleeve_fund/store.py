@@ -281,6 +281,14 @@ class Store:
         self.engine = engine or make_engine(url)
         metadata.create_all(self.engine)
 
+    @classmethod
+    def in_memory(cls) -> "Store":
+        """A private, throwaway store (one connection shared, so every call sees the same tables):
+        the journal a backtest's runtime writes to."""
+        from sqlalchemy.pool import StaticPool
+
+        return cls(engine=create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}))
+
     # --- sleeves -----------------------------------------------------------------
 
     def create_sleeve(
@@ -492,11 +500,11 @@ class Store:
             rows = _rows(c.execute(q.order_by(fee_schedules_t.c.fetched_at.desc(), fee_schedules_t.c.id.desc()).limit(1)))
         return rows[0] if rows else None
 
-    def event(self, sleeve: str | None, level: str, kind: str, message: str) -> None:
+    def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None) -> None:
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
         with self.engine.begin() as c:
-            c.execute(insert(events_t).values(sleeve=sleeve, ts=utcnow(), level=level, kind=kind, message=message))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message))
 
     def equity_series(self, sleeve: str, limit: int = 5000) -> list[dict]:
         q = select(equity_t).where(equity_t.c.sleeve == sleeve).order_by(equity_t.c.ts.desc(), equity_t.c.id.desc())

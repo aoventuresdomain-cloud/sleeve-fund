@@ -79,6 +79,26 @@ def _execution(res, wait, matched_on) -> dict:
     return out
 
 
+def _risk(events: list[dict], risk_profile: str | None) -> dict:
+    """What the runtime's risk guard did, in words the page shows."""
+    halts = [e for e in events if e["kind"] == "risk_halt"]
+    pauses = [e for e in events if e["kind"] == "risk_pause"]
+    out = {"profile": risk_profile, "halted": None, "pauses": len(pauses),
+           "events": [{"t": e["ts"].strftime("%d %b %Y"), "kind": e["kind"], "message": e["message"]} for e in events]}
+    notes = []
+    if halts:
+        h = halts[0]
+        out["halted"] = h["ts"].strftime("%d %b %Y")
+        reason = h["message"].split(";")[0]
+        notes.append(f"The risk guard halted this strategy on {out['halted']} ({reason}). In paper it would stay "
+                     "flat until you resume it, so from then on this backtest holds cash.")
+    if pauses:
+        notes.append(f"It paused for a day {len(pauses)} time{'s' if len(pauses) != 1 else ''} after a daily loss "
+                     "past the profile's limit, flattening each time, as paper would.")
+    out["note"] = " ".join(notes)
+    return out
+
+
 def _finite(v):
     """JSON has no NaN or infinity; the form shows None as n/a."""
     return None if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))) else v
@@ -96,11 +116,13 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
 
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
-        detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None) -> dict:
+        detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
+        risk_profile: str | None = None) -> dict:
     """Backtest these settings on the venue's daily history. days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
-    and the buy-and-hold benchmark is held at the same exposure."""
+    and the buy-and-hold benchmark is held at the same exposure. risk_profile runs the paper runtime
+    itself (cap, drawdown halt, daily-loss pause, journal) and sets cap from the profile."""
     from sleeve_fund.fees import resolve
 
     profile = venue_profile(venue)
@@ -113,7 +135,11 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     base, quote = pair.split("/")
     inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())),
                               fees=quote_fees.fees)
-    if cap is not None:
+    if risk_profile is not None:
+        from sleeve_fund.risk import profile as risk_profile_of
+
+        cap = risk_profile_of(risk_profile).max_position_pct
+    elif cap is not None:
         params = {**params, "position_cap_pct": cap}
     wait = params.get("maker_wait_minutes")
     exec_prices, matched_on = None, None
@@ -122,7 +148,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta("1D"), prices.index[-1], step)
         matched_on = None if exec_prices is None else f"{step}-minute"
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
-                       exec_minutes=5 if matched_on == "5-minute" else 1)
+                       exec_minutes=5 if matched_on == "5-minute" else 1, risk_profile=risk_profile)
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     s, b = summary(returns_from_equity(res.equity)), summary(returns_from_equity(bench))
     rows = fills_to_rows(res.fills)
@@ -144,6 +170,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
         "execution": _execution(res, wait, matched_on),
+        "risk": _risk(res.risk_events, risk_profile),
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
                          "source": quote_fees.source},
     }
