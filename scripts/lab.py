@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from statistics import NormalDist
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,7 +29,7 @@ from sleeve_fund.lab import sweep as sw  # noqa: E402
 from sleeve_fund.lab import trend_filter as tfl  # noqa: E402
 from sleeve_fund.lab import vwap_day as vd  # noqa: E402
 from sleeve_fund.research.ledger import IdeaLedger  # noqa: E402
-from sleeve_fund.research.metrics import deflated_sharpe_probability  # noqa: E402
+from sleeve_fund.research.metrics import expected_max_sharpe  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "minute"
@@ -359,6 +361,21 @@ TREND_VARIANTS = {
 }
 
 
+def deflated_sharpe(returns: pd.Series, n_trials: int) -> float:
+    """Deflated Sharpe probability (Bailey and Lopez de Prado), with the spread of trial Sharpes
+    taken as the no-skill sampling error 1/sqrt(T). The ledger's own Sharpes are not used for the
+    spread: the fee-destroyed intraday tries (Sharpe -10 and worse) would make any hurdle absurd."""
+    r = returns.dropna()
+    n = len(r)
+    if n < 30 or r.std(ddof=1) == 0:
+        return float("nan")
+    sr = r.mean() / r.std(ddof=1)
+    hurdle = expected_max_sharpe(n_trials, 1 / math.sqrt(n - 1))
+    skew, kurt = float(r.skew()), float(r.kurt()) + 3
+    denom = math.sqrt(max(1 - skew * sr + (kurt - 1) / 4 * sr**2, 1e-12))
+    return float(NormalDist().cdf((sr - hurdle) * math.sqrt(n - 1) / denom))
+
+
 def cmd_trend(args) -> None:
     """Long-only trend filter: staged report, calendar years, exposure, and the deflated Sharpe
     against every attempt in the idea ledger."""
@@ -389,7 +406,6 @@ def cmd_trend(args) -> None:
     # Strategy attempts only: benchmarks and the classifier diagnostics are not trials of a strategy.
     tried = [e for e in ledger.entries() if e["family"] != "benchmark" and e["stage"] != "diagnostic"]
     n_trials = len({(e["idea"], json.dumps(e["params"], sort_keys=True)) for e in tried})
-    trial_sharpes = [e["sharpe"] for e in tried]
     L = ["", "## By calendar year (long-only, Kraken retail costs, equal-weight basket)", "",
          "| Variant | " + " | ".join(str(y) for y in range(2018, 2026)) + " | Sharpe | Max DD | Avg exposure | Deflated Sharpe prob. |",
          "|" + "---|" * 13]
@@ -398,7 +414,7 @@ def cmd_trend(args) -> None:
         basket = pd.concat([s.rename(i) for i, s in per.items()], axis=1).fillna(0).mean(axis=1)
         yearly = (1 + basket).groupby(basket.index.year).prod() - 1
         st = sim.stats(sim.trades_frame([]), basket)
-        dsr = deflated_sharpe_probability(basket, n_trials, trial_sharpes)
+        dsr = deflated_sharpe(basket, n_trials)
         ex = sum(expo[vname].values()) / len(expo[vname]) if vname in expo else 1.0
         L.append(f"| {vname} | " + " | ".join(_pct(yearly.get(y, float('nan'))) for y in range(2018, 2026))
                  + f" | {st['sharpe']:.2f} | {_pct(-st['max_dd'])} | {ex:.0%} | {dsr:.2f} |")
@@ -409,17 +425,52 @@ def cmd_trend(args) -> None:
     print(f"wrote {out}")
 
 
+def cmd_trend_holdout(args) -> None:
+    """One-shot final test of a single pre-chosen trend variant on the held-back year. Refuses to
+    run twice for the same variant and instrument: a holdout seen once is no longer a holdout."""
+    vname = args.variant
+    p = TREND_VARIANTS[vname]
+    ledger = IdeaLedger(LEDGER)
+    idea = f"trend_filter:{vname}"
+    used = [i for i in args.instruments if ledger.holdout_used(idea, f"binance_1m:{i}")]
+    if used:
+        raise SystemExit(f"holdout already used for {vname} on {used}")
+    rows, per = [], {}
+    for inst in args.instruments:
+        m = data.load(inst, DATA)
+        _, hi = dev_window(m)
+        for cost in COST_LEVELS:
+            per.setdefault(cost, {})[inst] = tfl.daily_returns(m, p, cost=cost, start=hi)
+        per.setdefault("bench", {})[inst] = mt.buy_and_hold(data.resample(m, 1440), hi)
+        ledger.record(idea=idea, family="trend", params=p.as_dict(), dataset=f"binance_1m:{inst}", stage="holdout",
+                      sharpe=sim.stats(sim.trades_frame([]), per["kraken_pro_taker"][inst])["sharpe"])
+    L = [f"# Trend filter: holdout year ({vname})", "",
+         f"Run {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. The most recent {HOLDOUT_DAYS} days, never "
+         "used before. Equal-weight basket, long-only.", "",
+         "| Costs | Return | Sharpe | Max DD | " + " | ".join(f"{i.removesuffix('/USD')} return" for i in args.instruments) + " |",
+         "|" + "---|" * (4 + len(args.instruments))]
+    for cost, label in [(c, c.replace("_", " ")) for c in COST_LEVELS] + [("bench", "buy and hold")]:
+        b = pd.concat([s.rename(i) for i, s in per[cost].items()], axis=1).fillna(0).mean(axis=1)
+        st = sim.stats(sim.trades_frame([]), b)
+        L.append(f"| {label} | {_pct(st['total_return'])} | {st['sharpe']:.2f} | {_pct(-st['max_dd'])} | "
+                 + " | ".join(_pct(float((1 + per[cost][i]).prod() - 1)) for i in args.instruments) + " |")
+    out = RESULTS / "trend_filter_holdout.md"
+    out.write_text("\n".join(L) + "\n")
+    print(f"wrote {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["data", "classifier", "vwap_day", "mtf", "sweep", "pairs", "trend"])
+    ap.add_argument("command", choices=["data", "classifier", "vwap_day", "mtf", "sweep", "pairs", "trend", "trend_holdout"])
     ap.add_argument("--htf", type=int, default=240)
     ap.add_argument("--bar", type=int, default=5)
     ap.add_argument("--anchors", nargs="*", default=["utc", "us_open"])
     ap.add_argument("--instruments", nargs="*", default=BASKET)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--variant", default="4h 21/55, vol target 40%")
     args = ap.parse_args()
     RESULTS.mkdir(parents=True, exist_ok=True)
-    {"data": cmd_data, "classifier": cmd_classifier, "vwap_day": cmd_vwap_day, "mtf": cmd_mtf, "sweep": cmd_sweep, "pairs": cmd_pairs, "trend": cmd_trend}[args.command](args)
+    {"data": cmd_data, "classifier": cmd_classifier, "vwap_day": cmd_vwap_day, "mtf": cmd_mtf, "sweep": cmd_sweep, "pairs": cmd_pairs, "trend": cmd_trend, "trend_holdout": cmd_trend_holdout}[args.command](args)
 
 
 if __name__ == "__main__":
