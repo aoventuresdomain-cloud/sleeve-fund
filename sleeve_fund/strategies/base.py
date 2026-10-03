@@ -200,8 +200,9 @@ class LongFlatStrategy(Strategy):
                 return  # a backtest marks and guards once a bar, from on_bar
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
-            # Quotes put the venue's bid and ask in the simulated book, so a market order pays the
-            # spread as it would for real, and a maker order can join the best bid or ask.
+            # Quotes put the venue's bid and ask in the simulated book (each trade updates it too), so
+            # a market order fills at the latest ask, bid or trade rather than only the last trade, and
+            # a maker order can join the best bid or ask.
             self.subscribe_quotes(self._cfg.instrument_id)
             # Ticks are driven by market data (trades and bars, throttled) because a clock timer
             # alone did not fire in the live node; the timer stays as a backup for quiet markets.
