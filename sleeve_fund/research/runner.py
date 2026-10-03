@@ -16,6 +16,7 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
+from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY
 
 
@@ -30,6 +31,8 @@ class BacktestResult:
     starting_capital: float
     # Why each order was sent, keyed by client order id (the fills report's index).
     decisions: dict = field(default_factory=dict)
+    # With a risk profile: the halts and pauses the runtime made, oldest first, as paper would.
+    risk_events: list = field(default_factory=list)
 
 
 def run_backtest(
@@ -43,6 +46,7 @@ def run_backtest(
     bar_minutes: int = 1440,
     exec_prices: pd.DataFrame | None = None,
     exec_minutes: int = 1,
+    risk_profile: str | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -50,13 +54,27 @@ def run_backtest(
     fed these and builds the strategy's bars from them, so an order resting between decisions (a
     maker order, a stop) is matched against every minute, not just the next decision bar. Without
     them nothing trades between decision bars: a maker order that waits less than a bar never fills
-    and goes at market, so the backtest is charged the taker fee."""
+    and goes at market, so the backtest is charged the taker fee.
+
+    risk_profile: run with the paper runtime on a throwaway journal (SleeveRuntime.for_backtest), so
+    the profile's position cap, drawdown halt and daily-loss pause act exactly as they would in paper.
+    Without one (research), the strategy trades unguarded and uncapped unless position_cap_pct is set."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    if risk_profile is not None:
+        if runtime is not None:
+            raise ValueError("pass a runtime or a risk profile, not both")
+        from sleeve_fund.paper.runtime import SleeveRuntime
+
+        params.pop("position_cap_pct", None)  # the runtime's profile sets the cap
+        bt = bar_type_for(instrument, bar_minutes)
+        runtime = SleeveRuntime.for_backtest(
+            strategy=strategy_name, instrument=str(instrument.id.symbol), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
+            starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60)
 
     engine = BacktestEngine(
         BacktestEngineConfig(
@@ -106,8 +124,13 @@ def run_backtest(
             fees_paid=fees,
             starting_capital=starting_capital,
             decisions=dict(strategy.decisions),
+            risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
         )
     finally:
+        if runtime is not None:
+            # The runtime's clock is a closure over the strategy, a reference cycle the garbage
+            # collector would otherwise free on whatever thread it runs on, which the engine forbids.
+            runtime.now = _utcnow
         engine.dispose()
 
 

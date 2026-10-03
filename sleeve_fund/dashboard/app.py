@@ -244,7 +244,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("enter an instrument like SOL/USD")
             params = _form_params(q, strategy)
             balance = float(q.get("starting_balance") or 10_000)
-            return JSONResponse(preview.run(strategy, pair, params, starting=balance, cap=_profile_cap(q),
+            _profile_cap(q)  # validates the profile name
+            return JSONResponse(preview.run(strategy, pair, params, starting=balance,
+                                            risk_profile=q.get("risk_profile") or "balanced",
                                             fee_quote=resolve_fees(None, st())))
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
@@ -462,8 +464,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if not 100 <= starting <= 1e9:
                     raise ValueError("capital: between 100 and 1,000,000,000")
                 params = _form_params(q, strategy)
+                _profile_cap(q)  # validates the profile name
                 result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
-                                     detail=True, cap=_profile_cap(q), fee_quote=resolve_fees(None, st()))
+                                     detail=True, risk_profile=q.get("risk_profile") or "balanced",
+                                     fee_quote=resolve_fees(None, st()))
             except (ValueError, TypeError, KeyError) as exc:
                 error = str(exc).strip("'")
             except OSError as exc:  # Kraken unreachable

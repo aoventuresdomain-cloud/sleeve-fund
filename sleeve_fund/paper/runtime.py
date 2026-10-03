@@ -1,8 +1,10 @@
 """What turns a strategy into a sleeve: journal, PM controls and the risk guard.
 
-A strategy gets a SleeveRuntime in paper and live; in backtest it gets none and
-behaves exactly as before. The runtime is called from the strategy's own thread
-(a timer and fill events), so there is no concurrency inside it.
+A strategy gets a SleeveRuntime in paper and live, and backtests run with the same
+runtime on a throwaway journal (SleeveRuntime.for_backtest), so sizing, halts, pauses
+and the journal behave identically in every mode. Research runs without one. The runtime
+is called from the strategy's own thread (a timer and fill events), so there is no
+concurrency inside it.
 """
 
 from __future__ import annotations
@@ -16,6 +18,26 @@ RECONCILE_EVERY = timedelta(hours=24)
 
 
 class SleeveRuntime:
+    # True when replaying history: no live trade feed, so the strategy ticks once a bar and
+    # rests its stop at the simulated venue instead of watching every trade.
+    backtest = False
+
+    @classmethod
+    def for_backtest(cls, *, strategy: str, instrument: str, bar_spec: str, starting_balance: float,
+                     risk_profile: str, params: dict | None = None, bar_seconds: int = 86_400) -> "SleeveRuntime":
+        """The paper runtime on an in-memory journal, ticking on the backtest's clock once a bar."""
+        store = Store.in_memory()
+        store.create_sleeve(name="backtest", strategy=strategy, instrument=instrument, bar_spec=bar_spec,
+                            starting_balance=starting_balance, risk_profile=risk_profile, params=params or {})
+        rt = cls(store, "backtest", tick_seconds=bar_seconds)
+        rt.backtest = True
+        return rt
+
+    def risk_events(self) -> list[dict]:
+        """Halts and pauses, oldest first, for a backtest to show."""
+        kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch")
+        return [e for e in reversed(self.store.events(self.name, limit=10_000)) if e["kind"] in kinds]
+
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:
         self.tick_seconds = tick_seconds
         self.store = store
@@ -36,6 +58,7 @@ class SleeveRuntime:
         self.last_reconciled = None
         self._day = None
         self._day_open = None
+        self._last_equity = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
         self.flatten_why: tuple[str, str] | None = None
 
@@ -46,16 +69,16 @@ class SleeveRuntime:
         if now is not None:
             self.now = now
         if self.status in ("halted",):
-            self.store.event(self.name, "warning", "restart", "restarted while halted; stays halted until resumed")
+            self.store.event(self.name, "warning", "restart", "restarted while halted; stays halted until resumed", ts=self.now())
         elif self.status == "paused" and self.paused_until and self.paused_until > self.now():
-            self.store.event(self.name, "info", "restart", "restarted while paused")
+            self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
                              f"book restored from {self.book['fills']} journal fills: "
-                             f"cash {self.book['cash']:,.2f}, position {self.book['qty']:g}")
-        self.store.event(self.name, "info", "start", f"strategy started ({self.profile.name} risk profile)")
+                             f"cash {self.book['cash']:,.2f}, position {self.book['qty']:g}", ts=self.now())
+        self.store.event(self.name, "info", "start", f"strategy started ({self.profile.name} risk profile)", ts=self.now())
 
     def on_stop(self) -> None:
         if self.status in ("running", "starting"):
@@ -66,7 +89,7 @@ class SleeveRuntime:
     def can_open(self) -> bool:
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
             self._set("running", "daily-loss pause expired")
-            self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again")
+            self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
         return self.status == "running"
 
     def position_budget(self, equity: float) -> float:
@@ -90,7 +113,10 @@ class SleeveRuntime:
                                  ts=now)
         self.peak = max(self.peak, equity)
         if self._day != now.date():
-            self._day, self._day_open = now.date(), equity
+            # The day opens at the equity last marked before midnight: the same thing in paper, which
+            # marks every few seconds, and in a backtest, which marks once a bar.
+            self._day, self._day_open = now.date(), self._last_equity if self._last_equity is not None else equity
+        self._last_equity = equity
 
         flatten = False
         self.flatten_why = None
@@ -98,12 +124,12 @@ class SleeveRuntime:
             breach = risk.check(self.profile, equity, self.peak, self._day_open)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
-                self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume")
+                self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
             elif breach and breach.action == "pause_day":
                 until = now + timedelta(hours=24)
                 self._set("paused", breach.reason, until)
-                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours")
+                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
         for cmd in self.store.pending_commands(self.name):
@@ -120,7 +146,7 @@ class SleeveRuntime:
                     self.peak = equity  # a resume after a halt resets the drawdown reference
                 self._day_open = equity
                 self._set("running", "")
-            self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"])
+            self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
         return "flatten" if flatten else None
 
@@ -143,12 +169,12 @@ class SleeveRuntime:
         detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
                   f"engine position {qty:g} vs journal {book['qty']:g} ({book['fills']} fills)")
         if abs(d_cash) <= cash_tol and abs(d_qty) <= qty_tolerance:
-            self.store.event(self.name, "info", "reconcile", "engine matches journal: " + detail)
+            self.store.event(self.name, "info", "reconcile", "engine matches journal: " + detail, ts=self.now())
             return True
         self._set("halted", "reconciliation mismatch")
         self.store.event(self.name, "error", "reconcile_mismatch",
                          detail + ". Halted, nothing traded or corrected. Restart the strategy to rebuild "
-                         "from the journal, or resume once you have checked.")
+                         "from the journal, or resume once you have checked.", ts=self.now())
         return False
 
     # --- orders -------------------------------------------------------------------
@@ -162,13 +188,13 @@ class SleeveRuntime:
     def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
         self.store.update_order(order_id, status=status, message=message)
         if status in ("rejected", "denied"):
-            self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}")
+            self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}", ts=self.now())
 
     def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str) -> None:
         self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
-                               trade_id=trade_id)
+                               trade_id=trade_id, ts=self.now())
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
-        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}")
+        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=self.now())
 
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:
         self.status, self.paused_until = status, paused_until

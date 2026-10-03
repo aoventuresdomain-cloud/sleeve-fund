@@ -172,6 +172,12 @@ class LongFlatStrategy(Strategy):
         self.runtime = runtime
         return self
 
+    @property
+    def _backtest(self) -> bool:
+        """Replaying history (with or without a runtime): no live trade feed, so stops rest at the
+        simulated venue and take-profits are checked on each bar's high."""
+        return self.runtime is None or self.runtime.backtest
+
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self._cfg.instrument_id)
         if self.instrument is None:
@@ -189,6 +195,8 @@ class LongFlatStrategy(Strategy):
             book = self.runtime.book
             if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
                 self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
+            if self.runtime.backtest:
+                return  # a backtest marks and guards once a bar, from on_bar
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
             # Ticks are driven by market data (trades and bars, throttled) because a clock timer
@@ -336,7 +344,7 @@ class LongFlatStrategy(Strategy):
         if self.cache.orders_inflight(strategy_id=self.strategy_id):
             return False
         move = price / self._entry_px - 1
-        if self.runtime is None:
+        if self._backtest:
             peak = max(high or price, price) / self._entry_px - 1
             hit = "take_profit" if cfg.take_profit and peak >= cfg.take_profit else None
         else:
@@ -346,7 +354,8 @@ class LongFlatStrategy(Strategy):
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
         if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry")
+            self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry",
+                                     ts=self.runtime.now())
         level = cfg.stop_loss if hit == "stop_loss" else cfg.take_profit
         reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
                   f"the {self._entry_px:,.6g} entry, past the {level:.1%} {'stop' if hit == 'stop_loss' else 'target'}")
@@ -474,7 +483,7 @@ class LongFlatStrategy(Strategy):
             qty = min(left, self._position_qty(free=True)).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             self.log.info(f"post-only order {coid} {why}; the rest ({qty}) is below the minimum order size")
-            if self.runtime is None and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0:
+            if self._backtest and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0:
                 self._rest_stop()
             return
         reason = f"{info['reason']}. The post-only order {why}, so the rest went at market"
@@ -631,11 +640,12 @@ class LongFlatStrategy(Strategy):
             self._entry_qty = max(self._entry_qty - qty, 0.0)
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
-        if self.runtime is None:
+        if self._backtest:
             if event.is_buy and done:
                 self._rest_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") == "stop_loss":
                 self._exit_lock = True
+        if self.runtime is None:
             return
         fee = event.commission.as_double() if event.commission is not None else 0.0
         self.runtime.on_fill(
@@ -648,8 +658,8 @@ class LongFlatStrategy(Strategy):
         )
 
     def _rest_stop(self) -> None:
-        """Backtest only: after an entry fills, rest a sell stop at the stop-loss level, as a real
-        stop order would sit at the venue. Bars are matched open, high, low, close, so it fills at
+        """Backtests: after an entry fills, rest a sell stop at the stop-loss level, as a real stop
+        order would sit at the venue. (Paper and live watch every trade instead.) Bars are matched open, high, low, close, so it fills at
         the level within the bar, or at the open when the price gaps through it."""
         if not self._cfg.stop_loss or self._entry_px is None:
             return
@@ -671,6 +681,10 @@ class LongFlatStrategy(Strategy):
             "signal": {"entry_px": round(self._entry_px, 8), "stop_loss": self._cfg.stop_loss,
                        "trigger": round(level, 8)},
         }
+        if self.runtime is not None:
+            d = self.decisions[str(order.client_order_id)]
+            self.runtime.on_order(order_id=str(order.client_order_id), side="SELL", qty=float(qty), intent="stop_loss",
+                                  reason=d["reason"], signal=d["signal"], order_type="STOP")
         self.submit_order(order)
 
     def on_stop(self) -> None:
