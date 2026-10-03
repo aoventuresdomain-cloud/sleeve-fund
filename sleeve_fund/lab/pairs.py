@@ -175,7 +175,7 @@ def prepare(a: pd.DataFrame, b: pd.DataFrame, p: Params) -> pd.DataFrame:
     return df
 
 
-def run(df: pd.DataFrame, p: Params, *, cost: str = "kraken_pro_taker", start=None, name: str = "") -> pd.DataFrame:
+def run(df: pd.DataFrame, p: Params, *, cost: str = "kraken_taker", start=None, name: str = "") -> pd.DataFrame:
     """Simulate on hourly closes. Returns a trades table like sim.trades_frame."""
     c = COSTS[cost]
     per_side = (c["fee"] + c["slip"]) / 1e4

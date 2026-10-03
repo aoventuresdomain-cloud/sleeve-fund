@@ -1,7 +1,7 @@
 """Instrument definitions with the venue fee schedule baked in.
 
-Fees are mandatory: there is no way to build an instrument here without them.
-Defaults are Kraken's UK entry tier from 9 July 2026 (0.40% maker, 0.80% taker).
+Fees and venue are mandatory: there is no way to build an instrument here without them, and no
+venue is assumed. Each venue's rates live in its profile (sleeve_fund.venues).
 """
 
 from __future__ import annotations
@@ -11,9 +11,6 @@ from decimal import Decimal
 
 from nautilus_trader.execution import FeeModel
 from nautilus_trader.model import Currency, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol, Venue
-
-KRAKEN = Venue("KRAKEN")
-
 
 @dataclass(frozen=True)
 class FeeSchedule:
@@ -26,18 +23,15 @@ class FeeSchedule:
                 raise ValueError(f"{name} fee {value} outside sane range [0, 5%)")
 
 
-KRAKEN_UK_ENTRY = FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080"))
-
-
 def spot_pair(
     base: str,
     quote: str,
-    fees: FeeSchedule = KRAKEN_UK_ENTRY,
-    venue: Venue = KRAKEN,
+    fees: FeeSchedule,
+    venue: Venue,
     price_precision: int = 2,
     size_precision: int = 8,
 ) -> CurrencyPair:
-    """Build a spot CurrencyPair, e.g. spot_pair("BTC", "USD")."""
+    """Build a spot CurrencyPair. Use VenueProfile.instrument() so the venue's fees come with it."""
     base_ccy = Currency.from_str(base)
     quote_ccy = Currency.from_str(quote)
     symbol = Symbol(f"{base}/{quote}")
@@ -67,10 +61,10 @@ class ScheduleFeeModel(FeeModel):
 
     Used in both backtest and paper so the fee code path is identical. Market
     orders pay taker; anything else pays taker too unless it is post-only, which
-    is the only way to be sure of maker on Kraken.
+    is the only way to be sure of the maker rate.
     """
 
-    def __init__(self, fees: FeeSchedule = KRAKEN_UK_ENTRY) -> None:
+    def __init__(self, fees: FeeSchedule) -> None:
         super().__init__()
         self.fees = fees
 

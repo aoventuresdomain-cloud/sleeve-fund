@@ -15,6 +15,3 @@ risk_profile = "balanced"
 fast = 50
 slow = 200
 
-[fees]
-maker = 0.0040
-taker = 0.0080

@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv
-from sleeve_fund.instruments import spot_pair
+from sleeve_fund.venues import venue
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.study import run_study
 from sleeve_fund.research.tearsheet import render
@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--synthetic", action="store_true", help="random-walk data, pipeline check only")
     st.add_argument("--base", default="BTC")
     st.add_argument("--quote", default="USD")
+    st.add_argument("--venue", default=None, help="venue profile for fees (default: the default venue)")
     st.add_argument("--holdout-days", type=int, default=365)
     st.add_argument("--use-holdout", action="store_true", help="open the holdout (logged; do this once)")
     st.add_argument("--stop-loss", type=float, help="exit if price falls this fraction below entry, e.g. 0.08")
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         prices = load_kraken_ohlcvt(args.data)
         dataset = Path(args.data).stem
-    instrument = spot_pair(args.base, args.quote)
+    instrument = venue(args.venue).instrument(args.base, args.quote)
     result = run_study(
         spec,
         prices,

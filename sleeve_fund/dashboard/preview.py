@@ -1,7 +1,7 @@
 """Quick look-back for the new-sleeve form: how would these settings have traded recently?
 
 Runs the real strategy through the same backtest engine and fees as research, on
-Kraken's last ~2 years of daily candles. It is in-sample and unvalidated, so the
+the venue's daily candles (from its venue profile). It is in-sample and unvalidated, so the
 form says so; G1 is still decided by the research loop.
 """
 
@@ -12,25 +12,26 @@ import time
 
 import pandas as pd
 
-from sleeve_fund.data import fetch_kraken_daily
-from sleeve_fund.instruments import spot_pair
 from sleeve_fund.research.metrics import fills_to_rows, returns_from_equity, summary, trade_stats, trades
 from sleeve_fund.research.runner import run_backtest
+from sleeve_fund.venues import venue as venue_profile
 
 CACHE_SECONDS = 6 * 3600  # daily candles: refetching more often adds nothing
-_history: dict[str, tuple[float, object]] = {}
+_history: dict[tuple[str, str], tuple[float, object]] = {}
 _lock = threading.Lock()
 
 
-def history(pair: str, fetch=None):
-    """Daily candles for a pair, cached so the form doesn't call Kraken on every change."""
+def history(pair: str, fetch=None, venue: str | None = None):
+    """Daily candles for a pair, cached so the form doesn't call the venue on every change."""
+    profile = venue_profile(venue)
+    key = (profile.name, pair)
     with _lock:
-        hit = _history.get(pair)
+        hit = _history.get(key)
         if hit and time.time() - hit[0] < CACHE_SECONDS:
             return hit[1]
-    df = (fetch or fetch_kraken_daily)(pair)
+    df = (fetch or profile.daily_history)(pair)
     with _lock:
-        _history[pair] = (time.time(), df)
+        _history[key] = (time.time(), df)
     return df
 
 
@@ -51,18 +52,19 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
 
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
-        detail: bool = False, cap: float | None = None) -> dict:
-    """Backtest these settings on Kraken daily history. days trims to the most recent N days;
+        detail: bool = False, cap: float | None = None, venue: str | None = None) -> dict:
+    """Backtest these settings on the venue's daily history. days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
     and the buy-and-hold benchmark is held at the same exposure."""
-    prices = history(pair, fetch)
+    profile = venue_profile(venue)
+    prices = history(pair, fetch, profile.name)
     if days:
         prices = prices.iloc[-days:]
     if len(prices) < 60:
-        raise ValueError(f"only {len(prices)} days of Kraken history for {pair}; need at least 60")
+        raise ValueError(f"only {len(prices)} days of {profile.label} history for {pair}; need at least 60")
     base, quote = pair.split("/")
-    inst = spot_pair(base, quote, price_precision=_precision(float(prices["close"].median())))
+    inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())))
     if cap is not None:
         params = {**params, "position_cap_pct": cap}
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting)
@@ -86,6 +88,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
+        "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": profile.fee_text()},
     }
     if detail:
         from sleeve_fund.dashboard import trading
@@ -103,5 +106,5 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         # Daily candles are stamped at their close; the chart wants open times. Fills land on the
         # bar they decided on, which closed at the fill time.
         opened = prices.set_axis(prices.index - pd.Timedelta("1D"))
-        out["price"] = charts.payload(opened, 1440, rows, res.decisions, [], "kraken", shift_bars=1)
+        out["price"] = charts.payload(opened, 1440, rows, res.decisions, [], "venue", shift_bars=1)
     return out

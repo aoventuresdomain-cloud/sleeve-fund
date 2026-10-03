@@ -5,7 +5,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Backtest</h1>
-  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and Kraken fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
+  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and venue fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
 </div>
 
 <div class="grid">
@@ -31,7 +31,7 @@
   {% if result %}
     {% set s, h, ts = result.strategy, result.hold, result.stats %}
     <section class="panel bt-head">
-      <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days, after fees</span>
+      <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days, after fees: {{ result.fee_schedule.text }}</span>
         <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper sleeve with these settings</a></div>
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This strategy hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}

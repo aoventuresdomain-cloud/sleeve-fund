@@ -53,7 +53,7 @@ def prepare(bars: pd.DataFrame, p: Params) -> pd.DataFrame:
     return out
 
 
-def run(bars: pd.DataFrame, p: Params, *, cost: str = "kraken_pro_taker", long_only: bool = False, start=None,
+def run(bars: pd.DataFrame, p: Params, *, cost: str = "kraken_taker", long_only: bool = False, start=None,
         prepared: pd.DataFrame | None = None) -> Book:
     out = prepared if prepared is not None else prepare(bars, p)
     book = Book(risk=p.risk, max_leverage=p.max_leverage, long_only=long_only, cost=cost)

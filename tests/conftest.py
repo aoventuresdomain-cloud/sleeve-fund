@@ -1,12 +1,12 @@
 import pytest
 
 from sleeve_fund.data import synthetic_ohlcv
-from sleeve_fund.instruments import spot_pair
+from sleeve_fund.venues import venue
 
 
 @pytest.fixture(scope="session")
 def instrument():
-    return spot_pair("BTC", "USD")
+    return venue("KRAKEN").instrument("BTC", "USD")
 
 
 @pytest.fixture(scope="session")

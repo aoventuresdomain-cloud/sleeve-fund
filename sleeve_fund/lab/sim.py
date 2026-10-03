@@ -21,10 +21,15 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from sleeve_fund.venues import venue
+
 # Per-side costs in basis points. "plan" is the project plan's Kraken assumption (taker every fill).
+# The venue's own rates come from its profile, so the lab can't drift from paper again. The lab
+# simulator is being retired in favour of the one engine (fix plan milestone 3).
+_V = venue()
 COSTS = {
-    "plan_kraken_taker": {"fee": 80.0, "slip": 2.0},
-    "kraken_pro_taker": {"fee": 40.0, "slip": 2.0},
+    "kraken_taker": {"fee": float(_V.fees.taker) * 1e4, "slip": 2.0},
+    "kraken_maker": {"fee": float(_V.fees.maker) * 1e4, "slip": 2.0},
     "high_volume_taker": {"fee": 10.0, "slip": 2.0},
     "institutional": {"fee": 2.0, "slip": 1.0},
     "zero": {"fee": 0.0, "slip": 0.0},
@@ -75,7 +80,7 @@ class Book:
     """One instrument's account: at most one open trade at a time, compounding equity."""
 
     def __init__(self, *, equity: float = 100_000.0, risk: float = 0.005, max_leverage: float = 4.0,
-                 long_only: bool = False, cost: str = "kraken_pro_taker") -> None:
+                 long_only: bool = False, cost: str = "kraken_taker") -> None:
         self.equity = equity
         self.start = equity
         self.risk = risk

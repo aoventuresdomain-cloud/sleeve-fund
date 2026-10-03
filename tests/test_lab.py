@@ -95,7 +95,7 @@ def test_vwap_day_strategies_trade_long_only_without_shorts_and_book_costs():
     longs = sim.trades_frame(vwap_day.run(b, p, cost="zero", long_only=True).trades)
     assert len(both) > 20 and (both["side"] < 0).any()
     assert len(longs) and (longs["side"] > 0).all()
-    costly = sim.trades_frame(vwap_day.run(b, p, cost="kraken_pro_taker").trades)
+    costly = sim.trades_frame(vwap_day.run(b, p, cost="kraken_taker").trades)
     assert costly["fees"].sum() > 0 and costly["ret"].mean() < both["ret"].mean()
     # Each trade risks about 0.5% of equity: a full stop-out loses roughly that much before costs.
     stops = both[both["exit_why"] == "stop"]

@@ -186,13 +186,14 @@ def run_study(
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
-        fee_note=f"{float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} taker, taker charged on every order",
+        fee_note=(f"{instrument.id.venue}: {float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} "
+                  "taker, taker charged on every order"),
     )
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + ", ".join(f"{k.replace('_', ' ')} {v:.1%}" for k, v in exits.items())
-            + ". Stops and targets are checked at each bar's close, so the backtest misses moves inside the bar; "
-            "live paper checks them on every trade."
+            + ". The stop rests at the venue and fills at its level (or the open on a gap); the target is checked on "
+            "the bar's high and sold at the close, and the stop wins when one bar touches both. Paper checks both on every trade."
         )
 
     # 3. Holdout, only on request, using the most recent fold's choice.

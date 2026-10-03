@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sleeve_fund.store import Store
+from sleeve_fund.venues import KRAKEN
 
 AUTH = ("pm", "test-pw")
 SAME = {"origin": "http://testserver"}
@@ -206,7 +207,7 @@ def test_preview_runs_the_form_settings_on_history(client, monkeypatch):
 
     c, _ = client
     preview._history.clear()
-    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=2, start_price=150))
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=2, start_price=150))
     q = {"strategy": "trend_filter", "instrument": "sol/usd", "p_trend_filter__fast": "10",
          "p_trend_filter__slow": "40", "stop_loss_pct": "8", "starting_balance": "5000"}
     d = c.get("/api/preview", params=q, auth=AUTH).json()
@@ -355,7 +356,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
 
     c, _ = client
     preview._history.clear()
-    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
     assert "How testing works" in c.get("/backtest", auth=AUTH).text
     q = ("/backtest?run=1&instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5"
          "&p_trend_filter__slow=20&starting_balance=5000&period=365")
@@ -389,7 +390,7 @@ def test_backtest_sizes_with_the_chosen_risk_profile(client, monkeypatch):
 
     c, _ = client
     preview._history.clear()
-    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
     page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&risk_profile=conservative"
                  "&max_notional=1000&period=365", auth=AUTH).text
     assert "20% invested" in page and "sleeve cap" in page  # the 1,000 order cap binds before the 20% cap
@@ -407,7 +408,7 @@ def test_backtest_explains_bad_settings(client, monkeypatch, query, msg):
 
     c, _ = client
     preview._history.clear()
-    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
     page = c.get(f"/backtest?run=1&strategy=trend_filter&{query}", auth=AUTH).text
     assert "Couldn't run it" in page and msg in page
 
@@ -494,7 +495,7 @@ def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, mo
         raise OSError("no route to Kraken")
 
     charts._cache.clear()
-    monkeypatch.setattr(charts, "fetch_kraken_ohlc", down)
+    monkeypatch.setattr(KRAKEN, "ohlc_history", down)
     d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
     assert d["source"] == "marks" and d["chosen"] == "1h" and d["candles"]
     assert [m["text"] for m in d["markers"]] == ["", "Stop", ""]  # only the forced exit is labelled
@@ -506,9 +507,9 @@ def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, mo
     kraken = pd.DataFrame({"open": [1.0, 2.0], "high": [2.0, 3.0], "low": [0.5, 1.5], "close": [2.0, 2.5],
                            "volume": [10.0, 20.0]}, index=pd.DatetimeIndex([now - pd.Timedelta("4h"), now]))
     charts._cache.clear()
-    monkeypatch.setattr(charts, "fetch_kraken_ohlc", lambda pair, minutes: kraken)
+    monkeypatch.setattr(KRAKEN, "ohlc_history", lambda pair, minutes: kraken)
     d = c.get("/api/sleeves/sol-x/candles?interval=4h", auth=AUTH).json()
-    assert d["source"] == "kraken" and d["interval"] == 240 and len(d["candles"]) == 2 and d["volume"][1]["value"] == 20
+    assert d["source"] == "venue" and d["interval"] == 240 and len(d["candles"]) == 2 and d["volume"][1]["value"] == 20
     assert c.get("/api/sleeves/nope/candles", auth=AUTH).status_code == 404
     assert 'id="pc"' in c.get("/sleeves/sol-x", auth=AUTH).text
 
