@@ -183,6 +183,18 @@ account_keys_t = Table(
     Column("present", Integer, nullable=False),  # 1 if the supervisor sees both key and secret
     Column("checked_at", TS, nullable=False),
 )
+# Fee schedules read from each connected live account by the supervisor (query-only key, server
+# only). Every fetch is kept, so a result can always say which schedule it used.
+fee_schedules_t = Table(
+    "fee_schedules",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("venue", String(16), nullable=False),
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=False),
+    Column("maker", Float, nullable=False),
+    Column("taker", Float, nullable=False),
+    Column("fetched_at", TS, nullable=False),
+)
 # Stopped sleeves the PM has put away. Their history stays; they just leave the everyday lists.
 sleeve_archive_t = Table(
     "sleeve_archive",
@@ -461,6 +473,24 @@ class Store:
             for name, ok in present.items():
                 c.execute(account_keys_t.delete().where(account_keys_t.c.account == name))
                 c.execute(insert(account_keys_t).values(account=name, present=int(bool(ok)), checked_at=now))
+
+    def record_fees(self, venue: str, account: str, maker: float, taker: float) -> None:
+        """Supervisor only: the fee schedule a live account's venue reports for it."""
+        for label, v in (("maker", maker), ("taker", taker)):
+            if not 0 <= v < 0.05:
+                raise ValueError(f"{label} fee {v} outside [0, 5%)")
+        with self.engine.begin() as c:
+            c.execute(insert(fee_schedules_t).values(venue=venue.upper(), account=account, maker=float(maker),
+                                                     taker=float(taker), fetched_at=utcnow()))
+
+    def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
+        """The most recent fetched schedule for a venue (or one account), or None."""
+        q = select(fee_schedules_t).where(fee_schedules_t.c.venue == venue.upper())
+        if account:
+            q = q.where(fee_schedules_t.c.account == account)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q.order_by(fee_schedules_t.c.fetched_at.desc(), fee_schedules_t.c.id.desc()).limit(1)))
+        return rows[0] if rows else None
 
     def event(self, sleeve: str | None, level: str, kind: str, message: str) -> None:
         if level not in LEVELS:

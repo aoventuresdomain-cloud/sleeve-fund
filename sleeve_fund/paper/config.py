@@ -39,6 +39,9 @@ class SleeveConfig:
     warmup_bars: int = 0
     risk_profile: str = "balanced"
     venue: str = DEFAULT_VENUE
+    # The schedule to charge, from sleeve_fund.fees.resolve (the connected account's rates).
+    # None: the venue's published schedule. There is deliberately no per-sleeve fee setting.
+    fee_schedule: FeeSchedule | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "venue", venue_profile(self.venue).name)  # raises on an unknown venue
@@ -70,8 +73,7 @@ class SleeveConfig:
 
     @property
     def fees(self) -> FeeSchedule:
-        """The venue's fee schedule. There is deliberately no per-sleeve override: one source of fees."""
-        return venue_profile(self.venue).fees
+        return self.fee_schedule or venue_profile(self.venue).fees
 
     @property
     def instrument_id(self) -> str:
@@ -102,7 +104,7 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
     )
 
 
-def from_store(sleeve) -> SleeveConfig:
+def from_store(sleeve, fee_schedule: FeeSchedule | None = None) -> SleeveConfig:
     """SleeveConfig from a database row (sleeve_fund.store.Sleeve)."""
     params = dict(sleeve.params)
     max_notional = params.pop("max_notional", None)
@@ -117,6 +119,7 @@ def from_store(sleeve) -> SleeveConfig:
         warmup_bars=sleeve.warmup_bars,
         risk_profile=sleeve.risk_profile,
         venue=getattr(sleeve, "venue", None) or DEFAULT_VENUE,
+        fee_schedule=fee_schedule,
     )
 
 

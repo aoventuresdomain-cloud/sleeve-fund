@@ -105,9 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.db_sleeve:
         from sleeve_fund.store import Store
 
+        from sleeve_fund.fees import resolve
+
         store = Store()
-        sleeve = from_store(store.sleeve(args.db_sleeve))
+        row = store.sleeve(args.db_sleeve)
+        quote = resolve(getattr(row, "venue", None), store)
+        sleeve = from_store(row, fee_schedule=quote.fees)
         runtime = SleeveRuntime(store, sleeve.name)
+        store.event(sleeve.name, "info", "fees", f"Charging {quote.text}")
     else:
         sleeve = load_sleeve(args.sleeve)
     node = build_node(sleeve, log_level=args.log_level, runtime=runtime)

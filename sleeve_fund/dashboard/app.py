@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
+from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.risk import PROFILES
@@ -243,7 +244,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("enter an instrument like SOL/USD")
             params = _form_params(q, strategy)
             balance = float(q.get("starting_balance") or 10_000)
-            return JSONResponse(preview.run(strategy, pair, params, starting=balance, cap=_profile_cap(q)))
+            return JSONResponse(preview.run(strategy, pair, params, starting=balance, cap=_profile_cap(q),
+                                            fee_quote=resolve_fees(None, st())))
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
         except OSError as exc:  # Kraken unreachable
@@ -461,7 +463,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     raise ValueError("capital: between 100 and 1,000,000,000")
                 params = _form_params(q, strategy)
                 result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
-                                     detail=True, cap=_profile_cap(q))
+                                     detail=True, cap=_profile_cap(q), fee_quote=resolve_fees(None, st()))
             except (ValueError, TypeError, KeyError) as exc:
                 error = str(exc).strip("'")
             except OSError as exc:  # Kraken unreachable
@@ -509,7 +511,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         rows = st().accounts()
         for r in rows:
-            r["env"] = acc.env_names(r["name"]) if r["kind"] == "live" else None
+            r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
         return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
 
     @app.post("/accounts/new")
@@ -531,7 +533,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def settings_page(request: Request, _: str = Depends(require_pm)):
         from sleeve_fund.venues import VENUES
 
-        return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(),
+        fee_quotes = [resolve_fees(v.name, st()) for v in VENUES.values()]
+
+        return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
 
     return app

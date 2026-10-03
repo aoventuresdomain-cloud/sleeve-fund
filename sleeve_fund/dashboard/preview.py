@@ -63,19 +63,23 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
 
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
-        detail: bool = False, cap: float | None = None, venue: str | None = None) -> dict:
+        detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None) -> dict:
     """Backtest these settings on the venue's daily history. days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
     and the buy-and-hold benchmark is held at the same exposure."""
+    from sleeve_fund.fees import resolve
+
     profile = venue_profile(venue)
+    quote_fees = fee_quote or resolve(profile.name)
     prices = history(pair, fetch, profile.name)
     if days:
         prices = prices.iloc[-days:]
     if len(prices) < 60:
         raise ValueError(f"only {len(prices)} days of {profile.label} history for {pair}; need at least 60")
     base, quote = pair.split("/")
-    inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())))
+    inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())),
+                              fees=quote_fees.fees)
     if cap is not None:
         params = {**params, "position_cap_pct": cap}
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting)
@@ -99,7 +103,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
-        "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": profile.fee_text()},
+        "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
+                         "source": quote_fees.source},
     }
     if detail:
         from sleeve_fund.dashboard import trading

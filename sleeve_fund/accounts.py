@@ -16,12 +16,20 @@ KINDS = ("paper", "live")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
 
 
-def env_names(account: str) -> tuple[str, str]:
-    """The two environment variables that hold a live account's Kraken key and secret."""
-    suffix = account.upper().replace("-", "_")
-    return f"KRAKEN_API_KEY__{suffix}", f"KRAKEN_API_SECRET__{suffix}"
+def env_names(account: str, venue: str | None = None) -> tuple[str, str]:
+    """The two environment variables that hold a live account's key and secret for its venue."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    return venue_profile(venue).key_env(account)
 
 
-def key_present(account: str, environ=None) -> bool:
+def key_present(account: str, environ=None, venue: str | None = None) -> bool:
     env = os.environ if environ is None else environ
-    return all(env.get(n, "").strip() for n in env_names(account))
+    return all(env.get(n, "").strip() for n in env_names(account, venue))
+
+
+def credentials(account: str, venue: str | None = None, environ=None) -> tuple[str, str] | None:
+    """Supervisor only: the account's key and secret from the server environment, or None."""
+    env = os.environ if environ is None else environ
+    key, secret = (env.get(n, "").strip() for n in env_names(account, venue))
+    return (key, secret) if key and secret else None
