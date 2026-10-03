@@ -1,6 +1,6 @@
 # Long-only trend filter: staged screen
 
-Run 2026-10-03 19:29 UTC. Development history only: the most recent 365 days are held back untouched. Short windows are smoke tests, not verdicts. Expectancy is the average net return per trade in basis points of equity. Sharpe uses daily returns of an equal-weight basket (per instrument in the right-hand columns). Costs are per side. Long-only, spot, no leverage. Equal-weight basket of the instruments with history at each date (missing instruments count as flat). Vol target sizes each position to 40% annualised volatility (30-day realised), capped at 100%, re-set only on a 25% drift.
+Run 2026-10-03 19:33 UTC. Development history only: the most recent 365 days are held back untouched. Short windows are smoke tests, not verdicts. Expectancy is the average net return per trade in basis points of equity. Sharpe uses daily returns of an equal-weight basket (per instrument in the right-hand columns). Costs are per side. Long-only, spot, no leverage. Equal-weight basket of the instruments with history at each date (missing instruments count as flat). Vol target sizes each position to 40% annualised volatility (30-day realised), capped at 100%, re-set only on a 25% drift.
 
 ## History
 
@@ -178,12 +178,12 @@ Run 2026-10-03 19:29 UTC. Development history only: the most recent 365 days are
 
 | Variant | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 | Sharpe | Max DD | Avg exposure | Deflated Sharpe prob. |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| daily 20/50, full | -14.7% | +15.0% | +79.1% | +242.2% | -32.0% | +41.7% | +112.7% | +6.3% | 1.09 | -53.7% | 53% | 0.00 |
-| daily 50/200, full | -14.5% | -1.5% | +36.4% | +258.5% | -17.6% | +51.8% | +114.2% | +7.9% | 0.99 | -42.8% | 59% | 0.00 |
-| 4h 21/55, full | -8.2% | +13.9% | +91.3% | +186.2% | -33.8% | +78.7% | +81.7% | -4.2% | 1.11 | -48.3% | 50% | 0.00 |
-| daily 20/50, vol target 40% | -8.1% | +18.7% | +58.3% | +63.2% | -22.1% | +24.9% | +52.2% | +5.9% | 1.10 | -36.5% | 29% | 0.00 |
-| daily 50/200, vol target 40% | -6.1% | +2.5% | +40.4% | +65.0% | -9.3% | +34.9% | +58.3% | +10.4% | 1.07 | -27.4% | 32% | 0.00 |
-| 4h 21/55, vol target 40% | -8.3% | +16.6% | +70.9% | +50.2% | -18.4% | +42.9% | +43.9% | +1.8% | 1.20 | -27.8% | 27% | 0.00 |
-| bench: buy and hold | -28.9% | +9.7% | +127.3% | +339.7% | -65.1% | +179.8% | +196.5% | +26.1% | 1.06 | -73.7% | 100% | 0.00 |
+| daily 20/50, full | -14.7% | +15.0% | +79.1% | +242.2% | -32.0% | +41.7% | +112.7% | +6.3% | 1.09 | -53.7% | 53% | 0.85 |
+| daily 50/200, full | -14.5% | -1.5% | +36.4% | +258.5% | -17.6% | +51.8% | +114.2% | +7.9% | 0.99 | -42.8% | 59% | 0.78 |
+| 4h 21/55, full | -8.2% | +13.9% | +91.3% | +186.2% | -33.8% | +78.7% | +81.7% | -4.2% | 1.11 | -48.3% | 50% | 0.87 |
+| daily 20/50, vol target 40% | -8.1% | +18.7% | +58.3% | +63.2% | -22.1% | +24.9% | +52.2% | +5.9% | 1.10 | -36.5% | 29% | 0.86 |
+| daily 50/200, vol target 40% | -6.1% | +2.5% | +40.4% | +65.0% | -9.3% | +34.9% | +58.3% | +10.4% | 1.07 | -27.4% | 32% | 0.84 |
+| 4h 21/55, vol target 40% | -8.3% | +16.6% | +70.9% | +50.2% | -18.4% | +42.9% | +43.9% | +1.8% | 1.20 | -27.8% | 27% | 0.92 |
+| bench: buy and hold | -28.9% | +9.7% | +127.3% | +339.7% | -65.1% | +179.8% | +196.5% | +26.1% | 1.06 | -73.7% | 100% | 0.83 |
 
 Deflated Sharpe probability: the chance the true Sharpe beats the best you would expect by luck from 22 recorded attempts (above 0.95 is the plan's bar).
