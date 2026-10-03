@@ -130,6 +130,7 @@ class LongFlatStrategy(Strategy):
     def on_bar(self, bar: Bar) -> None:
         if not self._accept(bar):
             return
+        self.log.info(f"bar {bar}")
         target = self.want_long(bar)
         if target is None:
             return
