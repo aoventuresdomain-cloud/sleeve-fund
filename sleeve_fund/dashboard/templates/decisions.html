@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Decisions · Sleeve Fund{% endblock %}
+{% block title %}Decisions · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Decision log</h1>
@@ -7,7 +7,7 @@
   <p class="lede">Every create, start, stop, pause, flatten and resume, with who made it and why. Newest first.</p>
 </div>
 <form class="panel filters" method="get" action="/decisions">
-  <div class="field"><label for="f-sleeve">Sleeve</label><select id="f-sleeve" name="sleeve"><option value="">All sleeves</option>{% for n in sleeves %}<option {{ 'selected' if f.query.sleeve == n }}>{{ n }}</option>{% endfor %}</select></div>
+  <div class="field"><label for="f-sleeve">Strategy</label><select id="f-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if f.query.sleeve == n }}>{{ n }}</option>{% endfor %}</select></div>
   <div class="field"><label for="f-action">Action</label><select id="f-action" name="action"><option value="">All actions</option>{% for a in actions %}<option value="{{ a }}" {{ 'selected' if f.query.action == a }}>{{ a|capitalize }}</option>{% endfor %}</select></div>
   <div class="field"><label for="f-from">From</label><input id="f-from" type="date" name="from" value="{{ f.raw['from'] }}"></div>
   <div class="field"><label for="f-to">To</label><input id="f-to" type="date" name="to" value="{{ f.raw['to'] }}"></div>

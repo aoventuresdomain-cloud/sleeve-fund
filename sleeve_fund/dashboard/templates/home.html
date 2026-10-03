@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, signed, money_signed, usage, spark, help %}
-{% block title %}Portfolio · Sleeve Fund{% endblock %}
+{% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
   <h1>Portfolio</h1>
-  <div class="actions"><a class="button secondary" href="/sleeves/new">New sleeve</a></div>
+  <div class="actions"><a class="button secondary" href="/sleeves/new">New strategy</a></div>
   <p class="lede">
-    {% if book.attention %}<span class="loss">{{ book.attention }} sleeve{{ 's' if book.attention != 1 }} halted and waiting for you.</span>
-    {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} sleeve{{ 's' if book.unhealthy != 1 }} not reporting.</span>
-    {% else %}All sleeves healthy.{% endif %}
+    {% if book.attention %}<span class="loss">{{ book.attention }} strategy{{ 's' if book.attention != 1 }} halted and waiting for you.</span>
+    {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} strategy{{ 's' if book.unhealthy != 1 }} not reporting.</span>
+    {% else %}All strategies healthy.{% endif %}
     Marked to Kraken prices, after fees.
   </p>
 </div>
@@ -45,22 +45,22 @@
       {% endfor %}
     </ul>
     {% if alerts|length > 6 %}<p class="muted" style="margin:8px 0 0">{{ alerts|length - 6 }} more in <a href="/alerts">Alerts</a>.</p>{% endif %}
-    {% else %}<p class="empty">Nothing needs you. Warnings and errors from any sleeve land here.</p>{% endif %}
+    {% else %}<p class="empty">Nothing needs you. Warnings and errors from any strategy land here.</p>{% endif %}
   </section>
 </div>
 
 <section class="panel flush" aria-labelledby="sleeves-h" style="margin-bottom:14px">
-  <div class="panel-head"><h2 id="sleeves-h">Sleeves</h2><span class="hint">Select a column to sort</span></div>
+  <div class="panel-head"><h2 id="sleeves-h">Strategies</h2><span class="hint">Select a column to sort</span></div>
   <table class="responsive sortable" data-hide-xl="9" data-hide-lg="3 9 11" data-hide-md="8 10">
     <thead><tr>
-      <th data-sort="text">Sleeve</th><th data-sort="text">Status</th><th>Last 60 days</th>
+      <th data-sort="text">Strategy</th><th data-sort="text">Status</th><th>Last 60 days</th>
       <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
-      <th class="num" data-sort="num" title="Sleeve return minus buy-and-hold return over the same period">vs buy-and-hold</th>
+      <th class="num" data-sort="num" title="Strategy return minus buy-and-hold return over the same period">vs buy-and-hold</th>
       <th class="num" data-sort="num">Exposure</th><th class="num" data-sort="num">Closed trades</th>
       <th data-sort="num">Drawdown of limit</th><th>Health</th>
     </tr></thead>
     <tbody>
-    {% if not summaries %}<tr><td colspan="11" class="empty">Every sleeve is archived. <a href="/sleeves/new">Start a new sleeve</a> or restore one below.</td></tr>{% endif %}
+    {% if not summaries %}<tr><td colspan="11" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
     {% for x in summaries %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
@@ -87,7 +87,7 @@
 
 {% if archived %}
 <details class="panel archived" style="margin-bottom:14px">
-  <summary><strong>Archived sleeves ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
+  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
@@ -96,7 +96,7 @@
 
 <div class="grid">
   <section class="panel span-5" aria-labelledby="alloc-h">
-    <div class="panel-head"><h2 id="alloc-h">Where the money is</h2><span class="hint">share of book equity</span></div>
+    <div class="panel-head"><h2 id="alloc-h">Allocation</h2><span class="hint">share of total capital</span></div>
     {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
     <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.share * 100)|round(2) }}%; background: {{ 'var(--neutral-bg)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
     <table class="compact">
@@ -105,7 +105,7 @@
     </table>
   </section>
   <section class="panel span-7" aria-labelledby="corr-h">
-    <div class="panel-head"><h2 id="corr-h">How the sleeves move together</h2><span class="hint">correlation of daily returns, 1 = in lockstep</span></div>
+    <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2><span class="hint">correlation of daily returns, 1 = in lockstep</span></div>
     {% if book.correlation.matrix %}
     <div style="overflow-x:auto"><table class="corr">
       <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
@@ -115,17 +115,17 @@
         {% else %}<td style="background: color-mix(in srgb, {{ 'var(--loss)' if v >= 0 else 'var(--accent)' }} {{ (v|abs * 55)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
       {% endfor %}</tr>{% endfor %}
     </table></div>
-    <p class="muted" style="margin:8px 0 0;font-size:12px">High numbers mean the sleeves win and lose together, so the book is less diversified than the sleeve count suggests. Flat periods count as no movement.</p>
-    {% else %}<p class="empty">Needs two sleeves with at least 20 days of history.</p>{% endif %}
+    <p class="muted" style="margin:8px 0 0;font-size:12px">High numbers mean the strategies win and lose together, so the book is less diversified than the strategy count suggests. Flat periods count as no movement.</p>
+    {% else %}<p class="empty">Needs two strategies with at least 20 days of history.</p>{% endif %}
   </section>
 </div>
 {% else %}
 <section class="panel onboard" aria-labelledby="ob-h">
   <div class="panel-head"><h2 id="ob-h">Get started in three steps</h2></div>
-  <p class="muted" style="margin:0 0 14px">A sleeve runs one strategy on one Kraken pair, with its own capital and risk limits. Every sleeve starts on paper: live prices and fees, simulated money.</p>
+  <p class="muted" style="margin:0 0 14px">A strategy runs one model on one Kraken pair, with its own capital and risk limits. Every strategy starts on paper: live prices and fees, simulated money.</p>
   <ol class="onboard-steps">
-    <li><span class="n">1</span><div><strong>Test an idea</strong><p>Run a strategy over two years of Kraken prices and see every trade and why it happened.</p><a class="button secondary" href="/backtest">Open Backtest</a></div></li>
-    <li><span class="n">2</span><div><strong>Start it on paper</strong><p>One click from a backtest, or set it up yourself. Pick the pair, the settings, the capital and a risk profile.</p><a class="button" href="/sleeves/new">+ New sleeve</a></div></li>
+    <li><span class="n">1</span><div><strong>Test an idea</strong><p>Run a model over two years of Kraken prices and see every trade and why it happened.</p><a class="button secondary" href="/backtest">Open Backtest</a></div></li>
+    <li><span class="n">2</span><div><strong>Start it on paper</strong><p>One click from a backtest, or set it up yourself. Pick the pair, the settings, the capital and a risk profile.</p><a class="button" href="/sleeves/new">+ New strategy</a></div></li>
     <li><span class="n">3</span><div><strong>Watch and judge</strong><p>Positions, orders and the reason behind each trade show here as they happen. Live trading unlocks only after you approve G2.</p><a class="button secondary" href="/accounts">Set up accounts</a></div></li>
   </ol>
 </section>

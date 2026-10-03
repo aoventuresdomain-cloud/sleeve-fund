@@ -5,7 +5,7 @@
 {% endmacro %}
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
-<div class="field"><label for="strategy">Strategy</label>
+<div class="field"><label for="strategy">Model</label>
   <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}">{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
 {% for st in strategies %}
 <div class="params" data-strategy="{{ st.name }}">

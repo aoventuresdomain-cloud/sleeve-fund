@@ -74,7 +74,7 @@ window.Console = (() => {
     if (!eqEl || !window.Chart) return;
     // url may be the data itself (the backtest page embeds its result) or an endpoint to fetch.
     (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
-      if (!d.t.length) { eqEl.parentElement.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a sleeve starting.</p>'; ddEl.parentElement.remove(); return; }
+      if (!d.t.length) { eqEl.parentElement.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; ddEl.parentElement.remove(); return; }
       const grid = css("--line"), muted = css("--muted");
       const yWidth = (s) => { s.width = 64; };
       const base = {

@@ -24,7 +24,7 @@ SPEC = IdeaSpec(
     rules=(
         "Entry (all must hold at the bar close): RSI(rsi_period) < rsi_entry; close > EMA(ema_period); "
         "volume > vol_mult x SMA(volume, 20). Exit: close falls below the highest close since entry "
-        "minus atr_mult x ATR(atr_period). Whole sleeve in or out; market orders at the taker fee."
+        "minus atr_mult x ATR(atr_period). All of its capital in or out; market orders at the taker fee."
     ),
     param_grid={"rsi_entry": [25, 30, 35], "atr_mult": [2.0, 3.0, 4.0]},
     default_params={"rsi_entry": 30, "atr_mult": 3.0},

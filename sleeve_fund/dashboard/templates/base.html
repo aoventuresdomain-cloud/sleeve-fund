@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Sleeve Fund{% endblock %}</title>
+  <title>{% block title %}Multi-Strategy Fund{% endblock %}</title>
   <link rel="preload" href="/static/fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232c64c9'/%3E%3Cpath d='M3 11l3-3 2 2 5-5' stroke='white' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/app.css">
@@ -11,10 +11,10 @@
 <body>
 <div class="app">
   <aside class="rail" aria-label="Main">
-    <a class="brand" href="/">Sleeve Fund<small>Systematic multi-strategy book</small></a>
+    <a class="brand" href="/">Multi-Strategy Fund<small>Systematic strategies, one book</small></a>
     {% set here = request.url.path %}
     {% set is_sleeve = here.startswith('/sleeves/') and here != '/sleeves/new' %}
-    <a class="button rail-new" href="/sleeves/new">+ New sleeve</a>
+    <a class="button rail-new" href="/sleeves/new">+ New strategy</a>
     {# Primary destinations: on phones these are the bottom tab bar. #}
     <nav aria-label="Primary">
       <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>Portfolio</a>
@@ -30,7 +30,7 @@
       <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
       <div class="group">Research</div>
       <a href="/backtest" {{ 'aria-current=page' if here.startswith('/backtest') }}>Backtest</a>
-      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>Strategies</a>
+      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>Models</a>
       <div class="group">Records</div>
       <a href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
       <a href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
@@ -47,7 +47,7 @@
       <span class="mode">{{ 'Live trading' if shell.mode == 'live' else 'Paper trading' }}</span>
       <span class="wide">{{ 'Live trading locked until G2 is approved' if shell.live_locked else 'Live trading enabled' }}</span>
       <span class="sep"></span>
-      <span data-live="health"><span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} sleeves running{% endif %}</span></span>
+      <span data-live="health"><span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} strategies running{% endif %}</span></span>
       <span class="wide">Prices: Kraken live feed</span>
       <span class="live" id="live" hidden aria-live="polite"></span>
       <span class="clock" id="clock" data-now="{{ shell.now.isoformat() }}">{{ shell.now.strftime('%H:%M') }} UTC</span>
@@ -90,7 +90,7 @@
 <dialog id="more" class="sheet" aria-label="More pages">
   <div class="sheet-head"><strong>More</strong><button type="button" class="quiet" data-close>Close</button></div>
   <div class="sheet-body"></div>
-  <a class="button" href="/sleeves/new">+ New sleeve</a>
+  <a class="button" href="/sleeves/new">+ New strategy</a>
 </dialog>
 <script>
 (() => {

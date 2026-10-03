@@ -309,7 +309,7 @@ class Store:
         with self.engine.connect() as c:
             row = c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()
         if row is None:
-            raise KeyError(f"no sleeve {name!r}")
+            raise KeyError(f"no strategy {name!r}")
         return Sleeve.from_row(row)
 
     def sleeves(self) -> list[Sleeve]:
@@ -456,7 +456,7 @@ class Store:
         """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
         s = self.sleeve(sleeve)
         if s.desired_state != "stopped":
-            raise ValueError("stop the sleeve before archiving it")
+            raise ValueError("stop the strategy before archiving it")
         with self.engine.begin() as c:
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
             c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
