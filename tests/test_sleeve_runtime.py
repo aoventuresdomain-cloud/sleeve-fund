@@ -240,3 +240,24 @@ def test_maker_first_orders_are_journaled_with_the_market_fallback(store, instru
     assert "not filled within 15 minutes" in second["reason"] and second["signal"]["maker_order"] == first["order_id"]
     fills = store.fills("s1")  # the market order may walk a level or two of the thin test book
     assert fills and {(f["side"], f["order_id"]) for f in fills} == {("BUY", second["order_id"])}
+
+
+def test_live_quotes_record_the_typical_spread_hourly(store):
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2026, 10, 3, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    for i in range(150):  # mostly a 2-cent spread on 100, with a few wide outliers the median ignores
+        t[0] += timedelta(seconds=20)
+        rt.on_quote(99.99, 100.01 if i % 10 else 100.50, venue="KRAKEN")
+    assert store.latest_spread("KRAKEN", "BTC/USD") is None  # not an hour yet
+    for _ in range(40):
+        t[0] += timedelta(seconds=20)
+        rt.on_quote(99.99, 100.01, venue="KRAKEN")
+    row = store.latest_spread("KRAKEN", "BTC/USD")
+    assert row["half_spread"] == pytest.approx(0.0001) and row["samples"] >= 100
+
+    t[0] += timedelta(hours=2)
+    rt.on_quote(100.0, 100.02, venue="KRAKEN")  # one quote in a quiet hour: too few to record
+    assert store.latest_spread("KRAKEN", "BTC/USD")["samples"] == row["samples"]

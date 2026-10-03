@@ -64,16 +64,27 @@ class ScheduleFeeModel(FeeModel):
     is the only way to be sure of the maker rate.
     """
 
-    def __init__(self, fees: FeeSchedule) -> None:
+    def __init__(self, fees: FeeSchedule, half_spread: float = 0.0) -> None:
         super().__init__()
         self.fees = fees
+        # Backtests only (their bars carry trade prices, not quotes): half the bid-ask spread, charged
+        # with the commission on fills that take liquidity, and kept apart per order so reports can
+        # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
+        self.half_spread = Decimal(str(half_spread))
+        self.spread_paid: dict[str, float] = {}
 
     def rate_for(self, order) -> Decimal:
         return self.fees.maker if getattr(order, "is_post_only", False) else self.fees.taker
 
     def get_commission(self, order, fill_quantity, fill_px, instrument) -> Money:
         notional = fill_quantity.as_decimal() * fill_px.as_decimal()
-        return Money(float(notional * self.rate_for(order)), instrument.quote_currency)
+        charge = notional * self.rate_for(order)
+        if self.half_spread and not getattr(order, "is_post_only", False):
+            spread = notional * self.half_spread
+            coid = str(order.client_order_id)
+            self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
+            charge += spread
+        return Money(float(charge), instrument.quote_currency)
 
 
 def fill_model():

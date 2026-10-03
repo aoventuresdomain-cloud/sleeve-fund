@@ -195,6 +195,18 @@ fee_schedules_t = Table(
     Column("taker", Float, nullable=False),
     Column("fetched_at", TS, nullable=False),
 )
+# Typical half bid-ask spread per instrument, measured from a paper sleeve's live quotes. Backtests
+# charge it on every order that takes liquidity, since their bars carry trade prices, not quotes.
+spreads_t = Table(
+    "spreads",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("venue", String(16), nullable=False),
+    Column("instrument", String(32), nullable=False),
+    Column("half_spread", Float, nullable=False),  # median (ask - bid) / 2 / mid
+    Column("samples", Integer, nullable=False),
+    Column("measured_at", TS, nullable=False),
+)
 # Stopped sleeves the PM has put away. Their history stays; they just leave the everyday lists.
 sleeve_archive_t = Table(
     "sleeve_archive",
@@ -490,6 +502,21 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(fee_schedules_t).values(venue=venue.upper(), account=account, maker=float(maker),
                                                      taker=float(taker), fetched_at=utcnow()))
+
+    def record_spread(self, venue: str, instrument: str, half_spread: float, samples: int,
+                      ts: datetime | None = None) -> None:
+        if not 0 <= half_spread < 0.05:
+            raise ValueError(f"half spread {half_spread} outside [0, 5%)")
+        with self.engine.begin() as c:
+            c.execute(insert(spreads_t).values(venue=venue.upper(), instrument=instrument, half_spread=float(half_spread),
+                                               samples=int(samples), measured_at=ts or utcnow()))
+
+    def latest_spread(self, venue: str, instrument: str) -> dict | None:
+        q = (select(spreads_t).where(spreads_t.c.venue == venue.upper(), spreads_t.c.instrument == instrument)
+             .order_by(spreads_t.c.measured_at.desc(), spreads_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
         """The most recent fetched schedule for a venue (or one account), or None."""

@@ -46,6 +46,10 @@ echo "dashboard: with password $CODE, without $NOAUTH"
 [ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
+# Quotes put the venue's bid and ask in the paper book, so fills pay the spread as they would for real.
+QUOTED=$(docker compose logs --no-color supervisor | grep -c "first quote: bid" || true)
+echo "sleeves receiving live quotes: $QUOTED"
+[ "$QUOTED" -ge 1 ] || { echo "FAIL: no live quotes reached a paper sleeve"; exit 1; }
 
 # Restart check: a position in the journal must survive a restart and reconcile with the
 # rebuilt paper engine. Journal a 10 SUI buy, restart the sleeves, and expect them to carry it.

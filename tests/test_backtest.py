@@ -106,7 +106,7 @@ def test_multi_indicator_example_enters_on_all_conditions_and_trails_out(prices,
 def test_stop_fills_at_its_level_inside_the_bar(prices, instrument):
     # The fall from 100 to 90 happens inside one daily bar; a close-only check would sell at 90.
     closes = [100.0] * 10 + [90.0] * 5
-    res = run_backtest("buy_and_hold", _path(prices, closes), instrument, {"stop_loss": 0.05})
+    res = run_backtest("buy_and_hold", _path(prices, closes), instrument, {"stop_loss": 0.05}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
     assert len(sells) == 1
     assert float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
@@ -117,7 +117,7 @@ def test_stop_fills_at_the_open_when_price_gaps_through(prices, instrument):
     df = _path(prices, [100.0] * 10 + [80.0] * 5)
     df.iloc[10, df.columns.get_loc("open")] = 85.0  # opened below the 95 stop
     df.iloc[10, df.columns.get_loc("high")] = 85.0
-    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05})
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
     assert float(sells["avg_px"].iloc[0]) == pytest.approx(85.0)
 
@@ -126,7 +126,7 @@ def test_stop_wins_when_one_bar_touches_both(prices, instrument):
     df = _path(prices, [100.0] * 10 + [100.0] * 5)
     df.iloc[10, df.columns.get_loc("high")] = 115.0
     df.iloc[10, df.columns.get_loc("low")] = 90.0
-    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit": 0.10})
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit": 0.10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
     assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
 
@@ -134,7 +134,7 @@ def test_stop_wins_when_one_bar_touches_both(prices, instrument):
 def test_take_profit_is_checked_on_the_high_but_sold_at_the_close(prices, instrument):
     df = _path(prices, [100.0] * 10 + [104.0] * 5)
     df.iloc[10, df.columns.get_loc("high")] = 112.0
-    res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10})
+    res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
     assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(104.0)
 

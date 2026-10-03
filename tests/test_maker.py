@@ -24,6 +24,7 @@ def _daily(m):
 
 
 def _run(m, params, **kw):
+    kw.setdefault("half_spread", 0)  # these test the order mechanics; the spread has its own tests
     return run_backtest("buy_and_hold", _daily(m), kw.pop("instrument"), params, exec_prices=m, **kw)
 
 

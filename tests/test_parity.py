@@ -76,7 +76,7 @@ def test_engine_trend_filter_matches_the_research_rules(minutes, fast, slow, vol
     prices = _bars(minutes)
     params = {"fast": fast, "slow": slow, "ema": 1, "vol_target": vol_target}
     res = run_backtest("trend_filter", prices, k.instrument("BTC", "USD"), params, starting_capital=1_000_000,
-                       bar_minutes=minutes)
+                       bar_minutes=minutes, half_spread=0)  # the reference rules have no spread
     w = _reference_weights(prices["close"], minutes, fast, slow, vol_target)
     # All-or-nothing entries keep the engine's 1% cash buffer, as paper does.
     ref_end, ref_trades = _reference_equity(prices["close"], w, float(k.fees.taker), 1_000_000,
