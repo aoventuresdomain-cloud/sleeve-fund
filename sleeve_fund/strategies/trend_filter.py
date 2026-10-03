@@ -102,6 +102,8 @@ class TrendFilter(LongFlatStrategy):
         self._min_rets = int(10 * per_day)
         self._prev_close: float | None = None
         self._vol: float | None = None
+        self._sum = self._sumsq = 0.0  # running sums over self._rets, so each bar costs O(1)
+        self._since_exact = 0
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
@@ -116,13 +118,24 @@ class TrendFilter(LongFlatStrategy):
         c = bar.close.as_double()
         for avg in (self.fast, self.slow):
             avg.update(c if isinstance(avg, _Ema) else bar)
-        if self._prev_close:
-            self._rets.append(c / self._prev_close - 1)
-        self._prev_close = c
+        prev, self._prev_close = self._prev_close, c
+        if not self._cfg.vol_target or not prev:
+            return  # volatility only sizes vol-targeted positions; skip it otherwise
+        r = c / prev - 1
+        if len(self._rets) == self._rets.maxlen:
+            old = self._rets[0]
+            self._sum -= old
+            self._sumsq -= old * old
+        self._rets.append(r)
+        self._sum += r
+        self._sumsq += r * r
+        self._since_exact += 1
+        if self._since_exact >= self._rets.maxlen:  # running sums drift; recompute them once a window
+            self._sum, self._sumsq, self._since_exact = sum(self._rets), sum(x * x for x in self._rets), 0
         n = len(self._rets)
         if n >= max(self._min_rets, 2):
-            mean = sum(self._rets) / n
-            self._vol = math.sqrt(sum((r - mean) ** 2 for r in self._rets) / (n - 1)) * self._ann
+            var = max(self._sumsq - self._sum * self._sum / n, 0.0) / (n - 1)
+            self._vol = math.sqrt(var) * self._ann
         else:
             self._vol = None
 

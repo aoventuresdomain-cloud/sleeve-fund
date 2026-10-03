@@ -98,8 +98,13 @@ def run_study(
     use_holdout: bool = False,
     starting_capital: float = 10_000.0,
     exits: dict | None = None,
+    position_cap: float | None = None,
 ) -> StudyResult:
-    """exits: optional stop_loss / take_profit / risk_per_trade applied to every strategy run."""
+    """exits: optional stop_loss / take_profit / risk_per_trade applied to every strategy run.
+    position_cap: the largest share of capital in the position, as the paper risk profile allows. It
+    applies to the benchmark too, so G1 compares the strategy with buy and hold at the same exposure."""
+    if position_cap is not None and not 0 < position_cap <= 1:
+        raise ValueError(f"position_cap {position_cap} outside (0, 1]")
     if len(prices) < holdout_days + train_days + test_days:
         raise ValueError(
             f"{len(prices)} bars is too short for holdout {holdout_days} + train {train_days} + test {test_days}"
@@ -113,6 +118,8 @@ def run_study(
     def bt(name: str, df: pd.DataFrame, params: dict) -> BacktestResult:
         if name != "buy_and_hold":
             params = {**params, **exits}
+        if position_cap is not None:
+            params = {**params, "position_cap_pct": position_cap}
         return run_backtest(name, df, instrument, params, starting_capital=starting_capital)
 
     def log(params: dict, stage: str, sharpe: float) -> None:
@@ -189,6 +196,10 @@ def run_study(
         fee_note=(f"{instrument.id.venue}: {float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} "
                   "taker, taker charged on every order"),
     )
+    result.notes.append(
+        f"Positions are capped at {position_cap:.0%} of capital, as the paper risk profile allows, and the "
+        "buy-and-hold benchmark is held at the same exposure." if position_cap is not None else
+        "Positions are uncapped (all of the capital), and so is the benchmark; paper trades at its risk profile's cap.")
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + ", ".join(f"{k.replace('_', ' ')} {v:.1%}" for k, v in exits.items())

@@ -91,6 +91,12 @@ def run_backtest(
             strategy=strategy_name, instrument=str(instrument.id.symbol), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
             starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60)
 
+    if runtime is not None:
+        # Whatever runtime is passed, this is a replay of bars: there is no trade feed between them, so
+        # stops must rest at the simulated venue (as in every backtest), not wait for a trade that never
+        # comes and go at the next close. Same bars, same stop, same fill, with or without a runtime.
+        runtime.backtest = True
+
     engine = BacktestEngine(
         BacktestEngineConfig(
             trader_id=TraderId.from_str("RESEARCH-001"),

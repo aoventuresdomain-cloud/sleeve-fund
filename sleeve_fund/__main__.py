@@ -1,5 +1,6 @@
 """Command line entry point.
 
+    python -m sleeve_fund study trend_filter --store --base BTC --quote USD
     python -m sleeve_fund study trend_filter --data data/XBTUSD_1440.csv --base BTC --quote USD
     python -m sleeve_fund study trend_filter --synthetic
     python -m sleeve_fund counter
@@ -13,6 +14,7 @@ import sys
 from pathlib import Path
 
 from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv
+from sleeve_fund.risk import profile as risk_profile
 from sleeve_fund.venues import venue
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.study import run_study
@@ -36,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     st = sub.add_parser("study", help="run a full G1 study and write a tear sheet")
     st.add_argument("strategy")
     src = st.add_mutually_exclusive_group(required=True)
+    src.add_argument("--store", action="store_true", help="daily bars from the venue history store (the server's)")
     src.add_argument("--data", help="Kraken OHLCVT daily CSV")
     src.add_argument("--synthetic", action="store_true", help="random-walk data, pipeline check only")
     st.add_argument("--base", default="BTC")
@@ -46,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--stop-loss", type=float, help="exit if price falls this fraction below entry, e.g. 0.08")
     st.add_argument("--take-profit", type=float, help="exit if price rises this fraction above entry, e.g. 0.2")
     st.add_argument("--risk-per-trade", type=float, help="size so a stop-out loses this fraction of equity")
+    st.add_argument("--risk-profile", default="balanced",
+                    help="cap positions (and the benchmark) as this paper risk profile does; 'none' for uncapped")
     st.add_argument("--out", help="tear sheet path (default research/tearsheets/<strategy>_<dataset>.md)")
 
     sub.add_parser("counter", help="print the idea counter")
@@ -63,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     spec = _spec(args.strategy)
     if args.synthetic:
         prices, dataset = synthetic_ohlcv(), "synthetic"
+    elif args.store:
+        from sleeve_fund.history import HistoryStore
+
+        name = venue(args.venue).name
+        prices = HistoryStore().read(name, f"{args.base}/{args.quote}", 1440)
+        dataset = f"{name.lower()}-{args.base}{args.quote}-store".lower()
     else:
         prices = load_kraken_ohlcvt(args.data)
         dataset = Path(args.data).stem
@@ -88,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         holdout_days=args.holdout_days,
         use_holdout=args.use_holdout,
         exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade},
+        position_cap=None if args.risk_profile == "none" else risk_profile(args.risk_profile).max_position_pct,
     )
     out = Path(args.out) if args.out else ROOT / "research" / "tearsheets" / f"{spec.name}_{dataset}.md"
     out.parent.mkdir(parents=True, exist_ok=True)

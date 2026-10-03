@@ -27,6 +27,10 @@ ALLOWED_BAR_SPECS = {
 }
 
 
+# Most warm-up bars a sleeve loads at start: about five weeks of 1-minute bars from the store.
+MAX_WARMUP_BARS = 50_000
+
+
 @dataclass(frozen=True)
 class SleeveConfig:
     name: str
@@ -57,8 +61,8 @@ class SleeveConfig:
             raise ValueError("starting_balance must be positive")
         if self.max_notional is not None and self.max_notional <= 0:
             raise ValueError("max_notional must be positive")
-        if self.warmup_bars < 0:
-            raise ValueError("warmup_bars must be >= 0")
+        if not 0 <= self.warmup_bars <= MAX_WARMUP_BARS:
+            raise ValueError(f"warmup_bars must be between 0 and {MAX_WARMUP_BARS}")
         from sleeve_fund.risk import profile
 
         profile(self.risk_profile)  # raises on unknown

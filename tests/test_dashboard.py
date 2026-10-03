@@ -367,13 +367,13 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     # The sleeve decides on the daily bars that were tested, warm from its first bar (the slow 20).
     assert ('href="/sleeves/new?instrument=ETH%2FUSD&amp;strategy=trend_filter&amp;p_trend_filter__fast=5'
             '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;bar_spec=1-DAY-LAST-EXTERNAL'
-            '&amp;warmup_bars=20&amp;from=backtest"') in page
+            '&amp;tested_bar_spec=1-DAY-LAST-EXTERNAL&amp;warmup_bars=20&amp;from=backtest"') in page
     assert "33% invested" in page  # the benchmark is held at the balanced profile's cap
     form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest"
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
     assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "carried over" in form
     assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
-    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="720" value="40"' in form
+    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
 
 
 def test_sleeve_from_a_backtest_cannot_change_its_interval(client):
@@ -727,3 +727,54 @@ def test_backtest_charges_the_measured_spread_and_says_where_it_came_from(client
     assert "0.020% bid-ask spread, the median of 900 live quotes" in page
     d = c.get("/api/preview", params={"instrument": "ETH/USD", "strategy": "buy_and_hold"}, auth=AUTH).json()
     assert d["spread"]["source"] == "measured" and d["spread"]["paid"] > 0
+
+
+def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, monkeypatch, tmp_path):
+    """Review R2-B2: any interval the paper engine allows, down to 1 minute, from stored minutes."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(20), cursor="x")
+    preview._history.clear()
+    q = ("/backtest?run=1&instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5"
+         "&p_trend_filter__slow=20&bar_spec=1-HOUR-LAST-INTERNAL")
+    page = c.get(q, auth=AUTH).text
+    assert "Couldn't run it" not in page
+    assert 'value="1-HOUR-LAST-INTERNAL" selected' in page
+    assert "bar_spec=1-HOUR-LAST-INTERNAL" in page and "tested_bar_spec=1-HOUR-LAST-INTERNAL" in page
+    d = preview.run("trend_filter", "ETH/USD", {"fast": 5, "slow": 20}, minutes=1, detail=True)
+    assert d["minutes"] == 1 and d["bars"] > 20 * 1400 and d["trades"]["trades"] > 0
+    assert len(d["t"]) <= 21  # equity judged day by day, so Sharpe is annualised as daily
+    assert d["chart_minutes"] == 60 and len(d["price"]["candles"]) <= 720
+
+    form = c.get("/sleeves/new?from=backtest&bar_spec=1-HOUR-LAST-INTERNAL&tested_bar_spec=1-HOUR-LAST-INTERNAL",
+                 auth=AUTH).text
+    assert '<input type="hidden" name="tested_bar_spec" value="1-HOUR-LAST-INTERNAL">' in form
+    r = _new(c, name="bt-hour", bar_spec="1-HOUR-LAST-INTERNAL", tested_bar_spec="1-HOUR-LAST-INTERNAL",
+             **{"from": "backtest"})
+    assert r.headers["location"] == "/sleeves/bt-hour"
+    r = _new(c, name="bt-day", bar_spec="1-DAY-LAST-EXTERNAL", tested_bar_spec="1-HOUR-LAST-INTERNAL",
+             **{"from": "backtest"})
+    assert "interval" in r.headers["location"]
+
+
+def test_minute_backtests_need_the_history_store(client, monkeypatch, tmp_path):
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "empty")
+    preview._history.clear()
+    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
+                 auth=AUTH).text
+    assert "finished loading here yet, so only daily bars can be backtested" in page
+
+
+def test_trade_built_intervals_get_a_warm_up_from_the_store():
+    from sleeve_fund.dashboard.app import _warmup_for
+
+    # Venue candles stop at one request (720); bars built from trades load from the history store.
+    assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-EXTERNAL") == 720
+    assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-INTERNAL") > 720

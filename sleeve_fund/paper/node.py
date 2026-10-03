@@ -13,6 +13,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pandas as pd
+
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig, SandboxExecutionClientFactory
 from nautilus_trader.common import Environment, LoggerConfig, LogLevel
 from nautilus_trader.live import LiveNode
@@ -41,8 +43,33 @@ def _tag(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
 
 
+# Warm-up bars from a store that stopped updating would leave a hole before the first live bar.
+HISTORY_MAX_LAG = pd.Timedelta(hours=6)
+
+
+def history_loader(venue: str, pair: str, store=None):
+    """Loads a sleeve's warm-up bars from the venue history store (the latest complete bars at the
+    sleeve's interval), for bars the venue can't serve because they are built from live trades."""
+    from sleeve_fund.data import bar_minutes, to_bars
+    from sleeve_fund.history import HistoryStore
+
+    def load(instrument, bar_type, limit: int):
+        hs = store or HistoryStore()
+        cov = hs.coverage(venue, pair)
+        if cov is None:
+            raise LookupError(f"no stored history for {pair}")
+        lag = pd.Timestamp.now(tz="UTC") - cov.last
+        if lag > HISTORY_MAX_LAG:
+            raise LookupError(f"the stored history for {pair} is {lag.total_seconds() / 3600:.0f} hours old")
+        minutes = bar_minutes(bar_type)
+        df = hs.read(venue, pair, minutes, start=cov.last - pd.Timedelta(minutes=minutes * (limit + 2)))
+        return to_bars(df.tail(limit), instrument, bar_type)
+
+    return load
+
+
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
-               asset_fetch=None) -> LiveNode:
+               asset_fetch=None, history=None) -> LiveNode:
     assert_keyless()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
@@ -88,7 +115,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
                 **sleeve.params,
             )
-        ).attach_runtime(runtime)
+        ).attach_runtime(runtime).attach_history(history or history_loader(profile.name, sleeve.instrument))
     )
     return node
 

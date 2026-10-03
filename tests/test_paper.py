@@ -115,3 +115,75 @@ def test_kraken_asset_codes_use_the_venue_names():
         raise OSError("no network")
 
     assert kraken_asset_codes("SUI/USD", fetch=down) == ("SUI", "USD")
+
+
+def _store_with_minutes(tmp_path, end, n):
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.history import HistoryStore
+
+    idx = pd.date_range(end=pd.Timestamp(end).floor("min"), periods=n, freq="1min", tz="UTC")
+    c = 100 + np.arange(n, dtype=float)
+    store = HistoryStore(tmp_path)
+    store.append("KRAKEN", "BTC/USD", pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0},
+                                                   index=idx), cursor="c")
+    return store
+
+
+def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
+    import pandas as pd
+
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.venues import venue
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    store = _store_with_minutes(tmp_path, now + pd.Timedelta(minutes=20), 10 * 60)
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    bars = history_loader("KRAKEN", "BTC/USD", store)(instrument, bt, 3)
+    # The latest three complete hours, each stamped at its close; the forming hour is left to live trades.
+    assert [pd.Timestamp(b.ts_event, tz="UTC") for b in bars] == [now - pd.Timedelta(hours=h) for h in (2, 1, 0)]
+    assert all(b.bar_type == bt for b in bars)
+
+    events = []
+    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
+                            warmup_bars=3)
+    s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
+    s.instrument, s.runtime = instrument, runtime
+    s._warm_from_history()
+    assert s.slow.initialized and s.slow.value == pytest.approx(sum(b.close.as_double() for b in bars) / 3)
+    assert events == [("s1", "info", "warmup", "Loaded 3 of 3 warm-up bars from the history store")]
+
+
+def test_a_stale_history_store_is_not_used_for_warm_up(tmp_path):
+    import pandas as pd
+
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.venues import venue
+
+    store = _store_with_minutes(tmp_path, pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=7), 300)
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    with pytest.raises(LookupError, match="hours old"):
+        history_loader("KRAKEN", "BTC/USD", store)(instrument, bt, 3)
+    with pytest.raises(LookupError, match="no stored history"):
+        history_loader("KRAKEN", "ETH/USD", store)(instrument, bt, 3)
+
+
+def test_a_quiet_instrument_is_valued_from_its_quotes_until_it_trades(monkeypatch):
+    # e.g. SUI at night: quotes arrive at once, the first trade can take minutes, and until then
+    # the sleeve could neither mark nor reconcile.
+    bt = BarType.from_str("SUI/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
+    cfg = TrendFilterConfig(instrument_id=InstrumentId.from_str("SUI/USD.KRAKEN"), bar_type=bt, fast=2, slow=3,
+                            assumed_taker_fee=0.008)
+    last = {"px": None}
+    monkeypatch.setattr(TrendFilter, "cache", property(lambda self: type("C", (), {
+        "price": lambda _self, _iid, _kind: last["px"]})()))
+    s = TrendFilter(cfg)
+    assert s._price() == 0.0
+    s._bid, s._ask = 1.17, 1.19
+    assert s._price() == pytest.approx(1.18)
+    last["px"] = Price(1.2, 4)
+    assert s._price() == pytest.approx(1.2)  # a trade price wins once there is one

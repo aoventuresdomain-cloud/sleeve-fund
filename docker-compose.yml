@@ -21,6 +21,8 @@ services:
     depends_on: { db: { condition: service_healthy } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+      HISTORY_DIR: /data/history  # warm-up for sleeves on bars built from live trades
+    volumes: [history:/data/history:ro]
     env_file:
       - path: kraken.env
         required: false
