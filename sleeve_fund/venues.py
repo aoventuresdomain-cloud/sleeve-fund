@@ -130,9 +130,10 @@ def _kraken_data_client() -> tuple:
 KRAKEN = register(VenueProfile(
     name="KRAKEN",
     label="Kraken spot",
-    # Entry tier (under $10k 30-day volume), Kraken's UK schedule from 9 July 2026.
+    # Spot Tier 1 (under $2,501 30-day spot volume), read from the account's Kraken fee page on
+    # 3 Oct 2026. Tier 2 (0.30% maker, 0.60% taker) starts at $2,501; the PM chose to assume Tier 1.
     fees=FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080")),
-    fee_basis="entry tier",
+    fee_basis="Tier 1, from the account's fee page, 3 Oct 2026",
     daily_history=_kraken_daily,
     ohlc_history=_kraken_ohlc,
     asset_codes=kraken_asset_codes,
