@@ -22,3 +22,6 @@ class BuyAndHoldConfig(LongFlatConfig):
 class BuyAndHold(LongFlatStrategy):
     def want_long(self, bar: Bar) -> bool | None:
         return True
+
+    def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
+        return "Buy and hold: buys once on the first bar", {}

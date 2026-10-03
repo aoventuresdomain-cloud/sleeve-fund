@@ -173,3 +173,54 @@ def utcnow_fixed():
     from datetime import datetime, timezone
 
     return datetime(2026, 10, 3, tzinfo=timezone.utc)
+
+
+def test_every_order_is_journaled_with_its_reason_before_it_fills(store, instrument):
+    _sleeve(store)
+    _run(store, instrument, crash_prices())
+    orders = list(reversed(store.orders("s1")))
+    assert [(o["side"], o["intent"], o["status"]) for o in orders] == [("BUY", "entry", "filled"),
+                                                                          ("SELL", "risk_halt", "filled")]
+    entry, halt = orders
+    assert entry["reason"].startswith("Buy and hold") and entry["signal"]["sized_by"] == "balanced risk profile cap"
+    assert halt["reason"].startswith("Risk halt: drawdown")
+    fills = {f["order_id"]: f for f in store.fills("s1")}
+    for o in orders:  # the order rows agree with the fills journal
+        f = fills[o["order_id"]]
+        assert o["filled_qty"] == pytest.approx(f["qty"]) and o["avg_px"] == pytest.approx(f["price"])
+        assert o["fee"] == pytest.approx(f["fee"])
+
+
+def test_signal_values_recorded_at_entry_and_exit(store, instrument):
+    store.create_sleeve(name="tf", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, params={"fast": 5, "slow": 20}, risk_profile="aggressive")
+    rt = SleeveRuntime(store, "tf", tick_seconds=SIX_HOURS)
+    run_backtest("trend_filter", synthetic_ohlcv(days=200, seed=3, vol=0.03), instrument,
+                 params={"fast": 5, "slow": 20}, runtime=rt)
+    orders = store.orders("tf")
+    entries = [o for o in orders if o["intent"] == "entry"]
+    exits = [o for o in orders if o["intent"] == "exit"]
+    assert entries and exits
+    assert "5-bar average" in entries[0]["reason"] and "above the 20-bar average" in entries[0]["reason"]
+    assert "below the 20-bar average" in exits[0]["reason"]
+    sig = entries[0]["signal"]
+    assert sig["sma_5"] > sig["sma_20"] and sig["close"] > 0 and sig["price"] > 0
+
+
+def test_order_status_moves_forward_only(store):
+    _sleeve(store)
+    store.record_order("s1", order_id="O-1", side="BUY", qty=2.0, intent="entry", reason="test")
+    store.update_order("O-1", status="accepted")
+    store.update_order("O-1", fill_qty=0.5, fill_px=100.0, fee=0.4)
+    assert store.orders("s1")[0]["status"] == "partially_filled"
+    store.update_order("O-1", fill_qty=1.5, fill_px=104.0, fee=1.2)
+    store.update_order("O-1", status="accepted")  # a late event never reopens a filled order
+    o = store.orders("s1")[0]
+    assert o["status"] == "filled" and o["avg_px"] == pytest.approx(103.0) and o["fee"] == pytest.approx(1.6)
+    store.record_order("s1", order_id="O-2", side="SELL", qty=1.0, intent="exit", reason="test")
+    store.update_order("O-2", status="rejected", message="insufficient balance")
+    assert store.orders("s1", statuses=("rejected",))[0]["message"] == "insufficient balance"
+    store.update_order("unknown", status="canceled")  # orders from before the journal: ignored
+    assert store.order_counts("s1") == {"filled": 1, "rejected": 1}
+    with pytest.raises(ValueError):
+        store.record_order("s1", order_id="O-3", side="BUY", qty=1, intent="yolo", reason="x")

@@ -183,6 +183,12 @@ class LongFlatStrategy(Strategy):
         """True = be long, False = be flat, None = not enough data yet (do nothing)."""
         raise NotImplementedError
 
+    def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
+        """Why want_long() just said `target`: one plain-English sentence and the indicator values
+        behind it. Called straight after want_long() on the same bar, so it sees the same state.
+        It is journaled with the order, so the reason is the one the strategy acted on."""
+        return ("Signal to be long" if target else "Signal to be flat"), {}
+
     def on_bar(self, bar: Bar) -> None:
         if not self._accept(bar):
             return
@@ -204,9 +210,11 @@ class LongFlatStrategy(Strategy):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
-            self._buy_all(bar)
+            reason, values = self.explain(bar, target)
+            self._buy_all(bar, reason, {**values, "close": bar.close.as_double()})
         elif not target and is_long:
-            self._sell_all()
+            reason, values = self.explain(bar, target)
+            self._sell_all("exit", reason, {**values, "close": bar.close.as_double()})
 
     def _check_exits(self, price: float) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent."""
@@ -223,12 +231,16 @@ class LongFlatStrategy(Strategy):
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry")
+        level = cfg.stop_loss if hit == "stop_loss" else cfg.take_profit
+        reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
+                  f"the {self._entry_px:,.6g} entry, past the {level:.1%} {'stop' if hit == 'stop_loss' else 'target'}")
+        values = {"entry_px": self._entry_px, "move": move, hit: level}
         self._exit_lock = True
         self._entry_px = None  # don't fire again while the sell is in flight
-        self._sell_all()
+        self._sell_all(hit, reason, values)
         return True
 
-    def _buy_all(self, bar: Bar) -> None:
+    def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None) -> None:
         account = self._account()
         if account is None:
             self.log.warning("no account yet; skipping buy")
@@ -239,14 +251,18 @@ class LongFlatStrategy(Strategy):
             self.log.warning(f"no {quote} balance; skipping buy")
             return
         free = bal.free
-        budget = free.as_decimal()
+        # Every limit on the size, so the journal can say which one set it.
+        limits = {"free cash": free.as_decimal()}
         if self._cfg.max_notional is not None:
-            budget = min(budget, Decimal(str(self._cfg.max_notional)))
+            limits["sleeve cap"] = Decimal(str(self._cfg.max_notional))
         if self.runtime is not None:
-            budget = min(budget, Decimal(str(self.runtime.position_budget(self._mark()[0]))))
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
+                str(self.runtime.position_budget(self._mark()[0])))
         if self._cfg.risk_per_trade:
             equity = self._mark()[0] or float(free.as_decimal())
-            budget = min(budget, Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss)))
+            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss))
+        size_by = min(limits, key=limits.get)
+        budget = limits[size_by]
         budget *= Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         step = self.instrument.size_increment.as_decimal()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
@@ -254,12 +270,23 @@ class LongFlatStrategy(Strategy):
         if qty <= 0 or qty < min_qty:
             self.log.warning(f"buy size {qty} below minimum {min_qty}; skipping")
             return
+        signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
+                  "budget": round(float(budget), 2)}
+        self._submit(OrderSide.BUY, qty, "entry", reason, signal)
+
+    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict) -> None:
+        """Send a market order, journaling it with its reason first so the record exists before the venue sees it."""
         order = self.order_factory.market(
             instrument_id=self._cfg.instrument_id,
-            order_side=OrderSide.BUY,
+            order_side=side,
             quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
             time_in_force=TimeInForce.GTC,
         )
+        if self.runtime is not None:
+            signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
+            signal.setdefault("price", self._price())
+            self.runtime.on_order(order_id=str(order.client_order_id), side="BUY" if side == OrderSide.BUY else "SELL",
+                                  qty=float(qty), intent=intent, reason=reason, signal=signal)
         self.submit_order(order)
 
     def _min_qty(self) -> Decimal:
@@ -283,17 +310,12 @@ class LongFlatStrategy(Strategy):
     def _is_long(self) -> bool:
         return self._coin() >= self._min_qty()
 
-    def _sell_all(self) -> None:
+    def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
         step = self.instrument.size_increment.as_decimal()
         qty = self._coin(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
-        self.submit_order(self.order_factory.market(
-            instrument_id=self._cfg.instrument_id,
-            order_side=OrderSide.SELL,
-            quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
-            time_in_force=TimeInForce.GTC,
-        ))
+        self._submit(OrderSide.SELL, qty, intent, reason, dict(values or {}))
 
     # --- sleeve runtime hooks (paper/live only) --------------------------------
 
@@ -350,10 +372,31 @@ class LongFlatStrategy(Strategy):
                     self.cancel_all_orders(self._cfg.instrument_id)  # halted: no trading, no flattening
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
-                self._sell_all()
+                intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
+                self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
         except Exception as exc:  # never let bookkeeping kill the sleeve silently
             self.log.error(f"sleeve tick failed: {exc!r}")
             self.runtime.store.event(self.runtime.name, "error", "tick_failed", repr(exc))
+
+    # Order lifecycle into the journal; fills are journaled in on_order_filled.
+    def _order_status(self, event, status: str) -> None:
+        if self.runtime is not None:
+            self.runtime.on_order_status(str(event.client_order_id), status, str(getattr(event, "reason", "") or ""))
+
+    def on_order_accepted(self, event) -> None:
+        self._order_status(event, "accepted")
+
+    def on_order_rejected(self, event) -> None:
+        self._order_status(event, "rejected")
+
+    def on_order_denied(self, event) -> None:
+        self._order_status(event, "denied")
+
+    def on_order_canceled(self, event) -> None:
+        self._order_status(event, "canceled")
+
+    def on_order_expired(self, event) -> None:
+        self._order_status(event, "expired")
 
     def on_order_filled(self, event) -> None:
         qty, px = event.last_qty.as_double(), event.last_px.as_double()

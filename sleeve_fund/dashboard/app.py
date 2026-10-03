@@ -9,6 +9,7 @@ the decision log. Protected by one PM password (HTTP Basic, behind HTTPS).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -17,13 +18,13 @@ from urllib.parse import urlencode, urlparse
 
 import markdown
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import riskops
+from sleeve_fund.dashboard import reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
@@ -240,11 +241,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such sleeve") from None
         x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
-        fills = st().fills(name, limit=2000)
+        fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
-        trips = _trips(fills, events)
+        orders = trading.orders_by_id(st(), name)
+        trips = trading.trips(fills, st().events(name, limit=5000), orders)
         feed = _feed(events, request.query_params.get("feed", "all"))
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed,
+        recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    position=trading.open_position(x, fills, orders),
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params))
@@ -329,7 +333,84 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/decisions", response_class=HTMLResponse)
     def decisions(request: Request, _: str = Depends(require_pm)):
-        return page(request, "decisions.html", decisions=st().decisions(limit=500))
+        f = _decision_filters(request)
+        return page(request, "decisions.html", decisions=st().decisions(limit=500, **f["query"]), f=f,
+                    sleeves=[s.name for s in st().sleeves()], actions=DECISION_ACTIONS)
+
+    @app.get("/decisions.csv")
+    def decisions_csv(request: Request, _: str = Depends(require_pm)):
+        rows = st().decisions(limit=100_000, **_decision_filters(request)["query"])
+        return _csv("decisions", reports.to_csv(rows, ["ts", "actor", "action", "sleeve", "reason"]))
+
+    @app.get("/reports", response_class=HTMLResponse)
+    def reports_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        fills = {s.name: st().fills(s.name, limit=100_000) for s in sleeves}
+        return page(request, "reports.html", m=reports.monthly(summaries, frames, fills),
+                    sleeves=[s.name for s in sleeves], shell=shell(sleeves))
+
+    @app.get("/exports/{kind}.csv")
+    def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
+        names = [s.name for s in st().sleeves()]
+        if sleeve and sleeve not in names:
+            raise HTTPException(404, "no such sleeve")
+        chosen = [sleeve] if sleeve else names
+        if kind == "fills":
+            rows = [f for n in chosen for f in reversed(st().fills(n, limit=1_000_000))]
+            cols = ["ts", "sleeve", "side", "qty", "price", "fee", "order_id", "trade_id"]
+        elif kind == "equity":
+            rows = []
+            for n in chosen:
+                for ts, r in bookm.daily(st(), n).iterrows():
+                    rows.append({"date": ts.date(), "sleeve": n, **{k: round(float(r[k]), 8) for k in r.index}})
+            cols = ["date", "sleeve", "equity", "benchmark", "cash", "qty", "price"]
+        elif kind == "trades":
+            rows = []
+            for n in chosen:
+                orders = trading.orders_by_id(st(), n)
+                for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders):
+                    rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
+                                 if t["held"] else None})
+            cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
+                    "ret", "exit_kind", "entry_why", "exit_why", "entry_order", "exit_order"]
+        elif kind == "orders":
+            rows = [dict(o, signal=json.dumps(o["signal"], sort_keys=True))
+                    for n in chosen for o in reversed(st().orders(n, limit=1_000_000))]
+            cols = ["ts", "sleeve", "order_id", "side", "order_type", "qty", "status", "filled_qty", "avg_px", "fee",
+                    "intent", "reason", "signal", "message", "updated_at"]
+        else:
+            raise HTTPException(404, "unknown export")
+        return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
+
+    @app.get("/trades", response_class=HTMLResponse)
+    def trades_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, _frames, summaries = book_data()
+        names = [s.name for s in sleeves]
+        sleeve = request.query_params.get("sleeve") or None
+        if sleeve not in names:
+            sleeve = None
+        h = trading.history(st(), summaries, sleeve)
+        return page(request, "trades.html", h=h, sleeve=sleeve, sleeves=names, shell=shell(sleeves),
+                    book_equity=sum(x["equity"] for x in summaries))
+
+    @app.get("/orders", response_class=HTMLResponse)
+    def orders_page(request: Request, _: str = Depends(require_pm)):
+        names = [s.name for s in st().sleeves()]
+        q = request.query_params
+        sleeve = q.get("sleeve") if q.get("sleeve") in names else None
+        tab = q.get("status") if q.get("status") in trading.STATUS_TABS else "all"
+        rows = [trading.order_view(o) for o in st().orders(sleeve, trading.STATUS_TABS[tab][1], limit=1000)]
+        counts = st().order_counts(sleeve)
+        tabs = [(k, label, sum(counts.get(x, 0) for x in sts) if sts else sum(counts.values()))
+                for k, (label, sts) in trading.STATUS_TABS.items()]
+        return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_page(request: Request, _: str = Depends(require_pm)):
+        from sleeve_fund.instruments import KRAKEN_UK_ENTRY
+
+        return page(request, "settings.html", profiles=PROFILES, fees=KRAKEN_UK_ENTRY,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes())
 
     return app
 
@@ -342,8 +423,7 @@ COMMON_REASONS = [
     "Checked after an alert; safe to continue",
     "Planned change of settings",
 ]
-EXIT_KINDS = {"stop_loss": "Stop-loss", "take_profit": "Take-profit", "risk_halt": "Risk halt",
-              "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten"}
+EXIT_KINDS = trading.EXIT_EVENTS
 
 
 def _config_defaults(strategy: str) -> dict:
@@ -372,28 +452,11 @@ def _idea(strategy: str, params: dict | None = None) -> str:
         return spec.idea
 
 
-def _trips(fills: list[dict], events: list[dict]) -> list[dict]:
-    """Closed round trips, newest first, with holding time and why they closed."""
-    from sleeve_fund.research.metrics import trades
-
-    exits = [e for e in events if e["kind"] in EXIT_KINDS]
-    out = []
-    for t in reversed(trades(list(reversed(fills)))):
-        why = "Signal"
-        if t["opened"] and t["closed"]:
-            hit = [e for e in exits if t["opened"] <= e["ts"] <= t["closed"]]
-            if hit:
-                why = EXIT_KINDS[hit[0]["kind"]]
-        t["reason"] = why
-        t["held"] = (t["closed"] - t["opened"]) if t["opened"] and t["closed"] else None
-        out.append(t)
-    return out
-
 
 FEEDS = {
     "all": lambda e: e["kind"] != "reconcile",  # routine passes are summarised in the risk panel
     "alerts": lambda e: e["level"] in ("warning", "error"),
-    "trades": lambda e: e["kind"] in ("fill", *EXIT_KINDS),
+    "trades": lambda e: e["kind"] in ("fill", "order_rejected", "order_denied", *EXIT_KINDS),
     "pm": lambda e: e["kind"].startswith("pm_") or e["kind"] in ("start", "restart", "restore", "resume"),
 }
 
@@ -421,6 +484,30 @@ def _held(td) -> str:
         return ""
     hours = td.total_seconds() / 3600
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+
+
+DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten"]
+
+
+def _decision_filters(request: Request) -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    q = request.query_params
+    out = {"sleeve": q.get("sleeve") or None, "action": q.get("action") or None}
+    raw = {"from": q.get("from", ""), "to": q.get("to", "")}
+    for key, field, extra in (("from", "since", 0), ("to", "until", 1)):
+        try:
+            if raw[key]:
+                out[field] = datetime.strptime(raw[key], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=extra)
+        except ValueError:
+            raw[key] = ""  # an unreadable date is ignored rather than failing the page
+    return {"query": out, "raw": raw, "qs": urlencode({k: v for k, v in q.items() if v})}
+
+
+def _csv(name: str, body: str) -> Response:
+    stamp = utcnow().strftime("%Y%m%d")
+    return Response(body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="sleeve-fund-{name}-{stamp}.csv"'})
 
 
 def _bytes(n) -> str:

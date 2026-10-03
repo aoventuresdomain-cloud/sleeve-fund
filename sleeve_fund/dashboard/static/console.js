@@ -13,6 +13,18 @@ window.Console = (() => {
     document.querySelectorAll("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
   }
 
+  // "Why" buttons open the detail row that follows: the journaled reason and signal values.
+  function whys() {
+    document.querySelectorAll("[data-why]").forEach((b) => b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const row = document.getElementById(b.dataset.why);
+      if (!row) return;
+      row.hidden = !row.hidden;
+      b.setAttribute("aria-expanded", String(!row.hidden));
+      b.closest("tr")?.classList.toggle("open", !row.hidden);
+    }));
+  }
+
   function sortable() {
     document.querySelectorAll("table.sortable").forEach((table) => {
       const heads = [...table.querySelectorAll("thead th")];
@@ -179,5 +191,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, dialogs, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, dialogs, whys, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

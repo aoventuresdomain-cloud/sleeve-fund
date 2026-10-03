@@ -15,11 +15,15 @@
     {% set here = request.url.path %}
     <nav>
       <a href="/" {{ 'aria-current=page' if here == '/' or here.startswith('/sleeves/') and here != '/sleeves/new' }}>Portfolio</a>
+      <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>Trades</a>
+      <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>Orders</a>
       <a href="/alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
       <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>Risk</a>
-      <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
+      <a class="desk-only" href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
       <a class="desk-only" href="/research" {{ 'aria-current=page' if here.startswith('/research') }}>Research</a>
       <a class="desk-only" href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
+      <a class="desk-only" href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
+      <a class="desk-only" href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>Settings</a>
       <a class="desk-only" href="/sleeves/new" {{ 'aria-current=page' if here == '/sleeves/new' }}>New sleeve</a>
     </nav>
     <div class="rail-foot">

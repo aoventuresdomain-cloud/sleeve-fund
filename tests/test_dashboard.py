@@ -249,3 +249,92 @@ def test_fetch_kraken_daily_parses_and_drops_the_open_candle():
     assert df.index[0].timestamp() == 1_700_000_000 + day  # stamped at the bar's close, not its open
     with pytest.raises(ValueError):
         fetch_kraken_daily("NOPE/USD", get_json=get_json)
+
+
+def test_decision_log_filters_and_csv_keeps_formulas_as_text(client):
+    c, store = client
+    _new(c, name="btc-a")
+    _new(c, name="eth-b", instrument="ETH/USD", reason="=HYPERLINK(\"https://evil.example\")")
+    c.post("/sleeves/btc-a/command", data={"command": "pause", "reason": "news"}, auth=AUTH, headers=SAME)
+    page = c.get("/decisions?sleeve=btc-a&action=pause", auth=AUTH).text
+    assert "news" in page and "first test" not in page
+    assert c.get("/decisions?from=not-a-date", auth=AUTH).status_code == 200
+    r = c.get("/decisions.csv?sleeve=eth-b", auth=AUTH)
+    assert r.headers["content-disposition"].startswith('attachment; filename="sleeve-fund-decisions-')
+    lines = r.text.splitlines()
+    assert lines[0] == "ts,actor,action,sleeve,reason" and len(lines) == 2
+    assert "'=HYPERLINK" in lines[1]
+
+
+def test_exports_reports_and_settings(client):
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD")
+    store.record_equity("sol-x", equity=10_000, cash=10_000, qty=0, price=100, benchmark=10_000)
+    store.record_fill("sol-x", side="BUY", qty=10, price=100, fee=0.8, order_id="o1", trade_id="t1")
+    store.record_fill("sol-x", side="SELL", qty=10, price=110, fee=0.88, order_id="o2", trade_id="t2")
+    fills = c.get("/exports/fills.csv?sleeve=sol-x", auth=AUTH).text.splitlines()
+    assert len(fills) == 3 and ",BUY," in fills[1] and ",SELL," in fills[2]  # oldest first
+    trades = c.get("/exports/trades.csv", auth=AUTH).text.splitlines()
+    assert len(trades) == 2 and trades[1].startswith("sol-x,")
+    assert c.get("/exports/equity.csv", auth=AUTH).status_code == 200
+    assert c.get("/exports/secrets.csv", auth=AUTH).status_code == 404
+    assert c.get("/exports/fills.csv?sleeve=nope", auth=AUTH).status_code == 404
+    assert c.get("/exports/fills.csv").status_code == 401
+    assert "Book by month" in c.get("/reports", auth=AUTH).text
+    settings = c.get("/settings", auth=AUTH).text
+    assert "Live trading" in settings and "test-pw" not in settings
+
+
+def _round_trip(store, sleeve="sol-x"):
+    store.record_order(sleeve, order_id="O-1", side="BUY", qty=10, intent="entry",
+                       reason="RSI 28.0 below 30, close 100 above the 200-bar EMA 95", signal={"rsi": 28.0, "close": 100.0})
+    store.record_fill(sleeve, side="BUY", qty=10, price=100, fee=0.8, order_id="O-1", trade_id="t1")
+    store.record_order(sleeve, order_id="O-2", side="SELL", qty=10, intent="stop_loss",
+                       reason="Stop-loss: price 92 is -8.00% from the 100 entry", signal={"move": -0.08})
+    store.record_fill(sleeve, side="SELL", qty=10, price=92, fee=0.74, order_id="O-2", trade_id="t2")
+
+
+def test_trades_page_shows_positions_trades_and_the_journaled_reasons(client):
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD")
+    _round_trip(store)
+    store.record_order("sol-x", order_id="O-3", side="BUY", qty=5, intent="entry", reason="RSI 25.1 below 30")
+    store.record_fill("sol-x", side="BUY", qty=5, price=90, fee=0.36, order_id="O-3", trade_id="t3")
+    store.record_equity("sol-x", equity=9_900, cash=9_450, qty=5, price=99, benchmark=9_950)
+    page = c.get("/trades", auth=AUTH).text
+    assert "Open positions" in page and "RSI 25.1 below 30" in page  # why the open position was bought
+    assert "+45.00" in page  # unrealised: 5 x (99 - 90)
+    assert "RSI 28.0 below 30" in page and "Stop-loss: price 92" in page and "Move from entry" in page
+    assert "−81.54" in page  # (92 - 100) x 10 - 1.54 fees
+    assert c.get("/trades?sleeve=nope", auth=AUTH).status_code == 200  # unknown sleeve shows the book
+    sleeve = c.get("/sleeves/sol-x", auth=AUTH).text
+    assert "Why it was bought" in sleeve and "Stop-loss: price 92" in sleeve and "Blotter" in sleeve
+
+
+def test_trades_from_before_the_order_journal_say_so(client):
+    c, store = client
+    _new(c, name="old", instrument="SOL/USD")
+    store.record_fill("old", side="BUY", qty=1, price=100, fee=0.8, order_id="x1", trade_id="t1")
+    store.record_fill("old", side="SELL", qty=1, price=110, fee=0.88, order_id="x2", trade_id="t2")
+    assert "predates the order journal" in c.get("/trades", auth=AUTH).text
+
+
+def test_order_blotter_tabs_and_csv(client):
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD")
+    _round_trip(store)
+    store.record_order("sol-x", order_id="O-9", side="BUY", qty=3, intent="entry", reason="test reject")
+    store.update_order("O-9", status="rejected", message="EOrder:Insufficient funds")
+    store.record_order("sol-x", order_id="O-10", side="BUY", qty=3, intent="entry", reason="still working")
+    page = c.get("/orders", auth=AUTH).text
+    assert "Order blotter" in page and "Stop-loss" in page and "EOrder:Insufficient funds" in page
+    rejected = c.get("/orders?status=rejected", auth=AUTH).text
+    assert "test reject" in rejected and "still working" not in rejected
+    assert "still working" in c.get("/orders?status=open", auth=AUTH).text
+    assert "test reject" not in c.get("/orders?status=filled", auth=AUTH).text
+    assert c.get("/orders?status=bogus", auth=AUTH).status_code == 200
+    csv_text = c.get("/exports/orders.csv?sleeve=sol-x", auth=AUTH).text.splitlines()
+    assert csv_text[0].startswith("ts,sleeve,order_id,side") and len(csv_text) == 5
+    assert '""rsi"": 28.0' in csv_text[1]
+    trades_csv = c.get("/exports/trades.csv", auth=AUTH).text
+    assert "stop_loss" in trades_csv and "RSI 28.0 below 30" in trades_csv
