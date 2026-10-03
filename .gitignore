@@ -12,3 +12,5 @@ research/tearsheets/*_synthetic.md
 logs/
 *.egg-info/
 .pytest_cache/
+data/*.db
+data/*.db-*
