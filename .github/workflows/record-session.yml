@@ -1,0 +1,30 @@
+name: record-session
+# Records live paper sessions on Kraken's public feed for the replay test (tests/test_replay.py).
+# Paper only; no secrets are configured or used. The recordings are uploaded as an artifact to be
+# reviewed and committed under tests/data/replay.
+on:
+  pull_request:
+    paths:
+      - "scripts/record_session.sh"
+      - ".github/workflows/record-session.yml"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to record"
+        default: "45"
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: scripts/record_session.sh "${{ github.event.inputs.minutes || '45' }}" recordings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-recordings
+          path: recordings/
+          retention-days: 14

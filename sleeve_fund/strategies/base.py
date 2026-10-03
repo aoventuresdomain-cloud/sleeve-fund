@@ -153,6 +153,7 @@ class LongFlatStrategy(Strategy):
         self._last_bar_ts = 0
         self._last_close = None
         self._bid = self._ask = None  # the venue's best quotes (paper and live, and replayed quotes)
+        self.recorder = None  # sleeve_fund.paper.recorder.Recorder, when a paper run is being recorded
         self._last_tick_ns = 0
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
@@ -188,6 +189,8 @@ class LongFlatStrategy(Strategy):
                                          f"{self._cfg.instrument_id} is not listed on the venue")
             self.stop()
             return
+        if self.recorder is not None:
+            self.recorder.start(self.instrument)
         if self._cfg.warmup_bars:
             self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
         self.subscribe_bars(self._cfg.bar_type)
@@ -208,12 +211,20 @@ class LongFlatStrategy(Strategy):
             # alone did not fire in the live node; the timer stays as a backup for quiet markets.
             self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
 
+    def attach_recorder(self, recorder) -> "LongFlatStrategy":
+        self.recorder = recorder
+        return self
+
     def on_trade(self, tick) -> None:
+        if self.recorder is not None:
+            self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._check_exits(self._last_close)
         self._maybe_tick()
 
     def on_quote(self, quote) -> None:
+        if self.recorder is not None:
+            self.recorder.quote(quote)
         bid, ask = quote.bid_price.as_double(), quote.ask_price.as_double()
         if not 0 < bid <= ask:
             return
@@ -714,3 +725,5 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             self.clock.cancel_timer("sleeve-tick") if "sleeve-tick" in self.clock.timer_names() else None
             self.runtime.on_stop()
+        if self.recorder is not None:
+            self.recorder.close()
