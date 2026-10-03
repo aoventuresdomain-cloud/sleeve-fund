@@ -1,24 +1,57 @@
 <!doctype html>
-<html lang="en-GB">
+<html lang="en-GB" data-mode="{{ shell.mode }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Sleeve Fund{% endblock %}</title>
+  <link rel="preload" href="/static/fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232c64c9'/%3E%3Cpath d='M3 11l3-3 2 2 5-5' stroke='white' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header class="top"><div class="wrap">
-  <a class="brand" href="/">Sleeve Fund</a>
-  <nav>
-    <a href="/">Portfolio</a>
-    <a href="/sleeves/new">New paper sleeve</a>
-    <a href="/research">Research</a>
-    <a href="/decisions">Decisions</a>
-  </nav>
-  <span class="paper-badge">PAPER TRADING</span>
-</div></header>
-<main class="wrap">
+<div class="app">
+  <aside class="rail" aria-label="Main">
+    <a class="brand" href="/">Sleeve Fund<small>Systematic crypto sleeves</small></a>
+    {% set here = request.url.path %}
+    <nav>
+      <a href="/" {{ 'aria-current=page' if here == '/' or here.startswith('/sleeves/') and here != '/sleeves/new' }}>Portfolio</a>
+      <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>Trades</a>
+      <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>Orders</a>
+      <a href="/alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
+      <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>Risk</a>
+      <a class="desk-only" href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
+      <a class="desk-only" href="/research" {{ 'aria-current=page' if here.startswith('/research') }}>Research</a>
+      <a class="desk-only" href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
+      <a class="desk-only" href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
+      <a class="desk-only" href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>Settings</a>
+      <a class="desk-only" href="/sleeves/new" {{ 'aria-current=page' if here == '/sleeves/new' }}>New sleeve</a>
+    </nav>
+    <div class="rail-foot">
+      <div class="meta">Version {{ shell.version }}</div>
+    </div>
+  </aside>
+  <div>
+    <div class="strip" role="status">
+      <span class="mode">{{ 'Live trading' if shell.mode == 'live' else 'Paper trading' }}</span>
+      <span class="wide">{{ 'Live trading locked until G2 is approved' if shell.live_locked else 'Live trading enabled' }}</span>
+      <span class="sep"></span>
+      <span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} sleeves running{% endif %}</span>
+      <span class="wide">Prices: Kraken live feed</span>
+      <span class="clock" id="clock" data-now="{{ shell.now.isoformat() }}">{{ shell.now.strftime('%H:%M') }} UTC</span>
+    </div>
+    <main>
 {% block content %}{% endblock %}
-</main>
+    </main>
+  </div>
+</div>
+<script>
+(() => {
+  const el = document.getElementById("clock");
+  const fmt = (tz) => new Date().toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit", timeZone: tz});
+  const tick = () => { el.textContent = `${fmt("UTC")} UTC · ${fmt("Europe/London")} London`; };
+  tick(); setInterval(tick, 15000);
+})();
+</script>
+{% block scripts %}{% endblock %}
 </body>
 </html>

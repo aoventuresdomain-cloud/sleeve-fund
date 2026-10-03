@@ -29,7 +29,7 @@ dev = ["pytest>=8", "httpx>=0.27"]
 include = ["sleeve_fund*"]
 
 [tool.setuptools.package-data]
-"sleeve_fund.dashboard" = ["templates/*.html", "static/*"]
+"sleeve_fund.dashboard" = ["templates/*.html", "static/*", "static/fonts/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

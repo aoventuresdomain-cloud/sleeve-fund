@@ -8,6 +8,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
+    summary="Holds the coin while the {fast}-bar average is above the {slow}-bar average, otherwise cash.",
     name="trend_filter",
     family="trend",
     idea="Only hold the coin when the 50-day average is above the 200-day average.",
@@ -47,3 +48,10 @@ class TrendFilter(LongFlatStrategy):
         if not (self.fast.initialized and self.slow.initialized):
             return None
         return self.fast.value > self.slow.value
+
+    def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
+        f, s, c = self.fast.value, self.slow.value, self._cfg
+        rel = "above" if target else "below"
+        gap = f / s - 1 if s else 0.0
+        return (f"{c.fast}-bar average {f:,.6g} is {rel} the {c.slow}-bar average {s:,.6g} ({gap:+.2%})",
+                {f"sma_{c.fast}": f, f"sma_{c.slow}": s, "gap": gap})

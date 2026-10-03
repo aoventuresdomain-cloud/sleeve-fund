@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, usage %}
+{% block title %}Operations · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Operations</h1>
+  <p class="lede">Is everything running, fed and checked? Each sleeve is its own process on the server; the supervisor restarts any that stop.</p>
+</div>
+
+<section class="panel flush" style="margin-bottom:14px" aria-labelledby="proc-h">
+  <div class="panel-head"><h2 id="proc-h">Sleeve processes</h2></div>
+  <table class="responsive">
+    <thead><tr><th>Sleeve</th><th>Wanted</th><th>Heartbeat</th><th>Last price mark</th><th>Balance check</th><th>Last start</th><th class="num">Waiting commands</th><th class="num">Errors</th></tr></thead>
+    <tbody>{% for p in ops.procs %}{% set x = p.x %}{% set s = x.sleeve %}
+    <tr>
+      <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
+      <td data-m="hide">{{ s.desired_state|capitalize }}</td>
+      <td data-m="right">{% if x.healthy %}<span class="dot ok"></span>{% elif s.desired_state == 'running' %}<span class="dot stale"></span>{% else %}<span class="dot"></span>{% endif %}{{ s.heartbeat_at|ago }}</td>
+      <td data-m="hide">{% if p.mark_age is not none %}{{ p.mark_age|held }} ago{% else %}<span class="muted">none yet</span>{% endif %}</td>
+      <td data-label="Balance check">{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches' }}</span> <span class="muted">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">not yet</span>{% endif %}</td>
+      <td data-m="hide">{% if p.restart %}{{ p.restart.ts|ago }} <span class="muted">({{ p.restart.kind }})</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
+      <td class="num" data-m="hide">{{ p.pending }}</td>
+      <td class="num" data-m="hide">{% if p.errors %}<span class="loss">{{ p.errors }}</span>{% else %}0{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table>
+</section>
+
+<div class="grid">
+  <section class="panel span-6" aria-labelledby="srv-h">
+    <div class="panel-head"><h2 id="srv-h">Server</h2><span class="hint">as seen by the dashboard</span></div>
+    <table class="compact kv">
+      <tr><th scope="row">Version</th><td class="num">{{ shell.version }}</td></tr>
+      <tr><th scope="row">Disk</th><td class="num">{{ usage(ops.disk.share) }} <span class="muted">{{ ops.disk.used|bytes }} of {{ ops.disk.total|bytes }}</span></td></tr>
+      <tr><th scope="row">Memory</th><td class="num">{% if ops.memory %}{{ usage(ops.memory.share) }} <span class="muted">{{ ops.memory.used|bytes }} of {{ ops.memory.total|bytes }}</span>{% else %}n/a{% endif %}</td></tr>
+      <tr><th scope="row">Load</th><td class="num">{{ '%.2f'|format(ops.load[0]) }} <span class="muted">over {{ ops.cpus }} CPU{{ 's' if ops.cpus != 1 }}, 1-minute average</span></td></tr>
+      <tr><th scope="row">Database size</th><td class="num">{{ ops.db_bytes|bytes }}</td></tr>
+    </table>
+  </section>
+  <section class="panel span-6" aria-labelledby="jr-h">
+    <div class="panel-head"><h2 id="jr-h">Journal</h2><span class="hint">rows kept</span></div>
+    <table class="compact kv">
+      {% for name, label in [('equity', 'Equity marks'), ('fills', 'Fills'), ('events', 'Events'), ('decisions', 'Decisions'), ('commands', 'PM commands'), ('sleeves', 'Sleeves')] %}
+      <tr><th scope="row">{{ label }}</th><td class="num">{{ '{:,}'.format(ops.tables[name]) }}</td></tr>{% endfor %}
+    </table>
+  </section>
+</div>
+
+<section class="panel" aria-labelledby="safe-h">
+  <div class="panel-head"><h2 id="safe-h">Safety nets</h2></div>
+  <table class="compact kv">
+    <tr><th scope="row">Risk guard</th><td>On for every sleeve: halts at the drawdown limit, pauses at the daily-loss limit.</td></tr>
+    <tr><th scope="row">Balance reconciliation</th><td>On: at every start and every 24 hours; a mismatch halts the sleeve.</td></tr>
+    <tr><th scope="row">Outside alerts (Telegram)</th><td><span class="warn">Not set up yet.</span> Planned for M2.</td></tr>
+    <tr><th scope="row">Dead man's switch</th><td><span class="warn">Not set up yet.</span> Planned for M2: alerts if the server itself goes quiet.</td></tr>
+    <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>
+  </table>
+</section>
+{% endblock %}

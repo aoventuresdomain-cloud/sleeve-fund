@@ -1,47 +1,122 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, usage %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark %}
+{% block title %}Portfolio · Sleeve Fund{% endblock %}
 {% block content %}
-<h1>Portfolio</h1>
-<p class="sub">
-  {% if book.attention %}<span class="bad">{{ book.attention }} sleeve{{ 's' if book.attention != 1 }} need{{ 's' if book.attention == 1 }} you.</span>
-  {% elif book.unhealthy %}<span class="bad">{{ book.unhealthy }} sleeve{{ 's' if book.unhealthy != 1 }} not reporting.</span>
-  {% else %}All sleeves healthy.{% endif %}
-  Paper money only; prices are live from Kraken.
-</p>
-<div class="tiles">
-  <div class="tile"><div class="k">Paper equity</div><div class="v">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
-  <div class="tile"><div class="k">Return</div><div class="v">{{ signed(book.ret) }}</div><div class="s">buy-and-hold {{ book.bench_ret|pct }}</div></div>
-  <div class="tile"><div class="k">Sleeves running</div><div class="v">{{ book.running }} / {{ book.sleeves }}</div><div class="s">{{ book.attention }} halted or in error</div></div>
+<div class="page-head">
+  <h1>Portfolio</h1>
+  <div class="actions"><a class="button secondary" href="/sleeves/new">New sleeve</a></div>
+  <p class="lede">
+    {% if book.attention %}<span class="loss">{{ book.attention }} sleeve{{ 's' if book.attention != 1 }} halted and waiting for you.</span>
+    {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} sleeve{{ 's' if book.unhealthy != 1 }} not reporting.</span>
+    {% else %}All sleeves healthy.{% endif %}
+    Marked to Kraken prices, after fees.
+  </p>
 </div>
 
-<h2>Sleeves</h2>
-<div class="panel">
 {% if summaries %}
-<table>
-  <tr><th>Sleeve</th><th>Status</th><th>Strategy</th><th class="num">Equity</th><th class="num">Return</th><th class="num">vs buy-and-hold</th><th class="num">Trades · win rate</th><th>Drawdown vs limit</th><th>Reporting</th></tr>
-  {% for x in summaries %}
-  <tr>
-    <td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a><div class="muted" style="font-size:12px">{{ x.sleeve.instrument }} · {{ x.sleeve.bar_spec.split('-')[0] }} {{ x.sleeve.bar_spec.split('-')[1]|lower }}</div></td>
-    <td>{{ chip(x.sleeve.status) }}</td>
-    <td>{{ x.sleeve.strategy }}</td>
-    <td class="num">{{ x.equity|money }}</td>
-    <td class="num">{{ signed(x.ret) }}</td>
-    <td class="num">{{ signed(x.ret - x.bench_ret) }}</td>
-    <td class="num">{{ x.trades.trades }}{% if x.trades.trades %} · {{ x.trades.win_rate|pct0 }}{% endif %}</td>
-    <td>{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct0 }} / {{ x.profile.max_drawdown|pct0 }}</span></td>
-    <td>{% if x.healthy %}<span class="good">live</span>{% elif x.sleeve.desired_state == 'stopped' %}<span class="muted">stopped</span>{% else %}<span class="bad">silent</span>{% endif %}</td>
-  </tr>
-  {% endfor %}
-</table>
-{% else %}
-<p>No sleeves yet. <a href="/sleeves/new">Start a paper sleeve</a>.</p>
-{% endif %}
+<section class="ledger" aria-label="Book figures">
+  <div><div class="k">Book equity</div><div class="v lead">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
+  <div><div class="k">Today</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">since 00:00 UTC</div></div>
+  <div><div class="k">Month to date</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
+  <div><div class="k">Since start</div><div class="v">{{ signed(book.ret) }}</div><div class="s">holding: {{ book.bench_ret|pct1s }}</div></div>
+  <div><div class="k">In the market</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in coins</div></div>
+  <div><div class="k">Cash</div><div class="v">{{ book.cash|money }}</div><div class="s">open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
+  <div><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
+  <div><div class="k">Sharpe</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
+  <div><div class="k">Fees paid</div><div class="v">{{ book.fees|money }}</div><div class="s">volatility {{ book.vol|pctn0 }} a year</div></div>
+</section>
+
+<div class="grid">
+  <section class="panel span-8" aria-labelledby="curve-h">
+    <div class="panel-head"><h2 id="curve-h">Book equity against buy-and-hold</h2>
+      <div class="right range" role="group" aria-label="Range">
+        <button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button>
+      </div></div>
+    <div class="chart"><canvas id="eq" aria-label="Book equity and buy-and-hold by day"></canvas></div>
+    <div class="chart short"><canvas id="dd" aria-label="Book drawdown by day"></canvas></div>
+  </section>
+  <section class="panel span-4" aria-labelledby="alerts-h">
+    <div class="panel-head"><h2 id="alerts-h">Needs attention</h2><a class="right" href="/alerts">All alerts</a></div>
+    {% if alerts %}
+    <ul class="alerts">
+      {% for a in alerts[:6] %}
+      <li class="{{ a.level }}"><div><div class="when">{{ a.ts|ago }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</div><div class="msg">{{ a.message }}</div></div>
+        <form method="post" action="/alerts/{{ a.id }}/ack"><input type="hidden" name="next" value="/"><button class="quiet" title="Mark as seen">Acknowledge</button></form></li>
+      {% endfor %}
+    </ul>
+    {% if alerts|length > 6 %}<p class="muted" style="margin:8px 0 0">{{ alerts|length - 6 }} more in <a href="/alerts">Alerts</a>.</p>{% endif %}
+    {% else %}<p class="empty">Nothing needs you. Warnings and errors from any sleeve land here.</p>{% endif %}
+  </section>
 </div>
 
-<h2>Alerts</h2>
-{% for a in alerts %}
-<div class="alert {{ a.level }}"><span class="when">{{ a.ts|ts }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</span><br>{{ a.message }}</div>
+<section class="panel flush" aria-labelledby="sleeves-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="sleeves-h">Sleeves</h2><span class="hint">Select a column to sort</span></div>
+  <table class="responsive sortable">
+    <thead><tr>
+      <th data-sort="text">Sleeve</th><th data-sort="text">Status</th><th>Last 60 days</th>
+      <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
+      <th class="num" data-sort="num" title="Sleeve return minus buy-and-hold return over the same period">vs buy-and-hold</th>
+      <th class="num" data-sort="num">In market</th><th class="num" data-sort="num">Closed trades</th>
+      <th data-sort="num">Drawdown of limit</th><th>Health</th>
+    </tr></thead>
+    <tbody>
+    {% for x in summaries %}{% set s = x.sleeve %}
+    <tr>
+      <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
+      <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span></td>
+      <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
+      <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
+      <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
+      <td class="num" data-v="{{ x.ret }}" data-label="Since start">{{ signed(x.ret) }}</td>
+      <td class="num" data-v="{{ x.ret - x.bench_ret }}" data-m="right" data-label="vs buy-and-hold">{{ signed(x.ret - x.bench_ret) }}</td>
+      <td class="num" data-v="{{ x.exposure }}" data-m="hide">{{ x.exposure|pct0 }}</td>
+      <td class="num" data-v="{{ x.trades.trades }}" data-m="hide">{{ x.trades.trades }}{% if x.trades.trades %} <span class="muted">· {{ x.trades.win_rate|pct0 }} won</span>{% endif %}</td>
+      <td data-v="{{ x.dd_used }}" data-m="hide">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
+      <td data-m="hide">
+        {% if s.desired_state == 'stopped' %}<span class="muted">Stopped</span>
+        {% elif x.healthy %}<span title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot ok"></span>{{ s.heartbeat_at|ago }}</span>
+        {% else %}<span class="loss" title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot stale"></span>Silent {{ s.heartbeat_at|ago }}</span>{% endif %}
+        {% if x.reconcile %}<span class="sub2 {{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else 'muted' }}" style="display:block;font-size:12px">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Reconciled' }} {{ x.reconcile.ts|ago }}</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<div class="grid">
+  <section class="panel span-5" aria-labelledby="alloc-h">
+    <div class="panel-head"><h2 id="alloc-h">Where the money is</h2><span class="hint">share of book equity</span></div>
+    {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
+    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.share * 100)|round(2) }}%; background: {{ 'var(--neutral-bg)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
+    <table class="compact">
+      <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
+      <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--neutral-bg)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </section>
+  <section class="panel span-7" aria-labelledby="corr-h">
+    <div class="panel-head"><h2 id="corr-h">How the sleeves move together</h2><span class="hint">correlation of daily returns, 1 = in lockstep</span></div>
+    {% if book.correlation.matrix %}
+    <div style="overflow-x:auto"><table class="corr">
+      <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
+      {% for row in book.correlation.matrix %}{% set ri = loop.index0 %}{% set rn = book.correlation.names[ri] %}
+      <tr><th scope="row" class="row">{{ rn }}</th>{% for v in row %}
+        {% if loop.index0 == ri %}<td class="self">·</td>{% elif v is none %}<td class="faint">n/a</td>
+        {% else %}<td style="background: color-mix(in srgb, {{ 'var(--loss)' if v >= 0 else 'var(--accent)' }} {{ (v|abs * 55)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
+      {% endfor %}</tr>{% endfor %}
+    </table></div>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">High numbers mean the sleeves win and lose together, so the book is less diversified than the sleeve count suggests. Flat periods count as no movement.</p>
+    {% else %}<p class="empty">Needs two sleeves with at least 20 days of history.</p>{% endif %}
+  </section>
+</div>
 {% else %}
-<p class="muted">Nothing needs you.</p>
-{% endfor %}
+<section class="panel"><p class="empty">No sleeves yet. A sleeve runs one strategy on one Kraken pair with its own capital and risk limits.</p>
+  <p><a class="button" href="/sleeves/new">Create the first sleeve</a></p></section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/chart.umd.min.js"></script>
+<script src="/static/console.js"></script>
+<script>Console.sortable(); Console.bookCharts("/api/book/equity");</script>
 {% endblock %}

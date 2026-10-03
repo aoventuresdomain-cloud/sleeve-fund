@@ -1,36 +1,71 @@
 {% extends "base.html" %}
-{% block title %}New paper sleeve · Sleeve Fund{% endblock %}
+{% block title %}New sleeve · Sleeve Fund{% endblock %}
 {% block content %}
-<h1>New paper sleeve</h1>
-<p class="sub">Runs on live Kraken prices with paper money and Kraken's fees. It starts within a few seconds of saving.</p>
-{% if error %}<div class="error-box">{{ error }}</div>{% endif %}
-<form method="post" action="/sleeves/new" class="panel">
-  <div class="grid2">
-    <div class="field"><label>Name</label><input name="name" placeholder="eth-trend-fast" pattern="[a-z0-9][a-z0-9-]{1,40}" required></div>
-    <div class="field"><label>Strategy</label>
-      <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == 'trend_filter' }}>{{ st.name }} ({{ st.family }})</option>{% endfor %}</select></div>
-    <div class="field"><label>Asset pair (any Kraken spot pair, BASE/QUOTE)</label><input name="instrument" list="pairs" value="BTC/USD" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist></div>
-    <div class="field"><label>Bar size</label><select name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == '1-HOUR-LAST-INTERNAL' }}>{{ bar_label(b) }}</option>{% endfor %}</select></div>
-    <div class="field"><label>Paper balance (quote currency)</label><input name="starting_balance" type="number" min="100" step="100" value="10000" required></div>
-    <div class="field"><label>Max per order (optional)</label><input name="max_notional" type="number" min="10" step="10"></div>
-    <div class="field"><label>Stop-loss % below entry (optional)</label><input name="stop_loss_pct" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 8"></div>
-    <div class="field"><label>Take-profit % above entry (optional)</label><input name="take_profit_pct" type="number" min="0.1" max="1000" step="0.1" placeholder="e.g. 20"></div>
-    <div class="field"><label>Risk per trade, % of equity (needs a stop)</label><input name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 1"></div>
-    <div class="field"><label>Risk profile</label><select name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == 'balanced' }}>{{ p.name }}: halt at {{ p.max_drawdown|pct0 }} drawdown, max {{ p.max_position_pct|pct0 }} in the market</option>{% endfor %}</select></div>
-    <div class="field"><label>Warm-up bars (EXTERNAL bar sizes only)</label><input name="warmup_bars" type="number" min="0" max="720" value="0"></div>
+<div class="page-head">
+  <h1>New sleeve</h1>
+  <p class="lede">One strategy on one Kraken pair, with its own capital and limits. It starts within seconds of saving, in paper mode: live prices and Kraken's fees, simulated money. Live mode unlocks after G2.</p>
+</div>
+{% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
+<form method="post" action="/sleeves/new" id="sleeve-form" class="grid">
+  <div class="span-7">
+    <fieldset class="panel step">
+      <legend>1. Market</legend>
+      <div class="grid2">
+        <div class="field"><label for="instrument">Kraken pair</label><input id="instrument" name="instrument" list="pairs" value="BTC/USD" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off" aria-describedby="pair-hint"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist><p class="hint" id="pair-hint">Any spot pair Kraken lists, written COIN/CURRENCY.</p></div>
+        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == '1-HOUR-LAST-INTERNAL' }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">How often the strategy looks at the market and may trade.</p></div>
+      </div>
+    </fieldset>
+    <fieldset class="panel step">
+      <legend>2. Strategy</legend>
+      <div class="field"><label for="strategy">Strategy</label>
+        <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}">{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
+      {% for st in strategies %}
+      <div class="params" data-strategy="{{ st.name }}">
+        <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span> <a href="/strategies/{{ st.name }}">Details and evidence</a></p>
+        {% if st.params %}<div class="grid2">{% for k, v in st.params.items() %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ k|replace('_', ' ')|capitalize }}</label><input id="p-{{ st.name }}-{{ k }}" name="p_{{ st.name }}__{{ k }}" value="{{ v }}" inputmode="decimal"></div>{% endfor %}</div>{% endif %}
+      </div>
+      {% endfor %}
+    </fieldset>
+    <fieldset class="panel step">
+      <legend>3. Capital and risk</legend>
+      <div class="grid2">
+        <div class="field"><label for="starting_balance">Capital, in the pair's currency</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="10000" required></div>
+        <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == 'balanced' }} data-dd="{{ p.max_drawdown }}" data-day="{{ p.daily_loss }}" data-cap="{{ p.max_position_pct }}">{{ p.name|capitalize }}: halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
+        <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap"></div>
+        <div class="field"><label for="warmup_bars">History to load at start (bars)</label><input id="warmup_bars" name="warmup_bars" type="number" min="0" max="720" value="0"><p class="hint">Only for Kraken-candle intervals; lets indicators start ready.</p></div>
+      </div>
+    </fieldset>
+    <fieldset class="panel step">
+      <legend>4. Exits (optional)</legend>
+      <div class="grid2">
+        <div class="field"><label for="stop_loss_pct">Stop-loss, % below entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.1" placeholder="None"></div>
+        <div class="field"><label for="take_profit_pct">Take-profit, % above entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.1" placeholder="None"></div>
+        <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None"><p class="hint">Sizes each trade so hitting the stop loses this much. Needs a stop-loss.</p></div>
+      </div>
+    </fieldset>
+    <fieldset class="panel step">
+      <legend>5. Name and reason</legend>
+      <div class="grid2">
+        <div class="field"><label for="name">Sleeve name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9-]{1,40}" required><p class="hint">Lower-case letters, digits and dashes.</p></div>
+        <div class="field"><label for="reason">Why start it?</label><input id="reason" name="reason" required placeholder="Recorded in the decision log"></div>
+      </div>
+    </fieldset>
   </div>
-  {% for st in strategies %}
-  <div class="params" data-strategy="{{ st.name }}" style="margin-top:14px">
-    <p class="muted" style="margin:0 0 8px">{{ st.idea }}</p>
-    <div class="grid2">{% for k, v in st.params.items() %}<div class="field"><label>{{ k }}</label><input name="p_{{ st.name }}__{{ k }}" value="{{ v }}"></div>{% endfor %}</div>
-  </div>
-  {% endfor %}
-  <div class="field" style="margin-top:14px"><label>Why are you starting this sleeve?</label><input name="reason" required placeholder="Goes in the decision log"></div>
-  <p style="margin-top:14px"><button>Start paper sleeve</button></p>
+
+  <aside class="span-5">
+    <div class="panel sticky" aria-live="polite">
+      <div class="panel-head"><h2>This sleeve will</h2></div>
+      <ul class="summary" id="summary"></ul>
+      <div id="g1-note" class="banner warn" hidden>This strategy has not passed G1 on real data. It can run on paper as an observation; its results are not evidence.</div>
+      <div class="panel-head" style="margin-top:14px"><h2>Look-back</h2><button type="button" class="quiet right" id="run-preview">Run on Kraken history</button></div>
+      <div id="preview"><p class="muted" style="margin:0;font-size:12.5px">Runs these exact settings over Kraken's last two years of daily candles, with fees. It uses daily decisions whatever interval you pick, and it is in-sample: a sense check, not a G1 test.</p></div>
+      <p style="margin:16px 0 0"><button>Start sleeve in paper mode</button></p>
+    </div>
+  </aside>
 </form>
-<script>
-const sel = document.getElementById("strategy");
-const sync = () => document.querySelectorAll(".params").forEach(p => p.style.display = p.dataset.strategy === sel.value ? "" : "none");
-sel.addEventListener("change", sync); sync();
-</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/chart.umd.min.js"></script>
+<script src="/static/console.js"></script>
+<script>Console.sleeveForm();</script>
 {% endblock %}

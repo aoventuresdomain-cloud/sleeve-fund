@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Alerts · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Alerts</h1>
+  <div class="actions range" role="group" aria-label="Show">
+    <a class="button {{ '' if show == 'open' else 'secondary' }}" href="/alerts">Open</a>
+    <a class="button {{ '' if show == 'all' else 'secondary' }}" href="/alerts?show=all">All, including acknowledged</a>
+  </div>
+  <p class="lede">Warnings and errors from every sleeve. Acknowledging records that you have seen it; it does not change the sleeve.</p>
+</div>
+<section class="panel">
+{% if alerts %}
+<ul class="alerts">
+  {% for a in alerts %}
+  <li class="{{ a.level }}">
+    <div><div class="when">{{ a.ts|ts }} · {{ a.ts|ago }} · {{ a.level|capitalize }} · {{ a.kind|replace('_', ' ') }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</div>
+      <div class="msg">{{ a.message }}</div>
+      {% if a.acked_at %}<div class="acked">Acknowledged by {{ a.acked_by }} {{ a.acked_at|ago }}{% if a.ack_note %}: {{ a.ack_note }}{% endif %}</div>{% endif %}</div>
+    {% if not a.acked_at %}
+    <form method="post" action="/alerts/{{ a.id }}/ack" class="inline">
+      <input name="note" placeholder="Note (optional)" aria-label="Note" style="width:180px">
+      <input type="hidden" name="next" value="/alerts{{ '?show=all' if show == 'all' }}">
+      <button class="quiet">Acknowledge</button>
+    </form>{% else %}<span></span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p class="empty">{{ 'No open alerts. Anything a sleeve warns about lands here.' if show == 'open' else 'No alerts recorded yet.' }}</p>{% endif %}
+</section>
+{% endblock %}
