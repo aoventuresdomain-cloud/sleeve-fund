@@ -68,3 +68,38 @@ def test_stop_rests_at_the_venue_and_is_journaled(prices, instrument):
     stop = res.fills.iloc[1]
     assert float(stop["avg_px"]) == pytest.approx(10_000 * 0.95, rel=0.002)  # at the level, not a bar close
     assert res.decisions[res.fills.index[1]]["intent"] == "stop_loss"
+
+
+def test_a_runtime_passed_in_rests_its_stop_like_every_backtest(instrument):
+    """Same bars, same 10% stop: the fill is the same with or without a runtime (review R2-B4)."""
+    import pandas as pd
+
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import Store
+
+    idx = pd.date_range("2024-01-02", periods=6, freq="1D", tz="UTC")
+    c, o = [100, 110, 120, 80, 85, 90], [100, 105, 118, 119, 82, 86]
+    df = pd.DataFrame({"open": o, "high": [max(a, b) + 1 for a, b in zip(o, c)],
+                       "low": [min(a, b) - 1 for a, b in zip(o, c)], "close": c, "volume": 1e6}, index=idx)
+    plain = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.10}, half_spread=0)
+    store = Store.in_memory()
+    store.create_sleeve(name="x", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, params={"stop_loss": 0.10}, risk_profile="aggressive")
+    rt = SleeveRuntime(store, "x", tick_seconds=86_400)
+    guarded = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.10}, runtime=rt, half_spread=0)
+    assert float(plain.fills["avg_px"].iloc[-1]) == pytest.approx(90.0)
+    assert float(guarded.fills["avg_px"].iloc[-1]) == pytest.approx(90.0)
+    assert [(o["intent"], o["side"]) for o in reversed(store.orders("x"))] == [("entry", "BUY"), ("stop_loss", "SELL")]
+
+
+def test_trend_filter_runs_minute_bars_quickly(instrument):
+    """30 days of 1-minute bars with volatility targeting (43,200-bar window) in seconds (review R2-B3)."""
+    import time
+
+    from sleeve_fund.data import synthetic_ohlcv
+
+    df = synthetic_ohlcv(days=30 * 1440, seed=2, vol=0.0008)
+    df.index = df.index[0] + (df.index - df.index[0]) / 1440  # daily rows re-stamped a minute apart
+    t = time.perf_counter()
+    run_backtest("trend_filter", df, instrument, {"fast": 50, "slow": 200, "vol_target": 0.4}, bar_minutes=1)
+    assert time.perf_counter() - t < 20
