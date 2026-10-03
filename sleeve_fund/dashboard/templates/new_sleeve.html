@@ -7,6 +7,7 @@
   <p class="lede">One strategy on one Kraken pair, with its own capital and limits. It starts within seconds of saving, in paper mode: live prices and Kraken's fees, simulated money. Live mode unlocks after G2.</p>
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
+{% if pre.get('from') == 'clone' %}<div class="banner">Settings copied from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>. Change what you want to test, give it a reason, and start it on paper. {{ pre.get('source') }} keeps running unchanged.</div>{% endif %}
 {% if pre.get('from') == 'backtest' %}<div class="banner">Settings carried over from your backtest. Pick a decision interval, a name and a reason, then start it on paper.</div>{% endif %}
 <form method="post" action="/sleeves/new" id="sleeve-form" class="grid">
   <div class="span-7">
@@ -38,7 +39,7 @@
     <fieldset class="panel step">
       <legend>5. Name and reason</legend>
       <div class="grid2">
-        <div class="field"><label for="name">Sleeve name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9-]{1,40}" required value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
+        <div class="field"><label for="name">Sleeve name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}><p class="hint">Lower-case letters, digits and dashes.</p></div>
         <div class="field"><label for="reason">Why start it?</label><input id="reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
       </div>
     </fieldset>

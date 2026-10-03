@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, usage %}
+{% from "_macros.html" import chip, usage, help %}
 {% block title %}Risk · Sleeve Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -8,7 +8,7 @@
 </div>
 
 <section class="ledger" aria-label="Book risk">
-  <div><div class="k">In the market</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
+  <div><div class="k">In the market {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">share of book equity</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>

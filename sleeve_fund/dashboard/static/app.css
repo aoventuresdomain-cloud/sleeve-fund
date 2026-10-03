@@ -387,6 +387,18 @@ pre.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-siz
 .pc-foot, .pc-source { font-size: 12px; color: var(--faint); margin: 8px 0 0; }
 .pc-source { color: var(--warn); }
 @media (max-width: 900px) { .pc-canvas { height: 320px; } }
+/* --- onboarding, help, path to live ---------------------------------------------- */
+ol.onboard-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+ol.onboard-steps li { display: flex; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+ol.onboard-steps .n { flex: none; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--raised); font-weight: 700; }
+ol.onboard-steps p { margin: 4px 0 10px; color: var(--muted); }
+.help { display: inline-grid; place-items: center; width: 15px; height: 15px; margin-left: 4px; padding: 0; border-radius: 50%; border: 1px solid var(--line-strong); background: none; color: var(--muted); font-size: 10px; font-weight: 700; line-height: 1; vertical-align: 1px; cursor: help; }
+.help:hover, .help[aria-expanded="true"] { color: var(--text); border-color: var(--text); }
+.help-pop { position: absolute; z-index: 30; max-width: 280px; padding: 8px 10px; border-radius: 6px; background: var(--text); color: var(--page); font-size: 12.5px; font-weight: 400; line-height: 1.4; text-transform: none; letter-spacing: 0; box-shadow: 0 6px 20px rgb(0 0 0 / .25); }
+ul.checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+ul.checklist li { display: grid; grid-template-columns: 20px 1fr; gap: 8px; }
+ul.checklist .mark { font-weight: 700; } ul.checklist .ok .mark { color: var(--gain); } ul.checklist .todo .mark { color: var(--muted); } ul.checklist .bad .mark { color: var(--loss); }
+ul.checklist small { display: block; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */
@@ -420,3 +432,13 @@ form.filters select, form.filters input { height: 36px; box-sizing: border-box; 
 form.filters .field { min-width: 150px; }
 table.heat td { min-width: 62px; }
 table.heat th.row a { color: var(--text); }
+
+/* new-sleeve steps */
+.wiz-nav { display: flex; gap: 6px; margin: 0 0 14px; padding: 0; list-style: none; overflow-x: auto; counter-reset: none; }
+.wiz-nav button { white-space: nowrap; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: none; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.wiz-nav button.done { color: var(--text); }
+.wiz-nav button[aria-current="step"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.wiz-buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; clear: both; }
+.wiz-buttons [hidden] { display: none; }
+ul.checklist.cols { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); column-gap: 20px; }
+fieldset.step[hidden] { display: none; }

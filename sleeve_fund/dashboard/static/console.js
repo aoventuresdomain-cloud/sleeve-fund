@@ -249,6 +249,7 @@ window.Console = (() => {
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
+    wizard(form);
 
     let chart;
     document.getElementById("run-preview").addEventListener("click", async (ev) => {
@@ -288,6 +289,57 @@ window.Console = (() => {
         btn.disabled = false; btn.textContent = "Run again";
       }
     });
+  }
+
+  // The new-sleeve form one section at a time, with Next and Back. Without JavaScript every section shows.
+  function wizard(form) {
+    const steps = [...form.querySelectorAll("fieldset.step")];
+    if (steps.length < 2) return;
+    const make = (tag, props) => Object.assign(document.createElement(tag), props);
+    const nav = make("ol", {className: "wiz-nav"});
+    nav.setAttribute("aria-label", "Steps");
+    const bar = make("div", {className: "wiz-buttons"});
+    const back = make("button", {type: "button", className: "secondary", textContent: "Back"});
+    const next = make("button", {type: "button", textContent: "Next"});
+    const go = form.querySelector("aside button:not([type=button])").cloneNode(true);
+    bar.append(back, next, go);
+    let at = 0;
+    const show = (i, focus = true) => {
+      at = i;
+      steps.forEach((s, j) => { s.hidden = j !== i; });
+      tabs.forEach((b, j) => { b.setAttribute("aria-current", j === i ? "step" : "false"); b.classList.toggle("done", j < i); });
+      back.hidden = i === 0; next.hidden = i === steps.length - 1; go.hidden = !next.hidden;
+      steps[i].append(bar);
+      nav.scrollLeft = tabs[i].parentElement.offsetLeft - nav.offsetLeft - 8;  // keep the current step in view on a phone
+      if (focus) { steps[i].scrollIntoView({block: "nearest"}); steps[i].querySelector("input:not([type=hidden]), select")?.focus({preventScroll: true}); }
+    };
+    const valid = () => {
+      const bad = [...steps[at].querySelectorAll("input, select")].find((el) => !el.checkValidity());
+      if (bad) bad.reportValidity();
+      return !bad;
+    };
+    const tabs = steps.map((s, i) => {
+      const b = make("button", {type: "button", textContent: s.querySelector("legend").textContent});
+      b.addEventListener("click", () => { if (i <= at || valid()) show(i); });
+      nav.append(make("li")); nav.lastChild.append(b);
+      return b;
+    });
+    form.before(nav);
+    back.addEventListener("click", () => show(at - 1));
+    next.addEventListener("click", () => { if (valid()) show(at + 1); });
+    // Enter moves on rather than submitting from the middle of the form.
+    form.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.target.tagName === "INPUT" && at < steps.length - 1) { e.preventDefault(); next.click(); }
+    });
+    // If the browser blocks a submit, open the step holding the first field it complains about.
+    let jumped = false;
+    form.addEventListener("invalid", (e) => {
+      if (jumped) return;
+      jumped = true; setTimeout(() => { jumped = false; });
+      const i = steps.findIndex((s) => s.contains(e.target));
+      if (i >= 0 && i !== at) show(i, false);
+    }, true);
+    show(0, false);
   }
 
   return {sortable, dialogs, whys, strategyPicker, priceChart, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};

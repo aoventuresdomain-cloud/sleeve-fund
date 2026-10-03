@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, help %}
 {% block title %}Portfolio · Sleeve Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -13,17 +13,17 @@
   </p>
 </div>
 
-{% if summaries %}
+{% if summaries or archived %}
 <section class="ledger" aria-label="Book figures">
-  <div><div class="k">Book equity</div><div class="v lead">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
-  <div><div class="k">Today</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">since 00:00 UTC</div></div>
-  <div><div class="k">Month to date</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
-  <div><div class="k">Since start</div><div class="v">{{ signed(book.ret) }}</div><div class="s">holding: {{ book.bench_ret|pct1s }}</div></div>
-  <div><div class="k">In the market</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in coins</div></div>
-  <div><div class="k">Cash</div><div class="v">{{ book.cash|money }}</div><div class="s">open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
-  <div><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
-  <div><div class="k">Sharpe</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
-  <div><div class="k">Fees paid</div><div class="v">{{ book.fees|money }}</div><div class="s">volatility {{ book.vol|pctn0 }} a year</div></div>
+  <div><div class="k">Book equity {{ help('equity') }}</div><div class="v lead">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
+  <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">since 00:00 UTC</div></div>
+  <div><div class="k">Month to date {{ help('mtd') }}</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
+  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">holding: {{ book.bench_ret|pct1s }}</div></div>
+  <div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in coins</div></div>
+  <div><div class="k">Cash {{ help('cash') }}</div><div class="v">{{ book.cash|money }}</div><div class="s">open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
+  <div><div class="k">Drawdown {{ help('drawdown') }}</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
+  <div><div class="k">Sharpe {{ help('sharpe') }}</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
+  <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ book.fees|money }}</div><div class="s">volatility {{ book.vol|pctn0 }} a year</div></div>
 </section>
 
 <div class="grid">
@@ -60,6 +60,7 @@
       <th data-sort="num">Drawdown of limit</th><th>Health</th>
     </tr></thead>
     <tbody>
+    {% if not summaries %}<tr><td colspan="11" class="empty">Every sleeve is archived. <a href="/sleeves/new">Start a new sleeve</a> or restore one below.</td></tr>{% endif %}
     {% for x in summaries %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
@@ -83,6 +84,15 @@
     </tbody>
   </table>
 </section>
+
+{% if archived %}
+<details class="panel archived" style="margin-bottom:14px">
+  <summary><strong>Archived sleeves ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
 
 <div class="grid">
   <section class="panel span-5" aria-labelledby="alloc-h">
@@ -110,8 +120,15 @@
   </section>
 </div>
 {% else %}
-<section class="panel"><p class="empty">No sleeves yet. A sleeve runs one strategy on one Kraken pair with its own capital and risk limits.</p>
-  <p><a class="button" href="/sleeves/new">Create the first sleeve</a></p></section>
+<section class="panel onboard" aria-labelledby="ob-h">
+  <div class="panel-head"><h2 id="ob-h">Get started in three steps</h2></div>
+  <p class="muted" style="margin:0 0 14px">A sleeve runs one strategy on one Kraken pair, with its own capital and risk limits. Every sleeve starts on paper: live prices and fees, simulated money.</p>
+  <ol class="onboard-steps">
+    <li><span class="n">1</span><div><strong>Test an idea</strong><p>Run a strategy over two years of Kraken prices and see every trade and why it happened.</p><a class="button secondary" href="/backtest">Open Backtest</a></div></li>
+    <li><span class="n">2</span><div><strong>Start it on paper</strong><p>One click from a backtest, or set it up yourself. Pick the pair, the settings, the capital and a risk profile.</p><a class="button" href="/sleeves/new">+ New sleeve</a></div></li>
+    <li><span class="n">3</span><div><strong>Watch and judge</strong><p>Positions, orders and the reason behind each trade show here as they happen. Live trading unlocks only after you approve G2.</p><a class="button secondary" href="/accounts">Set up accounts</a></div></li>
+  </ol>
+</section>
 {% endif %}
 {% endblock %}
 

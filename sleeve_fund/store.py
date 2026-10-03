@@ -183,6 +183,13 @@ account_keys_t = Table(
     Column("present", Integer, nullable=False),  # 1 if the supervisor sees both key and secret
     Column("checked_at", TS, nullable=False),
 )
+# Stopped sleeves the PM has put away. Their history stays; they just leave the everyday lists.
+sleeve_archive_t = Table(
+    "sleeve_archive",
+    metadata,
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
+    Column("archived_at", TS, nullable=False),
+)
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
@@ -428,6 +435,24 @@ class Store:
                 raise ValueError(f"no account called {account}")
             c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
             c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=utcnow()))
+
+    def archived(self) -> dict[str, datetime]:
+        with self.engine.connect() as c:
+            return {r.sleeve: _aware(r.archived_at) for r in c.execute(select(sleeve_archive_t))}
+
+    def archive(self, sleeve: str) -> None:
+        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds coins."""
+        s = self.sleeve(sleeve)
+        if s.desired_state != "stopped":
+            raise ValueError("stop the sleeve before archiving it")
+        with self.engine.begin() as c:
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
+
+    def unarchive(self, sleeve: str) -> None:
+        self.sleeve(sleeve)
+        with self.engine.begin() as c:
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
 
     def report_keys(self, present: dict[str, bool]) -> None:
         """Supervisor only: whether each live account's key is on the server. Never the key itself."""

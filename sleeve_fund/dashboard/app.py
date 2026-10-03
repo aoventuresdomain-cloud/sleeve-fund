@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import reports, riskops, trading
+from sleeve_fund.dashboard import gates, reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
@@ -91,6 +91,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["px"] = lambda x: "n/a" if x is None or x != x else (f"{x:,.2f}" if x >= 100 else f"{x:,.4f}")
     templates.env.globals["bar_label"] = _bar_label
     templates.env.globals["bar_short"] = _bar_short
+    from sleeve_fund.dashboard.glossary import GLOSSARY
+
+    templates.env.globals["glossary"] = GLOSSARY
     templates.env.filters["ts"] = lambda t: t.strftime("%d %b %H:%M UTC") if t else "never"
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
@@ -131,8 +134,10 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request, _: str = Depends(require_pm)):
         sleeves, frames, summaries = book_data()
-        return page(request, "home.html", summaries=summaries, book=bookm.book_view(st(), summaries, frames),
-                    alerts=st().alerts(limit=30), shell=shell(sleeves))
+        put_away = st().archived()
+        return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
+                    archived=[x for x in summaries if x["sleeve"].name in put_away],
+                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves))
 
     @app.get("/api/book/equity")
     def book_equity_json(_: str = Depends(require_pm)):
@@ -262,7 +267,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     position=trading.open_position(x, fills, orders),
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
-                    idea=_idea(s.strategy, s.params))
+                    idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    clone_qs=_clone_qs(s), path=gates.path_to_live(st(), x, _g1_of(s.strategy), st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", _: str = Depends(require_pm)):
@@ -334,6 +340,25 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
+
+    @app.post("/sleeves/{name}/archive")
+    def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(...),
+                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        try:
+            if not reason.strip():
+                raise ValueError("a reason is required")
+            if action == "archive":
+                st().archive(name)
+            elif action == "restore":
+                st().unarchive(name)
+            else:
+                raise ValueError("unknown action")
+            st().decide(actor, action, reason, name)
+        except KeyError:
+            raise HTTPException(404, "no such sleeve") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -650,6 +675,27 @@ def _strategy_choices() -> list[dict]:
         out.append({"name": name, "idea": _idea(name), "params": spec.default_params, "family": spec.family,
                     "tpl": spec.summary, "defaults": _config_defaults(name)})
     return out
+
+
+def _g1_of(strategy: str) -> str | None:
+    from sleeve_fund.dashboard import pipeline
+
+    return {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, [])}.get(strategy)
+
+
+def _clone_qs(s) -> str:
+    """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
+    params = dict(s.params)
+    q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
+         "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
+         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name}
+    if "max_notional" in params:
+        q["max_notional"] = f"{params.pop('max_notional'):g}"
+    for key in ("stop_loss", "take_profit", "risk_per_trade"):  # stored as fractions, entered as %
+        if key in params:
+            q[f"{key}_pct"] = f"{params.pop(key) * 100:g}"
+    q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
+    return urlencode(q)
 
 
 def _form_params(form, strategy: str) -> dict:
