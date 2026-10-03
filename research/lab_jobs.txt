@@ -1,3 +1,4 @@
 # One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
-# Strategy 4, revision 1: daily direction with hourly entries, to cut the trade count that fees ate at 4h/15m.
-mtf --htf 1440 --bar 60
+# Strategies 1+2 on the only setting where the classifier held up on development history: US-open sessions,
+# the doc's own thresholds, 5-minute bars.
+vwap_day --anchors us_open
