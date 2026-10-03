@@ -14,8 +14,8 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
-from sleeve_fund.data import bar_type_for, to_bars
-from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
+from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
+from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
 from sleeve_fund.strategies import REGISTRY
 
 
@@ -41,8 +41,16 @@ def run_backtest(
     log_level: str = "ERROR",
     runtime=None,
     bar_minutes: int = 1440,
+    exec_prices: pd.DataFrame | None = None,
+    exec_minutes: int = 1,
 ) -> BacktestResult:
-    """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them."""
+    """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
+
+    exec_prices: optional shorter bars (`exec_minutes` long) over the same period. The engine is then
+    fed these and builds the strategy's bars from them, so an order resting between decisions (a
+    maker order, a stop) is matched against every minute, not just the next decision bar. Without
+    them nothing trades between decision bars: a maker order that waits less than a bar never fills
+    and goes at market, so the backtest is charged the taker fee."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
@@ -66,10 +74,15 @@ def run_backtest(
             base_currency=None,
             starting_balances=_opening_balances(starting_capital, quote, base, runtime),
             fee_model=ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee)),
+            fill_model=fill_model(),
         )
         engine.add_instrument(instrument)
-        bar_type = bar_type_for(instrument, bar_minutes)
-        engine.add_data(to_bars(prices, instrument, bar_type))
+        if exec_prices is not None and not exec_prices.empty:
+            bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
+            engine.add_data(to_bars(exec_prices, instrument, bar_type_for(instrument, exec_minutes)))
+        else:
+            bar_type = bar_type_for(instrument, bar_minutes)
+            engine.add_data(to_bars(prices, instrument, bar_type))
         config = config_cls(
             instrument_id=instrument.id,
             bar_type=bar_type,

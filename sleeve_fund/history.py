@@ -104,6 +104,9 @@ class HistoryStore:
         d = self._dir(venue, pair)
         lo = pd.Timestamp(start, tz="UTC") if start is not None and pd.Timestamp(start).tzinfo is None else start
         hi = pd.Timestamp(end, tz="UTC") if end is not None and pd.Timestamp(end).tzinfo is None else end
+        # Bars that divide a day never span two months, so each month is resampled on its own and
+        # years of minutes are never held in memory at once.
+        by_month = minutes > 1 and 1440 % minutes == 0
         parts = []
         for path in sorted(d.glob("*.npz")):
             month = pd.Timestamp(path.stem + "-01", tz="UTC")
@@ -111,19 +114,14 @@ class HistoryStore:
                 continue
             if hi is not None and month > hi:
                 continue
-            parts.append(_load(path))
+            part = _load(path)
+            part = part[(part.index >= cov.first) & (part.index < cov.last)]  # the last minute may still be forming
+            parts.append(_resample(part, minutes) if by_month else part)
         if not parts:
             return pd.DataFrame(columns=OHLCV)
-        df = pd.concat(parts).sort_index()
-        df = df[(df.index >= cov.first) & (df.index < cov.last)]  # the last minute may still be forming
-        if minutes > 1:
-            rule = f"{minutes}min"
-            g = df.resample(rule, origin="epoch", label="left", closed="left")
-            bars = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-            counts = g["close"].count()
-            bars = bars[counts == minutes]  # complete bars only: a part-day isn't a daily bar
-        else:
-            bars = df
+        bars = pd.concat(parts).sort_index()
+        if minutes > 1 and not by_month:
+            bars = _resample(bars, minutes)
         bars = bars.set_axis(bars.index + pd.Timedelta(minutes=minutes))
         bars.index.name = "timestamp"
         if lo is not None:
@@ -187,6 +185,15 @@ def _save(path: Path, df: pd.DataFrame) -> None:
     tmp = path.with_suffix(".tmp.npz")
     np.savez_compressed(tmp, t=t, **{c: df[c].to_numpy(float) for c in OHLCV})
     tmp.replace(path)
+
+
+def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """1-minute bars by open time -> complete `minutes` bars by open time."""
+    if minutes <= 1:
+        return df
+    g = df.resample(f"{minutes}min", origin="epoch", label="left", closed="left")
+    bars = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    return bars[g["close"].count() == minutes]  # complete bars only: a part-day isn't a daily bar
 
 
 def _load(path: Path) -> pd.DataFrame:

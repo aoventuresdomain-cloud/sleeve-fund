@@ -48,6 +48,14 @@ def signal_items(signal: dict | None) -> list[tuple[str, str]]:
         elif k in _PCT:
             label = {"gap": "Average gap", "move": "Move from entry", "stop_loss": "Stop", "take_profit": "Target"}[k]
             text = f"{v:+.2%}" if k in ("gap", "move") else f"{v:.1%}"
+        elif k == "order_type":
+            label, text = "Order", "Maker first (post-only limit)" if v == "maker" else "Market"
+        elif k == "limit_px":
+            label, text = "Limit", _px(v)
+        elif k == "maker_wait_minutes":
+            label, text = "Market after", f"{v:g} min"
+        elif k == "maker_order":
+            label, text = "Rest of order", str(v)
         elif k == "sized_by":
             label, text = "Size set by", str(v)
         elif k in ("budget", "equity", "peak_equity"):

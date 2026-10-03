@@ -16,8 +16,15 @@ from typing import Any
 from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
-from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, Price, PriceType, Quantity, TimeInForce
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, Price, PriceType, Quantity,
+                                   TimeInForce)
 from nautilus_trader.trading import Strategy
+
+from sleeve_fund.data import bar_minutes
+
+# Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
+# risk halts, PM flatten) always go at market, because getting out matters more than the fee.
+MAKER_INTENTS = ("entry", "exit", "rebalance")
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,7 @@ class LongFlatConfig(StrategyConfig):
         risk_per_trade: float | None = None,
         position_cap_pct: float | None = None,
         rebalance_band: float | None = None,
+        maker_wait_minutes: int | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -98,6 +106,13 @@ class LongFlatConfig(StrategyConfig):
         if rebalance_band is not None and (stop_loss or take_profit or risk_per_trade):
             raise ValueError("stop-loss, take-profit and risk per trade work on all-or-nothing positions; "
                              "they can't be combined with rebalancing to a target weight yet")
+        if maker_wait_minutes is not None:
+            if int(maker_wait_minutes) != maker_wait_minutes or maker_wait_minutes < 1:
+                raise ValueError("the wait before going to market must be a whole number of minutes, at least 1")
+            if maker_wait_minutes >= bar_minutes(bar_type):
+                raise ValueError(f"the wait before going to market ({maker_wait_minutes:g} minutes) must be shorter than "
+                                 f"one bar ({bar_minutes(bar_type)} minutes), so each order settles before the next decision")
+            maker_wait_minutes = int(maker_wait_minutes)
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
         self.instrument_id = instrument_id
@@ -121,6 +136,10 @@ class LongFlatConfig(StrategyConfig):
         # None: once in, hold until the signal says out (all-or-nothing). A number: when the target
         # weight moves more than this share away from the weight last traded to, trade back to it.
         self.rebalance_band = rebalance_band
+        # None: every order is a market order and pays the taker fee. A number: entries, signal exits
+        # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
+        # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
+        self.maker_wait_minutes = maker_wait_minutes
 
 
 class LongFlatStrategy(Strategy):
@@ -140,6 +159,8 @@ class LongFlatStrategy(Strategy):
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
+        self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
+        self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -243,8 +264,8 @@ class LongFlatStrategy(Strategy):
         w = min(max(float(raw), 0.0), 1.0, self._cap_pct())
         if w == 0:
             self._exit_lock = False
-        if self.cache.orders_inflight(strategy_id=self.strategy_id):
-            return
+        if self.cache.orders_inflight(strategy_id=self.strategy_id) or self._maker_working():
+            return  # the last decision is still being carried out
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
@@ -377,21 +398,88 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2)}
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
-    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict) -> None:
-        """Send a market order, journaling it with its reason first so the record exists before the venue sees it."""
-        order = self.order_factory.market(
-            instrument_id=self._cfg.instrument_id,
-            order_side=side,
-            quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
-            time_in_force=TimeInForce.GTC,
-        )
+    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
+        """Send an order, journaling it with its reason first so the record exists before the venue sees
+        it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first."""
+        quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
+        wait = self._cfg.maker_wait_minutes
+        last, tick = self._price(), self.instrument.price_increment.as_double()
         signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
-        signal.setdefault("price", self._price())
-        self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
+        signal.setdefault("price", last)
+        maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
+        if maker:
+            # One tick inside the last trade, so the order adds liquidity rather than taking it.
+            px = Price(last - tick if side == OrderSide.BUY else last + tick, self.instrument.price_precision)
+            order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
+                                             price=px, time_in_force=TimeInForce.GTC, post_only=True)
+            signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
+        else:
+            order = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=side,
+                                              quantity=quantity, time_in_force=TimeInForce.GTC)
+            if wait:
+                signal["order_type"] = "market"
+        coid = str(order.client_order_id)
+        self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
-            self.runtime.on_order(order_id=str(order.client_order_id), side="BUY" if side == OrderSide.BUY else "SELL",
-                                  qty=float(qty), intent=intent, reason=reason, signal=signal)
+            self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
+                                  qty=float(qty), intent=intent, reason=reason, signal=signal,
+                                  order_type="POST-ONLY LIMIT" if maker else "MARKET")
         self.submit_order(order)
+        if maker:
+            self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
+            self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
+                                      callback=self._maker_timeout)
+
+    def _maker_timeout(self, event) -> None:
+        """The post-only order has waited long enough: cancel what is left; the cancel's confirmation
+        sends the rest at market (on_order_canceled), so nothing is sold or bought twice."""
+        coid = event.name.removeprefix("maker-")
+        order = self.cache.order(ClientOrderId(coid))
+        if coid in self._maker and order is not None and not order.is_closed and self._pending_exit is None:
+            self._fallback.add(coid)
+            self.cancel_order(order.client_order_id)
+
+    def _maker_working(self) -> bool:
+        """True while a post-only order is still resting. Forgets any the venue has closed without
+        this strategy hearing (say a cancel that crossed with a fill), so one lost event can't stop
+        the strategy deciding for good."""
+        for coid in list(self._maker):
+            order = self.cache.order(ClientOrderId(coid))
+            if order is None or order.is_closed:
+                self._maker.pop(coid)
+                self._cancel_alert(coid)
+        return bool(self._maker)
+
+    def _cancel_alert(self, coid: str) -> None:
+        name = f"maker-{coid}"
+        if name in self.clock.timer_names():
+            self.clock.cancel_timer(name)
+
+    def _finish_at_market(self, coid: str, info: dict, why: str) -> None:
+        """Send the unfilled rest of a post-only order at market, sized to what the account can do now."""
+        order = self.cache.order(ClientOrderId(coid))
+        if order is None:
+            return
+        step = self.instrument.size_increment.as_decimal()
+        left = order.leaves_qty.as_decimal()
+        if order.side == OrderSide.BUY:
+            account, price = self._account(), Decimal(str(self._price()))
+            bal = next((b for c, b in account.balances().items() if str(c.code) in self._codes("quote")),
+                       None) if account else None
+            room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
+            # The price may have moved since the order was sized; never spend more than the cash allows.
+            affordable = bal.free.as_decimal() * room / price if bal is not None and price > 0 else Decimal(0)
+            qty = min(left, affordable).quantize(step, rounding=ROUND_DOWN)
+        else:
+            qty = min(left, self._position_qty(free=True)).quantize(step, rounding=ROUND_DOWN)
+        if qty <= 0 or qty < self._min_qty():
+            self.log.info(f"post-only order {coid} {why}; the rest ({qty}) is below the minimum order size")
+            if self.runtime is None and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0:
+                self._rest_stop()
+            return
+        reason = f"{info['reason']}. The post-only order {why}, so the rest went at market"
+        signal = {**{k: v for k, v in info["signal"].items() if k != "price"}, "maker_order": coid}
+        self._submit(order.side, qty, info["intent"], reason, signal, market=True)
 
     def _min_qty(self) -> Decimal:
         step = self.instrument.size_increment.as_decimal()
@@ -415,8 +503,9 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
-        if self.runtime is None and self.cache.orders_open(instrument_id=self._cfg.instrument_id):
-            # The resting stop holds the position; cancel it and sell once the cancel confirms.
+        if self.cache.orders_open(instrument_id=self._cfg.instrument_id):
+            # A resting order (the backtest's stop, or a post-only order) holds part of the position or
+            # cash; cancel it and sell once the cancel confirms.
             self._pending_exit = (intent, reason, values)
             self.cancel_all_orders(self._cfg.instrument_id)
             return
@@ -497,12 +586,27 @@ class LongFlatStrategy(Strategy):
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
+        coid = str(event.client_order_id)
+        info = self._maker.pop(coid, None)
+        if info is not None:  # e.g. the price moved and a post-only order would have taken liquidity
+            self._cancel_alert(coid)
+            self._finish_at_market(coid, info, f"was rejected ({getattr(event, 'reason', '') or 'no reason given'})")
 
     def on_order_denied(self, event) -> None:
         self._order_status(event, "denied")
 
     def on_order_canceled(self, event) -> None:
         self._order_status(event, "canceled")
+        coid = str(event.client_order_id)
+        info = self._maker.pop(coid, None)
+        self._cancel_alert(coid)
+        timed_out = coid in self._fallback
+        self._fallback.discard(coid)
+        # Only an order this strategy cancelled for time goes on at market: a cancel from a halt, a
+        # stop-loss or a shutdown means the decision no longer stands.
+        if info is not None and timed_out and self._pending_exit is None:
+            wait = self._cfg.maker_wait_minutes
+            self._finish_at_market(coid, info, f"was not filled within {wait} minute{'s' if wait != 1 else ''}")
         if self._pending_exit is not None and not self.cache.orders_open(instrument_id=self._cfg.instrument_id):
             intent, reason, values = self._pending_exit
             self._pending_exit = None
@@ -512,6 +616,12 @@ class LongFlatStrategy(Strategy):
         self._order_status(event, "expired")
 
     def on_order_filled(self, event) -> None:
+        coid = str(event.client_order_id)
+        order = self.cache.order(event.client_order_id)
+        done = order is None or order.is_closed
+        if coid in self._maker and done:
+            self._maker.pop(coid)
+            self._cancel_alert(coid)
         qty, px = event.last_qty.as_double(), event.last_px.as_double()
         if event.is_buy:
             cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
@@ -522,7 +632,7 @@ class LongFlatStrategy(Strategy):
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
         if self.runtime is None:
-            if event.is_buy:
+            if event.is_buy and done:
                 self._rest_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") == "stop_loss":
                 self._exit_lock = True
@@ -564,6 +674,8 @@ class LongFlatStrategy(Strategy):
         self.submit_order(order)
 
     def on_stop(self) -> None:
+        for coid in list(self._maker):
+            self._cancel_alert(coid)
         self.cancel_all_orders(self._cfg.instrument_id)
         if self.runtime is not None:
             self.clock.cancel_timer("sleeve-tick") if "sleeve-tick" in self.clock.timer_names() else None

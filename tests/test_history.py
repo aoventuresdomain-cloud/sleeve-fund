@@ -26,6 +26,19 @@ def test_daily_bars_are_complete_and_stamped_at_the_close(tmp_path):
     assert hours.index[0] == pd.Timestamp("2026-01-01 01:00", tz="UTC")  # 00:00-01:00 is known at 01:00
 
 
+def test_bars_read_month_by_month_match_one_resample_of_all_minutes(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append("X", "ABC/USD", _minutes("2026-01-30 07:00", 4 * 1440), cursor="c")  # spans January and February
+    one = store.read("X", "ABC/USD", 1)
+    for minutes in (5, 60, 1440):
+        opened = one.set_axis(one.index - pd.Timedelta("1min"))
+        g = opened.resample(f"{minutes}min", origin="epoch", label="left", closed="left")
+        whole = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        whole = whole[g["close"].count() == minutes]
+        whole = whole.set_axis(whole.index + pd.Timedelta(minutes=minutes))
+        pd.testing.assert_frame_equal(store.read("X", "ABC/USD", minutes), whole, check_names=False, check_freq=False)
+
+
 def test_appends_continue_across_months_and_fill_quiet_minutes(tmp_path):
     store = HistoryStore(tmp_path)
     store.append("X", "ABC/USD", _minutes("2026-01-31 23:50", 5), cursor="a")

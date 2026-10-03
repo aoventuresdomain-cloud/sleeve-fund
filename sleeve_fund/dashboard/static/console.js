@@ -254,7 +254,7 @@ window.Console = (() => {
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
       const items = [
-        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${$("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
+        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${document.getElementById("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}.`,
         `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
@@ -262,6 +262,7 @@ window.Console = (() => {
       const sl = $("stop_loss_pct").value, tp = $("take_profit_pct").value, rpt = $("risk_per_trade_pct").value;
       if (sl || tp) items.push(`Exit any trade ${[sl && `${sl}% below entry`, tp && `${tp}% above entry`].filter(Boolean).join(" or ")}.`);
       if (rpt) items.push(sl ? `Size each trade to lose about ${rpt}% of capital if the stop is hit.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      if ($("execution").value === "maker") items.push(`Rest each signal order as a post-only limit for the maker fee, and send whatever hasn't filled after ${$("maker_wait_minutes").value || 15} minutes at market. Protective exits go at market.`);
       if ($("max_notional").value) items.push(`Never place a single order above ${money.format(Number($("max_notional").value))} ${quote}.`);
       const ul = document.getElementById("summary");
       ul.replaceChildren(...items.map((t) => Object.assign(document.createElement("li"), {textContent: t})));
@@ -272,6 +273,7 @@ window.Console = (() => {
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
     wizard(form);
+    orderFields("sleeve-form");
 
     let chart;
     document.getElementById("run-preview").addEventListener("click", async (ev) => {
@@ -293,6 +295,7 @@ window.Console = (() => {
           <tr><td>Closed trades</td><td class="num">${d.trades.trades}${d.trades.trades ? ` · ${f(d.trades.win_rate, 0).replace("+", "")} won` : ""}</td><td class="num">1</td></tr>
           <tr><td>Fees paid</td><td class="num">${money.format(d.fees)}</td><td class="num"></td></tr></tbody></table>
           <p class="muted" style="margin:8px 0 0;font-size:12px">${d.pair}, ${d.from} to ${d.to} (${d.days} days), daily decisions. In-sample: a sense check, not a G1 test.</p>`;
+        if (d.execution && d.execution.note) box.appendChild(Object.assign(document.createElement("p"), {className: "muted", style: "margin:6px 0 0;font-size:12px", textContent: `${d.execution.maker_orders} of ${d.execution.orders} orders filled as maker. ${d.execution.note}`}));
         if (chart) chart.destroy();
         chart = new Chart(document.getElementById("pv"), {
           type: "line",
@@ -311,6 +314,15 @@ window.Console = (() => {
         btn.disabled = false; btn.textContent = "Run again";
       }
     });
+  }
+
+  // Order type: the wait only matters for maker-first orders, so it shows only then.
+  function orderFields(formId) {
+    const form = document.getElementById(formId);
+    if (!form || !form.elements.execution) return;
+    const wait = form.querySelector("[data-when-maker]");
+    const sync = () => { wait.hidden = form.elements.execution.value !== "maker"; };
+    form.elements.execution.addEventListener("change", sync); sync();
   }
 
   // The new-sleeve form one section at a time, with Next and Back. Without JavaScript every section shows.
@@ -364,5 +376,5 @@ window.Console = (() => {
     show(0, false);
   }
 
-  return {sortable, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

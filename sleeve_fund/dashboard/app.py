@@ -701,6 +701,8 @@ def _clone_qs(s) -> str:
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # stored as fractions, entered as %
         if key in params:
             q[f"{key}_pct"] = f"{params.pop(key) * 100:g}"
+    if "maker_wait_minutes" in params:
+        q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
     return urlencode(q)
 
@@ -742,6 +744,14 @@ def _form_params(form, strategy: str) -> dict:
         raw = str(form.get(f"{key}_pct", "")).strip()
         if raw:
             params[key] = round(float(raw) / 100, 6)
+    execution = str(form.get("execution", "") or "market")
+    if execution not in ("market", "maker"):
+        raise ValueError("order type: market or maker first")
+    if execution == "maker":
+        try:
+            params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)
+        except ValueError:
+            raise ValueError("go to market after: a whole number of minutes") from None
     return params
 
 

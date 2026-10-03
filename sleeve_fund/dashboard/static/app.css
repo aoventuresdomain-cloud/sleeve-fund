@@ -418,6 +418,7 @@ ul.checklist small { display: block; color: var(--muted); }
 fieldset.step { margin: 0 0 14px; min-width: 0; }
 fieldset.step legend { float: left; width: 100%; padding: 0; margin: 0 0 10px; font-weight: 650; font-size: 14px; }
 fieldset.step legend + * { clear: both; }
+fieldset.step .field-group { margin: 14px 0 8px; font-size: 13px; font-weight: 650; color: var(--muted); }
 .hint { margin: 4px 0 0; color: var(--faint); font-size: 12px; }
 .params[hidden] { display: none; }
 .sticky { position: sticky; top: calc(var(--strip) + 14px); }

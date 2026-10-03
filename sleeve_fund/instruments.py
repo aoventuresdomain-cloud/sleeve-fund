@@ -74,3 +74,12 @@ class ScheduleFeeModel(FeeModel):
     def get_commission(self, order, fill_quantity, fill_px, instrument) -> Money:
         notional = fill_quantity.as_decimal() * fill_px.as_decimal()
         return Money(float(notional * self.rate_for(order)), instrument.quote_currency)
+
+
+def fill_model():
+    """How resting limit orders fill, the same in backtests and paper: only when the price trades
+    through the limit. A price that merely touches it gets no fill, since a real order joining the
+    queue at that price is behind everyone already there."""
+    from nautilus_trader.execution import DefaultFillModel
+
+    return DefaultFillModel(prob_fill_on_limit=0.0, prob_slippage=0.0)
