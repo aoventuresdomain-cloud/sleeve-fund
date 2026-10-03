@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% from "_stages.html" import stepper %}
+{% from "_macros.html" import chip, signed %}
+{% block title %}{{ r.name }} · Sleeve Fund{% endblock %}
+{% block content %}
+<p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ r.name|replace('_', ' ') }}</span></p>
+<div class="page-head">
+  <h1>{{ r.name|replace('_', ' ')|capitalize }}</h1>
+  <div class="actions"><a class="button" href="/sleeves/new?strategy={{ r.name }}">Start a sleeve with this</a></div>
+  <p class="lede">{{ summary }}</p>
+</div>
+<section class="panel" style="margin-bottom:14px">{{ stepper(r.stage, stages, r.observation) }}
+  {% if r.observation %}<p class="warn" style="margin:10px 0 0">Running on paper without a G1 pass on real data. Treat its results as observation, not evidence.</p>{% endif %}</section>
+<div class="grid">
+  <section class="panel span-7">
+    <div class="panel-head"><h2>How it works</h2><span class="hint">{{ r.spec.family }}</span></div>
+    <table class="compact kv">
+      <tr><th scope="row">The idea</th><td>{{ r.spec.idea }}</td></tr>
+      <tr><th scope="row">Exact rules</th><td>{{ r.spec.rules }}</td></tr>
+      <tr><th scope="row">Known weaknesses</th><td>{{ r.spec.known_weaknesses or 'None recorded' }}</td></tr>
+      <tr><th scope="row">Data it needs</th><td>{{ r.spec.data_needs }}</td></tr>
+      <tr><th scope="row">Benchmark</th><td>{{ r.spec.benchmark|replace('_', ' ') }}</td></tr>
+      <tr><th scope="row">Default settings</th><td>{% for k, v in r.spec.default_params.items() %}{{ k|replace('_', ' ') }} {{ v }}{{ ', ' if not loop.last }}{% else %}None{% endfor %}</td></tr>
+      <tr><th scope="row">Research grid</th><td>{% for k, v in r.spec.param_grid.items() %}{{ k|replace('_', ' ') }}: {{ v|join(', ') }}{{ '; ' if not loop.last }}{% else %}None{% endfor %}</td></tr>
+    </table>
+  </section>
+  <section class="panel span-5">
+    <div class="panel-head"><h2>Evidence</h2></div>
+    {% if r.sheets %}<ul class="feed">{% for s in r.sheets %}<li><span class="when">{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% else %}<span class="chip">n/a</span>{% endif %}</span><span class="what"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.dataset == 'synthetic' %} <span class="warn">synthetic data</span>{% endif %}<br><span class="muted">{{ s.evidence }}</span></span></li>{% endfor %}</ul>
+    {% else %}<p class="empty">Not through the research loop yet.</p>{% endif %}
+    <h2 style="margin:16px 0 8px">Sleeves running it</h2>
+    {% if r.sleeves %}<ul class="feed">{% for s in r.sleeves %}<li><span class="when">{{ chip(s.status) }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }}</span></span></li>{% endfor %}</ul>
+    {% else %}<p class="empty">None.</p>{% endif %}
+  </section>
+</div>
+{% endblock %}

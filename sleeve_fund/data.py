@@ -9,6 +9,9 @@ look-ahead bug: the strategy would trade on a close that hasn't happened yet.
 
 from __future__ import annotations
 
+import json
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,46 @@ def load_kraken_ohlcvt(path: str | Path, interval: str = "1D") -> pd.DataFrame:
     df.index = opened + pd.Timedelta(interval)
     df.index.name = "timestamp"
     return validate_ohlcv(df)
+
+
+KRAKEN_API = "https://api.kraken.com/0/public"
+_KRAKEN_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
+
+
+def _get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=20) as r:  # public endpoints only, no key
+        return json.load(r)
+
+
+def kraken_pair_key(pair: str, get_json=_get_json) -> str:
+    """Kraken's own id for a BASE/QUOTE pair (e.g. BTC/USD -> XXBTZUSD), from its public pair list."""
+    norm = lambda code: _KRAKEN_ALIASES.get(code, code)  # noqa: E731
+    want = tuple(norm(c) for c in pair.upper().split("/"))
+    data = get_json(f"{KRAKEN_API}/AssetPairs")
+    for key, info in data.get("result", {}).items():
+        ws = info.get("wsname", "")
+        if "/" in ws and tuple(norm(c) for c in ws.split("/")) == want:
+            return key
+    raise ValueError(f"Kraken does not list {pair}")
+
+
+def fetch_kraken_daily(pair: str, get_json=_get_json) -> pd.DataFrame:
+    """Kraken's most recent daily candles (up to 720) for a pair, indexed by bar CLOSE time.
+
+    The newest candle is still forming, so it is dropped.
+    """
+    key = kraken_pair_key(pair, get_json)
+    data = get_json(f"{KRAKEN_API}/OHLC?" + urllib.parse.urlencode({"pair": key, "interval": 1440}))
+    if data.get("error"):
+        raise ValueError(f"Kraken: {'; '.join(data['error'])}")
+    rows = next((v for k, v in data.get("result", {}).items() if k != "last"), [])[:-1]
+    if not rows:
+        raise ValueError(f"no daily history for {pair}")
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "vwap", "volume", "count"])
+    out = df[OHLCV].astype(float)
+    out.index = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True) + pd.Timedelta("1D")
+    out.index.name = "timestamp"
+    return validate_ohlcv(out)
 
 
 def validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:

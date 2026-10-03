@@ -74,20 +74,30 @@ def trades(rows: list[dict]) -> list[dict]:
     fills are fine: a trip closes when the coin position returns to (about) zero.
     """
     out, qty, cost, proceeds, fees = [], 0.0, 0.0, 0.0, 0.0
+    bought = sold = 0.0
+    opened = entry_order = None
     for r in rows:
         if r["side"] == "BUY":
+            if qty <= 1e-12:
+                opened, entry_order = r.get("ts"), r.get("order_id")
             qty += r["qty"]
+            bought += r["qty"]
             cost += r["qty"] * r["price"]
         else:
             if qty <= 0:
                 continue  # a sell with nothing open (e.g. journal started mid-trip)
             qty -= r["qty"]
+            sold += r["qty"]
             proceeds += r["qty"] * r["price"]
         fees += r["fee"]
         if cost and qty <= 1e-12:
             pnl = proceeds - cost - fees
-            out.append({"pnl": pnl, "ret": pnl / cost, "cost": cost, "fees": fees})
-            qty, cost, proceeds, fees = 0.0, 0.0, 0.0, 0.0
+            out.append({"pnl": pnl, "ret": pnl / cost, "cost": cost, "fees": fees, "qty": bought,
+                        "entry_px": cost / bought, "exit_px": proceeds / sold if sold else float("nan"),
+                        "opened": opened, "closed": r.get("ts"),
+                        # Journal order ids, so the dashboard can show why the trade was opened and closed.
+                        "entry_order": entry_order, "exit_order": r.get("order_id")})
+            qty, cost, proceeds, fees, bought, sold = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     return out
 
 

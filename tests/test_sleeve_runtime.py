@@ -98,3 +98,129 @@ def test_guard_balanced(equity, peak, day_open, expected):
 def test_unknown_profile_rejected():
     with pytest.raises(ValueError):
         risk.profile("yolo")
+
+
+def test_journal_book_replays_fills_with_fees(store):
+    _sleeve(store)
+    store.record_fill("s1", side="BUY", qty=1.0, price=100.0, fee=0.8, order_id="o1", trade_id="t1")
+    store.record_fill("s1", side="BUY", qty=1.0, price=200.0, fee=1.6, order_id="o2", trade_id="t2")
+    store.record_fill("s1", side="SELL", qty=0.5, price=300.0, fee=1.2, order_id="o3", trade_id="t3")
+    book = store.journal_book("s1", 10_000)
+    assert book["fills"] == 3
+    assert book["qty"] == pytest.approx(1.5)
+    assert book["entry_px"] == pytest.approx(150.0)  # a partial sell keeps the average entry
+    assert book["cash"] == pytest.approx(10_000 - 100.8 - 201.6 + 148.8)
+    store.record_fill("s1", side="SELL", qty=1.5, price=300.0, fee=3.6, order_id="o4", trade_id="t4")
+    assert store.journal_book("s1", 10_000)["entry_px"] is None
+
+
+def test_restart_restores_the_book_and_reconciles(store, instrument):
+    _sleeve(store)
+    prices = synthetic_ohlcv(days=40, seed=3)
+    _run(store, instrument, prices.iloc[:20])  # buys and holds
+    before = store.journal_book("s1", 10_000)
+    assert before["qty"] > 0
+
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)  # the "restart"
+    run_backtest("buy_and_hold", prices.iloc[20:], instrument, runtime=rt)
+    kinds = [e["kind"] for e in store.events("s1")]
+    assert "restore" in kinds and "reconcile" in kinds and "reconcile_mismatch" not in kinds
+    # Still long from before, so no second buy (and no second entry fee).
+    assert [f["side"] for f in store.fills("s1")] == ["BUY"]
+    eq = store.last_equity("s1")
+    assert eq["qty"] == pytest.approx(before["qty"]) and eq["cash"] == pytest.approx(before["cash"], abs=0.01)
+    assert store.sleeve("s1").status == "stopped"  # the backtest ended cleanly, not halted
+
+
+def test_flatten_sells_a_restored_position(store, instrument):
+    _sleeve(store)
+    prices = synthetic_ohlcv(days=40, seed=3)
+    _run(store, instrument, prices.iloc[:20])
+    store.command("s1", "flatten", "test carry-over exit")
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    run_backtest("buy_and_hold", prices.iloc[20:], instrument, runtime=rt)
+    assert [f["side"] for f in reversed(store.fills("s1"))] == ["BUY", "SELL"]
+    assert store.journal_book("s1", 10_000)["qty"] == pytest.approx(0.0, abs=1e-8)
+
+
+def test_reconcile_mismatch_halts_without_trading(store, instrument):
+    _sleeve(store)
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    # A fill the engine never saw: the journal and the engine now disagree.
+    store.record_fill("s1", side="BUY", qty=0.1, price=100.0, fee=0.08, order_id="x", trade_id="x")
+    run_backtest("buy_and_hold", synthetic_ohlcv(days=20, seed=1), instrument, runtime=rt)
+    s = store.sleeve("s1")
+    assert s.status == "halted" and "reconciliation" in s.status_reason
+    assert any(e["kind"] == "reconcile_mismatch" for e in store.events("s1", min_level="error"))
+    assert len(store.fills("s1")) == 1  # only the bogus row: nothing traded, nothing corrected
+
+
+def test_reconcile_runs_every_24_hours(store):
+    from datetime import timedelta
+
+    _sleeve(store)
+    clock = [utcnow_fixed()]
+    rt = SleeveRuntime(store, "s1", now=lambda: clock[0])
+    assert rt.reconcile_due()
+    assert rt.reconcile(cash=10_000, qty=0)
+    clock[0] += timedelta(hours=23)
+    assert not rt.reconcile_due()
+    clock[0] += timedelta(hours=1)
+    assert rt.reconcile_due()
+
+
+def utcnow_fixed():
+    from datetime import datetime, timezone
+
+    return datetime(2026, 10, 3, tzinfo=timezone.utc)
+
+
+def test_every_order_is_journaled_with_its_reason_before_it_fills(store, instrument):
+    _sleeve(store)
+    _run(store, instrument, crash_prices())
+    orders = list(reversed(store.orders("s1")))
+    assert [(o["side"], o["intent"], o["status"]) for o in orders] == [("BUY", "entry", "filled"),
+                                                                          ("SELL", "risk_halt", "filled")]
+    entry, halt = orders
+    assert entry["reason"].startswith("Buy and hold") and entry["signal"]["sized_by"] == "balanced risk profile cap"
+    assert halt["reason"].startswith("Risk halt: drawdown")
+    fills = {f["order_id"]: f for f in store.fills("s1")}
+    for o in orders:  # the order rows agree with the fills journal
+        f = fills[o["order_id"]]
+        assert o["filled_qty"] == pytest.approx(f["qty"]) and o["avg_px"] == pytest.approx(f["price"])
+        assert o["fee"] == pytest.approx(f["fee"])
+
+
+def test_signal_values_recorded_at_entry_and_exit(store, instrument):
+    store.create_sleeve(name="tf", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, params={"fast": 5, "slow": 20}, risk_profile="aggressive")
+    rt = SleeveRuntime(store, "tf", tick_seconds=SIX_HOURS)
+    run_backtest("trend_filter", synthetic_ohlcv(days=200, seed=3, vol=0.03), instrument,
+                 params={"fast": 5, "slow": 20}, runtime=rt)
+    orders = store.orders("tf")
+    entries = [o for o in orders if o["intent"] == "entry"]
+    exits = [o for o in orders if o["intent"] == "exit"]
+    assert entries and exits
+    assert "5-bar average" in entries[0]["reason"] and "above the 20-bar average" in entries[0]["reason"]
+    assert "below the 20-bar average" in exits[0]["reason"]
+    sig = entries[0]["signal"]
+    assert sig["sma_5"] > sig["sma_20"] and sig["close"] > 0 and sig["price"] > 0
+
+
+def test_order_status_moves_forward_only(store):
+    _sleeve(store)
+    store.record_order("s1", order_id="O-1", side="BUY", qty=2.0, intent="entry", reason="test")
+    store.update_order("O-1", status="accepted")
+    store.update_order("O-1", fill_qty=0.5, fill_px=100.0, fee=0.4)
+    assert store.orders("s1")[0]["status"] == "partially_filled"
+    store.update_order("O-1", fill_qty=1.5, fill_px=104.0, fee=1.2)
+    store.update_order("O-1", status="accepted")  # a late event never reopens a filled order
+    o = store.orders("s1")[0]
+    assert o["status"] == "filled" and o["avg_px"] == pytest.approx(103.0) and o["fee"] == pytest.approx(1.6)
+    store.record_order("s1", order_id="O-2", side="SELL", qty=1.0, intent="exit", reason="test")
+    store.update_order("O-2", status="rejected", message="insufficient balance")
+    assert store.orders("s1", statuses=("rejected",))[0]["message"] == "insufficient balance"
+    store.update_order("unknown", status="canceled")  # orders from before the journal: ignored
+    assert store.order_counts("s1") == {"filled": 1, "rejected": 1}
+    with pytest.raises(ValueError):
+        store.record_order("s1", order_id="O-3", side="BUY", qty=1, intent="yolo", reason="x")

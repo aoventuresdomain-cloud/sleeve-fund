@@ -87,7 +87,12 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     assert_keyless()
     tag = _tag(sleeve.name)
     venue = Venue.from_str(KRAKEN)
-    _, quote_code = kraken_asset_codes(sleeve.instrument, fetch=asset_fetch)
+    base_code, quote_code = kraken_asset_codes(sleeve.instrument, fetch=asset_fetch)
+    balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
+    if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
+        balances = [Money(runtime.book["cash"], Currency.from_str(quote_code))]
+        if runtime.book["qty"] > 0:
+            balances.append(Money(runtime.book["qty"], Currency.from_str(base_code)))
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -104,7 +109,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             SandboxExecutionClientFactory(),
             SandboxExecutionClientConfig(
                 venue=venue,
-                starting_balances=[Money(sleeve.starting_balance, Currency.from_str(quote_code))],
+                starting_balances=balances,
                 account_id=AccountId.from_str(f"{KRAKEN}-PAPER-{tag[:20]}"),
                 oms_type=OmsType.NETTING,
                 account_type=AccountType.CASH,

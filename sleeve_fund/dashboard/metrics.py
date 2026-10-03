@@ -51,20 +51,3 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         )
         out["dd_used"] = min(out["drawdown"] / prof.max_drawdown, 1.0)
     return out
-
-
-def portfolio_summary(summaries: list[dict]) -> dict:
-    active = [x for x in summaries if x["sleeve"].desired_state == "running"]
-    start = sum(x["sleeve"].starting_balance for x in active)
-    equity = sum(x["equity"] for x in active)
-    bench = sum(x["benchmark"] for x in active)
-    return {
-        "sleeves": len(summaries),
-        "running": sum(1 for x in summaries if x["sleeve"].status == "running"),
-        "attention": sum(1 for x in summaries if x["sleeve"].status in ("halted", "error")),
-        "equity": equity,
-        "start": start,
-        "ret": equity / start - 1 if start else 0.0,
-        "bench_ret": bench / start - 1 if start else 0.0,
-        "unhealthy": sum(1 for x in active if not x["healthy"]),
-    }

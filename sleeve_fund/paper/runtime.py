@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from sleeve_fund import risk
 from sleeve_fund.store import Store, utcnow
 
+RECONCILE_EVERY = timedelta(hours=24)
+
 
 class SleeveRuntime:
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:
@@ -29,8 +31,13 @@ class SleeveRuntime:
         first = store.first_equity(sleeve_name)
         self.bench_base_price = first["price"] if first else None
         self.taker_fee = 0.008
+        # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
+        self.book = store.journal_book(sleeve_name, sleeve.starting_balance)
+        self.last_reconciled = None
         self._day = None
         self._day_open = None
+        # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
+        self.flatten_why: tuple[str, str] | None = None
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -44,12 +51,10 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restart", "restarted while paused")
         else:
             self._set("running", "")
-        last = self.store.last_equity(self.name)
-        if last and abs(last["equity"] - self.starting_balance) > 0.01:
-            # Paper fills live in memory; a restart begins flat with the starting balance.
-            self.store.event(self.name, "warning", "restart",
-                             f"paper account restarted flat at {self.starting_balance:,.2f} "
-                             f"(last recorded equity {last['equity']:,.2f})")
+        if self.book["fills"]:
+            self.store.event(self.name, "info", "restore",
+                             f"book restored from {self.book['fills']} journal fills: "
+                             f"cash {self.book['cash']:,.2f}, coin {self.book['qty']:g}")
         self.store.event(self.name, "info", "start", f"sleeve started ({self.profile.name} risk profile)")
 
     def on_stop(self) -> None:
@@ -85,21 +90,23 @@ class SleeveRuntime:
             self._day, self._day_open = now.date(), equity
 
         flatten = False
+        self.flatten_why = None
         if self.status == "running":
             breach = risk.check(self.profile, equity, self.peak, self._day_open)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume")
-                flatten = True
+                flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
             elif breach and breach.action == "pause_day":
                 until = now + timedelta(hours=24)
                 self._set("paused", breach.reason, until)
                 self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours")
-                flatten = True
+                flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
         for cmd in self.store.pending_commands(self.name):
             if cmd["command"] == "flatten":
                 flatten = True
+                self.flatten_why = self.flatten_why or ("pm_flatten", f"Flattened by PM: {cmd['reason']}")
                 if self.status != "halted":  # never downgrade a halt
                     self._set("paused", f"flattened by PM: {cmd['reason']}")
             elif cmd["command"] == "pause":
@@ -114,9 +121,49 @@ class SleeveRuntime:
             self.store.mark_applied(cmd["id"])
         return "flatten" if flatten else None
 
+    # --- reconciliation ----------------------------------------------------------
+
+    def reconcile_due(self) -> bool:
+        return self.last_reconciled is None or self.now() - self.last_reconciled >= RECONCILE_EVERY
+
+    def reconcile(self, *, cash: float, qty: float, qty_tolerance: float = 1e-8) -> bool:
+        """Check the engine's balances against the journal. On a mismatch, halt and alert.
+
+        Never corrects either side: trading on a book we can't vouch for is the risk this
+        guards against, so a person decides (restart to rebuild from the journal, or resume).
+        """
+        self.last_reconciled = self.now()
+        book = self.store.journal_book(self.name, self.starting_balance)
+        # Each fill can round the cash by up to a cent (notional and fee), so allow for that.
+        cash_tol = 0.01 * (1 + 2 * book["fills"])
+        d_cash, d_qty = cash - book["cash"], qty - book["qty"]
+        detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
+                  f"engine coin {qty:g} vs journal {book['qty']:g} ({book['fills']} fills)")
+        if abs(d_cash) <= cash_tol and abs(d_qty) <= qty_tolerance:
+            self.store.event(self.name, "info", "reconcile", "engine matches journal: " + detail)
+            return True
+        self._set("halted", "reconciliation mismatch")
+        self.store.event(self.name, "error", "reconcile_mismatch",
+                         detail + ". Halted, nothing traded or corrected. Restart the sleeve to rebuild "
+                         "from the journal, or resume once you have checked.")
+        return False
+
+    # --- orders -------------------------------------------------------------------
+
+    def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict) -> None:
+        """Journal an order and why it was sent, before it goes to the venue."""
+        self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
+                                signal=signal, ts=self.now())
+
+    def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
+        self.store.update_order(order_id, status=status, message=message)
+        if status in ("rejected", "denied"):
+            self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}")
+
     def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str) -> None:
         self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
                                trade_id=trade_id)
+        self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
         self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}")
 
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:

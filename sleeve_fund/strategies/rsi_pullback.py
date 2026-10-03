@@ -14,6 +14,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
+    summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
     name="rsi_pullback",
     family="mean-reversion-in-trend",
     idea=(
@@ -71,7 +72,7 @@ class RsiPullback(LongFlatStrategy):
         if not (self.rsi.initialized and self.ema.initialized and self.atr.initialized and self._prev_vol_avg):
             return None
         close = bar.close.as_double()
-        if self.portfolio.is_net_long(self.c.instrument_id):
+        if self._is_long():
             self._peak = max(self._peak or close, close)
             return close >= self._peak - self.c.atr_mult * self.atr.value  # False = trailing stop hit
         self._peak = None
@@ -83,3 +84,16 @@ class RsiPullback(LongFlatStrategy):
         if entry:
             self._peak = close
         return entry
+
+    def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
+        c, close = self.c, bar.close.as_double()
+        rsi, vol, avg = self.rsi.value * 100, bar.volume.as_double(), self._prev_vol_avg or 0.0
+        values = {"rsi": rsi, f"ema_{c.ema_period}": self.ema.value, "volume_x": vol / avg if avg else None,
+                  "atr": self.atr.value}
+        if target:
+            return (f"RSI {rsi:.1f} below {c.rsi_entry:g}, close {close:,.6g} above the {c.ema_period}-bar EMA "
+                    f"{self.ema.value:,.6g}, volume {vol / avg:.2f}x normal (needs {c.vol_mult:g}x)", values)
+        stop = (self._peak or close) - c.atr_mult * self.atr.value
+        values.update(peak=self._peak, trail_stop=stop)
+        return (f"Trailing stop: close {close:,.6g} fell below {stop:,.6g} (peak {self._peak or close:,.6g} minus "
+                f"{c.atr_mult:g} x ATR {self.atr.value:,.4g})", values)

@@ -6,6 +6,8 @@ on:
     paths:
       - "sleeve_fund/paper/**"
       - "sleeve_fund/strategies/**"
+      - "sleeve_fund/data.py"
+      - "sleeve_fund/dashboard/preview.py"
       - "configs/sleeves/**"
       - "scripts/paper_smoke.sh"
       - ".github/workflows/paper-smoke.yml"
@@ -24,4 +26,16 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e .
+      - name: Kraken daily history and look-back (public API, no key)
+        run: |
+          python - <<'PY'
+          from sleeve_fund.dashboard import preview
+          from sleeve_fund.data import fetch_kraken_daily
+          for pair in ("BTC/USD", "SUI/USD"):
+              df = fetch_kraken_daily(pair)
+              print(pair, len(df), "days", df.index[0].date(), "to", df.index[-1].date(), "last close", df["close"].iloc[-1])
+              assert len(df) >= 300, pair
+          d = preview.run("trend_filter", "ETH/USD", {"fast": 20, "slow": 60})
+          print("look-back ETH/USD:", d["days"], "days, sharpe", round(d["strategy"]["sharpe"], 2), "trades", d["trades"]["trades"])
+          PY
       - run: scripts/paper_smoke.sh "${{ inputs.minutes || '4' }}"
