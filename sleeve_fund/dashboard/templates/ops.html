@@ -9,7 +9,7 @@
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="proc-h">
   <div class="panel-head"><h2 id="proc-h">Sleeve processes</h2></div>
-  <table class="responsive">
+  <table class="responsive" data-hide-md="2 6 7">
     <thead><tr><th>Sleeve</th><th>Wanted</th><th>Heartbeat</th><th>Last price mark</th><th>Balance check</th><th>Last start</th><th class="num">Waiting commands</th><th class="num">Errors</th></tr></thead>
     <tbody>{% for p in ops.procs %}{% set x = p.x %}{% set s = x.sleeve %}
     <tr>

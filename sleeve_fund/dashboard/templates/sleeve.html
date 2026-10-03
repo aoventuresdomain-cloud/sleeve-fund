@@ -73,7 +73,7 @@
 <section class="panel flush" aria-labelledby="trips-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="trips-h">Closed trades</h2><span class="hint">entry to exit, after fees, newest first</span><a class="right" href="/trades?sleeve={{ s.name }}">All trades</a></div>
   {% if trips %}
-  <table class="responsive">
+  <table class="responsive" data-hide-md="3 4 8 9">
     <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for tr in trips[:50] %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ '%.4g'|format(tr.qty) }} {{ base }}</td>
@@ -97,7 +97,7 @@
 <section class="panel flush" aria-labelledby="ord-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="ord-h">Orders</h2><span class="hint">latest 15</span><a class="right" href="/orders?sleeve={{ s.name }}">Blotter</a></div>
   {% if orders %}
-  <table class="responsive">
+  <table class="responsive" data-hide-md="3 6">
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Fee</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody>{% for o in orders %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>

@@ -78,7 +78,7 @@ window.Console = (() => {
         type: "line",
         data: {labels: [], datasets: [{label: "Drawdown", data: [], borderColor: css("--loss"), backgroundColor: css("--loss-bg"), fill: "origin", borderWidth: 1, pointRadius: 0, tension: 0}]},
         options: {...base, plugins: {...base.plugins, tooltip: {...base.plugins.tooltip, callbacks: {label: (c) => `Drawdown: ${c.parsed.y.toFixed(1)}%`}}},
-          scales: {x: {ticks: {color: muted, maxTicksLimit: window.innerWidth < 760 ? 4 : 7, maxRotation: 0}, grid: {display: false}},
+          scales: {x: {ticks: {color: muted, maxTicksLimit: window.innerWidth < 420 ? 3 : window.innerWidth < 760 ? 4 : 7, maxRotation: 0}, grid: {display: false}},
                    y: {afterFit: yWidth, max: 0, ticks: {color: muted, maxTicksLimit: 3, callback: (v) => `${v}%`}, grid: {color: grid}, border: {display: false}}}},
       });
       const fmt = d.res === "intraday" ? minute : day;

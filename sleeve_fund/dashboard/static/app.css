@@ -60,6 +60,18 @@ a:hover { text-decoration: underline; }
 .rail nav a[aria-current="page"] { background: var(--raised); color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
 .rail .count { min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--loss-bg); color: var(--loss);
   font-size: 12px; font-weight: 600; text-align: center; }
+.rail .rail-new { justify-content: center; margin: 0 2px 14px; }
+.rail nav.secondary { margin-top: 10px; }
+.rail nav .group { padding: 12px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--faint); }
+.rail .more-btn { display: none; }
+dialog.sheet { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); padding: 0; width: min(420px, calc(100vw - 24px)); }
+dialog.sheet::backdrop { background: rgb(0 0 0 / .45); }
+.sheet-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.sheet-body nav { display: flex; flex-direction: column; padding: 4px 8px 8px; }
+.sheet-body nav a { padding: 11px 10px; border-radius: 6px; color: var(--text); font-weight: 500; }
+.sheet-body nav a[aria-current] { background: var(--raised); box-shadow: inset 2px 0 0 var(--accent); }
+.sheet-body nav .group { padding: 12px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--faint); }
+dialog.sheet > .button { display: flex; justify-content: center; margin: 4px 16px 16px; }
 .rail .rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
 .rail .rail-foot .meta { padding: 0 10px; font-size: 12px; color: var(--faint); }
 
@@ -231,15 +243,20 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 @media (max-width: 1100px) {
   .span-8, .span-7, .span-6, .span-5, .span-4 { grid-column: span 12; }
 }
-@media (max-width: 760px) {
+@media (max-width: 900px) {
   .app { grid-template-columns: 1fr; background: none; }
-  .rail { position: fixed; z-index: 10; inset: auto 0 0 0; height: auto; flex-direction: row; padding: 0;
+  .rail { position: fixed; z-index: 10; inset: auto 0 0 0; height: auto; flex-direction: row; padding: 0 0 env(safe-area-inset-bottom);
     border-right: 0; border-top: 1px solid var(--line); }
   .rail .brand, .rail .rail-foot { display: none; }
   .rail nav { flex-direction: row; width: 100%; gap: 0; }
   .rail nav a { flex: 1; justify-content: center; gap: 6px; padding: 12px 4px; border-radius: 0; font-size: 13px; }
   .rail nav a[aria-current="page"] { box-shadow: inset 0 2px 0 var(--accent); }
-  .rail nav a.desk-only { display: none; }
+  .rail .rail-new, .rail nav.secondary { display: none; }
+  .rail .more-btn { display: flex; flex: 1; justify-content: center; padding: 12px 4px; border: 0; border-radius: 0;
+    background: none; color: var(--muted); font-size: 13px; font-weight: 500; }
+  .rail .more-btn[aria-current] { color: var(--text); box-shadow: inset 0 2px 0 var(--accent); }
+  dialog.sheet { margin: auto auto 0; width: 100vw; max-width: 100vw; border-radius: 14px 14px 0 0; border-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom); }
   main { padding: 14px 14px 80px; }
   .strip { padding: 0 14px; gap: 12px; }
   .strip .wide { display: none; }
@@ -247,18 +264,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .ledger > div { border-left: 0; border-top: 1px solid var(--line); }
   .ledger > div:first-child { grid-column: span 2; border-top: 0; }
   .ledger > div:nth-child(odd):not(:first-child) { border-left: 1px solid var(--line); }
-  table.responsive thead { display: none; }
-  table.responsive tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-  table.responsive td { display: block; padding: 0; border: 0; text-align: left; }
-  table.responsive td[data-m="hide"] { display: none; }
-  table.responsive td[data-label]::before { content: attr(data-label) " "; color: var(--muted); font-size: 12px; }
   .panel-head { flex-wrap: wrap; }
   .alerts li { grid-template-columns: 4px 1fr; }
   .alerts li > form, .alerts li > span { grid-column: 2; }
   .alerts form.inline input { flex: 1; width: auto !important; }
-  table.responsive td[data-m="right"] { text-align: right; }
-  table.responsive td:first-child { padding-left: 0; } table.responsive td:last-child { padding-right: 0; }
-  tbody tr:hover td { background: none; }
 }
 /* --- orders, trades and their reasons ------------------------------------------ */
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -287,14 +296,72 @@ nav.tabs a { padding: 8px 12px; color: var(--muted); font-weight: 500; border-bo
 nav.tabs a:hover { color: var(--text); text-decoration: none; }
 nav.tabs a[aria-current] { color: var(--text); border-bottom-color: var(--accent); }
 nav.tabs .n { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: var(--neutral-bg); font-size: 11.5px; text-align: center; }
-@media (max-width: 760px) {
+@media (max-width: 900px) {
+  .why-grid { grid-template-columns: 1fr; }
+}
+
+/* Phones: wide tables become cards, so no column hides behind a sideways scroll. */
+@media (max-width: 900px) {
+  table.responsive thead { display: none; }
+  table.responsive tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  table.responsive td { display: block; padding: 0; border: 0; text-align: left; }
+  table.responsive td[data-m="hide"] { display: none; }
+  table.responsive td[data-label]::before { content: attr(data-label) " "; color: var(--muted); font-size: 12px; }
+  table.responsive td[data-m="right"] { text-align: right; }
+  table.responsive td:first-child { padding-left: 0; } table.responsive td:last-child { padding-right: 0; }
+  tbody tr:hover td { background: none; }
   .m-only { display: inline; }
   table.responsive tr.detail { display: block; padding: 0; }
   table.responsive tr.detail[hidden] { display: none; }
   table.responsive tr.detail > td { display: block; padding: 4px 14px 14px; }
-  .why-grid { grid-template-columns: 1fr; }
+  table.responsive td { white-space: normal; min-width: 0; }
+  table.responsive tr { grid-template-columns: minmax(0, 1fr) auto; }
 }
-
+/* Tablets: drop the columns marked data-t="hide" and the strip's extras. */
+@media (max-width: 1100px) {
+  [data-t="hide"] { display: none; }
+  .strip .wide { display: none; }
+}
+/* Tables name the columns to drop on narrower desks (data-hide-lg ≤1280px, data-hide-md ≤1100px), so the
+   key figures stay in view without a sideways scroll. Phones use the card layout instead. */
+@media (min-width: 901px) and (max-width: 1440px) {
+  table[data-hide-xl~="9"] tr > :nth-child(9) { display: none; }
+}
+@media (min-width: 901px) and (max-width: 1100px) {
+  :root { --rail: 180px; }
+  th, td { padding-left: 8px; padding-right: 8px; }
+}
+@media (min-width: 901px) and (max-width: 1280px) {
+  table[data-hide-lg~="2"] tr > :nth-child(2),
+  table[data-hide-lg~="3"] tr > :nth-child(3),
+  table[data-hide-lg~="4"] tr > :nth-child(4),
+  table[data-hide-lg~="5"] tr > :nth-child(5),
+  table[data-hide-lg~="6"] tr > :nth-child(6),
+  table[data-hide-lg~="7"] tr > :nth-child(7),
+  table[data-hide-lg~="8"] tr > :nth-child(8),
+  table[data-hide-lg~="9"] tr > :nth-child(9),
+  table[data-hide-lg~="10"] tr > :nth-child(10),
+  table[data-hide-lg~="11"] tr > :nth-child(11),
+  table[data-hide-lg~="12"] tr > :nth-child(12),
+  table[data-hide-lg~="13"] tr > :nth-child(13),
+  table[data-hide-lg~="14"] tr > :nth-child(14) { display: none; }
+  td.reason { max-width: 200px; }
+}
+@media (min-width: 901px) and (max-width: 1100px) {
+  table[data-hide-md~="2"] tr > :nth-child(2),
+  table[data-hide-md~="3"] tr > :nth-child(3),
+  table[data-hide-md~="4"] tr > :nth-child(4),
+  table[data-hide-md~="5"] tr > :nth-child(5),
+  table[data-hide-md~="6"] tr > :nth-child(6),
+  table[data-hide-md~="7"] tr > :nth-child(7),
+  table[data-hide-md~="8"] tr > :nth-child(8),
+  table[data-hide-md~="9"] tr > :nth-child(9),
+  table[data-hide-md~="10"] tr > :nth-child(10),
+  table[data-hide-md~="11"] tr > :nth-child(11),
+  table[data-hide-md~="12"] tr > :nth-child(12),
+  table[data-hide-md~="13"] tr > :nth-child(13),
+  table[data-hide-md~="14"] tr > :nth-child(14) { display: none; }
+}
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */

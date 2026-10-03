@@ -10,7 +10,7 @@
   <section class="panel flush span-8" aria-labelledby="m-h">
     <div class="panel-head"><h2 id="m-h">Book by month</h2><span class="hint">newest first</span></div>
     {% if m.rows %}
-    <table class="responsive">
+    <table class="responsive" data-hide-lg="7 8">
       <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Holding</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
       <tbody>{% for r in m.rows %}
       <tr><td><strong>{{ r.month }}</strong></td><td class="num" data-m="right">{{ money_signed(r.pnl) }}</td><td class="num" data-label="Return">{{ signed(r.ret) }}</td>

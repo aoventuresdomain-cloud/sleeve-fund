@@ -30,7 +30,7 @@
 <section class="panel flush" aria-labelledby="pos-h">
   <div class="panel-head"><h2 id="pos-h">Open positions</h2><span class="hint">marked to the last Kraken price</span></div>
   {% if h.positions %}
-  <table class="responsive">
+  <table class="responsive" data-hide-md="4 7 8">
     <thead><tr><th>Sleeve</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Value</th><th class="num">Unrealised</th><th class="num">Held</th><th class="num">Stop / target</th><th></th></tr></thead>
     <tbody>{% for p in h.positions %}{% set rid = 'pos-' ~ loop.index %}
     <tr><td><a href="/sleeves/{{ p.sleeve }}"><strong>{{ p.sleeve }}</strong></a> <span class="muted">{{ p.pair }}</span></td>
@@ -44,13 +44,13 @@
     <tr class="detail" id="{{ rid }}" hidden><td colspan="9"><div class="why-grid">{{ why('Why it was bought' ~ (' · ' ~ p.opened|ts if p.opened else ''), p.why, p.sig) }}</div></td></tr>
     {% endfor %}</tbody>
   </table>
-  {% else %}<p class="empty" style="padding:4px 14px 14px">All in cash. A position appears here as soon as a sleeve buys.</p>{% endif %}
+  {% else %}<p class="empty" style="padding:4px 14px 14px">All in cash. A position appears here as soon as a sleeve buys. <a href="/sleeves/new">Start a new sleeve</a></p>{% endif %}
 </section>
 
 <section class="panel flush" aria-labelledby="tr-h">
   <div class="panel-head"><h2 id="tr-h">Closed trades</h2><span class="hint">entry to exit, after both fees, newest first</span></div>
   {% if h.trades %}
-  <table class="responsive">
+  <table class="responsive" data-hide-md="3 6 7 9">
     <thead><tr><th>Closed</th><th>Sleeve</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for t in h.trades %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ t.closed|ts }}</td><td><a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a></td>

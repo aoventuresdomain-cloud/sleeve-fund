@@ -338,3 +338,12 @@ def test_order_blotter_tabs_and_csv(client):
     assert '""rsi"": 28.0' in csv_text[1]
     trades_csv = c.get("/exports/trades.csv", auth=AUTH).text
     assert "stop_loss" in trades_csv and "RSI 28.0 below 30" in trades_csv
+
+
+@pytest.mark.parametrize("path", ["/", "/trades", "/orders", "/alerts", "/risk", "/reports", "/settings"])
+def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
+    c, _ = client
+    page = c.get(path, auth=AUTH).text
+    assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
+    for href in ("/trades", "/orders", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
+        assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
