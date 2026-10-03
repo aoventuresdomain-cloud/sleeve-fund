@@ -309,6 +309,31 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(fills_t.c.ts.desc(), fills_t.c.id.desc()).limit(limit)))
 
+    def journal_book(self, sleeve: str, starting_balance: float) -> dict:
+        """Cash, coin and average entry implied by the journal: the paper book's source of truth.
+
+        Fees are charged in the quote currency (as Kraken spot does), so a buy costs
+        qty * price + fee and a sell returns qty * price - fee.
+        """
+        q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
+        with self.engine.connect() as c:
+            fills = _rows(c.execute(q))
+        cash, qty, entry = float(starting_balance), 0.0, None
+        for f in fills:
+            notional = f["qty"] * f["price"]
+            if f["side"] == "BUY":
+                entry = ((entry or 0.0) * qty + notional) / (qty + f["qty"])
+                cash -= notional + f["fee"]
+                qty += f["qty"]
+            else:
+                cash += notional - f["fee"]
+                qty -= f["qty"]
+                if abs(qty) <= 1e-12:
+                    qty = 0.0
+                if qty <= 0:  # a negative qty is left visible so reconciliation catches it
+                    entry = None
+        return {"cash": cash, "qty": qty, "entry_px": entry, "fills": len(fills)}
+
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         q = select(events_t).where(events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))
         if sleeve:

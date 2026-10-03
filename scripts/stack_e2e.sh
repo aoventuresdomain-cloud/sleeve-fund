@@ -46,4 +46,22 @@ echo "dashboard: with password $CODE, without $NOAUTH"
 [ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
+
+# Restart check: a position in the journal must survive a restart and reconcile with the
+# rebuilt paper engine. Journal a 10 SUI buy, restart the sleeves, and expect them to carry it.
+q "insert into fills (sleeve, ts, side, qty, price, fee, order_id, trade_id)
+   values ('sui-e2e', now(), 'BUY', 10, 1.0, 0.01, 'e2e-carry', 'e2e-carry')"
+docker compose restart supervisor
+echo "waiting ${WAIT}s after restart..."
+sleep "$WAIT"
+q "select ts, sleeve, level, kind, message from events where kind in ('restore', 'reconcile', 'reconcile_mismatch') order by id"
+RESTORED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'restore' and message like '%coin 10%'")
+RECONCILED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'reconcile'")
+ERRS=$(q "select count(*) from events where level = 'error'")
+HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")
+echo "restored: $RESTORED, reconciled: $RECONCILED, error events: $ERRS, heartbeating: $HEART"
+[ "$RESTORED" -ge 1 ] || { echo "FAIL: SUI position not restored from the journal"; exit 1; }
+[ "$RECONCILED" -ge 2 ] || { echo "FAIL: expected a reconciliation before and after the restart"; exit 1; }
+[ "$ERRS" -eq 0 ] || { echo "FAIL: error events after restart (a reconcile mismatch?)"; exit 1; }
+[ "$HEART" -ge 3 ] || { echo "FAIL: sleeves not heartbeating after restart"; exit 1; }
 echo PASS

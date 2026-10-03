@@ -71,7 +71,7 @@ class RsiPullback(LongFlatStrategy):
         if not (self.rsi.initialized and self.ema.initialized and self.atr.initialized and self._prev_vol_avg):
             return None
         close = bar.close.as_double()
-        if self.portfolio.is_net_long(self.c.instrument_id):
+        if self._is_long():
             self._peak = max(self._peak or close, close)
             return close >= self._peak - self.c.atr_mult * self.atr.value  # False = trailing stop hit
         self._peak = None

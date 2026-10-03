@@ -139,6 +139,9 @@ class LongFlatStrategy(Strategy):
         self.subscribe_bars(self._cfg.bar_type)
         if self.runtime is not None:
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
+            book = self.runtime.book
+            if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
+                self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
             # Ticks are driven by market data (trades and bars, throttled) because a clock timer
@@ -193,7 +196,7 @@ class LongFlatStrategy(Strategy):
             self._exit_lock = False
         if self.cache.orders_inflight(strategy_id=self.strategy_id):
             return
-        is_long = self.portfolio.is_net_long(self._cfg.instrument_id)
+        is_long = self._is_long()
         if target and not is_long:
             if self._exit_lock:
                 return
@@ -201,7 +204,7 @@ class LongFlatStrategy(Strategy):
                 return
             self._buy_all(bar)
         elif not target and is_long:
-            self.close_all_positions(self._cfg.instrument_id)
+            self._sell_all()
 
     def _check_exits(self, price: float) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent."""
@@ -220,7 +223,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry")
         self._exit_lock = True
         self._entry_px = None  # don't fire again while the sell is in flight
-        self.close_all_positions(cfg.instrument_id)
+        self._sell_all()
         return True
 
     def _buy_all(self, bar: Bar) -> None:
@@ -256,6 +259,39 @@ class LongFlatStrategy(Strategy):
             time_in_force=TimeInForce.GTC,
         )
         self.submit_order(order)
+
+    def _min_qty(self) -> Decimal:
+        step = self.instrument.size_increment.as_decimal()
+        return self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
+
+    def _coin(self, free: bool = False) -> Decimal:
+        """Coin held, read from the account rather than positions, so a book restored from the
+        journal after a restart (a coin balance with no position object) is still recognised."""
+        account = self._account()
+        if account is None:
+            return Decimal(0)
+        bals = account.balances() if free else account.balances_total()
+        codes = self._codes("base")
+        total = Decimal(0)
+        for cur, b in bals.items():
+            if str(cur.code) in codes:
+                total += (b.free if free else b).as_decimal()
+        return total
+
+    def _is_long(self) -> bool:
+        return self._coin() >= self._min_qty()
+
+    def _sell_all(self) -> None:
+        step = self.instrument.size_increment.as_decimal()
+        qty = self._coin(free=True).quantize(step, rounding=ROUND_DOWN)
+        if qty <= 0 or qty < self._min_qty():
+            return
+        self.submit_order(self.order_factory.market(
+            instrument_id=self._cfg.instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
+            time_in_force=TimeInForce.GTC,
+        ))
 
     # --- sleeve runtime hooks (paper/live only) --------------------------------
 
@@ -306,9 +342,13 @@ class LongFlatStrategy(Strategy):
                     self.log.warning(f"cannot mark sleeve yet: {why}")
                     self.runtime.store.event(self.runtime.name, "warning", "mark_unavailable", why)
                 return
+            if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
+                tol = self.instrument.size_increment.as_double() / 2
+                if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
+                    self.cancel_all_orders(self._cfg.instrument_id)  # halted: no trading, no flattening
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
-                self.close_all_positions(self._cfg.instrument_id)
+                self._sell_all()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently
             self.log.error(f"sleeve tick failed: {exc!r}")
             self.runtime.store.event(self.runtime.name, "error", "tick_failed", repr(exc))

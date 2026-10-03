@@ -60,7 +60,7 @@ def run_backtest(
             oms_type=OmsType.NETTING,
             account_type=AccountType.CASH,
             base_currency=None,
-            starting_balances=[Money(starting_capital, quote)],
+            starting_balances=_opening_balances(starting_capital, quote, base, runtime),
             fee_model=ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee)),
         )
         engine.add_instrument(instrument)
@@ -89,6 +89,14 @@ def run_backtest(
         )
     finally:
         engine.dispose()
+
+
+def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime) -> list[Money]:
+    """A sleeve runtime opens from its journal (as a paper restart does); research opens in cash."""
+    if runtime is None:
+        return [Money(starting_capital, quote)]
+    book = runtime.book
+    return [Money(book["cash"], quote)] + ([Money(book["qty"], base)] if book["qty"] > 0 else [])
 
 
 def _mark_to_market(
