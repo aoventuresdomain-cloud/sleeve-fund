@@ -22,14 +22,25 @@ _lock = threading.Lock()
 
 
 def history(pair: str, fetch=None, venue: str | None = None):
-    """Daily candles for a pair, cached so the form doesn't call the venue on every change."""
+    """Daily candles for a pair: the full stored history when the history store has it, otherwise
+    the venue's recent candles. Cached so the form doesn't reload on every change."""
+    from sleeve_fund.history import HistoryStore
+
     profile = venue_profile(venue)
     key = (profile.name, pair)
     with _lock:
         hit = _history.get(key)
         if hit and time.time() - hit[0] < CACHE_SECONDS:
             return hit[1]
-    df = (fetch or profile.daily_history)(pair)
+    df = None
+    if fetch is None:
+        store = HistoryStore()
+        cov = store.coverage(profile.name, pair)
+        # Only a series that has caught up to now: a backfill still in 2017 would hide recent years.
+        if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last < pd.Timedelta("2D"):
+            df = store.read(profile.name, pair, 1440)
+    if df is None:
+        df = (fetch or profile.daily_history)(pair)
     with _lock:
         _history[key] = (time.time(), df)
     return df
