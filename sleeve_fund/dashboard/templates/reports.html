@@ -26,7 +26,8 @@
       <select id="dl-sleeve" name="sleeve"><option value="">All sleeves</option>{% for n in sleeves %}<option>{{ n }}</option>{% endfor %}</select></form>
     <table class="compact kv">
       <tr><th scope="row">Every fill</th><td class="num"><a data-dl href="/exports/fills.csv">fills.csv</a></td></tr>
-      <tr><th scope="row">Closed trades with P&amp;L</th><td class="num"><a data-dl href="/exports/trades.csv">trades.csv</a></td></tr>
+      <tr><th scope="row">Every order, with its reason</th><td class="num"><a data-dl href="/exports/orders.csv">orders.csv</a></td></tr>
+      <tr><th scope="row">Closed trades with P&amp;L and reasons</th><td class="num"><a data-dl href="/exports/trades.csv">trades.csv</a></td></tr>
       <tr><th scope="row">Daily equity and positions</th><td class="num"><a data-dl href="/exports/equity.csv">equity.csv</a></td></tr>
       <tr><th scope="row">Decision log</th><td class="num"><a href="/decisions.csv">decisions.csv</a></td></tr>
     </table>

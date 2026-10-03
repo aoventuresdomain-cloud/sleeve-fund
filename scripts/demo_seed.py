@@ -56,6 +56,13 @@ def main(url: str) -> None:
         else:
             store.set_status(name, "running")
         store.heartbeat(name)
+    if not store.orders("sol-rsi-pullback", statuses=("rejected",)):
+        # One rejected order so the blotter's rejected view has something to show.
+        store.record_order("sol-rsi-pullback", order_id="O-DEMO-REJECT", side="BUY", qty=12.5, intent="entry",
+                           reason="RSI 41.2 below 55, close 151.3 above the 50-bar EMA 148.9, volume 1.31x normal "
+                                  "(needs 0.8x)", signal={"rsi": 41.2, "ema_50": 148.9, "volume_x": 1.31,
+                                                          "close": 151.3, "sized_by": "balanced risk profile cap"})
+        store.update_order("O-DEMO-REJECT", status="rejected", message="EOrder:Insufficient funds")
     print(f"seeded {url}")
 
 
