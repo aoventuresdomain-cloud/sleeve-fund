@@ -73,3 +73,14 @@ def test_trade_stats_after_fees_with_partial_fills():
     assert s["trades"] == 2 and s["win_rate"] == 0.5 and round(s["pnl"], 2) == 11.68
     assert round(s["profit_factor"], 2) == round(18.24 / 6.56, 2)
     assert trade_stats([])["trades"] == 0
+
+
+def test_deflated_sharpe_with_the_no_skill_spread_gets_harder_with_more_tries():
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.research.metrics import deflated_sharpe_probability
+
+    r = pd.Series(np.random.default_rng(0).normal(0.001, 0.02, 1500))
+    p1, p20, p200 = (deflated_sharpe_probability(r, n) for n in (1, 20, 200))
+    assert 0 < p200 < p20 < p1 <= 1

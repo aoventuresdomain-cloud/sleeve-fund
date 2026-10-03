@@ -1,3 +1,0 @@
-# One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
-# Final, one-shot test of the pre-chosen trend variant on the held-back year (PM approved, 3 Oct 2026). Uses the default variant: 4h 21/55, vol target 40%.
-trend_holdout
