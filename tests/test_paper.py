@@ -170,3 +170,20 @@ def test_a_stale_history_store_is_not_used_for_warm_up(tmp_path):
         history_loader("KRAKEN", "BTC/USD", store)(instrument, bt, 3)
     with pytest.raises(LookupError, match="no stored history"):
         history_loader("KRAKEN", "ETH/USD", store)(instrument, bt, 3)
+
+
+def test_a_quiet_instrument_is_valued_from_its_quotes_until_it_trades(monkeypatch):
+    # e.g. SUI at night: quotes arrive at once, the first trade can take minutes, and until then
+    # the sleeve could neither mark nor reconcile.
+    bt = BarType.from_str("SUI/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
+    cfg = TrendFilterConfig(instrument_id=InstrumentId.from_str("SUI/USD.KRAKEN"), bar_type=bt, fast=2, slow=3,
+                            assumed_taker_fee=0.008)
+    last = {"px": None}
+    monkeypatch.setattr(TrendFilter, "cache", property(lambda self: type("C", (), {
+        "price": lambda _self, _iid, _kind: last["px"]})()))
+    s = TrendFilter(cfg)
+    assert s._price() == 0.0
+    s._bid, s._ask = 1.17, 1.19
+    assert s._price() == pytest.approx(1.18)
+    last["px"] = Price(1.2, 4)
+    assert s._price() == pytest.approx(1.2)  # a trade price wins once there is one
