@@ -1,4 +1,5 @@
 import pytest
+import pandas as pd
 
 from sleeve_fund.research.metrics import returns_from_equity
 from sleeve_fund.research.runner import run_backtest
@@ -150,3 +151,27 @@ def test_position_cap_sizes_like_the_risk_profile(prices, instrument):
     notional = float(res.fills["filled_qty"].iloc[0]) * float(res.fills["avg_px"].iloc[0])
     assert notional == pytest.approx(3_300, rel=0.02)
     assert res.decisions[res.fills.index[0]]["signal"]["sized_by"] == "risk profile cap"
+
+
+def test_vol_target_rebalances_part_of_the_position_with_reasons(prices, instrument):
+    res = run_backtest("trend_filter", prices, instrument, {"fast": 10, "slow": 30, "ema": 1, "vol_target": 0.3},
+                       starting_capital=100_000)
+    intents = [res.decisions[i]["intent"] for i in res.fills.index]
+    assert "rebalance" in intents and intents[0] == "entry"
+    reb = next(res.decisions[i] for i in res.fills.index if res.decisions[i]["intent"] == "rebalance")
+    assert {"from_weight", "to_weight", "volatility"} <= set(reb["signal"]) and "hold" in reb["reason"]
+    assert 0 < res.exposure.max() <= 1.0 and res.exposure[res.exposure > 0].mean() < 0.9  # not all in
+
+
+def test_rebalancing_cannot_be_combined_with_stops(prices, instrument):
+    with pytest.raises(ValueError, match="all-or-nothing"):
+        run_backtest("trend_filter", prices.iloc[:50], instrument, {"vol_target": 0.3, "stop_loss": 0.05})
+
+
+def test_any_bar_length_backtests(instrument):
+    from sleeve_fund.data import synthetic_ohlcv
+
+    four_hourly = synthetic_ohlcv(days=600, seed=5, vol=0.03)
+    four_hourly.index = pd.date_range("2024-01-01 04:00", periods=len(four_hourly), freq="4h", tz="UTC")
+    res = run_backtest("trend_filter", four_hourly, instrument, {"fast": 6, "slow": 30}, bar_minutes=240)
+    assert len(res.fills) > 2 and res.equity.index.equals(four_hourly.index)

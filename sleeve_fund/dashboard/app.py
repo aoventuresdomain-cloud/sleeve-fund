@@ -715,9 +715,8 @@ def _profile_cap(q) -> float:
 
 
 def _warmup_for(strategy: str, q) -> int:
-    """Bars to load at start so the slowest indicator is ready on the sleeve's first bar: twice the
-    longest whole-number setting (exponential averages need more than one span to settle), capped
-    at what the venue returns. Thresholds get counted too, which only loads a little extra history."""
+    """Bars to load at start so the slowest indicator is ready on the sleeve's first daily bar, as
+    the strategy itself says, capped at what the venue returns in one request."""
     import importlib
 
     params = dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
@@ -725,8 +724,7 @@ def _warmup_for(strategy: str, q) -> int:
         params.update(_form_params(q, strategy))
     except ValueError:
         pass
-    longest = max((v for v in params.values() if isinstance(v, int) and not isinstance(v, bool)), default=0)
-    return min(MAX_WARMUP_BARS, 2 * longest)
+    return min(MAX_WARMUP_BARS, REGISTRY[strategy][0].warmup_needed(params, 1440))
 
 
 def _form_params(form, strategy: str) -> dict:
