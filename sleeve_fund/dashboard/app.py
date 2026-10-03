@@ -200,6 +200,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             if not reason:
                 raise ValueError("a reason is required")
             params = _form_params(form, strategy)
+            if form.get("from") == "backtest" and form.get("bar_spec") != BACKTEST_BAR_SPEC:
+                raise ValueError(f"interval: the backtest decided on daily bars, so this sleeve must too "
+                                 f"({BACKTEST_BAR_SPEC}); backtest another interval before changing it")
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=str(form.get("bar_spec", "")),
                                starting_balance=float(form.get("starting_balance", 0) or 0), params=params,
@@ -239,9 +242,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             if not PAIR_RE.match(pair):
                 raise ValueError("enter an instrument like SOL/USD")
             params = _form_params(q, strategy)
-            params.pop("max_notional", None)  # a per-order cap doesn't change a look-back meaningfully
             balance = float(q.get("starting_balance") or 10_000)
-            return JSONResponse(preview.run(strategy, pair, params, starting=balance))
+            return JSONResponse(preview.run(strategy, pair, params, starting=balance, cap=_profile_cap(q)))
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
         except OSError as exc:  # Kraken unreachable
@@ -458,16 +460,17 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if not 100 <= starting <= 1e9:
                     raise ValueError("capital: between 100 and 1,000,000,000")
                 params = _form_params(q, strategy)
-                params.pop("max_notional", None)
                 result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
-                                     detail=True)
+                                     detail=True, cap=_profile_cap(q))
             except (ValueError, TypeError, KeyError) as exc:
                 error = str(exc).strip("'")
             except OSError as exc:  # Kraken unreachable
                 error = f"could not reach Kraken for price history ({exc}). Try again in a minute."
             except Exception as exc:  # noqa: BLE001 - say what failed instead of a blank page
                 error = f"the backtest failed: {exc}"
+        # The sleeve must decide on the bars that were tested, with indicators warm from its first bar.
         carry = {k: v for k, v in q.items() if k not in ("run", "period") and v}
+        carry.update(bar_spec=BACKTEST_BAR_SPEC, warmup_bars=_warmup_for(strategy, q))
         g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         chart = None
         if result:
@@ -475,7 +478,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                      "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}
         return page(request, "backtest.html", result=result, error=error, pre=dict(q), chosen=strategy,
                     strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, period=period,
-                    periods=BACKTEST_PERIODS, sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
+                    periods=BACKTEST_PERIODS, profiles=PROFILES, sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
 
     @app.get("/trades", response_class=HTMLResponse)
     def trades_page(request: Request, _: str = Depends(require_pm)):
@@ -696,6 +699,34 @@ def _clone_qs(s) -> str:
             q[f"{key}_pct"] = f"{params.pop(key) * 100:g}"
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
     return urlencode(q)
+
+
+# The backtest page runs on the venue's daily candles, so a sleeve made from it decides daily too.
+BACKTEST_BAR_SPEC = "1-DAY-LAST-EXTERNAL"
+MAX_WARMUP_BARS = 720  # what the venue returns in one request
+
+
+def _profile_cap(q) -> float:
+    """The chosen risk profile's position cap, as paper applies it (balanced when none is given)."""
+    name = q.get("risk_profile") or "balanced"
+    if name not in PROFILES:
+        raise ValueError(f"risk profile: no profile called {name}")
+    return PROFILES[name].max_position_pct
+
+
+def _warmup_for(strategy: str, q) -> int:
+    """Bars to load at start so the slowest indicator is ready on the sleeve's first bar: twice the
+    longest whole-number setting (exponential averages need more than one span to settle), capped
+    at what the venue returns. Thresholds get counted too, which only loads a little extra history."""
+    import importlib
+
+    params = dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
+    try:
+        params.update(_form_params(q, strategy))
+    except ValueError:
+        pass
+    longest = max((v for v in params.values() if isinstance(v, int) and not isinstance(v, bool)), default=0)
+    return min(MAX_WARMUP_BARS, 2 * longest)
 
 
 def _form_params(form, strategy: str) -> dict:

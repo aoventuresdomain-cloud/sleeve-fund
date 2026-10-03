@@ -82,7 +82,10 @@ class SleeveRuntime:
             return None
         if self.bench_base_price is None:
             self.bench_base_price = price
-        benchmark = self.starting_balance * (1 - self.taker_fee) * price / self.bench_base_price
+        # Buy and hold at the exposure this sleeve may take (its profile's position cap), the rest in
+        # cash, so the comparison isn't flattered or punished by the cap itself. Same as the backtest page.
+        cap = self.profile.max_position_pct
+        benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
         self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
                                  ts=now)
         self.peak = max(self.peak, equity)

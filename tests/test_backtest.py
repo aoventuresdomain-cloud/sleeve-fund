@@ -100,3 +100,53 @@ def test_multi_indicator_example_enters_on_all_conditions_and_trails_out(prices,
     assert len(round_trips(res.fills)) == 1
     df["volume"] = 1_000.0  # same prices, no volume spike: the entry must not fire
     assert run_backtest("rsi_pullback", df, instrument, {"rsi_entry": 35, "atr_mult": 2.0}).fills.empty
+
+
+def test_stop_fills_at_its_level_inside_the_bar(prices, instrument):
+    # The fall from 100 to 90 happens inside one daily bar; a close-only check would sell at 90.
+    closes = [100.0] * 10 + [90.0] * 5
+    res = run_backtest("buy_and_hold", _path(prices, closes), instrument, {"stop_loss": 0.05})
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1
+    assert float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
+    assert res.decisions[sells.index[0]]["intent"] == "stop_loss"
+
+
+def test_stop_fills_at_the_open_when_price_gaps_through(prices, instrument):
+    df = _path(prices, [100.0] * 10 + [80.0] * 5)
+    df.iloc[10, df.columns.get_loc("open")] = 85.0  # opened below the 95 stop
+    df.iloc[10, df.columns.get_loc("high")] = 85.0
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05})
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert float(sells["avg_px"].iloc[0]) == pytest.approx(85.0)
+
+
+def test_stop_wins_when_one_bar_touches_both(prices, instrument):
+    df = _path(prices, [100.0] * 10 + [100.0] * 5)
+    df.iloc[10, df.columns.get_loc("high")] = 115.0
+    df.iloc[10, df.columns.get_loc("low")] = 90.0
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit": 0.10})
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
+
+
+def test_take_profit_is_checked_on_the_high_but_sold_at_the_close(prices, instrument):
+    df = _path(prices, [100.0] * 10 + [104.0] * 5)
+    df.iloc[10, df.columns.get_loc("high")] = 112.0
+    res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10})
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(104.0)
+
+
+def test_signal_exit_cancels_the_resting_stop_first(prices, instrument):
+    res = run_backtest("trend_filter", prices, instrument, {"fast": 20, "slow": 100, "stop_loss": 0.30})
+    buys, sells = (res.fills[res.fills["side"] == s] for s in ("BUY", "SELL"))
+    assert len(buys) >= 2 and len(sells) >= len(buys) - 1  # every exit went through despite the stop
+
+
+def test_position_cap_sizes_like_the_risk_profile(prices, instrument):
+    res = run_backtest("buy_and_hold", _path(prices, [100.0] * 20), instrument, {"position_cap_pct": 0.33},
+                       starting_capital=10_000)
+    notional = float(res.fills["filled_qty"].iloc[0]) * float(res.fills["avg_px"].iloc[0])
+    assert notional == pytest.approx(3_300, rel=0.02)
+    assert res.decisions[res.fills.index[0]]["signal"]["sized_by"] == "risk profile cap"
