@@ -1,0 +1,127 @@
+"""Run one strategy over one price history in a NautilusTrader backtest.
+
+Returns a daily equity curve marked at each bar's close, plus fills and fees,
+so the benchmark and the strategy are measured identically.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.common import LoggerConfig, LogLevel
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
+
+from sleeve_fund.data import daily_bar_type, to_bars
+from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
+from sleeve_fund.strategies import REGISTRY
+
+
+@dataclass
+class BacktestResult:
+    strategy: str
+    params: dict
+    equity: pd.Series  # quote-currency equity at each bar close
+    exposure: pd.Series  # fraction of equity in the coin at each bar close
+    fills: pd.DataFrame
+    fees_paid: float
+    starting_capital: float
+
+
+def run_backtest(
+    strategy_name: str,
+    prices: pd.DataFrame,
+    instrument: CurrencyPair,
+    params: dict | None = None,
+    starting_capital: float = 10_000.0,
+    log_level: str = "ERROR",
+) -> BacktestResult:
+    if strategy_name not in REGISTRY:
+        raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
+    if starting_capital <= 0:
+        raise ValueError("starting_capital must be positive")
+    params = dict(params or {})
+    strategy_cls, config_cls = REGISTRY[strategy_name]
+
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            trader_id=TraderId.from_str("RESEARCH-001"),
+            logging=LoggerConfig(stdout_level=getattr(LogLevel, log_level)),
+        )
+    )
+    try:
+        quote: Currency = instrument.quote_currency
+        base: Currency = instrument.base_currency
+        engine.add_venue(
+            venue=instrument.id.venue,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.CASH,
+            base_currency=None,
+            starting_balances=[Money(starting_capital, quote)],
+            fee_model=ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee)),
+        )
+        engine.add_instrument(instrument)
+        engine.add_data(to_bars(prices, instrument))
+        config = config_cls(
+            instrument_id=instrument.id,
+            bar_type=daily_bar_type(instrument),
+            assumed_taker_fee=float(instrument.taker_fee),
+            **params,
+        )
+        engine.add_strategy(strategy_cls(config))
+        engine.run()
+
+        fills = engine.generate_order_fills_report()
+        account = engine.generate_account_report(instrument.id.venue)
+        equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
+        fees = _fees_paid(fills)
+        return BacktestResult(
+            strategy=strategy_name,
+            params=params,
+            equity=equity,
+            exposure=exposure,
+            fills=fills,
+            fees_paid=fees,
+            starting_capital=starting_capital,
+        )
+    finally:
+        engine.dispose()
+
+
+def _mark_to_market(
+    account: pd.DataFrame,
+    prices: pd.DataFrame,
+    quote: str,
+    base: str,
+    starting_capital: float,
+) -> tuple[pd.Series, pd.Series]:
+    """Forward-fill account balances onto bar closes and value the coin at the close."""
+    idx = prices.index
+    if account.empty:
+        cash = pd.Series(starting_capital, index=idx)
+        coin = pd.Series(0.0, index=idx)
+    else:
+        acct = account.copy()
+        acct.index = pd.to_datetime(acct.index, utc=True)
+        acct["total"] = acct["total"].astype(float)
+        by_ccy = acct.pivot_table(index=acct.index, columns="currency", values="total", aggfunc="last")
+        by_ccy = by_ccy.reindex(by_ccy.index.union(idx)).sort_index().ffill()
+        cash = by_ccy.get(quote, pd.Series(0.0, index=by_ccy.index)).reindex(idx).fillna(starting_capital)
+        coin = by_ccy.get(base, pd.Series(0.0, index=by_ccy.index)).reindex(idx).fillna(0.0)
+    coin_value = coin * prices["close"]
+    equity = cash + coin_value
+    exposure = (coin_value / equity).clip(lower=0.0)
+    return equity.rename("equity"), exposure.rename("exposure")
+
+
+def _fees_paid(fills: pd.DataFrame) -> float:
+    """Sum commissions from the fills report (one quote-currency Money string per order)."""
+    if fills is None or fills.empty or "commissions" not in fills:
+        return 0.0
+    total = 0.0
+    for entry in fills["commissions"]:
+        for money in entry if isinstance(entry, (list, tuple)) else [entry]:
+            total += float(str(money).split()[0])
+    return total

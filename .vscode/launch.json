@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Paper: BTC trend smoke (1-minute, 30 min)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "sleeve_fund.paper",
+      "args": ["configs/sleeves/btc_trend_smoke.toml", "--minutes", "30"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Paper: BTC trend daily (50/200, runs until stopped)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "sleeve_fund.paper",
+      "args": ["configs/sleeves/btc_trend_daily.toml"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Research: trend filter study (synthetic data)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "sleeve_fund",
+      "args": ["study", "trend_filter", "--synthetic"],
+      "console": "integratedTerminal"
+    }
+  ]
+}

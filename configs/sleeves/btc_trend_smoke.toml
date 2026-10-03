@@ -1,0 +1,20 @@
+# Pipeline smoke test: trades within about half an hour so you can watch the
+# whole loop (live prices -> bars -> signal -> simulated fill -> fee) end to end.
+# Says nothing about whether the strategy makes money.
+
+[sleeve]
+name = "btc-trend-smoke"
+strategy = "trend_filter"
+instrument = "BTC/USD"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
+starting_balance = 10000              # paper USD
+max_notional = 1000                   # never buy more than this per order
+warmup_bars = 0
+
+[params]
+fast = 5
+slow = 20
+
+[fees]   # Kraken UK entry tier from 9 July 2026
+maker = 0.0040
+taker = 0.0080
