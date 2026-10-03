@@ -135,6 +135,32 @@ acks_t = Table(
     Column("actor", String(32), nullable=False),
     Column("note", Text, nullable=False, default=""),
 )
+# Every order a sleeve sends, with why it was sent, written when the decision is made (not
+# reconstructed later). Also a separate table, so it arrives as a plain CREATE TABLE.
+orders_t = Table(
+    "orders",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("order_id", String(64), nullable=False, unique=True),  # the client order id fills carry
+    Column("ts", TS, nullable=False),  # decided and sent
+    Column("updated_at", TS, nullable=False),
+    Column("side", String(8), nullable=False),
+    Column("order_type", String(16), nullable=False),
+    Column("qty", Float, nullable=False),
+    Column("status", String(16), nullable=False),  # one of ORDER_STATUSES
+    Column("filled_qty", Float, nullable=False, default=0.0),
+    Column("avg_px", Float),
+    Column("fee", Float, nullable=False, default=0.0),
+    Column("intent", String(16), nullable=False),  # one of INTENTS: what the order was for
+    Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
+    Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
+    Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
+    Index("orders_sleeve_ts", "sleeve", "ts"),
+)
+ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
+OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
+INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
 
 
 def utcnow() -> datetime:
@@ -279,6 +305,56 @@ class Store:
             c.execute(insert(fills_t).values(sleeve=sleeve, ts=ts or utcnow(), side=side, qty=qty, price=price,
                                              fee=fee, order_id=order_id, trade_id=trade_id))
 
+    def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+        if intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
+        now = ts or utcnow()
+        with self.engine.begin() as c:
+            c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
+                                              order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
+                                              fee=0.0, intent=intent, reason=reason, signal=signal or {},
+                                              message=""))
+
+    def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
+                     fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0) -> None:
+        """Move an order on (accepted, cancelled, rejected...) or add a fill to it. Unknown ids are ignored:
+        orders sent before this journal existed have no row."""
+        if status is not None and status not in ORDER_STATUSES:
+            raise ValueError(f"bad order status {status!r}")
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
+            if row is None:
+                return
+            values = {"updated_at": utcnow()}
+            if fill_qty:
+                filled = row.filled_qty + fill_qty
+                values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
+                values["filled_qty"] = filled
+                values["fee"] = row.fee + fee
+                values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
+            if status is not None and row.status not in ("filled", "canceled", "rejected", "denied", "expired"):
+                values["status"] = status  # a late "accepted" never reopens a finished order
+            if message:
+                values["message"] = message
+            c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
+
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+        q = select(orders_t)
+        if sleeve:
+            q = q.where(orders_t.c.sleeve == sleeve)
+        if statuses:
+            q = q.where(orders_t.c.status.in_(statuses))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
+
+    def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
+        q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
+        if sleeve:
+            q = q.where(orders_t.c.sleeve == sleeve)
+        with self.engine.connect() as c:
+            return {s: n for s, n in c.execute(q)}
+
     def event(self, sleeve: str | None, level: str, kind: str, message: str) -> None:
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
@@ -386,6 +462,32 @@ class Store:
             if c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == event_id)).first() is None:
                 c.execute(insert(acks_t).values(event_id=event_id, ts=utcnow(), actor=actor, note=note.strip()))
 
+    def events_of(self, kinds: tuple[str, ...], limit: int = 100) -> list[dict]:
+        q = select(events_t).where(events_t.c.kind.in_(kinds)).order_by(events_t.c.id.desc()).limit(limit)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def table_sizes(self) -> dict[str, int]:
+        out = {}
+        with self.engine.connect() as c:
+            for t in (sleeves_t, equity_t, fills_t, orders_t, events_t, commands_t, decisions_t):
+                out[t.name] = c.execute(select(func.count()).select_from(t)).scalar() or 0
+        return out
+
+    def database_bytes(self) -> int | None:
+        """Size on disk where the engine can tell us; None otherwise."""
+        try:
+            with self.engine.connect() as c:
+                if self.engine.dialect.name == "postgresql":
+                    return int(c.exec_driver_sql("select pg_database_size(current_database())").scalar())
+                if self.engine.dialect.name == "sqlite":
+                    pages = c.exec_driver_sql("pragma page_count").scalar()
+                    size = c.exec_driver_sql("pragma page_size").scalar()
+                    return int(pages * size)
+        except Exception:  # noqa: BLE001 - a missing figure on the ops page is not worth an error
+            return None
+        return None
+
     # --- PM commands and decisions ----------------------------------------------
 
     def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:
@@ -414,9 +516,16 @@ class Store:
             c.execute(insert(decisions_t).values(ts=utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
 
-    def decisions(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
+    def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,
+                  since: datetime | None = None, until: datetime | None = None) -> list[dict]:
         q = select(decisions_t)
         if sleeve:
             q = q.where(decisions_t.c.sleeve == sleeve)
+        if action:
+            q = q.where(decisions_t.c.action == action)
+        if since:
+            q = q.where(decisions_t.c.ts >= since)
+        if until:
+            q = q.where(decisions_t.c.ts < until)
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(decisions_t.c.id.desc()).limit(limit)))

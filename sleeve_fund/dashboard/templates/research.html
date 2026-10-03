@@ -1,19 +1,43 @@
 {% extends "base.html" %}
+{% from "_stages.html" import stepper %}
 {% block title %}Research · Sleeve Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Research</h1>
-  <p class="lede">Tear sheets from the research loop. A strategy passes G1 when its out-of-sample Sharpe beats buy-and-hold after fees.</p>
+  <p class="lede">Every strategy moves through the same gates: tested on real history, passes G1 (out-of-sample Sharpe beats buy-and-hold after fees), runs on paper, passes G2, then goes live with small money.</p>
 </div>
-<section class="ledger" aria-label="Research counters" style="max-width:560px">
-  <div><div class="k">Ideas tested</div><div class="v lead">{{ counts.ideas }}</div><div class="s">rethink after 15 to 20 with no pass</div></div>
-  <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">each one raises the bar</div></div>
+<section class="ledger" aria-label="Research counters">
+  <div><div class="k">Strategies</div><div class="v lead">{{ rows|length }}</div><div class="s">in the library</div></div>
+  <div><div class="k">Passed G1</div><div class="v lead">{{ rows|selectattr('g1', 'equalto', 'PASS')|list|length }}</div><div class="s">on real data</div></div>
+  <div><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div><div class="s">rethink after 15 to 20 with no pass</div></div>
+  <div><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div><div class="s">each one raises the bar</div></div>
 </section>
-<section class="panel flush">
-  <div class="panel-head"><h2>Tear sheets</h2><span class="hint">newest first</span></div>
+
+<section class="panel flush" style="margin-bottom:14px" aria-labelledby="pipe-h">
+  <div class="panel-head"><h2 id="pipe-h">Pipeline</h2><span class="hint">furthest stage reached</span></div>
+  <table class="responsive">
+    <thead><tr><th>Strategy</th><th>Stage</th><th>G1 on real data</th><th>Sleeves</th><th></th></tr></thead>
+    <tbody>{% for r in rows %}
+    <tr>
+      <td class="cell-name"><a href="/strategies/{{ r.name }}">{{ r.name|replace('_', ' ') }}</a><span class="sub2">{{ r.spec.family }}</span></td>
+      <td data-m="right">{{ stepper(r.stage, stages, r.observation) }}</td>
+      <td data-label="G1">{% if r.g1 == 'PASS' %}<span class="chip running">Passed</span>{% elif r.g1 == 'FAIL' %}<span class="chip halted">Failed</span>{% elif r.sheets %}<span class="muted">Synthetic only</span>{% else %}<span class="muted">Not tested</span>{% endif %}</td>
+      <td data-m="right">{% if r.sleeves %}{{ r.sleeves|length }} running{% if r.observation %} <span class="warn" title="Running on paper without a real G1 pass">· observation</span>{% endif %}{% else %}<span class="muted">None</span>{% endif %}</td>
+      <td data-m="hide" class="num"><a class="button secondary" href="/sleeves/new?strategy={{ r.name }}">New sleeve</a></td>
+    </tr>{% endfor %}</tbody>
+  </table>
+</section>
+
+<section class="panel flush" aria-labelledby="ts-h">
+  <div class="panel-head"><h2 id="ts-h">Tear sheets</h2><span class="hint">newest first</span></div>
   {% if sheets %}
-  <table><thead><tr><th>Tear sheet</th></tr></thead>
-    <tbody>{% for s in sheets %}<tr><td class="cell-name"><a href="/research/{{ s }}">{{ s|replace('_', ' ') }}</a></td></tr>{% endfor %}</tbody></table>
+  <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th></tr></thead>
+    <tbody>{% for s in sheets %}<tr>
+      <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a></td>
+      <td data-m="right">{% if s.dataset == 'synthetic' %}<span class="warn">Synthetic</span>{% else %}{{ s.dataset }}{% endif %}</td>
+      <td>{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
+      <td data-m="hide" class="muted">{{ s.evidence }}</td></tr>{% endfor %}</tbody></table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
 </section>
+<p class="muted" style="font-size:12.5px;margin-top:12px">New ideas: describe them in plain English in the project chat, including entry, exit and the market, and they are built as strategies here.</p>
 {% endblock %}

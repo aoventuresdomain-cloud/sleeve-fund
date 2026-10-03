@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, usage %}
+{% block title %}Risk · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Risk</h1>
+  <p class="lede">Every limit across the book, what a sharp fall would cost, and every time a limit has fired. Limits are per sleeve; the guard flattens and halts a sleeve on its own.</p>
+</div>
+
+<section class="ledger" aria-label="Book risk">
+  <div><div class="k">In the market</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
+  <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">share of book equity</div></div>
+  <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
+  <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
+  <div><div class="k">If crypto falls 20%</div><div class="v {{ 'loss' if risk.scenarios[1].loss >= 0.5 }}">{{ (0 - risk.scenarios[1].loss)|smoney0 }}</div><div class="s">{{ risk.scenarios[1].loss_pct|pct1 }} of the book</div></div>
+</section>
+
+<section class="panel flush" style="margin-bottom:14px" aria-labelledby="lim-h">
+  <div class="panel-head"><h2 id="lim-h">Limits by sleeve</h2><span class="hint">bars show how much of each limit is used</span></div>
+  <table class="responsive">
+    <thead><tr><th>Sleeve</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the sleeve">Room to halt</th><th>Stop-loss</th></tr></thead>
+    <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
+    <tr>
+      <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
+      <td data-m="right">{{ x.profile.name|capitalize }}</td>
+      <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
+      <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
+      <td data-m="hide">{{ usage(r.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td>
+      <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
+      <td data-m="hide">{% if r.has_stop %}{{ (s.params.stop_loss * 100)|round(1) }}%{% else %}<span class="warn">None</span>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table>
+</section>
+
+<div class="grid">
+  <section class="panel span-7" aria-labelledby="stress-h">
+    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2><span class="hint">every coin drops at once, before any stop can act</span></div>
+    <table class="compact">
+      <thead><tr><th>Fall</th><th class="num">Book loss</th><th class="num">Share of book</th><th>Sleeves that would halt</th></tr></thead>
+      <tbody>{% for sc in risk.scenarios %}
+      <tr><td>{{ (sc.shock * 100)|round(0)|int }}%</td><td class="num loss">{{ '−{:,.2f}'.format(sc.loss) if sc.loss > 0.005 else '0.00' }}</td><td class="num">{{ sc.loss_pct|pct1 }}</td>
+        <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">Uses current positions and each sleeve's peak equity. Crypto falls of 20% in a day have happened; a stop-loss sells after the fact, at whatever price it gets.</p>
+  </section>
+  <section class="panel span-5" aria-labelledby="hist-h">
+    <div class="panel-head"><h2 id="hist-h">Limits that fired</h2><span class="hint">halts, pauses, mismatches</span></div>
+    {% if risk.history %}
+    <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message }}</span></li>{% endfor %}</ul>
+    {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}
+  </section>
+</div>
+{% endblock %}
