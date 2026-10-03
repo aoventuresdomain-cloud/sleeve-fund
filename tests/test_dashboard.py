@@ -373,7 +373,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
     assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "carried over" in form
     assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
-    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="720" value="40"' in form
+    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
 
 
 def test_sleeve_from_a_backtest_cannot_change_its_interval(client):
@@ -770,3 +770,11 @@ def test_minute_backtests_need_the_history_store(client, monkeypatch, tmp_path):
     page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
                  auth=AUTH).text
     assert "finished loading here yet, so only daily bars can be backtested" in page
+
+
+def test_trade_built_intervals_get_a_warm_up_from_the_store():
+    from sleeve_fund.dashboard.app import _warmup_for
+
+    # Venue candles stop at one request (720); bars built from trades load from the history store.
+    assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-EXTERNAL") == 720
+    assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-INTERNAL") > 720

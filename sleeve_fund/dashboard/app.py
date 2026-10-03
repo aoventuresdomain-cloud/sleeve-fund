@@ -720,7 +720,7 @@ def _clone_qs(s) -> str:
 
 # The backtest page's default interval. A sleeve made from a backtest decides on the bars it tested.
 BACKTEST_BAR_SPEC = "1-DAY-LAST-EXTERNAL"
-MAX_WARMUP_BARS = 720  # what the venue returns in one request
+MAX_WARMUP_BARS = 720  # what the venue returns in one request; bars built from trades load from the store
 
 
 def _profile_cap(q) -> float:
@@ -733,18 +733,19 @@ def _profile_cap(q) -> float:
 
 def _warmup_for(strategy: str, q, bar_spec: str = BACKTEST_BAR_SPEC) -> int:
     """Bars to load at start so the slowest indicator is ready on the sleeve's first bar, as the
-    strategy itself says, capped at what the venue returns in one request. Bars built from live
-    trades can't be loaded from the venue, so those start cold (0)."""
-    if bar_spec.endswith("INTERNAL"):
-        return 0
+    strategy itself says. Venue candles are capped at what the venue returns in one request; bars
+    built from live trades load from the history store, up to the sleeve limit."""
     import importlib
+
+    from sleeve_fund.paper.config import MAX_WARMUP_BARS as MAX_STORED_WARMUP_BARS
 
     params = dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
     try:
         params.update(_form_params(q, strategy))
     except ValueError:
         pass
-    return min(MAX_WARMUP_BARS, REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)))
+    cap = MAX_STORED_WARMUP_BARS if bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
+    return min(cap, REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)))
 
 
 def _form_params(form, strategy: str) -> dict:

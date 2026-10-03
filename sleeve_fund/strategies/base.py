@@ -165,12 +165,21 @@ class LongFlatStrategy(Strategy):
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
+        # Paper/live on bars built from live trades: loads warm-up bars from the venue history store
+        # (the venue can't serve those bars). Attach with attach_history(); None requests them from
+        # the venue's candles instead.
+        self.history_loader = None
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
+        return self
+
+    def attach_history(self, loader) -> "LongFlatStrategy":
+        """loader(instrument, bar_type, limit) -> the latest `limit` complete bars, oldest first."""
+        self.history_loader = loader
         return self
 
     @property
@@ -189,7 +198,10 @@ class LongFlatStrategy(Strategy):
             self.stop()
             return
         if self._cfg.warmup_bars:
-            self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
+            if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
+                self._warm_from_history()
+            else:
+                self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
         self.subscribe_bars(self._cfg.bar_type)
         if self.runtime is not None:
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
@@ -246,6 +258,25 @@ class LongFlatStrategy(Strategy):
         for bar in sorted(bars, key=lambda b: b.ts_event):
             self._accept(bar)
         self.log.info(f"warmed up on {len(bars)} historical bars")
+
+    def _warm_from_history(self) -> None:
+        """Feed the indicators the latest stored bars, so a model on bars built from live trades
+        is ready on its first live bar instead of waiting out its longest look-back."""
+        want = self._cfg.warmup_bars
+        try:
+            bars = self.history_loader(self.instrument, self._cfg.bar_type, want)
+        except Exception as exc:  # noqa: BLE001 - a missing or stale store must not stop the sleeve
+            bars, why = [], str(exc)
+        else:
+            why = "the history store has none"
+        if bars:
+            self.on_historical_bars(bars)
+            msg = f"Loaded {len(bars)} of {want} warm-up bars from the history store"
+        else:
+            msg = f"No warm-up bars loaded ({why}); the model waits for {want} live bars"
+        self.log.info(msg)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info" if bars else "warning", "warmup", msg)
 
     def want_long(self, bar: Bar) -> bool | None:
         """True = be long, False = be flat, None = not enough data yet (do nothing)."""
