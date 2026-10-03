@@ -48,7 +48,7 @@
 
   <form class="panel span-5" method="post" action="/accounts/new" id="add" aria-labelledby="add-h">
     <div class="panel-head"><h2 id="add-h">Add an account</h2></div>
-    <div class="field"><label for="a-name">Name</label><input id="a-name" name="name" required pattern="[a-z0-9][a-z0-9-]{1,40}" placeholder="kraken-trend" value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
+    <div class="field"><label for="a-name">Name</label><input id="a-name" name="name" required pattern="[a-z0-9][a-z0-9\-]{1,40}" placeholder="kraken-trend" value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
     <div class="field"><label for="a-kind">Type</label><select id="a-kind" name="kind"><option value="live" {{ 'selected' if pre.get('kind', 'live') == 'live' }}>Live: a Kraken account or sub-account</option><option value="paper" {{ 'selected' if pre.get('kind') == 'paper' }}>Paper: simulated money, for grouping sleeves</option></select></div>
     <div class="field"><label for="a-note">Note (optional)</label><input id="a-note" name="note" maxlength="200" placeholder="What this account is for" value="{{ pre.get('note', '') }}"></div>
     <div class="field"><label for="a-reason">Why add it?</label><input id="a-reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>

@@ -509,3 +509,87 @@ def test_fetch_kraken_ohlc_keeps_the_forming_candle_and_uses_open_times():
     assert len(df) == 2 and df.index[0].timestamp() == 1700000000 and df["close"].iloc[-1] == 2.0
     with pytest.raises(ValueError):
         fetch_kraken_ohlc("SOL/USD", 7, get_json)
+
+
+def test_every_headline_figure_explains_itself(client):
+    from sleeve_fund.dashboard.glossary import GLOSSARY
+
+    c, store = client
+    _new(c)
+    for path in ("/", "/sleeves/btc-test", "/trades"):
+        page = c.get(path, auth=AUTH).text
+        assert 'class="help"' in page and 'aria-label="What does this mean?"' in page
+    assert GLOSSARY["drawdown"] in c.get("/", auth=AUTH).text
+
+
+def test_clone_with_changes_prefills_the_new_sleeve_form(client):
+    from urllib.parse import parse_qs, urlparse
+
+    c, store = client
+    _new(c, name="sol-stops", instrument="SOL/USD", stop_loss_pct="8", max_notional="500")
+    page = c.get("/sleeves/sol-stops", auth=AUTH).text
+    href = next(p for p in page.split('"') if p.startswith("/sleeves/new?"))
+    q = {k: v[0] for k, v in parse_qs(urlparse(href.replace("&amp;", "&")).query).items()}
+    assert q["instrument"] == "SOL/USD" and q["stop_loss_pct"] == "8" and q["max_notional"] == "500"
+    assert q["p_trend_filter__fast"] == "10" and q["name"] == "sol-stops-v2" and q["from"] == "clone"
+    form = c.get(href.replace("&amp;", "&"), auth=AUTH).text
+    assert "Settings copied from" in form and 'value="sol-stops-v2" data-touched=1' in form
+    # Submitting the clone unchanged (bar the reason) gives an identical second sleeve.
+    form_data = {k: v for k, v in q.items() if k not in ("from", "source")}
+    assert _new(c, **form_data, reason="same again").status_code == 303
+    assert store.sleeve("sol-stops-v2").params == store.sleeve("sol-stops").params
+
+
+def test_archive_hides_a_stopped_sleeve_and_restore_brings_it_back(client):
+    c, store = client
+    _new(c)
+    post = lambda action, reason="done with it": c.post(  # noqa: E731
+        "/sleeves/btc-test/archive", data={"action": action, "reason": reason}, auth=AUTH, headers=SAME,
+        follow_redirects=False)
+    assert post("archive").status_code == 400  # still running
+    store.set_desired_state("btc-test", "stopped")
+    assert post("archive", reason=" ").status_code == 400
+    assert c.post("/sleeves/btc-test/archive", data={"action": "archive", "reason": "x"}, auth=AUTH,
+                  headers={"Origin": "https://evil.example"}).status_code == 403
+    assert post("archive").status_code == 303
+    home = c.get("/", auth=AUTH).text
+    assert "Archived sleeves (1)" in home and home.count('href="/sleeves/btc-test"') == 1
+    assert "Archived: hidden" in c.get("/sleeves/btc-test", auth=AUTH).text
+    assert post("restore", reason="back in use").status_code == 303
+    assert "Archived sleeves" not in c.get("/", auth=AUTH).text
+    assert [d["action"] for d in store.decisions("btc-test")][:2] == ["restore", "archive"]
+
+
+def test_path_to_live_reports_g2_evidence_and_never_approves(client):
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard import gates
+    from sleeve_fund.dashboard.book import sleeve_extras
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+    from sleeve_fund.store import utcnow
+
+    c, store = client
+    _new(c)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Path to live" in page and "0 of 8 G2 conditions met" not in page and "Your G2 approval" in page
+    s = store.sleeve("btc-test")
+    x = sleeve_extras(store, sleeve_summary(store, s), __import__("pandas").DataFrame())
+    rows = {r["label"]: r for r in gates.path_to_live(store, x, "PASS", store.accounts(), utcnow() + timedelta(days=50))}
+    assert rows["Strategy passed G1"]["ok"] and rows["Six weeks of paper trading"]["ok"]
+    assert not rows["At least 10 closed trades"]["ok"] and rows["Results inside the backtest's range"]["ok"] is None
+    assert rows["Your G2 approval"]["ok"] is False  # the checklist can never approve G2 itself
+    store.event("btc-test", "error", "reconcile_mismatch", "engine 1 BTC, journal 0")
+    rows = {r["label"]: r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow())}
+    assert rows["Journal and engine always agreed"]["bad"] and not rows["Strategy passed G1"]["ok"]
+    store.create_account("kraken-live", "live")
+    store.report_keys({"kraken-live": True})
+    rows = {r["label"]: r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow())}
+    assert rows["Live Kraken account with its key installed"]["detail"] == "kraken-live"
+
+
+def test_new_sleeve_form_is_one_step_at_a_time_with_javascript_and_whole_without(client):
+    c, _ = client
+    page = c.get("/sleeves/new", auth=AUTH).text
+    assert page.count('<fieldset class="panel step">') == 5  # all present in the HTML; the script shows one at a time
+    js = c.get("/static/console.js", auth=AUTH).text
+    assert "function wizard(form)" in js

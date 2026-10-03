@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart %}
+{% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Sleeve Fund{% endblock %}
@@ -11,11 +11,14 @@
       {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {{ 'disabled' if x.qty <= 0 }}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
-    {% else %}<button type="button" data-open="dlg-start">Start</button>{% endif %}
+    {% else %}<button type="button" data-open="dlg-start">Start</button>
+      {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {{ 'disabled title="Flatten before archiving"' if x.qty > 0 }}>Archive</button>{% endif %}{% endif %}
+    <a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new sleeve from these settings">Clone with changes</a>
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
 </div>
 
+{% if archived %}<div class="banner" role="status">Archived: hidden from the home page's sleeve list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
@@ -25,14 +28,14 @@
 {% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the sleeve to pick up ({{ pending|map(attribute='command')|join(', ') }}). Sleeves check about every 30 seconds.</div>{% endif %}
 
 <section class="ledger" aria-label="Sleeve figures">
-  <div><div class="k">Equity</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
-  <div><div class="k">Today</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
-  <div><div class="k">Since start</div><div class="v">{{ signed(x.ret) }}</div><div class="s">holding: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Holding</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
-  <div><div class="k">Open P&amp;L</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
-  <div><div class="k">Closed trades</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% else %}none yet{% endif %}</div></div>
-  <div><div class="k" title="Average return per closed trade, after fees">Avg trade</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
-  <div><div class="k">Fees paid</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
+  <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
+  <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
+  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">holding: {{ x.bench_ret|pct1s }}</div></div>
+  <div><div class="k">Holding {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
+  <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% else %}none yet{% endif %}</div></div>
+  <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
+  <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
 </section>
 {% if t.trades and t.trades < 10 %}<p class="muted" style="margin:-6px 0 14px;font-size:12.5px">Only {{ t.trades }} closed trade{{ 's' if t.trades != 1 }}. Win rate and expectancy mean little until there are at least 10.</p>{% endif %}
 
@@ -110,6 +113,14 @@
   {% else %}<p class="empty" style="padding:4px 14px 14px">No orders journaled yet. Each order is recorded here with its reason when it is sent.</p>{% endif %}
 </section>
 
+<section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="g2-h">Path to live {{ help('g2') }}</h2><span class="hint">{{ path|selectattr('ok')|list|length }} of {{ path|length }} G2 conditions met</span></div>
+  <ul class="checklist cols">{% for r in path %}{% set cls = 'ok' if r.ok else ('bad' if r.bad else 'todo') %}
+    <li class="{{ cls }}"><span class="mark" aria-hidden="true">{{ '✓' if r.ok else ('!' if r.bad else ('?' if r.ok is none else '○')) }}</span><span><span class="sr-only">{{ 'Met' if r.ok else ('Problem' if r.bad else ('Your call' if r.ok is none else 'Not yet')) }}: </span>{{ r.label }}<small>{{ r.detail }}</small></span></li>{% endfor %}
+  </ul>
+  <p class="muted" style="margin:10px 0 0;font-size:12.5px">This only reports evidence. Live trading stays locked until you approve G2, and then only on a live account whose key you install on the server.</p>
+</section>
+
 <div class="grid">
   <section class="panel span-7" aria-labelledby="feed-h">
     <div class="panel-head"><h2 id="feed-h">Activity</h2>
@@ -146,17 +157,19 @@
   'resume': ('Resume ' ~ s.name, 'The sleeve trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the sleeve.', 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the sleeve process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It holds no coins.'), 'Stop sleeve', 'danger' if x.qty > 0 else ''),
+  'archive': ('Archive ' ~ s.name, 'Hides it from the sleeve list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive sleeve', ''),
+  'restore': ('Restore ' ~ s.name, 'Puts it back in the sleeve list on the home page. It stays stopped until you start it.', 'Restore sleeve', ''),
   'start': ('Start ' ~ s.name, 'Starts the sleeve process. It picks up its journal and reconciles before trading.', 'Start sleeve', ''),
 } %}
 <datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
 <dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
-  <form method="post" action="/sleeves/{{ s.name }}/command">
+  <form method="post" action="/sleeves/{{ s.name }}/{{ 'archive' if cmd in ['archive', 'restore'] else 'command' }}">
     <h2 id="dlg-{{ cmd }}-h">{{ title }}</h2>
     <p>{{ effect }}</p>
     <label for="r-{{ cmd }}">Reason for the decision log</label>
     <input id="r-{{ cmd }}" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="{{ cmd }}" class="{{ tone }}">{{ label }}</button></div>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ cmd }}" class="{{ tone }}">{{ label }}</button></div>
   </form>
 </dialog>
 {% endfor %}

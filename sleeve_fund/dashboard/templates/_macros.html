@@ -15,3 +15,4 @@
   <div class="why-grid pc-note" hidden aria-live="polite"></div>
   <p class="pc-foot">Tap a buy or sell arrow to see why it traded. Charts by <a href="https://www.tradingview.com/" rel="noopener" target="_blank">TradingView Lightweight Charts™</a>.</p>
 </section>{% endmacro %}
+{% macro help(key) %}{% set t = glossary.get(key) %}{% if t %}<button type="button" class="help" data-help="{{ t }}" title="{{ t }}" aria-label="What does this mean?">?</button>{% endif %}{% endmacro %}

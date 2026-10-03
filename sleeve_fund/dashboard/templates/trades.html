@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import signed, money_signed, tag, why, why_toggle %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, help %}
 {% block title %}Trades · Sleeve Fund{% endblock %}
 {% block content %}
 {% set st = h.stats %}
@@ -18,13 +18,13 @@
 
 <section class="ledger" aria-label="Trade figures">
   <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div><div class="s">{{ h.exposure|money }} in coins</div></div>
-  <div><div class="k">Open P&amp;L</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
+  <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
   <div><div class="k">Closed trades</div><div class="v">{{ st.trades }}</div><div class="s">{{ st.wins }} won, {{ st.losses }} lost</div></div>
-  <div><div class="k">Win rate</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>
-  <div><div class="k">Realised P&amp;L</div><div class="v">{{ money_signed(st.pnl) }}</div><div class="s">after {{ st.fees|money }} fees</div></div>
+  <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>
+  <div><div class="k">Realised P&amp;L {{ help('realised') }}</div><div class="v">{{ money_signed(st.pnl) }}</div><div class="s">after {{ st.fees|money }} fees</div></div>
   <div><div class="k">Average win</div><div class="v">{{ st.avg_win|pctn }}</div><div class="s">loss {{ st.avg_loss|pctn }}</div></div>
-  <div><div class="k">Expectancy</div><div class="v">{{ st.expectancy|pctn }}</div><div class="s">per trade</div></div>
-  <div><div class="k">Profit factor</div><div class="v">{{ st.profit_factor|numn }}</div><div class="s">gross won ÷ lost</div></div>
+  <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ st.expectancy|pctn }}</div><div class="s">per trade</div></div>
+  <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ st.profit_factor|numn }}</div><div class="s">gross won ÷ lost</div></div>
 </section>
 
 <section class="panel flush" aria-labelledby="pos-h">

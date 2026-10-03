@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
 {% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
 {% block title %}Backtest · Sleeve Fund{% endblock %}
 {% block content %}
@@ -35,19 +35,19 @@
         <thead><tr><th></th><th class="num">Strategy</th><th class="num">Buy and hold</th></tr></thead>
         <tbody>
           <tr><th scope="row">Return</th><td class="num">{{ signed(s.total_return) }}</td><td class="num">{{ h.total_return|pct }}</td></tr>
-          <tr><th scope="row">A year (CAGR)</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
-          <tr><th scope="row">Sharpe</th><td class="num">{{ s.sharpe|numn }}</td><td class="num">{{ h.sharpe|numn }}</td></tr>
-          <tr><th scope="row">Worst drawdown</th><td class="num">{{ (-s.max_drawdown)|pct1 }}</td><td class="num">{{ (-h.max_drawdown)|pct1 }}</td></tr>
-          <tr><th scope="row">Volatility</th><td class="num">{{ s.volatility|pct1 }}</td><td class="num">{{ h.volatility|pct1 }}</td></tr>
+          <tr><th scope="row">A year (CAGR) {{ help('cagr') }}</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
+          <tr><th scope="row">Sharpe {{ help('sharpe') }}</th><td class="num">{{ s.sharpe|numn }}</td><td class="num">{{ h.sharpe|numn }}</td></tr>
+          <tr><th scope="row">Worst drawdown {{ help('drawdown') }}</th><td class="num">{{ (-s.max_drawdown)|pct1 }}</td><td class="num">{{ (-h.max_drawdown)|pct1 }}</td></tr>
+          <tr><th scope="row">Volatility {{ help('volatility') }}</th><td class="num">{{ s.volatility|pct1 }}</td><td class="num">{{ h.volatility|pct1 }}</td></tr>
         </tbody>
       </table>
       <section class="ledger compact" aria-label="Trade figures">
         <div><div class="k">Trades</div><div class="v">{{ ts.trades }}</div><div class="s">{% if ts.trades < 10 %}too few to judge{% else %}{{ ts.wins }} won{% endif %}</div></div>
-        <div><div class="k">Win rate</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
-        <div><div class="k">Expectancy</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
-        <div><div class="k">Profit factor</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
+        <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
+        <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
+        <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
         <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">of {{ result.start|money }}</div></div>
-        <div><div class="k">In the market</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
+        <div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
       </section>
     </section>
 
