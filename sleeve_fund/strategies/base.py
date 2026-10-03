@@ -227,9 +227,12 @@ class LongFlatStrategy(Strategy):
         if account is None:
             self.log.warning("no account yet; skipping buy")
             return
-        free = account.balance_free(self.instrument.quote_currency)
-        if free is None:
+        quote = str(self.instrument.quote_currency.code)
+        bal = next((b for c, b in account.balances().items() if str(c.code) == quote), None)
+        if bal is None:
+            self.log.warning(f"no {quote} balance; skipping buy")
             return
+        free = bal.free
         budget = free.as_decimal()
         if self._cfg.max_notional is not None:
             budget = min(budget, Decimal(str(self._cfg.max_notional)))
@@ -273,10 +276,11 @@ class LongFlatStrategy(Strategy):
         account = self._account()
         if account is None or self.instrument is None:
             return 0.0, 0.0, 0.0, price
-        cash_m = account.balance_total(self.instrument.quote_currency)
-        coin_m = account.balance_total(self.instrument.base_currency)
-        cash = cash_m.as_double() if cash_m else 0.0
-        qty = coin_m.as_double() if coin_m else 0.0
+        # Match balances by currency code: the live venue's instrument currencies are not always
+        # the same objects as the sandbox account's, so balance_total(currency) can miss.
+        totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
+        cash = totals.get(str(self.instrument.quote_currency.code), 0.0)
+        qty = totals.get(str(self.instrument.base_currency.code), 0.0)
         return cash + qty * price, cash, qty, price
 
     def _on_tick(self, _event=None) -> None:
@@ -288,8 +292,10 @@ class LongFlatStrategy(Strategy):
                 self.runtime.store.heartbeat(self.runtime.name)
                 if not self._mark_warned:
                     self._mark_warned = True
-                    why = (f"account={'missing' if self._account() is None else 'ok'} "
-                           f"price={price} cash={cash} qty={qty}")
+                    acct = self._account()
+                    why = (f"account={'missing' if acct is None else 'ok'} price={price} cash={cash} qty={qty} "
+                           f"balances={({str(c.code): m.as_double() for c, m in acct.balances_total().items()} if acct else {})} "
+                           f"quote={self.instrument.quote_currency.code if self.instrument else '?'}")
                     self.log.warning(f"cannot mark sleeve yet: {why}")
                     self.runtime.store.event(self.runtime.name, "warning", "mark_unavailable", why)
                 return
