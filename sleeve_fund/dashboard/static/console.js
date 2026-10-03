@@ -112,6 +112,82 @@ window.Console = (() => {
     });
   }
 
+  // TradingView-style price chart: candles, volume, a marker on every fill, and entry/stop/target
+  // lines. Clicking a marker shows the reason journaled when the order was sent.
+  // src is the data itself, or an endpoint that takes ?interval=.
+  function priceChart(boxId, src) {
+    const box = document.getElementById(boxId);
+    if (!box || !window.LightweightCharts) return;
+    const $ = (sel) => box.querySelector(sel);
+    const chart = LightweightCharts.createChart($(".pc-canvas"), {
+      autoSize: true,
+      layout: {background: {type: "solid", color: css("--panel")}, textColor: css("--muted"), fontFamily: getComputedStyle(document.body).fontFamily, attributionLogo: true},
+      grid: {vertLines: {color: css("--line")}, horzLines: {color: css("--line")}},
+      rightPriceScale: {borderColor: css("--line")}, timeScale: {borderColor: css("--line"), rightOffset: 4},
+      crosshair: {mode: 0},
+    });
+    const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
+    const vol = chart.addHistogramSeries({priceScaleId: "vol", priceFormat: {type: "volume"}, color: css("--line-strong"), lastValueVisible: false, priceLineVisible: false});
+    chart.priceScale("vol").applyOptions({scaleMargins: {top: 0.82, bottom: 0}});
+    let lines = [], data = null;
+    const fmt = (v) => (v >= 100 ? v.toLocaleString("en-GB", {minimumFractionDigits: 2, maximumFractionDigits: 2}) : v.toPrecision(5));
+    const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+    const showNote = (ids) => {
+      const note = $(".pc-note");
+      note.replaceChildren();
+      ids.forEach((id) => {
+        const n = data.notes[id];
+        if (!n) return;
+        const block = el("div", "why-block");
+        block.append(el("div", "k", `${n.side} · ${n.intent} · ${n.ts} at ${fmt(n.price)}`));
+        block.append(el("p", null, n.reason || "Not recorded: this fill predates the order journal."));
+        if (n.signal.length) {
+          const dl = el("dl", "sig");
+          n.signal.forEach(([k, v]) => { const d = el("div"); d.append(el("dt", null, k), el("dd", null, v)); dl.append(d); });
+          block.append(dl);
+        }
+        note.append(block);
+      });
+      note.hidden = !note.childElementCount;
+    };
+    const render = (d) => {
+      data = d;
+      chart.applyOptions({timeScale: {timeVisible: d.interval < 1440, secondsVisible: false}});
+      candles.setData(d.candles);
+      vol.setData(d.volume.map((v, i) => ({...v, color: d.candles[i] && d.candles[i].close >= d.candles[i].open ? css("--gain-bg") : css("--loss-bg")})));
+      candles.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")})));
+      lines.forEach((l) => candles.removePriceLine(l));
+      lines = d.lines.map((l) => candles.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
+        color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : css("--accent")}));
+      chart.timeScale().fitContent();
+      $(".pc-source").hidden = d.source !== "marks";
+      $(".pc-empty").hidden = d.candles.length > 0;
+      showNote([]);
+      const tabs = $(".pc-intervals");
+      if (tabs && d.intervals) {
+        tabs.replaceChildren(...d.intervals.map((k) => {
+          const b = el("button", null, k); b.type = "button"; b.setAttribute("aria-pressed", String(k === d.chosen));
+          b.addEventListener("click", () => load(k)); return b;
+        }));
+      }
+    };
+    const load = (interval) => {
+      if (typeof src !== "string") { render(src); return; }
+      fetch(src + (interval ? `?interval=${interval}` : "")).then((r) => r.json()).then(render);
+    };
+    chart.subscribeCrosshairMove((p) => {
+      const bar = p.seriesData && p.seriesData.get(candles);
+      $(".pc-legend").textContent = bar ? `O ${fmt(bar.open)}  H ${fmt(bar.high)}  L ${fmt(bar.low)}  C ${fmt(bar.close)}` : "";
+    });
+    chart.subscribeClick((p) => {
+      if (!data || !p.time) return;
+      const ids = p.hoveredObjectId && data.notes[p.hoveredObjectId] ? [p.hoveredObjectId]
+        : data.markers.filter((m) => m.time === p.time).map((m) => m.id);
+      if (ids.length) showNote(ids);
+    });
+    load("");
+  }
+
   // Any form with a strategy picker: show only the chosen strategy's settings, with its sentence filled in.
   function strategyPicker(formId) {
     const form = document.getElementById(formId);
@@ -214,5 +290,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, dialogs, whys, strategyPicker, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, dialogs, whys, strategyPicker, priceChart, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

@@ -74,6 +74,28 @@ def fetch_kraken_daily(pair: str, get_json=_get_json) -> pd.DataFrame:
     return validate_ohlcv(out)
 
 
+KRAKEN_INTERVALS = (1, 5, 15, 30, 60, 240, 1440, 10080)  # minutes Kraken's OHLC endpoint accepts
+
+
+def fetch_kraken_ohlc(pair: str, interval: int, get_json=_get_json) -> pd.DataFrame:
+    """Kraken's recent candles (up to 720) for charts, indexed by bar OPEN time, as charting tools
+    expect. Unlike fetch_kraken_daily, the newest (still forming) candle is kept, so the chart is live."""
+    if interval not in KRAKEN_INTERVALS:
+        raise ValueError(f"interval must be one of {KRAKEN_INTERVALS} minutes")
+    key = kraken_pair_key(pair, get_json)
+    data = get_json(f"{KRAKEN_API}/OHLC?" + urllib.parse.urlencode({"pair": key, "interval": interval}))
+    if data.get("error"):
+        raise ValueError(f"Kraken: {'; '.join(data['error'])}")
+    rows = next((v for k, v in data.get("result", {}).items() if k != "last"), [])
+    if not rows:
+        raise ValueError(f"no candles for {pair}")
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "vwap", "volume", "count"])
+    out = df[OHLCV].astype(float)
+    out.index = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
+    out.index.name = "timestamp"
+    return out
+
+
 def validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """Fail loudly on data that would silently corrupt a backtest."""
     missing = set(OHLCV) - set(df.columns)

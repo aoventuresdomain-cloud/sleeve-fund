@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle %}
+{% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Sleeve Fund{% endblock %}
@@ -35,6 +35,8 @@
   <div><div class="k">Fees paid</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
 </section>
 {% if t.trades and t.trades < 10 %}<p class="muted" style="margin:-6px 0 14px;font-size:12.5px">Only {{ t.trades }} closed trade{{ 's' if t.trades != 1 }}. Win rate and expectancy mean little until there are at least 10.</p>{% endif %}
+
+{{ price_chart("pc", s.instrument ~ " on Kraken", "every fill marked; dashed lines show entry, stop and target") }}
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h">
@@ -162,6 +164,7 @@
 
 {% block scripts %}
 <script src="/static/chart.umd.min.js"></script>
+<script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.dialogs(); Console.whys(); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
+<script>Console.dialogs(); Console.whys(); Console.priceChart("pc", "/api/sleeves/{{ s.name }}/candles"); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
 {% endblock %}

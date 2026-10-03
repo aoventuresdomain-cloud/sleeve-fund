@@ -8,6 +8,7 @@ on:
       - "sleeve_fund/strategies/**"
       - "sleeve_fund/data.py"
       - "sleeve_fund/dashboard/preview.py"
+      - "sleeve_fund/dashboard/charts.py"
       - "configs/sleeves/**"
       - "scripts/paper_smoke.sh"
       - ".github/workflows/paper-smoke.yml"
@@ -35,7 +36,12 @@ jobs:
               df = fetch_kraken_daily(pair)
               print(pair, len(df), "days", df.index[0].date(), "to", df.index[-1].date(), "last close", df["close"].iloc[-1])
               assert len(df) >= 300, pair
-          d = preview.run("trend_filter", "ETH/USD", {"fast": 20, "slow": 60})
+          from sleeve_fund.data import fetch_kraken_ohlc
+          h = fetch_kraken_ohlc("ETH/USD", 60)
+          print("ETH/USD hourly candles:", len(h), "newest", h.index[-1])
+          assert len(h) >= 500
+          d = preview.run("trend_filter", "ETH/USD", {"fast": 20, "slow": 60}, detail=True)
+          assert d["price"]["candles"] and d["price"]["markers"], "backtest chart has candles and trade markers"
           print("look-back ETH/USD:", d["days"], "days, sharpe", round(d["strategy"]["sharpe"], 2), "trades", d["trades"]["trades"])
           PY
       - run: scripts/paper_smoke.sh "${{ inputs.minutes || '4' }}"

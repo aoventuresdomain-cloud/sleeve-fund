@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pandas as pd
+
 from sleeve_fund.data import fetch_kraken_daily
 from sleeve_fund.instruments import spot_pair
 from sleeve_fund.research.metrics import fills_to_rows, returns_from_equity, summary, trade_stats, trades
@@ -84,4 +86,10 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         out["strategy"].update(sortino=s["sortino"], calmar=s["calmar"])
         out["hold"].update(sortino=b["sortino"], calmar=b["calmar"])
         out["start"] = round(float(starting), 2)
+        from sleeve_fund.dashboard import charts
+
+        # Daily candles are stamped at their close; the chart wants open times. Fills land on the
+        # bar they decided on, which closed at the fill time.
+        opened = prices.set_axis(prices.index - pd.Timedelta("1D"))
+        out["price"] = charts.payload(opened, 1440, rows, res.decisions, [], "kraken", shift_bars=1)
     return out
