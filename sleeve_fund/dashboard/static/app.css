@@ -259,3 +259,28 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   tbody tr:hover td { background: none; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */
+.stepper { display: flex; gap: 3px; list-style: none; margin: 0; padding: 0; counter-reset: st; }
+.stepper li { counter-increment: st; position: relative; width: 26px; height: 6px; border-radius: 2px; background: var(--neutral-bg); }
+.stepper li.done { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+.stepper li.now { background: var(--accent); }
+.stepper li.now.obs { background: var(--warn); }
+.stepper li span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.panel > .stepper li { flex: 1; height: auto; padding: 6px 8px; font-size: 12px; color: var(--muted); }
+.panel > .stepper li span { position: static; width: auto; height: auto; overflow: visible; clip: auto; }
+.panel > .stepper li span::before { content: counter(st) "  "; color: var(--faint); }
+.panel > .stepper li.done, .panel > .stepper li.now { color: #fff; }
+.panel > .stepper li.done span::before, .panel > .stepper li.now span::before { color: rgb(255 255 255 / .7); }
+
+/* --- new-sleeve form ---------------------------------------------------------- */
+fieldset.step { margin: 0 0 14px; min-width: 0; }
+fieldset.step legend { float: left; width: 100%; padding: 0; margin: 0 0 10px; font-weight: 650; font-size: 14px; }
+fieldset.step legend + * { clear: both; }
+.hint { margin: 4px 0 0; color: var(--faint); font-size: 12px; }
+.params[hidden] { display: none; }
+.sticky { position: sticky; top: calc(var(--strip) + 14px); }
+ul.summary { margin: 0; padding-left: 18px; }
+ul.summary li { margin: 0 0 6px; }
+.panel .banner { margin: 12px 0 0; font-size: 13px; }
+@media (max-width: 1100px) { .sticky { position: static; } }

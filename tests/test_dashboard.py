@@ -198,3 +198,54 @@ def test_ops_page_shows_processes_and_safety_nets(client):
     _new(c)
     page = c.get("/ops", auth=AUTH).text
     assert "Sleeve processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page
+
+
+def test_preview_runs_the_form_settings_on_history(client, monkeypatch):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    preview._history.clear()
+    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=2, start_price=150))
+    q = {"strategy": "trend_filter", "instrument": "sol/usd", "p_trend_filter__fast": "10",
+         "p_trend_filter__slow": "40", "stop_loss_pct": "8", "starting_balance": "5000"}
+    d = c.get("/api/preview", params=q, auth=AUTH).json()
+    assert d["pair"] == "SOL/USD" and d["days"] == 400 and d["equity"][0] == pytest.approx(5000, rel=0.01)
+    assert set(d["strategy"]) >= {"sharpe", "max_drawdown"} and d["trades"]["trades"] >= 1
+    bad = c.get("/api/preview", params={**q, "p_trend_filter__fast": "50"}, auth=AUTH)  # fast must be < slow
+    assert bad.status_code == 422 and "error" in bad.json()
+    assert c.get("/api/preview", params={**q, "instrument": "nonsense"}, auth=AUTH).status_code == 422
+
+
+def test_research_pipeline_and_strategy_pages(client):
+    c, _ = client
+    _new(c)  # a buy_and_hold sleeve, with no real G1 pass, so it shows as an observation
+    page = c.get("/research", auth=AUTH).text
+    assert "Pipeline" in page and "observation" in page and "trend filter" in page
+    s = c.get("/strategies/trend_filter", auth=AUTH).text
+    assert "Exact rules" in s and "Start a sleeve with this" in s
+    assert c.get("/strategies/nope", auth=AUTH).status_code == 404
+    form = c.get("/sleeves/new?strategy=rsi_pullback", auth=AUTH).text
+    assert '<option value="rsi_pullback" selected' in form
+
+
+def test_fetch_kraken_daily_parses_and_drops_the_open_candle():
+    from sleeve_fund.data import fetch_kraken_daily
+
+    day = 86400
+    canned = {
+        "AssetPairs": {"error": [], "result": {"XXBTZUSD": {"wsname": "XBT/USD"}, "SUIUSD": {"wsname": "SUI/USD"}}},
+        "OHLC": {"error": [], "result": {"XXBTZUSD": [[1_700_000_000 + i * day, "100", "110", "95", "105", "102", "7", 3]
+                                                      for i in range(5)], "last": 1}},
+    }
+    seen = []
+
+    def get_json(url):
+        seen.append(url)
+        return canned["AssetPairs" if "AssetPairs" in url else "OHLC"]
+
+    df = fetch_kraken_daily("BTC/USD", get_json=get_json)
+    assert len(df) == 4 and "pair=XXBTZUSD" in seen[-1]
+    assert df.index[0].timestamp() == 1_700_000_000 + day  # stamped at the bar's close, not its open
+    with pytest.raises(ValueError):
+        fetch_kraken_daily("NOPE/USD", get_json=get_json)
