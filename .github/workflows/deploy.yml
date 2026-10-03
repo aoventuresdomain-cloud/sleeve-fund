@@ -46,3 +46,16 @@ jobs:
           printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q\n' "$DASHBOARD_PASSWORD" "$SITE" | \
             ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
+      - name: Check the sleeves are live
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # Give the sleeves time to connect to Kraken and report, then read the journal.
+          sleep 150
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tA -F " | " -c "
+            select name, instrument, status, heartbeat_at from sleeves order by id;
+            select count(*) as marks_last_5_min from equity where ts > now() - interval '"'"'5 minutes'"'"';
+            select ts, sleeve, level, kind, message from events where level <> '"'"'info'"'"' order by id desc limit 10;"' | tee health.txt
+          LIVE=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "select count(*) from sleeves where desired_state = '"'"'running'"'"' and (heartbeat_at is null or heartbeat_at < now() - interval '"'"'3 minutes'"'"')"')
+          echo "running sleeves not reporting: $LIVE"
+          [ "$LIVE" = "0" ] || { echo "FAIL: some running sleeves are not reporting"; exit 1; }
