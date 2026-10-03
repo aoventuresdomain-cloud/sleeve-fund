@@ -180,7 +180,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         chosen = strategy if strategy in REGISTRY else "trend_filter"
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
-                    bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen)
+                    bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
+                    pre=dict(request.query_params))
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -207,7 +208,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                                risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars)
             st().decide(actor, "create", reason, name)
         except (ValueError, TypeError) as exc:
-            return RedirectResponse(f"/sleeves/new?{urlencode({'error': str(exc)})}", status_code=303)
+            # Send the form back filled in, so a typo doesn't cost the PM everything they entered.
+            kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
+            return RedirectResponse(f"/sleeves/new?{urlencode({'error': str(exc), **kept})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
     @app.get("/api/preview")
@@ -382,6 +385,43 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "unknown export")
         return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
 
+    @app.get("/backtest", response_class=HTMLResponse)
+    def backtest_page(request: Request, _: str = Depends(require_pm)):
+        """Run any strategy and settings over Kraken's daily history and show every trade with its reason."""
+        from sleeve_fund.dashboard import pipeline, preview
+
+        q = request.query_params
+        strategy = q.get("strategy") if q.get("strategy") in REGISTRY else "trend_filter"
+        period = q.get("period") if q.get("period") in BACKTEST_PERIODS else "all"
+        result, error = None, ""
+        if q.get("run"):
+            try:
+                pair = q.get("instrument", "").strip().upper()
+                if not PAIR_RE.fullmatch(pair):
+                    raise ValueError("pair: write it as COIN/CURRENCY, for example SOL/USD")
+                starting = float(q.get("starting_balance") or 10_000)
+                if not 100 <= starting <= 1e9:
+                    raise ValueError("capital: between 100 and 1,000,000,000")
+                params = _form_params(q, strategy)
+                params.pop("max_notional", None)
+                result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
+                                     detail=True)
+            except (ValueError, TypeError, KeyError) as exc:
+                error = str(exc).strip("'")
+            except OSError as exc:  # Kraken unreachable
+                error = f"could not reach Kraken for price history ({exc}). Try again in a minute."
+            except Exception as exc:  # noqa: BLE001 - say what failed instead of a blank page
+                error = f"the backtest failed: {exc}"
+        carry = {k: v for k, v in q.items() if k not in ("run", "period") and v}
+        g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
+        chart = None
+        if result:
+            chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
+                     "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}
+        return page(request, "backtest.html", result=result, error=error, pre=dict(q), chosen=strategy,
+                    strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, period=period,
+                    periods=BACKTEST_PERIODS, sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
+
     @app.get("/trades", response_class=HTMLResponse)
     def trades_page(request: Request, _: str = Depends(require_pm)):
         sleeves, _frames, summaries = book_data()
@@ -414,6 +454,9 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     return app
 
+
+BACKTEST_PERIODS = {"180": ("6 months", 180), "365": ("1 year", 365), "all": ("All, about 2 years", None)}
+PAIR_RE = re.compile(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}")
 
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",

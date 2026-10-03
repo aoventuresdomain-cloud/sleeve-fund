@@ -347,3 +347,48 @@ def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
     assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
     for href in ("/trades", "/orders", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
         assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
+
+
+def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_sleeve(client, monkeypatch):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    preview._history.clear()
+    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    assert "How testing works" in c.get("/backtest", auth=AUTH).text
+    q = ("/backtest?run=1&instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5"
+         "&p_trend_filter__slow=20&starting_balance=5000&period=365")
+    page = c.get(q, auth=AUTH).text
+    assert "Trend filter on ETH/USD" in page and "Every trade" in page and "Buy and hold" in page
+    assert "5-bar average" in page and "above the 20-bar average" in page  # the entry reasons, from the strategy
+    assert "365 days" in page
+    assert ('href="/sleeves/new?instrument=ETH%2FUSD&amp;strategy=trend_filter&amp;p_trend_filter__fast=5'
+            '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;from=backtest"') in page
+    form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest",
+                 auth=AUTH).text
+    assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "carried over" in form
+
+
+@pytest.mark.parametrize("query, msg", [
+    ("instrument=nonsense", "COIN/CURRENCY"),
+    ("instrument=BTC/USD&starting_balance=5", "capital"),
+    ("instrument=BTC/USD&p_trend_filter__fast=30&p_trend_filter__slow=10", "fast"),
+])
+def test_backtest_explains_bad_settings(client, monkeypatch, query, msg):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    preview._history.clear()
+    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    page = c.get(f"/backtest?run=1&strategy=trend_filter&{query}", auth=AUTH).text
+    assert "Couldn't run it" in page and msg in page
+
+
+def test_new_sleeve_errors_keep_what_was_typed(client):
+    c, _ = client
+    r = _new(c, name="BAD NAME", reason="testing keeps fields")
+    assert r.status_code == 303
+    form = c.get(r.headers["location"], auth=AUTH).text
+    assert "Not saved" in form and 'value="testing keeps fields"' in form

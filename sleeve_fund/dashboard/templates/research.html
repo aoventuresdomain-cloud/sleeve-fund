@@ -23,7 +23,7 @@
       <td data-m="right">{{ stepper(r.stage, stages, r.observation) }}</td>
       <td data-label="G1">{% if r.g1 == 'PASS' %}<span class="chip running">Passed</span>{% elif r.g1 == 'FAIL' %}<span class="chip halted">Failed</span>{% elif r.sheets %}<span class="muted">Synthetic only</span>{% else %}<span class="muted">Not tested</span>{% endif %}</td>
       <td data-m="right">{% if r.sleeves %}{{ r.sleeves|length }} running{% if r.observation %} <span class="warn" title="Running on paper without a real G1 pass">· observation</span>{% endif %}{% else %}<span class="muted">None</span>{% endif %}</td>
-      <td data-m="hide" class="num"><a class="button secondary" href="/sleeves/new?strategy={{ r.name }}">New sleeve</a></td>
+      <td data-m="hide" class="num"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest</a> <a class="button secondary" href="/sleeves/new?strategy={{ r.name }}">New sleeve</a></td>
     </tr>{% endfor %}</tbody>
   </table>
 </section>
