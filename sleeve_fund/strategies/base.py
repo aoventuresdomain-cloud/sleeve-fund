@@ -122,6 +122,9 @@ class LongFlatStrategy(Strategy):
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
+        # Every order's intent, reason and signal by client order id, in backtests too, so a
+        # backtest can show why each trade happened exactly as paper and live do.
+        self.decisions: dict[str, dict] = {}
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
@@ -282,9 +285,10 @@ class LongFlatStrategy(Strategy):
             quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
             time_in_force=TimeInForce.GTC,
         )
+        signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
+        signal.setdefault("price", self._price())
+        self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
-            signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
-            signal.setdefault("price", self._price())
             self.runtime.on_order(order_id=str(order.client_order_id), side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal)
         self.submit_order(order)

@@ -6,7 +6,7 @@
 <p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ r.name|replace('_', ' ') }}</span></p>
 <div class="page-head">
   <h1>{{ r.name|replace('_', ' ')|capitalize }}</h1>
-  <div class="actions"><a class="button" href="/sleeves/new?strategy={{ r.name }}">Start a sleeve with this</a></div>
+  <div class="actions"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest it</a> <a class="button" href="/sleeves/new?strategy={{ r.name }}">Start a sleeve with this</a></div>
   <p class="lede">{{ summary }}</p>
 </div>
 <section class="panel" style="margin-bottom:14px">{{ stepper(r.stage, stages, r.observation) }}

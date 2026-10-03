@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle %}
+{% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
+{% block title %}Backtest · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Backtest</h1>
+  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and Kraken fees as paper trading, over Kraken's daily price history, and shows every trade with the reason it was taken.</p>
+</div>
+
+<div class="grid">
+  <form class="panel span-4 bt-form" method="get" action="/backtest" id="bt-form">
+    <input type="hidden" name="run" value="1">
+    <div class="panel-head"><h2>Settings</h2></div>
+    {{ pair_field(instruments, pre) }}
+    {{ strategy_fields(strategies, chosen, g1, pre) }}
+    <div class="grid2">
+      <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
+      <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
+    </div>
+    <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('take_profit_pct') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre) }}</details>
+    <p style="margin:14px 0 0"><button>Run backtest</button></p>
+  </form>
+
+  <div class="span-8">
+  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}</div>{% endif %}
+  {% if result %}
+    {% set s, h, ts = result.strategy, result.hold, result.stats %}
+    <section class="panel bt-head">
+      <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days, after fees</span>
+        <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper sleeve with these settings</a></div>
+      {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This strategy hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
+      {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
+      <table class="compare">
+        <thead><tr><th></th><th class="num">Strategy</th><th class="num">Buy and hold</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Return</th><td class="num">{{ signed(s.total_return) }}</td><td class="num">{{ h.total_return|pct }}</td></tr>
+          <tr><th scope="row">A year (CAGR)</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
+          <tr><th scope="row">Sharpe</th><td class="num">{{ s.sharpe|numn }}</td><td class="num">{{ h.sharpe|numn }}</td></tr>
+          <tr><th scope="row">Worst drawdown</th><td class="num">{{ (-s.max_drawdown)|pct1 }}</td><td class="num">{{ (-h.max_drawdown)|pct1 }}</td></tr>
+          <tr><th scope="row">Volatility</th><td class="num">{{ s.volatility|pct1 }}</td><td class="num">{{ h.volatility|pct1 }}</td></tr>
+        </tbody>
+      </table>
+      <section class="ledger compact" aria-label="Trade figures">
+        <div><div class="k">Trades</div><div class="v">{{ ts.trades }}</div><div class="s">{% if ts.trades < 10 %}too few to judge{% else %}{{ ts.wins }} won{% endif %}</div></div>
+        <div><div class="k">Win rate</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
+        <div><div class="k">Expectancy</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
+        <div><div class="k">Profit factor</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
+        <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">of {{ result.start|money }}</div></div>
+        <div><div class="k">In the market</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
+      </section>
+    </section>
+
+    <section class="panel" aria-labelledby="bt-curve-h">
+      <div class="panel-head"><h2 id="bt-curve-h">Equity against buy-and-hold</h2>
+        <div class="right range" role="group" aria-label="Range"><button type="button" data-range="90">3M</button><button type="button" data-range="180">6M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div></div>
+      <div class="chart"><canvas id="eq" aria-label="Backtest equity and buy-and-hold by day"></canvas></div>
+      <div class="chart short"><canvas id="dd" aria-label="Backtest drawdown by day"></canvas></div>
+    </section>
+
+    <section class="panel flush" aria-labelledby="bt-tr-h">
+      <div class="panel-head"><h2 id="bt-tr-h">Every trade</h2><span class="hint">open Why for the signal behind each entry and exit</span></div>
+      {% if result.trips %}
+      <table class="responsive" data-hide-md="4 5">
+        <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">P&amp;L</th><th class="num">Return</th><th>Exit</th><th></th></tr></thead>
+        <tbody>{% for t in result.trips|reverse %}{% set rid = 'bt-' ~ loop.index %}
+        <tr><td data-m="hide">{{ t.opened.strftime('%d %b %Y') }}</td><td>{{ t.closed.strftime('%d %b %Y') }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
+          <td class="num" data-m="hide">{{ t.entry_px|px }}</td><td class="num" data-m="hide">{{ t.exit_px|px }}</td>
+          <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td>
+          <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td><td data-m="right">{{ why_toggle(rid) }}</td></tr>
+        <tr class="detail" id="{{ rid }}" hidden><td colspan="9"><div class="why-grid">
+          {{ why('Entry · ' ~ t.opened.strftime('%d %b %Y') ~ ' at ' ~ t.entry_px|px, t.entry_why, t.entry_items) }}
+          {{ why(t.reason ~ ' · ' ~ t.closed.strftime('%d %b %Y') ~ ' at ' ~ t.exit_px|px, t.exit_why, t.exit_items) }}
+        </div></td></tr>
+        {% endfor %}</tbody>
+      </table>
+      {% else %}<p class="empty" style="padding:4px 14px 14px">No completed trades in this period. The strategy may still be holding, or its entry never triggered. Try a longer period or looser settings.</p>{% endif %}
+    </section>
+  {% elif not error %}
+    <section class="panel">
+      <div class="panel-head"><h2>How testing works here</h2></div>
+      <ol class="steps-list">
+        <li><strong>Backtest</strong> (this page): see how settings would have traded over the last two years, with fees. It's quick, and you can change anything.</li>
+        <li><strong>Paper sleeve</strong>: when a result looks worth watching, start it on paper with one click. It trades live Kraken prices with simulated money.</li>
+        <li><strong>Evidence</strong>: G1 needs the research loop's out-of-sample tests. G2 needs at least six weeks of paper results inside the backtest's range.</li>
+        <li><strong>Live</strong>: only after you approve G2, and only on a Kraken account whose key you install on the server.</li>
+      </ol>
+      <p class="muted" style="margin:0">Pick a pair and a strategy on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
+    </section>
+  {% endif %}
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/chart.umd.min.js"></script>
+<script src="/static/console.js"></script>
+{% if chart %}<script id="bt-data" type="application/json">{{ chart|tojson }}</script>{% endif %}
+<script>
+Console.strategyPicker("bt-form"); Console.whys();
+{% if chart %}Console.pair(JSON.parse(document.getElementById("bt-data").textContent), "eq", "dd", ["Strategy", "Buy-and-hold"]);{% endif %}
+</script>
+{% endblock %}

@@ -62,8 +62,9 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
     f = fills.sort_values("ts_last")
     fees = f["commissions"] if "commissions" in f else [0.0] * len(f)
     return [
-        {"side": "BUY" if str(side).endswith("BUY") else "SELL", "qty": float(q), "price": float(px), "fee": _money(c)}
-        for side, q, px, c in zip(f["side"], f["filled_qty"], f["avg_px"], fees)
+        {"side": "BUY" if str(side).endswith("BUY") else "SELL", "qty": float(q), "price": float(px), "fee": _money(c),
+         "ts": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, "order_id": str(oid)}
+        for side, q, px, c, ts, oid in zip(f["side"], f["filled_qty"], f["avg_px"], fees, f["ts_last"], f.index)
     ]
 
 

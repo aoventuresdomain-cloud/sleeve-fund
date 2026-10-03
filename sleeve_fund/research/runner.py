@@ -6,7 +6,7 @@ so the benchmark and the strategy are measured identically.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 from nautilus_trader.backtest import BacktestEngine
@@ -28,6 +28,8 @@ class BacktestResult:
     fills: pd.DataFrame
     fees_paid: float
     starting_capital: float
+    # Why each order was sent, keyed by client order id (the fills report's index).
+    decisions: dict = field(default_factory=dict)
 
 
 def run_backtest(
@@ -71,7 +73,8 @@ def run_backtest(
             assumed_taker_fee=float(instrument.taker_fee),
             **params,
         )
-        engine.add_strategy(strategy_cls(config).attach_runtime(runtime))
+        strategy = strategy_cls(config).attach_runtime(runtime)
+        engine.add_strategy(strategy)
         engine.run()
 
         fills = engine.generate_order_fills_report()
@@ -86,6 +89,7 @@ def run_backtest(
             fills=fills,
             fees_paid=fees,
             starting_capital=starting_capital,
+            decisions=dict(strategy.decisions),
         )
     finally:
         engine.dispose()

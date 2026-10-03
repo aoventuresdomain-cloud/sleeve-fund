@@ -1,0 +1,24 @@
+{# Form sections shared by the new-sleeve form and the backtest page, so a backtest's settings
+   carry straight into a sleeve. `pre` holds values to prefill (from the query string). #}
+{% macro pair_field(instruments, pre) %}
+<div class="field"><label for="instrument">Kraken pair</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument', 'BTC/USD') }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off" aria-describedby="pair-hint"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist><p class="hint" id="pair-hint">Any spot pair Kraken lists, written COIN/CURRENCY.</p></div>
+{% endmacro %}
+
+{% macro strategy_fields(strategies, chosen, g1, pre) %}
+<div class="field"><label for="strategy">Strategy</label>
+  <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}">{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
+{% for st in strategies %}
+<div class="params" data-strategy="{{ st.name }}">
+  <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span> <a href="/strategies/{{ st.name }}">Details and evidence</a></p>
+  {% if st.params %}<div class="grid2">{% for k, v in st.params.items() %}{% set fname = 'p_' ~ st.name ~ '__' ~ k %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ k|replace('_', ' ')|capitalize }}</label><input id="p-{{ st.name }}-{{ k }}" name="{{ fname }}" value="{{ pre.get(fname, v) }}" inputmode="decimal"></div>{% endfor %}</div>{% endif %}
+</div>
+{% endfor %}
+{% endmacro %}
+
+{% macro exit_fields(pre) %}
+<div class="grid2">
+  <div class="field"><label for="stop_loss_pct">Stop-loss, % below entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.1" placeholder="None" value="{{ pre.get('stop_loss_pct', '') }}"></div>
+  <div class="field"><label for="take_profit_pct">Take-profit, % above entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.1" placeholder="None" value="{{ pre.get('take_profit_pct', '') }}"></div>
+  <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint">Sizes each trade so hitting the stop loses this much. Needs a stop-loss.</p></div>
+</div>
+{% endmacro %}

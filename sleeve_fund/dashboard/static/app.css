@@ -9,7 +9,7 @@
 :root {
   --page: #f2f4f7; --panel: #ffffff; --raised: #f7f8fa; --line: #dde2e9; --line-strong: #c9d0da;
   --text: #17202b; --muted: #5a6576; --faint: #8a94a3;
-  --accent: #2c64c9; --gain: #0e8a6e; --loss: #c8423b; --warn: #9a6b00; --live: #7a45d6;
+  --accent: #2c64c9; --on-accent: #ffffff; --gain: #0e8a6e; --loss: #c8423b; --warn: #9a6b00; --live: #7a45d6;
   --gain-bg: #e3f3ee; --loss-bg: #fbe8e6; --warn-bg: #fbf1dc; --neutral-bg: #eceff3;
   --mode: #8a94a3;
   --rail: 208px; --strip: 36px;
@@ -19,7 +19,7 @@
   :root {
     --page: #121821; --panel: #171e28; --raised: #1d2531; --line: #263040; --line-strong: #344052;
     --text: #d8dee7; --muted: #8a96a8; --faint: #5f6b7d;
-    --accent: #6ea8fe; --gain: #3fb59a; --loss: #e8615a; --warn: #d7a640; --live: #b07cff;
+    --accent: #6ea8fe; --on-accent: #0b1424; --gain: #3fb59a; --loss: #e8615a; --warn: #d7a640; --live: #b07cff;
     --gain-bg: #15302b; --loss-bg: #3a1d1d; --warn-bg: #352a12; --neutral-bg: #222b37;
     --mode: #5f6b7d;
     color-scheme: dark;
@@ -120,6 +120,7 @@ main > .panel { margin-bottom: 14px; overflow-x: auto; }
 .panel-head { display: flex; align-items: baseline; gap: 10px; margin: -2px 0 10px; }
 .panel-head .hint { color: var(--muted); font-size: 12px; }
 .panel-head .right { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
+.panel-head .button.right { color: var(--on-accent); font-size: 13px; }
 .panel.flush { padding: 0; overflow-x: auto; }
 .panel.flush .panel-head { padding: 12px 14px 0; }
 .empty { color: var(--muted); padding: 18px 0; }
@@ -200,7 +201,7 @@ label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 4
 form.inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 input[name=reason] { flex: 1; min-width: 200px; }
 button, .button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-weight: 600; font-size: 13px;
-  border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; cursor: pointer; background: var(--accent); color: #fff; }
+  border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; cursor: pointer; background: var(--accent); color: var(--on-accent); }
 .button:hover { text-decoration: none; }
 button.secondary, .button.secondary { background: var(--panel); color: var(--text); border-color: var(--line-strong); }
 button.danger { background: var(--loss); }
@@ -362,6 +363,19 @@ nav.tabs .n { display: inline-block; min-width: 18px; padding: 0 5px; margin-lef
   table[data-hide-md~="13"] tr > :nth-child(13),
   table[data-hide-md~="14"] tr > :nth-child(14) { display: none; }
 }
+/* --- backtest ------------------------------------------------------------------- */
+.bt-form .field { margin-bottom: 10px; }
+.bt-form .grid2 { gap: 0 12px; }
+details.more-fields { margin-top: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.more-fields summary { cursor: pointer; color: var(--accent); font-weight: 500; margin-bottom: 8px; }
+table.compare { margin-bottom: 12px; }
+table.compare th[scope="row"] { color: var(--muted); font-weight: 500; background: none; font-size: 13px; }
+table.compare td:nth-child(3) { color: var(--muted); }
+.ledger.compact { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); margin: 0; }
+.ledger.compact .v { font-size: 17px; }
+ol.steps-list { margin: 0 0 12px; padding-left: 20px; display: grid; gap: 8px; }
+.bt-head .panel-head .button { margin-left: auto; }
+@media (max-width: 900px) { .bt-head .panel-head .button { margin: 8px 0 0; width: 100%; justify-content: center; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */

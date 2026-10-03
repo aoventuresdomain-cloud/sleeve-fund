@@ -54,7 +54,8 @@ window.Console = (() => {
   function pair(url, eqId, ddId, labels) {
     const eqEl = document.getElementById(eqId), ddEl = document.getElementById(ddId);
     if (!eqEl || !window.Chart) return;
-    fetch(url).then((r) => r.json()).then((d) => {
+    // url may be the data itself (the backtest page embeds its result) or an endpoint to fetch.
+    (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
       if (!d.t.length) { eqEl.parentElement.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a sleeve starting.</p>'; ddEl.parentElement.remove(); return; }
       const grid = css("--line"), muted = css("--muted");
       const yWidth = (s) => { s.width = 64; };
@@ -108,6 +109,28 @@ window.Console = (() => {
         show(parseInt(b.dataset.range, 10));
       }));
       show(0);
+    });
+  }
+
+  // Any form with a strategy picker: show only the chosen strategy's settings, with its sentence filled in.
+  function strategyPicker(formId) {
+    const form = document.getElementById(formId);
+    if (!form) return;
+    const sync = () => {
+      const strat = form.elements.strategy.value;
+      form.querySelectorAll(".params").forEach((p) => { p.hidden = p.dataset.strategy !== strat; });
+      const desc = form.querySelector(`.params[data-strategy="${strat}"] .desc`);
+      if (desc && desc.dataset.tpl) {
+        const vals = JSON.parse(desc.dataset.defaults || "{}");
+        form.querySelectorAll(`[name^="p_${strat}__"]`).forEach((i) => { if (i.value !== "") vals[i.name.split("__")[1]] = i.value; });
+        desc.textContent = desc.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => (k in vals ? vals[k] : m));
+      }
+    };
+    form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
+    // Only the chosen strategy's inputs go in the URL, so a shared link stays readable.
+    form.addEventListener("submit", () => {
+      form.querySelectorAll(".params").forEach((p) => p.querySelectorAll("input").forEach((i) => { i.disabled = p.hidden; }));
+      form.querySelectorAll("input").forEach((i) => { if (i.value === "") i.disabled = true; });
     });
   }
 
@@ -191,5 +214,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, dialogs, whys, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, dialogs, whys, strategyPicker, sleeveForm, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();
