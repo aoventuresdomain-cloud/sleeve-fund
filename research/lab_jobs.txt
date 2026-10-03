@@ -1,3 +1,3 @@
 # One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
-# Classifier re-run on development history only, with bar-size-independent crossings and one relaxed variant.
-classifier
+# Strategy 4, revision 1: daily direction with hourly entries, to cut the trade count that fees ate at 4h/15m.
+mtf --htf 1440 --bar 60

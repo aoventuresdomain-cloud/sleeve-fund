@@ -174,7 +174,7 @@ def write_report(*, slug: str, title: str, note: str, idea: str, family: str, pa
             L += ["", f"## {mode_name}, {cost.replace('_', ' ')} costs ({sim.COSTS[cost]['fee']:g} bp fee + "
                       f"{sim.COSTS[cost]['slip']:g} bp slippage per side)", "",
                   "| Variant | Window | Trades | Expectancy bp | Win rate | Sharpe | Total return | Max DD | "
-                  + " | ".join(f"{i.split('/')[0]} Sharpe" for i in insts) + " | Cross-asset pass |",
+                  + " | ".join(f"{i.removesuffix('/USD')} Sharpe" for i in insts) + " | Cross-asset pass |",
                   "|" + "---|" * (9 + len(insts))]
             for v in variants:
                 res = results.get((v, long_only, cost))
