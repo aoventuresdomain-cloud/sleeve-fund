@@ -581,7 +581,12 @@ class LongFlatStrategy(Strategy):
         px = self.cache.price(self._cfg.instrument_id, PriceType.LAST)
         if px is not None:
             return px.as_double()
-        return self._last_close or 0.0
+        if self._last_close:
+            return self._last_close
+        # A quiet instrument may not trade for minutes after start; its quotes still value the book.
+        if self._bid and self._ask:
+            return (self._bid + self._ask) / 2
+        return 0.0
 
     def _codes(self, side: str) -> set[str]:
         """Currency codes for one side of the pair: the venue's (e.g. ZUSD) and the plain one (USD)."""
