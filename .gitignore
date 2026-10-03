@@ -6,6 +6,7 @@ data/*.csv
 data/*.zip
 data/catalog/
 .env
+kraken.env
 *.key
 research/idea_ledger.synthetic.jsonl
 research/tearsheets/*_synthetic.md

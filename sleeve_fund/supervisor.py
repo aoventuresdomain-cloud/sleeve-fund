@@ -12,6 +12,7 @@ restarts any whose heartbeat goes stale.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import subprocess
 import sys
@@ -19,10 +20,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from sleeve_fund import accounts
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import Sleeve, Store, utcnow
 
 POLL_SECONDS = 5
+KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
@@ -63,7 +66,9 @@ class Supervisor:
         self._stopping = False
 
     def _start(self, name: str, proc: Proc) -> None:
-        proc.popen = subprocess.Popen([self.python, "-m", "sleeve_fund.paper", "--db-sleeve", name])
+        # Paper processes never need a venue key, so they don't inherit one.
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("KRAKEN_API_KEY", "KRAKEN_API_SECRET"))}
+        proc.popen = subprocess.Popen([self.python, "-m", "sleeve_fund.paper", "--db-sleeve", name], env=env)
         proc.started_at = utcnow()
         self.store.event(name, "info", "process_start", f"paper process started (pid {proc.popen.pid})")
 
@@ -103,12 +108,22 @@ class Supervisor:
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
 
+    def check_keys(self) -> None:
+        """Tell the dashboard which live accounts have a Kraken key on this server (presence only)."""
+        live = [a["name"] for a in self.store.accounts() if a["kind"] == "live"]
+        if live:
+            self.store.report_keys({name: accounts.key_present(name) for name in live})
+
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "_stopping", True))
         self.store.event(None, "info", "supervisor_start", "supervisor started")
+        loops = 0
         while not self._stopping:
             try:
+                if loops % KEY_CHECK_EVERY == 0:
+                    self.check_keys()
+                loops += 1
                 self.step()
             except Exception as exc:  # keep supervising; the dashboard shows the error
                 self.store.event(None, "error", "supervisor_error", repr(exc))

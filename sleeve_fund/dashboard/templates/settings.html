@@ -12,7 +12,8 @@
     <table class="compact kv">
       <tr><th scope="row">G2 approved by you</th><td><span class="warn">Not yet</span>: needs 6+ weeks of paper inside the backtest's range</td></tr>
       <tr><th scope="row">Server live switch</th><td><span class="warn">Off</span>: set by you on the server; not built yet</td></tr>
-      <tr><th scope="row">Kraken trading key</th><td><span class="warn">Not installed</span>: you place it on the server; Claude never sees it</td></tr>
+      {% set live = accounts|selectattr('kind', 'equalto', 'live')|list %}{% set keyed = live|selectattr('key_present')|list %}
+      <tr><th scope="row">Kraken trading key</th><td>{% if keyed %}<span class="gain">Installed</span> for {{ keyed|length }} of {{ live|length }} live account{{ 's' if live|length != 1 }}{% else %}<span class="warn">Not installed</span>{% endif %}: you place keys on the server; Claude never sees them. <a href="/accounts">Accounts</a></td></tr>
     </table>
   </section>
   <section class="panel span-6" aria-labelledby="acc-h">

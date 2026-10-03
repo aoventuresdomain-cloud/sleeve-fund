@@ -392,3 +392,60 @@ def test_new_sleeve_errors_keep_what_was_typed(client):
     assert r.status_code == 303
     form = c.get(r.headers["location"], auth=AUTH).text
     assert "Not saved" in form and 'value="testing keeps fields"' in form
+
+
+def test_accounts_page_adds_live_accounts_and_shows_key_presence_only(client, monkeypatch):
+    from sleeve_fund import accounts
+    from sleeve_fund.supervisor import Supervisor
+
+    c, store = client
+    page = c.get("/accounts", auth=AUTH).text
+    assert "paper" in page and "Connect a Kraken sub-account" in page and "Never tick Withdraw Funds" in page
+    r = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "reason": "first live sub-account"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303
+    assert "KRAKEN_API_KEY__KRAKEN_TREND=your-api-key" in c.get("/accounts", auth=AUTH).text
+    assert "Not checked yet" in c.get("/accounts", auth=AUTH).text
+    # The supervisor reports presence; the secret's value never reaches the store or the page.
+    monkeypatch.setenv("KRAKEN_API_KEY__KRAKEN_TREND", "k-SECRET-VALUE")
+    monkeypatch.setenv("KRAKEN_API_SECRET__KRAKEN_TREND", "s-SECRET-VALUE")
+    assert accounts.key_present("kraken-trend")
+    Supervisor(store).check_keys()
+    page = c.get("/accounts", auth=AUTH).text
+    assert "Installed" in page and "SECRET-VALUE" not in page
+    assert "Installed</span> for 1 of 1" in c.get("/settings", auth=AUTH).text
+    assert any(d["action"] == "create_account" for d in store.decisions())
+
+
+def test_account_rules(client):
+    c, store = client
+    bad = c.post("/accounts/new", data={"name": "Bad Name", "kind": "live", "reason": "x"}, auth=AUTH, headers=SAME,
+                 follow_redirects=False)
+    assert "error=" in bad.headers["location"] and "name=Bad+Name" in bad.headers["location"]
+    assert c.post("/accounts/new", data={"name": "x1", "kind": "live", "reason": "x"}, auth=AUTH,
+                  headers={"Origin": "https://evil.example"}).status_code == 403
+    store.create_account("kraken-live", "live")
+    store.create_account("research", "paper")
+    form = c.get("/sleeves/new", auth=AUTH).text
+    assert 'value="kraken-live" disabled' in form and "live, locked until G2" in form
+    r = _new(c, name="on-live", account="kraken-live")
+    assert "locked+until+G2" in r.headers["location"]
+    assert _new(c, name="on-research", account="research").status_code == 303
+    assert store.account_of("on-research") == "research" and store.account_of("btc-nothing") == "paper"
+    assert "research</a>" in c.get("/sleeves/on-research", auth=AUTH).text
+
+
+def test_paper_processes_do_not_inherit_kraken_keys(monkeypatch, tmp_path):
+    import subprocess
+
+    from sleeve_fund.supervisor import Proc, Supervisor
+
+    seen = {}
+    monkeypatch.setenv("KRAKEN_API_KEY__X", "k")
+    monkeypatch.setenv("KRAKEN_API_SECRET__X", "s")
+    monkeypatch.setattr(subprocess, "Popen", lambda args, env=None: seen.update(env=env) or type("P", (), {"pid": 1})())
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    store.create_sleeve(name="s1", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=1000)
+    Supervisor(store)._start("s1", Proc())
+    assert not any(k.startswith("KRAKEN_API") for k in seen["env"])

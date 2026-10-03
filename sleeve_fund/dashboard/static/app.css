@@ -376,6 +376,8 @@ table.compare td:nth-child(3) { color: var(--muted); }
 ol.steps-list { margin: 0 0 12px; padding-left: 20px; display: grid; gap: 8px; }
 .bt-head .panel-head .button { margin-left: auto; }
 @media (max-width: 900px) { .bt-head .panel-head .button { margin: 8px 0 0; width: 100%; justify-content: center; } }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); padding: 1px 4px; border-radius: 4px; }
+pre.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 0; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */

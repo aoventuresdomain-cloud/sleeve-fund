@@ -181,7 +181,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         chosen = strategy if strategy in REGISTRY else "trend_filter"
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
                     bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
-                    pre=dict(request.query_params))
+                    pre=dict(request.query_params), accounts=st().accounts())
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -203,9 +203,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             _check_strategy_params(cfg)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a sleeve called {name} already exists")
+            account = str(form.get("account", "") or "paper")
+            kinds = {a["name"]: a["kind"] for a in st().accounts()}
+            if account not in kinds:
+                raise ValueError(f"account: no account called {account}")
+            if kinds[account] == "live":  # the shell's live lock: nothing trades real money before G2
+                raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
             st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
                                starting_balance=cfg.starting_balance, params=params,
                                risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars)
+            st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
         except (ValueError, TypeError) as exc:
             # Send the form back filled in, so a typo doesn't cost the PM everything they entered.
@@ -251,6 +258,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    account=st().account_of(name),
                     position=trading.open_position(x, fills, orders),
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
@@ -445,12 +453,36 @@ def create_app(store: Store | None = None) -> FastAPI:
                 for k, (label, sts) in trading.STATUS_TABS.items()]
         return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names)
 
+    @app.get("/accounts", response_class=HTMLResponse)
+    def accounts_page(request: Request, _: str = Depends(require_pm), error: str = ""):
+        from sleeve_fund import accounts as acc
+
+        rows = st().accounts()
+        for r in rows:
+            r["env"] = acc.env_names(r["name"]) if r["kind"] == "live" else None
+        return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
+
+    @app.post("/accounts/new")
+    async def new_account(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        form = dict(await request.form())
+        name = str(form.get("name", "")).strip()
+        try:
+            reason = str(form.get("reason", "")).strip()
+            if not reason:
+                raise ValueError("a reason is required")
+            st().create_account(name, str(form.get("kind", "")), str(form.get("note", "")).strip()[:200])
+            st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
+        except ValueError as exc:
+            kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
+            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
+        return RedirectResponse(f"/accounts#acct-{name}", status_code=303)
+
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request, _: str = Depends(require_pm)):
         from sleeve_fund.instruments import KRAKEN_UK_ENTRY
 
         return page(request, "settings.html", profiles=PROFILES, fees=KRAKEN_UK_ENTRY,
-                    tearsheets=str(TEARSHEETS), counts=st().table_sizes())
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
 
     return app
 
