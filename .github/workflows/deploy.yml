@@ -52,6 +52,8 @@ jobs:
         run: |
           # Give the sleeves time to connect to Kraken and report, then read the journal.
           sleep 150
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose ps -a && sudo docker compose logs --no-color --tail 40 caddy dashboard && grep SITE_ADDRESS .env && curl -s -o /dev/null -w "dashboard via caddy on the server: %{http_code}\n" -k --resolve "$(grep SITE_ADDRESS .env | cut -d= -f2):443:127.0.0.1" "https://$(grep SITE_ADDRESS .env | cut -d= -f2)/healthz" || true'
+          curl -s -m 20 -o /dev/null -w "dashboard from the internet: %{http_code}\n" "https://$HOST.sslip.io/healthz" || echo "dashboard from the internet: unreachable"
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tA -F " | " -c "
             select name, instrument, status, heartbeat_at from sleeves order by id;
             select count(*) as marks_last_5_min from equity where ts > now() - interval '"'"'5 minutes'"'"';
