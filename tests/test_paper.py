@@ -54,12 +54,19 @@ def _sleeve(**over):
 
 @pytest.mark.parametrize(
     "over",
-    [{"strategy": "nope"}, {"bar_spec": "1-TICK-LAST-INTERNAL"}, {"instrument": "BTCUSD"},
+    [{"strategy": "nope"}, {"bar_spec": "1-TICK-LAST-INTERNAL"}, {"instrument": "BTCUSD"}, {"instrument": "SUI/"},
+     {"instrument": "SUI/USD; rm"},
      {"starting_balance": 0}, {"max_notional": -1}, {"warmup_bars": -1}],
 )
 def test_bad_sleeve_config_rejected(over):
     with pytest.raises(ValueError):
         _sleeve(**over)
+
+
+@pytest.mark.parametrize("pair,expected", [("SUI/USD", "SUI/USD"), (" xrp/gbp ", "XRP/GBP"), ("ETH/USDT", "ETH/USDT")])
+def test_any_kraken_pair_accepted(pair, expected):
+    cfg = _sleeve(instrument=pair)
+    assert cfg.instrument == expected and cfg.instrument_id == f"{expected}.KRAKEN"
 
 
 def test_typo_in_strategy_params_rejected():

@@ -98,6 +98,7 @@ class LongFlatStrategy(Strategy):
         self.instrument = None
         self._last_bar_ts = 0
         self._last_close = None
+        self._last_tick_ns = 0
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -110,6 +111,9 @@ class LongFlatStrategy(Strategy):
         self.instrument = self.cache.instrument(self._cfg.instrument_id)
         if self.instrument is None:
             self.log.error(f"instrument {self._cfg.instrument_id} not found")
+            if self.runtime is not None:  # surface on the dashboard, e.g. a pair Kraken doesn't list
+                self.runtime.store.event(self.runtime.name, "error", "instrument_not_found",
+                                         f"{self._cfg.instrument_id} is not listed on the venue")
             self.stop()
             return
         if self._cfg.warmup_bars:
@@ -119,7 +123,19 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
+            # Ticks are driven by market data (trades and bars, throttled) because a clock timer
+            # alone did not fire in the live node; the timer stays as a backup for quiet markets.
             self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
+
+    def on_trade(self, tick) -> None:
+        self._maybe_tick()
+
+    def _maybe_tick(self) -> None:
+        if self.runtime is None:
+            return
+        now = self.clock.timestamp_ns()
+        if now - self._last_tick_ns >= self.runtime.tick_seconds * 1_000_000_000:
+            self._on_tick()
 
     def update_indicators(self, bar: Bar) -> None:
         """Override to feed indicators. Called once per bar, historical or live, in time order."""
@@ -147,6 +163,7 @@ class LongFlatStrategy(Strategy):
             return
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        self._maybe_tick()
         target = self.want_long(bar)
         if target is None:
             return
@@ -209,6 +226,7 @@ class LongFlatStrategy(Strategy):
         return cash + qty * price, cash, qty, price
 
     def _on_tick(self, _event=None) -> None:
+        self._last_tick_ns = self.clock.timestamp_ns()
         try:
             equity, cash, qty, price = self._mark()
             if price <= 0 or equity <= 0:

@@ -64,6 +64,13 @@ def test_create_sleeve_and_control_it(client):
     assert store.sleeve("btc-test").desired_state == "stopped"
 
 
+def test_any_asset_pair_can_be_chosen(client):
+    c, store = client
+    assert 'list="pairs"' in c.get("/sleeves/new", auth=AUTH).text
+    r = _new(c, name="sui-trend", instrument="sui/usd")
+    assert r.status_code == 303 and store.sleeve("sui-trend").instrument == "SUI/USD"
+
+
 @pytest.mark.parametrize(
     "over,msg",
     [({"name": "Bad Name"}, "name"), ({"p_trend_filter__fast": "50", "p_trend_filter__slow": "20"}, "fast"),

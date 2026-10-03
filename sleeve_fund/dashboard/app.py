@@ -33,7 +33,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheets"))
 LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
-INSTRUMENTS = ["BTC/USD", "ETH/USD", "SOL/USD", "BTC/GBP", "ETH/GBP"]
+# Suggestions only: the field accepts any Kraken spot pair.
+INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 security = HTTPBasic(realm="Sleeve Fund")
@@ -94,7 +95,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/sleeves/new", response_class=HTMLResponse)
     def new_sleeve_form(request: Request, _: str = Depends(require_pm), error: str = ""):
-        return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENTS,
+        return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
                     bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error)
 
     @app.post("/sleeves/new")

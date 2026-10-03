@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -9,6 +10,9 @@ from pathlib import Path
 
 from sleeve_fund.instruments import KRAKEN_UK_ENTRY, FeeSchedule
 from sleeve_fund.strategies import REGISTRY
+
+# Any Kraken spot pair (SUI/USD, XRP/GBP, ...). Whether Kraken lists it is checked when the sleeve starts.
+PAIR_RE = re.compile(r"^[A-Z0-9]{1,12}/[A-Z0-9]{2,6}$")
 
 ALLOWED_BAR_SPECS = {
     # Built locally from Kraken trades; bars close on time, no venue buffering.
@@ -41,9 +45,10 @@ class SleeveConfig:
             raise ValueError(f"unknown strategy {self.strategy!r}; known: {sorted(REGISTRY)}")
         if self.bar_spec not in ALLOWED_BAR_SPECS:
             raise ValueError(f"bar_spec {self.bar_spec!r} not in {sorted(ALLOWED_BAR_SPECS)}")
-        base, sep, quote = self.instrument.partition("/")
-        if not (sep and base and quote):
-            raise ValueError(f"instrument must look like BASE/QUOTE, got {self.instrument!r}")
+        # Any Kraken spot pair works; the venue rejects pairs it doesn't list at start-up.
+        object.__setattr__(self, "instrument", self.instrument.strip().upper())  # frozen dataclass
+        if not PAIR_RE.match(self.instrument):
+            raise ValueError(f"instrument must look like BASE/QUOTE (e.g. SUI/USD), got {self.instrument!r}")
         if self.starting_balance <= 0:
             raise ValueError("starting_balance must be positive")
         if self.max_notional is not None and self.max_notional <= 0:

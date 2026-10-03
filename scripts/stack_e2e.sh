@@ -11,10 +11,23 @@ SITE_ADDRESS=localhost
 ENV
 trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker compose down -v' EXIT
 docker compose up -d --build
+# Prove any asset works: add a non-BTC sleeve through the dashboard form, as the PM would.
+for i in $(seq 1 30); do
+  docker compose exec -T dashboard python -c "
+import base64, urllib.parse, urllib.request
+form = urllib.parse.urlencode({'name': 'sui-e2e', 'strategy': 'trend_filter', 'instrument': 'SUI/USD',
+    'bar_spec': '1-MINUTE-LAST-INTERNAL', 'starting_balance': '5000', 'risk_profile': 'balanced',
+    'warmup_bars': '0', 'p_trend_filter__fast': '5', 'p_trend_filter__slow': '20', 'reason': 'e2e any-asset check'}).encode()
+req = urllib.request.Request('http://localhost:8000/sleeves/new', data=form, headers={
+    'Authorization': 'Basic ' + base64.b64encode(b'pm:e2e-dash-pw').decode(),
+    'Origin': 'http://localhost:8000', 'Host': 'localhost:8000'})
+urllib.request.urlopen(req)" && break
+  sleep 2
+done
 echo "waiting ${WAIT}s for sleeves to connect and mark..."
 sleep "$WAIT"
 q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
-echo "sleeves:"; q "select name, status, heartbeat_at from sleeves order by id"
+echo "sleeves:"; q "select name, instrument, status, heartbeat_at from sleeves order by id"
 HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")
 MARKS=$(q "select count(*) from equity")
 ERRS=$(q "select count(*) from events where level = 'error'")
@@ -29,8 +42,8 @@ import urllib.request, urllib.error
 try: urllib.request.urlopen('http://localhost:8000/'); print(200)
 except urllib.error.HTTPError as e: print(e.code)")
 echo "dashboard: with password $CODE, without $NOAUTH"
-[ "$HEART" -ge 2 ] || { echo "FAIL: expected 2 heartbeating sleeves"; exit 1; }
-[ "$MARKS" -ge 2 ] || { echo "FAIL: no equity marks"; exit 1; }
+[ "$HEART" -ge 3 ] || { echo "FAIL: expected 3 heartbeating sleeves (BTC smoke, BTC daily, SUI)"; exit 1; }
+[ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
 echo PASS

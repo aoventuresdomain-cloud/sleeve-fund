@@ -1,0 +1,44 @@
+name: deploy
+# Ships main to the paper server. Needs repository secrets:
+#   DEPLOY_HOST          server IP or hostname
+#   DEPLOY_SSH_KEY       private key whose public half is in the server's authorized_keys (user root)
+#   DASHBOARD_PASSWORD   the PM dashboard password (letters and digits; no $)
+# Optional: SITE_ADDRESS (defaults to <DEPLOY_HOST>.sslip.io for free HTTPS without a domain).
+# No exchange credentials are involved: this stack is paper only.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency: deploy
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    if: ${{ vars.DEPLOY_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Ship code
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy root@"$HOST" 'mkdir -p /opt/sleeve-fund'
+          rsync -az --delete --exclude .git --exclude .env --exclude data \
+            -e "ssh -i ~/.ssh/id_deploy" ./ root@"$HOST":/opt/sleeve-fund/
+      - name: Start stack
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          SITE_ADDRESS: ${{ secrets.SITE_ADDRESS }}
+        run: |
+          SITE="${SITE_ADDRESS:-$HOST.sslip.io}"
+          # Secrets go over stdin, never on a command line.
+          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q\n' "$DASHBOARD_PASSWORD" "$SITE" | \
+            ssh -i ~/.ssh/id_deploy root@"$HOST" 'eval "$(cat)"; bash /opt/sleeve-fund/deploy/remote_up.sh'
+          echo "Dashboard: https://$SITE"
