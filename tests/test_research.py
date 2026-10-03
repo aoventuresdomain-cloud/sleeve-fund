@@ -84,3 +84,37 @@ def test_deflated_sharpe_with_the_no_skill_spread_gets_harder_with_more_tries():
     r = pd.Series(np.random.default_rng(0).normal(0.001, 0.02, 1500))
     p1, p20, p200 = (deflated_sharpe_probability(r, n) for n in (1, 20, 200))
     assert 0 < p200 < p20 < p1 <= 1
+
+
+def test_study_caps_strategy_and_benchmark_like_paper(tmp_path, instrument):
+    """Review R2-M5: research is judged at the paper risk profile's exposure, benchmark included."""
+    prices = synthetic_ohlcv(days=1500, seed=3)
+    kw = dict(dataset="syn", ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True, holdout_days=100,
+              train_days=730, test_days=300)
+    r = run_study(SPEC, prices, instrument, position_cap=0.33, **kw)
+    for res in (r.full_period, r.full_period_benchmark):  # sized at the cap on entry (it drifts with price after)
+        first = res.exposure[res.exposure > 0].iloc[0]
+        assert 0.3 < first <= 0.34
+    assert any("capped at 33%" in n for n in r.notes)
+    assert "capped at 33%" in render(r, kw["ledger"])
+    with pytest.raises(ValueError):
+        run_study(SPEC, prices, instrument, position_cap=1.5, **kw)
+
+
+def test_cli_reads_the_history_store(tmp_path, monkeypatch):
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund import history
+    from sleeve_fund.__main__ import main
+
+    idx = pd.date_range("2020-01-01", periods=1700 * 1440 // 60, freq="60min", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.004, len(idx))))
+    hourly = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx)
+    minutes = hourly.resample("1min").ffill()
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "BTC/USD", minutes, cursor="x")
+    out = tmp_path / "sheet.md"
+    assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "buy_and_hold", "--store", "--holdout-days", "100",
+                 "--out", str(out)]) == 0
+    assert "capped at 33%" in out.read_text()

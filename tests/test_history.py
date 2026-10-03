@@ -125,3 +125,19 @@ def test_backtest_page_reads_the_store_once_it_has_caught_up(tmp_path, monkeypat
     stale.append("KRAKEN", "OLD/USD", _minutes("2017-01-01", 100 * 1440), cursor="x")
     monkeypatch.setattr(venues.KRAKEN, "daily_history", lambda pair: "recent candles")
     assert preview.history("OLD/USD") == "recent candles"  # still backfilling: use the venue's recent candles
+
+
+def test_long_stretches_without_trades_are_reported_not_hidden(tmp_path):
+    from sleeve_fund.history import quiet_runs
+
+    store = HistoryStore(tmp_path)
+    before, after = _minutes("2026-01-01", 600), _minutes("2026-01-01 13:00", 600, price=800.0)
+    store.append("X", "ABC/USD", before, cursor="c1")
+    store.append("X", "ABC/USD", after, cursor="c2")  # 10:00 to 13:00 had no trades: a 3-hour hole
+    rep = store.report("X", "ABC/USD")
+    assert rep["missing"] == 0  # every minute is stored...
+    q = rep["quiet_over_an_hour"]  # ...but the quiet stretch is reported
+    assert q["count"] == 1 and q["longest_minutes"] == 180 and q["longest_end"] == pd.Timestamp("2026-01-01 12:59", tz="UTC")
+    hours = store.read("X", "ABC/USD", 60)
+    assert quiet_runs(hours, 60)["longest_minutes"] == 180
+    assert quiet_runs(hours, 60, at_least=240)["count"] == 0

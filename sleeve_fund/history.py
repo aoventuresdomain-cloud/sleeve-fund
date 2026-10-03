@@ -140,7 +140,25 @@ class HistoryStore:
         expected = int((cov.last - cov.first) / pd.Timedelta("1min")) + 1
         return {"venue": venue, "pair": pair, "stored": True, "first": cov.first, "last": cov.last,
                 "minutes": len(df), "missing": expected - df.index.nunique(),
-                "duplicates": int(df.index.duplicated().sum())}
+                "duplicates": int(df.index.duplicated().sum()),
+                "quiet_over_an_hour": quiet_runs(df[~df.index.duplicated()], 1)}
+
+
+def quiet_runs(bars: pd.DataFrame, minutes: int, at_least: int = 60) -> dict:
+    """Stretches of bars with no trades lasting `at_least` minutes or more. The store keeps them
+    flat at the last price, because the venue reported no trades; a long one may be a venue outage,
+    so it is reported rather than hidden. Bars are stamped at their close."""
+    if bars.empty:
+        return {"count": 0, "longest_minutes": 0, "longest_end": None}
+    quiet = (bars["volume"] <= 0).to_numpy()
+    run_id = np.cumsum(~quiet)  # each quiet stretch shares the id of the traded bar before it
+    lengths = pd.Series(quiet.astype(int)).groupby(run_id).sum()
+    long = lengths[lengths * minutes >= at_least]
+    if long.empty:
+        return {"count": 0, "longest_minutes": 0, "longest_end": None}
+    rid = long.idxmax()
+    end = bars.index[(run_id == rid) & quiet][-1]
+    return {"count": int(len(long)), "longest_minutes": int(long.max() * minutes), "longest_end": end}
 
 
 def trades_to_minutes(trades: pd.DataFrame) -> pd.DataFrame:

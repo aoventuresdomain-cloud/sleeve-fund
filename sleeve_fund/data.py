@@ -157,6 +157,15 @@ def bar_type_for(instrument, minutes: int) -> BarType:
     return BarType.from_str(f"{instrument.id}-{spec}-LAST-EXTERNAL")
 
 
+def spec_minutes(spec: str) -> int:
+    """Minutes in a bar spec without its instrument, e.g. "4-HOUR-LAST-EXTERNAL" -> 240."""
+    step, unit = spec.split("-")[:2]
+    per = {"MINUTE": 1, "HOUR": 60, "DAY": 1440}
+    if unit not in per:
+        raise ValueError(f"unsupported bar unit in {spec!r}")
+    return int(step) * per[unit]
+
+
 def bar_minutes(bar_type) -> int:
     """Bar length in minutes from a bar type such as BTC/USD.KRAKEN-4-HOUR-LAST-EXTERNAL, or a
     composite one such as ...-1-DAY-LAST-INTERNAL@1-MINUTE-EXTERNAL (the decision bar's length)."""

@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
+from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
@@ -202,9 +203,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             if not reason:
                 raise ValueError("a reason is required")
             params = _form_params(form, strategy)
-            if form.get("from") == "backtest" and form.get("bar_spec") != BACKTEST_BAR_SPEC:
-                raise ValueError(f"interval: the backtest decided on daily bars, so this strategy must too "
-                                 f"({BACKTEST_BAR_SPEC}); backtest another interval before changing it")
+            tested = str(form.get("tested_bar_spec") or BACKTEST_BAR_SPEC)
+            if form.get("from") == "backtest" and form.get("bar_spec") != tested:
+                raise ValueError(f"interval: the backtest decided on {_bar_short(tested)}, so this strategy must "
+                                 "too; backtest another interval before changing it")
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=str(form.get("bar_spec", "")),
                                starting_balance=float(form.get("starting_balance", 0) or 0), params=params,
@@ -456,6 +458,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = request.query_params
         strategy = q.get("strategy") if q.get("strategy") in REGISTRY else "trend_filter"
         period = q.get("period") if q.get("period") in BACKTEST_PERIODS else "all"
+        bar_spec = q.get("bar_spec") if q.get("bar_spec") in ALLOWED_BAR_SPECS else BACKTEST_BAR_SPEC
         result, error = None, ""
         if q.get("run"):
             try:
@@ -468,7 +471,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 params = _form_params(q, strategy)
                 _profile_cap(q)  # validates the profile name
                 result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
-                                     detail=True, risk_profile=q.get("risk_profile") or "balanced",
+                                     detail=True, minutes=spec_minutes(bar_spec), risk_profile=q.get("risk_profile") or "balanced",
                                      fee_quote=resolve_fees(None, st()),
                                      spread_quote=resolve_spread(None, pair, st()))
             except (ValueError, TypeError, KeyError) as exc:
@@ -479,15 +482,16 @@ def create_app(store: Store | None = None) -> FastAPI:
                 error = f"the backtest failed: {exc}"
         # The sleeve must decide on the bars that were tested, with indicators warm from its first bar.
         carry = {k: v for k, v in q.items() if k not in ("run", "period") and v}
-        carry.update(bar_spec=BACKTEST_BAR_SPEC, warmup_bars=_warmup_for(strategy, q))
+        carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
         g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
-                     "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}
+                     "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}  # equity is daily
         return page(request, "backtest.html", result=result, error=error, pre=dict(q), chosen=strategy,
                     strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, period=period,
-                    periods=BACKTEST_PERIODS, profiles=PROFILES, sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
+                    periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
+                    bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes), sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
 
     @app.get("/trades", response_class=HTMLResponse)
     def trades_page(request: Request, _: str = Depends(require_pm)):
@@ -548,7 +552,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     return app
 
 
-BACKTEST_PERIODS = {"180": ("6 months", 180), "365": ("1 year", 365), "all": ("All, about 2 years", None)}
+BACKTEST_PERIODS = {"180": ("6 months", 180), "365": ("1 year", 365), "all": ("All available", None)}
 PAIR_RE = re.compile(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}")
 
 COMMON_REASONS = [
@@ -714,9 +718,9 @@ def _clone_qs(s) -> str:
     return urlencode(q)
 
 
-# The backtest page runs on the venue's daily candles, so a sleeve made from it decides daily too.
+# The backtest page's default interval. A sleeve made from a backtest decides on the bars it tested.
 BACKTEST_BAR_SPEC = "1-DAY-LAST-EXTERNAL"
-MAX_WARMUP_BARS = 720  # what the venue returns in one request
+MAX_WARMUP_BARS = 720  # what the venue returns in one request; bars built from trades load from the store
 
 
 def _profile_cap(q) -> float:
@@ -727,17 +731,21 @@ def _profile_cap(q) -> float:
     return PROFILES[name].max_position_pct
 
 
-def _warmup_for(strategy: str, q) -> int:
-    """Bars to load at start so the slowest indicator is ready on the sleeve's first daily bar, as
-    the strategy itself says, capped at what the venue returns in one request."""
+def _warmup_for(strategy: str, q, bar_spec: str = BACKTEST_BAR_SPEC) -> int:
+    """Bars to load at start so the slowest indicator is ready on the sleeve's first bar, as the
+    strategy itself says. Venue candles are capped at what the venue returns in one request; bars
+    built from live trades load from the history store, up to the sleeve limit."""
     import importlib
+
+    from sleeve_fund.paper.config import MAX_WARMUP_BARS as MAX_STORED_WARMUP_BARS
 
     params = dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
     try:
         params.update(_form_params(q, strategy))
     except ValueError:
         pass
-    return min(MAX_WARMUP_BARS, REGISTRY[strategy][0].warmup_needed(params, 1440))
+    cap = MAX_STORED_WARMUP_BARS if bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
+    return min(cap, REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)))
 
 
 def _form_params(form, strategy: str) -> dict:
