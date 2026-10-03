@@ -113,3 +113,22 @@ def test_vwap_day_signals_do_not_change_when_future_bars_are_removed():
     early = full[pd.to_datetime(full["exit_time"]) < cut - pd.Timedelta(hours=1)]
     assert len(early) > 5
     assert list(early["entry_time"]) == list(part["entry_time"][: len(early)])
+
+
+def test_trend_filter_no_look_ahead_and_band():
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.lab import trend_filter as tf
+
+    idx = pd.date_range("2020-01-01", periods=400 * 24, freq="1h", tz="UTC")
+    rng = np.random.default_rng(3)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx))))
+    m = pd.DataFrame({"open": c, "high": c * 1.001, "low": c * 0.999, "close": c, "volume": 1.0}, index=idx)
+    p = tf.Params(1440, 5, 20, "vol_target")
+    full = tf.daily_returns(m, p, cost="zero")
+    cut = tf.daily_returns(m[m.index < idx[300 * 24]], p, cost="zero")
+    # Truncating the future changes nothing already booked (the last day may be partial).
+    pd.testing.assert_series_equal(full.iloc[: len(cut) - 1], cut.iloc[:-1])
+    held = tf.held_weights(pd.Series([0.0, 0.5, 0.55, 0.7, 0.0, 0.3]), 0.25)
+    assert held.tolist() == [0.0, 0.5, 0.5, 0.7, 0.0, 0.3]

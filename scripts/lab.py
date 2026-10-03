@@ -24,8 +24,10 @@ from sleeve_fund.lab import data, sim  # noqa: E402
 from sleeve_fund.lab import mtf_trend as mt  # noqa: E402
 from sleeve_fund.lab import pairs as pr  # noqa: E402
 from sleeve_fund.lab import sweep as sw  # noqa: E402
+from sleeve_fund.lab import trend_filter as tfl  # noqa: E402
 from sleeve_fund.lab import vwap_day as vd  # noqa: E402
 from sleeve_fund.research.ledger import IdeaLedger  # noqa: E402
+from sleeve_fund.research.metrics import deflated_sharpe_probability  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "minute"
@@ -346,9 +348,70 @@ def _bp(x):
     return "n/a" if x is None or x != x else f"{x * 1e4:+.0f}"
 
 
+# Pre-registered trend-filter variants (round 2). Each counts in the idea ledger.
+TREND_VARIANTS = {
+    "daily 20/50, full": tfl.Params(1440, 20, 50, "full"),
+    "daily 50/200, full": tfl.Params(1440, 50, 200, "full"),
+    "4h 21/55, full": tfl.Params(240, 21, 55, "full"),
+    "daily 20/50, vol target 40%": tfl.Params(1440, 20, 50, "vol_target"),
+    "daily 50/200, vol target 40%": tfl.Params(1440, 50, 200, "vol_target"),
+    "4h 21/55, vol target 40%": tfl.Params(240, 21, 55, "vol_target"),
+}
+
+
+def cmd_trend(args) -> None:
+    """Long-only trend filter: staged report, calendar years, exposure, and the deflated Sharpe
+    against every attempt in the idea ledger."""
+    results, starts, ends, spans, expo = {}, {}, {}, {}, {}
+    for inst in args.instruments:
+        m = data.load(inst, DATA)
+        lo, hi = dev_window(m)
+        m = m[m.index < hi]
+        spans[inst] = data.span(m)
+        starts[inst] = m.index[0] + pd.Timedelta(days=220)  # slow-average warm-up (200 daily bars)
+        ends[inst] = hi
+        for vname, p in TREND_VARIANTS.items():
+            for cost in COST_LEVELS:
+                results.setdefault((vname, True, cost), {})[inst] = tfl.daily_returns(m, p, cost=cost, start=starts[inst])
+            expo.setdefault(vname, {})[inst] = float(tfl.exposure(m, p, starts[inst]).mean())
+        bh = mt.buy_and_hold(data.resample(m, 1440), starts[inst])
+        for cost in COST_LEVELS:
+            results.setdefault(("bench: buy and hold", True, cost), {})[inst] = bh
+        print(f"{inst}: done", flush=True)
+    write_report(slug="trend_filter", title="Long-only trend filter: staged screen",
+                 note="Long-only, spot, no leverage. Equal-weight basket of the instruments with history at each date "
+                      "(missing instruments count as flat). Vol target sizes each position to 40% annualised volatility "
+                      "(30-day realised), capped at 100%, re-set only on a 25% drift.",
+                 idea="trend_filter", family="trend", params={k: v.as_dict() for k, v in TREND_VARIANTS.items()},
+                 results=results, starts=starts, ends=ends, spans=spans)
+    # Calendar years and significance, at retail costs.
+    ledger = IdeaLedger(LEDGER)
+    # Strategy attempts only: benchmarks and the classifier diagnostics are not trials of a strategy.
+    tried = [e for e in ledger.entries() if e["family"] != "benchmark" and e["stage"] != "diagnostic"]
+    n_trials = len({(e["idea"], json.dumps(e["params"], sort_keys=True)) for e in tried})
+    trial_sharpes = [e["sharpe"] for e in tried]
+    L = ["", "## By calendar year (long-only, Kraken retail costs, equal-weight basket)", "",
+         "| Variant | " + " | ".join(str(y) for y in range(2018, 2026)) + " | Sharpe | Max DD | Avg exposure | Deflated Sharpe prob. |",
+         "|" + "---|" * 13]
+    for vname in list(TREND_VARIANTS) + ["bench: buy and hold"]:
+        per = results[(vname, True, "kraken_pro_taker")]
+        basket = pd.concat([s.rename(i) for i, s in per.items()], axis=1).fillna(0).mean(axis=1)
+        yearly = (1 + basket).groupby(basket.index.year).prod() - 1
+        st = sim.stats(sim.trades_frame([]), basket)
+        dsr = deflated_sharpe_probability(basket, n_trials, trial_sharpes)
+        ex = sum(expo[vname].values()) / len(expo[vname]) if vname in expo else 1.0
+        L.append(f"| {vname} | " + " | ".join(_pct(yearly.get(y, float('nan'))) for y in range(2018, 2026))
+                 + f" | {st['sharpe']:.2f} | {_pct(-st['max_dd'])} | {ex:.0%} | {dsr:.2f} |")
+    L += ["", f"Deflated Sharpe probability: the chance the true Sharpe beats the best you would expect by luck from "
+              f"{n_trials} recorded attempts (above 0.95 is the plan's bar)."]
+    out = RESULTS / "trend_filter.md"
+    out.write_text(out.read_text() + "\n".join(L) + "\n")
+    print(f"wrote {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["data", "classifier", "vwap_day", "mtf", "sweep", "pairs"])
+    ap.add_argument("command", choices=["data", "classifier", "vwap_day", "mtf", "sweep", "pairs", "trend"])
     ap.add_argument("--htf", type=int, default=240)
     ap.add_argument("--bar", type=int, default=5)
     ap.add_argument("--anchors", nargs="*", default=["utc", "us_open"])
@@ -356,7 +419,7 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true")
     args = ap.parse_args()
     RESULTS.mkdir(parents=True, exist_ok=True)
-    {"data": cmd_data, "classifier": cmd_classifier, "vwap_day": cmd_vwap_day, "mtf": cmd_mtf, "sweep": cmd_sweep, "pairs": cmd_pairs}[args.command](args)
+    {"data": cmd_data, "classifier": cmd_classifier, "vwap_day": cmd_vwap_day, "mtf": cmd_mtf, "sweep": cmd_sweep, "pairs": cmd_pairs, "trend": cmd_trend}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
 # One lab command per line; the lab workflow runs them in order on every push to a claude/lab* branch.
-# Strategies 1+2 on the only setting where the classifier held up on development history: US-open sessions,
-# the doc's own thresholds, 5-minute bars.
-vwap_day --anchors us_open
+# Round 2: the long-only trend filter (6 pre-registered variants), development history only.
+trend
