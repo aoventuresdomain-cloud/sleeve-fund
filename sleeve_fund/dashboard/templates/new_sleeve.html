@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
+{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields %}
 {% block title %}New strategy · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -35,7 +35,9 @@
       </div>
     </fieldset>
     <fieldset class="panel step">
-      <legend>4. Exits (optional)</legend>
+      <legend>4. Orders and exits</legend>
+      {{ order_fields(pre) }}
+      <h3 class="field-group">Exits (optional)</h3>
       {{ exit_fields(pre) }}
     </fieldset>
     <fieldset class="panel step">

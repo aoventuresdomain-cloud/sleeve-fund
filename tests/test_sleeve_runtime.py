@@ -224,3 +224,19 @@ def test_order_status_moves_forward_only(store):
     assert store.order_counts("s1") == {"filled": 1, "rejected": 1}
     with pytest.raises(ValueError):
         store.record_order("s1", order_id="O-3", side="BUY", qty=1, intent="yolo", reason="x")
+
+
+def test_maker_first_orders_are_journaled_with_the_market_fallback(store, instrument):
+    from test_maker import _daily, _minutes
+
+    _sleeve(store)
+    day = [10_000.0] * 1440
+    m = _minutes(day + [10_000.0 + i for i in range(1, 2 * 1440 + 1)])  # runs away from the limit
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    run_backtest("buy_and_hold", _daily(m), instrument, {"maker_wait_minutes": 15}, runtime=rt, exec_prices=m)
+    first, second = reversed(store.orders("s1"))
+    assert (first["order_type"], first["status"]) == ("POST-ONLY LIMIT", "canceled")
+    assert (second["order_type"], second["status"]) == ("MARKET", "filled")
+    assert "not filled within 15 minutes" in second["reason"] and second["signal"]["maker_order"] == first["order_id"]
+    fills = store.fills("s1")  # the market order may walk a level or two of the thin test book
+    assert fills and {(f["side"], f["order_id"]) for f in fills} == {("BUY", second["order_id"])}

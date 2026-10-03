@@ -641,3 +641,55 @@ def test_sleeve_page_marks_its_status_banners_and_dialogs_live(client):
         assert key in page
     js = c.get("/static/live.js", auth=AUTH).text
     assert "Not updating since" in js and "visibilitychange" in js
+
+
+def test_maker_first_orders_round_trip_through_the_form_and_clone(client):
+    from urllib.parse import parse_qs, urlparse
+
+    c, store = client
+    assert _new(c, name="eth-maker", instrument="ETH/USD", execution="maker", maker_wait_minutes="20").status_code == 303
+    assert store.sleeve("eth-maker").params["maker_wait_minutes"] == 20
+    page = c.get("/sleeves/eth-maker", auth=AUTH).text
+    assert "Maker first, the rest at market after 20 min" in page
+    href = next(p for p in page.split('"') if p.startswith("/sleeves/new?"))
+    q = {k: v[0] for k, v in parse_qs(urlparse(href.replace("&amp;", "&")).query).items()}
+    assert q["execution"] == "maker" and q["maker_wait_minutes"] == "20"
+    form = c.get(href.replace("&amp;", "&"), auth=AUTH).text
+    assert '<option value="maker" selected>' in form and 'name="maker_wait_minutes" type="number"' in form
+    # Market orders store nothing extra, so existing strategies are unchanged.
+    _new(c, name="eth-market", instrument="ETH/USD", execution="market", maker_wait_minutes="20")
+    assert "maker_wait_minutes" not in store.sleeve("eth-market").params
+    # The wait must fit inside one decision bar (hourly here).
+    r = _new(c, name="eth-slow", execution="maker", maker_wait_minutes="60")
+    assert "shorter than one bar" in c.get(r.headers["location"], auth=AUTH).text
+
+
+def _wavy_minutes(days):
+    import numpy as np
+    import pandas as pd
+
+    now = pd.Timestamp.now(tz="UTC").floor("1D")
+    idx = pd.date_range(now - pd.Timedelta(days=days), periods=days * 1440, freq="1min", tz="UTC")
+    t = np.arange(len(idx))
+    c = 2_000 * (1 + 0.0004 * t / 1440) + 5 * np.sin(t / 7)  # drifts up, swings a few dollars every few minutes
+    return pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": 1.0}, index=idx)
+
+
+def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, monkeypatch, tmp_path):
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(90), cursor="x")
+    preview._history.clear()
+    q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&execution=maker&maker_wait_minutes=15"
+    page = c.get(q, auth=AUTH).text
+    assert "1 of 1 as maker" in page and "matched against 1-minute bars" in page
+    assert "maker_wait_minutes=15" in page and "execution=maker" in page  # carried to the paper strategy
+
+    preview._history.clear()  # no stored minutes for this one: the page says every maker order paid taker
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    page = c.get(q.replace("ETH/USD", "SOL/USD"), auth=AUTH).text
+    assert "0 of 1 as maker" in page and "assumed to miss and is charged the taker fee" in page

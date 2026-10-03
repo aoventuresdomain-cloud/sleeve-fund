@@ -153,10 +153,11 @@ class SleeveRuntime:
 
     # --- orders -------------------------------------------------------------------
 
-    def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict) -> None:
+    def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict,
+                 order_type: str = "MARKET") -> None:
         """Journal an order and why it was sent, before it goes to the venue."""
         self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
-                                signal=signal, ts=self.now())
+                                signal=signal, order_type=order_type, ts=self.now())
 
     def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
         self.store.update_order(order_id, status=status, message=message)

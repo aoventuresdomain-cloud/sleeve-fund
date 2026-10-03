@@ -158,9 +158,24 @@ def bar_type_for(instrument, minutes: int) -> BarType:
 
 
 def bar_minutes(bar_type) -> int:
-    """Bar length in minutes from a bar type such as BTC/USD.KRAKEN-4-HOUR-LAST-EXTERNAL."""
-    step, unit = str(bar_type).rsplit("-", 4)[1:3]
-    return int(step) * {"MINUTE": 1, "HOUR": 60, "DAY": 1440}[unit]
+    """Bar length in minutes from a bar type such as BTC/USD.KRAKEN-4-HOUR-LAST-EXTERNAL, or a
+    composite one such as ...-1-DAY-LAST-INTERNAL@1-MINUTE-EXTERNAL (the decision bar's length)."""
+    if isinstance(bar_type, str):
+        bar_type = BarType.from_str(bar_type)
+    return int(bar_type.spec.timedelta.total_seconds() // 60)
+
+
+def decision_bar_type(instrument, minutes: int, exec_minutes: int | None = None) -> BarType:
+    """The bar type a strategy decides on. With exec_minutes, the backtest is fed bars of that
+    shorter length and the engine builds the decision bars from them, so orders resting between
+    decisions (maker orders, stops) are matched minute by minute, as they would be at the venue."""
+    bt = bar_type_for(instrument, minutes)
+    if not exec_minutes:
+        return bt
+    if minutes % exec_minutes or exec_minutes >= minutes:
+        raise ValueError(f"execution bars of {exec_minutes} minutes don't divide {minutes}-minute bars")
+    src = str(bar_type_for(instrument, exec_minutes)).split(f"{instrument.id}-", 1)[1].replace("-LAST", "")
+    return BarType.from_str(str(bt).replace("-EXTERNAL", "-INTERNAL") + "@" + src)
 
 
 def to_bars(df: pd.DataFrame, instrument, bar_type: BarType | None = None) -> list[Bar]:

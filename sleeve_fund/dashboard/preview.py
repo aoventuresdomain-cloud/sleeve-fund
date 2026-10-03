@@ -46,6 +46,39 @@ def history(pair: str, fetch=None, venue: str | None = None):
     return df
 
 
+# Maker orders are matched against short bars from the history store. Past one year the page
+# uses 5-minute bars so a long backtest stays quick; an order then counts as filled only once a
+# whole 5-minute bar inside its wait has traded through it.
+MINUTE_MATCH_DAYS = 365
+
+
+def execution_history(pair: str, venue: str, start, end, minutes: int):
+    """Short bars from the history store to match resting orders against, or None when the store
+    hasn't caught up for this instrument (the daily candles then came from the venue)."""
+    from sleeve_fund.history import HistoryStore
+
+    store = HistoryStore()
+    cov = store.coverage(venue, pair)
+    if cov is None or pd.Timestamp.now(tz="UTC") - cov.last >= pd.Timedelta("2D"):
+        return None
+    df = store.read(venue, pair, minutes, start=start, end=end)
+    return df if len(df) else None
+
+
+def _execution(res, wait, matched_on) -> dict:
+    filled = res.fills[res.fills["filled_qty"].astype(float) > 0] if not res.fills.empty else res.fills
+    sides = list(filled["liquidity_side"]) if not filled.empty else []
+    out = {"maker": bool(wait), "wait": wait, "matched_on": matched_on,
+           "maker_orders": sides.count("MAKER"), "orders": len(sides)}
+    if wait and matched_on is None:
+        out["note"] = ("There is no minute-by-minute history for this instrument here yet, so every maker order is "
+                       "assumed to miss and is charged the taker fee.")
+    elif wait:
+        out["note"] = (f"Maker orders were matched against {matched_on} bars: they count as filled only where the "
+                       "price traded through them, never on a touch.")
+    return out
+
+
 def _finite(v):
     """JSON has no NaN or infinity; the form shows None as n/a."""
     return None if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))) else v
@@ -82,7 +115,14 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
                               fees=quote_fees.fees)
     if cap is not None:
         params = {**params, "position_cap_pct": cap}
-    res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting)
+    wait = params.get("maker_wait_minutes")
+    exec_prices, matched_on = None, None
+    if wait and fetch is None:
+        step = 1 if len(prices) <= MINUTE_MATCH_DAYS else 5
+        exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta("1D"), prices.index[-1], step)
+        matched_on = None if exec_prices is None else f"{step}-minute"
+    res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
+                       exec_minutes=5 if matched_on == "5-minute" else 1)
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     s, b = summary(returns_from_equity(res.equity)), summary(returns_from_equity(bench))
     rows = fills_to_rows(res.fills)
@@ -103,6 +143,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
+        "execution": _execution(res, wait, matched_on),
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
                          "source": quote_fees.source},
     }

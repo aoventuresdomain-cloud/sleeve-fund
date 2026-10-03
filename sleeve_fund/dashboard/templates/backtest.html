@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
-{% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
+{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields %}
 {% block title %}Backtest · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -22,6 +22,7 @@
       <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: positions up to {{ p.max_position_pct|pct0 }}</option>{% endfor %}</select><p class="hint">Caps each position exactly as paper trading will.</p></div>
       <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
     </div>
+    {{ order_fields(pre) }}
     <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('take_profit_pct') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre) }}</details>
     <p style="margin:14px 0 0"><button>Run backtest</button></p>
   </form>
@@ -35,6 +36,7 @@
         <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a></div>
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
+      {% if result.execution.note %}<p class="{{ 'banner warn' if result.execution.matched_on is none else 'muted' }}" style="margin:0 0 10px;font-size:12.5px">{{ result.execution.note }}</p>{% endif %}
       <table class="compare">
         <thead><tr><th></th><th class="num">Model</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>
         <tbody>
@@ -50,7 +52,7 @@
         <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
         <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
         <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
-        <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">of {{ result.start|money }}</div></div>
+        <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">{% if result.execution.maker %}{{ result.execution.maker_orders }} of {{ result.execution.orders }} as maker{% else %}of {{ result.start|money }}{% endif %}</div></div>
         <div><div class="k">Time in market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
       </section>
     </section>
@@ -103,7 +105,7 @@
 <script src="/static/console.js"></script>
 {% if chart %}<script id="bt-data" type="application/json">{{ chart|tojson }}</script><script id="bt-price" type="application/json">{{ result.price|tojson }}</script>{% endif %}
 <script>
-Console.strategyPicker("bt-form"); Console.whys();
+Console.strategyPicker("bt-form"); Console.orderFields("bt-form"); Console.whys();
 {% if chart %}Console.priceChart("pc", JSON.parse(document.getElementById("bt-price").textContent));
 Console.pair(JSON.parse(document.getElementById("bt-data").textContent), "eq", "dd", ["Strategy", "Buy-and-hold"]);{% endif %}
 </script>

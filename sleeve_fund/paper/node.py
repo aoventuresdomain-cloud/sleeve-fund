@@ -29,7 +29,7 @@ from nautilus_trader.model import (
     Venue,
 )
 
-from sleeve_fund.instruments import ScheduleFeeModel
+from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless
@@ -71,6 +71,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 oms_type=OmsType.NETTING,
                 account_type=AccountType.CASH,
                 fee_model=ScheduleFeeModel(sleeve.fees),
+                fill_model=fill_model(),
             ),
         )
         .build()

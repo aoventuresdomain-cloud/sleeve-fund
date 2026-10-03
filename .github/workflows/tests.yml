@@ -23,4 +23,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
+      - run: python -m playwright install --with-deps chromium  # tests/test_browser.py
       - run: pytest -q

@@ -58,8 +58,9 @@ def _secs(ts) -> int:
 
 def payload(df: pd.DataFrame, minutes: int, fills: list[dict], orders: dict[str, dict], lines: list[dict],
             source: str, shift_bars: int = 0) -> dict:
-    """Everything the chart draws. fills are oldest first. shift_bars moves each marker back that many
-    bars: a backtest fills at the bar's close, which belongs to the candle that just ended."""
+    """Everything the chart draws. fills are oldest first. shift_bars moves a marker filled exactly at a
+    bar's close back that many bars, since that fill belongs to the candle that just ended; a fill inside
+    a bar (a maker order or a stop matched minute by minute) stays on the candle it happened in."""
     df = df.iloc[-720:]
     out_candles = [{"time": _secs(t), "open": r.open, "high": r.high, "low": r.low, "close": r.close}
                    for t, r in df.iterrows()]
@@ -71,7 +72,9 @@ def payload(df: pd.DataFrame, minutes: int, fills: list[dict], orders: dict[str,
         ts = pd.Timestamp(f["ts"])
         if start is not None and ts < start:
             continue  # older than the chart's first candle
-        t = ts.floor(f"{minutes}min") - shift_bars * bucket
+        t = ts.floor(f"{minutes}min")
+        if t == ts:  # filled exactly at a bar's close: it belongs to the candle that just ended
+            t -= shift_bars * bucket
         o = orders.get(f.get("order_id") or "")
         mid = f"m{i}"
         buy = f["side"] == "BUY"

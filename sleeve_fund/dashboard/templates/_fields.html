@@ -22,3 +22,14 @@
   <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint">Sizes each trade so hitting the stop loses this much. Needs a stop-loss.</p></div>
 </div>
 {% endmacro %}
+
+{% macro order_fields(pre) %}
+{% set maker = pre.get('execution') == 'maker' %}
+<div class="grid2 order-fields">
+  <div class="field"><label for="execution">Order type</label><select id="execution" name="execution" aria-describedby="execution-hint">
+    <option value="market" {{ 'selected' if not maker }}>Market: fills at once, pays the taker fee</option>
+    <option value="maker" {{ 'selected' if maker }}>Maker first: rests as a limit, pays the maker fee if filled</option>
+  </select><p class="hint" id="execution-hint">Maker first posts a post-only limit one tick inside the last price; whatever hasn't filled in time goes at market. Stop-loss, take-profit and risk exits always go at market.</p></div>
+  <div class="field" data-when-maker {{ 'hidden' if not maker }}><label for="maker_wait_minutes">Go to market after, minutes</label><input id="maker_wait_minutes" name="maker_wait_minutes" type="number" min="1" max="1439" step="1" value="{{ pre.get('maker_wait_minutes', 15) }}"><p class="hint">Shorter than the decision interval, so each order settles before the next decision.</p></div>
+</div>
+{% endmacro %}
