@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_every_mode_uses_the_venue_profile_fees():
     from sleeve_fund.dashboard import preview
-    from sleeve_fund.lab.sim import COSTS
 
     k = venues.venue("KRAKEN")
     inst = k.instrument("BTC", "USD")  # research
@@ -28,7 +27,6 @@ def test_every_mode_uses_the_venue_profile_fees():
         "research": (inst.maker_fee, inst.taker_fee),
         "paper": (paper.fees.maker, paper.fees.taker),
         "backtest page": (Decimal(str(bt["fee_schedule"]["maker"])), Decimal(str(bt["fee_schedule"]["taker"]))),
-        "lab": (Decimal(str(COSTS["kraken_maker"]["fee"] / 1e4)), Decimal(str(COSTS["kraken_taker"]["fee"] / 1e4))),
     }
     for mode, (maker, taker) in rates.items():
         assert (maker, taker) == (k.fees.maker, k.fees.taker), mode

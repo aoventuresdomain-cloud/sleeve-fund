@@ -1,7 +1,7 @@
 """Parity: the engine's trend filter trades exactly as the research rules say it should.
 
-The reference below is the lab's trend-filter rules (sleeve_fund/lab/trend_filter.py:
-exponential averages, volatility targeting, the rebalance band), written out in plain pandas and
+The reference below is the retired lab's trend-filter rules (exponential averages, volatility
+targeting, the rebalance band; checked identical to the lab's code before it was removed), written out in plain pandas and
 held as a quantity between trades, as any real account does. The engine must match it to within
 25 basis points a year with the same number of trades, which is what lets research run on the
 engine alone.
