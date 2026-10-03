@@ -14,6 +14,12 @@ DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD missing}
 SITE_ADDRESS=${SITE_ADDRESS:?SITE_ADDRESS missing}
 ENV
 fi
+# Kraken keys for live accounts go here by hand, on the server only (see the dashboard's Accounts
+# page). Created empty and private so the supervisor can always load it; deploys never touch it.
+if [ ! -f kraken.env ]; then
+  umask 077
+  : > kraken.env
+fi
 # Keep the dashboard password in step with the GitHub secret (no sed: passwords may contain /).
 umask 077
 grep -v '^DASHBOARD_PASSWORD=' .env > .env.tmp

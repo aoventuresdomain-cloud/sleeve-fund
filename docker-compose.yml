@@ -1,5 +1,6 @@
-# Paper fund on one machine: database, sleeve supervisor, dashboard, HTTPS.
-# Paper only: no venue credentials exist anywhere in this stack.
+# The fund on one machine: database, sleeve supervisor, dashboard, HTTPS.
+# Kraken keys for live accounts, if any, live only in kraken.env on the server, which only the
+# supervisor reads. The dashboard never sees a key; it shows whether one is present.
 services:
   db:
     image: postgres:16
@@ -20,6 +21,9 @@ services:
     depends_on: { db: { condition: service_healthy } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+    env_file:
+      - path: kraken.env
+        required: false
     command: sh -c "python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run"
 
   dashboard:

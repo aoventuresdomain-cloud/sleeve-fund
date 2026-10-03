@@ -125,6 +125,7 @@
     <table class="compact kv">
       <tr><th scope="row">Strategy</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Pair and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
+      <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}

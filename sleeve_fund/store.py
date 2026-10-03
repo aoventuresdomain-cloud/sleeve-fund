@@ -158,6 +158,31 @@ orders_t = Table(
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
 )
+# Venue accounts (see sleeve_fund/accounts.py), which sleeve trades on which, and whether the
+# supervisor can see a key for each live account. New tables, so they arrive as CREATE TABLE.
+accounts_t = Table(
+    "accounts",
+    metadata,
+    Column("name", String(41), primary_key=True),
+    Column("kind", String(8), nullable=False),  # paper | live
+    Column("venue", String(16), nullable=False, default="kraken"),
+    Column("note", Text, nullable=False, default=""),
+    Column("created_at", TS, nullable=False),
+)
+sleeve_accounts_t = Table(
+    "sleeve_accounts",
+    metadata,
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=False),
+    Column("assigned_at", TS, nullable=False),
+)
+account_keys_t = Table(
+    "account_keys",
+    metadata,
+    Column("account", String(41), ForeignKey("accounts.name"), primary_key=True),
+    Column("present", Integer, nullable=False),  # 1 if the supervisor sees both key and secret
+    Column("checked_at", TS, nullable=False),
+)
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
@@ -354,6 +379,63 @@ class Store:
             q = q.where(orders_t.c.sleeve == sleeve)
         with self.engine.connect() as c:
             return {s: n for s, n in c.execute(q)}
+
+    # --- accounts ------------------------------------------------------------------
+
+    def _ensure_paper_account(self, c) -> None:
+        if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == "paper")).first() is None:
+            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
+                                                note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+
+    def create_account(self, name: str, kind: str, note: str = "") -> None:
+        from sleeve_fund.accounts import KINDS, NAME_RE
+
+        if not NAME_RE.fullmatch(name):
+            raise ValueError("account name: lower-case letters, digits and dashes, 2 to 41 characters")
+        if kind not in KINDS:
+            raise ValueError(f"account kind must be one of {KINDS}")
+        with self.engine.begin() as c:
+            self._ensure_paper_account(c)
+            if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == name)).first():
+                raise ValueError(f"an account called {name} already exists")
+            c.execute(insert(accounts_t).values(name=name, kind=kind, venue="kraken", note=note, created_at=utcnow()))
+
+    def accounts(self) -> list[dict]:
+        """Every account with its sleeves and, for live ones, whether the supervisor sees a key."""
+        with self.engine.begin() as c:
+            self._ensure_paper_account(c)
+            rows = _rows(c.execute(select(accounts_t).order_by(accounts_t.c.created_at, accounts_t.c.name)))
+            keys = {r["account"]: r for r in _rows(c.execute(select(account_keys_t)))}
+            links = _rows(c.execute(select(sleeve_accounts_t)))
+            names = [r[0] for r in c.execute(select(sleeves_t.c.name))]
+        assigned = {r["sleeve"]: r["account"] for r in links}
+        for r in rows:
+            r["sleeves"] = [n for n in names if assigned.get(n, "paper") == r["name"]]
+            k = keys.get(r["name"])
+            r["key_present"] = bool(k["present"]) if k else None  # None: the supervisor hasn't checked yet
+            r["key_checked_at"] = k["checked_at"] if k else None
+        return rows
+
+    def account_of(self, sleeve: str) -> str:
+        with self.engine.connect() as c:
+            row = c.execute(select(sleeve_accounts_t.c.account).where(sleeve_accounts_t.c.sleeve == sleeve)).first()
+        return row[0] if row else "paper"
+
+    def assign_account(self, sleeve: str, account: str) -> None:
+        with self.engine.begin() as c:
+            self._ensure_paper_account(c)
+            if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == account)).first() is None:
+                raise ValueError(f"no account called {account}")
+            c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
+            c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=utcnow()))
+
+    def report_keys(self, present: dict[str, bool]) -> None:
+        """Supervisor only: whether each live account's key is on the server. Never the key itself."""
+        now = utcnow()
+        with self.engine.begin() as c:
+            for name, ok in present.items():
+                c.execute(account_keys_t.delete().where(account_keys_t.c.account == name))
+                c.execute(insert(account_keys_t).values(account=name, present=int(bool(ok)), checked_at=now))
 
     def event(self, sleeve: str | None, level: str, kind: str, message: str) -> None:
         if level not in LEVELS:

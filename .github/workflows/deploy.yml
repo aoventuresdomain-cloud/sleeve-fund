@@ -33,7 +33,7 @@ jobs:
         run: |
           # sudo is a no-op for root and needed for a non-root user such as Lightsail's ubuntu.
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo mkdir -p /opt/sleeve-fund'
-          rsync -az --delete --exclude .git --exclude .env --exclude data --rsync-path="sudo rsync" \
+          rsync -az --delete --exclude .git --exclude .env --exclude kraken.env --exclude data --rsync-path="sudo rsync" \
             -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
       - name: Start stack
         env:
