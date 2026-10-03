@@ -33,6 +33,7 @@ class SleeveConfig:
     params: dict = field(default_factory=dict)
     max_notional: float | None = None
     warmup_bars: int = 0
+    risk_profile: str = "balanced"
     fees: FeeSchedule = KRAKEN_UK_ENTRY
 
     def __post_init__(self) -> None:
@@ -49,6 +50,9 @@ class SleeveConfig:
             raise ValueError("max_notional must be positive")
         if self.warmup_bars < 0:
             raise ValueError("warmup_bars must be >= 0")
+        from sleeve_fund.risk import profile
+
+        profile(self.risk_profile)  # raises on unknown
 
     @property
     def base(self) -> str:
@@ -81,5 +85,34 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
         params=dict(raw.get("params", {})),
         max_notional=sleeve.get("max_notional"),
         warmup_bars=int(sleeve.get("warmup_bars", 0)),
+        risk_profile=sleeve.get("risk_profile", "balanced"),
         fees=FeeSchedule(Decimal(str(fees["maker"])), Decimal(str(fees["taker"]))) if fees else KRAKEN_UK_ENTRY,
+    )
+
+
+def from_store(sleeve) -> SleeveConfig:
+    """SleeveConfig from a database row (sleeve_fund.store.Sleeve)."""
+    params = dict(sleeve.params)
+    max_notional = params.pop("max_notional", None)
+    return SleeveConfig(
+        name=sleeve.name,
+        strategy=sleeve.strategy,
+        instrument=sleeve.instrument,
+        bar_spec=sleeve.bar_spec,
+        starting_balance=sleeve.starting_balance,
+        params=params,
+        max_notional=max_notional,
+        warmup_bars=sleeve.warmup_bars,
+        risk_profile=sleeve.risk_profile,
+    )
+
+
+def to_store_kwargs(cfg: SleeveConfig) -> dict:
+    params = dict(cfg.params)
+    if cfg.max_notional is not None:
+        params["max_notional"] = cfg.max_notional
+    return dict(
+        name=cfg.name, strategy=cfg.strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
+        starting_balance=cfg.starting_balance, params=params, risk_profile=cfg.risk_profile,
+        warmup_bars=cfg.warmup_bars,
     )

@@ -9,7 +9,13 @@ description = "Sleeve Fund: research loop and paper trading on NautilusTrader"
 requires-python = ">=3.12,<3.14"
 # NautilusTrader 2.x is the first line with a Kraken adapter. It is a release
 # candidate: fine for research and paper, re-check before any live money (G2).
-dependencies = ["nautilus_trader==2.0.0rc5", "pandas>=2.2", "numpy>=1.26"]
+dependencies = [
+    "nautilus_trader==2.0.0rc5",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

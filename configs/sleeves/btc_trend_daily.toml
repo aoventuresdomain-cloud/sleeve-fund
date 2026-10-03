@@ -9,6 +9,7 @@ bar_spec = "1-DAY-LAST-EXTERNAL"
 starting_balance = 10000
 max_notional = 10000
 warmup_bars = 250
+risk_profile = "balanced"
 
 [params]
 fast = 50

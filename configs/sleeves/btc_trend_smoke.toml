@@ -10,6 +10,7 @@ bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
 starting_balance = 10000              # paper USD
 max_notional = 1000                   # never buy more than this per order
 warmup_bars = 0
+risk_profile = "aggressive"
 
 [params]
 fast = 5

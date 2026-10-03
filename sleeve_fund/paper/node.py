@@ -36,7 +36,8 @@ from nautilus_trader.model import (
 )
 
 from sleeve_fund.instruments import ScheduleFeeModel
-from sleeve_fund.paper.config import SleeveConfig, load_sleeve
+from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
+from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless
 from sleeve_fund.strategies import REGISTRY
 
@@ -47,7 +48,7 @@ def _tag(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
 
 
-def build_node(sleeve: SleeveConfig, log_level: str = "INFO") -> LiveNode:
+def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None) -> LiveNode:
     assert_keyless()
     tag = _tag(sleeve.name)
     venue = Venue.from_str(KRAKEN)
@@ -88,20 +89,30 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO") -> LiveNode:
                 strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
                 **sleeve.params,
             )
-        )
+        ).attach_runtime(runtime)
     )
     return node
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.paper", description="Run one paper sleeve")
-    ap.add_argument("sleeve", type=Path, help="sleeve TOML, e.g. configs/sleeves/btc_trend_smoke.toml")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("sleeve", nargs="?", type=Path, help="sleeve TOML, e.g. configs/sleeves/btc_trend_smoke.toml")
+    src.add_argument("--db-sleeve", help="run the named sleeve from the database (journal, controls, risk guard)")
     ap.add_argument("--minutes", type=float, default=0, help="stop after N minutes (0 = run until Ctrl+C)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = ap.parse_args(argv)
 
-    sleeve = load_sleeve(args.sleeve)
-    node = build_node(sleeve, log_level=args.log_level)
+    runtime = None
+    if args.db_sleeve:
+        from sleeve_fund.store import Store
+
+        store = Store()
+        sleeve = from_store(store.sleeve(args.db_sleeve))
+        runtime = SleeveRuntime(store, sleeve.name)
+    else:
+        sleeve = load_sleeve(args.sleeve)
+    node = build_node(sleeve, log_level=args.log_level, runtime=runtime)
     if args.minutes > 0:
         handle = node.handle()
         timer = threading.Timer(args.minutes * 60, handle.stop)

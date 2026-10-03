@@ -37,6 +37,7 @@ def run_backtest(
     params: dict | None = None,
     starting_capital: float = 10_000.0,
     log_level: str = "ERROR",
+    runtime=None,
 ) -> BacktestResult:
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
@@ -70,7 +71,7 @@ def run_backtest(
             assumed_taker_fee=float(instrument.taker_fee),
             **params,
         )
-        engine.add_strategy(strategy_cls(config))
+        engine.add_strategy(strategy_cls(config).attach_runtime(runtime))
         engine.run()
 
         fills = engine.generate_order_fills_report()

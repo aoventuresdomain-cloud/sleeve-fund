@@ -13,7 +13,9 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from nautilus_trader.config import StrategyConfig
-from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, Quantity, TimeInForce
+from datetime import timedelta
+
+from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, PriceType, Quantity, TimeInForce
 from nautilus_trader.trading import Strategy
 
 
@@ -95,6 +97,14 @@ class LongFlatStrategy(Strategy):
         self._cfg = config
         self.instrument = None
         self._last_bar_ts = 0
+        self._last_close = None
+        # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
+        # Attach with attach_runtime() before the strategy is added to a node or engine.
+        self.runtime = None
+
+    def attach_runtime(self, runtime) -> "LongFlatStrategy":
+        self.runtime = runtime
+        return self
 
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self._cfg.instrument_id)
@@ -105,6 +115,11 @@ class LongFlatStrategy(Strategy):
         if self._cfg.warmup_bars:
             self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
         self.subscribe_bars(self._cfg.bar_type)
+        if self.runtime is not None:
+            self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
+            # Trades give a fresh price for marking and the risk guard between (daily) bars.
+            self.subscribe_trades(self._cfg.instrument_id)
+            self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
 
     def update_indicators(self, bar: Bar) -> None:
         """Override to feed indicators. Called once per bar, historical or live, in time order."""
@@ -131,6 +146,7 @@ class LongFlatStrategy(Strategy):
         if not self._accept(bar):
             return
         self.log.info(f"bar {bar}")
+        self._last_close = bar.close.as_double()
         target = self.want_long(bar)
         if target is None:
             return
@@ -138,6 +154,8 @@ class LongFlatStrategy(Strategy):
             return
         is_long = self.portfolio.is_net_long(self._cfg.instrument_id)
         if target and not is_long:
+            if self.runtime is not None and not self.runtime.can_open():
+                return
             self._buy_all(bar)
         elif not target and is_long:
             self.close_all_positions(self._cfg.instrument_id)
@@ -153,6 +171,8 @@ class LongFlatStrategy(Strategy):
         budget = free.as_decimal()
         if self._cfg.max_notional is not None:
             budget = min(budget, Decimal(str(self._cfg.max_notional)))
+        if self.runtime is not None:
+            budget = min(budget, Decimal(str(self.runtime.position_budget(self._mark()[0]))))
         budget *= Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         step = self.instrument.size_increment.as_decimal()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
@@ -168,5 +188,53 @@ class LongFlatStrategy(Strategy):
         )
         self.submit_order(order)
 
+    # --- sleeve runtime hooks (paper/live only) --------------------------------
+
+    def _price(self) -> float:
+        px = self.cache.price(self._cfg.instrument_id, PriceType.LAST)
+        if px is not None:
+            return px.as_double()
+        return self._last_close or 0.0
+
+    def _mark(self) -> tuple[float, float, float, float]:
+        """(equity, cash, coin qty, price) in the quote currency."""
+        price = self._price()
+        account = self.portfolio.account(self._cfg.instrument_id.venue)
+        if account is None or self.instrument is None:
+            return 0.0, 0.0, 0.0, price
+        cash_m = account.balance_total(self.instrument.quote_currency)
+        coin_m = account.balance_total(self.instrument.base_currency)
+        cash = cash_m.as_double() if cash_m else 0.0
+        qty = coin_m.as_double() if coin_m else 0.0
+        return cash + qty * price, cash, qty, price
+
+    def _on_tick(self, _event=None) -> None:
+        try:
+            equity, cash, qty, price = self._mark()
+            if price <= 0 or equity <= 0:
+                return
+            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
+                self.cancel_all_orders(self._cfg.instrument_id)
+                self.close_all_positions(self._cfg.instrument_id)
+        except Exception as exc:  # never let bookkeeping kill the sleeve silently
+            self.log.error(f"sleeve tick failed: {exc!r}")
+            self.runtime.store.event(self.runtime.name, "error", "tick_failed", repr(exc))
+
+    def on_order_filled(self, event) -> None:
+        if self.runtime is None:
+            return
+        fee = event.commission.as_double() if event.commission is not None else 0.0
+        self.runtime.on_fill(
+            side="BUY" if event.is_buy else "SELL",
+            qty=event.last_qty.as_double(),
+            price=event.last_px.as_double(),
+            fee=fee,
+            order_id=str(event.client_order_id),
+            trade_id=str(event.trade_id),
+        )
+
     def on_stop(self) -> None:
         self.cancel_all_orders(self._cfg.instrument_id)
+        if self.runtime is not None:
+            self.clock.cancel_timer("sleeve-tick") if "sleeve-tick" in self.clock.timer_names() else None
+            self.runtime.on_stop()
