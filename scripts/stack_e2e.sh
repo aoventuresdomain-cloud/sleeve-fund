@@ -55,7 +55,7 @@ docker compose restart supervisor
 echo "waiting ${WAIT}s after restart..."
 sleep "$WAIT"
 q "select ts, sleeve, level, kind, message from events where kind in ('restore', 'reconcile', 'reconcile_mismatch') order by id"
-RESTORED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'restore' and message like '%coin 10%'")
+RESTORED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'restore' and message like '%position 10%'")
 RECONCILED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'reconcile'")
 ERRS=$(q "select count(*) from events where level = 'error'")
 HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")
