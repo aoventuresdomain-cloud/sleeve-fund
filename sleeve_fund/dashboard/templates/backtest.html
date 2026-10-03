@@ -5,7 +5,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Backtest</h1>
-  <p class="lede">Test a model before it touches any money. It runs the real model code through the same engine and venue fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
+  <p class="lede">Test a model before it touches any money. It runs the real model code through the same engine and venue fees as paper trading, over the venue's price history (Kraken for now) at the interval you choose, and shows every trade with the reason it was taken.</p>
 </div>
 
 <div class="grid">
@@ -16,6 +16,7 @@
     {{ strategy_fields(strategies, chosen, g1, pre) }}
     <div class="grid2">
       <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
+      <div class="field"><label for="bt_bar_spec">Decision interval</label><select id="bt_bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == bar_spec }}>{{ bar_label(b).split(' (')[0] }}{{ ' (from live trades in paper)' if b.endswith('INTERNAL') else '' }}</option>{% endfor %}</select></div>
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
     <div class="grid2">

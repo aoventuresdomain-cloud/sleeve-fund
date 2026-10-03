@@ -9,9 +9,9 @@
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
 {% if pre.get('from') == 'clone' %}<div class="banner">Settings copied from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>. Change what you want to test, give it a reason, and start it on paper. {{ pre.get('source') }} keeps running unchanged.</div>{% endif %}
 {% set from_bt = pre.get('from') == 'backtest' %}
-{% if from_bt %}<div class="banner">Settings carried over from your backtest, including its daily decision interval and enough history to start with indicators ready. Give it a name and a reason, then start it on paper.</div>{% endif %}
+{% if from_bt %}<div class="banner">Settings carried over from your backtest, including its decision interval and enough history to start with indicators ready. Give it a name and a reason, then start it on paper.</div>{% endif %}
 <form method="post" action="/sleeves/new" id="sleeve-form" class="grid">
-  {% if from_bt %}<input type="hidden" name="from" value="backtest"><input type="hidden" name="bar_spec" value="{{ pre.get('bar_spec') }}">{% endif %}
+  {% if from_bt %}<input type="hidden" name="from" value="backtest"><input type="hidden" name="bar_spec" value="{{ pre.get('bar_spec') }}"><input type="hidden" name="tested_bar_spec" value="{{ pre.get('tested_bar_spec') or pre.get('bar_spec') }}">{% endif %}
   <div class="span-7">
     <fieldset class="panel step">
       <legend>1. Market</legend>

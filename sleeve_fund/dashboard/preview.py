@@ -21,12 +21,16 @@ _history: dict[tuple[str, str], tuple[float, object]] = {}
 _lock = threading.Lock()
 
 
-def history(pair: str, fetch=None, venue: str | None = None):
-    """Daily candles for a pair: the full stored history when the history store has it, otherwise
-    the venue's recent candles. Cached so the form doesn't reload on every change."""
+def history(pair: str, fetch=None, venue: str | None = None, minutes: int = 1440, days: int | None = None):
+    """Bars of `minutes` for a pair, stamped at their close. Daily: the full stored history when the
+    history store has it, otherwise the venue's recent candles. Shorter bars come only from the
+    history store, and only once it has caught up to now. Cached so the form doesn't reload on every
+    change."""
     from sleeve_fund.history import HistoryStore
 
     profile = venue_profile(venue)
+    if minutes != 1440:
+        return _intraday(pair, profile, minutes, days)
     key = (profile.name, pair)
     with _lock:
         hit = _history.get(key)
@@ -44,6 +48,52 @@ def history(pair: str, fetch=None, venue: str | None = None):
     with _lock:
         _history[key] = (time.time(), df)
     return df
+
+
+def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFrame:
+    from sleeve_fund.history import HistoryStore
+
+    store = HistoryStore()
+    cov = store.coverage(profile.name, pair)
+    if cov is None or pd.Timestamp.now(tz="UTC") - cov.last >= pd.Timedelta("2D"):
+        raise ValueError(f"interval: {profile.label}'s minute-by-minute history for {pair} hasn't finished "
+                         "loading here yet, so only daily bars can be backtested for now")
+    days = min(days or MAX_DAYS[minutes], MAX_DAYS[minutes]) if minutes in MAX_DAYS else days
+    start = cov.last - pd.Timedelta(days=days) if days else None
+    key = (profile.name, pair, minutes, days)
+    with _lock:
+        hit = _history.get(key)
+        if hit and time.time() - hit[0] < INTRADAY_CACHE_SECONDS:
+            return hit[1]
+    df = store.read(profile.name, pair, minutes, start=start)
+    with _lock:
+        _history[key] = (time.time(), df)
+    return df
+
+
+# Short bars mean a lot of rows: a year of 1-minute bars is 525,600, and the engine holds every bar
+# in memory. These caps keep a dashboard backtest inside the server's memory and under a minute.
+MAX_DAYS = {1: 365, 5: 365 * 3}
+INTRADAY_CACHE_SECONDS = 15 * 60
+CHART_CANDLES = 720  # what the price chart shows at most
+
+
+def _daily(series: pd.Series) -> pd.Series:
+    """Daily closes of an intraday series, so returns, Sharpe and drawdowns are annualised as daily."""
+    return series.resample("1D", closed="right", label="right").last().dropna()
+
+
+def _chart_minutes(minutes: int, span: pd.Timedelta) -> int:
+    """The finest candle, no finer than the strategy's bars, that fits the whole period on the chart."""
+    for m in (minutes, 5, 15, 60, 240, 1440):
+        if m >= minutes and span / pd.Timedelta(minutes=m) <= CHART_CANDLES:
+            return m
+    return 1440
+
+
+def _coarsen(prices: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    g = prices.resample(f"{minutes}min", closed="right", label="right", origin="epoch")
+    return g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
 
 
 # Maker orders are matched against short bars from the history store. Past one year the page
@@ -117,8 +167,8 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
-        risk_profile: str | None = None, spread_quote=None) -> dict:
-    """Backtest these settings on the venue's daily history. days trims to the most recent N days;
+        risk_profile: str | None = None, spread_quote=None, minutes: int = 1440) -> dict:
+    """Backtest these settings on the venue's history, deciding on bars of `minutes` (daily by default). days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
     and the buy-and-hold benchmark is held at the same exposure. risk_profile runs the paper runtime
@@ -130,11 +180,11 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
 
     profile = venue_profile(venue)
     quote_fees = fee_quote or resolve(profile.name)
-    prices = history(pair, fetch, profile.name)
-    if days:
-        prices = prices.iloc[-days:]
+    prices = history(pair, fetch, profile.name, minutes=minutes, days=days)
+    if days and len(prices):
+        prices = prices[prices.index > prices.index[-1] - pd.Timedelta(days=days)]
     if len(prices) < 60:
-        raise ValueError(f"only {len(prices)} days of {profile.label} history for {pair}; need at least 60")
+        raise ValueError(f"only {len(prices)} bars of {profile.label} history for {pair}; need at least 60")
     spread = spread_quote or spreads.resolve(profile.name, pair)
     base, quote = pair.split("/")
     inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())),
@@ -147,26 +197,35 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         params = {**params, "position_cap_pct": cap}
     wait = params.get("maker_wait_minutes")
     exec_prices, matched_on = None, None
+    span = prices.index[-1] - prices.index[0]
     if wait and fetch is None:
-        step = 1 if len(prices) <= MINUTE_MATCH_DAYS else 5
-        exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta("1D"), prices.index[-1], step)
-        matched_on = None if exec_prices is None else f"{step}-minute"
+        step = 1 if span <= pd.Timedelta(days=MINUTE_MATCH_DAYS) or minutes < 5 else 5
+        if step < minutes:
+            exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta(minutes=minutes),
+                                            prices.index[-1], step)
+            matched_on = None if exec_prices is None else f"{step}-minute"
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
                        exec_minutes=5 if matched_on == "5-minute" else 1, risk_profile=risk_profile,
-                       half_spread=spread.half_spread)
+                       half_spread=spread.half_spread, bar_minutes=minutes)
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
-    s, b = summary(returns_from_equity(res.equity)), summary(returns_from_equity(bench))
+    if minutes < 1440:  # judge returns day by day, whatever the bar length, so Sharpe is annualised right
+        equity, bench = _daily(res.equity), _daily(bench)
+    else:
+        equity = res.equity
+    s, b = summary(returns_from_equity(equity)), summary(returns_from_equity(bench))
     rows = fills_to_rows(res.fills)
     trips = trades(rows)
     stats = trade_stats(trips)
-    step = 1 if detail else max(1, len(res.equity) // 400)
+    step = 1 if detail else max(1, len(equity) // 400)
     out = {
         "pair": pair,
         "from": prices.index[0].strftime("%d %b %Y"),
         "to": prices.index[-1].strftime("%d %b %Y"),
-        "days": len(prices),
-        "t": [t.isoformat() for t in res.equity.index[::step]],
-        "equity": [round(v, 2) for v in res.equity.iloc[::step]],
+        "days": max(1, round((span + pd.Timedelta(minutes=minutes)) / pd.Timedelta("1D"))),  # each bar covers its own time
+        "bars": len(prices),
+        "minutes": minutes,
+        "t": [t.isoformat() for t in equity.index[::step]],
+        "equity": [round(v, 2) for v in equity.iloc[::step]],
         "benchmark": [round(v, 2) for v in bench.iloc[::step]],
         "strategy": {k: s[k] for k in ("total_return", "cagr", "sharpe", "max_drawdown", "volatility")},
         "hold": {k: b[k] for k in ("total_return", "cagr", "sharpe", "max_drawdown", "volatility")},
@@ -184,8 +243,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     if detail:
         from sleeve_fund.dashboard import trading
 
-        peak = res.equity.cummax()
-        out["drawdown"] = [round(float(v), 6) for v in (1 - res.equity / peak)]
+        peak = equity.cummax()
+        out["drawdown"] = [round(float(v), 6) for v in (1 - equity / peak)]
         out["fills"] = [{"t": r["ts"].isoformat(), "side": r["side"], "price": r["price"]} for r in rows]
         out["trips"] = trading.trips(list(reversed(rows)), [], res.decisions)
         out["stats"] = {k: _finite(v) for k, v in stats.items()}
@@ -194,8 +253,12 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         out["start"] = round(float(starting), 2)
         from sleeve_fund.dashboard import charts
 
-        # Daily candles are stamped at their close; the chart wants open times. Fills land on the
-        # bar they decided on, which closed at the fill time.
-        opened = prices.set_axis(prices.index - pd.Timedelta("1D"))
-        out["price"] = charts.payload(opened, 1440, rows, res.decisions, [], "venue", shift_bars=1)
+        # Bars are stamped at their close; the chart wants open times. Fills land on the bar they
+        # decided on, which closed at the fill time. Short bars are drawn coarser so the chart holds
+        # the whole period.
+        shown = _chart_minutes(minutes, span)
+        candles = prices if shown == minutes else _coarsen(prices, shown)
+        opened = candles.set_axis(candles.index - pd.Timedelta(minutes=shown))
+        out["price"] = charts.payload(opened, shown, rows, res.decisions, [], "venue", shift_bars=1)
+        out["chart_minutes"] = shown
     return out
