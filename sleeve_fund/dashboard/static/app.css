@@ -76,6 +76,7 @@ a:hover { text-decoration: underline; }
 .strip .bad-dot::before { background: var(--loss); }
 .strip .clock { margin-left: auto; color: var(--text); }
 
+.app > div { min-width: 0; } /* lets wide tables scroll inside their panel instead of widening the page */
 main { padding: 18px 20px 48px; min-width: 0; }
 .page-head { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 16px; margin-bottom: 14px; }
 .page-head h1 { font-size: 20px; font-weight: 650; font-stretch: 87.5%; letter-spacing: -.01em; margin: 0; }
@@ -103,6 +104,7 @@ main > h2 { margin: 22px 0 8px; }
 .span-6 { grid-column: span 6; } .span-5 { grid-column: span 5; } .span-4 { grid-column: span 4; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
 main > .panel { margin-bottom: 14px; overflow-x: auto; }
+.grid > .panel { overflow-x: auto; }
 .panel-head { display: flex; align-items: baseline; gap: 10px; margin: -2px 0 10px; }
 .panel-head .hint { color: var(--muted); font-size: 12px; }
 .panel-head .right { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
@@ -284,3 +286,10 @@ ul.summary { margin: 0; padding-left: 18px; }
 ul.summary li { margin: 0 0 6px; }
 .panel .banner { margin: 12px 0 0; font-size: 13px; }
 @media (max-width: 1100px) { .sticky { position: static; } }
+
+/* --- filters and report grid ------------------------------------------------- */
+form.filters { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; margin-bottom: 14px; }
+form.filters select, form.filters input { height: 36px; box-sizing: border-box; }
+form.filters .field { min-width: 150px; }
+table.heat td { min-width: 62px; }
+table.heat th.row a { color: var(--text); }

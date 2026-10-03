@@ -249,3 +249,37 @@ def test_fetch_kraken_daily_parses_and_drops_the_open_candle():
     assert df.index[0].timestamp() == 1_700_000_000 + day  # stamped at the bar's close, not its open
     with pytest.raises(ValueError):
         fetch_kraken_daily("NOPE/USD", get_json=get_json)
+
+
+def test_decision_log_filters_and_csv_keeps_formulas_as_text(client):
+    c, store = client
+    _new(c, name="btc-a")
+    _new(c, name="eth-b", instrument="ETH/USD", reason="=HYPERLINK(\"https://evil.example\")")
+    c.post("/sleeves/btc-a/command", data={"command": "pause", "reason": "news"}, auth=AUTH, headers=SAME)
+    page = c.get("/decisions?sleeve=btc-a&action=pause", auth=AUTH).text
+    assert "news" in page and "first test" not in page
+    assert c.get("/decisions?from=not-a-date", auth=AUTH).status_code == 200
+    r = c.get("/decisions.csv?sleeve=eth-b", auth=AUTH)
+    assert r.headers["content-disposition"].startswith('attachment; filename="sleeve-fund-decisions-')
+    lines = r.text.splitlines()
+    assert lines[0] == "ts,actor,action,sleeve,reason" and len(lines) == 2
+    assert "'=HYPERLINK" in lines[1]
+
+
+def test_exports_reports_and_settings(client):
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD")
+    store.record_equity("sol-x", equity=10_000, cash=10_000, qty=0, price=100, benchmark=10_000)
+    store.record_fill("sol-x", side="BUY", qty=10, price=100, fee=0.8, order_id="o1", trade_id="t1")
+    store.record_fill("sol-x", side="SELL", qty=10, price=110, fee=0.88, order_id="o2", trade_id="t2")
+    fills = c.get("/exports/fills.csv?sleeve=sol-x", auth=AUTH).text.splitlines()
+    assert len(fills) == 3 and ",BUY," in fills[1] and ",SELL," in fills[2]  # oldest first
+    trades = c.get("/exports/trades.csv", auth=AUTH).text.splitlines()
+    assert len(trades) == 2 and trades[1].startswith("sol-x,")
+    assert c.get("/exports/equity.csv", auth=AUTH).status_code == 200
+    assert c.get("/exports/secrets.csv", auth=AUTH).status_code == 404
+    assert c.get("/exports/fills.csv?sleeve=nope", auth=AUTH).status_code == 404
+    assert c.get("/exports/fills.csv").status_code == 401
+    assert "Book by month" in c.get("/reports", auth=AUTH).text
+    settings = c.get("/settings", auth=AUTH).text
+    assert "Live trading" in settings and "test-pw" not in settings

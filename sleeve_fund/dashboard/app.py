@@ -17,13 +17,13 @@ from urllib.parse import urlencode, urlparse
 
 import markdown
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import riskops
+from sleeve_fund.dashboard import reports, riskops
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
@@ -329,7 +329,55 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/decisions", response_class=HTMLResponse)
     def decisions(request: Request, _: str = Depends(require_pm)):
-        return page(request, "decisions.html", decisions=st().decisions(limit=500))
+        f = _decision_filters(request)
+        return page(request, "decisions.html", decisions=st().decisions(limit=500, **f["query"]), f=f,
+                    sleeves=[s.name for s in st().sleeves()], actions=DECISION_ACTIONS)
+
+    @app.get("/decisions.csv")
+    def decisions_csv(request: Request, _: str = Depends(require_pm)):
+        rows = st().decisions(limit=100_000, **_decision_filters(request)["query"])
+        return _csv("decisions", reports.to_csv(rows, ["ts", "actor", "action", "sleeve", "reason"]))
+
+    @app.get("/reports", response_class=HTMLResponse)
+    def reports_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        fills = {s.name: st().fills(s.name, limit=100_000) for s in sleeves}
+        return page(request, "reports.html", m=reports.monthly(summaries, frames, fills),
+                    sleeves=[s.name for s in sleeves], shell=shell(sleeves))
+
+    @app.get("/exports/{kind}.csv")
+    def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
+        names = [s.name for s in st().sleeves()]
+        if sleeve and sleeve not in names:
+            raise HTTPException(404, "no such sleeve")
+        chosen = [sleeve] if sleeve else names
+        if kind == "fills":
+            rows = [f for n in chosen for f in reversed(st().fills(n, limit=1_000_000))]
+            cols = ["ts", "sleeve", "side", "qty", "price", "fee", "order_id", "trade_id"]
+        elif kind == "equity":
+            rows = []
+            for n in chosen:
+                for ts, r in bookm.daily(st(), n).iterrows():
+                    rows.append({"date": ts.date(), "sleeve": n, **{k: round(float(r[k]), 8) for k in r.index}})
+            cols = ["date", "sleeve", "equity", "benchmark", "cash", "qty", "price"]
+        elif kind == "trades":
+            rows = []
+            for n in chosen:
+                for t in _trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000)):
+                    rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
+                                 if t["held"] else None})
+            cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
+                    "ret", "reason"]
+        else:
+            raise HTTPException(404, "unknown export")
+        return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_page(request: Request, _: str = Depends(require_pm)):
+        from sleeve_fund.instruments import KRAKEN_UK_ENTRY
+
+        return page(request, "settings.html", profiles=PROFILES, fees=KRAKEN_UK_ENTRY,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes())
 
     return app
 
@@ -421,6 +469,30 @@ def _held(td) -> str:
         return ""
     hours = td.total_seconds() / 3600
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+
+
+DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten"]
+
+
+def _decision_filters(request: Request) -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    q = request.query_params
+    out = {"sleeve": q.get("sleeve") or None, "action": q.get("action") or None}
+    raw = {"from": q.get("from", ""), "to": q.get("to", "")}
+    for key, field, extra in (("from", "since", 0), ("to", "until", 1)):
+        try:
+            if raw[key]:
+                out[field] = datetime.strptime(raw[key], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=extra)
+        except ValueError:
+            raw[key] = ""  # an unreadable date is ignored rather than failing the page
+    return {"query": out, "raw": raw, "qs": urlencode({k: v for k, v in q.items() if v})}
+
+
+def _csv(name: str, body: str) -> Response:
+    stamp = utcnow().strftime("%Y%m%d")
+    return Response(body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="sleeve-fund-{name}-{stamp}.csv"'})
 
 
 def _bytes(n) -> str:

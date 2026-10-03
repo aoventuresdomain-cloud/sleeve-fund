@@ -440,9 +440,16 @@ class Store:
             c.execute(insert(decisions_t).values(ts=utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
 
-    def decisions(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
+    def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,
+                  since: datetime | None = None, until: datetime | None = None) -> list[dict]:
         q = select(decisions_t)
         if sleeve:
             q = q.where(decisions_t.c.sleeve == sleeve)
+        if action:
+            q = q.where(decisions_t.c.action == action)
+        if since:
+            q = q.where(decisions_t.c.ts >= since)
+        if until:
+            q = q.where(decisions_t.c.ts < until)
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(decisions_t.c.id.desc()).limit(limit)))

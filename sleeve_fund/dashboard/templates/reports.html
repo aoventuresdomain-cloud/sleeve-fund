@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import signed, money_signed %}
+{% block title %}Reports · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Reports</h1>
+  <p class="lede">Month by month, after fees, marked to Kraken prices at each month's last mark. Downloads open in any spreadsheet.</p>
+</div>
+<div class="grid">
+  <section class="panel flush span-8" aria-labelledby="m-h">
+    <div class="panel-head"><h2 id="m-h">Book by month</h2><span class="hint">newest first</span></div>
+    {% if m.rows %}
+    <table class="responsive">
+      <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Holding</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
+      <tbody>{% for r in m.rows %}
+      <tr><td><strong>{{ r.month }}</strong></td><td class="num" data-m="right">{{ money_signed(r.pnl) }}</td><td class="num" data-label="Return">{{ signed(r.ret) }}</td>
+        <td class="num" data-m="right" data-label="Holding">{{ r.bench_ret|pct }}</td><td class="num" data-m="hide">{{ r.worst_dd|pct1 }}</td><td class="num" data-m="hide">{{ r.fees|money }}</td>
+        <td class="num" data-m="hide">{{ r.fills }}</td><td class="num" data-m="hide">{{ r.turnover|money }}</td><td class="num" data-m="hide">{{ r.equity|money }}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+    {% else %}<p class="empty" style="padding:4px 14px 14px">No marks yet. Months appear once sleeves have run.</p>{% endif %}
+  </section>
+  <section class="panel span-4" aria-labelledby="dl-h">
+    <div class="panel-head"><h2 id="dl-h">Downloads</h2><span class="hint">CSV</span></div>
+    <form method="get" class="field" id="dl-form" style="margin-bottom:12px"><label for="dl-sleeve">For</label>
+      <select id="dl-sleeve" name="sleeve"><option value="">All sleeves</option>{% for n in sleeves %}<option>{{ n }}</option>{% endfor %}</select></form>
+    <table class="compact kv">
+      <tr><th scope="row">Every fill</th><td class="num"><a data-dl href="/exports/fills.csv">fills.csv</a></td></tr>
+      <tr><th scope="row">Closed trades with P&amp;L</th><td class="num"><a data-dl href="/exports/trades.csv">trades.csv</a></td></tr>
+      <tr><th scope="row">Daily equity and positions</th><td class="num"><a data-dl href="/exports/equity.csv">equity.csv</a></td></tr>
+      <tr><th scope="row">Decision log</th><td class="num"><a href="/decisions.csv">decisions.csv</a></td></tr>
+    </table>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">Amounts are in each pair's quote currency (USD for */USD pairs). Pound values and UK capital gains are not included yet.</p>
+  </section>
+</div>
+{% if m.grid %}
+<section class="panel flush" aria-labelledby="g-h">
+  <div class="panel-head"><h2 id="g-h">Sleeves by month</h2><span class="hint">monthly return; shading shows size</span></div>
+  <div style="overflow-x:auto"><table class="corr heat">
+    <tr><th></th>{% for mo in m.months|reverse %}<th scope="col">{{ mo }}</th>{% endfor %}</tr>
+    {% for n in m.sleeves %}<tr><th scope="row" class="row"><a href="/sleeves/{{ n }}">{{ n }}</a></th>
+      {% for mo in m.months|reverse %}{% set v = m.grid[n].get(mo) %}
+      {% if v is none %}<td class="faint">·</td>{% else %}<td style="background: color-mix(in srgb, {{ 'var(--gain)' if v >= 0 else 'var(--loss)' }} {{ [(v|abs) * 300, 60]|min|round(0) }}%, var(--panel))">{{ '%+.1f'|format(v * 100) }}%</td>{% endif %}
+      {% endfor %}</tr>{% endfor %}
+  </table></div>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const sel = document.getElementById("dl-sleeve");
+  const sync = () => document.querySelectorAll("a[data-dl]").forEach((a) => {
+    const u = new URL(a.href); sel.value ? u.searchParams.set("sleeve", sel.value) : u.searchParams.delete("sleeve"); a.href = u;
+  });
+  sel.addEventListener("change", sync);
+})();
+</script>
+{% endblock %}
