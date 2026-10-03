@@ -17,7 +17,7 @@
 </div>
 
 <section class="ledger" aria-label="Trade figures">
-  <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div><div class="s">{{ h.exposure|money }} in coins</div></div>
+  <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div><div class="s">{{ h.exposure|money }} gross exposure</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
   <div><div class="k">Closed trades</div><div class="v">{{ st.trades }}</div><div class="s">{{ st.wins }} won, {{ st.losses }} lost</div></div>
   <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>

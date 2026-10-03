@@ -13,7 +13,7 @@ import pandas as pd
 
 from sleeve_fund.store import Store, utcnow
 
-DAYS_A_YEAR = 365  # crypto trades every day
+DAYS_A_YEAR = 365  # the venue trades every day
 MIN_DAYS_FOR_RATIOS = 30
 MIN_DAYS_FOR_CORRELATION = 20
 
@@ -141,7 +141,7 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.Dat
 
 
 def allocation(summaries: list[dict], equity: float) -> list[dict]:
-    """Capital by asset (coin positions) plus cash, as shares of book equity."""
+    """Capital by instrument (open positions) plus cash, as shares of book equity."""
     by_asset: dict[str, float] = {}
     for x in summaries:
         base = x["sleeve"].instrument.split("/")[0]

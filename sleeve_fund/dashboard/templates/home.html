@@ -18,8 +18,8 @@
   <div><div class="k">Book equity {{ help('equity') }}</div><div class="v lead">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
   <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">since 00:00 UTC</div></div>
   <div><div class="k">Month to date {{ help('mtd') }}</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
-  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">holding: {{ book.bench_ret|pct1s }}</div></div>
-  <div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in coins</div></div>
+  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">benchmark: {{ book.bench_ret|pct1s }}</div></div>
+  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in positions</div></div>
   <div><div class="k">Cash {{ help('cash') }}</div><div class="v">{{ book.cash|money }}</div><div class="s">open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
   <div><div class="k">Drawdown {{ help('drawdown') }}</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Sharpe {{ help('sharpe') }}</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
@@ -56,7 +56,7 @@
       <th data-sort="text">Sleeve</th><th data-sort="text">Status</th><th>Last 60 days</th>
       <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
       <th class="num" data-sort="num" title="Sleeve return minus buy-and-hold return over the same period">vs buy-and-hold</th>
-      <th class="num" data-sort="num">In market</th><th class="num" data-sort="num">Closed trades</th>
+      <th class="num" data-sort="num">Exposure</th><th class="num" data-sort="num">Closed trades</th>
       <th data-sort="num">Drawdown of limit</th><th>Health</th>
     </tr></thead>
     <tbody>

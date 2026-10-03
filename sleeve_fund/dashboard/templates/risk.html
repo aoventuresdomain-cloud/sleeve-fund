@@ -8,11 +8,11 @@
 </div>
 
 <section class="ledger" aria-label="Book risk">
-  <div><div class="k">In the market {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
+  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">share of book equity</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
-  <div><div class="k">If crypto falls 20%</div><div class="v {{ 'loss' if risk.scenarios[1].loss >= 0.5 }}">{{ (0 - risk.scenarios[1].loss)|smoney0 }}</div><div class="s">{{ risk.scenarios[1].loss_pct|pct1 }} of the book</div></div>
+  <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.scenarios[1].loss >= 0.5 }}">{{ (0 - risk.scenarios[1].loss)|smoney0 }}</div><div class="s">{{ risk.scenarios[1].loss_pct|pct1 }} of the book</div></div>
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="lim-h">
@@ -34,7 +34,7 @@
 
 <div class="grid">
   <section class="panel span-7" aria-labelledby="stress-h">
-    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2><span class="hint">every coin drops at once, before any stop can act</span></div>
+    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2><span class="hint">every position falls at once, before any stop can act</span></div>
     <table class="compact">
       <thead><tr><th>Fall</th><th class="num">Book loss</th><th class="num">Share of book</th><th>Sleeves that would halt</th></tr></thead>
       <tbody>{% for sc in risk.scenarios %}
@@ -42,7 +42,7 @@
         <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
       {% endfor %}</tbody>
     </table>
-    <p class="muted" style="margin:8px 0 0;font-size:12px">Uses current positions and each sleeve's peak equity. Crypto falls of 20% in a day have happened; a stop-loss sells after the fact, at whatever price it gets.</p>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">Uses current positions and each sleeve's peak equity. Single-day falls of 20% have happened in the instruments this book trades; a stop-loss sells after the fact, at whatever price it gets.</p>
   </section>
   <section class="panel span-5" aria-labelledby="hist-h">
     <div class="panel-head"><h2 id="hist-h">Limits that fired</h2><span class="hint">halts, pauses, mismatches</span></div>

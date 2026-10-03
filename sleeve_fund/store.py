@@ -441,7 +441,7 @@ class Store:
             return {r.sleeve: _aware(r.archived_at) for r in c.execute(select(sleeve_archive_t))}
 
     def archive(self, sleeve: str) -> None:
-        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds coins."""
+        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
         s = self.sleeve(sleeve)
         if s.desired_state != "stopped":
             raise ValueError("stop the sleeve before archiving it")
@@ -503,7 +503,7 @@ class Store:
             return _rows(c.execute(q.order_by(fills_t.c.ts.desc(), fills_t.c.id.desc()).limit(limit)))
 
     def journal_book(self, sleeve: str, starting_balance: float) -> dict:
-        """Cash, coin and average entry implied by the journal: the paper book's source of truth.
+        """Cash, position and average entry implied by the journal: the paper book's source of truth.
 
         Fees are charged in the quote currency (as Kraken spot does), so a buy costs
         qty * price + fee and a sell returns qty * price - fee.

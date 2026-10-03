@@ -30,8 +30,8 @@
 <section class="ledger" aria-label="Sleeve figures">
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
   <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
-  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">holding: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Holding {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
+  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
   <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% else %}none yet{% endif %}</div></div>
   <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
@@ -53,7 +53,7 @@
   <section class="panel span-4" aria-labelledby="risk-h">
     <div class="panel-head"><h2 id="risk-h">Position and limits</h2></div>
     <table class="compact kv">
-      <tr><th scope="row">Holding</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
+      <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
       <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
       <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
       <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif s.params.stop_loss %}{{ (s.params.stop_loss * 100)|round(1) }}% below entry{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
@@ -137,7 +137,7 @@
     <div class="panel-head"><h2 id="set-h">Settings</h2><span class="hint">created {{ s.created_at|ts }}</span></div>
     <table class="compact kv">
       <tr><th scope="row">Strategy</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
-      <tr><th scope="row">Pair and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
+      <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
@@ -156,7 +156,7 @@
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause sleeve', ''),
   'resume': ('Resume ' ~ s.name, 'The sleeve trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the sleeve.', 'Sell to cash and pause', 'danger'),
-  'stop': ('Stop ' ~ s.name, 'Shuts the sleeve process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It holds no coins.'), 'Stop sleeve', 'danger' if x.qty > 0 else ''),
+  'stop': ('Stop ' ~ s.name, 'Shuts the sleeve process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop sleeve', 'danger' if x.qty > 0 else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the sleeve list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive sleeve', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the sleeve list on the home page. It stays stopped until you start it.', 'Restore sleeve', ''),
   'start': ('Start ' ~ s.name, 'Starts the sleeve process. It picks up its journal and reconciles before trading.', 'Start sleeve', ''),

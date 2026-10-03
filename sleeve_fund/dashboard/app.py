@@ -36,7 +36,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheets"))
 LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
-# Suggestions only: the field accepts any Kraken spot pair.
+# Suggestions only: the field accepts any instrument Kraken spot lists.
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
@@ -237,7 +237,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             if strategy not in REGISTRY:
                 raise ValueError("pick a strategy")
             if not PAIR_RE.match(pair):
-                raise ValueError("enter a pair like SOL/USD")
+                raise ValueError("enter an instrument like SOL/USD")
             params = _form_params(q, strategy)
             params.pop("max_notional", None)  # a per-order cap doesn't change a look-back meaningfully
             balance = float(q.get("starting_balance") or 10_000)
@@ -453,7 +453,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             try:
                 pair = q.get("instrument", "").strip().upper()
                 if not PAIR_RE.fullmatch(pair):
-                    raise ValueError("pair: write it as COIN/CURRENCY, for example SOL/USD")
+                    raise ValueError("instrument: write it as BASE/QUOTE, for example SOL/USD")
                 starting = float(q.get("starting_balance") or 10_000)
                 if not 100 <= starting <= 1e9:
                     raise ValueError("capital: between 100 and 1,000,000,000")

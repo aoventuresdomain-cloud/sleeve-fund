@@ -5,7 +5,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Backtest</h1>
-  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and Kraken fees as paper trading, over Kraken's daily price history, and shows every trade with the reason it was taken.</p>
+  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and Kraken fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
 </div>
 
 <div class="grid">
@@ -47,7 +47,7 @@
         <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
         <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
         <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">of {{ result.start|money }}</div></div>
-        <div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
+        <div><div class="k">Time in market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
       </section>
     </section>
 
@@ -87,7 +87,7 @@
         <li><strong>Evidence</strong>: G1 needs the research loop's out-of-sample tests. G2 needs at least six weeks of paper results inside the backtest's range.</li>
         <li><strong>Live</strong>: only after you approve G2, and only on a Kraken account whose key you install on the server.</li>
       </ol>
-      <p class="muted" style="margin:0">Pick a pair and a strategy on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
+      <p class="muted" style="margin:0">Pick an instrument and a strategy on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
     </section>
   {% endif %}
   </div>

@@ -1,4 +1,4 @@
-"""Performance metrics. Crypto trades every day, so annualisation uses 365."""
+"""Performance metrics. The venue trades every day, so annualisation uses 365."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def trades(rows: list[dict]) -> list[dict]:
     """Closed round trips (flat -> long -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial
-    fills are fine: a trip closes when the coin position returns to (about) zero.
+    fills are fine: a trip closes when the position returns to (about) zero.
     """
     out, qty, cost, proceeds, fees = [], 0.0, 0.0, 0.0, 0.0
     bought = sold = 0.0
