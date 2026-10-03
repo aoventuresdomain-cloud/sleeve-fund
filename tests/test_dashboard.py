@@ -710,3 +710,20 @@ def test_backtest_page_says_when_the_risk_guard_halted(client, monkeypatch):
     preview._history.clear()
     page = c.get(q.replace("conservative", "aggressive"), auth=AUTH).text  # a 60% fall at a 50% cap is a 30% drawdown, short of 35%
     assert "The risk guard halted" not in page
+
+
+def test_backtest_charges_the_measured_spread_and_says_where_it_came_from(client, monkeypatch):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, store = client
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold"
+    page = c.get(q, auth=AUTH).text
+    assert "0.100% bid-ask spread, assumed" in page and " spread</div>" in page
+    store.record_spread("KRAKEN", "ETH/USD", 0.0001, samples=900)
+    page = c.get(q, auth=AUTH).text
+    assert "0.020% bid-ask spread, the median of 900 live quotes" in page
+    d = c.get("/api/preview", params={"instrument": "ETH/USD", "strategy": "buy_and_hold"}, auth=AUTH).json()
+    assert d["spread"]["source"] == "measured" and d["spread"]["paid"] > 0

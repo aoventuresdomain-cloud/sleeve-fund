@@ -42,6 +42,9 @@ class VenueProfile:
     merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
     request_interval: float = 1.0  # seconds between loader requests, within the venue's rate limit
     calendar: str = "24/7"
+    # Half the bid-ask spread a backtest charges on orders that take liquidity, until a paper sleeve
+    # on this venue has measured the instrument's own (sleeve_fund.spreads). Deliberately cautious.
+    assumed_half_spread: float = 0.0005
 
     @property
     def venue(self) -> Venue:

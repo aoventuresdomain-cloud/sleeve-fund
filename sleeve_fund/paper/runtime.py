@@ -15,6 +15,9 @@ from sleeve_fund import risk
 from sleeve_fund.store import Store, utcnow
 
 RECONCILE_EVERY = timedelta(hours=24)
+# How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
+SPREAD_EVERY = timedelta(hours=1)
+SPREAD_MIN_SAMPLES = 100
 
 
 class SleeveRuntime:
@@ -59,6 +62,8 @@ class SleeveRuntime:
         self._day = None
         self._day_open = None
         self._last_equity = None
+        self._spreads: list[float] = []
+        self._spread_since = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
         self.flatten_why: tuple[str, str] | None = None
 
@@ -176,6 +181,25 @@ class SleeveRuntime:
                          detail + ". Halted, nothing traded or corrected. Restart the strategy to rebuild "
                          "from the journal, or resume once you have checked.", ts=self.now())
         return False
+
+    # --- quotes -------------------------------------------------------------------
+
+    def on_quote(self, bid: float, ask: float, venue: str) -> None:
+        """Sample the half spread; once an hour record its median, which backtests then charge."""
+        mid = (bid + ask) / 2
+        if mid <= 0 or ask < bid:
+            return
+        now = self.now()
+        if self._spread_since is None:
+            self._spread_since = now
+        self._spreads.append((ask - bid) / 2 / mid)
+        if now - self._spread_since >= SPREAD_EVERY:
+            if len(self._spreads) >= SPREAD_MIN_SAMPLES:
+                half = sorted(self._spreads)[len(self._spreads) // 2]
+                if half < 0.05:  # a crossed or broken book is not a spread worth charging
+                    instrument = self.store.sleeve(self.name).instrument
+                    self.store.record_spread(venue, instrument, half, samples=len(self._spreads), ts=now)
+            self._spreads, self._spread_since = [], now
 
     # --- orders -------------------------------------------------------------------
 

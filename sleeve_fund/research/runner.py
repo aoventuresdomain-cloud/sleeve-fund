@@ -33,6 +33,9 @@ class BacktestResult:
     decisions: dict = field(default_factory=dict)
     # With a risk profile: the halts and pauses the runtime made, oldest first, as paper would.
     risk_events: list = field(default_factory=list)
+    # Half the bid-ask spread paid on orders that took liquidity (already in the fills' prices).
+    spread_paid: float = 0.0
+    half_spread: float = 0.0
 
 
 def run_backtest(
@@ -47,6 +50,7 @@ def run_backtest(
     exec_prices: pd.DataFrame | None = None,
     exec_minutes: int = 1,
     risk_profile: str | None = None,
+    half_spread: float | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -58,13 +62,24 @@ def run_backtest(
 
     risk_profile: run with the paper runtime on a throwaway journal (SleeveRuntime.for_backtest), so
     the profile's position cap, drawdown halt and daily-loss pause act exactly as they would in paper.
-    Without one (research), the strategy trades unguarded and uncapped unless position_cap_pct is set."""
+    Without one (research), the strategy trades unguarded and uncapped unless position_cap_pct is set.
+
+    half_spread: half the bid-ask spread, as a fraction of the price, paid by every order that takes
+    liquidity (bars carry trade prices; a real market order buys at the ask and sells at the bid).
+    None uses the venue profile's cautious assumption; sleeve_fund.spreads.resolve gives a measured
+    one. The fills report shows the prices after the spread, as paper fills on the bid or ask would."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    if half_spread is None:
+        from sleeve_fund.venues import venue as venue_profile
+
+        half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
+    if not 0 <= half_spread < 0.05:
+        raise ValueError(f"half spread {half_spread} outside [0, 5%)")
     if risk_profile is not None:
         if runtime is not None:
             raise ValueError("pass a runtime or a risk profile, not both")
@@ -91,7 +106,8 @@ def run_backtest(
             account_type=AccountType.CASH,
             base_currency=None,
             starting_balances=_opening_balances(starting_capital, quote, base, runtime),
-            fee_model=ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee)),
+            fee_model=(fee_model := ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee),
+                                                     half_spread=half_spread)),
             fill_model=fill_model(),
         )
         engine.add_instrument(instrument)
@@ -111,7 +127,7 @@ def run_backtest(
         engine.add_strategy(strategy)
         engine.run()
 
-        fills = engine.generate_order_fills_report()
+        fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
         account = engine.generate_account_report(instrument.id.venue)
         equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees = _fees_paid(fills)
@@ -125,6 +141,8 @@ def run_backtest(
             starting_capital=starting_capital,
             decisions=dict(strategy.decisions),
             risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
+            spread_paid=sum(fee_model.spread_paid.values()),
+            half_spread=half_spread,
         )
     finally:
         if runtime is not None:
@@ -166,6 +184,27 @@ def _mark_to_market(
     equity = cash + position_value
     exposure = (position_value / equity).clip(lower=0.0)
     return equity.rename("equity"), exposure.rename("exposure")
+
+
+def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float]) -> pd.DataFrame:
+    """The engine charges the spread with the commission (bars have no bid or ask to fill on). Move
+    it into each order's average price, so the report reads as a fill on the ask or bid would, and
+    leave the commissions as the venue's fee alone. Cash and equity are the same either way."""
+    if fills is None or fills.empty or not spread_paid:
+        return fills
+    fills = fills.copy()
+    for coid, spread in spread_paid.items():
+        if coid not in fills.index or spread <= 0:
+            continue
+        qty = float(fills.at[coid, "filled_qty"])
+        px = float(fills.at[coid, "avg_px"])
+        buy = str(fills.at[coid, "side"]).endswith("BUY")
+        fills.at[coid, "avg_px"] = str(px + spread / qty if buy else px - spread / qty)
+        entry = fills.at[coid, "commissions"]
+        moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
+        first, ccy = moneys[0].split()
+        fills.at[coid, "commissions"] = [f"{float(first) - spread:.2f} {ccy}", *moneys[1:]]
+    return fills
 
 
 def _fees_paid(fills: pd.DataFrame) -> float:

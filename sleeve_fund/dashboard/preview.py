@@ -117,12 +117,15 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
-        risk_profile: str | None = None) -> dict:
+        risk_profile: str | None = None, spread_quote=None) -> dict:
     """Backtest these settings on the venue's daily history. days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
     and the buy-and-hold benchmark is held at the same exposure. risk_profile runs the paper runtime
-    itself (cap, drawdown halt, daily-loss pause, journal) and sets cap from the profile."""
+    itself (cap, drawdown halt, daily-loss pause, journal) and sets cap from the profile. spread_quote
+    (sleeve_fund.spreads.resolve) is the spread charged on orders that take liquidity; without one,
+    the venue's assumption."""
+    from sleeve_fund import spreads
     from sleeve_fund.fees import resolve
 
     profile = venue_profile(venue)
@@ -132,6 +135,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         prices = prices.iloc[-days:]
     if len(prices) < 60:
         raise ValueError(f"only {len(prices)} days of {profile.label} history for {pair}; need at least 60")
+    spread = spread_quote or spreads.resolve(profile.name, pair)
     base, quote = pair.split("/")
     inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())),
                               fees=quote_fees.fees)
@@ -148,7 +152,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta("1D"), prices.index[-1], step)
         matched_on = None if exec_prices is None else f"{step}-minute"
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
-                       exec_minutes=5 if matched_on == "5-minute" else 1, risk_profile=risk_profile)
+                       exec_minutes=5 if matched_on == "5-minute" else 1, risk_profile=risk_profile,
+                       half_spread=spread.half_spread)
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     s, b = summary(returns_from_equity(res.equity)), summary(returns_from_equity(bench))
     rows = fills_to_rows(res.fills)
@@ -171,6 +176,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "cap": cap,
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile),
+        "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
+                   "source": spread.source},
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
                          "source": quote_fees.source},
     }

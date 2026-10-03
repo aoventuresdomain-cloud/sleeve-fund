@@ -152,6 +152,7 @@ class LongFlatStrategy(Strategy):
         self.instrument = None
         self._last_bar_ts = 0
         self._last_close = None
+        self._bid = self._ask = None  # the venue's best quotes (paper and live, and replayed quotes)
         self._last_tick_ns = 0
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
@@ -199,6 +200,9 @@ class LongFlatStrategy(Strategy):
                 return  # a backtest marks and guards once a bar, from on_bar
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
+            # Quotes put the venue's bid and ask in the simulated book, so a market order pays the
+            # spread as it would for real, and a maker order can join the best bid or ask.
+            self.subscribe_quotes(self._cfg.instrument_id)
             # Ticks are driven by market data (trades and bars, throttled) because a clock timer
             # alone did not fire in the live node; the timer stays as a backup for quiet markets.
             self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
@@ -207,6 +211,16 @@ class LongFlatStrategy(Strategy):
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._check_exits(self._last_close)
         self._maybe_tick()
+
+    def on_quote(self, quote) -> None:
+        bid, ask = quote.bid_price.as_double(), quote.ask_price.as_double()
+        if not 0 < bid <= ask:
+            return
+        if self._bid is None:
+            self.log.info(f"first quote: bid {bid} ask {ask}")
+        self._bid, self._ask = bid, ask
+        if self.runtime is not None:
+            self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
 
     def _maybe_tick(self) -> None:
         if self.runtime is None:
@@ -417,8 +431,13 @@ class LongFlatStrategy(Strategy):
         signal.setdefault("price", last)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
         if maker:
-            # One tick inside the last trade, so the order adds liquidity rather than taking it.
-            px = Price(last - tick if side == OrderSide.BUY else last + tick, self.instrument.price_precision)
+            # Join the best bid (to buy) or ask (to sell), so the order adds liquidity rather than taking
+            # it. Without quotes (a backtest on bars), one tick inside the last trade.
+            if self._bid is not None and self._ask is not None:
+                raw = self._bid if side == OrderSide.BUY else self._ask
+            else:
+                raw = last - tick if side == OrderSide.BUY else last + tick
+            px = Price(raw, self.instrument.price_precision)
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
                                              price=px, time_in_force=TimeInForce.GTC, post_only=True)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)

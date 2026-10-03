@@ -27,6 +27,7 @@ from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.fees import resolve as resolve_fees
+from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.risk import PROFILES
@@ -247,7 +248,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             _profile_cap(q)  # validates the profile name
             return JSONResponse(preview.run(strategy, pair, params, starting=balance,
                                             risk_profile=q.get("risk_profile") or "balanced",
-                                            fee_quote=resolve_fees(None, st())))
+                                            fee_quote=resolve_fees(None, st()),
+                                            spread_quote=resolve_spread(None, pair, st())))
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
         except OSError as exc:  # Kraken unreachable
@@ -467,7 +469,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 _profile_cap(q)  # validates the profile name
                 result = preview.run(strategy, pair, params, starting=starting, days=BACKTEST_PERIODS[period][1],
                                      detail=True, risk_profile=q.get("risk_profile") or "balanced",
-                                     fee_quote=resolve_fees(None, st()))
+                                     fee_quote=resolve_fees(None, st()),
+                                     spread_quote=resolve_spread(None, pair, st()))
             except (ValueError, TypeError, KeyError) as exc:
                 error = str(exc).strip("'")
             except OSError as exc:  # Kraken unreachable
