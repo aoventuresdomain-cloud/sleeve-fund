@@ -17,7 +17,7 @@
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits by sleeve</h2><span class="hint">bars show how much of each limit is used</span></div>
-  <table class="responsive">
+  <table class="responsive" data-hide-md="2 5 7">
     <thead><tr><th>Sleeve</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the sleeve">Room to halt</th><th>Stop-loss</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>

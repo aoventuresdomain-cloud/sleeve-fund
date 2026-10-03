@@ -13,18 +13,27 @@
   <aside class="rail" aria-label="Main">
     <a class="brand" href="/">Sleeve Fund<small>Systematic crypto sleeves</small></a>
     {% set here = request.url.path %}
-    <nav>
-      <a href="/" {{ 'aria-current=page' if here == '/' or here.startswith('/sleeves/') and here != '/sleeves/new' }}>Portfolio</a>
+    {% set is_sleeve = here.startswith('/sleeves/') and here != '/sleeves/new' %}
+    <a class="button rail-new" href="/sleeves/new">+ New sleeve</a>
+    {# Primary destinations: on phones these are the bottom tab bar. #}
+    <nav aria-label="Primary">
+      <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>Portfolio</a>
       <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>Trades</a>
       <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>Orders</a>
       <a href="/alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>Alerts{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
+      <button type="button" class="more-btn" aria-haspopup="dialog" aria-controls="more" data-open="more">More</button>
+    </nav>
+    {# Everything else: listed in the rail on wider screens, in the More sheet on phones. #}
+    <nav class="secondary" aria-label="More">
+      <div class="group">Risk and operations</div>
       <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>Risk</a>
-      <a class="desk-only" href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
-      <a class="desk-only" href="/research" {{ 'aria-current=page' if here.startswith('/research') }}>Research</a>
-      <a class="desk-only" href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
-      <a class="desk-only" href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
-      <a class="desk-only" href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>Settings</a>
-      <a class="desk-only" href="/sleeves/new" {{ 'aria-current=page' if here == '/sleeves/new' }}>New sleeve</a>
+      <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>Operations</a>
+      <div class="group">Research</div>
+      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>Strategies</a>
+      <div class="group">Records</div>
+      <a href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>Decisions</a>
+      <a href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>Reports</a>
+      <a href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>Settings</a>
     </nav>
     <div class="rail-foot">
       <div class="meta">Version {{ shell.version }}</div>
@@ -50,6 +59,21 @@
   const fmt = (tz) => new Date().toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit", timeZone: tz});
   const tick = () => { el.textContent = `${fmt("UTC")} UTC · ${fmt("Europe/London")} London`; };
   tick(); setInterval(tick, 15000);
+})();
+</script>
+<dialog id="more" class="sheet" aria-label="More pages">
+  <div class="sheet-head"><strong>More</strong><button type="button" class="quiet" data-close>Close</button></div>
+  <div class="sheet-body"></div>
+  <a class="button" href="/sleeves/new">+ New sleeve</a>
+</dialog>
+<script>
+(() => {
+  const sheet = document.getElementById("more"), btn = document.querySelector(".more-btn");
+  sheet.querySelector(".sheet-body").append(document.querySelector("nav.secondary").cloneNode(true));
+  btn.addEventListener("click", () => sheet.showModal());
+  sheet.querySelector("[data-close]").addEventListener("click", () => sheet.close());
+  sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });  // tap outside closes
+  if (sheet.querySelector("[aria-current]")) btn.setAttribute("aria-current", "page");
 })();
 </script>
 {% block scripts %}{% endblock %}
