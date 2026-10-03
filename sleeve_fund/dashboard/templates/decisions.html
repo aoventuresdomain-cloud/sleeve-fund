@@ -1,10 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Decisions · Sleeve Fund{% endblock %}
 {% block content %}
-<h1>Decision log</h1>
-<p class="sub">Every start, stop, pause, flatten and resume, with who and why.</p>
-<div class="panel">
-<table><tr><th>Time</th><th>Who</th><th>Action</th><th>Sleeve</th><th>Reason</th></tr>
-{% for d in decisions %}<tr><td>{{ d.ts|ts }}</td><td>{{ d.actor }}</td><td>{{ d.action }}</td><td>{% if d.sleeve %}<a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% endif %}</td><td style="white-space:normal">{{ d.reason }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No decisions yet.</td></tr>{% endfor %}
-</table></div>
+<div class="page-head">
+  <h1>Decision log</h1>
+  <p class="lede">Every start, stop, pause, flatten and resume, with who made it and why. Newest first.</p>
+</div>
+<section class="panel flush">
+<table class="responsive">
+  <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Sleeve</th><th>Reason</th></tr></thead>
+  <tbody>
+  {% for d in decisions %}<tr><td data-m="hide">{{ d.ts|ts }}</td><td data-m="hide">{{ d.actor }}</td><td><strong>{{ d.action|capitalize }}</strong>{% if d.sleeve %} <a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% endif %}</td><td data-m="right" class="muted">{{ d.ts|ago }}</td><td class="wrap">{{ d.reason }}</td></tr>
+  {% else %}<tr><td colspan="5" class="empty">No decisions yet. Every control you use is recorded here with its reason.</td></tr>{% endfor %}
+  </tbody>
+</table>
+</section>
 {% endblock %}

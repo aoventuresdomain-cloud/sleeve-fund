@@ -1,14 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Research · Sleeve Fund{% endblock %}
 {% block content %}
-<h1>Research</h1>
-<p class="sub">Tear sheets from the research loop. G1 asks for a higher out-of-sample Sharpe than buy-and-hold after fees.</p>
-<div class="tiles">
-  <div class="tile"><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div><div class="s">stop and rethink after 15 to 20 with no pass</div></div>
-  <div class="tile"><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div><div class="s">raises the bar for every result</div></div>
+<div class="page-head">
+  <h1>Research</h1>
+  <p class="lede">Tear sheets from the research loop. A strategy passes G1 when its out-of-sample Sharpe beats buy-and-hold after fees.</p>
 </div>
-<h2>Tear sheets</h2>
-<div class="panel">
-{% for s in sheets %}<p style="margin:4px 0"><a href="/research/{{ s }}">{{ s }}</a></p>{% else %}<p class="muted">No tear sheets yet.</p>{% endfor %}
-</div>
+<section class="ledger" aria-label="Research counters" style="max-width:560px">
+  <div><div class="k">Ideas tested</div><div class="v lead">{{ counts.ideas }}</div><div class="s">rethink after 15 to 20 with no pass</div></div>
+  <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">each one raises the bar</div></div>
+</section>
+<section class="panel flush">
+  <div class="panel-head"><h2>Tear sheets</h2><span class="hint">newest first</span></div>
+  {% if sheets %}
+  <table><thead><tr><th>Tear sheet</th></tr></thead>
+    <tbody>{% for s in sheets %}<tr><td class="cell-name"><a href="/research/{{ s }}">{{ s|replace('_', ' ') }}</a></td></tr>{% endfor %}</tbody></table>
+  {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
+</section>
 {% endblock %}

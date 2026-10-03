@@ -14,6 +14,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
+    summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
     name="rsi_pullback",
     family="mean-reversion-in-trend",
     idea=(

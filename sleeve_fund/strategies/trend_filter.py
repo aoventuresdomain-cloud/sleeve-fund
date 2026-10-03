@@ -8,6 +8,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
+    summary="Holds the coin while the {fast}-bar average is above the {slow}-bar average, otherwise cash.",
     name="trend_filter",
     family="trend",
     idea="Only hold the coin when the 50-day average is above the 200-day average.",

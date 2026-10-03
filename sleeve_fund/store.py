@@ -125,6 +125,16 @@ decisions_t = Table(
     Column("sleeve", String(64)),
     Column("reason", Text, nullable=False),
 )
+# PM acknowledgements of warning/error events (the alerts inbox). A separate table, so
+# adding it is a plain CREATE TABLE on start-up rather than a change to an existing one.
+acks_t = Table(
+    "alert_acks",
+    metadata,
+    Column("event_id", Integer, ForeignKey("events.id"), primary_key=True),
+    Column("ts", TS, nullable=False),
+    Column("actor", String(32), nullable=False),
+    Column("note", Text, nullable=False, default=""),
+)
 
 
 def utcnow() -> datetime:
@@ -340,6 +350,41 @@ class Store:
             q = q.where(events_t.c.sleeve == sleeve)
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(events_t.c.id.desc()).limit(limit)))
+
+    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
+        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
+             .order_by(events_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
+    def alerts(self, limit: int = 50, include_acked: bool = False) -> list[dict]:
+        """Warnings and errors, newest first, each with its acknowledgement (or None)."""
+        q = (select(events_t, acks_t.c.ts.label("acked_at"), acks_t.c.actor.label("acked_by"),
+                    acks_t.c.note.label("ack_note"))
+             .select_from(events_t.outerjoin(acks_t, acks_t.c.event_id == events_t.c.id))
+             .where(events_t.c.level.in_(("warning", "error"))))
+        if not include_acked:
+            q = q.where(acks_t.c.event_id.is_(None))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q.order_by(events_t.c.id.desc()).limit(limit)))
+        for r in rows:
+            r["acked_at"] = _aware(r["acked_at"])
+        return rows
+
+    def open_alert_count(self) -> int:
+        q = (select(func.count()).select_from(events_t.outerjoin(acks_t, acks_t.c.event_id == events_t.c.id))
+             .where(events_t.c.level.in_(("warning", "error")), acks_t.c.event_id.is_(None)))
+        with self.engine.connect() as c:
+            return c.execute(q).scalar() or 0
+
+    def ack(self, event_id: int, actor: str, note: str = "") -> None:
+        with self.engine.begin() as c:
+            ev = c.execute(select(events_t.c.level).where(events_t.c.id == event_id)).first()
+            if ev is None or ev.level == "info":
+                raise KeyError(f"no alert {event_id}")
+            if c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == event_id)).first() is None:
+                c.execute(insert(acks_t).values(event_id=event_id, ts=utcnow(), actor=actor, note=note.strip()))
 
     # --- PM commands and decisions ----------------------------------------------
 

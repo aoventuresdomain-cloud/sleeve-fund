@@ -1,82 +1,140 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, usage %}
-{% block title %}{{ x.sleeve.name }} · Sleeve Fund{% endblock %}
+{% from "_macros.html" import chip, signed, money_signed, usage %}
+{% set s = x.sleeve %}{% set t = x.trades %}
+{% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
+{% block title %}{{ s.name }} · Sleeve Fund{% endblock %}
 {% block content %}
-{% set s = x.sleeve %}
-<h1>{{ s.name }} {{ chip(s.status) }}</h1>
-<p class="sub">{{ s.strategy }} on {{ s.instrument }} · {{ s.bar_spec }} · {{ x.profile.name }} risk · {% for k, v in s.params.items() %}{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ k.replace('_', ' ') }} {{ (v * 100)|round(2) }}%{% else %}{{ 'max per order' if k == 'max_notional' else k }} {{ v }}{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if s.status_reason %}<br><strong>{{ s.status_reason }}</strong>{% endif %}</p>
-
-<div class="tiles">
-  <div class="tile"><div class="k">Equity</div><div class="v">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }}</div></div>
-  <div class="tile"><div class="k">Return</div><div class="v">{{ signed(x.ret) }}</div><div class="s">buy-and-hold {{ x.bench_ret|pct }}</div></div>
-  <div class="tile"><div class="k">Drawdown</div><div class="v">{{ x.drawdown|pct0 }}</div><div class="s">{{ usage(x.dd_used) }} limit {{ x.profile.max_drawdown|pct0 }} · worst {{ x.max_drawdown|pct0 }}</div></div>
-  <div class="tile"><div class="k">In the market</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">cap {{ x.profile.max_position_pct|pct0 }} of equity</div></div>
-  <div class="tile"><div class="k">P&amp;L after fees</div><div class="v">{{ x.pnl|money }}</div><div class="s">{{ x.fees|money }} fees over {{ x.fills }} fills</div></div>
-  {% set t = x.trades %}
-  <div class="tile"><div class="k">Closed trades · win rate</div><div class="v">{{ t.trades }}{% if t.trades %} · {{ t.win_rate|pct0 }}{% endif %}</div><div class="s">{% if t.trades %}{{ t.wins }} won, {{ t.losses }} lost{% else %}none closed yet{% endif %}</div></div>
-  <div class="tile"><div class="k">Avg win · avg loss</div><div class="v" style="font-size:18px">{{ t.avg_win|pctn }} · {{ t.avg_loss|pctn }}</div><div class="s">expectancy {{ t.expectancy|pctn }} a trade · profit factor {{ t.profit_factor|numn }}</div></div>
-  <div class="tile"><div class="k">Last heartbeat</div><div class="v" style="font-size:16px">{{ s.heartbeat_at|ts }}</div><div class="s">{{ 'live' if x.healthy else 'not reporting' }}</div></div>
-</div>
-
-<h2>Equity vs buy-and-hold</h2>
-<div class="panel"><div class="chart"><canvas id="eq"></canvas></div>
-{% if x.points == 0 %}<p class="muted">No marks yet. The first one arrives about 30 seconds after the sleeve starts.</p>{% endif %}</div>
-
-<h2>Controls</h2>
-<div class="panel">
-  <form class="inline" method="post" action="/sleeves/{{ s.name }}/command">
-    <input name="reason" placeholder="Reason (goes in the decision log)" required>
+<div class="page-head">
+  <h1>{{ s.name }}</h1> {{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>
+  <div class="actions">
     {% if s.desired_state == 'running' %}
-      {% if s.status in ['paused', 'halted'] %}<button name="command" value="resume">Resume</button>{% else %}<button name="command" value="pause" class="secondary">Pause</button>{% endif %}
-      <button name="command" value="flatten" class="danger">Flatten</button>
-      <button name="command" value="stop" class="secondary">Stop sleeve</button>
-    {% else %}
-      <button name="command" value="start">Start sleeve</button>
-    {% endif %}
+      {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
+      <button type="button" class="secondary" data-open="dlg-flatten" {{ 'disabled' if x.qty <= 0 }}>Flatten</button>
+      <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
+    {% else %}<button type="button" data-open="dlg-start">Start</button>{% endif %}
+  </div>
+  <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
+</div>
+
+{% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
+<div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
+  <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
+  {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
+</div>
+{% endif %}
+{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the sleeve to pick up ({{ pending|map(attribute='command')|join(', ') }}). Sleeves check about every 30 seconds.</div>{% endif %}
+
+<section class="ledger" aria-label="Sleeve figures">
+  <div><div class="k">Equity</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
+  <div><div class="k">Today</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
+  <div><div class="k">Since start</div><div class="v">{{ signed(x.ret) }}</div><div class="s">holding: {{ x.bench_ret|pct1s }}</div></div>
+  <div><div class="k">Holding</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Open P&amp;L</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
+  <div><div class="k">Closed trades</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% else %}none yet{% endif %}</div></div>
+  <div><div class="k" title="Average return per closed trade, after fees">Avg trade</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
+  <div><div class="k">Fees paid</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
+</section>
+{% if t.trades and t.trades < 10 %}<p class="muted" style="margin:-6px 0 14px;font-size:12.5px">Only {{ t.trades }} closed trade{{ 's' if t.trades != 1 }}. Win rate and expectancy mean little until there are at least 10.</p>{% endif %}
+
+<div class="grid">
+  <section class="panel span-8" aria-labelledby="curve-h">
+    <div class="panel-head"><h2 id="curve-h">Equity against buy-and-hold</h2><span class="hint">triangles mark buys and sells</span>
+      <div class="right range" role="group" aria-label="Range">
+        <button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button>
+      </div></div>
+    <div class="chart"><canvas id="eq" aria-label="Sleeve equity and buy-and-hold"></canvas></div>
+    <div class="chart short"><canvas id="dd" aria-label="Sleeve drawdown"></canvas></div>
+  </section>
+  <section class="panel span-4" aria-labelledby="risk-h">
+    <div class="panel-head"><h2 id="risk-h">Position and limits</h2></div>
+    <table class="compact kv">
+      <tr><th scope="row">Holding</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
+      <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
+      <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
+      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif s.params.stop_loss %}{{ (s.params.stop_loss * 100)|round(1) }}% below entry{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
+      <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
+      <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
+      <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
+      <tr><th scope="row">Today's loss</th><td class="num">{{ usage(risk.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td></tr>
+      <tr><th scope="row">Worst drawdown</th><td class="num">{{ x.max_drawdown|pct1 }}</td></tr>
+      <tr><th scope="row">Reconciled</th><td class="num">{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches journal' }}</span> <span class="muted">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</td></tr>
+      <tr><th scope="row">Heartbeat</th><td class="num">{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</td></tr>
+    </table>
+  </section>
+</div>
+
+<section class="panel flush" aria-labelledby="trips-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="trips-h">Closed trades</h2><span class="hint">entry to exit, after fees, newest first</span></div>
+  {% if trips %}
+  <table class="responsive">
+    <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Fees</th><th>Exit reason</th></tr></thead>
+    <tbody>{% for tr in trips %}
+    <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ '%.4g'|format(tr.qty) }} {{ base }}</td>
+      <td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td>
+      <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="right" class="muted">{{ tr.reason }}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 14px 14px">No closed trades yet. A trade appears here once the sleeve has bought and sold back to cash.</p>{% endif %}
+  {% if fills %}
+  <details class="fills"><summary>All {{ x.fills }} fills</summary>
+    <table><thead><tr><th>Time</th><th>Side</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th></tr></thead>
+    <tbody>{% for f in fills %}<tr><td>{{ f.ts|ts }}</td><td>{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</td><td class="num">{{ '%.6f'|format(f.qty) }}</td><td class="num">{{ f.price|px }}</td><td class="num">{{ f.fee|money }}</td></tr>{% endfor %}</tbody></table>
+  </details>{% endif %}
+</section>
+
+<div class="grid">
+  <section class="panel span-7" aria-labelledby="feed-h">
+    <div class="panel-head"><h2 id="feed-h">Activity</h2>
+      <nav class="right range" aria-label="Filter activity">
+        {% for k, label in [('all', 'All'), ('alerts', 'Warnings'), ('trades', 'Trades'), ('pm', 'PM and restarts')] %}<a class="seg" href="?feed={{ k }}#feed-h" {{ 'aria-current=true' if feed_kind == k }}>{{ label }}</a>{% endfor %}
+      </nav></div>
+    {% if feed %}
+    <ul class="feed">{% for e in feed %}
+      <li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what">{{ e.message }}</span></li>{% endfor %}
+    </ul>{% else %}<p class="empty">Nothing in this view yet.</p>{% endif %}
+    <p class="muted" style="margin:8px 0 0;font-size:12px">Routine reconciliation passes are left out; the latest result is under Position and limits.</p>
+  </section>
+  <section class="panel span-5" aria-labelledby="set-h">
+    <div class="panel-head"><h2 id="set-h">Settings</h2><span class="hint">created {{ s.created_at|ts }}</span></div>
+    <table class="compact kv">
+      <tr><th scope="row">Strategy</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
+      <tr><th scope="row">Pair and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
+      <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
+      <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
+      {% for k, v in s.params.items() %}
+      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
+        <td>{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ (v * 100)|round(2) }}%{% elif k == 'max_notional' %}{{ v|money }} {{ quote }}{% else %}{{ v }}{% endif %}</td></tr>
+      {% endfor %}
+    </table>
+    <h2 style="margin:16px 0 8px">Decisions</h2>
+    <ul class="feed">{% for d in decisions %}<li><span class="when">{{ d.ts|ts }}</span><span class="what"><strong>{{ d.action|capitalize }}</strong> by {{ d.actor }}: {{ d.reason }}</span></li>{% else %}<li class="muted">None yet.</li>{% endfor %}</ul>
+  </section>
+</div>
+
+{# One confirmation dialog per command: says exactly what will happen before it does. #}
+{% set dialogs = {
+  'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause sleeve', ''),
+  'resume': ('Resume ' ~ s.name, 'The sleeve trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
+  'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the sleeve.', 'Sell to cash and pause', 'danger'),
+  'stop': ('Stop ' ~ s.name, 'Shuts the sleeve process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It holds no coins.'), 'Stop sleeve', 'danger' if x.qty > 0 else ''),
+  'start': ('Start ' ~ s.name, 'Starts the sleeve process. It picks up its journal and reconciles before trading.', 'Start sleeve', ''),
+} %}
+<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
+{% for cmd, (title, effect, label, tone) in dialogs.items() %}
+<dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
+  <form method="post" action="/sleeves/{{ s.name }}/command">
+    <h2 id="dlg-{{ cmd }}-h">{{ title }}</h2>
+    <p>{{ effect }}</p>
+    <label for="r-{{ cmd }}">Reason for the decision log</label>
+    <input id="r-{{ cmd }}" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="{{ cmd }}" class="{{ tone }}">{{ label }}</button></div>
   </form>
-  <p class="muted" style="margin:10px 0 0;font-size:13px">Pause stops new entries and keeps the position. Flatten sells to cash and pauses. Resume after a halt resets the drawdown reference. Commands apply within 30 seconds.
-  {% if pending %}<br><strong>{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting to apply.</strong>{% endif %}</p>
-</div>
+</dialog>
+{% endfor %}
+{% endblock %}
 
-<h2>Trades</h2>
-<div class="panel">
-{% if fills %}
-<table><tr><th>Time</th><th>Side</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th></tr>
-{% for f in fills %}<tr><td>{{ f.ts|ts }}</td><td class="{{ 'good' if f.side == 'BUY' else 'bad' }}">{{ f.side }}</td><td class="num">{{ '%.6f'|format(f.qty) }}</td><td class="num">{{ f.price|money }}</td><td class="num">{{ f.fee|money }}</td></tr>{% endfor %}
-</table>
-{% else %}<p class="muted">No trades yet.</p>{% endif %}
-</div>
-
-<h2>Activity</h2>
-<div class="panel">
-<table><tr><th>Time</th><th>Level</th><th>What</th></tr>
-{% for e in events %}<tr><td>{{ e.ts|ts }}</td><td class="{{ 'bad' if e.level == 'error' else ('muted' if e.level == 'info' else '') }}">{{ e.level }}</td><td style="white-space:normal">{{ e.message }}</td></tr>{% else %}<tr><td colspan="3" class="muted">Nothing yet.</td></tr>{% endfor %}
-</table></div>
-
-<h2>Decisions</h2>
-<div class="panel">
-<table><tr><th>Time</th><th>Who</th><th>Action</th><th>Reason</th></tr>
-{% for d in decisions %}<tr><td>{{ d.ts|ts }}</td><td>{{ d.actor }}</td><td>{{ d.action }}</td><td style="white-space:normal">{{ d.reason }}</td></tr>{% else %}<tr><td colspan="4" class="muted">None yet.</td></tr>{% endfor %}
-</table></div>
-
+{% block scripts %}
 <script src="/static/chart.umd.min.js"></script>
-<script>
-fetch("/api/sleeves/{{ s.name }}/equity").then(r => r.json()).then(d => {
-  if (!d.t.length) return;
-  const css = getComputedStyle(document.documentElement);
-  const c = (v) => css.getPropertyValue(v).trim();
-  new Chart(document.getElementById("eq"), {
-    type: "line",
-    data: { labels: d.t.map(t => new Date(t).toLocaleString("en-GB", {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"})),
-      datasets: [
-        { label: "Sleeve", data: d.equity, borderColor: c("--accent"), borderWidth: 2, pointRadius: 0, tension: 0.1 },
-        { label: "Buy-and-hold", data: d.benchmark, borderColor: c("--muted"), borderWidth: 1.5, borderDash: [5, 4], pointRadius: 0, tension: 0.1 },
-      ] },
-    options: { maintainAspectRatio: false, animation: false, interaction: { mode: "index", intersect: false },
-      scales: { x: { ticks: { maxTicksLimit: 6, color: c("--muted") }, grid: { display: false } },
-                y: { ticks: { color: c("--muted") }, grid: { color: c("--line") } } },
-      plugins: { legend: { labels: { color: c("--text") } } } }
-  });
-});
-</script>
+<script src="/static/console.js"></script>
+<script>Console.dialogs(); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
 {% endblock %}

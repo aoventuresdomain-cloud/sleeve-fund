@@ -7,6 +7,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
+    summary="Buys once and holds. The benchmark every strategy has to beat.",
     name="buy_and_hold",
     family="benchmark",
     idea="Buy and hold.",

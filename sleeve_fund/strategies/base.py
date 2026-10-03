@@ -34,6 +34,8 @@ class IdeaSpec:
     param_grid: dict[str, list] = field(default_factory=dict)
     default_params: dict = field(default_factory=dict)
     known_weaknesses: str = ""
+    # One sentence with {param} placeholders, filled from a sleeve's own settings for display.
+    summary: str = ""
 
 
 # StrategyConfig is a native type: Python passes the same keyword arguments to its

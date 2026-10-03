@@ -73,7 +73,8 @@ def test_exits_entered_as_percent_and_stats_shown(client):
     store.record_fill("sol-stops", side="BUY", qty=1, price=100, fee=0.8, order_id="o1", trade_id="t1")
     store.record_fill("sol-stops", side="SELL", qty=1, price=110, fee=0.88, order_id="o2", trade_id="t2")
     page = c.get("/sleeves/sol-stops", auth=AUTH).text
-    assert "stop loss 8.0%" in page and "Closed trades" in page and "100%" in page
+    assert "Stop-loss" in page and "8.0%" in page and "Closed trades" in page and "100% won" in page
+    assert "+8.32%" in page  # the round trip's return after both fees: (110 - 100 - 1.68) / 100
     r = _new(c, name="no-stop", risk_per_trade_pct="1")
     assert "stop_loss" in r.headers["location"]
 
@@ -127,3 +128,55 @@ def test_research_and_tearsheet(client):
     assert c.get("/research/..%2F..%2Fetc%2Fpasswd", auth=AUTH).status_code == 404
     assert c.get("/decisions", auth=AUTH).status_code == 200
     assert c.get("/sleeves/new", auth=AUTH).status_code == 200
+
+
+def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
+    c, store = client
+    _new(c, name="eth-book", instrument="ETH/USD")
+    store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
+    store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
+    page = c.get("/", auth=AUTH).text
+    for text in ("Book equity", "Month to date", "In the market", "Where the money is", "price feed quiet"):
+        assert text in page
+    alert = store.alerts()[0]
+    r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/"
+    assert store.open_alert_count() == 0 and store.alerts(include_acked=True)[0]["ack_note"] == "seen"
+    assert "price feed quiet" not in c.get("/", auth=AUTH).text
+    assert "seen" in c.get("/alerts?show=all", auth=AUTH).text
+
+
+def test_ack_rejects_cross_site_and_unknown_alerts(client):
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "x", "boom")
+    eid = store.alerts()[0]["id"]
+    assert c.post(f"/alerts/{eid}/ack", auth=AUTH, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert c.post("/alerts/99999/ack", auth=AUTH, headers=SAME).status_code == 404
+    store.event("btc-test", "info", "start", "not an alert")
+    info_id = store.events("btc-test")[0]["id"]
+    assert c.post(f"/alerts/{info_id}/ack", auth=AUTH, headers=SAME).status_code == 404
+    r = c.post(f"/alerts/{eid}/ack", data={"next": "https://evil.example"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.headers["location"] == "/alerts"  # no open redirect
+
+
+def test_book_and_sleeve_chart_data(client):
+    c, store = client
+    _new(c)
+    store.record_equity("btc-test", equity=10_000, cash=10_000, qty=0, price=60_000, benchmark=10_000)
+    store.record_fill("btc-test", side="BUY", qty=0.1, price=60_000, fee=48, order_id="o", trade_id="t")
+    book = c.get("/api/book/equity", auth=AUTH).json()
+    assert book["equity"] and len(book["t"]) == len(book["drawdown"])
+    sleeve = c.get("/api/sleeves/btc-test/equity", auth=AUTH).json()
+    assert sleeve["res"] == "intraday" and sleeve["fills"][0]["side"] == "BUY"
+    assert c.get("/api/sleeves/nope/equity", auth=AUTH).status_code == 404
+
+
+def test_flatten_asks_for_confirmation_with_its_effect(client):
+    c, store = client
+    _new(c)
+    store.record_equity("btc-test", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'id="dlg-flatten"' in page and "Sells 0.1 BTC (about 6,000.00 USD) at market" in page

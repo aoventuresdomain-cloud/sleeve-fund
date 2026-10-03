@@ -22,11 +22,12 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund.dashboard.metrics import portfolio_summary, sleeve_summary
+from sleeve_fund.dashboard import book as bookm
+from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.risk import PROFILES
-from sleeve_fund.store import Store
+from sleeve_fund.store import Store, utcnow
 from sleeve_fund.strategies import REGISTRY
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +37,7 @@ LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jso
 # Suggestions only: the field accepts any Kraken spot pair.
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 
 security = HTTPBasic(realm="Sleeve Fund")
 
@@ -76,15 +78,48 @@ def create_app(store: Store | None = None) -> FastAPI:
     # NaN-safe versions for stats that don't exist until a trade has closed.
     templates.env.filters["pctn"] = lambda x: "n/a" if x != x else f"{x:+.1%}"
     templates.env.filters["numn"] = lambda x: "n/a" if x != x else ("∞" if x == float("inf") else f"{x:.2f}")
+    templates.env.filters["pct1"] = lambda x: f"{x:.1%}"
+    templates.env.filters["pctn0"] = lambda x: "n/a" if x != x else f"{x:.0%}"
+    templates.env.filters["smoney"] = lambda x: ("+" if x > 0.005 else ("−" if x < -0.005 else "")) + f"{abs(x):,.2f}"
+    templates.env.filters["pct1s"] = lambda x: f"{x:+.1%}"
+    templates.env.filters["smoney0"] = lambda x: ("+" if x >= 0.5 else ("−" if x <= -0.5 else "")) + f"{abs(x):,.0f}"
+    templates.env.filters["ago"] = _ago
+    templates.env.filters["held"] = _held
+    templates.env.filters["px"] = lambda x: "n/a" if x is None or x != x else (f"{x:,.2f}" if x >= 100 else f"{x:,.4f}")
     templates.env.globals["bar_label"] = _bar_label
+    templates.env.globals["bar_short"] = _bar_short
     templates.env.filters["ts"] = lambda t: t.strftime("%d %b %H:%M UTC") if t else "never"
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     def st() -> Store:
         return app.state.store
 
+    def shell(sleeves=None) -> dict:
+        """What the frame shows on every page: mode, health and open alerts."""
+        sleeves = st().sleeves() if sleeves is None else sleeves
+        now = utcnow()
+        wanted = [x for x in sleeves if x.desired_state == "running"]
+        return {
+            "mode": "paper",  # live mode arrives with the G2 work; until then nothing can trade real money
+            "live_locked": True,
+            "now": now,
+            "version": VERSION,
+            "alerts": st().open_alert_count(),
+            "total": len(sleeves),
+            "running": sum(1 for x in sleeves if x.status == "running"),
+            "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
+            "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
+        }
+
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
+        ctx.setdefault("shell", shell())
         return templates.TemplateResponse(request, name, ctx)
+
+    def book_data():
+        sleeves = st().sleeves()
+        frames = {s.name: bookm.daily(st(), s.name) for s in sleeves}
+        summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[s.name]) for s in sleeves]
+        return sleeves, frames, summaries
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
@@ -92,9 +127,36 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request, _: str = Depends(require_pm)):
-        summaries = [sleeve_summary(st(), s) for s in st().sleeves()]
-        return page(request, "home.html", summaries=summaries, book=portfolio_summary(summaries),
-                    alerts=st().events(min_level="warning", limit=15))
+        sleeves, frames, summaries = book_data()
+        return page(request, "home.html", summaries=summaries, book=bookm.book_view(st(), summaries, frames),
+                    alerts=st().alerts(limit=30), shell=shell(sleeves))
+
+    @app.get("/api/book/equity")
+    def book_equity_json(_: str = Depends(require_pm)):
+        _, frames, summaries = book_data()
+        active = [x for x in summaries if x["sleeve"].desired_state == "running"] or summaries
+        curve = bookm.book_curve(active, frames)
+        return JSONResponse({
+            "t": [t.isoformat() for t in curve.index],
+            "equity": [round(v, 2) for v in curve["equity"]],
+            "benchmark": [round(v, 2) for v in curve["benchmark"]],
+            "drawdown": [round(v, 5) for v in curve["drawdown"]] if len(curve) else [],
+        })
+
+    @app.get("/alerts", response_class=HTMLResponse)
+    def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):
+        rows = st().alerts(limit=300, include_acked=(show == "all"))
+        return page(request, "alerts.html", alerts=rows, show=show)
+
+    @app.post("/alerts/{event_id}/ack")
+    def ack_alert(event_id: int, note: str = Form(""), next: str = Form("/alerts"),
+                  actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        try:
+            st().ack(event_id, actor, note)
+        except KeyError:
+            raise HTTPException(404, "no such alert") from None
+        target = next if next.startswith("/") and not next.startswith("//") else "/alerts"
+        return RedirectResponse(target, status_code=303)
 
     @app.get("/sleeves/new", response_class=HTMLResponse)
     def new_sleeve_form(request: Request, _: str = Depends(require_pm), error: str = ""):
@@ -143,19 +205,46 @@ def create_app(store: Store | None = None) -> FastAPI:
             s = st().sleeve(name)
         except KeyError:
             raise HTTPException(404, "no such sleeve") from None
-        return page(request, "sleeve.html", x=sleeve_summary(st(), s), fills=st().fills(name, limit=100),
-                    events=st().events(name, limit=60), decisions=st().decisions(name, limit=50),
-                    pending=st().pending_commands(name))
+        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
+        fills = st().fills(name, limit=2000)
+        events = st().events(name, limit=400)
+        trips = _trips(fills, events)
+        feed = _feed(events, request.query_params.get("feed", "all"))
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed,
+                    feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
+                    pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
+                    idea=_idea(s.strategy, s.params))
 
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, _: str = Depends(require_pm)):
-        rows = st().equity_series(name, limit=20_000)
-        step = max(1, len(rows) // 1500)  # keep the chart light
-        rows = rows[::step] + ([rows[-1]] if rows and (len(rows) - 1) % step else [])
+        try:
+            s = st().sleeve(name)
+        except KeyError:
+            raise HTTPException(404, "no such sleeve") from None
+        rows = st().equity_series(name, limit=500_000)
+        intraday = bool(rows) and (rows[-1]["ts"] - rows[0]["ts"]).total_seconds() < 3 * 86400
+        if intraday:
+            step = max(1, len(rows) // 1500)  # keep the chart light
+            rows = rows[::step] + ([rows[-1]] if rows and (len(rows) - 1) % step else [])
+            t = [r["ts"] for r in rows]
+            eq, bench = [r["equity"] for r in rows], [r["benchmark"] for r in rows]
+        else:
+            frame = bookm.daily(st(), name)
+            t, eq, bench = list(frame.index), list(frame["equity"]), list(frame["benchmark"])
+        peak, dd = 0.0, []
+        for v in eq:
+            peak = max(peak, v)
+            dd.append(round(1 - v / peak, 5) if peak else 0.0)
+        fills = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
+                 for f in st().fills(name, limit=2000)]
         return JSONResponse({
-            "t": [r["ts"].isoformat() for r in rows],
-            "equity": [round(r["equity"], 2) for r in rows],
-            "benchmark": [round(r["benchmark"], 2) for r in rows],
+            "res": "intraday" if intraday else "daily",
+            "start": s.starting_balance,
+            "t": [x.isoformat() for x in t],
+            "equity": [round(v, 2) for v in eq],
+            "benchmark": [round(v, 2) for v in bench],
+            "drawdown": dd,
+            "fills": fills,
         })
 
     @app.post("/sleeves/{name}/command")
@@ -194,6 +283,107 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "decisions.html", decisions=st().decisions(limit=500))
 
     return app
+
+
+COMMON_REASONS = [
+    "Risk limit close; reducing exposure",
+    "Market event; standing aside",
+    "Strategy behaving outside its backtest range",
+    "Data or venue problem",
+    "Checked after an alert; safe to continue",
+    "Planned change of settings",
+]
+EXIT_KINDS = {"stop_loss": "Stop-loss", "take_profit": "Take-profit", "risk_halt": "Risk halt",
+              "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten"}
+
+
+def _idea(strategy: str, params: dict | None = None) -> str:
+    """The strategy in one sentence, using this sleeve's settings rather than the defaults."""
+    import importlib
+    import inspect
+
+    try:
+        spec = importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC
+    except (ImportError, AttributeError):
+        return ""
+    if not spec.summary:
+        return spec.idea
+    _, config_cls = REGISTRY[strategy]
+    values = {k: p.default for k, p in inspect.signature(config_cls.__init__).parameters.items()
+              if p.default is not inspect.Parameter.empty}
+    values.update(params or {})
+    try:
+        return spec.summary.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return spec.idea
+
+
+def _trips(fills: list[dict], events: list[dict]) -> list[dict]:
+    """Closed round trips, newest first, with holding time and why they closed."""
+    from sleeve_fund.research.metrics import trades
+
+    exits = [e for e in events if e["kind"] in EXIT_KINDS]
+    out = []
+    for t in reversed(trades(list(reversed(fills)))):
+        why = "Signal"
+        if t["opened"] and t["closed"]:
+            hit = [e for e in exits if t["opened"] <= e["ts"] <= t["closed"]]
+            if hit:
+                why = EXIT_KINDS[hit[0]["kind"]]
+        t["reason"] = why
+        t["held"] = (t["closed"] - t["opened"]) if t["opened"] and t["closed"] else None
+        out.append(t)
+    return out
+
+
+FEEDS = {
+    "all": lambda e: e["kind"] != "reconcile",  # routine passes are summarised in the risk panel
+    "alerts": lambda e: e["level"] in ("warning", "error"),
+    "trades": lambda e: e["kind"] in ("fill", *EXIT_KINDS),
+    "pm": lambda e: e["kind"].startswith("pm_") or e["kind"] in ("start", "restart", "restore", "resume"),
+}
+
+
+def _feed(events: list[dict], kind: str) -> list[dict]:
+    keep = FEEDS.get(kind, FEEDS["all"])
+    return [e for e in events if keep(e)][:120]
+
+
+def _risk_view(x: dict) -> dict:
+    p, params = x["profile"], x["sleeve"].params
+    entry = x["entry_px"]
+    sl, tp = params.get("stop_loss"), params.get("take_profit")
+    return {
+        "stop_px": entry * (1 - sl) if entry and sl else None,
+        "target_px": entry * (1 + tp) if entry and tp else None,
+        "to_stop": (x["price"] / (entry * (1 - sl)) - 1) if entry and sl and x["price"] else None,
+        "cap_used": min(x["exposure"] / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
+        "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+    }
+
+
+def _held(td) -> str:
+    if td is None:
+        return ""
+    hours = td.total_seconds() / 3600
+    return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+
+
+def _ago(t) -> str:
+    if not t:
+        return "never"
+    secs = int((utcnow() - t).total_seconds())
+    if secs < 0:
+        return t.strftime("%d %b %H:%M UTC")
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "min")):
+        if secs >= size:
+            return f"{secs // size} {unit} ago"
+    return "just now"
+
+
+def _bar_short(spec: str) -> str:
+    step, unit = spec.split("-")[:2]
+    return f"{step}{ {'SECOND': 's', 'MINUTE': 'm', 'HOUR': 'h', 'DAY': 'd'}.get(unit, unit.lower())} bars"
 
 
 def _bar_label(spec: str) -> str:

@@ -1,8 +1,10 @@
 {% extends "base.html" %}
-{% block title %}New paper sleeve · Sleeve Fund{% endblock %}
+{% block title %}New sleeve · Sleeve Fund{% endblock %}
 {% block content %}
-<h1>New paper sleeve</h1>
-<p class="sub">Runs on live Kraken prices with paper money and Kraken's fees. It starts within a few seconds of saving.</p>
+<div class="page-head">
+  <h1>New sleeve</h1>
+  <p class="lede">A sleeve runs one strategy on one Kraken pair with its own capital and limits. It starts within a few seconds of saving, in paper mode: live prices and Kraken's fees, with simulated money. Live mode unlocks after G2.</p>
+</div>
 {% if error %}<div class="error-box">{{ error }}</div>{% endif %}
 <form method="post" action="/sleeves/new" class="panel">
   <div class="grid2">
@@ -26,7 +28,7 @@
   </div>
   {% endfor %}
   <div class="field" style="margin-top:14px"><label>Why are you starting this sleeve?</label><input name="reason" required placeholder="Goes in the decision log"></div>
-  <p style="margin-top:14px"><button>Start paper sleeve</button></p>
+  <p style="margin-top:14px"><button>Start sleeve in paper mode</button></p>
 </form>
 <script>
 const sel = document.getElementById("strategy");
