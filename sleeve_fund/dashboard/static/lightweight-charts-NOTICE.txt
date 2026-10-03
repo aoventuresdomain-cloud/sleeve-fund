@@ -1,0 +1,4 @@
+TradingView Lightweight Charts(TM)
+Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/
+
+Vendored from the npm package lightweight-charts 4.2.3 (Apache License 2.0, see lightweight-charts-LICENSE.txt).

@@ -264,6 +264,28 @@ def create_app(store: Store | None = None) -> FastAPI:
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params))
 
+    @app.get("/api/sleeves/{name}/candles")
+    def candles_json(name: str, interval: str = "", _: str = Depends(require_pm)):
+        from sleeve_fund.dashboard import charts
+
+        try:
+            s = st().sleeve(name)
+        except KeyError:
+            raise HTTPException(404, "no such sleeve") from None
+        interval = interval if interval in charts.INTERVALS else charts.default_interval(s.bar_spec)
+        minutes = charts.INTERVALS[interval]
+        try:
+            df, source = charts.candles(s.instrument, minutes), "kraken"
+        except (OSError, ValueError):  # Kraken unreachable or pair unknown: chart the sleeve's own marks
+            df, source = charts.from_marks(st().equity_series(name, limit=500_000), minutes), "marks"
+        fills = list(reversed(st().fills(name, limit=100_000)))
+        orders = trading.orders_by_id(st(), name)
+        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
+        position = trading.open_position(x, list(reversed(fills)), orders)
+        data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source)
+        data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        return JSONResponse(data)
+
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, _: str = Depends(require_pm)):
         try:

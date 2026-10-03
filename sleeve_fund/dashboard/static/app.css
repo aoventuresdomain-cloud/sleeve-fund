@@ -378,6 +378,15 @@ ol.steps-list { margin: 0 0 12px; padding-left: 20px; display: grid; gap: 8px; }
 @media (max-width: 900px) { .bt-head .panel-head .button { margin: 8px 0 0; width: 100%; justify-content: center; } }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); padding: 1px 4px; border-radius: 4px; }
 pre.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 0; }
+/* --- price chart ---------------------------------------------------------------- */
+.price-chart { margin-bottom: 14px; }
+.pc-canvas { height: 420px; position: relative; }
+.pc-legend { font-size: 12px; color: var(--muted); min-height: 16px; font-variant-numeric: tabular-nums; margin: -4px 0 4px; }
+.pc-note[hidden] { display: none; }
+.pc-note { margin-top: 12px; padding: 10px 12px; background: var(--raised); border-radius: 6px; }
+.pc-foot, .pc-source { font-size: 12px; color: var(--faint); margin: 8px 0 0; }
+.pc-source { color: var(--warn); }
+@media (max-width: 900px) { .pc-canvas { height: 320px; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */

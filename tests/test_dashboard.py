@@ -449,3 +449,63 @@ def test_paper_processes_do_not_inherit_kraken_keys(monkeypatch, tmp_path):
                         starting_balance=1000)
     Supervisor(store)._start("s1", Proc())
     assert not any(k.startswith("KRAKEN_API") for k in seen["env"])
+
+
+def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, monkeypatch):
+    import pandas as pd
+
+    from sleeve_fund.dashboard import charts
+
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD", bar_spec="1-HOUR-LAST-INTERNAL", stop_loss_pct="8")
+    store.record_equity("sol-x", equity=10_000, cash=9_000, qty=10, price=100, benchmark=10_000)
+    _round_trip(store)
+    store.record_order("sol-x", order_id="O-3", side="BUY", qty=10, intent="entry", reason="RSI 25.1 below 30")
+    store.record_fill("sol-x", side="BUY", qty=10, price=90, fee=0.72, order_id="O-3", trade_id="t3")
+    store.record_equity("sol-x", equity=9_950, cash=9_000, qty=10, price=95, benchmark=9_900)
+
+    def down(pair, minutes):
+        raise OSError("no route to Kraken")
+
+    charts._cache.clear()
+    monkeypatch.setattr(charts, "fetch_kraken_ohlc", down)
+    d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
+    assert d["source"] == "marks" and d["chosen"] == "1h" and d["candles"]
+    assert [m["text"] for m in d["markers"]] == ["", "Stop", ""]  # only the forced exit is labelled
+    notes = list(d["notes"].values())
+    assert notes[1]["reason"].startswith("Stop-loss: price 92") and notes[2]["reason"] == "RSI 25.1 below 30"
+    assert {ln["title"] for ln in d["lines"]} == {"Entry", "Stop"} and d["lines"][0]["price"] == 90
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    kraken = pd.DataFrame({"open": [1.0, 2.0], "high": [2.0, 3.0], "low": [0.5, 1.5], "close": [2.0, 2.5],
+                           "volume": [10.0, 20.0]}, index=pd.DatetimeIndex([now - pd.Timedelta("4h"), now]))
+    charts._cache.clear()
+    monkeypatch.setattr(charts, "fetch_kraken_ohlc", lambda pair, minutes: kraken)
+    d = c.get("/api/sleeves/sol-x/candles?interval=4h", auth=AUTH).json()
+    assert d["source"] == "kraken" and d["interval"] == 240 and len(d["candles"]) == 2 and d["volume"][1]["value"] == 20
+    assert c.get("/api/sleeves/nope/candles", auth=AUTH).status_code == 404
+    assert 'id="pc"' in c.get("/sleeves/sol-x", auth=AUTH).text
+
+
+def test_chart_helpers():
+    from sleeve_fund.dashboard import charts
+
+    assert charts.default_interval("1-DAY-LAST-EXTERNAL") == "1d"
+    assert charts.default_interval("5-MINUTE-LAST-INTERNAL") == "15m"
+    assert charts.default_interval("4-HOUR-LAST-EXTERNAL") == "4h"
+
+
+def test_fetch_kraken_ohlc_keeps_the_forming_candle_and_uses_open_times():
+    from sleeve_fund.data import fetch_kraken_ohlc
+
+    def get_json(url):
+        if "AssetPairs" in url:
+            return {"result": {"SOLUSD": {"wsname": "SOL/USD"}}}
+        assert "interval=60" in url
+        return {"error": [], "result": {"SOLUSD": [[1700000000, "1", "2", "0.5", "1.5", "1.2", "10", 5],
+                                                   [1700003600, "1.5", "2.5", "1", "2", "1.8", "4", 2]], "last": 1}}
+
+    df = fetch_kraken_ohlc("SOL/USD", 60, get_json)
+    assert len(df) == 2 and df.index[0].timestamp() == 1700000000 and df["close"].iloc[-1] == 2.0
+    with pytest.raises(ValueError):
+        fetch_kraken_ohlc("SOL/USD", 7, get_json)
