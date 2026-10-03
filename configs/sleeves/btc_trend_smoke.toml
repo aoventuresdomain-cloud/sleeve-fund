@@ -16,6 +16,3 @@ risk_profile = "aggressive"
 fast = 5
 slow = 20
 
-[fees]   # Kraken UK entry tier from 9 July 2026
-maker = 0.0040
-taker = 0.0080

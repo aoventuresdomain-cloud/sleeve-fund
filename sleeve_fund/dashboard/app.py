@@ -283,8 +283,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         interval = interval if interval in charts.INTERVALS else charts.default_interval(s.bar_spec)
         minutes = charts.INTERVALS[interval]
         try:
-            df, source = charts.candles(s.instrument, minutes), "kraken"
-        except (OSError, ValueError):  # Kraken unreachable or pair unknown: chart the sleeve's own marks
+            df, source = charts.candles(s.instrument, minutes), "venue"
+        except (OSError, ValueError):  # venue unreachable or pair unknown: chart the sleeve's own marks
             df, source = charts.from_marks(st().equity_series(name, limit=500_000), minutes), "marks"
         fills = list(reversed(st().fills(name, limit=100_000)))
         orders = trading.orders_by_id(st(), name)
@@ -529,9 +529,9 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request, _: str = Depends(require_pm)):
-        from sleeve_fund.instruments import KRAKEN_UK_ENTRY
+        from sleeve_fund.venues import VENUES
 
-        return page(request, "settings.html", profiles=PROFILES, fees=KRAKEN_UK_ENTRY,
+        return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(),
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
 
     return app
@@ -766,5 +766,5 @@ def _check_strategy_params(cfg: SleeveConfig) -> None:
     params = dict(cfg.params)
     params.pop("max_notional", None)
     config_cls(instrument_id=InstrumentId.from_str(cfg.instrument_id), bar_type=BarType.from_str(cfg.bar_type),
-               **params)
+               assumed_taker_fee=float(cfg.fees.taker), **params)
 

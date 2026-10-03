@@ -1,6 +1,6 @@
 """Build and run one paper sleeve.
 
-Data: Kraken Spot public market data (no credentials).
+Data: the sleeve's venue's public market data (no credentials), from its venue profile.
 Execution: Nautilus sandbox, a local matching engine fed by that live data.
 There is deliberately no code path here that adds a venue execution client.
 """
@@ -8,19 +8,11 @@ There is deliberately no code path here that adds a venue execution client.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 import threading
-import urllib.request
 from pathlib import Path
 
-from nautilus_trader.adapters.kraken import (
-    KrakenDataClientConfig,
-    KrakenDataClientFactory,
-    KrakenEnvironment,
-    KrakenProductType,
-)
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig, SandboxExecutionClientFactory
 from nautilus_trader.common import Environment, LoggerConfig, LogLevel
 from nautilus_trader.live import LiveNode
@@ -42,52 +34,23 @@ from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless
 from sleeve_fund.strategies import REGISTRY
-
-KRAKEN = "KRAKEN"
+from sleeve_fund.venues import venue as venue_profile
 
 
 def _tag(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
 
 
-# Kraken names some assets differently in its instrument data than in the pair (USD is ZUSD,
-# BTC is XXBT). The sandbox account must hold cash in the instrument's own quote currency
-# or every buy is rejected, so look the codes up from Kraken's public pair list.
-ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
-_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
-
-
-def _norm(code: str) -> str:
-    return _ALIASES.get(code, code)
-
-
-def kraken_asset_codes(pair: str, fetch=None) -> tuple[str, str]:
-    """(base, quote) as Kraken's instrument data names them, e.g. SUI/USD -> (SUI, ZUSD).
-
-    Falls back to the pair's own codes if Kraken can't be reached or doesn't list it.
-    """
-    base, quote = pair.split("/")
-    try:
-        if fetch is None:
-            with urllib.request.urlopen(ASSET_PAIRS_URL, timeout=15) as r:  # public endpoint, no key
-                data = json.load(r)
-        else:
-            data = fetch()
-        for info in data.get("result", {}).values():
-            ws = info.get("wsname", "")
-            if "/" in ws and tuple(_norm(x) for x in ws.split("/")) == (_norm(base), _norm(quote)):
-                return info["base"], info["quote"]
-    except Exception as exc:  # noqa: BLE001 - fall back, the sleeve still runs and logs a mark warning
-        print(f"asset code lookup failed for {pair}: {exc!r}", file=sys.stderr)
-    return base, quote
-
-
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
                asset_fetch=None) -> LiveNode:
     assert_keyless()
     tag = _tag(sleeve.name)
-    venue = Venue.from_str(KRAKEN)
-    base_code, quote_code = kraken_asset_codes(sleeve.instrument, fetch=asset_fetch)
+    profile = venue_profile(sleeve.venue)
+    if profile.data_client is None:
+        raise ValueError(f"{profile.label} has no live market data client yet, so it can't run paper sleeves")
+    venue = profile.venue
+    base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
+    data_factory, data_config = profile.data_client()
     balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
     if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
         balances = [Money(runtime.book["cash"], Currency.from_str(quote_code))]
@@ -97,20 +60,14 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
-        .add_data_client(
-            None,
-            KrakenDataClientFactory(),
-            # Real Kraken prices (LIVE is Kraken's production feed; DEMO is futures-only).
-            # No api_key/api_secret: public market data only.
-            KrakenDataClientConfig(product_type=KrakenProductType.SPOT, environment=KrakenEnvironment.LIVE),
-        )
+        .add_data_client(None, data_factory, data_config)
         .add_simulated_exec_client(
-            KRAKEN,
+            profile.name,
             SandboxExecutionClientFactory(),
             SandboxExecutionClientConfig(
                 venue=venue,
                 starting_balances=balances,
-                account_id=AccountId.from_str(f"{KRAKEN}-PAPER-{tag[:20]}"),
+                account_id=AccountId.from_str(f"{profile.name}-PAPER-{tag[:20]}"),
                 oms_type=OmsType.NETTING,
                 account_type=AccountType.CASH,
                 fee_model=ScheduleFeeModel(sleeve.fees),

@@ -63,7 +63,7 @@ class LongFlatConfig(StrategyConfig):
         bar_type: BarType,
         cash_buffer: float = 0.01,
         max_notional: float | None = None,
-        assumed_taker_fee: float = 0.008,
+        assumed_taker_fee: float | None = None,
         warmup_bars: int = 0,
         stop_loss: float | None = None,
         take_profit: float | None = None,
@@ -75,6 +75,8 @@ class LongFlatConfig(StrategyConfig):
         if unknown:
             raise TypeError(f"unknown strategy parameters: {sorted(unknown)}")
         super().__init__()
+        if assumed_taker_fee is None:
+            raise ValueError("assumed_taker_fee is required: pass the venue profile's taker fee")
         if not 0 <= assumed_taker_fee < 0.05:
             raise ValueError(f"assumed_taker_fee {assumed_taker_fee} outside [0, 0.05)")
         if warmup_bars < 0:
@@ -97,7 +99,7 @@ class LongFlatConfig(StrategyConfig):
         self.cash_buffer = cash_buffer
         # Hard cap on the quote-currency value of any single buy (sleeve budget).
         self.max_notional = max_notional
-        # Venue instruments may not carry fee rates (Kraken spot doesn't), so sizing uses this.
+        # Venue instruments may not carry fee rates (some venues leave them out), so sizing uses this.
         self.assumed_taker_fee = assumed_taker_fee
         # Live/paper only: bars to request from the venue at start to warm indicators.
         self.warmup_bars = warmup_bars
@@ -141,7 +143,7 @@ class LongFlatStrategy(Strategy):
         self.instrument = self.cache.instrument(self._cfg.instrument_id)
         if self.instrument is None:
             self.log.error(f"instrument {self._cfg.instrument_id} not found")
-            if self.runtime is not None:  # surface on the dashboard, e.g. a pair Kraken doesn't list
+            if self.runtime is not None:  # surface on the dashboard, e.g. a pair the venue doesn't list
                 self.runtime.store.event(self.runtime.name, "error", "instrument_not_found",
                                          f"{self._cfg.instrument_id} is not listed on the venue")
             self.stop()

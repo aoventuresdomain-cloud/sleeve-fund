@@ -38,8 +38,8 @@
   <section class="panel span-5" aria-labelledby="fee-h">
     <div class="panel-head"><h2 id="fee-h">Costs and data</h2></div>
     <table class="compact kv">
-      <tr><th scope="row">Kraken fees</th><td>{{ (fees.maker * 100)|round(2) }}% maker, {{ (fees.taker * 100)|round(2) }}% taker; every order is charged the taker fee</td></tr>
-      <tr><th scope="row">Prices</th><td>Kraken public market data, no key</td></tr>
+      {% for v in venues %}<tr><th scope="row">{{ v.label }} fees</th><td>{{ (v.fees.maker * 100)|round(2) }}% maker, {{ (v.fees.taker * 100)|round(2) }}% taker ({{ v.fee_basis }}); every order is charged the taker fee</td></tr>
+      <tr><th scope="row">{{ v.label }} prices</th><td>Public market data, no key</td></tr>{% endfor %}
       <tr><th scope="row">Balance checks</th><td>At every start and every 24 hours</td></tr>
       <tr><th scope="row">Outside alerts</th><td class="warn">Telegram not set up yet</td></tr>
       <tr><th scope="row">Journal kept</th><td>Everything, indefinitely ({{ '{:,}'.format(counts.equity) }} marks so far)</td></tr>

@@ -5,22 +5,22 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass, field
-from decimal import Decimal
 from pathlib import Path
 
-from sleeve_fund.instruments import KRAKEN_UK_ENTRY, FeeSchedule
+from sleeve_fund.instruments import FeeSchedule
 from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
 
-# Any Kraken spot pair (SUI/USD, XRP/GBP, ...). Whether Kraken lists it is checked when the sleeve starts.
+# Any spot pair (SUI/USD, XRP/GBP, ...). Whether the venue lists it is checked when the sleeve starts.
 PAIR_RE = re.compile(r"^[A-Z0-9]{1,12}/[A-Z0-9]{2,6}$")
 
 ALLOWED_BAR_SPECS = {
-    # Built locally from Kraken trades; bars close on time, no venue buffering.
+    # Built locally from the venue's trades; bars close on time, no venue buffering.
     "1-MINUTE-LAST-INTERNAL",
     "5-MINUTE-LAST-INTERNAL",
     "15-MINUTE-LAST-INTERNAL",
     "1-HOUR-LAST-INTERNAL",
-    # Kraken's own OHLC; needed for daily strategies so warm-up can come from REST history.
+    # The venue's own OHLC; needed for daily strategies so warm-up can come from REST history.
     "1-HOUR-LAST-EXTERNAL",
     "4-HOUR-LAST-EXTERNAL",
     "1-DAY-LAST-EXTERNAL",
@@ -38,14 +38,15 @@ class SleeveConfig:
     max_notional: float | None = None
     warmup_bars: int = 0
     risk_profile: str = "balanced"
-    fees: FeeSchedule = KRAKEN_UK_ENTRY
+    venue: str = DEFAULT_VENUE
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "venue", venue_profile(self.venue).name)  # raises on an unknown venue
         if self.strategy not in REGISTRY:
             raise ValueError(f"unknown strategy {self.strategy!r}; known: {sorted(REGISTRY)}")
         if self.bar_spec not in ALLOWED_BAR_SPECS:
             raise ValueError(f"bar_spec {self.bar_spec!r} not in {sorted(ALLOWED_BAR_SPECS)}")
-        # Any Kraken spot pair works; the venue rejects pairs it doesn't list at start-up.
+        # Any spot pair works; the venue rejects pairs it doesn't list at start-up.
         object.__setattr__(self, "instrument", self.instrument.strip().upper())  # frozen dataclass
         if not PAIR_RE.match(self.instrument):
             raise ValueError(f"instrument must look like BASE/QUOTE (e.g. SUI/USD), got {self.instrument!r}")
@@ -68,8 +69,13 @@ class SleeveConfig:
         return self.instrument.split("/")[1]
 
     @property
+    def fees(self) -> FeeSchedule:
+        """The venue's fee schedule. There is deliberately no per-sleeve override: one source of fees."""
+        return venue_profile(self.venue).fees
+
+    @property
     def instrument_id(self) -> str:
-        return f"{self.instrument}.KRAKEN"
+        return f"{self.instrument}.{self.venue}"
 
     @property
     def bar_type(self) -> str:
@@ -80,7 +86,8 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     sleeve = raw.get("sleeve", {})
-    fees = raw.get("fees")
+    if "fees" in raw:
+        raise ValueError(f"{path}: fees come from the venue profile (sleeve_fund/venues.py); remove [fees]")
     return SleeveConfig(
         name=sleeve["name"],
         strategy=sleeve["strategy"],
@@ -91,7 +98,7 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
         max_notional=sleeve.get("max_notional"),
         warmup_bars=int(sleeve.get("warmup_bars", 0)),
         risk_profile=sleeve.get("risk_profile", "balanced"),
-        fees=FeeSchedule(Decimal(str(fees["maker"])), Decimal(str(fees["taker"]))) if fees else KRAKEN_UK_ENTRY,
+        venue=sleeve.get("venue", DEFAULT_VENUE),
     )
 
 
@@ -109,6 +116,7 @@ def from_store(sleeve) -> SleeveConfig:
         max_notional=max_notional,
         warmup_bars=sleeve.warmup_bars,
         risk_profile=sleeve.risk_profile,
+        venue=getattr(sleeve, "venue", None) or DEFAULT_VENUE,
     )
 
 

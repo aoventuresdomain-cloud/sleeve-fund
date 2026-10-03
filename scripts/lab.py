@@ -123,7 +123,7 @@ def cmd_classifier(args) -> None:
 HOLDOUT_DAYS = 365
 STAGES = [("1 week", 7), ("1 month", 30), ("3 months", 91), ("6 months", 182), ("1 year", 365),
           ("2 years", 730), ("all development history", None)]
-COST_LEVELS = ["kraken_pro_taker", "high_volume_taker", "institutional"]
+COST_LEVELS = ["kraken_taker", "kraken_maker", "high_volume_taker", "institutional"]
 
 
 def dev_window(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -198,7 +198,7 @@ def write_report(*, slug: str, title: str, note: str, idea: str, family: str, pa
     out.with_suffix(".json").write_text(json.dumps(jsn, default=str))
     ledger = IdeaLedger(LEDGER)
     for (v, long_only, cost), res in results.items():
-        if cost != "kraken_pro_taker":
+        if cost != "kraken_taker":
             continue
         for inst, r in res.items():
             st = _stage_rows(v, {inst: r}, starts, ends, None)["per"][inst]
@@ -410,7 +410,7 @@ def cmd_trend(args) -> None:
          "| Variant | " + " | ".join(str(y) for y in range(2018, 2026)) + " | Sharpe | Max DD | Avg exposure | Deflated Sharpe prob. |",
          "|" + "---|" * 13]
     for vname in list(TREND_VARIANTS) + ["bench: buy and hold"]:
-        per = results[(vname, True, "kraken_pro_taker")]
+        per = results[(vname, True, "kraken_taker")]
         basket = pd.concat([s.rename(i) for i, s in per.items()], axis=1).fillna(0).mean(axis=1)
         yearly = (1 + basket).groupby(basket.index.year).prod() - 1
         st = sim.stats(sim.trades_frame([]), basket)
@@ -443,7 +443,7 @@ def cmd_trend_holdout(args) -> None:
             per.setdefault(cost, {})[inst] = tfl.daily_returns(m, p, cost=cost, start=hi)
         per.setdefault("bench", {})[inst] = mt.buy_and_hold(data.resample(m, 1440), hi)
         ledger.record(idea=idea, family="trend", params=p.as_dict(), dataset=f"binance_1m:{inst}", stage="holdout",
-                      sharpe=sim.stats(sim.trades_frame([]), per["kraken_pro_taker"][inst])["sharpe"])
+                      sharpe=sim.stats(sim.trades_frame([]), per["kraken_taker"][inst])["sharpe"])
     L = [f"# Trend filter: holdout year ({vname})", "",
          f"Run {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. The most recent {HOLDOUT_DAYS} days, never "
          "used before. Equal-weight basket, long-only.", "",

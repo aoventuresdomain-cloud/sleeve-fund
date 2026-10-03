@@ -1,4 +1,4 @@
-"""Price charts: Kraken candles with each fill marked, the reason behind it, and the open
+"""Price charts: the venue's candles with each fill marked, the reason behind it, and the open
 position's entry, stop and target as lines. Drawn by TradingView Lightweight Charts."""
 
 from __future__ import annotations
@@ -9,11 +9,11 @@ import time
 import pandas as pd
 
 from sleeve_fund.dashboard import trading
-from sleeve_fund.data import fetch_kraken_ohlc
+from sleeve_fund.venues import venue as venue_profile
 
 INTERVALS = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 FORCED = {"stop_loss": "Stop", "take_profit": "Target", "risk_halt": "Halt", "risk_pause": "Pause", "pm_flatten": "Flatten"}
-_cache: dict[tuple[str, int], tuple[float, pd.DataFrame]] = {}
+_cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
 _lock = threading.Lock()
 
 
@@ -24,21 +24,25 @@ def default_interval(bar_spec: str) -> str:
     return min(INTERVALS, key=lambda k: abs(INTERVALS[k] - minutes))
 
 
-def candles(pair: str, minutes: int, fetch=None) -> pd.DataFrame:
-    """Kraken candles, cached briefly: a minute for intraday charts, an hour for daily ones."""
+def candles(pair: str, minutes: int, fetch=None, venue: str | None = None) -> pd.DataFrame:
+    """The venue's candles, cached briefly: a minute for intraday charts, an hour for daily ones."""
+    profile = venue_profile(venue)
+    if fetch is None and profile.ohlc_history is None:
+        raise OSError(f"{profile.label} has no candle source")
     ttl = 3600 if minutes >= 1440 else 60
+    key = (profile.name, pair, minutes)
     with _lock:
-        hit = _cache.get((pair, minutes))
+        hit = _cache.get(key)
         if hit and time.time() - hit[0] < ttl:
             return hit[1]
-    df = (fetch or fetch_kraken_ohlc)(pair, minutes)
+    df = (fetch or profile.ohlc_history)(pair, minutes)
     with _lock:
-        _cache[(pair, minutes)] = (time.time(), df)
+        _cache[key] = (time.time(), df)
     return df
 
 
 def from_marks(marks: list[dict], minutes: int) -> pd.DataFrame:
-    """Candles built from the sleeve's own price marks, for when Kraken can't be reached."""
+    """Candles built from the sleeve's own price marks, for when the venue can't be reached."""
     if not marks:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     s = pd.Series([m["price"] for m in marks], index=pd.DatetimeIndex([m["ts"] for m in marks]))

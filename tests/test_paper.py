@@ -80,7 +80,8 @@ def test_typo_in_strategy_params_rejected():
 
 def test_warmup_and_live_bars_never_double_count():
     bt = BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
-    cfg = TrendFilterConfig(instrument_id=InstrumentId.from_str("BTC/USD.KRAKEN"), bar_type=bt, fast=2, slow=3)
+    cfg = TrendFilterConfig(instrument_id=InstrumentId.from_str("BTC/USD.KRAKEN"), bar_type=bt, fast=2, slow=3,
+                            assumed_taker_fee=0.008)
     s = TrendFilter(cfg)
 
     def bar(i, px):
@@ -98,7 +99,7 @@ def test_warmup_and_live_bars_never_double_count():
 
 
 def test_kraken_asset_codes_use_the_venue_names():
-    from sleeve_fund.paper.node import kraken_asset_codes
+    from sleeve_fund.venues import kraken_asset_codes
 
     pairs = {"result": {
         "XXBTZUSD": {"wsname": "XBT/USD", "base": "XXBT", "quote": "ZUSD"},

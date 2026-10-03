@@ -75,7 +75,7 @@ def prepare(bars: pd.DataFrame, p: Params) -> pd.DataFrame:
     return out
 
 
-def run(bars: pd.DataFrame, p: Params, *, cost: str = "kraken_pro_taker", long_only: bool = False,
+def run(bars: pd.DataFrame, p: Params, *, cost: str = "kraken_taker", long_only: bool = False,
         start=None, prepared: pd.DataFrame | None = None) -> Book:
     """Trade one instrument. Bars before `start` only warm up the indicators."""
     out = prepared if prepared is not None else prepare(bars, p)
@@ -256,7 +256,7 @@ def _divergence(side, hist, hi, lo, rsi_now, gap: int = 3) -> bool:
     return lo < prior[j][1] and np.isfinite(prior[j][2]) and rsi_now > prior[j][2]
 
 
-def intraday_momentum(bars: pd.DataFrame, *, anchor: str = "utc", decide_at: int = 60, cost: str = "kraken_pro_taker",
+def intraday_momentum(bars: pd.DataFrame, *, anchor: str = "utc", decide_at: int = 60, cost: str = "kraken_taker",
                       long_only: bool = False, start=None) -> pd.DataFrame:
     """The doc's benchmark: from the decision time to the session end, hold in the direction of
     the session so far. Fully invested (1x), one round trip a day."""

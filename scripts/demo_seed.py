@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import sleeve_fund.store as store_mod
 from sleeve_fund.data import synthetic_ohlcv
-from sleeve_fund.instruments import spot_pair
+from sleeve_fund.venues import venue
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import Store
@@ -46,7 +46,7 @@ def main(url: str) -> None:
         rt = SleeveRuntime(store, name, tick_seconds=6 * 3600)
         store_mod.utcnow = lambda: rt.now()  # journal rows carry the simulated time
         try:
-            run_backtest(strat, prices, spot_pair(base, quote, price_precision=4 if px < 10 else 2), params=params,
+            run_backtest(strat, prices, venue().instrument(base, quote, price_precision=4 if px < 10 else 2), params=params,
                          runtime=rt)
         finally:
             store_mod.utcnow = real_now

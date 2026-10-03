@@ -64,7 +64,7 @@ def held_weights(target: pd.Series, band: float) -> pd.Series:
     return pd.Series(out, index=target.index)
 
 
-def daily_returns(minute: pd.DataFrame, p: Params, *, cost: str = "kraken_pro_taker", start=None) -> pd.Series:
+def daily_returns(minute: pd.DataFrame, p: Params, *, cost: str = "kraken_taker", start=None) -> pd.Series:
     bars = resample(minute, p.bar_min) if p.bar_min > 1 else minute
     w = target_weights(bars, p)
     if p.sizing != "full":
