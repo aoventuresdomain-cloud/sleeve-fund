@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tag, why, why_toggle %}
+{% block title %}Orders · Sleeve Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Order blotter</h1>
+  <div class="actions">
+    <form class="inline" method="get" action="/orders">
+      <input type="hidden" name="status" value="{{ tab }}">
+      <label class="sr-only" for="o-sleeve">Sleeve</label>
+      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All sleeves</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <noscript><button>Show</button></noscript>
+    </form>
+    <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve if sleeve }}">Download CSV</a>
+  </div>
+  <p class="lede">Every order the sleeves have sent, newest first, with what it was for and the reason recorded when it was sent.</p>
+</div>
+
+<nav class="tabs" aria-label="Order status">
+  {% for k, label, n in tabs %}<a href="?status={{ k }}{{ '&sleeve=' ~ sleeve if sleeve }}" {{ 'aria-current=page' if tab == k }}>{{ label }} <span class="n">{{ n }}</span></a>{% endfor %}
+</nav>
+
+<section class="panel flush">
+  {% if orders %}
+  <table class="responsive">
+    <thead><tr><th>Sent</th><th>Sleeve</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Value</th><th class="num">Fee</th><th>Status</th><th>Reason</th><th></th></tr></thead>
+    <tbody>{% for o in orders %}{% set rid = 'o-' ~ loop.index %}
+    <tr><td data-m="hide">{{ o.ts|ts }}</td>
+      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
+      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
+      <td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
+      <td class="num" data-m="hide">{{ '%.6g'|format(o.qty) }}{% if o.filled_qty and o.filled_qty < o.qty %}<div class="sub">{{ '%.6g'|format(o.filled_qty) }} filled</div>{% endif %}</td>
+      <td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td>
+      <td class="num" data-m="right">{{ o.notional|money if o.filled_qty else '–' }}</td>
+      <td class="num" data-m="hide">{{ o.fee|money }}</td>
+      <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td>
+      <td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td>
+      <td data-m="right">{{ why_toggle(rid) }}</td></tr>
+    <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
+      {{ why(o.intent_label ~ ' · ' ~ ('buy' if o.side == 'BUY' else 'sell') ~ ' ' ~ ('%.6g'|format(o.qty)), o.reason, o.sig) }}
+      <div class="why-block"><div class="k">Order</div>
+        <dl class="sig">
+          <div><dt>Order id</dt><dd class="mono">{{ o.order_id }}</dd></div>
+          <div><dt>Filled</dt><dd>{{ '%.6g'|format(o.filled_qty) }} of {{ '%.6g'|format(o.qty) }}</dd></div>
+          <div><dt>Type</dt><dd>{{ o.order_type|capitalize }}</dd></div>
+          <div><dt>Sent</dt><dd>{{ o.ts|ts }}</dd></div>
+          <div><dt>Last update</dt><dd>{{ o.updated_at|ts }}</dd></div>
+          {% if o.message %}<div><dt>Venue said</dt><dd class="{{ 'loss' if o.tone == 'halted' }}">{{ o.message }}</dd></div>{% endif %}
+        </dl></div>
+    </div></td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}
+  <p class="empty" style="padding:14px">{% if tab == 'open' %}No orders working. Sleeves trade at market, so an order is normally open for seconds.{% elif tab == 'all' %}No orders yet. Each order a sleeve sends is listed here with its reason.{% else %}None in this view.{% endif %}</p>
+  {% endif %}
+</section>
+<p class="muted" style="font-size:12px">Orders are journaled from this release onwards. Earlier trades still appear under <a href="/trades">Positions and trades</a>, without a recorded reason.</p>
+{% endblock %}
+{% block scripts %}<script src="/static/console.js"></script><script>Console.whys();</script>{% endblock %}

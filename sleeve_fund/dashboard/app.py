@@ -9,6 +9,7 @@ the decision log. Protected by one PM password (HTTP Basic, behind HTTPS).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -17,13 +18,13 @@ from urllib.parse import urlencode, urlparse
 
 import markdown
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import riskops
+from sleeve_fund.dashboard import reports, riskops, trading
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
@@ -173,9 +174,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(target, status_code=303)
 
     @app.get("/sleeves/new", response_class=HTMLResponse)
-    def new_sleeve_form(request: Request, _: str = Depends(require_pm), error: str = ""):
+    def new_sleeve_form(request: Request, _: str = Depends(require_pm), error: str = "", strategy: str = ""):
+        from sleeve_fund.dashboard import pipeline
+
+        g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
+        chosen = strategy if strategy in REGISTRY else "trend_filter"
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
-                    bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error)
+                    bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen)
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -188,15 +193,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("name: lower-case letters, digits and dashes, 2 to 41 characters")
             if not reason:
                 raise ValueError("a reason is required")
-            # Each strategy's parameter inputs are named p_<strategy>__<param>; only the chosen one counts.
-            prefix = f"p_{strategy}__"
-            params = _coerce_params({k[len(prefix):]: v for k, v in form.items() if k.startswith(prefix) and v != ""})
-            if str(form.get("max_notional", "")).strip():
-                params["max_notional"] = float(form["max_notional"])
-            for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
-                raw = str(form.get(f"{key}_pct", "")).strip()
-                if raw:
-                    params[key] = round(float(raw) / 100, 6)
+            params = _form_params(form, strategy)
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=str(form.get("bar_spec", "")),
                                starting_balance=float(form.get("starting_balance", 0) or 0), params=params,
@@ -213,6 +210,30 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse(f"/sleeves/new?{urlencode({'error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
+    @app.get("/api/preview")
+    def preview_json(request: Request, _: str = Depends(require_pm)):
+        """Look-back of the form's settings on Kraken's recent daily history (in-sample, not G1)."""
+        from sleeve_fund.dashboard import preview
+        from sleeve_fund.paper.config import PAIR_RE
+
+        q = request.query_params
+        strategy, pair = q.get("strategy", ""), q.get("instrument", "").strip().upper()
+        try:
+            if strategy not in REGISTRY:
+                raise ValueError("pick a strategy")
+            if not PAIR_RE.match(pair):
+                raise ValueError("enter a pair like SOL/USD")
+            params = _form_params(q, strategy)
+            params.pop("max_notional", None)  # a per-order cap doesn't change a look-back meaningfully
+            balance = float(q.get("starting_balance") or 10_000)
+            return JSONResponse(preview.run(strategy, pair, params, starting=balance))
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        except OSError as exc:  # Kraken unreachable
+            return JSONResponse({"error": f"could not reach Kraken: {exc}"}, status_code=502)
+        except Exception as exc:  # noqa: BLE001 - the form shows the message instead of a blank chart
+            return JSONResponse({"error": f"look-back failed: {exc}"}, status_code=500)
+
     @app.get("/sleeves/{name}", response_class=HTMLResponse)
     def sleeve_detail(request: Request, name: str, _: str = Depends(require_pm)):
         try:
@@ -220,11 +241,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such sleeve") from None
         x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
-        fills = st().fills(name, limit=2000)
+        fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
-        trips = _trips(fills, events)
+        orders = trading.orders_by_id(st(), name)
+        trips = trading.trips(fills, st().events(name, limit=5000), orders)
         feed = _feed(events, request.query_params.get("feed", "all"))
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed,
+        recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    position=trading.open_position(x, fills, orders),
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params))
@@ -280,9 +304,21 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
-        sheets = sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-        counts = IdeaLedger(LEDGER).counts()
-        return page(request, "research.html", sheets=[p.stem for p in sheets], counts=counts)
+        from sleeve_fund.dashboard import pipeline
+
+        sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
+                                                         reverse=True)]
+        return page(request, "research.html", sheets=sheets, counts=IdeaLedger(LEDGER).counts(),
+                    rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES)
+
+    @app.get("/strategies/{name}", response_class=HTMLResponse)
+    def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
+        from sleeve_fund.dashboard import pipeline
+
+        row = next((r for r in pipeline.strategies(TEARSHEETS, st().sleeves()) if r["name"] == name), None)
+        if row is None:
+            raise HTTPException(404, "no such strategy")
+        return page(request, "strategy.html", r=row, stages=pipeline.STAGES, summary=_idea(name))
 
     @app.get("/research/{sheet}", response_class=HTMLResponse)
     def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
@@ -290,11 +326,91 @@ def create_app(store: Store | None = None) -> FastAPI:
         if path.parent != TEARSHEETS.resolve() or not path.exists():
             raise HTTPException(404, "no such tear sheet")
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
+        # Results as status chips, so a FAIL can't be missed in a wall of text.
+        for word, tone in (("PASS", "running"), ("FAIL", "halted"), ("WARN", "paused"), ("INFO", "stopped")):
+            html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{word.capitalize()}</span></td>')
         return page(request, "tearsheet.html", title=sheet, body=html)
 
     @app.get("/decisions", response_class=HTMLResponse)
     def decisions(request: Request, _: str = Depends(require_pm)):
-        return page(request, "decisions.html", decisions=st().decisions(limit=500))
+        f = _decision_filters(request)
+        return page(request, "decisions.html", decisions=st().decisions(limit=500, **f["query"]), f=f,
+                    sleeves=[s.name for s in st().sleeves()], actions=DECISION_ACTIONS)
+
+    @app.get("/decisions.csv")
+    def decisions_csv(request: Request, _: str = Depends(require_pm)):
+        rows = st().decisions(limit=100_000, **_decision_filters(request)["query"])
+        return _csv("decisions", reports.to_csv(rows, ["ts", "actor", "action", "sleeve", "reason"]))
+
+    @app.get("/reports", response_class=HTMLResponse)
+    def reports_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        fills = {s.name: st().fills(s.name, limit=100_000) for s in sleeves}
+        return page(request, "reports.html", m=reports.monthly(summaries, frames, fills),
+                    sleeves=[s.name for s in sleeves], shell=shell(sleeves))
+
+    @app.get("/exports/{kind}.csv")
+    def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
+        names = [s.name for s in st().sleeves()]
+        if sleeve and sleeve not in names:
+            raise HTTPException(404, "no such sleeve")
+        chosen = [sleeve] if sleeve else names
+        if kind == "fills":
+            rows = [f for n in chosen for f in reversed(st().fills(n, limit=1_000_000))]
+            cols = ["ts", "sleeve", "side", "qty", "price", "fee", "order_id", "trade_id"]
+        elif kind == "equity":
+            rows = []
+            for n in chosen:
+                for ts, r in bookm.daily(st(), n).iterrows():
+                    rows.append({"date": ts.date(), "sleeve": n, **{k: round(float(r[k]), 8) for k in r.index}})
+            cols = ["date", "sleeve", "equity", "benchmark", "cash", "qty", "price"]
+        elif kind == "trades":
+            rows = []
+            for n in chosen:
+                orders = trading.orders_by_id(st(), n)
+                for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders):
+                    rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
+                                 if t["held"] else None})
+            cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
+                    "ret", "exit_kind", "entry_why", "exit_why", "entry_order", "exit_order"]
+        elif kind == "orders":
+            rows = [dict(o, signal=json.dumps(o["signal"], sort_keys=True))
+                    for n in chosen for o in reversed(st().orders(n, limit=1_000_000))]
+            cols = ["ts", "sleeve", "order_id", "side", "order_type", "qty", "status", "filled_qty", "avg_px", "fee",
+                    "intent", "reason", "signal", "message", "updated_at"]
+        else:
+            raise HTTPException(404, "unknown export")
+        return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
+
+    @app.get("/trades", response_class=HTMLResponse)
+    def trades_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, _frames, summaries = book_data()
+        names = [s.name for s in sleeves]
+        sleeve = request.query_params.get("sleeve") or None
+        if sleeve not in names:
+            sleeve = None
+        h = trading.history(st(), summaries, sleeve)
+        return page(request, "trades.html", h=h, sleeve=sleeve, sleeves=names, shell=shell(sleeves),
+                    book_equity=sum(x["equity"] for x in summaries))
+
+    @app.get("/orders", response_class=HTMLResponse)
+    def orders_page(request: Request, _: str = Depends(require_pm)):
+        names = [s.name for s in st().sleeves()]
+        q = request.query_params
+        sleeve = q.get("sleeve") if q.get("sleeve") in names else None
+        tab = q.get("status") if q.get("status") in trading.STATUS_TABS else "all"
+        rows = [trading.order_view(o) for o in st().orders(sleeve, trading.STATUS_TABS[tab][1], limit=1000)]
+        counts = st().order_counts(sleeve)
+        tabs = [(k, label, sum(counts.get(x, 0) for x in sts) if sts else sum(counts.values()))
+                for k, (label, sts) in trading.STATUS_TABS.items()]
+        return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_page(request: Request, _: str = Depends(require_pm)):
+        from sleeve_fund.instruments import KRAKEN_UK_ENTRY
+
+        return page(request, "settings.html", profiles=PROFILES, fees=KRAKEN_UK_ENTRY,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes())
 
     return app
 
@@ -307,14 +423,20 @@ COMMON_REASONS = [
     "Checked after an alert; safe to continue",
     "Planned change of settings",
 ]
-EXIT_KINDS = {"stop_loss": "Stop-loss", "take_profit": "Take-profit", "risk_halt": "Risk halt",
-              "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten"}
+EXIT_KINDS = trading.EXIT_EVENTS
+
+
+def _config_defaults(strategy: str) -> dict:
+    import inspect
+
+    _, config_cls = REGISTRY[strategy]
+    return {k: p.default for k, p in inspect.signature(config_cls.__init__).parameters.items()
+            if p.default is not inspect.Parameter.empty and isinstance(p.default, (int, float, str))}
 
 
 def _idea(strategy: str, params: dict | None = None) -> str:
     """The strategy in one sentence, using this sleeve's settings rather than the defaults."""
     import importlib
-    import inspect
 
     try:
         spec = importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC
@@ -322,9 +444,7 @@ def _idea(strategy: str, params: dict | None = None) -> str:
         return ""
     if not spec.summary:
         return spec.idea
-    _, config_cls = REGISTRY[strategy]
-    values = {k: p.default for k, p in inspect.signature(config_cls.__init__).parameters.items()
-              if p.default is not inspect.Parameter.empty}
+    values = _config_defaults(strategy)
     values.update(params or {})
     try:
         return spec.summary.format(**values)
@@ -332,28 +452,11 @@ def _idea(strategy: str, params: dict | None = None) -> str:
         return spec.idea
 
 
-def _trips(fills: list[dict], events: list[dict]) -> list[dict]:
-    """Closed round trips, newest first, with holding time and why they closed."""
-    from sleeve_fund.research.metrics import trades
-
-    exits = [e for e in events if e["kind"] in EXIT_KINDS]
-    out = []
-    for t in reversed(trades(list(reversed(fills)))):
-        why = "Signal"
-        if t["opened"] and t["closed"]:
-            hit = [e for e in exits if t["opened"] <= e["ts"] <= t["closed"]]
-            if hit:
-                why = EXIT_KINDS[hit[0]["kind"]]
-        t["reason"] = why
-        t["held"] = (t["closed"] - t["opened"]) if t["opened"] and t["closed"] else None
-        out.append(t)
-    return out
-
 
 FEEDS = {
     "all": lambda e: e["kind"] != "reconcile",  # routine passes are summarised in the risk panel
     "alerts": lambda e: e["level"] in ("warning", "error"),
-    "trades": lambda e: e["kind"] in ("fill", *EXIT_KINDS),
+    "trades": lambda e: e["kind"] in ("fill", "order_rejected", "order_denied", *EXIT_KINDS),
     "pm": lambda e: e["kind"].startswith("pm_") or e["kind"] in ("start", "restart", "restore", "resume"),
 }
 
@@ -381,6 +484,30 @@ def _held(td) -> str:
         return ""
     hours = td.total_seconds() / 3600
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+
+
+DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten"]
+
+
+def _decision_filters(request: Request) -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    q = request.query_params
+    out = {"sleeve": q.get("sleeve") or None, "action": q.get("action") or None}
+    raw = {"from": q.get("from", ""), "to": q.get("to", "")}
+    for key, field, extra in (("from", "since", 0), ("to", "until", 1)):
+        try:
+            if raw[key]:
+                out[field] = datetime.strptime(raw[key], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=extra)
+        except ValueError:
+            raw[key] = ""  # an unreadable date is ignored rather than failing the page
+    return {"query": out, "raw": raw, "qs": urlencode({k: v for k, v in q.items() if v})}
+
+
+def _csv(name: str, body: str) -> Response:
+    stamp = utcnow().strftime("%Y%m%d")
+    return Response(body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="sleeve-fund-{name}-{stamp}.csv"'})
 
 
 def _bytes(n) -> str:
@@ -423,8 +550,23 @@ def _strategy_choices() -> list[dict]:
     out = []
     for name in sorted(REGISTRY):
         spec = importlib.import_module(f"sleeve_fund.strategies.{name}").SPEC
-        out.append({"name": name, "idea": spec.idea, "params": spec.default_params, "family": spec.family})
+        out.append({"name": name, "idea": _idea(name), "params": spec.default_params, "family": spec.family,
+                    "tpl": spec.summary, "defaults": _config_defaults(name)})
     return out
+
+
+def _form_params(form, strategy: str) -> dict:
+    """Strategy parameters and exits from the new-sleeve form (also used by the preview)."""
+    # Each strategy's parameter inputs are named p_<strategy>__<param>; only the chosen one counts.
+    prefix = f"p_{strategy}__"
+    params = _coerce_params({k[len(prefix):]: v for k, v in form.items() if k.startswith(prefix) and v != ""})
+    if str(form.get("max_notional", "")).strip():
+        params["max_notional"] = float(form["max_notional"])
+    for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
+        raw = str(form.get(f"{key}_pct", "")).strip()
+        if raw:
+            params[key] = round(float(raw) / 100, 6)
+    return params
 
 
 def _coerce_params(raw: dict) -> dict:

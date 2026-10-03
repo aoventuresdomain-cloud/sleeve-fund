@@ -75,11 +75,11 @@ def trades(rows: list[dict]) -> list[dict]:
     """
     out, qty, cost, proceeds, fees = [], 0.0, 0.0, 0.0, 0.0
     bought = sold = 0.0
-    opened = None
+    opened = entry_order = None
     for r in rows:
         if r["side"] == "BUY":
             if qty <= 1e-12:
-                opened = r.get("ts")
+                opened, entry_order = r.get("ts"), r.get("order_id")
             qty += r["qty"]
             bought += r["qty"]
             cost += r["qty"] * r["price"]
@@ -94,7 +94,9 @@ def trades(rows: list[dict]) -> list[dict]:
             pnl = proceeds - cost - fees
             out.append({"pnl": pnl, "ret": pnl / cost, "cost": cost, "fees": fees, "qty": bought,
                         "entry_px": cost / bought, "exit_px": proceeds / sold if sold else float("nan"),
-                        "opened": opened, "closed": r.get("ts")})
+                        "opened": opened, "closed": r.get("ts"),
+                        # Journal order ids, so the dashboard can show why the trade was opened and closed.
+                        "entry_order": entry_order, "exit_order": r.get("order_id")})
             qty, cost, proceeds, fees, bought, sold = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     return out
 

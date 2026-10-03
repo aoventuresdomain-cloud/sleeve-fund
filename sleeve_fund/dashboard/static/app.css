@@ -76,6 +76,7 @@ a:hover { text-decoration: underline; }
 .strip .bad-dot::before { background: var(--loss); }
 .strip .clock { margin-left: auto; color: var(--text); }
 
+.app > div { min-width: 0; } /* lets wide tables scroll inside their panel instead of widening the page */
 main { padding: 18px 20px 48px; min-width: 0; }
 .page-head { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 16px; margin-bottom: 14px; }
 .page-head h1 { font-size: 20px; font-weight: 650; font-stretch: 87.5%; letter-spacing: -.01em; margin: 0; }
@@ -103,6 +104,7 @@ main > h2 { margin: 22px 0 8px; }
 .span-6 { grid-column: span 6; } .span-5 { grid-column: span 5; } .span-4 { grid-column: span 4; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
 main > .panel { margin-bottom: 14px; overflow-x: auto; }
+.grid > .panel { overflow-x: auto; }
 .panel-head { display: flex; align-items: baseline; gap: 10px; margin: -2px 0 10px; }
 .panel-head .hint { color: var(--muted); font-size: 12px; }
 .panel-head .right { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
@@ -258,4 +260,71 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   table.responsive td:first-child { padding-left: 0; } table.responsive td:last-child { padding-right: 0; }
   tbody tr:hover td { background: none; }
 }
+/* --- orders, trades and their reasons ------------------------------------------ */
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.m-only { display: none; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.tag { display: inline-block; padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tag.stop_loss, .tag.risk_halt { border-color: color-mix(in srgb, var(--loss) 45%, transparent); color: var(--loss); }
+.tag.risk_pause, .tag.pm_flatten { border-color: color-mix(in srgb, var(--warn) 45%, transparent); color: var(--warn); }
+.tag.take_profit { border-color: color-mix(in srgb, var(--gain) 45%, transparent); color: var(--gain); }
+.side { font-weight: 600; } .side.buy { color: var(--gain); } .side.sell { color: var(--loss); }
+td .sub { font-size: 11.5px; color: var(--faint); }
+td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.why-btn { background: none; border: 1px solid var(--line); color: var(--muted); padding: 1px 8px; font-size: 12px; font-weight: 500; border-radius: 4px; }
+.why-btn:hover { color: var(--text); border-color: var(--line-strong); }
+.why-btn[aria-expanded="true"] { background: var(--raised); color: var(--text); }
+tr.open td { background: var(--raised); }
+tr.detail > td { background: var(--raised); padding: 4px 14px 14px; white-space: normal; }
+.why-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px 24px; }
+.why-block .k { font-size: 12px; color: var(--muted); font-weight: 600; margin-bottom: 2px; }
+.why-block p { margin: 0 0 8px; }
+dl.sig { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0; font-size: 12.5px; }
+dl.sig > div { display: flex; gap: 6px; }
+dl.sig dt { color: var(--muted); } dl.sig dd { margin: 0; font-variant-numeric: tabular-nums; }
+nav.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 14px; overflow-x: auto; }
+nav.tabs a { padding: 8px 12px; color: var(--muted); font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+nav.tabs a:hover { color: var(--text); text-decoration: none; }
+nav.tabs a[aria-current] { color: var(--text); border-bottom-color: var(--accent); }
+nav.tabs .n { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: var(--neutral-bg); font-size: 11.5px; text-align: center; }
+@media (max-width: 760px) {
+  .m-only { display: inline; }
+  table.responsive tr.detail { display: block; padding: 0; }
+  table.responsive tr.detail[hidden] { display: none; }
+  table.responsive tr.detail > td { display: block; padding: 4px 14px 14px; }
+  .why-grid { grid-template-columns: 1fr; }
+}
+
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* --- research pipeline stepper: a real sequence, so numbered pips are earned --- */
+.stepper { display: flex; gap: 3px; list-style: none; margin: 0; padding: 0; counter-reset: st; }
+.stepper li { counter-increment: st; position: relative; width: 26px; height: 6px; border-radius: 2px; background: var(--neutral-bg); }
+.stepper li.done { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+.stepper li.now { background: var(--accent); }
+.stepper li.now.obs { background: var(--warn); }
+.stepper li span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.panel > .stepper li { flex: 1; height: auto; padding: 6px 8px; font-size: 12px; color: var(--muted); }
+.panel > .stepper li span { position: static; width: auto; height: auto; overflow: visible; clip: auto; }
+.panel > .stepper li span::before { content: counter(st) "  "; color: var(--faint); }
+.panel > .stepper li.done, .panel > .stepper li.now { color: #fff; }
+.panel > .stepper li.done span::before, .panel > .stepper li.now span::before { color: rgb(255 255 255 / .7); }
+
+/* --- new-sleeve form ---------------------------------------------------------- */
+fieldset.step { margin: 0 0 14px; min-width: 0; }
+fieldset.step legend { float: left; width: 100%; padding: 0; margin: 0 0 10px; font-weight: 650; font-size: 14px; }
+fieldset.step legend + * { clear: both; }
+.hint { margin: 4px 0 0; color: var(--faint); font-size: 12px; }
+.params[hidden] { display: none; }
+.sticky { position: sticky; top: calc(var(--strip) + 14px); }
+ul.summary { margin: 0; padding-left: 18px; }
+ul.summary li { margin: 0 0 6px; }
+.panel .banner { margin: 12px 0 0; font-size: 13px; }
+@media (max-width: 1100px) { .sticky { position: static; } }
+
+/* --- filters and report grid ------------------------------------------------- */
+form.filters { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; margin-bottom: 14px; }
+form.filters select, form.filters input { height: 36px; box-sizing: border-box; }
+form.filters .field { min-width: 150px; }
+table.heat td { min-width: 62px; }
+table.heat th.row a { color: var(--text); }
