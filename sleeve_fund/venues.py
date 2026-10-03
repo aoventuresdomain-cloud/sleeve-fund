@@ -35,6 +35,8 @@ class VenueProfile:
     asset_codes: Callable[..., tuple[str, str]] = lambda pair, fetch=None: tuple(pair.split("/"))  # type: ignore[assignment]
     # () -> (factory, config) for the live market data client; None if paper can't run here yet
     data_client: Callable[[], tuple] | None = None
+    # (api_key, api_secret) -> FeeSchedule the venue charges that account. Query-only; supervisor only.
+    fetch_fees: Callable[[str, str], FeeSchedule] | None = None
     # (pair, cursor) -> (1-minute bars by open time, next cursor, caught_up), for the history store
     minute_loader: Callable[[str, str], tuple] | None = None
     merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
@@ -45,10 +47,17 @@ class VenueProfile:
     def venue(self) -> Venue:
         return Venue(self.name)
 
-    def instrument(self, base: str, quote: str, price_precision: int = 2, size_precision: int = 8) -> CurrencyPair:
-        """A spot instrument at this venue, carrying this venue's fees."""
-        return spot_pair(base, quote, fees=self.fees, venue=self.venue, price_precision=price_precision,
+    def instrument(self, base: str, quote: str, price_precision: int = 2, size_precision: int = 8,
+                   fees: FeeSchedule | None = None) -> CurrencyPair:
+        """A spot instrument at this venue, carrying the given fees (sleeve_fund.fees.resolve: the
+        connected account's) or, without them, the venue's published schedule."""
+        return spot_pair(base, quote, fees=fees or self.fees, venue=self.venue, price_precision=price_precision,
                          size_precision=size_precision)
+
+    def key_env(self, account: str) -> tuple[str, str]:
+        """The two server environment variables holding a live account's key and secret on this venue."""
+        suffix = account.upper().replace("-", "_")
+        return f"{self.name}_API_KEY__{suffix}", f"{self.name}_API_SECRET__{suffix}"
 
     def fee_text(self) -> str:
         return f"{self.label}: {float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker ({self.fee_basis})"
@@ -94,6 +103,44 @@ _ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 def _norm(code: str) -> str:
     return _ALIASES.get(code, code)
+
+
+def kraken_sign(path: str, data: str, nonce: str, secret: str) -> str:
+    """Kraken's API-Sign header: HMAC-SHA512 of path + SHA256(nonce + POST data), keyed by the
+    base64-decoded secret."""
+    import base64
+    import hashlib
+    import hmac
+
+    digest = hashlib.sha256((nonce + data).encode()).digest()
+    mac = hmac.new(base64.b64decode(secret), path.encode() + digest, hashlib.sha512)
+    return base64.b64encode(mac.digest()).decode()
+
+
+def kraken_account_fees(api_key: str, api_secret: str, post=None) -> FeeSchedule:
+    """The spot maker and taker fees Kraken charges this account now (its TradeVolume endpoint,
+    which needs only a query permission). Rates are for BTC/USD, Kraken's reference pair; spot
+    pairs share one tier schedule."""
+    import time
+    import urllib.parse
+
+    path = "/0/private/TradeVolume"
+    nonce = str(int(time.time() * 1000))
+    data = urllib.parse.urlencode({"nonce": nonce, "pair": "XBTUSD"})
+    headers = {"API-Key": api_key, "API-Sign": kraken_sign(path, data, nonce, api_secret),
+               "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}
+    if post is None:
+        req = urllib.request.Request("https://api.kraken.com" + path, data=data.encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.load(r)
+    else:
+        body = post(path, data, headers)
+    if body.get("error"):
+        raise ValueError(f"Kraken: {'; '.join(body['error'])}")
+    res = body["result"]
+    taker = next(iter(res["fees"].values()))["fee"]
+    maker = next(iter((res.get("fees_maker") or res["fees"]).values()))["fee"]
+    return FeeSchedule(maker=Decimal(str(maker)) / 100, taker=Decimal(str(taker)) / 100)
 
 
 _KRAKEN_KEYS: dict[str, str] = {}  # pair -> Kraken's pair id, looked up once per process
@@ -159,14 +206,16 @@ def _kraken_data_client() -> tuple:
 KRAKEN = register(VenueProfile(
     name="KRAKEN",
     label="Kraken spot",
-    # Spot Tier 1 (under $2,501 30-day spot volume), read from the account's Kraken fee page on
-    # 3 Oct 2026. Tier 2 (0.30% maker, 0.60% taker) starts at $2,501; the PM chose to assume Tier 1.
+    # Fallback only, until an account is connected (then the account's own rates are fetched):
+    # spot Tier 1 (under $2,501 30-day spot volume), read from the account's Kraken fee page on
+    # 3 Oct 2026. Tier 2 (0.30% maker, 0.60% taker) starts at $2,501.
     fees=FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080")),
     fee_basis="Tier 1, from the account's fee page, 3 Oct 2026",
     daily_history=_kraken_daily,
     ohlc_history=_kraken_ohlc,
     asset_codes=kraken_asset_codes,
     data_client=_kraken_data_client,
+    fetch_fees=kraken_account_fees,
     minute_loader=kraken_minutes,
     merge_minutes=True,
 ))

@@ -21,11 +21,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sleeve_fund import accounts
+from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import Sleeve, Store, utcnow
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
+FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
@@ -67,7 +69,7 @@ class Supervisor:
 
     def _start(self, name: str, proc: Proc) -> None:
         # Paper processes never need a venue key, so they don't inherit one.
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("KRAKEN_API_KEY", "KRAKEN_API_SECRET"))}
+        env = {k: v for k, v in os.environ.items() if not credential_var(k)}
         proc.popen = subprocess.Popen([self.python, "-m", "sleeve_fund.paper", "--db-sleeve", name], env=env)
         proc.started_at = utcnow()
         self.store.event(name, "info", "process_start", f"paper process started (pid {proc.popen.pid})")
@@ -110,9 +112,29 @@ class Supervisor:
 
     def check_keys(self) -> None:
         """Tell the dashboard which live accounts have a Kraken key on this server (presence only)."""
-        live = [a["name"] for a in self.store.accounts() if a["kind"] == "live"]
+        live = [a for a in self.store.accounts() if a["kind"] == "live"]
         if live:
-            self.store.report_keys({name: accounts.key_present(name) for name in live})
+            self.store.report_keys({a["name"]: accounts.key_present(a["name"], venue=a["venue"]) for a in live})
+
+    def check_fees(self, environ=None) -> None:
+        """Read each connected live account's fee schedule from its venue, so backtests and paper
+        charge what the exchange actually charges that account. Query-only; the key never leaves
+        this process."""
+        from sleeve_fund.venues import venue as venue_profile
+
+        for a in self.store.accounts():
+            if a["kind"] != "live":
+                continue
+            creds = accounts.credentials(a["name"], a["venue"], environ)
+            profile = venue_profile(a["venue"])
+            if creds is None or profile.fetch_fees is None:
+                continue
+            try:
+                fees = profile.fetch_fees(*creds)
+                self.store.record_fees(profile.name, a["name"], float(fees.maker), float(fees.taker))
+            except Exception as exc:  # noqa: BLE001 - keep the last good schedule; show why on the dashboard
+                msg = str(exc).replace(creds[0], "***").replace(creds[1], "***")
+                self.store.event(None, "warning", "fee_fetch_failed", f"{a['name']}: {msg}")
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stopping", True))
@@ -123,6 +145,8 @@ class Supervisor:
             try:
                 if loops % KEY_CHECK_EVERY == 0:
                     self.check_keys()
+                if loops % FEE_CHECK_EVERY == 0:
+                    self.check_fees()
                 loops += 1
                 self.step()
             except Exception as exc:  # keep supervising; the dashboard shows the error

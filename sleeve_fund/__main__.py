@@ -66,7 +66,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         prices = load_kraken_ohlcvt(args.data)
         dataset = Path(args.data).stem
-    instrument = venue(args.venue).instrument(args.base, args.quote)
+    import os
+
+    from sleeve_fund.fees import resolve
+
+    store = None
+    if os.environ.get("DATABASE_URL"):  # on the server: use the connected account's fetched rates
+        from sleeve_fund.store import Store
+
+        store = Store()
+    quote = resolve(args.venue, store)
+    print(f"fees: {quote.text}")
+    instrument = venue(args.venue).instrument(args.base, args.quote, fees=quote.fees)
     result = run_study(
         spec,
         prices,
