@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
 {% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
-{% block title %}Backtest · Sleeve Fund{% endblock %}
+{% block title %}Backtest · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Backtest</h1>
-  <p class="lede">Test a strategy before it touches any money. It runs the real strategy code through the same engine and venue fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
+  <p class="lede">Test a model before it touches any money. It runs the real model code through the same engine and venue fees as paper trading, over the venue's daily price history (Kraken for now), and shows every trade with the reason it was taken.</p>
 </div>
 
 <div class="grid">
@@ -32,11 +32,11 @@
     {% set s, h, ts = result.strategy, result.hold, result.stats %}
     <section class="panel bt-head">
       <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days, after fees: {{ result.fee_schedule.text }}</span>
-        <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper sleeve with these settings</a></div>
-      {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This strategy hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
+        <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a></div>
+      {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
       <table class="compare">
-        <thead><tr><th></th><th class="num">Strategy</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>
+        <thead><tr><th></th><th class="num">Model</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>
         <tbody>
           <tr><th scope="row">Return</th><td class="num">{{ signed(s.total_return) }}</td><td class="num">{{ h.total_return|pct }}</td></tr>
           <tr><th scope="row">A year (CAGR) {{ help('cagr') }}</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
@@ -80,18 +80,18 @@
         </div></td></tr>
         {% endfor %}</tbody>
       </table>
-      {% else %}<p class="empty" style="padding:4px 14px 14px">No completed trades in this period. The strategy may still be holding, or its entry never triggered. Try a longer period or looser settings.</p>{% endif %}
+      {% else %}<p class="empty" style="padding:4px 14px 14px">No completed trades in this period. The model may still be holding, or its entry never triggered. Try a longer period or looser settings.</p>{% endif %}
     </section>
   {% elif not error %}
     <section class="panel">
       <div class="panel-head"><h2>How testing works here</h2></div>
       <ol class="steps-list">
         <li><strong>Backtest</strong> (this page): see how settings would have traded over the venue's daily history, with fees. It's quick, and you can change anything.</li>
-        <li><strong>Paper sleeve</strong>: when a result looks worth watching, start it on paper with one click. It trades live Kraken prices with simulated money.</li>
+        <li><strong>Paper strategy</strong>: when a result looks worth watching, start it on paper with one click. It trades live Kraken prices with simulated money.</li>
         <li><strong>Evidence</strong>: G1 needs the research loop's out-of-sample tests. G2 needs at least six weeks of paper results inside the backtest's range.</li>
         <li><strong>Live</strong>: only after you approve G2, and only on a Kraken account whose key you install on the server.</li>
       </ol>
-      <p class="muted" style="margin:0">Pick an instrument and a strategy on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
+      <p class="muted" style="margin:0">Pick an instrument and a model on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
     </section>
   {% endif %}
   </div>

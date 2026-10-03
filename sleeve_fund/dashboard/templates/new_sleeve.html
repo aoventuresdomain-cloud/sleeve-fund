@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 {% from "_fields.html" import pair_field, strategy_fields, exit_fields %}
-{% block title %}New sleeve · Sleeve Fund{% endblock %}
+{% block title %}New strategy · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
-  <h1>New sleeve</h1>
-  <p class="lede">One strategy on one instrument, with its own capital and limits. It starts within seconds of saving, in paper mode: live prices and Kraken's fees, simulated money. Live mode unlocks after G2.</p>
+  <h1>New strategy</h1>
+  <p class="lede">One model on one instrument, with its own capital and limits. It starts within seconds of saving, in paper mode: live prices and Kraken's fees, simulated money. Live mode unlocks after G2.</p>
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
 {% if pre.get('from') == 'clone' %}<div class="banner">Settings copied from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>. Change what you want to test, give it a reason, and start it on paper. {{ pre.get('source') }} keeps running unchanged.</div>{% endif %}
@@ -17,11 +17,11 @@
       <legend>1. Market</legend>
       <div class="grid2">
         {{ pair_field(instruments, pre) }}
-        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">{{ 'Fixed to the interval the backtest used. To trade another interval, backtest it first.' if from_bt else 'How often the strategy looks at the market and may trade.' }}</p></div>
+        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">{{ 'Fixed to the interval the backtest used. To trade another interval, backtest it first.' if from_bt else 'How often the model looks at the market and may trade.' }}</p></div>
       </div>
     </fieldset>
     <fieldset class="panel step">
-      <legend>2. Strategy</legend>
+      <legend>2. Model</legend>
       {{ strategy_fields(strategies, chosen, g1, pre) }}
     </fieldset>
     <fieldset class="panel step">
@@ -41,7 +41,7 @@
     <fieldset class="panel step">
       <legend>5. Name and reason</legend>
       <div class="grid2">
-        <div class="field"><label for="name">Sleeve name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}><p class="hint">Lower-case letters, digits and dashes.</p></div>
+        <div class="field"><label for="name">Strategy name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}><p class="hint">Lower-case letters, digits and dashes.</p></div>
         <div class="field"><label for="reason">Why start it?</label><input id="reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
       </div>
     </fieldset>
@@ -49,12 +49,12 @@
 
   <aside class="span-5">
     <div class="panel sticky" aria-live="polite">
-      <div class="panel-head"><h2>This sleeve will</h2></div>
+      <div class="panel-head"><h2>This strategy will</h2></div>
       <ul class="summary" id="summary"></ul>
-      <div id="g1-note" class="banner warn" hidden>This strategy has not passed G1 on real data. It can run on paper as an observation; its results are not evidence.</div>
+      <div id="g1-note" class="banner warn" hidden>This model has not passed G1 on real data. It can run on paper as an observation; its results are not evidence.</div>
       <div class="panel-head" style="margin-top:14px"><h2>Look-back</h2><button type="button" class="quiet right" id="run-preview">Run on Kraken history</button></div>
       <div id="preview"><p class="muted" style="margin:0;font-size:12.5px">Runs these exact settings over the venue's daily candles, with fees. It uses daily decisions whatever interval you pick, and it is in-sample: a sense check, not a G1 test.</p></div>
-      <p style="margin:16px 0 0"><button>Start sleeve in paper mode</button></p>
+      <p style="margin:16px 0 0"><button>Start strategy in paper mode</button></p>
     </div>
   </aside>
 </form>

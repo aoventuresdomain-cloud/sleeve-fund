@@ -137,7 +137,7 @@ def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
     store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
     store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
     page = c.get("/", auth=AUTH).text
-    for text in ("Book equity", "Month to date", "Gross exposure", "Where the money is", "price feed quiet"):
+    for text in ("Book equity", "Month to date", "Gross exposure", "Allocation", "price feed quiet"):
         assert text in page
     alert = store.alerts()[0]
     r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
@@ -190,7 +190,7 @@ def test_risk_page_stress_and_limits(client):
     store.record_equity("eth-risk", equity=10_000, cash=4_000, qty=2, price=3_000, benchmark=10_000)
     store.event("eth-risk", "error", "risk_halt", "drawdown 21% hit the 20% limit")
     page = c.get("/risk", auth=AUTH).text
-    assert "Limits by sleeve" in page and "−3,000.00" in page and "eth-risk</span>" in page
+    assert "Limits by strategy" in page and "−3,000.00" in page and "eth-risk</span>" in page
     assert "drawdown 21% hit the 20% limit" in page
 
 
@@ -198,7 +198,7 @@ def test_ops_page_shows_processes_and_safety_nets(client):
     c, store = client
     _new(c)
     page = c.get("/ops", auth=AUTH).text
-    assert "Sleeve processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page
+    assert "Strategy processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page
 
 
 def test_preview_runs_the_form_settings_on_history(client, monkeypatch):
@@ -224,7 +224,7 @@ def test_research_pipeline_and_strategy_pages(client):
     page = c.get("/research", auth=AUTH).text
     assert "Pipeline" in page and "observation" in page and "trend filter" in page
     s = c.get("/strategies/trend_filter", auth=AUTH).text
-    assert "Exact rules" in s and "Start a sleeve with this" in s
+    assert "Exact rules" in s and "Start a strategy with this" in s
     assert c.get("/strategies/nope", auth=AUTH).status_code == 404
     form = c.get("/sleeves/new?strategy=rsi_pullback", auth=AUTH).text
     assert '<option value="rsi_pullback" selected' in form
@@ -261,7 +261,7 @@ def test_decision_log_filters_and_csv_keeps_formulas_as_text(client):
     assert "news" in page and "first test" not in page
     assert c.get("/decisions?from=not-a-date", auth=AUTH).status_code == 200
     r = c.get("/decisions.csv?sleeve=eth-b", auth=AUTH)
-    assert r.headers["content-disposition"].startswith('attachment; filename="sleeve-fund-decisions-')
+    assert r.headers["content-disposition"].startswith('attachment; filename="fund-decisions-')
     lines = r.text.splitlines()
     assert lines[0] == "ts,actor,action,sleeve,reason" and len(lines) == 2
     assert "'=HYPERLINK" in lines[1]
@@ -393,7 +393,7 @@ def test_backtest_sizes_with_the_chosen_risk_profile(client, monkeypatch):
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
     page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&risk_profile=conservative"
                  "&max_notional=1000&period=365", auth=AUTH).text
-    assert "20% invested" in page and "sleeve cap" in page  # the 1,000 order cap binds before the 20% cap
+    assert "20% invested" in page and "largest order cap" in page  # the 1,000 order cap binds before the 20% cap
     assert "risk profile" in c.get("/backtest?run=1&instrument=ETH/USD&risk_profile=reckless", auth=AUTH).text
 
 
@@ -580,7 +580,7 @@ def test_archive_hides_a_stopped_sleeve_and_restore_brings_it_back(client):
                   headers={"Origin": "https://evil.example"}).status_code == 403
     assert post("archive").status_code == 303
     home = c.get("/", auth=AUTH).text
-    assert "Archived sleeves (1)" in home and home.count('href="/sleeves/btc-test"') == 1
+    assert "Archived strategies (1)" in home and home.count('href="/sleeves/btc-test"') == 1
     assert "Archived: hidden" in c.get("/sleeves/btc-test", auth=AUTH).text
     assert post("restore", reason="back in use").status_code == 303
     assert "Archived sleeves" not in c.get("/", auth=AUTH).text

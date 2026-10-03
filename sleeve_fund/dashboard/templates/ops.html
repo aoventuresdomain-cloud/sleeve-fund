@@ -1,16 +1,16 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, usage %}
-{% block title %}Operations · Sleeve Fund{% endblock %}
+{% block title %}Operations · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Operations</h1>
-  <p class="lede">Is everything running, fed and checked? Each sleeve is its own process on the server; the supervisor restarts any that stop.</p>
+  <p class="lede">Is everything running, fed and checked? Each strategy is its own process on the server; the supervisor restarts any that stop.</p>
 </div>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="proc-h">
-  <div class="panel-head"><h2 id="proc-h">Sleeve processes</h2></div>
+  <div class="panel-head"><h2 id="proc-h">Strategy processes</h2></div>
   <table class="responsive" data-hide-md="2 6 7">
-    <thead><tr><th>Sleeve</th><th>Wanted</th><th>Heartbeat</th><th>Last price mark</th><th>Balance check</th><th>Last start</th><th class="num">Waiting commands</th><th class="num">Errors</th></tr></thead>
+    <thead><tr><th>Strategy</th><th>Wanted</th><th>Heartbeat</th><th>Last price mark</th><th>Balance check</th><th>Last start</th><th class="num">Waiting commands</th><th class="num">Errors</th></tr></thead>
     <tbody>{% for p in ops.procs %}{% set x = p.x %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
@@ -48,8 +48,8 @@
 <section class="panel" aria-labelledby="safe-h">
   <div class="panel-head"><h2 id="safe-h">Safety nets</h2></div>
   <table class="compact kv">
-    <tr><th scope="row">Risk guard</th><td>On for every sleeve: halts at the drawdown limit, pauses at the daily-loss limit.</td></tr>
-    <tr><th scope="row">Balance reconciliation</th><td>On: at every start and every 24 hours; a mismatch halts the sleeve.</td></tr>
+    <tr><th scope="row">Risk guard</th><td>On for every strategy: halts at the drawdown limit, pauses at the daily-loss limit.</td></tr>
+    <tr><th scope="row">Balance reconciliation</th><td>On: at every start and every 24 hours; a mismatch halts the strategy.</td></tr>
     <tr><th scope="row">Outside alerts (Telegram)</th><td><span class="warn">Not set up yet.</span> Planned for M2.</td></tr>
     <tr><th scope="row">Dead man's switch</th><td><span class="warn">Not set up yet.</span> Planned for M2: alerts if the server itself goes quiet.</td></tr>
     <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>

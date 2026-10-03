@@ -1,17 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Accounts · Sleeve Fund{% endblock %}
+{% block title %}Accounts · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Accounts</h1>
   <div class="actions"><a class="button secondary" href="#add">Add an account</a></div>
-  <p class="lede">Which money each sleeve trades. Paper accounts use simulated money at live Kraken prices. A live account is a Kraken account or sub-account with its own key. That key stays on the server, and this page only shows whether it's there.</p>
+  <p class="lede">Which money each strategy trades. Paper accounts use simulated money at live Kraken prices. A live account is a Kraken account or sub-account with its own key. That key stays on the server, and this page only shows whether it's there.</p>
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
 
 <section class="panel flush" aria-labelledby="acc-h">
   <div class="panel-head"><h2 id="acc-h">Your accounts</h2><span class="hint">live trading is locked until G2 is approved</span></div>
   <table class="responsive">
-    <thead><tr><th>Account</th><th>Type</th><th>Sleeves</th><th>Kraken key on the server</th><th>Note</th></tr></thead>
+    <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Kraken key on the server</th><th>Note</th></tr></thead>
     <tbody>{% for a in accounts %}
     <tr id="acct-{{ a.name }}"><td><strong>{{ a.name }}</strong></td>
       <td data-m="right"><span class="chip {{ a.kind }}">{{ 'Live' if a.kind == 'live' else 'Paper' }}</span></td>
@@ -29,11 +29,11 @@
   <section class="panel span-7" aria-labelledby="how-h">
     <div class="panel-head"><h2 id="how-h">Connect a Kraken sub-account</h2></div>
     <ol class="steps-list">
-      <li><strong>On Kraken:</strong> create the sub-account and move into it only the money that sleeve may trade. Keeping each live sleeve on its own sub-account limits what any one strategy can lose.</li>
+      <li><strong>On Kraken:</strong> create the sub-account and move into it only the money that strategy may trade. Keeping each live strategy on its own sub-account limits what any one model can lose.</li>
       <li><strong>Create an API key in that sub-account</strong> with these permissions only: Query Funds, Query Open Orders &amp; Trades, Query Closed Orders &amp; Trades, Create &amp; Modify Orders, and Cancel/Close Orders. <strong>Never tick Withdraw Funds.</strong></li>
       <li><strong>Add it here</strong> as a live account (form below). Use a short name such as <code>kraken-trend</code>.</li>
       <li><strong>Put the key on the server, nowhere else.</strong> Sign in to the server over SSH, open <code>/opt/sleeve-fund/kraken.env</code>, and add the two lines this page shows for the account. Then run <code>cd /opt/sleeve-fund &amp;&amp; sudo docker compose up -d supervisor</code>. Don't paste a key into GitHub, chat, or this dashboard.</li>
-      <li><strong>Check it here:</strong> within a minute the account shows the key as installed. Sleeves can only use a live account once you've approved G2 and the server's live switch is on.</li>
+      <li><strong>Check it here:</strong> within a minute the account shows the key as installed. Strategies can only use a live account once you've approved G2 and the server's live switch is on.</li>
     </ol>
     {% set live = accounts|selectattr('kind', 'equalto', 'live')|list %}
     {% if live %}
@@ -49,7 +49,7 @@
   <form class="panel span-5" method="post" action="/accounts/new" id="add" aria-labelledby="add-h">
     <div class="panel-head"><h2 id="add-h">Add an account</h2></div>
     <div class="field"><label for="a-name">Name</label><input id="a-name" name="name" required pattern="[a-z0-9][a-z0-9\-]{1,40}" placeholder="kraken-trend" value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
-    <div class="field"><label for="a-kind">Type</label><select id="a-kind" name="kind"><option value="live" {{ 'selected' if pre.get('kind', 'live') == 'live' }}>Live: a Kraken account or sub-account</option><option value="paper" {{ 'selected' if pre.get('kind') == 'paper' }}>Paper: simulated money, for grouping sleeves</option></select></div>
+    <div class="field"><label for="a-kind">Type</label><select id="a-kind" name="kind"><option value="live" {{ 'selected' if pre.get('kind', 'live') == 'live' }}>Live: a Kraken account or sub-account</option><option value="paper" {{ 'selected' if pre.get('kind') == 'paper' }}>Paper: simulated money, for grouping strategies</option></select></div>
     <div class="field"><label for="a-note">Note (optional)</label><input id="a-note" name="note" maxlength="200" placeholder="What this account is for" value="{{ pre.get('note', '') }}"></div>
     <div class="field"><label for="a-reason">Why add it?</label><input id="a-reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
     <p class="muted" style="font-size:12px">Adding a live account moves no money and enables nothing. It only gives the key a name to attach to.</p>

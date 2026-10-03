@@ -11,7 +11,7 @@ SPEC = IdeaSpec(
     name="buy_and_hold",
     family="benchmark",
     idea="Buy and hold.",
-    rules="Buy with the whole sleeve on the first bar; never sell.",
+    rules="Buy with all of the strategy's capital on the first bar; never sell.",
 )
 
 

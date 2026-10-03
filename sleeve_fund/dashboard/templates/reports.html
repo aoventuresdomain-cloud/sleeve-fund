@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed %}
-{% block title %}Reports · Sleeve Fund{% endblock %}
+{% block title %}Reports · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Reports</h1>
@@ -18,12 +18,12 @@
         <td class="num" data-m="hide">{{ r.fills }}</td><td class="num" data-m="hide">{{ r.turnover|money }}</td><td class="num" data-m="hide">{{ r.equity|money }}</td></tr>
       {% endfor %}</tbody>
     </table>
-    {% else %}<p class="empty" style="padding:4px 14px 14px">No marks yet. Months appear once sleeves have run.</p>{% endif %}
+    {% else %}<p class="empty" style="padding:4px 14px 14px">No marks yet. Months appear once strategies have run.</p>{% endif %}
   </section>
   <section class="panel span-4" aria-labelledby="dl-h">
     <div class="panel-head"><h2 id="dl-h">Downloads</h2><span class="hint">CSV</span></div>
     <form method="get" class="field" id="dl-form" style="margin-bottom:12px"><label for="dl-sleeve">For</label>
-      <select id="dl-sleeve" name="sleeve"><option value="">All sleeves</option>{% for n in sleeves %}<option>{{ n }}</option>{% endfor %}</select></form>
+      <select id="dl-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option>{{ n }}</option>{% endfor %}</select></form>
     <table class="compact kv">
       <tr><th scope="row">Every fill</th><td class="num"><a data-dl href="/exports/fills.csv">fills.csv</a></td></tr>
       <tr><th scope="row">Every order, with its reason</th><td class="num"><a data-dl href="/exports/orders.csv">orders.csv</a></td></tr>
@@ -36,7 +36,7 @@
 </div>
 {% if m.grid %}
 <section class="panel flush" aria-labelledby="g-h">
-  <div class="panel-head"><h2 id="g-h">Sleeves by month</h2><span class="hint">monthly return; shading shows size</span></div>
+  <div class="panel-head"><h2 id="g-h">Strategies by month</h2><span class="hint">monthly return; shading shows size</span></div>
   <div style="overflow-x:auto"><table class="corr heat">
     <tr><th></th>{% for mo in m.months|reverse %}<th scope="col">{{ mo }}</th>{% endfor %}</tr>
     {% for n in m.sleeves %}<tr><th scope="row" class="row"><a href="/sleeves/{{ n }}">{{ n }}</a></th>

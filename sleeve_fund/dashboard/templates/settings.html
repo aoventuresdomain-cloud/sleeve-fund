@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Settings · Sleeve Fund{% endblock %}
+{% block title %}Settings · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Settings</h1>
@@ -8,7 +8,7 @@
 <div class="grid">
   <section class="panel span-6" aria-labelledby="live-h">
     <div class="panel-head"><h2 id="live-h">Live trading</h2><span class="chip {{ 'paper' if shell.live_locked else 'live' }}">{{ 'Locked' if shell.live_locked else 'Unlocked' }}</span></div>
-    <p class="muted" style="margin:0 0 10px">A sleeve can trade real money only when all three are true. Until then every sleeve runs on paper.</p>
+    <p class="muted" style="margin:0 0 10px">A strategy can trade real money only when all three are true. Until then every strategy runs on paper.</p>
     <table class="compact kv">
       <tr><th scope="row">G2 approved by you</th><td><span class="warn">Not yet</span>: needs 6+ weeks of paper inside the backtest's range</td></tr>
       <tr><th scope="row">Server live switch</th><td><span class="warn">Off</span>: set by you on the server; not built yet</td></tr>
@@ -28,12 +28,12 @@
 </div>
 <div class="grid">
   <section class="panel flush span-7" aria-labelledby="rp-h">
-    <div class="panel-head"><h2 id="rp-h">Risk profiles</h2><span class="hint">chosen per sleeve</span></div>
+    <div class="panel-head"><h2 id="rp-h">Risk profiles</h2><span class="hint">chosen per strategy</span></div>
     <table>
       <thead><tr><th>Profile</th><th class="num">Halt at drawdown</th><th class="num">Pause at daily loss</th><th class="num">Max exposure</th></tr></thead>
       <tbody>{% for p in profiles.values() %}<tr><td><strong>{{ p.name|capitalize }}</strong></td><td class="num">{{ p.max_drawdown|pct0 }}</td><td class="num">{{ p.daily_loss|pct0 }}</td><td class="num">{{ p.max_position_pct|pct0 }}</td></tr>{% endfor %}</tbody>
     </table>
-    <p class="muted" style="margin:0;padding:8px 14px 12px;font-size:12px">A halt flattens the sleeve and waits for you. A daily-loss pause flattens and resumes after 24 hours.</p>
+    <p class="muted" style="margin:0;padding:8px 14px 12px;font-size:12px">A halt flattens the strategy and waits for you. A daily-loss pause flattens and resumes after 24 hours.</p>
   </section>
   <section class="panel span-5" aria-labelledby="fee-h">
     <div class="panel-head"><h2 id="fee-h">Costs and data</h2></div>

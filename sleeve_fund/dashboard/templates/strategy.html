@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% from "_stages.html" import stepper %}
 {% from "_macros.html" import chip, signed %}
-{% block title %}{{ r.name }} · Sleeve Fund{% endblock %}
+{% block title %}{{ r.name }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ r.name|replace('_', ' ') }}</span></p>
 <div class="page-head">
   <h1>{{ r.name|replace('_', ' ')|capitalize }}</h1>
-  <div class="actions"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest it</a> <a class="button" href="/sleeves/new?strategy={{ r.name }}">Start a sleeve with this</a></div>
+  <div class="actions"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest it</a> <a class="button" href="/sleeves/new?strategy={{ r.name }}">Start a strategy with this</a></div>
   <p class="lede">{{ summary }}</p>
 </div>
 <section class="panel" style="margin-bottom:14px">{{ stepper(r.stage, stages, r.observation) }}
@@ -28,7 +28,7 @@
     <div class="panel-head"><h2>Evidence</h2></div>
     {% if r.sheets %}<ul class="feed">{% for s in r.sheets %}<li><span class="when">{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% else %}<span class="chip">n/a</span>{% endif %}</span><span class="what"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.dataset == 'synthetic' %} <span class="warn">synthetic data</span>{% endif %}<br><span class="muted">{{ s.evidence }}</span></span></li>{% endfor %}</ul>
     {% else %}<p class="empty">Not through the research loop yet.</p>{% endif %}
-    <h2 style="margin:16px 0 8px">Sleeves running it</h2>
+    <h2 style="margin:16px 0 8px">Strategies running it</h2>
     {% if r.sleeves %}<ul class="feed">{% for s in r.sleeves %}<li><span class="when">{{ chip(s.status) }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }}</span></span></li>{% endfor %}</ul>
     {% else %}<p class="empty">None.</p>{% endif %}
   </section>

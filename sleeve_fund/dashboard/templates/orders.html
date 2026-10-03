@@ -1,19 +1,19 @@
 {% extends "base.html" %}
 {% from "_macros.html" import tag, why, why_toggle %}
-{% block title %}Orders · Sleeve Fund{% endblock %}
+{% block title %}Orders · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
   <h1>Order blotter</h1>
   <div class="actions">
     <form class="inline" method="get" action="/orders">
       <input type="hidden" name="status" value="{{ tab }}">
-      <label class="sr-only" for="o-sleeve">Sleeve</label>
-      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All sleeves</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <label class="sr-only" for="o-sleeve">Strategy</label>
+      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
       <noscript><button>Show</button></noscript>
     </form>
     <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve if sleeve }}">Download CSV</a>
   </div>
-  <p class="lede">Every order the sleeves have sent, newest first, with what it was for and the reason recorded when it was sent.</p>
+  <p class="lede">Every order the strategies have sent, newest first, with what it was for and the reason recorded when it was sent.</p>
 </div>
 
 <nav class="tabs" aria-label="Order status" data-live="order-tabs">
@@ -23,7 +23,7 @@
 <section class="panel flush" data-live="orders">
   {% if orders %}
   <table class="responsive" data-hide-lg="8" data-hide-md="4 5 10">
-    <thead><tr><th>Sent</th><th>Sleeve</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Value</th><th class="num">Fee</th><th>Status</th><th>Reason</th><th></th></tr></thead>
+    <thead><tr><th>Sent</th><th>Strategy</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Value</th><th class="num">Fee</th><th>Status</th><th>Reason</th><th></th></tr></thead>
     <tbody>{% for o in orders %}{% set rid = 'o-' ~ loop.index %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td>
       <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
@@ -51,7 +51,7 @@
     {% endfor %}</tbody>
   </table>
   {% else %}
-  <p class="empty" style="padding:14px">{% if tab == 'open' %}No orders working. Sleeves trade at market, so an order is normally open for seconds.{% elif tab == 'all' %}No orders yet. Each order a sleeve sends is listed here with its reason. <a href="/sleeves/new">Start a new sleeve</a>{% else %}None in this view.{% endif %}</p>
+  <p class="empty" style="padding:14px">{% if tab == 'open' %}No orders working. Strategies trade at market, so an order is normally open for seconds.{% elif tab == 'all' %}No orders yet. Each order a strategy sends is listed here with its reason. <a href="/sleeves/new">Start a new strategy</a>{% else %}None in this view.{% endif %}</p>
   {% endif %}
 </section>
 <p class="muted" style="font-size:12px">Orders are journaled from this release onwards. Earlier trades still appear under <a href="/trades">Positions and trades</a>, without a recorded reason.</p>

@@ -55,7 +55,7 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restore",
                              f"book restored from {self.book['fills']} journal fills: "
                              f"cash {self.book['cash']:,.2f}, position {self.book['qty']:g}")
-        self.store.event(self.name, "info", "start", f"sleeve started ({self.profile.name} risk profile)")
+        self.store.event(self.name, "info", "start", f"strategy started ({self.profile.name} risk profile)")
 
     def on_stop(self) -> None:
         if self.status in ("running", "starting"):
@@ -147,7 +147,7 @@ class SleeveRuntime:
             return True
         self._set("halted", "reconciliation mismatch")
         self.store.event(self.name, "error", "reconcile_mismatch",
-                         detail + ". Halted, nothing traded or corrected. Restart the sleeve to rebuild "
+                         detail + ". Halted, nothing traded or corrected. Restart the strategy to rebuild "
                          "from the journal, or resume once you have checked.")
         return False
 

@@ -27,7 +27,7 @@ SPEC = IdeaSpec(
     rules=(
         "Long when the fast average (simple, or exponential with ema=1) is above the slow one at the "
         "close, flat (cash) otherwise. With vol_target, hold vol_target / realised volatility of the "
-        "sleeve, at most all of it, rebalanced only past the band. Market orders, charged the taker fee."
+        "strategy's capital, at most all of it, rebalanced only past the band. Market orders, charged the taker fee."
     ),
     param_grid={"fast": [20, 50, 100], "slow": [100, 150, 200, 250]},
     default_params={"fast": 50, "slow": 200, "ema": 0, "vol_target": 0.0, "vol_lookback_days": 30},
@@ -151,6 +151,6 @@ class TrendFilter(LongFlatStrategy):
         if c.vol_target and target and self._vol:
             w = min(1.0, c.vol_target / self._vol) if self._vol > 0 else 1.0
             text += (f"; volatility is {self._vol:.0%} a year against a {c.vol_target:.0%} target, "
-                     f"so hold {w:.0%} of the sleeve")
+                     f"so hold {w:.0%} of its capital")
             values.update(volatility=self._vol, vol_target=c.vol_target)
         return text, values

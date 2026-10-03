@@ -2,7 +2,7 @@
 {% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
-{% block title %}{{ s.name }} · Sleeve Fund{% endblock %}
+{% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
   <h1>{{ s.name }}</h1> {{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>
@@ -13,23 +13,23 @@
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {{ 'disabled title="Flatten before archiving"' if x.qty > 0 }}>Archive</button>{% endif %}{% endif %}
-    <a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new sleeve from these settings">Clone with changes</a>
+    <a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
 </div>
 
 <div data-live="banners">
-{% if archived %}<div class="banner" role="status">Archived: hidden from the home page's sleeve list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
+{% if archived %}<div class="banner" role="status">Archived: hidden from the home page's strategy list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
   {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
-{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the sleeve to pick up ({{ pending|map(attribute='command')|join(', ') }}). Sleeves check about every 30 seconds.</div>{% endif %}
+{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the strategy to pick up ({{ pending|map(attribute='command')|join(', ') }}). Strategies check about every 30 seconds.</div>{% endif %}
 </div>
 
-<section class="ledger" aria-label="Sleeve figures">
+<section class="ledger" aria-label="Strategy figures">
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
   <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
@@ -49,8 +49,8 @@
       <div class="right range" role="group" aria-label="Range">
         <button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button>
       </div></div>
-    <div class="chart"><canvas id="eq" aria-label="Sleeve equity and buy-and-hold"></canvas></div>
-    <div class="chart short"><canvas id="dd" aria-label="Sleeve drawdown"></canvas></div>
+    <div class="chart"><canvas id="eq" aria-label="Strategy equity and buy-and-hold"></canvas></div>
+    <div class="chart short"><canvas id="dd" aria-label="Strategy drawdown"></canvas></div>
   </section>
   <section class="panel span-4" aria-labelledby="risk-h">
     <div class="panel-head"><h2 id="risk-h">Position and limits</h2></div>
@@ -93,7 +93,7 @@
     </div></td></tr>
     {% endfor %}</tbody>
   </table>
-  {% else %}<p class="empty" style="padding:4px 14px 14px">No closed trades yet. A trade appears here once the sleeve has bought and sold back to cash.</p>{% endif %}
+  {% else %}<p class="empty" style="padding:4px 14px 14px">No closed trades yet. A trade appears here once the strategy has bought and sold back to cash.</p>{% endif %}
   {% if fills %}
   <details class="fills"><summary>All {{ x.fills }} fills</summary>
     <table><thead><tr><th>Time</th><th>Side</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th></tr></thead>
@@ -138,7 +138,7 @@
   <section class="panel span-5" aria-labelledby="set-h">
     <div class="panel-head"><h2 id="set-h">Settings</h2><span class="hint">created {{ s.created_at|ts }}</span></div>
     <table class="compact kv">
-      <tr><th scope="row">Strategy</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
+      <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
@@ -155,13 +155,13 @@
 
 {# One confirmation dialog per command: says exactly what will happen before it does. #}
 {% set dialogs = {
-  'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause sleeve', ''),
-  'resume': ('Resume ' ~ s.name, 'The sleeve trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
-  'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the sleeve.', 'Sell to cash and pause', 'danger'),
-  'stop': ('Stop ' ~ s.name, 'Shuts the sleeve process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop sleeve', 'danger' if x.qty > 0 else ''),
-  'archive': ('Archive ' ~ s.name, 'Hides it from the sleeve list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive sleeve', ''),
-  'restore': ('Restore ' ~ s.name, 'Puts it back in the sleeve list on the home page. It stays stopped until you start it.', 'Restore sleeve', ''),
-  'start': ('Start ' ~ s.name, 'Starts the sleeve process. It picks up its journal and reconciles before trading.', 'Start sleeve', ''),
+  'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
+  'resume': ('Resume ' ~ s.name, 'The strategy trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
+  'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
+  'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty > 0 else ''),
+  'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
+  'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
+  'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 <div data-live="dialogs" data-live-forms>
 <datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>

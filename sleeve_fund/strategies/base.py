@@ -355,7 +355,7 @@ class LongFlatStrategy(Strategy):
         if weight < 1:
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         if self._cfg.max_notional is not None:
-            limits["sleeve cap"] = Decimal(str(self._cfg.max_notional))
+            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
                 str(self.runtime.position_budget(self._mark()[0])))

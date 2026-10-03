@@ -42,7 +42,7 @@ INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 
-security = HTTPBasic(realm="Sleeve Fund")
+security = HTTPBasic(realm="Multi-Strategy Fund")
 
 
 def _password() -> str:
@@ -59,7 +59,7 @@ def require_pm(creds: HTTPBasicCredentials = Depends(security)) -> str:
         and secrets.compare_digest(creds.password.encode(), pw.encode())
     ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong user or password",
-                            headers={"WWW-Authenticate": 'Basic realm="Sleeve Fund"'})
+                            headers={"WWW-Authenticate": 'Basic realm="Multi-Strategy Fund"'})
     return "PM"
 
 
@@ -72,7 +72,7 @@ def same_origin(request: Request) -> None:
 
 def create_app(store: Store | None = None) -> FastAPI:
     _password()  # fail at start-up, not on first request
-    app = FastAPI(title="Sleeve Fund", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store or Store()
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
@@ -202,7 +202,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("a reason is required")
             params = _form_params(form, strategy)
             if form.get("from") == "backtest" and form.get("bar_spec") != BACKTEST_BAR_SPEC:
-                raise ValueError(f"interval: the backtest decided on daily bars, so this sleeve must too "
+                raise ValueError(f"interval: the backtest decided on daily bars, so this strategy must too "
                                  f"({BACKTEST_BAR_SPEC}); backtest another interval before changing it")
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=str(form.get("bar_spec", "")),
@@ -211,7 +211,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                risk_profile=str(form.get("risk_profile", "")))
             _check_strategy_params(cfg)
             if any(s.name == name for s in st().sleeves()):
-                raise ValueError(f"a sleeve called {name} already exists")
+                raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
             kinds = {a["name"]: a["kind"] for a in st().accounts()}
             if account not in kinds:
@@ -258,7 +258,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             s = st().sleeve(name)
         except KeyError:
-            raise HTTPException(404, "no such sleeve") from None
+            raise HTTPException(404, "no such strategy") from None
         x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
         fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
@@ -281,7 +281,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             s = st().sleeve(name)
         except KeyError:
-            raise HTTPException(404, "no such sleeve") from None
+            raise HTTPException(404, "no such strategy") from None
         interval = interval if interval in charts.INTERVALS else charts.default_interval(s.bar_spec)
         minutes = charts.INTERVALS[interval]
         try:
@@ -301,7 +301,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             s = st().sleeve(name)
         except KeyError:
-            raise HTTPException(404, "no such sleeve") from None
+            raise HTTPException(404, "no such strategy") from None
         rows = st().equity_series(name, limit=500_000)
         intraday = bool(rows) and (rows[-1]["ts"] - rows[0]["ts"]).total_seconds() < 3 * 86400
         if intraday:
@@ -340,7 +340,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             else:
                 st().command(name, command, reason, actor=actor)
         except KeyError:
-            raise HTTPException(404, "no such sleeve") from None
+            raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
@@ -359,7 +359,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("unknown action")
             st().decide(actor, action, reason, name)
         except KeyError:
-            raise HTTPException(404, "no such sleeve") from None
+            raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
@@ -415,7 +415,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
         names = [s.name for s in st().sleeves()]
         if sleeve and sleeve not in names:
-            raise HTTPException(404, "no such sleeve")
+            raise HTTPException(404, "no such strategy")
         chosen = [sleeve] if sleeve else names
         if kind == "fills":
             rows = [f for n in chosen for f in reversed(st().fills(n, limit=1_000_000))]
@@ -636,7 +636,7 @@ def _decision_filters(request: Request) -> dict:
 def _csv(name: str, body: str) -> Response:
     stamp = utcnow().strftime("%Y%m%d")
     return Response(body, media_type="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="sleeve-fund-{name}-{stamp}.csv"'})
+                    headers={"Content-Disposition": f'attachment; filename="fund-{name}-{stamp}.csv"'})
 
 
 def _bytes(n) -> str:
