@@ -1,7 +1,8 @@
 name: deploy
 # Ships main to the paper server. Needs repository secrets:
 #   DEPLOY_HOST          server IP or hostname
-#   DEPLOY_SSH_KEY       private key whose public half is in the server's authorized_keys (user root)
+#   DEPLOY_SSH_KEY       private key whose public half is in the server's authorized_keys
+# Optional variable DEPLOY_USER: login user (default root; AWS Lightsail Ubuntu uses ubuntu, with sudo).
 #   DASHBOARD_PASSWORD   the PM dashboard password (letters and digits; no $)
 # Optional: SITE_ADDRESS (defaults to <DEPLOY_HOST>.sslip.io for free HTTPS without a domain).
 # No exchange credentials are involved: this stack is paper only.
@@ -13,6 +14,8 @@ concurrency: deploy
 jobs:
   deploy:
     runs-on: ubuntu-24.04
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
     if: ${{ vars.DEPLOY_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
@@ -28,9 +31,10 @@ jobs:
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          ssh -i ~/.ssh/id_deploy root@"$HOST" 'mkdir -p /opt/sleeve-fund'
-          rsync -az --delete --exclude .git --exclude .env --exclude data \
-            -e "ssh -i ~/.ssh/id_deploy" ./ root@"$HOST":/opt/sleeve-fund/
+          # sudo is a no-op for root and needed for a non-root user such as Lightsail's ubuntu.
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo mkdir -p /opt/sleeve-fund'
+          rsync -az --delete --exclude .git --exclude .env --exclude data --rsync-path="sudo rsync" \
+            -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
       - name: Start stack
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -40,5 +44,5 @@ jobs:
           SITE="${SITE_ADDRESS:-$HOST.sslip.io}"
           # Secrets go over stdin, never on a command line.
           printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q\n' "$DASHBOARD_PASSWORD" "$SITE" | \
-            ssh -i ~/.ssh/id_deploy root@"$HOST" 'eval "$(cat)"; bash /opt/sleeve-fund/deploy/remote_up.sh'
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
