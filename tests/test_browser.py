@@ -121,3 +121,37 @@ def test_order_type_shows_the_wait_only_for_maker_orders(site, browser):
     assert page.is_visible("#maker_wait_minutes")
     assert errors == []
     page.context.close()
+
+
+@pytest.mark.parametrize("path", PAGES)
+def test_page_fits_a_phone_without_sideways_scrolling(site, browser, path):
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                              viewport={"width": 390, "height": 844})
+    page = ctx.new_page()
+    page.goto(site + path)
+    page.wait_for_load_state("networkidle")
+    wide = page.evaluate("""() => {
+        const vw = document.documentElement.clientWidth;
+        const out = [];
+        for (const el of document.querySelectorAll('body *')) {
+            const r = el.getBoundingClientRect();
+            if (r.width && r.right > vw + 1 && !el.closest('.scroll-x, .table-wrap')) out.push(
+                `${el.tagName.toLowerCase()}.${[...el.classList].join('.')}#${el.id} right=${Math.round(r.right)}`);
+        }
+        return {sw: document.documentElement.scrollWidth, vw, out: out.slice(0, 8)};
+    }""")
+    ctx.close()
+    assert wide["sw"] <= wide["vw"], wide
+
+
+def test_backtest_result_comes_before_its_settings_on_a_phone(site, browser):
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                              viewport={"width": 390, "height": 844})
+    page = ctx.new_page()
+    page.goto(site + PAGES[-1])
+    page.wait_for_load_state("networkidle")
+    head, form = page.locator(".bt-head").bounding_box(), page.locator("#bt-form").bounding_box()
+    if os.environ.get("SCREENSHOT_DIR"):
+        page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "backtest-390.png"), full_page=False)
+    ctx.close()
+    assert head["y"] < form["y"]

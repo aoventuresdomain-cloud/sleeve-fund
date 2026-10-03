@@ -406,6 +406,13 @@ table.compare td:nth-child(3) { color: var(--muted); }
 ol.steps-list { margin: 0 0 12px; padding-left: 20px; display: grid; gap: 8px; }
 .bt-head .panel-head .button { margin-left: auto; }
 @media (max-width: 900px) { .bt-head .panel-head .button { margin: 8px 0 0; width: 100%; justify-content: center; } }
+/* Phones: a result comes before the settings that made it, and the comparison wraps to fit. */
+@media (max-width: 1100px) { .bt-form.has-result { order: 2; } .m-jump { display: inline-block; margin-top: 4px; } }
+@media (min-width: 1101px) { .m-jump { display: none; } }
+@media (max-width: 900px) {
+  table.compare th, table.compare td { white-space: normal; padding-left: 6px; padding-right: 6px; }
+  table.compare th:first-child { padding-left: 0; } table.compare td:last-child { padding-right: 0; }
+}
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); padding: 1px 4px; border-radius: 4px; }
 pre.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--raised); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 0; }
 /* --- price chart ---------------------------------------------------------------- */

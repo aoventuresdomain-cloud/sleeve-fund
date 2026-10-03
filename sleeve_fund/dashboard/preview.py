@@ -165,6 +165,21 @@ def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: floa
     return starting * (1 - cap) + starting * cap * (1 - taker_fee) * prices["close"] / prices["close"].iloc[0]
 
 
+def _data_note(prices: pd.DataFrame, minutes: int) -> dict:
+    """Long stretches with no trades in the bars tested: kept flat, as the venue reported, but said."""
+    from sleeve_fund.history import quiet_runs
+
+    q = quiet_runs(prices, minutes)
+    note = ""
+    if q["count"]:
+        hours = q["longest_minutes"] / 60
+        note = (f"The price history has {q['count']} stretch{'es' if q['count'] != 1 else ''} of an hour or more "
+                f"with no trades (the longest, {hours:.0f} hour{'s' if round(hours) != 1 else ''}, ended "
+                f"{q['longest_end']:%d %b %Y %H:%M} UTC). They are held flat at the last price, as the venue "
+                "reported no trades; a long one may be a venue outage.")
+    return {**q, "longest_end": q["longest_end"].isoformat() if q["longest_end"] is not None else None, "note": note}
+
+
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
         risk_profile: str | None = None, spread_quote=None, minutes: int = 1440) -> dict:
@@ -233,6 +248,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
+        "data": _data_note(prices, minutes),
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
@@ -261,4 +277,6 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         opened = candles.set_axis(candles.index - pd.Timedelta(minutes=shown))
         out["price"] = charts.payload(opened, shown, rows, res.decisions, [], "venue", shift_bars=1)
         out["chart_minutes"] = shown
+        out["chart_label"] = "daily candles" if shown == 1440 else (
+            f"{shown // 60}-hour candles" if shown % 60 == 0 else f"{shown}-minute candles")
     return out

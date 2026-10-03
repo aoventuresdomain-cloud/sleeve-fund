@@ -778,3 +778,22 @@ def test_trade_built_intervals_get_a_warm_up_from_the_store():
     # Venue candles stop at one request (720); bars built from trades load from the history store.
     assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-EXTERNAL") == 720
     assert _warmup_for("trend_filter", {"p_trend_filter__slow": "1000"}, "1-HOUR-LAST-INTERNAL") > 720
+
+
+def test_backtest_says_when_its_history_has_long_quiet_stretches(client, monkeypatch, tmp_path):
+    """Review R2-M1: a stretch with no trades is held flat, as the venue reported, and said on the page."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    minutes = _wavy_minutes(20)
+    gap = (minutes.index >= minutes.index[4980]) & (minutes.index < minutes.index[4980 + 180])
+    minutes.loc[gap, "volume"] = 0.0
+    minutes.loc[gap, ["open", "high", "low", "close"]] = minutes["close"].iloc[4979]
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", minutes, cursor="x")
+    preview._history.clear()
+    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-HOUR-LAST-INTERNAL",
+                 auth=AUTH).text
+    assert "1 stretch of an hour or more with no trades" in page and "3 hours" in page
+    assert "ETH/USD 1-hour candles" in page
