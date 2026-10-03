@@ -363,11 +363,37 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     assert "Trend filter on ETH/USD" in page and "Every trade" in page and "Buy and hold" in page
     assert "5-bar average" in page and "above the 20-bar average" in page  # the entry reasons, from the strategy
     assert "365 days" in page
+    # The sleeve decides on the daily bars that were tested, warm from its first bar (2 x the slow 20).
     assert ('href="/sleeves/new?instrument=ETH%2FUSD&amp;strategy=trend_filter&amp;p_trend_filter__fast=5'
-            '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;from=backtest"') in page
-    form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest",
-                 auth=AUTH).text
+            '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;bar_spec=1-DAY-LAST-EXTERNAL'
+            '&amp;warmup_bars=40&amp;from=backtest"') in page
+    assert "33% invested" in page  # the benchmark is held at the balanced profile's cap
+    form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest"
+                 "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
     assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "carried over" in form
+    assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
+    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="720" value="40"' in form
+
+
+def test_sleeve_from_a_backtest_cannot_change_its_interval(client):
+    c, _ = client
+    r = _new(c, name="bt-hourly", bar_spec="1-HOUR-LAST-INTERNAL", **{"from": "backtest"})
+    assert r.status_code == 303 and "interval" in r.headers["location"] and "/sleeves/new" in r.headers["location"]
+    r = _new(c, name="bt-daily", bar_spec="1-DAY-LAST-EXTERNAL", warmup_bars="400", **{"from": "backtest"})
+    assert r.headers["location"] == "/sleeves/bt-daily"
+
+
+def test_backtest_sizes_with_the_chosen_risk_profile(client, monkeypatch):
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    preview._history.clear()
+    monkeypatch.setattr(preview, "fetch_kraken_daily", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&risk_profile=conservative"
+                 "&max_notional=1000&period=365", auth=AUTH).text
+    assert "20% invested" in page and "sleeve cap" in page  # the 1,000 order cap binds before the 20% cap
+    assert "risk profile" in c.get("/backtest?run=1&instrument=ETH/USD&risk_profile=reckless", auth=AUTH).text
 
 
 @pytest.mark.parametrize("query, msg", [

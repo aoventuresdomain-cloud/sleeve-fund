@@ -8,14 +8,16 @@
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
 {% if pre.get('from') == 'clone' %}<div class="banner">Settings copied from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>. Change what you want to test, give it a reason, and start it on paper. {{ pre.get('source') }} keeps running unchanged.</div>{% endif %}
-{% if pre.get('from') == 'backtest' %}<div class="banner">Settings carried over from your backtest. Pick a decision interval, a name and a reason, then start it on paper.</div>{% endif %}
+{% set from_bt = pre.get('from') == 'backtest' %}
+{% if from_bt %}<div class="banner">Settings carried over from your backtest, including its daily decision interval and enough history to start with indicators ready. Give it a name and a reason, then start it on paper.</div>{% endif %}
 <form method="post" action="/sleeves/new" id="sleeve-form" class="grid">
+  {% if from_bt %}<input type="hidden" name="from" value="backtest"><input type="hidden" name="bar_spec" value="{{ pre.get('bar_spec') }}">{% endif %}
   <div class="span-7">
     <fieldset class="panel step">
       <legend>1. Market</legend>
       <div class="grid2">
         {{ pair_field(instruments, pre) }}
-        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">How often the strategy looks at the market and may trade.</p></div>
+        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">{{ 'Fixed to the interval the backtest used. To trade another interval, backtest it first.' if from_bt else 'How often the strategy looks at the market and may trade.' }}</p></div>
       </div>
     </fieldset>
     <fieldset class="panel step">

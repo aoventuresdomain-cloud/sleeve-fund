@@ -43,10 +43,19 @@ def _precision(price: float) -> int:
     return 2 if price >= 100 else 4 if price >= 1 else 6
 
 
+def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: float = 1.0) -> pd.Series:
+    """Buy and hold at the same exposure the sleeve is allowed: `cap` of capital bought on day one
+    (after the taker fee), the rest left in cash. Comparing a 33%-capped strategy with a fully
+    invested benchmark would credit the strategy for simply holding less."""
+    return starting * (1 - cap) + starting * cap * (1 - taker_fee) * prices["close"] / prices["close"].iloc[0]
+
+
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
-        detail: bool = False) -> dict:
+        detail: bool = False, cap: float | None = None) -> dict:
     """Backtest these settings on Kraken daily history. days trims to the most recent N days;
-    detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page)."""
+    detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
+    cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
+    and the buy-and-hold benchmark is held at the same exposure."""
     prices = history(pair, fetch)
     if days:
         prices = prices.iloc[-days:]
@@ -54,8 +63,10 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         raise ValueError(f"only {len(prices)} days of Kraken history for {pair}; need at least 60")
     base, quote = pair.split("/")
     inst = spot_pair(base, quote, price_precision=_precision(float(prices["close"].median())))
+    if cap is not None:
+        params = {**params, "position_cap_pct": cap}
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting)
-    bench = starting * (1 - float(inst.taker_fee)) * prices["close"] / prices["close"].iloc[0]
+    bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     s, b = summary(returns_from_equity(res.equity)), summary(returns_from_equity(bench))
     rows = fills_to_rows(res.fills)
     trips = trades(rows)
@@ -74,6 +85,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "trades": {k: _finite(stats[k]) for k in ("trades", "win_rate", "expectancy", "profit_factor")},
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
+        "cap": cap,
     }
     if detail:
         from sleeve_fund.dashboard import trading

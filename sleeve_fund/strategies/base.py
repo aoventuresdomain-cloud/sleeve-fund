@@ -15,7 +15,7 @@ from typing import Any
 from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
-from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, PriceType, Quantity, TimeInForce
+from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, Price, PriceType, Quantity, TimeInForce
 from nautilus_trader.trading import Strategy
 
 
@@ -68,6 +68,7 @@ class LongFlatConfig(StrategyConfig):
         stop_loss: float | None = None,
         take_profit: float | None = None,
         risk_per_trade: float | None = None,
+        position_cap_pct: float | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -86,6 +87,8 @@ class LongFlatConfig(StrategyConfig):
                              ("risk_per_trade", risk_per_trade, 0.2)):
             if v is not None and not 0 < v <= hi:
                 raise ValueError(f"{label} {v} outside (0, {hi}]; use a fraction, e.g. 0.05 for 5%")
+        if position_cap_pct is not None and not 0 < position_cap_pct <= 1:
+            raise ValueError(f"position_cap_pct {position_cap_pct} outside (0, 1]")
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
         self.instrument_id = instrument_id
@@ -103,6 +106,9 @@ class LongFlatConfig(StrategyConfig):
         self.take_profit = take_profit
         # Optional sizing: lose at most this fraction of equity if the stop is hit.
         self.risk_per_trade = risk_per_trade
+        # Backtest only: the risk profile's position cap (a share of equity), so a backtest sizes
+        # exactly as paper does. Paper and live take the cap from the sleeve's runtime instead.
+        self.position_cap_pct = position_cap_pct
 
 
 class LongFlatStrategy(Strategy):
@@ -119,6 +125,7 @@ class LongFlatStrategy(Strategy):
         self._entry_px = None  # average entry price of the open position
         self._entry_qty = 0.0
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
+        self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -198,7 +205,9 @@ class LongFlatStrategy(Strategy):
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         self._maybe_tick()
-        if self._check_exits(self._last_close):
+        if self._pending_exit is not None:
+            return
+        if self._check_exits(self._last_close, high=bar.high.as_double()):
             return
         target = self.want_long(bar)
         if target is None:
@@ -219,16 +228,26 @@ class LongFlatStrategy(Strategy):
             reason, values = self.explain(bar, target)
             self._sell_all("exit", reason, {**values, "close": bar.close.as_double()})
 
-    def _check_exits(self, price: float) -> bool:
-        """Stop-loss / take-profit against the average entry. True if an exit was sent."""
+    def _check_exits(self, price: float, high: float | None = None) -> bool:
+        """Stop-loss / take-profit against the average entry. True if an exit was sent.
+
+        Paper and live call this on every trade, so both levels are watched tick by tick. A
+        backtest only sees whole bars: its stop rests at the venue (_rest_stop), which fills at
+        the level, or at the open if the bar gaps through it, and the target is checked on the
+        bar's high but sold at the close. When one bar touches both, the stop wins, and a target
+        exit is never priced better than the close."""
         cfg = self._cfg
         if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
             return False
         if self.cache.orders_inflight(strategy_id=self.strategy_id):
             return False
         move = price / self._entry_px - 1
-        hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
-               else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
+        if self.runtime is None:
+            peak = max(high or price, price) / self._entry_px - 1
+            hit = "take_profit" if cfg.take_profit and peak >= cfg.take_profit else None
+        else:
+            hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
+                   else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
@@ -261,6 +280,9 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
                 str(self.runtime.position_budget(self._mark()[0])))
+        elif self._cfg.position_cap_pct is not None:
+            equity = self._mark()[0] or float(free.as_decimal())
+            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
         if self._cfg.risk_per_trade:
             equity = self._mark()[0] or float(free.as_decimal())
             limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss))
@@ -315,6 +337,11 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
+        if self.runtime is None and self.cache.orders_open(instrument_id=self._cfg.instrument_id):
+            # The resting stop holds the position; cancel it and sell once the cancel confirms.
+            self._pending_exit = (intent, reason, values)
+            self.cancel_all_orders(self._cfg.instrument_id)
+            return
         step = self.instrument.size_increment.as_decimal()
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
@@ -398,6 +425,10 @@ class LongFlatStrategy(Strategy):
 
     def on_order_canceled(self, event) -> None:
         self._order_status(event, "canceled")
+        if self._pending_exit is not None and not self.cache.orders_open(instrument_id=self._cfg.instrument_id):
+            intent, reason, values = self._pending_exit
+            self._pending_exit = None
+            self._sell_all(intent, reason, values)
 
     def on_order_expired(self, event) -> None:
         self._order_status(event, "expired")
@@ -413,6 +444,10 @@ class LongFlatStrategy(Strategy):
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
         if self.runtime is None:
+            if event.is_buy:
+                self._rest_stop()
+            elif self.decisions.get(str(event.client_order_id), {}).get("intent") == "stop_loss":
+                self._exit_lock = True
             return
         fee = event.commission.as_double() if event.commission is not None else 0.0
         self.runtime.on_fill(
@@ -423,6 +458,32 @@ class LongFlatStrategy(Strategy):
             order_id=str(event.client_order_id),
             trade_id=str(event.trade_id),
         )
+
+    def _rest_stop(self) -> None:
+        """Backtest only: after an entry fills, rest a sell stop at the stop-loss level, as a real
+        stop order would sit at the venue. Bars are matched open, high, low, close, so it fills at
+        the level within the bar, or at the open when the price gaps through it."""
+        if not self._cfg.stop_loss or self._entry_px is None:
+            return
+        qty = self._position_qty(free=True).quantize(self.instrument.size_increment.as_decimal(), rounding=ROUND_DOWN)
+        if qty < self._min_qty():
+            return
+        level = self._entry_px * (1 - self._cfg.stop_loss)
+        order = self.order_factory.stop_market(
+            instrument_id=self._cfg.instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
+            trigger_price=Price(level, self.instrument.price_precision),
+            time_in_force=TimeInForce.GTC,
+        )
+        self.decisions[str(order.client_order_id)] = {
+            "intent": "stop_loss",
+            "reason": (f"Stop-loss: resting sell at {level:,.6g}, {self._cfg.stop_loss:.1%} below the "
+                       f"{self._entry_px:,.6g} entry; fills at that level, or the open if the price gaps through"),
+            "signal": {"entry_px": round(self._entry_px, 8), "stop_loss": self._cfg.stop_loss,
+                       "trigger": round(level, 8)},
+        }
+        self.submit_order(order)
 
     def on_stop(self) -> None:
         self.cancel_all_orders(self._cfg.instrument_id)

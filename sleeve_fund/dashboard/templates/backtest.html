@@ -18,6 +18,10 @@
       <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
+    <div class="grid2">
+      <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: positions up to {{ p.max_position_pct|pct0 }}</option>{% endfor %}</select><p class="hint">Caps each position exactly as paper trading will.</p></div>
+      <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
+    </div>
     <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('take_profit_pct') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre) }}</details>
     <p style="margin:14px 0 0"><button>Run backtest</button></p>
   </form>
@@ -32,7 +36,7 @@
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This strategy hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
       <table class="compare">
-        <thead><tr><th></th><th class="num">Strategy</th><th class="num">Buy and hold</th></tr></thead>
+        <thead><tr><th></th><th class="num">Strategy</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>
         <tbody>
           <tr><th scope="row">Return</th><td class="num">{{ signed(s.total_return) }}</td><td class="num">{{ h.total_return|pct }}</td></tr>
           <tr><th scope="row">A year (CAGR) {{ help('cagr') }}</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
