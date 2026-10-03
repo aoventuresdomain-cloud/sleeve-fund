@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Decisions · Sleeve Fund{% endblock %}
+{% block content %}
+<h1>Decision log</h1>
+<p class="sub">Every start, stop, pause, flatten and resume, with who and why.</p>
+<div class="panel">
+<table><tr><th>Time</th><th>Who</th><th>Action</th><th>Sleeve</th><th>Reason</th></tr>
+{% for d in decisions %}<tr><td>{{ d.ts|ts }}</td><td>{{ d.actor }}</td><td>{{ d.action }}</td><td>{% if d.sleeve %}<a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% endif %}</td><td style="white-space:normal">{{ d.reason }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No decisions yet.</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

@@ -1,0 +1,20 @@
+# Idea #1 from the plan as it would run for real: 50/200-day trend filter on BTC.
+# Warms up on Kraken's daily history at start, then acts once a day.
+
+[sleeve]
+name = "btc-trend-daily"
+strategy = "trend_filter"
+instrument = "BTC/USD"
+bar_spec = "1-DAY-LAST-EXTERNAL"
+starting_balance = 10000
+max_notional = 10000
+warmup_bars = 250
+risk_profile = "balanced"
+
+[params]
+fast = 50
+slow = 200
+
+[fees]
+maker = 0.0040
+taker = 0.0080

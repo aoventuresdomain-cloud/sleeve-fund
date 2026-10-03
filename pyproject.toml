@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sleeve-fund"
+version = "0.1.0"
+description = "Sleeve Fund: research loop and paper trading on NautilusTrader"
+requires-python = ">=3.12,<3.14"
+# NautilusTrader 2.x is the first line with a Kraken adapter. It is a release
+# candidate: fine for research and paper, re-check before any live money (G2).
+dependencies = [
+    "nautilus_trader==2.0.0rc5",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "markdown>=3.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["sleeve_fund*"]
+
+[tool.setuptools.package-data]
+"sleeve_fund.dashboard" = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}New paper sleeve · Sleeve Fund{% endblock %}
+{% block content %}
+<h1>New paper sleeve</h1>
+<p class="sub">Runs on live Kraken prices with paper money and Kraken's fees. It starts within a few seconds of saving.</p>
+{% if error %}<div class="error-box">{{ error }}</div>{% endif %}
+<form method="post" action="/sleeves/new" class="panel">
+  <div class="grid2">
+    <div class="field"><label>Name</label><input name="name" placeholder="eth-trend-fast" pattern="[a-z0-9][a-z0-9-]{1,40}" required></div>
+    <div class="field"><label>Strategy</label>
+      <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == 'trend_filter' }}>{{ st.name }} ({{ st.family }})</option>{% endfor %}</select></div>
+    <div class="field"><label>Asset pair (any Kraken spot pair, BASE/QUOTE)</label><input name="instrument" list="pairs" value="BTC/USD" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist></div>
+    <div class="field"><label>Bar size</label><select name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == '1-HOUR-LAST-INTERNAL' }}>{{ bar_label(b) }}</option>{% endfor %}</select></div>
+    <div class="field"><label>Paper balance (quote currency)</label><input name="starting_balance" type="number" min="100" step="100" value="10000" required></div>
+    <div class="field"><label>Max per order (optional)</label><input name="max_notional" type="number" min="10" step="10"></div>
+    <div class="field"><label>Stop-loss % below entry (optional)</label><input name="stop_loss_pct" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 8"></div>
+    <div class="field"><label>Take-profit % above entry (optional)</label><input name="take_profit_pct" type="number" min="0.1" max="1000" step="0.1" placeholder="e.g. 20"></div>
+    <div class="field"><label>Risk per trade, % of equity (needs a stop)</label><input name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 1"></div>
+    <div class="field"><label>Risk profile</label><select name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == 'balanced' }}>{{ p.name }}: halt at {{ p.max_drawdown|pct0 }} drawdown, max {{ p.max_position_pct|pct0 }} in the market</option>{% endfor %}</select></div>
+    <div class="field"><label>Warm-up bars (EXTERNAL bar sizes only)</label><input name="warmup_bars" type="number" min="0" max="720" value="0"></div>
+  </div>
+  {% for st in strategies %}
+  <div class="params" data-strategy="{{ st.name }}" style="margin-top:14px">
+    <p class="muted" style="margin:0 0 8px">{{ st.idea }}</p>
+    <div class="grid2">{% for k, v in st.params.items() %}<div class="field"><label>{{ k }}</label><input name="p_{{ st.name }}__{{ k }}" value="{{ v }}"></div>{% endfor %}</div>
+  </div>
+  {% endfor %}
+  <div class="field" style="margin-top:14px"><label>Why are you starting this sleeve?</label><input name="reason" required placeholder="Goes in the decision log"></div>
+  <p style="margin-top:14px"><button>Start paper sleeve</button></p>
+</form>
+<script>
+const sel = document.getElementById("strategy");
+const sync = () => document.querySelectorAll(".params").forEach(p => p.style.display = p.dataset.strategy === sel.value ? "" : "none");
+sel.addEventListener("change", sync); sync();
+</script>
+{% endblock %}

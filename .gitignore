@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/*.csv
+data/*.zip
+data/catalog/
+.env
+*.key
+research/idea_ledger.synthetic.jsonl
+research/tearsheets/*_synthetic.md
+logs/
+*.egg-info/
+.pytest_cache/
+data/*.db
+data/*.db-*

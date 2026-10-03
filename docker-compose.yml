@@ -1,0 +1,47 @@
+# Paper fund on one machine: database, sleeve supervisor, dashboard, HTTPS.
+# Paper only: no venue credentials exist anywhere in this stack.
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sleeve_fund
+      POSTGRES_USER: sleeve
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sleeve -d sleeve_fund"]
+      interval: 5s
+      retries: 20
+
+  supervisor:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+    command: sh -c "python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run"
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
+    command: uvicorn --factory sleeve_fund.dashboard.app:create_app --host 0.0.0.0 --port 8000 --proxy-headers
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [dashboard]
+    ports: ["80:80", "443:443"]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+
+volumes:
+  pgdata:
+  caddy_data:

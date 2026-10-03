@@ -1,0 +1,13 @@
+name: stack-e2e
+# Builds and runs the whole stack (Postgres, supervisor, dashboard, Caddy) against
+# Kraken's live public feed. Paper only; no secrets are configured or used.
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/stack_e2e.sh 150

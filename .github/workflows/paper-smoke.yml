@@ -1,0 +1,27 @@
+name: paper-smoke
+# Runs on PRs that touch the paper path, or manually: connects to Kraken's public feed and checks live bars arrive.
+# Paper only. No secrets are configured or used.
+on:
+  pull_request:
+    paths:
+      - "sleeve_fund/paper/**"
+      - "sleeve_fund/strategies/**"
+      - "configs/sleeves/**"
+      - "scripts/paper_smoke.sh"
+      - ".github/workflows/paper-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to run"
+        default: "4"
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: scripts/paper_smoke.sh "${{ inputs.minutes || '4' }}"
