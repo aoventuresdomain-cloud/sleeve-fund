@@ -53,3 +53,23 @@ def test_study_end_to_end_and_holdout_flag(tmp_path, instrument):
     second = run_study(SPEC, prices, instrument, use_holdout=True, **kw)
     assert second.holdout_reused
     assert "holdout opened more than once" in render(second, ledger)
+
+
+def test_trade_stats_after_fees_with_partial_fills():
+    from sleeve_fund.research.metrics import trade_stats, trades
+
+    rows = [
+        {"side": "BUY", "qty": 0.5, "price": 100, "fee": 0.4},
+        {"side": "BUY", "qty": 0.5, "price": 100, "fee": 0.4},
+        {"side": "SELL", "qty": 1.0, "price": 120, "fee": 0.96},  # +20 gross, +18.24 net
+        {"side": "SELL", "qty": 1.0, "price": 999, "fee": 0},  # nothing open: ignored
+        {"side": "BUY", "qty": 1.0, "price": 100, "fee": 0.8},
+        {"side": "SELL", "qty": 1.0, "price": 95, "fee": 0.76},  # -5 gross, -6.56 net
+        {"side": "BUY", "qty": 1.0, "price": 100, "fee": 0.8},  # still open: not counted
+    ]
+    t = trades(rows)
+    assert [round(x["pnl"], 2) for x in t] == [18.24, -6.56]
+    s = trade_stats(t)
+    assert s["trades"] == 2 and s["win_rate"] == 0.5 and round(s["pnl"], 2) == 11.68
+    assert round(s["profit_factor"], 2) == round(18.24 / 6.56, 2)
+    assert trade_stats([])["trades"] == 0

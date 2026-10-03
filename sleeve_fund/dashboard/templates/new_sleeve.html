@@ -13,6 +13,9 @@
     <div class="field"><label>Bar size</label><select name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == '1-HOUR-LAST-INTERNAL' }}>{{ bar_label(b) }}</option>{% endfor %}</select></div>
     <div class="field"><label>Paper balance (quote currency)</label><input name="starting_balance" type="number" min="100" step="100" value="10000" required></div>
     <div class="field"><label>Max per order (optional)</label><input name="max_notional" type="number" min="10" step="10"></div>
+    <div class="field"><label>Stop-loss % below entry (optional)</label><input name="stop_loss_pct" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 8"></div>
+    <div class="field"><label>Take-profit % above entry (optional)</label><input name="take_profit_pct" type="number" min="0.1" max="1000" step="0.1" placeholder="e.g. 20"></div>
+    <div class="field"><label>Risk per trade, % of equity (needs a stop)</label><input name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 1"></div>
     <div class="field"><label>Risk profile</label><select name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == 'balanced' }}>{{ p.name }}: halt at {{ p.max_drawdown|pct0 }} drawdown, max {{ p.max_position_pct|pct0 }} in the market</option>{% endfor %}</select></div>
     <div class="field"><label>Warm-up bars (EXTERNAL bar sizes only)</label><input name="warmup_bars" type="number" min="0" max="720" value="0"></div>
   </div>

@@ -17,7 +17,15 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.research.ledger import IdeaLedger
-from sleeve_fund.research.metrics import returns_from_equity, round_trips, summary, turnover_per_year
+from sleeve_fund.research.metrics import (
+    fills_to_rows,
+    returns_from_equity,
+    round_trips,
+    summary,
+    trade_stats,
+    trades,
+    turnover_per_year,
+)
 from sleeve_fund.research.runner import BacktestResult, run_backtest
 from sleeve_fund.strategies.base import IdeaSpec
 
@@ -59,6 +67,10 @@ class StudyResult:
         return round_trips(self.full_period.fills)
 
     @property
+    def trade_stats(self) -> dict:
+        return trade_stats(trades(fills_to_rows(self.full_period.fills)))
+
+    @property
     def turnover(self) -> float:
         return turnover_per_year(self.full_period.fills, self.full_period.equity)
 
@@ -85,7 +97,9 @@ def run_study(
     test_days: int = 365,
     use_holdout: bool = False,
     starting_capital: float = 10_000.0,
+    exits: dict | None = None,
 ) -> StudyResult:
+    """exits: optional stop_loss / take_profit / risk_per_trade applied to every strategy run."""
     if len(prices) < holdout_days + train_days + test_days:
         raise ValueError(
             f"{len(prices)} bars is too short for holdout {holdout_days} + train {train_days} + test {test_days}"
@@ -94,11 +108,17 @@ def run_study(
     combos = grid(spec.param_grid)
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
 
+    exits = {k: v for k, v in (exits or {}).items() if v is not None}
+
     def bt(name: str, df: pd.DataFrame, params: dict) -> BacktestResult:
+        if name != "buy_and_hold":
+            params = {**params, **exits}
         return run_backtest(name, df, instrument, params, starting_capital=starting_capital)
 
     def log(params: dict, stage: str, sharpe: float) -> None:
-        ledger.record(idea=spec.name, family=spec.family, params=params, dataset=dataset, stage=stage, sharpe=sharpe)
+        # Exit settings make it a different variant, so they count towards the idea counter.
+        ledger.record(idea=spec.name, family=spec.family, params={**params, **exits}, dataset=dataset, stage=stage,
+                      sharpe=sharpe)
 
     # Benchmark over the research period; sliced for every comparison below.
     bench = bt("buy_and_hold", research, {})
@@ -168,6 +188,12 @@ def run_study(
         oos_benchmark_returns=pd.concat(bench_parts),
         fee_note=f"{float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} taker, taker charged on every order",
     )
+    if exits:
+        result.notes.append(
+            "Exits on top of the signal: " + ", ".join(f"{k.replace('_', ' ')} {v:.1%}" for k, v in exits.items())
+            + ". Stops and targets are checked at each bar's close, so the backtest misses moves inside the bar; "
+            "live paper checks them on every trade."
+        )
 
     # 3. Holdout, only on request, using the most recent fold's choice.
     if use_holdout and holdout_days:

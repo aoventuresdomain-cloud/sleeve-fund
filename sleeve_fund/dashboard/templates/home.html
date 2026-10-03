@@ -18,7 +18,7 @@
 <div class="panel">
 {% if summaries %}
 <table>
-  <tr><th>Sleeve</th><th>Status</th><th>Strategy</th><th class="num">Equity</th><th class="num">Return</th><th class="num">vs buy-and-hold</th><th>Drawdown vs limit</th><th>Reporting</th></tr>
+  <tr><th>Sleeve</th><th>Status</th><th>Strategy</th><th class="num">Equity</th><th class="num">Return</th><th class="num">vs buy-and-hold</th><th class="num">Trades · win rate</th><th>Drawdown vs limit</th><th>Reporting</th></tr>
   {% for x in summaries %}
   <tr>
     <td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a><div class="muted" style="font-size:12px">{{ x.sleeve.instrument }} · {{ x.sleeve.bar_spec.split('-')[0] }} {{ x.sleeve.bar_spec.split('-')[1]|lower }}</div></td>
@@ -27,6 +27,7 @@
     <td class="num">{{ x.equity|money }}</td>
     <td class="num">{{ signed(x.ret) }}</td>
     <td class="num">{{ signed(x.ret - x.bench_ret) }}</td>
+    <td class="num">{{ x.trades.trades }}{% if x.trades.trades %} · {{ x.trades.win_rate|pct0 }}{% endif %}</td>
     <td>{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct0 }} / {{ x.profile.max_drawdown|pct0 }}</span></td>
     <td>{% if x.healthy %}<span class="good">live</span>{% elif x.sleeve.desired_state == 'stopped' %}<span class="muted">stopped</span>{% else %}<span class="bad">silent</span>{% endif %}</td>
   </tr>

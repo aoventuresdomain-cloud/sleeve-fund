@@ -75,9 +75,10 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"{counts['variants']} variants across {counts['ideas']} ideas so far",
         ),
         (
-            "Sensible trade count",
-            "PASS" if trips >= MIN_ROUND_TRIPS else "WARN",
-            f"{trips} round trips over the research period (bar: {MIN_ROUND_TRIPS}); turnover {r.turnover:.1f}x a year",
+            # A Sharpe built on a handful of trades is luck, not evidence, so this one can fail G1.
+            "Enough trades to judge",
+            "PASS" if trips >= MIN_ROUND_TRIPS else "FAIL",
+            f"{trips} closed trades over the research period (bar: {MIN_ROUND_TRIPS}); turnover {r.turnover:.1f}x a year",
         ),
     ]
     return checks
@@ -96,8 +97,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
     years_full = len(r.full_period.equity) / PERIODS_PER_YEAR
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
-    trips = r.round_trips
-    hit = sum(t > 0 for t in trips) / len(trips) if trips else float("nan")
+    ts = r.trade_stats
 
     out: list[str] = []
     out.append(f"# Tear sheet: {spec.name}")
@@ -146,8 +146,14 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## Trading and costs (full research period, default params)")
     out.append("")
-    out.append(f"- Round trips: {len(trips)} · hit rate {_share(hit)} · "
-               f"average trip {_pct(sum(trips) / len(trips)) if trips else 'n/a'} before fees")
+    out.append("| Closed trades | Win rate | Net P&L | Avg win | Avg loss | Expectancy per trade | Profit factor | Best | Worst |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    out.append(f"| {ts['trades']} ({ts['wins']} won, {ts['losses']} lost) | {_share(ts['win_rate'])} | {ts['pnl']:,.0f} "
+               f"| {_pct(ts['avg_win'])} | {_pct(ts['avg_loss'])} | {_pct(ts['expectancy'])} | {_num(ts['profit_factor'])} "
+               f"| {_pct(ts['best'])} | {_pct(ts['worst'])} |")
+    out.append("")
+    out.append("All trade figures are after fees. Expectancy is the average return per closed trade.")
+    out.append("")
     out.append(f"- Turnover: {r.turnover:.1f}x average equity a year")
     out.append(f"- Fees paid: {r.full_period.fees_paid:,.0f} on {r.full_period.starting_capital:,.0f} starting capital; "
                f"fee drag {fee_drag:.2%} of average equity a year")

@@ -4,14 +4,17 @@
 {% block content %}
 {% set s = x.sleeve %}
 <h1>{{ s.name }} {{ chip(s.status) }}</h1>
-<p class="sub">{{ s.strategy }} on {{ s.instrument }} · {{ s.bar_spec }} · {{ x.profile.name }} risk · {% for k, v in s.params.items() %}{{ 'max per order' if k == 'max_notional' else k }} {{ v }}{{ ', ' if not loop.last }}{% endfor %}{% if s.status_reason %}<br><strong>{{ s.status_reason }}</strong>{% endif %}</p>
+<p class="sub">{{ s.strategy }} on {{ s.instrument }} · {{ s.bar_spec }} · {{ x.profile.name }} risk · {% for k, v in s.params.items() %}{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ k.replace('_', ' ') }} {{ (v * 100)|round(2) }}%{% else %}{{ 'max per order' if k == 'max_notional' else k }} {{ v }}{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if s.status_reason %}<br><strong>{{ s.status_reason }}</strong>{% endif %}</p>
 
 <div class="tiles">
   <div class="tile"><div class="k">Equity</div><div class="v">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }}</div></div>
   <div class="tile"><div class="k">Return</div><div class="v">{{ signed(x.ret) }}</div><div class="s">buy-and-hold {{ x.bench_ret|pct }}</div></div>
   <div class="tile"><div class="k">Drawdown</div><div class="v">{{ x.drawdown|pct0 }}</div><div class="s">{{ usage(x.dd_used) }} limit {{ x.profile.max_drawdown|pct0 }} · worst {{ x.max_drawdown|pct0 }}</div></div>
   <div class="tile"><div class="k">In the market</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">cap {{ x.profile.max_position_pct|pct0 }} of equity</div></div>
-  <div class="tile"><div class="k">Fills · fees</div><div class="v">{{ x.fills }}</div><div class="s">{{ x.fees|money }} paid</div></div>
+  <div class="tile"><div class="k">P&amp;L after fees</div><div class="v">{{ x.pnl|money }}</div><div class="s">{{ x.fees|money }} fees over {{ x.fills }} fills</div></div>
+  {% set t = x.trades %}
+  <div class="tile"><div class="k">Closed trades · win rate</div><div class="v">{{ t.trades }}{% if t.trades %} · {{ t.win_rate|pct0 }}{% endif %}</div><div class="s">{% if t.trades %}{{ t.wins }} won, {{ t.losses }} lost{% else %}none closed yet{% endif %}</div></div>
+  <div class="tile"><div class="k">Avg win · avg loss</div><div class="v" style="font-size:18px">{{ t.avg_win|pctn }} · {{ t.avg_loss|pctn }}</div><div class="s">expectancy {{ t.expectancy|pctn }} a trade · profit factor {{ t.profit_factor|numn }}</div></div>
   <div class="tile"><div class="k">Last heartbeat</div><div class="v" style="font-size:16px">{{ s.heartbeat_at|ts }}</div><div class="s">{{ 'live' if x.healthy else 'not reporting' }}</div></div>
 </div>
 

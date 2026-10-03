@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from sleeve_fund.research.metrics import trade_stats, trades
 from sleeve_fund.risk import profile as risk_profile
 from sleeve_fund.store import Sleeve, Store, utcnow
 
@@ -13,6 +14,7 @@ STALE = timedelta(minutes=3)
 def sleeve_summary(store: Store, s: Sleeve) -> dict:
     series = store.equity_series(s.name, limit=100_000)
     prof = risk_profile(s.risk_profile)
+    fills = store.fills(s.name, limit=10_000)
     out = {
         "sleeve": s,
         "profile": prof,
@@ -25,8 +27,10 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         "dd_used": 0.0,
         "exposure": 0.0,
         "points": len(series),
-        "fills": len(store.fills(s.name, limit=10_000)),
-        "fees": sum(f["fee"] for f in store.fills(s.name, limit=10_000)),
+        "fills": len(fills),
+        "fees": sum(f["fee"] for f in fills),
+        "pnl": 0.0,
+        "trades": trade_stats(trades(list(reversed(fills)))),  # closed trips, after fees
         "healthy": bool(s.heartbeat_at and utcnow() - s.heartbeat_at < STALE),
     }
     if series:
@@ -39,6 +43,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
             equity=last["equity"],
             benchmark=last["benchmark"],
             ret=last["equity"] / s.starting_balance - 1,
+            pnl=last["equity"] - s.starting_balance,
             bench_ret=last["benchmark"] / s.starting_balance - 1,
             drawdown=1 - last["equity"] / peak,
             max_drawdown=mdd,

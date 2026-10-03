@@ -64,6 +64,20 @@ def test_create_sleeve_and_control_it(client):
     assert store.sleeve("btc-test").desired_state == "stopped"
 
 
+def test_exits_entered_as_percent_and_stats_shown(client):
+    c, store = client
+    r = _new(c, name="sol-stops", instrument="SOL/USD", stop_loss_pct="8", take_profit_pct="20", risk_per_trade_pct="1")
+    assert r.status_code == 303
+    p = store.sleeve("sol-stops").params
+    assert (p["stop_loss"], p["take_profit"], p["risk_per_trade"]) == (0.08, 0.2, 0.01)
+    store.record_fill("sol-stops", side="BUY", qty=1, price=100, fee=0.8, order_id="o1", trade_id="t1")
+    store.record_fill("sol-stops", side="SELL", qty=1, price=110, fee=0.88, order_id="o2", trade_id="t2")
+    page = c.get("/sleeves/sol-stops", auth=AUTH).text
+    assert "stop loss 8.0%" in page and "Closed trades" in page and "100%" in page
+    r = _new(c, name="no-stop", risk_per_trade_pct="1")
+    assert "stop_loss" in r.headers["location"]
+
+
 def test_any_asset_pair_can_be_chosen(client):
     c, store = client
     assert 'list="pairs"' in c.get("/sleeves/new", auth=AUTH).text

@@ -73,6 +73,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
+    # NaN-safe versions for stats that don't exist until a trade has closed.
+    templates.env.filters["pctn"] = lambda x: "n/a" if x != x else f"{x:+.1%}"
+    templates.env.filters["numn"] = lambda x: "n/a" if x != x else ("∞" if x == float("inf") else f"{x:.2f}")
     templates.env.globals["bar_label"] = _bar_label
     templates.env.filters["ts"] = lambda t: t.strftime("%d %b %H:%M UTC") if t else "never"
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
@@ -114,6 +117,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             params = _coerce_params({k[len(prefix):]: v for k, v in form.items() if k.startswith(prefix) and v != ""})
             if str(form.get("max_notional", "")).strip():
                 params["max_notional"] = float(form["max_notional"])
+            for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
+                raw = str(form.get(f"{key}_pct", "")).strip()
+                if raw:
+                    params[key] = round(float(raw) / 100, 6)
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=str(form.get("bar_spec", "")),
                                starting_balance=float(form.get("starting_balance", 0) or 0), params=params,

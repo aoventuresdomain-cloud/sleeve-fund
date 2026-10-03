@@ -63,6 +63,9 @@ class LongFlatConfig(StrategyConfig):
         max_notional: float | None = None,
         assumed_taker_fee: float = 0.008,
         warmup_bars: int = 0,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        risk_per_trade: float | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -77,6 +80,12 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"cash_buffer {cash_buffer} outside [0, 0.5)")
         if max_notional is not None and max_notional <= 0:
             raise ValueError("max_notional must be positive")
+        for label, v, hi in (("stop_loss", stop_loss, 0.5), ("take_profit", take_profit, 10.0),
+                             ("risk_per_trade", risk_per_trade, 0.2)):
+            if v is not None and not 0 < v <= hi:
+                raise ValueError(f"{label} {v} outside (0, {hi}]; use a fraction, e.g. 0.05 for 5%")
+        if risk_per_trade is not None and stop_loss is None:
+            raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Leave room for the taker fee and rounding so a full-size buy never rejects.
@@ -87,6 +96,11 @@ class LongFlatConfig(StrategyConfig):
         self.assumed_taker_fee = assumed_taker_fee
         # Live/paper only: bars to request from the venue at start to warm indicators.
         self.warmup_bars = warmup_bars
+        # Optional exits on top of the strategy's own signal, as fractions of the entry price.
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        # Optional sizing: lose at most this fraction of equity if the stop is hit.
+        self.risk_per_trade = risk_per_trade
 
 
 class LongFlatStrategy(Strategy):
@@ -100,6 +114,9 @@ class LongFlatStrategy(Strategy):
         self._last_close = None
         self._last_tick_ns = 0
         self._mark_warned = False
+        self._entry_px = None  # average entry price of the open position
+        self._entry_qty = 0.0
+        self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -129,6 +146,7 @@ class LongFlatStrategy(Strategy):
             self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
 
     def on_trade(self, tick) -> None:
+        self._check_exits(tick.price.as_double())
         self._maybe_tick()
 
     def _maybe_tick(self) -> None:
@@ -165,18 +183,44 @@ class LongFlatStrategy(Strategy):
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         self._maybe_tick()
+        if self._check_exits(self._last_close):
+            return
         target = self.want_long(bar)
         if target is None:
             return
+        if not target:
+            self._exit_lock = False
         if self.cache.orders_inflight(strategy_id=self.strategy_id):
             return
         is_long = self.portfolio.is_net_long(self._cfg.instrument_id)
         if target and not is_long:
+            if self._exit_lock:
+                return
             if self.runtime is not None and not self.runtime.can_open():
                 return
             self._buy_all(bar)
         elif not target and is_long:
             self.close_all_positions(self._cfg.instrument_id)
+
+    def _check_exits(self, price: float) -> bool:
+        """Stop-loss / take-profit against the average entry. True if an exit was sent."""
+        cfg = self._cfg
+        if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
+            return False
+        if self.cache.orders_inflight(strategy_id=self.strategy_id):
+            return False
+        move = price / self._entry_px - 1
+        hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
+               else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
+        if hit is None:
+            return False
+        self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry")
+        self._exit_lock = True
+        self._entry_px = None  # don't fire again while the sell is in flight
+        self.close_all_positions(cfg.instrument_id)
+        return True
 
     def _buy_all(self, bar: Bar) -> None:
         account = self._account()
@@ -191,6 +235,9 @@ class LongFlatStrategy(Strategy):
             budget = min(budget, Decimal(str(self._cfg.max_notional)))
         if self.runtime is not None:
             budget = min(budget, Decimal(str(self.runtime.position_budget(self._mark()[0]))))
+        if self._cfg.risk_per_trade:
+            equity = self._mark()[0] or float(free.as_decimal())
+            budget = min(budget, Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss)))
         budget *= Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         step = self.instrument.size_increment.as_decimal()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
@@ -254,6 +301,15 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "error", "tick_failed", repr(exc))
 
     def on_order_filled(self, event) -> None:
+        qty, px = event.last_qty.as_double(), event.last_px.as_double()
+        if event.is_buy:
+            cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
+            self._entry_qty += qty
+            self._entry_px = cost / self._entry_qty
+        else:
+            self._entry_qty = max(self._entry_qty - qty, 0.0)
+            if self._entry_qty <= 1e-12:
+                self._entry_px, self._entry_qty = None, 0.0
         if self.runtime is None:
             return
         fee = event.commission.as_double() if event.commission is not None else 0.0

@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--quote", default="USD")
     st.add_argument("--holdout-days", type=int, default=365)
     st.add_argument("--use-holdout", action="store_true", help="open the holdout (logged; do this once)")
+    st.add_argument("--stop-loss", type=float, help="exit if price falls this fraction below entry, e.g. 0.08")
+    st.add_argument("--take-profit", type=float, help="exit if price rises this fraction above entry, e.g. 0.2")
+    st.add_argument("--risk-per-trade", type=float, help="size so a stop-out loses this fraction of equity")
     st.add_argument("--out", help="tear sheet path (default research/tearsheets/<strategy>_<dataset>.md)")
 
     sub.add_parser("counter", help="print the idea counter")
@@ -72,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         synthetic=args.synthetic,
         holdout_days=args.holdout_days,
         use_holdout=args.use_holdout,
+        exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade},
     )
     out = Path(args.out) if args.out else ROOT / "research" / "tearsheets" / f"{spec.name}_{dataset}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
