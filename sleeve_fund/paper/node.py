@@ -8,9 +8,11 @@ There is deliberately no code path here that adds a venue execution client.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import threading
+import urllib.request
 from pathlib import Path
 
 from nautilus_trader.adapters.kraken import (
@@ -48,10 +50,44 @@ def _tag(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
 
 
-def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None) -> LiveNode:
+# Kraken names some assets differently in its instrument data than in the pair (USD is ZUSD,
+# BTC is XXBT). The sandbox account must hold cash in the instrument's own quote currency
+# or every buy is rejected, so look the codes up from Kraken's public pair list.
+ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
+_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
+
+
+def _norm(code: str) -> str:
+    return _ALIASES.get(code, code)
+
+
+def kraken_asset_codes(pair: str, fetch=None) -> tuple[str, str]:
+    """(base, quote) as Kraken's instrument data names them, e.g. SUI/USD -> (SUI, ZUSD).
+
+    Falls back to the pair's own codes if Kraken can't be reached or doesn't list it.
+    """
+    base, quote = pair.split("/")
+    try:
+        if fetch is None:
+            with urllib.request.urlopen(ASSET_PAIRS_URL, timeout=15) as r:  # public endpoint, no key
+                data = json.load(r)
+        else:
+            data = fetch()
+        for info in data.get("result", {}).values():
+            ws = info.get("wsname", "")
+            if "/" in ws and tuple(_norm(x) for x in ws.split("/")) == (_norm(base), _norm(quote)):
+                return info["base"], info["quote"]
+    except Exception as exc:  # noqa: BLE001 - fall back, the sleeve still runs and logs a mark warning
+        print(f"asset code lookup failed for {pair}: {exc!r}", file=sys.stderr)
+    return base, quote
+
+
+def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
+               asset_fetch=None) -> LiveNode:
     assert_keyless()
     tag = _tag(sleeve.name)
     venue = Venue.from_str(KRAKEN)
+    _, quote_code = kraken_asset_codes(sleeve.instrument, fetch=asset_fetch)
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -68,7 +104,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             SandboxExecutionClientFactory(),
             SandboxExecutionClientConfig(
                 venue=venue,
-                starting_balances=[Money(sleeve.starting_balance, Currency.from_str(sleeve.quote))],
+                starting_balances=[Money(sleeve.starting_balance, Currency.from_str(quote_code))],
                 account_id=AccountId.from_str(f"{KRAKEN}-PAPER-{tag[:20]}"),
                 oms_type=OmsType.NETTING,
                 account_type=AccountType.CASH,

@@ -146,7 +146,8 @@ class LongFlatStrategy(Strategy):
             self.clock.set_timer("sleeve-tick", timedelta(seconds=self.runtime.tick_seconds), callback=self._on_tick)
 
     def on_trade(self, tick) -> None:
-        self._check_exits(tick.price.as_double())
+        self._last_close = tick.price.as_double()  # freshest price for marking between bars
+        self._check_exits(self._last_close)
         self._maybe_tick()
 
     def _maybe_tick(self) -> None:
@@ -227,8 +228,8 @@ class LongFlatStrategy(Strategy):
         if account is None:
             self.log.warning("no account yet; skipping buy")
             return
-        quote = str(self.instrument.quote_currency.code)
-        bal = next((b for c, b in account.balances().items() if str(c.code) == quote), None)
+        quote = self._codes("quote")
+        bal = next((b for c, b in account.balances().items() if str(c.code) in quote), None)
         if bal is None:
             self.log.warning(f"no {quote} balance; skipping buy")
             return
@@ -264,6 +265,12 @@ class LongFlatStrategy(Strategy):
             return px.as_double()
         return self._last_close or 0.0
 
+    def _codes(self, side: str) -> set[str]:
+        """Currency codes for one side of the pair: the venue's (e.g. ZUSD) and the plain one (USD)."""
+        base, quote = str(self._cfg.instrument_id.symbol).split("/")
+        cur = self.instrument.base_currency if side == "base" else self.instrument.quote_currency
+        return {str(cur.code), base if side == "base" else quote}
+
     def _account(self):
         account = self.portfolio.account(self._cfg.instrument_id.venue)
         if account is None:  # live sandbox: ask the cache directly
@@ -279,8 +286,8 @@ class LongFlatStrategy(Strategy):
         # Match balances by currency code: the live venue's instrument currencies are not always
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
-        cash = totals.get(str(self.instrument.quote_currency.code), 0.0)
-        qty = totals.get(str(self.instrument.base_currency.code), 0.0)
+        cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
+        qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
         return cash + qty * price, cash, qty, price
 
     def _on_tick(self, _event=None) -> None:

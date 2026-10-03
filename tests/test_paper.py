@@ -37,7 +37,7 @@ def test_shipped_sleeves_build_in_sandbox(path, monkeypatch):
     for k in list(__import__("os").environ):
         if k.upper().startswith("KRAKEN_"):
             monkeypatch.delenv(k)
-    node = build_node(load_sleeve(path), log_level="ERROR")
+    node = build_node(load_sleeve(path), log_level="ERROR", asset_fetch=dict)
     try:
         assert node.environment == Environment.SANDBOX
     finally:
@@ -95,3 +95,22 @@ def test_warmup_and_live_bars_never_double_count():
     assert s.slow.value == pytest.approx(102.0)  # (101+102+103)/3; 102.67 if double-counted
     assert s._accept(bar(4, 110))
     assert s.slow.value == pytest.approx(105.0)
+
+
+def test_kraken_asset_codes_use_the_venue_names():
+    from sleeve_fund.paper.node import kraken_asset_codes
+
+    pairs = {"result": {
+        "XXBTZUSD": {"wsname": "XBT/USD", "base": "XXBT", "quote": "ZUSD"},
+        "SUIUSD": {"wsname": "SUI/USD", "base": "SUI", "quote": "ZUSD"},
+        "ETHUSDT": {"wsname": "ETH/USDT", "base": "XETH", "quote": "USDT"},
+    }}
+    assert kraken_asset_codes("BTC/USD", fetch=lambda: pairs) == ("XXBT", "ZUSD")
+    assert kraken_asset_codes("SUI/USD", fetch=lambda: pairs) == ("SUI", "ZUSD")
+    assert kraken_asset_codes("ETH/USDT", fetch=lambda: pairs) == ("XETH", "USDT")
+    assert kraken_asset_codes("ABC/GBP", fetch=lambda: pairs) == ("ABC", "GBP")  # unlisted: plain codes
+
+    def down():
+        raise OSError("no network")
+
+    assert kraken_asset_codes("SUI/USD", fetch=down) == ("SUI", "USD")
