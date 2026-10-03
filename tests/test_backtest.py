@@ -80,3 +80,23 @@ def test_risk_per_trade_sizes_from_the_stop(prices, instrument):
 def test_bad_exit_settings_rejected(prices, instrument, bad):
     with pytest.raises(ValueError):
         run_backtest("buy_and_hold", prices.iloc[:20], instrument, bad)
+
+
+def test_multi_indicator_example_enters_on_all_conditions_and_trails_out(prices, instrument):
+    from sleeve_fund.research.metrics import round_trips
+
+    # Long uptrend, a sharp dip whose last day has a volume spike, a rebound, then a slide.
+    closes = [10_000.0 * 1.005**i for i in range(260)]
+    for _ in range(6):
+        closes.append(closes[-1] * 0.96)
+    closes += [closes[-1] * 1.01**i for i in range(1, 15)] + [closes[-1] * 1.01**14 * 0.97**i for i in range(1, 15)]
+    df = _path(prices, closes)
+    df["volume"] = 1_000.0
+    df.iloc[265, df.columns.get_loc("volume")] = 5_000.0
+    res = run_backtest("rsi_pullback", df, instrument, {"rsi_entry": 35, "atr_mult": 2.0})
+    assert len(res.fills) == 2
+    first = res.fills.sort_values("ts_last")["ts_last"].iloc[0]
+    assert first >= df.index[265]  # not before the volume spike
+    assert len(round_trips(res.fills)) == 1
+    df["volume"] = 1_000.0  # same prices, no volume spike: the entry must not fire
+    assert run_backtest("rsi_pullback", df, instrument, {"rsi_entry": 35, "atr_mult": 2.0}).fills.empty
