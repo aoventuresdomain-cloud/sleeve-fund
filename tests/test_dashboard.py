@@ -364,10 +364,10 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     assert "Trend filter on ETH/USD" in page and "Every trade" in page and "Buy and hold" in page
     assert "5-bar average" in page and "above the 20-bar average" in page  # the entry reasons, from the strategy
     assert "365 days" in page
-    # The sleeve decides on the daily bars that were tested, warm from its first bar (2 x the slow 20).
+    # The sleeve decides on the daily bars that were tested, warm from its first bar (the slow 20).
     assert ('href="/sleeves/new?instrument=ETH%2FUSD&amp;strategy=trend_filter&amp;p_trend_filter__fast=5'
             '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;bar_spec=1-DAY-LAST-EXTERNAL'
-            '&amp;warmup_bars=40&amp;from=backtest"') in page
+            '&amp;warmup_bars=20&amp;from=backtest"') in page
     assert "33% invested" in page  # the benchmark is held at the balanced profile's cap
     form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest"
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text

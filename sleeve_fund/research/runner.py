@@ -14,7 +14,7 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
-from sleeve_fund.data import daily_bar_type, to_bars
+from sleeve_fund.data import bar_type_for, to_bars
 from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
 from sleeve_fund.strategies import REGISTRY
 
@@ -40,7 +40,9 @@ def run_backtest(
     starting_capital: float = 10_000.0,
     log_level: str = "ERROR",
     runtime=None,
+    bar_minutes: int = 1440,
 ) -> BacktestResult:
+    """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
@@ -66,10 +68,11 @@ def run_backtest(
             fee_model=ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee)),
         )
         engine.add_instrument(instrument)
-        engine.add_data(to_bars(prices, instrument))
+        bar_type = bar_type_for(instrument, bar_minutes)
+        engine.add_data(to_bars(prices, instrument, bar_type))
         config = config_cls(
             instrument_id=instrument.id,
-            bar_type=daily_bar_type(instrument),
+            bar_type=bar_type,
             assumed_taker_fee=float(instrument.taker_fee),
             **params,
         )

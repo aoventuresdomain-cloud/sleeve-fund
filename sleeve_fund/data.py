@@ -144,6 +144,25 @@ def daily_bar_type(instrument) -> BarType:
     return BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL")
 
 
+def bar_type_for(instrument, minutes: int) -> BarType:
+    """The bar type for bars of `minutes` length: 1440 -> 1-DAY, 240 -> 4-HOUR, 15 -> 15-MINUTE."""
+    if minutes <= 0:
+        raise ValueError("bar length must be positive")
+    if minutes % 1440 == 0:
+        spec = f"{minutes // 1440}-DAY"
+    elif minutes % 60 == 0:
+        spec = f"{minutes // 60}-HOUR"
+    else:
+        spec = f"{minutes}-MINUTE"
+    return BarType.from_str(f"{instrument.id}-{spec}-LAST-EXTERNAL")
+
+
+def bar_minutes(bar_type) -> int:
+    """Bar length in minutes from a bar type such as BTC/USD.KRAKEN-4-HOUR-LAST-EXTERNAL."""
+    step, unit = str(bar_type).rsplit("-", 4)[1:3]
+    return int(step) * {"MINUTE": 1, "HOUR": 60, "DAY": 1440}[unit]
+
+
 def to_bars(df: pd.DataFrame, instrument, bar_type: BarType | None = None) -> list[Bar]:
     """Build Nautilus bars; each index value is the bar's close time (ts_event)."""
     bar_type = bar_type or daily_bar_type(instrument)

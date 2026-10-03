@@ -2,8 +2,9 @@
 
 Every strategy is a plain NautilusTrader Strategy (no AI in the order path) plus
 an IdeaSpec that records where it came from and what it needs. The same class
-runs in backtest and in paper trading. Phase 1 is spot, so the base class is
-long-or-flat with the whole sleeve in or out.
+runs in backtest and in paper trading. Phase 1 is spot, so positions are long or
+flat: a strategy says what share of the sleeve to hold (target_weight, 0 to 1),
+or simply in or out (want_long).
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class LongFlatConfig(StrategyConfig):
         take_profit: float | None = None,
         risk_per_trade: float | None = None,
         position_cap_pct: float | None = None,
+        rebalance_band: float | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -91,6 +93,11 @@ class LongFlatConfig(StrategyConfig):
                 raise ValueError(f"{label} {v} outside (0, {hi}]; use a fraction, e.g. 0.05 for 5%")
         if position_cap_pct is not None and not 0 < position_cap_pct <= 1:
             raise ValueError(f"position_cap_pct {position_cap_pct} outside (0, 1]")
+        if rebalance_band is not None and not 0 <= rebalance_band < 1:
+            raise ValueError(f"rebalance_band {rebalance_band} outside [0, 1)")
+        if rebalance_band is not None and (stop_loss or take_profit or risk_per_trade):
+            raise ValueError("stop-loss, take-profit and risk per trade work on all-or-nothing positions; "
+                             "they can't be combined with rebalancing to a target weight yet")
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
         self.instrument_id = instrument_id
@@ -111,10 +118,14 @@ class LongFlatConfig(StrategyConfig):
         # Backtest only: the risk profile's position cap (a share of equity), so a backtest sizes
         # exactly as paper does. Paper and live take the cap from the sleeve's runtime instead.
         self.position_cap_pct = position_cap_pct
+        # None: once in, hold until the signal says out (all-or-nothing). A number: when the target
+        # weight moves more than this share away from the weight last traded to, trade back to it.
+        self.rebalance_band = rebalance_band
 
 
 class LongFlatStrategy(Strategy):
-    """Holds 100% of the sleeve or 0%. Subclasses implement want_long()."""
+    """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
+    want_long() for all-or-nothing, or target_weight() for anything in between."""
 
     def __init__(self, config: LongFlatConfig) -> None:
         super().__init__(config)
@@ -128,6 +139,7 @@ class LongFlatStrategy(Strategy):
         self._entry_qty = 0.0
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
+        self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -195,6 +207,19 @@ class LongFlatStrategy(Strategy):
         """True = be long, False = be flat, None = not enough data yet (do nothing)."""
         raise NotImplementedError
 
+    @classmethod
+    def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
+        """Bars of history to load so every indicator is ready on the first live bar. The default
+        is twice the longest whole-number setting; strategies that know better override it."""
+        longest = max((v for v in params.values() if isinstance(v, int) and not isinstance(v, bool)), default=0)
+        return 2 * longest
+
+    def target_weight(self, bar: Bar) -> float | None:
+        """Share of the sleeve to hold from this bar's close, 0 to 1; None = not enough data yet.
+        The default maps want_long() to all (1) or nothing (0)."""
+        target = self.want_long(bar)
+        return None if target is None else (1.0 if target else 0.0)
+
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         """Why want_long() just said `target`: one plain-English sentence and the indicator values
         behind it. Called straight after want_long() on the same bar, so it sees the same state.
@@ -211,24 +236,70 @@ class LongFlatStrategy(Strategy):
             return
         if self._check_exits(self._last_close, high=bar.high.as_double()):
             return
-        target = self.want_long(bar)
-        if target is None:
+        raw = self.target_weight(bar)
+        if raw is None:
             return
-        if not target:
+        # The risk profile's position cap is a ceiling on the weight, the same in every mode.
+        w = min(max(float(raw), 0.0), 1.0, self._cap_pct())
+        if w == 0:
             self._exit_lock = False
         if self.cache.orders_inflight(strategy_id=self.strategy_id):
             return
         is_long = self._is_long()
-        if target and not is_long:
+        close = bar.close.as_double()
+        if w > 0 and not is_long:
             if self._exit_lock:
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
-            reason, values = self.explain(bar, target)
-            self._buy_all(bar, reason, {**values, "close": bar.close.as_double()})
-        elif not target and is_long:
-            reason, values = self.explain(bar, target)
-            self._sell_all("exit", reason, {**values, "close": bar.close.as_double()})
+            reason, values = self.explain(bar, True)
+            extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
+            # The cap is its own limit in _buy_all, so the journal says which one set the size.
+            self._buy_all(bar, reason, {**values, **extra, "close": close}, weight=min(max(float(raw), 0.0), 1.0))
+            self._held_w = w
+        elif w == 0 and is_long:
+            reason, values = self.explain(bar, False)
+            self._sell_all("exit", reason, {**values, "close": close})
+            self._held_w = 0.0
+        elif w > 0 and is_long and self._cfg.rebalance_band is not None:
+            if self._held_w is None:  # e.g. after a restart: start from what is actually held
+                equity, _, qty, _ = self._mark()
+                self._held_w = qty * close / equity if equity > 0 else w
+            if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
+                reason, values = self.explain(bar, True)
+                if self._rebalance(bar, w, reason, {**values, "target_weight": round(float(raw), 6), "close": close}):
+                    self._held_w = w
+
+    def _cap_pct(self) -> float:
+        if self.runtime is not None:
+            return float(self.runtime.profile.max_position_pct)
+        return float(self._cfg.position_cap_pct) if self._cfg.position_cap_pct is not None else 1.0
+
+    def _rebalance(self, bar: Bar, w: float, reason: str, values: dict) -> bool:
+        """Trade part of the position so it is worth `w` of the sleeve's equity at this close."""
+        equity, _, qty, _ = self._mark()
+        price = bar.close.as_decimal()
+        diff = Decimal(str(equity * w)) - Decimal(str(qty)) * price
+        step = self.instrument.size_increment.as_decimal()
+        signal = {**values, "from_weight": round(self._held_w or 0.0, 6), "to_weight": round(w, 6)}
+        if diff > 0:
+            account = self._account()
+            quote = self._codes("quote")
+            bal = next((b for c, b in account.balances().items() if str(c.code) in quote), None) if account else None
+            if bal is None:
+                return False
+            fee = Decimal(str(self._cfg.assumed_taker_fee))
+            budget = min(diff, bal.free.as_decimal() * (Decimal(1) - fee - Decimal(str(self._cfg.cash_buffer))))
+            if self._cfg.max_notional is not None:
+                budget = min(budget, Decimal(str(self._cfg.max_notional)))
+            side, size = OrderSide.BUY, (budget / price).quantize(step, rounding=ROUND_DOWN)
+        else:
+            side = OrderSide.SELL
+            size = min((-diff / price).quantize(step, rounding=ROUND_DOWN), self._position_qty(free=True))
+        if size <= 0 or size < self._min_qty():
+            return False
+        self._submit(side, size, "rebalance", reason, signal)
+        return True
 
     def _check_exits(self, price: float, high: float | None = None) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent.
@@ -264,7 +335,8 @@ class LongFlatStrategy(Strategy):
         self._sell_all(hit, reason, values)
         return True
 
-    def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None) -> None:
+    def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None,
+                 weight: float = 1.0) -> None:
         account = self._account()
         if account is None:
             self.log.warning("no account yet; skipping buy")
@@ -276,7 +348,12 @@ class LongFlatStrategy(Strategy):
             return
         free = bal.free
         # Every limit on the size, so the journal can say which one set it.
-        limits = {"free cash": free.as_decimal()}
+        # Free cash leaves room for the taker fee and rounding so a full-size buy never rejects;
+        # the other limits are sizes in their own right, and their fee comes out of the spare cash.
+        room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
+        limits = {"free cash": free.as_decimal() * room}
+        if weight < 1:
+            limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         if self._cfg.max_notional is not None:
             limits["sleeve cap"] = Decimal(str(self._cfg.max_notional))
         if self.runtime is not None:
@@ -290,7 +367,6 @@ class LongFlatStrategy(Strategy):
             limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss))
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
-        budget *= Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         step = self.instrument.size_increment.as_decimal()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
         min_qty = self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
