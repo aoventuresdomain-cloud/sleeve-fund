@@ -386,6 +386,32 @@ class Store:
             if c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == event_id)).first() is None:
                 c.execute(insert(acks_t).values(event_id=event_id, ts=utcnow(), actor=actor, note=note.strip()))
 
+    def events_of(self, kinds: tuple[str, ...], limit: int = 100) -> list[dict]:
+        q = select(events_t).where(events_t.c.kind.in_(kinds)).order_by(events_t.c.id.desc()).limit(limit)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def table_sizes(self) -> dict[str, int]:
+        out = {}
+        with self.engine.connect() as c:
+            for t in (sleeves_t, equity_t, fills_t, events_t, commands_t, decisions_t):
+                out[t.name] = c.execute(select(func.count()).select_from(t)).scalar() or 0
+        return out
+
+    def database_bytes(self) -> int | None:
+        """Size on disk where the engine can tell us; None otherwise."""
+        try:
+            with self.engine.connect() as c:
+                if self.engine.dialect.name == "postgresql":
+                    return int(c.exec_driver_sql("select pg_database_size(current_database())").scalar())
+                if self.engine.dialect.name == "sqlite":
+                    pages = c.exec_driver_sql("pragma page_count").scalar()
+                    size = c.exec_driver_sql("pragma page_size").scalar()
+                    return int(pages * size)
+        except Exception:  # noqa: BLE001 - a missing figure on the ops page is not worth an error
+            return None
+        return None
+
     # --- PM commands and decisions ----------------------------------------------
 
     def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:

@@ -115,7 +115,7 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; background: var(--raised); }
 th:first-child, td:first-child { padding-left: 14px; } th:last-child, td:last-child { padding-right: 14px; }
-tr:last-child td { border-bottom: 0; }
+tr:last-child td, tr:last-child th { border-bottom: 0; }
 tbody tr:hover td { background: var(--raised); }
 td.wrap { white-space: normal; min-width: 240px; }
 th[data-sort] { cursor: pointer; user-select: none; }

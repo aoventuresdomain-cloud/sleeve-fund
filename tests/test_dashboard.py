@@ -180,3 +180,21 @@ def test_flatten_asks_for_confirmation_with_its_effect(client):
     store.record_equity("btc-test", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert 'id="dlg-flatten"' in page and "Sells 0.1 BTC (about 6,000.00 USD) at market" in page
+
+
+def test_risk_page_stress_and_limits(client):
+    c, store = client
+    _new(c, name="eth-risk", instrument="ETH/USD")
+    # 60% of a 10,000 sleeve in ETH: a 50% fall costs 3,000, a 30% drawdown, past the balanced 20% limit.
+    store.record_equity("eth-risk", equity=10_000, cash=4_000, qty=2, price=3_000, benchmark=10_000)
+    store.event("eth-risk", "error", "risk_halt", "drawdown 21% hit the 20% limit")
+    page = c.get("/risk", auth=AUTH).text
+    assert "Limits by sleeve" in page and "−3,000.00" in page and "eth-risk</span>" in page
+    assert "drawdown 21% hit the 20% limit" in page
+
+
+def test_ops_page_shows_processes_and_safety_nets(client):
+    c, store = client
+    _new(c)
+    page = c.get("/ops", auth=AUTH).text
+    assert "Sleeve processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page

@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund.dashboard import book as bookm
+from sleeve_fund.dashboard import riskops
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research.ledger import IdeaLedger
@@ -85,6 +86,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["smoney0"] = lambda x: ("+" if x >= 0.5 else ("−" if x <= -0.5 else "")) + f"{abs(x):,.0f}"
     templates.env.filters["ago"] = _ago
     templates.env.filters["held"] = _held
+    templates.env.filters["bytes"] = _bytes
     templates.env.filters["px"] = lambda x: "n/a" if x is None or x != x else (f"{x:,.2f}" if x >= 100 else f"{x:,.4f}")
     templates.env.globals["bar_label"] = _bar_label
     templates.env.globals["bar_short"] = _bar_short
@@ -142,6 +144,18 @@ def create_app(store: Store | None = None) -> FastAPI:
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
             "drawdown": [round(v, 5) for v in curve["drawdown"]] if len(curve) else [],
         })
+
+    @app.get("/risk", response_class=HTMLResponse)
+    def risk_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        book = bookm.book_view(st(), summaries, frames)
+        return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
+                    shell=shell(sleeves))
+
+    @app.get("/ops", response_class=HTMLResponse)
+    def ops_page(request: Request, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        return page(request, "ops.html", ops=riskops.ops_view(st(), summaries), shell=shell(sleeves))
 
     @app.get("/alerts", response_class=HTMLResponse)
     def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):
@@ -367,6 +381,16 @@ def _held(td) -> str:
         return ""
     hours = td.total_seconds() / 3600
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+
+
+def _bytes(n) -> str:
+    if n is None:
+        return "n/a"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
+    return ""
 
 
 def _ago(t) -> str:
