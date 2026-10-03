@@ -6,8 +6,11 @@ name: deploy
 #   DASHBOARD_PASSWORD   the PM dashboard password (letters and digits; no $)
 # Optional: SITE_ADDRESS (defaults to <DEPLOY_HOST>.sslip.io for free HTTPS without a domain).
 # No exchange credentials are involved: this stack is paper only.
+# Deploys only a commit whose tests passed: it runs when the tests workflow finishes green on main.
 on:
-  push:
+  workflow_run:
+    workflows: [tests]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 concurrency: deploy
@@ -16,9 +19,14 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
-    if: ${{ vars.DEPLOY_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (vars.DEPLOY_ENABLED == 'true' && github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'push') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}  # exactly the commit that was tested
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
