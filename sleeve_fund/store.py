@@ -592,6 +592,16 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(select(func.max(equity_t.c.equity)).where(equity_t.c.sleeve == sleeve)).scalar()
 
+    def max_drawdown(self, sleeve: str) -> float:
+        """The deepest fall from a running peak over every mark kept, however many: the screens read only
+        the latest marks, and a paper strategy marks every few seconds."""
+        peak = func.max(equity_t.c.equity).over(order_by=(equity_t.c.ts, equity_t.c.id),
+                                                rows=(None, 0)).label("peak")
+        marks = select(equity_t.c.equity, peak).where(equity_t.c.sleeve == sleeve).subquery()
+        q = select(func.max(1 - marks.c.equity / marks.c.peak)).where(marks.c.peak > 0)
+        with self.engine.connect() as c:
+            return float(c.execute(q).scalar() or 0.0)
+
     def equity_at_or_before(self, sleeve: str, ts: datetime) -> dict | None:
         q = (select(equity_t).where(equity_t.c.sleeve == sleeve, equity_t.c.ts <= ts)
              .order_by(equity_t.c.ts.desc(), equity_t.c.id.desc()).limit(1))

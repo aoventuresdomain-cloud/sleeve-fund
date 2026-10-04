@@ -149,12 +149,32 @@ def test_stop_wins_when_one_bar_touches_both(prices, instrument):
     assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
 
 
-def test_take_profit_is_checked_on_the_high_but_sold_at_the_close(prices, instrument):
+def test_take_profit_fills_at_its_level_not_the_close(prices, instrument):
+    """Review R5-M1: the target used to trigger on the high and sell at the close, anywhere from -0.56R
+    to +2.80R against a planned +0.62R. It now rests as a limit and fills at its level."""
     df = _path(prices, [100.0] * 10 + [104.0] * 5)
     df.iloc[10, df.columns.get_loc("high")] = 112.0
     res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(104.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+    d = res.decisions[sells.index[0]]
+    assert d["intent"] == "take_profit" and "resting sell at 110" in d["reason"]
+
+
+def test_take_profit_is_never_credited_more_than_its_level(prices, instrument):
+    # Opens above the target: a resting limit would get the open, but bars can't show the queue, so
+    # the backtest gives only the level, and the linked stop is cancelled.
+    df = _path(prices, [100.0] * 10 + [120.0] * 5)
+    df.iloc[10, df.columns.get_loc("open")] = 118.0
+    df.iloc[10, df.columns.get_loc("low")] = 118.0
+    res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10, "stop_loss": 0.05}, half_spread=0)
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+
+
+def test_a_target_that_cannot_cover_its_costs_is_refused(prices, instrument):
+    with pytest.raises(ValueError, match="round trip"):
+        run_backtest("buy_and_hold", prices.iloc[:20], instrument, {"take_profit": 0.012, "stop_loss": 0.004})
 
 
 def test_signal_exit_cancels_the_resting_stop_first(prices, instrument):

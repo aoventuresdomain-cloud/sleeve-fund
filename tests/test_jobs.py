@@ -107,3 +107,28 @@ def test_thinning_marks_as_they_come_saves_exactly_what_it_did(hours):
     assert thin.first_equity("bt") == full.first_equity("bt") and thin.last_equity("bt") == full.last_equity("bt")
     if hours > 100:
         assert len(thin.equity) < 5000 + hours + 1 < len(full.equity)
+
+
+def test_a_saved_long_run_keeps_its_deepest_drawdown():
+    """Review round 5, R5-M2: a long intraday run saves one mark a day, so a fall and recovery within a
+    day vanished: the page showed -19.27% beside "halted: drawdown 20.0%". The peak and the trough of
+    the deepest drawdown are now saved too, so the drawdown on the page is the one the guard saw."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.paper.journal import MemoryJournal
+
+    j, t0 = MemoryJournal(), datetime(2024, 1, 1, tzinfo=timezone.utc)
+    for i in range(200 * 1440):
+        ts = t0 + timedelta(minutes=i)
+        eq = 100.0 + i / 1000
+        if 150 * 1440 + 600 <= i < 150 * 1440 + 660:  # an hour mid-day: 30% down, then all back
+            eq *= 0.7
+        j.record_equity("bt", equity=eq, cash=0, qty=1, price=eq, benchmark=100, ts=ts)
+    kept = j.marks_to_keep()
+    assert len(kept) < 300 and j.max_drawdown() == pytest.approx(0.3, abs=1e-4)
+    peak, worst = 0.0, 0.0
+    for m in kept:
+        peak = max(peak, m["equity"])
+        worst = max(worst, 1 - m["equity"] / peak)
+    assert worst == pytest.approx(j.max_drawdown(), abs=1e-12)
+    assert [m["ts"] for m in kept] == sorted(m["ts"] for m in kept)

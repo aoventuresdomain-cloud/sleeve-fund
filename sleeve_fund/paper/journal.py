@@ -28,6 +28,10 @@ class MemoryJournal:
         self.events_: list[dict] = []
         self._ids = itertools.count(1)
         self._peak: float | None = None
+        # The deepest drawdown over every mark, as (peak mark, trough mark): kept through thinning so the
+        # saved run's drawdown is the one the risk guard saw, not the one left between hourly marks.
+        self._peak_mark: dict | None = None
+        self._worst: tuple[dict, dict] | None = None
         self._hour: tuple | None = None  # the hour of the latest mark, and where its marks start
         self._hour_start = 0
         self._thinned = False
@@ -84,9 +88,12 @@ class MemoryJournal:
                     del self.equity[start:-1]
                     self._thinned = True
             self._hour, self._hour_start = hour, len(self.equity)
-        self.equity.append({"ts": ts, "equity": equity, "cash": cash, "qty": qty, "price": price,
-                            "benchmark": benchmark})
-        self._peak = equity if self._peak is None else max(self._peak, equity)
+        mark = {"ts": ts, "equity": equity, "cash": cash, "qty": qty, "price": price, "benchmark": benchmark}
+        self.equity.append(mark)
+        if self._peak is None or equity > self._peak:
+            self._peak, self._peak_mark = equity, mark
+        elif self._peak > 0 and (self._worst is None or equity / self._peak < self._worst[1]["equity"] / self._worst[0]["equity"]):
+            self._worst = (self._peak_mark, mark)
 
     def record_fill(self, sleeve: str, *, side: str, qty: float, price: float, fee: float, order_id: str,
                     trade_id: str, ts: datetime | None = None) -> None:
@@ -176,7 +183,8 @@ class MemoryJournal:
     def marks_to_keep(self) -> list[dict]:
         """Equity marks worth saving: every mark of a short run; the last of each hour (or, past
         90 days, of each day) of a long one, which is what the screens chart anyway. The first and
-        last marks are always kept, so the run's start and end values are exact."""
+        last marks are always kept, so the run's start and end values are exact, and so are the peak
+        and trough of the deepest drawdown, so the maximum drawdown is exact too."""
         marks = self.equity
         if len(marks) <= KEEP_ALL_MARKS and not self._thinned:
             return list(marks)
@@ -184,4 +192,12 @@ class MemoryJournal:
         fmt = "%Y%m%d%H" if span.days <= 90 else "%Y%m%d"
         keys = [m["ts"].strftime(fmt) for m in marks]
         kept = [marks[0]] + [m for i, m in enumerate(marks) if i and (i + 1 == len(marks) or keys[i + 1] != keys[i])]
+        if self._worst:
+            ids = {id(m) for m in kept}
+            kept += [m for m in self._worst if id(m) not in ids]
+            kept.sort(key=lambda m: m["ts"])  # stable: marks sharing a time keep their order
         return kept
+
+    def max_drawdown(self, sleeve: str | None = None) -> float:
+        """The deepest fall from a peak over every mark of the run, thinned or not."""
+        return 1 - self._worst[1]["equity"] / self._worst[0]["equity"] if self._worst else 0.0

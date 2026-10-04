@@ -261,3 +261,18 @@ def test_live_quotes_record_the_typical_spread_hourly(store):
     t[0] += timedelta(hours=2)
     rt.on_quote(100.0, 100.02, venue="KRAKEN")  # one quote in a quiet hour: too few to record
     assert store.latest_spread("KRAKEN", "BTC/USD")["samples"] == row["samples"]
+
+
+def test_max_drawdown_counts_every_mark_not_just_the_latest(store):
+    """The screens read the latest marks only; a paper strategy marks every few seconds, so after a
+    month the deepest drawdown could fall out of view. It is measured in the database, over every mark."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+
+    _sleeve(store)
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    for i, eq in enumerate([10_000, 12_000, 9_000, 13_000, 11_700, 14_000]):
+        store.record_equity("s1", equity=eq, cash=eq, qty=0, price=1, benchmark=10_000, ts=t0 + timedelta(days=i))
+    assert store.max_drawdown("s1") == pytest.approx(0.25) and store.max_drawdown("nobody") == 0.0
+    assert sleeve_summary(store, store.sleeve("s1"))["max_drawdown"] == pytest.approx(0.25)

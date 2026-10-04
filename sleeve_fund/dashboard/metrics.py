@@ -35,10 +35,8 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
     }
     if series:
         last = series[-1]
-        peak, mdd = 0.0, 0.0
-        for p in series:
-            peak = max(peak, p["equity"])
-            mdd = max(mdd, 1 - p["equity"] / peak)
+        peak = store.peak_equity(s.name) or max(p["equity"] for p in series)
+        mdd = store.max_drawdown(s.name)  # over every mark, not only the latest ones read here
         out.update(
             equity=last["equity"],
             benchmark=last["benchmark"],
