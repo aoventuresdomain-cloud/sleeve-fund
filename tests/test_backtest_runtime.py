@@ -103,3 +103,22 @@ def test_trend_filter_runs_minute_bars_quickly(instrument):
     t = time.perf_counter()
     run_backtest("trend_filter", df, instrument, {"fast": 50, "slow": 200, "vol_target": 0.4}, bar_minutes=1)
     assert time.perf_counter() - t < 20
+
+
+def test_a_halt_and_an_exit_on_the_same_bar_sell_once(instrument):
+    """A risk halt's flatten and the strategy's own exit fell on one bar (16 Nov 2020 in this series).
+    The backtest's market sell had not reached the venue yet, so both sold the whole position and the
+    book went short. Only the first sell goes now."""
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    rt = SleeveRuntime.for_backtest(strategy="trend_filter", instrument="ETH/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                                    starting_balance=10_000, risk_profile="aggressive")
+    run_backtest("trend_filter", synthetic_ohlcv(days=1200, seed=3, vol=0.03), instrument,
+                 params={"fast": 5, "slow": 20}, runtime=rt)
+    orders = rt.store.orders(limit=10_000)[::-1]
+    halt = [o for o in orders if o["intent"] == "risk_halt"]
+    assert halt, "the series should still contain the halt bar"
+    same_bar = [o for o in orders if o["side"] == "SELL" and o["ts"] == halt[0]["ts"]]
+    assert [o["intent"] for o in same_bar] == ["risk_halt"]
+    assert rt.store.journal_book("backtest", 10_000)["qty"] >= 0

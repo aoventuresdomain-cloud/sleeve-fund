@@ -36,6 +36,8 @@ class BacktestResult:
     # Half the bid-ask spread paid on orders that took liquidity (already in the fills' prices).
     spread_paid: float = 0.0
     half_spread: float = 0.0
+    # With a risk profile: the runtime's journal (orders, fills, marks, events), for Store.save_backtest.
+    journal: object = None
 
 
 def run_backtest(
@@ -51,6 +53,7 @@ def run_backtest(
     exec_minutes: int = 1,
     risk_profile: str | None = None,
     half_spread: float | None = None,
+    progress=None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -67,7 +70,10 @@ def run_backtest(
     half_spread: half the bid-ask spread, as a fraction of the price, paid by every order that takes
     liquidity (bars carry trade prices; a real market order buys at the ask and sells at the bid).
     None uses the venue profile's cautious assumption; sleeve_fund.spreads.resolve gives a measured
-    one. The fills report shows the prices after the spread, as paper fills on the bid or ask would."""
+    one. The fills report shows the prices after the spread, as paper fills on the bid or ask would.
+
+    progress: with a risk profile, called with the simulated time at every bar, to report how far a
+    long run has got."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
@@ -90,6 +96,7 @@ def run_backtest(
         runtime = SleeveRuntime.for_backtest(
             strategy=strategy_name, instrument=str(instrument.id.symbol), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
             starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60)
+        runtime.progress = progress
 
     if runtime is not None:
         # Whatever runtime is passed, this is a replay of bars: there is no trade feed between them, so
@@ -149,6 +156,7 @@ def run_backtest(
             risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
+            journal=runtime.store if risk_profile is not None else None,
         )
     finally:
         if runtime is not None:
