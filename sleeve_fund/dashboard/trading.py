@@ -32,7 +32,7 @@ def signal_items(signal: dict | None) -> list[tuple[str, str]]:
     """The values behind a decision as (label, text) pairs for display."""
     out = []
     for k, v in (signal or {}).items():
-        if v is None:
+        if v is None or k == "stop_cfg":  # the stop settings, kept to tell whether a later edit changed the stop
             continue
         if k.startswith(("sma_", "ema_")):
             label, text = f"{k[:3].upper()} {k[4:]}", _px(v)
@@ -85,9 +85,26 @@ def order_view(o: dict) -> dict:
     return o
 
 
-def trips(fills: list[dict], events: list[dict], orders: dict[str, dict]) -> list[dict]:
+def plan_items(plan: dict) -> list[tuple[str, str]]:
+    """An exit plan set after entry (see Store.set_exit_plan), as (label, text) pairs for display."""
+    out = [("Exits", "edited by the PM" if plan["kind"] == "edit" else "set again after a restart")]
+    if plan.get("stop_frac") is not None:
+        s = plan["stop_frac"]
+        out.append(("Stop now", f"{s:.1%} below the entry" if s >= 0 else f"{-s:.1%} above the entry"))
+    if plan.get("tp_frac"):
+        out.append(("Target now", f"{plan['tp_frac']:.1%}"))
+    if plan.get("risk_amount"):
+        out.append(("1R now", f"{plan['risk_amount']:,.2f}"))
+    if plan.get("planned_r") is not None:
+        out.append(("Target in R now", f"{plan['planned_r']:+.2f}R"))
+    return out
+
+
+def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
+          plans: dict[str, dict] | None = None) -> list[dict]:
     """Closed round trips, newest first, with holding time and the journaled reason at each end.
-    fills: newest first, as the store returns them. orders: journal rows keyed by order id."""
+    fills: newest first, as the store returns them. orders: journal rows keyed by order id. plans: exit
+    plans set after entry (Store.exit_plans), by entry order id."""
     exits = [e for e in events if e["kind"] in EXIT_EVENTS]
     out = []
     for t in reversed(trades(list(reversed(fills)))):
@@ -108,10 +125,16 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict]) -> lis
             exit_items=signal_items(exit_["signal"]) if exit_ else [],
             held=(t["closed"] - t["opened"]) if t["opened"] and t["closed"] else None,
         )
-        # R: the trade's P&L over what it would have lost at its stop, as sized at entry.
-        risk = (entry or {}).get("signal", {}).get("risk_amount")
+        # R: the trade's P&L over what it would have lost at its stop, as sized at entry, or over what it
+        # risked after a looser stop was set (the larger of the two; see LongFlatStrategy._set_plan).
+        sig = (entry or {}).get("signal", {})
+        plan = (plans or {}).get(t["entry_order"] or "")
+        risk = (plan or {}).get("risk_amount") or sig.get("risk_amount")
         t["r"] = t["pnl"] / risk if risk else None
-        t["planned_r"] = (entry or {}).get("signal", {}).get("planned_r")
+        t["planned_r"] = plan["planned_r"] if plan else sig.get("planned_r")
+        t["exits_edited"] = bool(plan and plan["kind"] == "edit")
+        if plan:
+            t["entry_items"] = t["entry_items"] + plan_items(plan)
         out.append(t)
     return out
 
@@ -131,22 +154,27 @@ def open_lot(fills: list[dict]) -> dict | None:
     return opened
 
 
-def exit_fracs(params: dict, signal: dict | None) -> tuple[float | None, float | None]:
-    """The open position's stop and target as shares of its entry price: what its entry journaled
-    (an ATR or swing-low stop is set at entry), else the strategy's fixed % settings."""
+def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> tuple[float | None, float | None]:
+    """The open position's stop and target as shares of its entry price: the plan set since entry, if
+    any, else what its entry journaled (an ATR or swing-low stop is set at entry), else the strategy's
+    fixed % settings."""
+    if plan is not None:
+        return plan["stop_frac"], plan["tp_frac"]
     sig = signal or {}
     if "stop_frac" in sig or "tp_frac" in sig:
         return sig.get("stop_frac"), sig.get("tp_frac")
     return params.get("stop_loss"), params.get("take_profit")
 
 
-def open_position(x: dict, fills: list[dict], orders: dict[str, dict]) -> dict | None:
+def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
+                  plans: dict[str, dict] | None = None) -> dict | None:
     """An open position from a sleeve summary (with book extras), or None when flat."""
     if x["qty"] <= 0 or not x["entry_px"]:
         return None
     lot = open_lot(fills)
     entry = orders.get(lot["order_id"]) if lot else None
-    sl, tp = exit_fracs(x["sleeve"].params, entry["signal"] if entry else None)
+    plan = (plans or {}).get(lot["order_id"]) if lot else None
+    sl, tp = exit_fracs(x["sleeve"].params, entry["signal"] if entry else None, plan)
     cost = x["qty"] * x["entry_px"]
     return {
         "sleeve": x["sleeve"].name,
@@ -159,10 +187,11 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict]) -> dict |
         "unrealised_ret": x["unrealised"] / cost if cost else 0.0,
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
-        "stop_px": x["entry_px"] * (1 - sl) if sl else None,
+        "stop_px": x["entry_px"] * (1 - sl) if sl is not None else None,
         "target_px": x["entry_px"] * (1 + tp) if tp else None,
         "why": entry["reason"] if entry else None,
-        "sig": signal_items(entry["signal"]) if entry else [],
+        "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan) if plan else []),
+        "exits_edited": bool(plan and plan["kind"] == "edit"),
         "weight": x["position_value"] / x["equity"] if x["equity"] else 0.0,
     }
 
@@ -179,10 +208,11 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         name = x["sleeve"].name
         fills = store.fills(name, limit=1_000_000)
         orders = orders_by_id(store, name)
-        pos = open_position(x, fills, orders)
+        plans = store.exit_plans(name)
+        pos = open_position(x, fills, orders, plans)
         if pos:
             positions.append(pos)
-        for t in trips(fills, store.events(name, limit=5000), orders):
+        for t in trips(fills, store.events(name, limit=5000), orders, plans):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)

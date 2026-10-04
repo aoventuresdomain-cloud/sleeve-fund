@@ -89,6 +89,12 @@ def r_target(r: float, stop: float, leg: float) -> float:
     return (r * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg)
 
 
+def _from_entry(stop: float) -> str:
+    """A stop's distance in words: "2.0% below the entry", or above it for a stop set from the market on
+    a position already in profit."""
+    return f"{stop:.1%} below the entry" if stop >= 0 else f"{-stop:.1%} above the entry"
+
+
 def exit_warmup(params: dict) -> int:
     """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop."""
     if params.get("stop_atr"):
@@ -269,6 +275,10 @@ class LongFlatStrategy(Strategy):
         self._stop_frac: float | None = None
         self._tp_frac: float | None = None
         self._stop_basis = ""  # how the stop was set, in words, for the journal
+        # After a restart: a new ATR or swing-low stop to set from the market on the next bar, with the old
+        # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
+        self._replan_pending: tuple[str, int] | None = None
+        self._plan_entry: dict | None = None  # the open position's entry order, after a restart
         self._atr = Atr(config.atr_bars) if config.stop_atr else None
         self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
@@ -456,49 +466,137 @@ class LongFlatStrategy(Strategy):
             if len(self._lows) < c.stop_swing_bars or close <= 0:
                 return None
             low = min(self._lows)
-            stop, basis = 1 - low / close, f"under the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
+            stop, basis = 1 - low / close, f"at the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
         if stop is not None and (c.stop_atr or c.stop_swing_bars):
             clamped = min(max(stop, MIN_STOP), MAX_STOP)
             if clamped != stop:
                 basis += f", held to {clamped:.1%}"
             stop = clamped
-        tp = c.take_profit if c.take_profit else (
-            r_target(c.take_profit_r, stop, self._round_trip_cost()) if c.take_profit_r and stop else None)
-        return stop, tp, basis
+        return stop, self._target_for(stop), basis
+
+    def _target_for(self, stop: float | None) -> float | None:
+        """The target as a share of the entry price: the fixed % one, or r_target around this stop."""
+        c = self._cfg
+        if c.take_profit:
+            return c.take_profit
+        if c.take_profit_r and stop is not None and stop > 0:
+            return r_target(c.take_profit_r, stop, self._round_trip_cost())
+        return None
+
+    def _stop_cfg(self) -> dict:
+        """The stop settings, journaled with each entry, so a later edit can tell whether it changed the stop."""
+        c = self._cfg
+        if c.stop_atr:
+            return {"stop_atr": c.stop_atr, "atr_bars": c.atr_bars}
+        if c.stop_swing_bars:
+            return {"stop_swing_bars": c.stop_swing_bars}
+        return {"stop_loss": c.stop_loss} if c.stop_loss else {}
 
     def _restore_plan(self) -> None:
-        """After a restart with a position open: the stop and target its entry journaled. Fixed %
-        exits need no journal; an ATR or swing-low stop set at entry is read back, or, for an entry
-        journaled before stops were recorded, set again from the market on the next bar (_replan).
-        When the PM has changed the settings since the entry, the new ones are set the same way."""
-        c = self._cfg
-        if not self._has_exits:
-            return
-        entry = next((o for o in self.runtime.store.orders(self.runtime.name, limit=200)
+        """After a restart with a position open, the stop and target it works to: the plan its entry
+        journaled, or the latest one set since (Store.exit_plan). When the PM has changed the stop or
+        target since, the new settings apply to it (review round 8, B8-1):
+        - a target-only edit keeps the stop to the tick and sets the target again around it;
+        - a new % stop applies at once;
+        - a new ATR or swing-low stop is set from the market on the next bar with bars enough (_replan),
+          and the old stop keeps working until then.
+        An entry journaled before stops were recorded gets the fixed % plan, or an ATR or swing-low stop
+        set from the market once there are bars enough."""
+        c, store, name = self._cfg, self.runtime.store, self.runtime.name
+        entry = next((o for o in store.orders(name, limit=200)
                       if o.get("intent") == "entry" and o.get("side") == "BUY"), None)
-        sig = (entry or {}).get("signal") or {}
-        changed = self.runtime.store.last_event(self.runtime.name, ("exits_change",))
-        if entry and changed and changed["ts"] > entry["ts"]:
-            sig = {}  # the PM changed the stop or target since this entry: the new ones apply to it too
-        if "stop_frac" in sig or "tp_frac" in sig:
-            self._stop_frac, self._tp_frac = sig.get("stop_frac"), sig.get("tp_frac")
-            self._stop_basis = sig.get("stop_basis", "")
+        self._plan_entry, self._replan_pending = entry, None
+        if entry is None:
+            if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
+                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            return
+        sig = entry.get("signal") or {}
+        plan = store.exit_plan(name, entry["order_id"])
+        if plan is not None:
+            base = (plan["stop_frac"], plan["tp_frac"], plan["basis"] or "", plan["stop_cfg"])
+        elif "stop_frac" in sig or "tp_frac" in sig:
+            base = (sig.get("stop_frac"), sig.get("tp_frac"), sig.get("stop_basis", ""), sig.get("stop_cfg"))
+        else:
+            base = None
+        after = (plan or {}).get("event_id") or 0
+        edits = [e for e in store.sleeve_events_since(name, ("exits_change",), after) if e["ts"] > entry["ts"]]
+        if not edits:
+            if base is not None:
+                self._stop_frac, self._tp_frac, self._stop_basis = base[0], base[1], base[2]
+            elif c.stop_atr or c.stop_swing_bars:
+                last = store.last_event(name, ("exits_change",))
+                self._replan_pending = ("restart", last["id"] if last else 0)
+            elif self._has_exits:
+                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            return
+        event_id = edits[-1]["id"]
+        old_stop, old_tp, old_basis, old_cfg = base or (None, None, "", None)
+        if old_cfg is not None:
+            same_stop = old_cfg == self._stop_cfg()
+        else:  # an entry journaled before its stop settings were: the change messages say what changed
+            same_stop = base is not None and not any("Stop-loss " in e["message"] for e in edits)
+        if same_stop:
+            self._set_plan(old_stop, self._target_for(old_stop), old_basis, "edit", event_id)
         elif not (c.stop_atr or c.stop_swing_bars):
-            self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            stop = c.stop_loss
+            self._set_plan(stop, self._target_for(stop), _from_entry(stop) if stop else "", "edit", event_id)
+        else:
+            self._stop_frac, self._stop_basis = old_stop, old_basis
+            self._tp_frac = c.take_profit or old_tp
+            self._replan_pending = ("edit", event_id)
 
     def _replan(self, close: float) -> None:
+        """Set an ATR or swing-low stop from the market for a position already open: as a price level
+        (the close less so many ATRs, or the swing low itself), then as a share of the entry price, so
+        the stop sits where its words say. It only ever tightens the stop working until now."""
         plan = self._plan_exits(close)
         if plan is None:
-            self._note("stop_not_ready", "The open position has no stop yet: it is set from the last "
-                       f"{self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} bars, "
-                       "and there aren't that many since the restart")
+            self._note("stop_not_ready", ("The open position keeps its old stop until the new one can be set: "
+                                          if self._stop_frac is not None else "The open position has no stop yet: ")
+                       + f"it is set from the last {self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} "
+                       "bars, and there aren't that many since the restart")
             return
         self._noted.discard("stop_not_ready")
-        self._stop_frac, self._tp_frac, self._stop_basis = plan
-        if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "warning", "stop_reset",
-                                     f"Stop for the open position set again from the market after a restart: "
-                                     f"{self._stop_frac:.1%} below the entry ({self._stop_basis})", ts=self.runtime.now())
+        kind, event_id = self._replan_pending
+        self._replan_pending = None
+        distance, _, basis = plan
+        level = close * (1 - distance)
+        stop = 1 - level / self._entry_px
+        if self._stop_frac is not None and self._stop_frac < stop:
+            basis = (f"kept: the new setting ({basis}) would put it lower, at {level:,.6g}, and a stop set "
+                     f"from the market only ever tightens; {self._stop_basis or _from_entry(self._stop_frac)}")
+            stop = self._stop_frac
+        self._set_plan(stop, self._target_for(stop) if (stop > 0 or not self._cfg.take_profit_r) else self._tp_frac,
+                       basis, kind, event_id)
+
+    def _set_plan(self, stop: float | None, tp: float | None, basis: str, kind: str, event_id: int) -> None:
+        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so."""
+        self._stop_frac, self._tp_frac, self._stop_basis = stop, tp, basis
+        if self.runtime is None or self._plan_entry is None:
+            return
+        sig = self._plan_entry.get("signal") or {}
+        notional = self._entry_px * self._entry_qty
+        cost = self._round_trip_cost()
+        # A looser stop risks more than the entry did, and R is measured on the larger of the two, so
+        # widening a stop can't flatter the trade's R multiple (review round 8, M8-1).
+        risk = max(float(sig.get("risk_amount") or 0.0),
+                   notional * (stop + cost + (1 - stop) * cost) if stop is not None else 0.0) or None
+        planned = round((tp - cost - (1 + tp) * cost) * notional / risk, 2) if tp and risk else None
+        store, name, now = self.runtime.store, self.runtime.name, self.runtime.now()
+        store.set_exit_plan(name, self._plan_entry["order_id"], kind=kind, ts=now, event_id=event_id,
+                            stop_frac=None if stop is None else round(stop, 6), tp_frac=None if tp is None else round(tp, 6),
+                            basis=basis, stop_cfg=self._stop_cfg(), risk_amount=None if risk is None else round(risk, 2),
+                            planned_r=planned)
+        parts = [f"stop at {self._entry_px * (1 - stop):,.6g}, {_from_entry(stop)}" + (f" ({basis})" if basis and
+                 not basis.endswith("below the entry") else "") if stop is not None else "no stop",
+                 f"target at {self._entry_px * (1 + tp):,.6g}, {tp:.1%} above it" if tp else "no target"]
+        if kind == "edit":
+            store.event(name, "info", "exits_applied", "The open position now works to the new settings: "
+                        f"{'; '.join(parts)} (entry {self._entry_px:,.6g})"
+                        + (f"; 1R is now {risk:,.2f}" if risk else "") + ".", ts=now)
+        else:
+            store.event(name, "warning", "stop_reset", "Stop for the open position set again from the market after "
+                        f"a restart: {'; '.join(parts)} (entry {self._entry_px:,.6g}).", ts=now)
 
     def on_historical_bars(self, bars) -> None:
         for bar in sorted(bars, key=lambda b: b.ts_event):
@@ -567,7 +665,7 @@ class LongFlatStrategy(Strategy):
         self._maybe_tick()
         if self._pending_exit is not None:
             return
-        if self._entry_px is not None and self._has_exits and self._stop_frac is None and self._tp_frac is None:
+        if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
         if self._check_exits(self._last_close):
             return
@@ -694,14 +792,14 @@ class LongFlatStrategy(Strategy):
         Paper and live call this on every trade, so both levels are watched tick by tick. A
         backtest only sees whole bars, so both exits rest at the venue instead (_rest_exits)."""
         stop, tp = self._stop_frac, self._tp_frac
-        if self._entry_px is None or not (stop or tp) or price <= 0:
+        if self._entry_px is None or (stop is None and not tp) or price <= 0:
             return False
         if self._busy():
             return False
         if self._backtest:
             return False  # both exits rest at the venue (_rest_exits) and fill at their levels
         move = price / self._entry_px - 1
-        hit = ("stop_loss" if stop and move <= -stop else "take_profit" if tp and move >= tp else None)
+        hit = ("stop_loss" if stop is not None and move <= -stop else "take_profit" if tp and move >= tp else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
@@ -710,7 +808,8 @@ class LongFlatStrategy(Strategy):
                                      ts=self.runtime.now())
         level = stop if hit == "stop_loss" else tp
         reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
-                  f"the {self._entry_px:,.6g} entry, past the {level:.1%} {'stop' if hit == 'stop_loss' else 'target'}")
+                  f"the {self._entry_px:,.6g} entry, past the "
+                  + (f"stop {_from_entry(level)}" if hit == "stop_loss" else f"{level:.1%} target"))
         values = {"entry_px": self._entry_px, "move": move, hit: level}
         self._exit_lock = True
         self._entry_px = None  # don't fire again while the sell is in flight
@@ -774,6 +873,8 @@ class LongFlatStrategy(Strategy):
                 signal["planned_r"] = round((tp - cost - (1 + tp) * cost) / loss, 2)
         elif self._tp_frac:
             signal["tp_frac"] = round(self._tp_frac, 6)
+        if self._has_exits:
+            signal["stop_cfg"] = self._stop_cfg()
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
     def _loss_at_stop(self) -> float:
@@ -1184,6 +1285,7 @@ class LongFlatStrategy(Strategy):
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
                 self._stop_frac = self._tp_frac = None
+                self._replan_pending = self._plan_entry = None
         if self._backtest:
             if event.is_buy and done and self._pending_exit is None:
                 self._rest_exits()

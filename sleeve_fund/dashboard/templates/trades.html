@@ -52,14 +52,14 @@
   <div class="panel-head"><h2 id="tr-h">Closed trades</h2></div>
   {% if h.trades %}
   <table class="responsive" data-hide-md="3 6 7 9">
-    <thead><tr><th>Closed</th><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th>Exit</th><th></th></tr></thead>
+    <thead><tr><th>Closed</th><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for t in h.trades %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ t.closed|ts }}</td><td><a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a></td>
       <td class="num" data-m="hide">{{ '%.6g'|format(t.qty) }} {{ t.pair.split('/')[0] }}</td>
       <td class="num" data-m="hide">{{ t.entry_px|px }}<div class="sub">{{ t.opened|ts }}</div></td>
       <td class="num" data-m="hide">{{ t.exit_px|px }}<div class="sub">{{ t.closed|ts }}</div></td>
       <td class="num" data-m="hide">{{ t.held|held }}</td><td class="num" data-m="hide">{{ t.fees|money }}</td>
-      <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td><td class="num" data-m="hide">{{ t.r|rmult }}</td>
+      <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td><td class="num" data-m="hide">{{ t.r|rmult }}{% if t.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td>
       <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">

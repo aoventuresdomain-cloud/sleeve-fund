@@ -164,6 +164,26 @@ orders_t = Table(
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
 )
+# The stop and target an open position works to after the PM edited them, or after a restart set them
+# again from the market, as shares of its entry price (the entry order's signal holds the plan it was
+# entered with). The latest row per entry order is in force. A new table: CREATE TABLE.
+exit_plans_t = Table(
+    "exit_plans",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("entry_order", String(64), nullable=False),  # the entry's client order id
+    Column("ts", TS, nullable=False),
+    Column("kind", String(16), nullable=False),  # "edit": the PM changed the settings; "restart": set again
+    Column("stop_frac", Float),
+    Column("tp_frac", Float),
+    Column("basis", Text, nullable=False, default=""),  # how the stop was set, in words
+    Column("stop_cfg", JSON),  # the stop settings it was set from
+    Column("risk_amount", Float),  # the trade's 1R from now on: the larger of the entry's and this plan's
+    Column("planned_r", Float),
+    Column("event_id", Integer),  # the newest settings-change event it applies
+    Index("exit_plans_entry", "sleeve", "entry_order", "id"),
+)
 # Venue accounts (see sleeve_fund/accounts.py), which sleeve trades on which, and whether the
 # supervisor can see a key for each live account. New tables, so they arrive as CREATE TABLE.
 accounts_t = Table(
@@ -771,6 +791,37 @@ class Store:
         with self.engine.connect() as c:
             return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
 
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
+        """One sleeve's events of these kinds newer than an id, oldest first."""
+        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds), events_t.c.id > after_id)
+             .order_by(events_t.c.id))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def set_exit_plan(self, sleeve: str, entry_order: str, *, kind: str, stop_frac: float | None,
+                      tp_frac: float | None, basis: str = "", stop_cfg: dict | None = None,
+                      risk_amount: float | None = None, planned_r: float | None = None, event_id: int | None = None,
+                      ts: datetime | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(insert(exit_plans_t).values(
+                sleeve=sleeve, entry_order=entry_order, ts=ts or utcnow(), kind=kind, stop_frac=stop_frac,
+                tp_frac=tp_frac, basis=basis, stop_cfg=stop_cfg, risk_amount=risk_amount, planned_r=planned_r,
+                event_id=event_id))
+
+    def exit_plan(self, sleeve: str, entry_order: str) -> dict | None:
+        """The plan in force for this entry since it was entered, or None if it still has its entry's."""
+        q = (select(exit_plans_t).where(exit_plans_t.c.sleeve == sleeve, exit_plans_t.c.entry_order == entry_order)
+             .order_by(exit_plans_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
+    def exit_plans(self, sleeve: str) -> dict[str, dict]:
+        """The plan in force for each of a sleeve's entries that has one, by entry order id."""
+        q = select(exit_plans_t).where(exit_plans_t.c.sleeve == sleeve).order_by(exit_plans_t.c.id)
+        with self.engine.connect() as c:
+            return {r["entry_order"]: r for r in _rows(c.execute(q))}
+
     def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
              .order_by(events_t.c.id.desc()).limit(1))
@@ -931,7 +982,7 @@ class Store:
             # otherwise block deleting its event (a foreign key) and with it every later prune.
             c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
                                                                   .where(events_t.c.sleeve.in_(old)))))
-            for t in (equity_t, fills_t, orders_t, events_t):
+            for t in (equity_t, fills_t, orders_t, events_t, exit_plans_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
             c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))

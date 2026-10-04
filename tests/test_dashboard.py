@@ -1256,6 +1256,31 @@ def test_bad_settings_changes_are_refused_and_keep_what_was_typed(client, over, 
         assert "Not saved" in c.get(loc.split("#")[0], auth=AUTH).text
 
 
+def test_loosening_the_stop_on_an_open_position_is_checked_against_its_size(client):
+    """Review round 8, M8-1: a 3% to 50% edit on an open position saved, about 17R at risk. A looser stop
+    now needs the PM's confirmation, with the risk in money and R; one past the drawdown halt is refused."""
+    from urllib.parse import unquote_plus
+
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    c, store = client
+    _new(c, stop_loss_pct="3")
+    rt = SleeveRuntime(store, "btc-test")
+    rt.on_order(order_id="E-1", side="BUY", qty=0.06, intent="entry", reason="Signal to be long",
+                signal={"stop_frac": 0.03, "risk_amount": 137.28, "stop_cfg": {"stop_loss": 0.03}})
+    rt.on_fill(side="BUY", qty=0.06, price=50_000.0, fee=24.0, order_id="E-1", trade_id="T-1")
+    store.record_equity("btc-test", equity=4_976.0, cash=1_976.0, qty=0.06, price=50_000.0, benchmark=5_000)
+    assert "Accept a looser stop on the open position" in c.get("/sleeves/btc-test", auth=AUTH).text
+    loc = unquote_plus(_settings(c, stop_loss_pct="5").headers["location"])
+    assert "looser than the 3.0%" in loc and "(1.5R of the entry" in loc
+    assert store.sleeve("btc-test").params["stop_loss"] == 0.03
+    loc = unquote_plus(_settings(c, stop_loss_pct="50", confirm_looser="1").headers["location"])
+    assert "drawdown halt" in loc and store.sleeve("btc-test").params["stop_loss"] == 0.03
+    assert "saved=settings" in _settings(c, stop_loss_pct="5", confirm_looser="1").headers["location"]
+    assert store.sleeve("btc-test").params["stop_loss"] == 0.05
+    assert "saved=settings" in _settings(c, stop_loss_pct="2").headers["location"]  # tighter: no question
+
+
 def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
     c, store = client
     _new(c)
