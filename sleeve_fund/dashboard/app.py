@@ -636,7 +636,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         view = dict(job.view(), ahead=app.state.jobs.ahead_of(job)) if job is not None else None
         # The study's own settings come back on the redirect, so the form shows what is running.
         pre = {k: v for k, v in request.query_params.items() if k != "job"}
-        return research_page(request, job=view, pre=pre)
+        lost = request.query_params.get("job") and job is None
+        return research_page(request, job=view, pre=pre, error=LOST_JOB if lost else "")
 
     @app.post("/research/run")
     async def research_run(request: Request, _: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -814,7 +815,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         the background; a quick one comes straight back as its saved result, a long one shows progress."""
         q = request.query_params
         if not q.get("run"):
-            return backtest_form(request, q)
+            lost = q.get("job") and app.state.jobs.get(q["job"]) is None
+            return backtest_form(request, q, error=LOST_JOB if lost else "")
         try:
             args = _backtest_args(q)
         except (ValueError, TypeError, KeyError) as exc:
@@ -1040,6 +1042,10 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                         bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
+
+LOST_JOB = ("that run is no longer known, most likely because the server restarted while it ran; "
+            "run it again (review round 10, m9)")
+
 
 def _qty(x: float) -> str:
     """A quantity to six significant figures, without exponents: 23,350.1 and 0.0765 rather than 2.335e+04

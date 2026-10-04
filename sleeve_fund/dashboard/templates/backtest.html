@@ -106,7 +106,7 @@
       {% if runs %}
       <table class="compact">
         <thead><tr><th>Run</th><th>Saved</th></tr></thead>
-        <tbody>{% for r in runs %}<tr{{ ' aria-current="true"' if saved and saved.id == r.id }}><td><a href="/backtest/{{ r.id }}">{{ r.title }}</a>{% if r.errored %} <span class="chip halted">Strategy error</span>{% endif %}</td><td class="muted">{{ r.created_at|ts }}</td></tr>{% endfor %}</tbody>
+        <tbody>{% for r in runs %}<tr{{ ' aria-current="true"' if saved and saved.id == r.id }}><td><a href="/backtest/{{ r.id }}">{{ r.title }}</a>{% if r.errored %} <span class="chip halted">Strategy error</span>{% endif %}{% if r.halted %} <span class="chip halted">Halted</span>{% endif %}</td><td class="muted">{{ r.created_at|ts }}</td></tr>{% endfor %}</tbody>
       </table>
       {% else %}<p class="empty" style="padding:4px 14px 14px">None yet. Pick an instrument and a model, then press Run backtest.</p>{% endif %}
     </section>
