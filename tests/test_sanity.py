@@ -877,6 +877,53 @@ def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
 
 
+XRP_INST = K.instrument("XRP", "USD", price_precision=5, size_precision=6)
+
+
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
+def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots(profile):
+    """B11-2, B11-3, M10-4 over a long run at small-unit sizes (thousands of units to six decimals), long
+    and short with a stop and target, through a fall deep enough to halt it:
+    - every fill and every order's filled quantity is an exact number of lots, journaled without float
+      residue, and each order's filled quantity is the exact sum of its fills;
+    - every fill other than an entry is reduce-only: it shrinks the position and never carries it through
+      flat to the other side, so no exit, stop or target opens a position, after a halt or otherwise;
+    - every exit closes to exactly zero, and every entry on either side rests a full-size stop and target."""
+    from decimal import Decimal
+
+    lot = Decimal(str(XRP_INST.size_increment))
+    s = np.arange(0, 1500 * 3600, 3600)
+    c = 0.5 * (1 + 0.04 * np.sin(s / 40_000) + 0.01 * np.sin(s / 7_000)) * np.where(s > 1200 * 3600, 0.6, 1.0)
+    j = run_backtest("probe_ls", _ls_bars(np.round(c, 5), minutes=60), XRP_INST,
+                     {"period": 5, "stop_loss": 0.03, "take_profit": 0.05, **PERP}, starting_capital=10_000,
+                     risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    by_order: dict = {}
+    held = Decimal(0)
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        q = Decimal(str(f["qty"]))
+        assert q > 0 and q % lot == 0 and -q.as_tuple().exponent <= 6, f  # an exact number of lots
+        by_order[f["order_id"]] = by_order.get(f["order_id"], Decimal(0)) + q
+        after = held + q * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] != "entry":
+            assert abs(after) < abs(held) and after * held >= 0, (f, held, after)  # reduce-only
+            assert after == 0, (f, after)  # and it closes the whole position
+        held = after
+    for o in orders:
+        assert Decimal(str(o["filled_qty"])) == by_order.get(o["order_id"], Decimal(0)), o
+    assert {o["intent"] for o in orders} & {"risk_pause", "risk_halt", "stop_loss"}  # it went through the guards
+    entries = [i for i, o in enumerate(orders) if o["intent"] == "entry"]
+    assert len(entries) > 30 and {orders[i]["side"] for i in entries} == {"BUY", "SELL"}
+    for i in entries:
+        e = orders[i]
+        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
+        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        far = "SELL" if e["side"] == "BUY" else "BUY"
+        assert all(o["side"] == far and Decimal(str(o["qty"])) == Decimal(str(e["filled_qty"]))
+                   for o in legs.values()), (e, legs)
+
+
 @pytest.mark.xfail(strict=True, reason="sanity 5 Oct: a gap past liquidation books a loss beyond the strategy's "
                                        "isolated margin (equity goes negative); reported to the build thread")
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
