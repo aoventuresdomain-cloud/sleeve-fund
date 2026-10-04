@@ -33,4 +33,7 @@ include = ["sleeve_fund*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["strategy_errors: the test makes a strategy raise on purpose, to check the errors are reported"]
+markers = [
+    "strategy_errors: the test makes a strategy raise on purpose, to check the errors are reported",
+    "sanity: fast arithmetic checks on fees, sizing, the books, R and paper-backtest parity (pytest -m sanity)",
+]
