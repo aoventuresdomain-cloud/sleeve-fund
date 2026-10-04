@@ -49,10 +49,14 @@ def test_study_end_to_end_and_holdout_flag(tmp_path, instrument):
     assert "Synthetic data" in render(r, ledger)
 
     first = run_study(SPEC, prices, instrument, use_holdout=True, **kw)
-    assert first.holdout is not None and not first.holdout_reused
-    second = run_study(SPEC, prices, instrument, use_holdout=True, **kw)
-    assert second.holdout_reused
-    assert "holdout opened more than once" in render(second, ledger)
+    assert first.holdout is not None
+    # A second opening, at any bar length, leaves it closed and says when it was opened (review round 10, M10-1).
+    for dataset in ("syn", "syn-60m"):
+        second = run_study(SPEC, prices, instrument, use_holdout=True, **dict(kw, dataset=dataset))
+        assert second.holdout is None
+        assert "opened on " in second.holdout_withheld and "on daily bars" in second.holdout_withheld
+        assert "a second look can't be fresh" in render(second, ledger)
+    assert sum(e["stage"] == "holdout" for e in ledger.entries()) == 1
 
 
 def test_trade_stats_after_fees_with_partial_fills():
@@ -298,11 +302,12 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
             "that test window sat flat at +0.0% throughout and 1 inside the test window, flat from then on "
             "(1 of them closed a trade first)") in gaps
     enough = next(c for c in g1_checks(r, ledger) if c[0] == "Enough out-of-sample trades to judge")
-    assert enough[1] == "FAIL" and enough[2].startswith("1 closed in the 2 walk-forward test windows")
+    # One of two windows blind, so half: not judged since round 10 (M10-1), and the trade count can't fail.
+    assert enough[1] == "N/A" and enough[2].startswith("not judged: 1 closed in the 2 walk-forward test windows")
     sheet = render(r, ledger)
     assert "> **No trades out-of-sample in 1 of 2 test windows.**" in sheet
     assert "| 0 (halted 29 Mar 2022) |" in sheet and "| 1 (halted 27 Mar 2022) |" in sheet  # halt dates per fold
-    assert "**G1: FAIL**" in sheet  # one test window traded into its halt: a result, judged
+    assert "**G1: NOT JUDGED**" in sheet  # the one window left traded into its halt
     assert "kept in the repository" not in sheet
     import sleeve_fund.research.tearsheet as tearsheet
 
@@ -428,10 +433,10 @@ def _folds(*spec):
             for h, b, t in spec]
 
 
-def test_a_study_whose_test_windows_are_mostly_blind_is_not_judged():
+def test_a_study_whose_test_windows_are_half_or_more_blind_is_not_judged():
     """Review round 9, N7: a 5-minute study with 5 of 6 folds halted and 4 of 6 test windows empty read
     G1 FAIL on the 2 windows left. A window is blind when a halt kept it flat or left it without a trade;
-    with most windows blind the study is not judged. A window the signal simply never traded in, or one
+    with half or more blind the study is not judged. A window the signal simply never traded in, or one
     halted after it traded, is still a result."""
     from types import SimpleNamespace
 
@@ -445,7 +450,10 @@ def test_a_study_whose_test_windows_are_mostly_blind_is_not_judged():
     assert why(reviewer).startswith("the risk guard halted the strategy in 5 of 6 folds, leaving 4 of 6 test "
                                     "windows flat or without a trade, and out-of-sample closed 7 trades")
     assert why(_folds((1, 1, 0), (1, 0, 2), (0, 0, 0), (0, 0, 0), (0, 0, 5), (0, 0, 1))) == ""  # 1 blind, 2 quiet
-    assert why(_folds((1, 1, 0), (1, 0, 0), (1, 0, 1), (0, 0, 4))) == ""  # half blind is not most
+    # Review round 10, M10-1: exactly half blind is not judged either; it read FAIL on one live window.
+    round10 = _folds((0, 0, 4), (1, 0, 1), (1, 1, 0), (1, 0, 1), (1, 1, 0), (1, 0, 0))
+    assert why(round10).startswith("the risk guard halted the strategy in 5 of 6 folds, leaving 3 of 6 test windows")
+    assert why(_folds((1, 1, 0), (0, 0, 2), (0, 0, 1), (0, 0, 4))) == ""  # a quarter blind is judged
     assert why(_folds((1, 1, 0), (0, 0, 0))) != ""  # no trade out-of-sample at all, with a halt behind it
 
 

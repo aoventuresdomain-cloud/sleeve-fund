@@ -30,7 +30,7 @@
       <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
       <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
       <td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
-      <td class="num" data-m="hide">{{ '%.6g'|format(o.qty) }}{% if o.filled_qty and o.filled_qty < o.qty %}<div class="sub">{{ '%.6g'|format(o.filled_qty) }} filled</div>{% endif %}</td>
+      <td class="num" data-m="hide">{{ o.qty|qty }}{% if o.filled_qty and o.filled_qty|qty != o.qty|qty %}<div class="sub">{{ o.filled_qty|qty }} filled</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td>
       <td class="num" data-m="right">{{ o.notional|money if o.filled_qty else '–' }}</td>
       <td class="num" data-m="hide">{{ o.fee|money }}</td>
@@ -38,11 +38,11 @@
       <td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
-      {{ why(o.intent_label ~ ' · ' ~ ('buy' if o.side == 'BUY' else 'sell') ~ ' ' ~ ('%.6g'|format(o.qty)), o.reason, o.sig) }}
+      {{ why(o.intent_label ~ ' · ' ~ ('buy' if o.side == 'BUY' else 'sell') ~ ' ' ~ (o.qty|qty), o.reason, o.sig) }}
       <div class="why-block"><div class="k">Order</div>
         <dl class="sig">
           <div><dt>Order id</dt><dd class="mono">{{ o.order_id }}</dd></div>
-          <div><dt>Filled</dt><dd>{{ '%.6g'|format(o.filled_qty) }} of {{ '%.6g'|format(o.qty) }}</dd></div>
+          <div><dt>Filled</dt><dd>{{ o.filled_qty|qty }} of {{ o.qty|qty }}</dd></div>
           <div><dt>Type</dt><dd>{{ o.order_type|capitalize }}</dd></div>
           <div><dt>Sent</dt><dd>{{ o.ts|ts }}</dd></div>
           <div><dt>Last update</dt><dd>{{ o.updated_at|ts }}</dd></div>

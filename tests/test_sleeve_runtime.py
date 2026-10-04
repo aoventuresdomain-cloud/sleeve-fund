@@ -169,6 +169,16 @@ def test_reconcile_runs_every_24_hours(store):
     assert rt.reconcile_due()
 
 
+def test_a_mismatch_line_shows_the_gap(store):
+    """Review round 10, m1: "engine position 9075.15 vs journal 9075.15" hid a 1e-7 gap."""
+    _sleeve(store)
+    store.record_fill("s1", side="BUY", qty=9075.15, price=0.5, fee=0.0, order_id="x", trade_id="x")
+    rt = SleeveRuntime(store, "s1", now=utcnow_fixed)
+    assert not rt.reconcile(cash=10_000 - 9075.15 * 0.5, qty=9075.1500001, qty_tolerance=1e-8)
+    msg = next(e["message"] for e in store.events("s1") if e["kind"] == "reconcile_mismatch")
+    assert "engine position 9075.1500001 vs journal 9075.15, +1e-07 apart (1 fills)" in msg
+
+
 def utcnow_fixed():
     from datetime import datetime, timezone
 

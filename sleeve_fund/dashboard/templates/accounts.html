@@ -46,7 +46,7 @@
     <h2 id="dlg-retire-{{ a.name }}-h">{{ 'Reinstate' if a.retired_at else 'Retire' }} {{ a.name }}</h2>
     {% if a.retired_at %}<p>Strategies can be moved onto it and started on it again.</p>
     {% elif running %}<p class="warn">{{ running|join(', ') }} still run{{ 's' if running|length == 1 }} on it. Stop {{ 'it' if running|length == 1 else 'them' }} or move {{ 'it' if running|length == 1 else 'them' }} to another account first.</p>
-    {% elif a.held %}<p class="warn">{{ a.held|join(', ') }} {{ 'is' if a.held|length == 1 else 'are' }} stopped but still hold{{ 's' if a.held|length == 1 }} a position on it. Flatten {{ 'it' if a.held|length == 1 else 'them' }} first.</p>
+    {% elif a.held %}<p class="warn">{% for n in a.held %}<a href="/sleeves/{{ n }}">{{ n }}</a>{{ ', ' if not loop.last }}{% endfor %} {{ 'is' if a.held|length == 1 else 'are' }} stopped but still hold{{ 's' if a.held|length == 1 }} a position on it. Flatten {{ 'it' if a.held|length == 1 else 'them' }} first.</p>
     {% else %}<p>Nothing is deleted. No strategy can be moved onto it or started on it until you reinstate it{% if a.sleeves %}; {{ a.sleeves|join(', ') }} stay{{ 's' if a.sleeves|length == 1 }} assigned to it, stopped{% endif %}.</p>{% endif %}
     <label for="rr-{{ a.name }}">Reason for the decision log</label>
     <input id="rr-{{ a.name }}" name="reason" list="account-reasons" required autocomplete="off" placeholder="Pick or type a reason">
