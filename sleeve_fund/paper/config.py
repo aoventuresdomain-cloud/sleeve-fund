@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sleeve_fund import markets
 from sleeve_fund.instruments import FeeSchedule
 from sleeve_fund.strategies import REGISTRY
 from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
@@ -77,7 +78,8 @@ class SleeveConfig:
 
     @property
     def fees(self) -> FeeSchedule:
-        return self.fee_schedule or venue_profile(self.venue).fees
+        # A perpetual pays its market's schedule (sleeve_fund.markets); spot pays the venue's.
+        return markets.fees_for(self.params, self.fee_schedule or venue_profile(self.venue).fees)
 
     @property
     def instrument_id(self) -> str:

@@ -45,7 +45,7 @@ class SleeveRuntime:
 
     def risk_events(self) -> list[dict]:
         """Halts and pauses, oldest first, for a backtest to show."""
-        kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch")
+        kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch", "liquidation", "liquidation_guard")
         return [e for e in reversed(self.store.events(self.name, limit=10_000)) if e["kind"] in kinds]
 
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:
@@ -164,8 +164,11 @@ class SleeveRuntime:
 
     # --- periodic tick ----------------------------------------------------------
 
-    def tick(self, *, equity: float, cash: float, qty: float, price: float) -> str | None:
-        """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now."""
+    def tick(self, *, equity: float, cash: float, qty: float, price: float,
+             guard_equity: float | None = None) -> str | None:
+        """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
+        guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
+        a perp), which the guard judges by when lower; the mark is still this tick's equity."""
         now = self.now()
         self.store.heartbeat(self.name)
         if self.progress is not None:
@@ -196,7 +199,8 @@ class SleeveRuntime:
         flatten = False
         self.flatten_why = None
         if self.status == "running":
-            breach = risk.check(self.profile, equity, self.peak, self._day_open)
+            judged = min(equity, guard_equity) if guard_equity is not None else equity
+            breach = risk.check(self.profile, judged, self.peak, self._day_open)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume", ts=self.now())

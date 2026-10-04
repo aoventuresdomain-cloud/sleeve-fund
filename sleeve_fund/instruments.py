@@ -121,6 +121,9 @@ class ScheduleFeeModel(FeeModel):
         # at market as it earns it, and this charges the slice as filled at the limit with the maker fee:
         # the commission carries the difference from the price the venue filled at (review round 9, M9-3).
         self.maker_slices: dict[str, tuple[Decimal, bool]] = {}
+        # Paper on a perp: the order that puts a position carried over a restart back at the simulated
+        # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
+        self.free_orders: set[str] = set()
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -137,6 +140,8 @@ class ScheduleFeeModel(FeeModel):
         return self.fees.maker if getattr(order, "is_post_only", False) else self.fees.taker
 
     def get_commission(self, order, fill_quantity, fill_px, instrument) -> Money:
+        if str(order.client_order_id) in self.free_orders:
+            return Money(0, instrument.quote_currency)
         notional = fill_quantity.as_decimal() * fill_px.as_decimal()
         maker_slice = self.maker_slices.get(str(order.client_order_id))
         if maker_slice is not None:

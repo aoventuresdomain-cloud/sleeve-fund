@@ -125,7 +125,7 @@
   <section class="panel span-5" aria-labelledby="alloc-h">
     <div class="panel-head"><h2 id="alloc-h">Allocation</h2></div>
     {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
-    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.share * 100)|round(2) }}%; background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
+    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.bar * 100)|round(2) }}%; background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
     <table class="compact">
       <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
       <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>

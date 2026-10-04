@@ -27,6 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
@@ -231,7 +232,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                       if any(c["command"] == "flatten" for c in st().pending_commands(x["sleeve"].name))]
         live = [x for x in summaries if x["sleeve"].name not in flattening]
         trading = [x for x in live if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
-        held = [x for x in live if x["qty"] > 0 and x not in trading]
+        held = [x for x in live if x["qty"] and x not in trading]
         return {"trading": trading, "held": held, "all": trading + held, "flattening": flattening,
                 "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"]}
 
@@ -363,7 +364,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         events = st().events(name, limit=400)
         orders = trading.orders_by_id(st(), name)
         plans = st().exit_plans(name)
-        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans)
+        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, markets.is_perp(s.params))
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
         position = trading.open_position(x, fills, orders, plans)
@@ -377,7 +378,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     command_error=q.get("command_error", ""),
                     # The journal's position, as the flatten and account checks read it: a stopped strategy's
                     # last mark may be older than its last fill.
-                    held=0.0 if bt_id else max(st().journal_book(name, s.starting_balance)["qty"], 0.0),
+                    held=0.0 if bt_id else st().journal_book(name, s.starting_balance)["qty"],
                     costs=exit_costs(), reload=st().pending_reload(name),
                     position=position,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
@@ -761,7 +762,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             for n in chosen:
                 orders = trading.orders_by_id(st(), n)
                 for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders,
-                                       st().exit_plans(n)):
+                                       st().exit_plans(n), _shorts(st(), n)):
                     rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
                                  if t["held"] else None})
             cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
@@ -857,7 +858,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = dict(parse_qsl(row["query"]))
         result, name = row["result"], row["sleeve"]
         result["trips"] = trading.trips(st().fills(name, limit=1_000_000), st().events(name, limit=10_000),
-                                        trading.orders_by_id(st(), name))
+                                        trading.orders_by_id(st(), name), shorts=_shorts(st(), name))
         result["orders"] = sum(st().order_counts(name).values())
         rs = [t["r"] for t in result["trips"] if t["r"] is not None]
         result["expectancy_r"] = sum(rs) / len(rs) if rs else None
@@ -1182,8 +1183,9 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
-        "to_stop": (1 - stop_px / x["price"]) if stop_px and x["price"] else None,  # the drop from here (round 9, N3)
-        "cap_used": min(x["exposure"] / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
+        # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
+        "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
+        "cap_used": min(abs(x["exposure"]) / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
     }
 
@@ -1438,6 +1440,14 @@ def _coerce_params(raw: dict) -> dict:
     return out
 
 
+def _shorts(store: Store, name: str) -> bool:
+    """Whether a strategy's (or saved backtest's) journal can hold shorts: it trades a perpetual."""
+    try:
+        return markets.is_perp(store.sleeve(name).params)
+    except (KeyError, ValueError):
+        return False
+
+
 def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirmed: bool) -> None:
     """A stop the PM loosens on an open position is checked against its size before it saves (review
     round 8, M8-1: a 3% to 50% edit saved, about 17R at risk). A stop set from the market only ever
@@ -1447,16 +1457,18 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
     - Otherwise a looser stop saves only with the PM's confirmation, which the error asks for with the
       risk in money and in R of the entry's risk."""
     book = store.journal_book(s.name, s.starting_balance)
-    if book["qty"] <= 0 or not book["entry_px"] or params.get("stop_atr") or params.get("stop_swing_bars"):
+    if not book["qty"] or not book["entry_px"] or params.get("stop_atr") or params.get("stop_swing_bars"):
         return
-    lot = trading.open_lot(store.fills(s.name, limit=100_000))
+    lot = trading.open_lot(store.fills(s.name, limit=100_000), shorts=markets.is_perp(s.params))
     entry = trading.orders_by_id(store, s.name).get(lot["order_id"]) if lot else None
     plan = store.exit_plans(s.name).get(lot["order_id"]) if lot else None
     working, _ = trading.exit_fracs(s.params, entry["signal"] if entry else None, plan)
     new = params.get("stop_loss")
     if working is None or (new is not None and new <= working):
         return
-    qty, entry_px = book["qty"], book["entry_px"]
+    # A short works the same way mirrored: its stop is above the entry and its loss is a rise.
+    side = 1 if book["qty"] > 0 else -1
+    qty, entry_px = abs(book["qty"]), book["entry_px"]
     last = store.last_equity(s.name)
     price = last["price"] if last and last.get("price") else entry_px
     if new is None:
@@ -1464,8 +1476,8 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
             raise ValueError(f"removing the stop leaves the open position ({qty * price:,.2f}) with none; tick "
                              "\"Accept a looser stop on the open position\" to save it")
         return
-    level = entry_px * (1 - new)
-    loss = max(qty * (price - level), 0.0) + qty * level * leg  # from here to the stop, and the fee to sell
+    level = entry_px * (1 - side * new)
+    loss = max(side * qty * (price - level), 0.0) + qty * level * leg  # from here to the stop, and the fee to close
     equity = last["equity"] if last else s.starting_balance
     peak = max(store.peak_equity(s.name) or s.starting_balance, equity)
     headroom = equity - peak * (1 - profile.max_drawdown)
@@ -1475,7 +1487,7 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
                          f"{profile.max_drawdown:.0%} drawdown halt, which would close it first; choose a tighter stop")
     if not confirmed:
         risk = (plan or {}).get("risk_amount") or ((entry or {}).get("signal") or {}).get("risk_amount")
-        in_r = f" ({qty * entry_px * (new + leg + (1 - new) * leg) / risk:.1f}R of the entry's risk)" if risk else ""
+        in_r = f" ({qty * entry_px * (new + leg + (1 - side * new) * leg) / risk:.1f}R of the entry's risk)" if risk else ""
         raise ValueError(f"a {new:.1%} stop is looser than the {working:.1%} the open position works to now: it "
                          f"risks {loss:,.2f} from here{in_r}. Tick \"Accept a looser stop on the open position\" "
                          "to save it")

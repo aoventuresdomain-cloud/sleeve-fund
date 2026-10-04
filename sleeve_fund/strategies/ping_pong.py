@@ -20,8 +20,8 @@ SPEC = IdeaSpec(
     rules=(
         "A cycle on bar closes. Long leg: buy on the first bar; sell when the close is rise above the close of "
         "the bar it bought on. Short leg: from the bar it sold on until the close is dip below that bar's close, "
-        "then buy again. Short positions arrive with the long/short build, so until then the short leg is held "
-        "flat: same timing, no position. Measured from bar closes rather than fill prices, so backtest and paper "
+        "then buy again. On a perpetual with shorts allowed the short leg is a short position (the long is sold "
+        "and the short opened on the same close); on spot it is held flat: same timing, no position. Measured from bar closes rather than fill prices, so backtest and paper "
         "make the same decisions. All of its capital in or out; no stop-loss unless one is set."
     ),
     data_needs="1-minute OHLCV",
@@ -58,12 +58,14 @@ class PingPong(LongFlatStrategy):
             return
         # After a restart, pick the cycle up from the journal: long from the average entry, or waiting to buy
         # again from the last sell. With no fills yet it starts with a buy, as on the first start.
-        if self.runtime.book["qty"] > 0 and self.runtime.book["entry_px"]:
-            self._side, self._ref = 1, float(self.runtime.book["entry_px"])
+        # On a perpetual a short is picked up from its entry the same way.
+        qty, entry = self.runtime.book["qty"], self.runtime.book["entry_px"]
+        if qty and entry:
+            self._side, self._ref = (1 if qty > 0 else -1), float(entry)
             return
         last = self.runtime.store.fills(self.runtime.name, limit=1)
-        if last and last[0]["side"] == "SELL":
-            self._side, self._ref = -1, float(last[0]["price"])
+        if last:
+            self._side, self._ref = (-1 if last[0]["side"] == "SELL" else 1), float(last[0]["price"])
 
     def target_side(self, close: float) -> int:
         """The side the cycle wants from this close: +1 long, -1 short. Moves the cycle on when a leg ends."""
@@ -83,8 +85,12 @@ class PingPong(LongFlatStrategy):
             self._side, self._ref = 1, close
         return self._side
 
+    def want_side(self, bar: Bar) -> int | None:
+        # A perpetual: the short leg is a short (held flat unless allow_short).
+        return self.target_side(bar.close.as_double())
+
     def want_long(self, bar: Bar) -> bool | None:
-        # Long-only for now: the short leg is held flat.
+        # Spot: the short leg is held flat.
         return self.target_side(bar.close.as_double()) == 1
 
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:

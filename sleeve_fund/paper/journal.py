@@ -24,6 +24,7 @@ class MemoryJournal:
         self.sleeve_row: Sleeve | None = None
         self.equity: list[dict] = []
         self.fills_: list[dict] = []
+        self.funding_: list[dict] = []
         self.orders_: dict[str, dict] = {}
         self.events_: list[dict] = []
         self.exit_plans_: dict[str, list[dict]] = {}
@@ -194,21 +195,19 @@ class MemoryJournal:
         return self.equity[-limit:]
 
     def journal_book(self, sleeve: str, starting_balance: float) -> dict:
-        cash, qty, entry = float(starting_balance), 0.0, None
-        for f in self.fills_:
-            notional = f["qty"] * f["price"]
-            if f["side"] == "BUY":
-                entry = ((entry or 0.0) * qty + notional) / (qty + f["qty"])
-                cash -= notional + f["fee"]
-                qty += f["qty"]
-            else:
-                cash += notional - f["fee"]
-                qty -= f["qty"]
-                if abs(qty) <= 1e-12:
-                    qty = 0.0
-                if qty <= 0:
-                    entry = None
-        return {"cash": cash, "qty": qty, "entry_px": entry, "fills": len(self.fills_)}
+        from sleeve_fund.store import replay_book
+
+        return replay_book(self.fills_, starting_balance, self.funding_total(sleeve))
+
+    def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
+                       ts: datetime | None = None) -> None:
+        self.funding_.append({"sleeve": sleeve, "ts": ts, "qty": qty, "price": price, "rate": rate, "amount": amount})
+
+    def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
+        return list(reversed(self.funding_))[:limit]
+
+    def funding_total(self, sleeve: str) -> float:
+        return float(sum(f["amount"] for f in self.funding_))
 
     # --- into the real journal ---------------------------------------------------------
 

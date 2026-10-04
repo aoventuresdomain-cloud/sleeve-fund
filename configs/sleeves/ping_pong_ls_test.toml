@@ -1,0 +1,21 @@
+# Test strategy 1, long and short (PM, 4 Oct 2026): the same cycle as ping-pong-test with its short leg
+# traded. Long from the start, sold after a 1% rise in the close and shorted on the same close; the short
+# is covered after a 0.5% dip (its take-profit) and the long bought again. Simulated on a low-fee
+# perpetual (0.02% maker, 0.05% taker, funding every 8 hours) on Kraken's live prices.
+# Added stopped: the PM (or the QA hand-over) starts it from the dashboard.
+
+[sleeve]
+name = "ping-pong-ls-test"
+strategy = "ping_pong"
+instrument = "BTC/USD"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
+starting_balance = 10000
+warmup_bars = 0
+risk_profile = "balanced"
+start = false
+
+[params]
+rise = 0.01
+dip = 0.005
+market = "perp"
+allow_short = true

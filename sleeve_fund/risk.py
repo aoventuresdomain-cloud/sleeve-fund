@@ -16,14 +16,24 @@ class RiskProfile:
     daily_loss: float  # from the UTC day's opening equity: flatten and pause 24 hours
     max_position_pct: float  # largest position as a share of sleeve equity
     max_open_positions: int
+    # Strategies that may go short trade a perpetual on margin (sleeve_fund.markets). Their gross exposure
+    # stays under this many times equity, a stop sits at most stop_to_liquidation of the way to the
+    # liquidation price, and an open position is cut back once the price comes within
+    # min_liquidation_distance of liquidation (long/short verdict, 4 Oct 2026: risk limits for both sides).
+    max_leverage: float = 1.0
+    stop_to_liquidation: float = 0.5
+    min_liquidation_distance: float = 0.10
 
 
 PROFILES: dict[str, RiskProfile] = {
     p.name: p
     for p in (
-        RiskProfile("conservative", max_drawdown=0.10, daily_loss=0.03, max_position_pct=0.20, max_open_positions=3),
-        RiskProfile("balanced", max_drawdown=0.20, daily_loss=0.05, max_position_pct=0.33, max_open_positions=3),
-        RiskProfile("aggressive", max_drawdown=0.35, daily_loss=0.08, max_position_pct=0.50, max_open_positions=2),
+        RiskProfile("conservative", max_drawdown=0.10, daily_loss=0.03, max_position_pct=0.20, max_open_positions=3,
+                    max_leverage=1.0, stop_to_liquidation=0.33, min_liquidation_distance=0.15),
+        RiskProfile("balanced", max_drawdown=0.20, daily_loss=0.05, max_position_pct=0.33, max_open_positions=3,
+                    max_leverage=2.0, stop_to_liquidation=0.5, min_liquidation_distance=0.10),
+        RiskProfile("aggressive", max_drawdown=0.35, daily_loss=0.08, max_position_pct=0.50, max_open_positions=2,
+                    max_leverage=3.0, stop_to_liquidation=0.5, min_liquidation_distance=0.07),
     )
 }
 
