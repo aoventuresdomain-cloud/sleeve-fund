@@ -104,4 +104,9 @@ jobs:
             select ts, sleeve, level, kind, message from events where level <> '"'"'info'"'"' order by id desc limit 10;"' | tee health.txt
           LIVE=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "select count(*) from sleeves where desired_state = '"'"'running'"'"' and (heartbeat_at is null or heartbeat_at < now() - interval '"'"'3 minutes'"'"')"')
           echo "running sleeves not reporting: $LIVE"
+          # One line per strategy as a notice, so the run's annotations show what the server is running.
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tA -F " " -c "
+            select s.name, s.desired_state, s.status, case when a.sleeve is null then '"'"'on the book'"'"' else '"'"'archived'"'"' end
+            from sleeves s left join sleeve_archive a on a.sleeve = s.name where s.name not like '"'"'bt:%'"'"' order by s.id"' |
+            while read -r line; do [ -n "$line" ] && echo "::notice title=Strategy::$line"; done
           [ "$LIVE" = "0" ] || { echo "FAIL: some running sleeves are not reporting"; exit 1; }
