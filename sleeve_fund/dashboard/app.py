@@ -93,6 +93,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
+    templates.env.globals["market_choices"] = market_choices
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -803,7 +804,12 @@ def create_app(store: Store | None = None) -> FastAPI:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
                      "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily",  # equity is daily
                      "worst": round(-result["strategy"]["max_drawdown"], 5)}  # over every mark, as the table
+        market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
+        shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
+        market_words = ("Spot, long only" if market == markets.SPOT else
+                        f"{markets.terms({'market': market}).label}, {'long and short' if shorts else 'long only'}")
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
+                    market_words=market_words,
                     chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, g1_here=g1_here,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
@@ -1347,12 +1353,34 @@ def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict) -> l
     return [f"{k} {before[k]} to {after[k]}" for k in before if before[k] != after[k]]
 
 
+MARKET_KEYS = ("market", "allow_short", "demo_mirror")  # form fields of their own, not model parameters
+
+
+def market_choices() -> list[tuple[str, str]]:
+    return [(markets.SPOT, "Spot: long only, the venue's fees"),
+            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {markets.LOW_FEE_PERP.fees.maker:.2%} maker, "
+                           f"{markets.LOW_FEE_PERP.fees.taker:.2%} taker, funding"),
+            (markets.PERP_VENUE_FEES, f"{markets.VENUE_FEE_PERP.label}: funding")]
+
+
+def _market_form(params: dict) -> dict:
+    """A strategy's market settings as the form's own fields."""
+    out = {}
+    if params.get("market"):
+        out["market"] = params["market"]
+    for key in ("allow_short", "demo_mirror"):
+        if params.get(key):
+            out[key] = "1"
+    return out
+
+
 def _clone_qs(s) -> str:
     """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
-    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS}
+    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS and k not in MARKET_KEYS}
     q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
          "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
-         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params)}
+         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params),
+         **_market_form(s.params)}
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
@@ -1398,6 +1426,24 @@ def _form_params(form, strategy: str) -> dict:
     # Each strategy's parameter inputs are named p_<strategy>__<param>; only the chosen one counts.
     prefix = f"p_{strategy}__"
     params = _coerce_params({k[len(prefix):]: v for k, v in form.items() if k.startswith(prefix) and v != ""})
+    # A setting the form can't honour is refused, never dropped: a long/short strategy's market came
+    # through "Clone with changes" as a model parameter the form had no field for, and the backtest quietly
+    # ran it as long-only spot (review round 11, B11-1).
+    known = set(_defaults(strategy)) | _config_keys(strategy) if strategy in REGISTRY else set()
+    unknown = sorted(set(params) - known)
+    if unknown:
+        raise ValueError(f"{', '.join(unknown)}: unknown setting for the {strategy.replace('_', ' ')} model; it "
+                         "can't be honoured here, so nothing was run")
+    market = str(form.get("market", "") or markets.SPOT)
+    if market not in markets.MARKETS:
+        raise ValueError(f"market: one of {', '.join(markets.MARKETS)}")
+    if market != markets.SPOT:
+        params["market"] = market
+    for key in ("allow_short", "demo_mirror"):
+        if str(form.get(key, "")).strip().lower() in ("1", "true", "on", "yes"):
+            if market == markets.SPOT:
+                raise ValueError(f"{key.replace('_', ' ')}: only on a perpetual; spot is long only")
+            params[key] = True
     if str(form.get("max_notional", "")).strip():
         params["max_notional"] = float(form["max_notional"])
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
@@ -1424,6 +1470,14 @@ def _form_params(form, strategy: str) -> dict:
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
     return params
+
+
+def _config_keys(strategy: str) -> set[str]:
+    """The keyword settings a model's config takes beyond the common ones."""
+    import inspect
+
+    sig = inspect.signature(REGISTRY[strategy][1].__init__)
+    return {n for n, p in sig.parameters.items() if p.kind == p.KEYWORD_ONLY}
 
 
 def _coerce_params(raw: dict) -> dict:

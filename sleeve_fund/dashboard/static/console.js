@@ -795,7 +795,12 @@ window.Console = (() => {
       const items = [
         `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${document.getElementById("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
-        `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}.`,
+        (() => {
+          const mk = form.elements.market ? form.elements.market.value : "spot";
+          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}, long only.`;
+          const shorts = form.elements.allow_short && form.elements.allow_short.checked;
+          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
+        })(),
         `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
       items.push(...exitFields(form)());
@@ -816,7 +821,7 @@ window.Console = (() => {
     const bt = document.getElementById("bt-these");
     bt.addEventListener("click", () => {
       const q = new URLSearchParams(new FormData(form));
-      ["name", "reason", "warmup_bars", "tested_bar_spec", "from", "account"].forEach((k) => q.delete(k));
+      ["name", "reason", "warmup_bars", "tested_bar_spec", "from", "account", "demo_mirror"].forEach((k) => q.delete(k));
       q.set("run", "1");
       bt.href = `/backtest?${q}`;
     });
@@ -902,6 +907,15 @@ window.Console = (() => {
   function orderFields(formId) {
     const form = document.getElementById(formId);
     exitFields(form);
+    if (form && form.elements.market) {  // shorts and the testnet mirror only on a perpetual
+      const perp = [...form.querySelectorAll("[data-when-perp]")];
+      const syncMarket = () => {
+        const spot = form.elements.market.value === "spot";
+        perp.forEach((el) => { el.hidden = spot; if (spot) el.querySelectorAll("input[type=checkbox]").forEach((c) => { c.checked = false; }); });
+        form.dispatchEvent(new Event("market-change"));
+      };
+      form.elements.market.addEventListener("change", syncMarket); syncMarket();
+    }
     if (!form || !form.elements.execution) return;
     const wait = form.querySelector("[data-when-maker]");
     if (!wait) return;  // maker-first orders switched off: market only

@@ -295,7 +295,9 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     if risk_profile is not None:
         from sleeve_fund.risk import profile as risk_profile_of
 
-        cap = risk_profile_of(risk_profile).max_position_pct
+        from sleeve_fund.risk import position_cap
+
+        cap = position_cap(risk_profile_of(risk_profile), params)  # a perpetual sizes by its leverage cap
     elif cap is not None:
         params = {**params, "position_cap_pct": cap}
     wait = params.get("maker_wait_minutes")

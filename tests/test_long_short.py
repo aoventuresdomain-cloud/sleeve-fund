@@ -503,3 +503,64 @@ def test_paper_shorts_rest_their_stop_after_exits_filled_in_slices(tmp_path):
     assert ("BUY", "stop_loss") in kinds[3:], kinds
     net = sum(Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1) for f in fills)
     assert abs(net) < Decimal("1e-8")  # the stop closed the whole short
+
+
+def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client, monkeypatch):  # noqa: F811
+    """Review round 11, B11-1: "Clone with changes" carried the market and shorts as model parameters the
+    forms had no field for, so "Backtest these settings" quietly ran a long-only spot backtest at the
+    venue's spot fees and "Start" would have made a long-only spot copy. Both forms now have the fields,
+    the backtest says which market and side it ran, and a setting a form can't honour is refused."""
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.venues import KRAKEN
+    from test_dashboard import AUTH, SAME
+
+    c, store = client
+    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="ETH/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000,
+                        params={"rise": 0.01, "dip": 0.005, **PERP, "demo_mirror": True})
+    page = c.get("/sleeves/pp-ls", auth=AUTH).text
+    href = next(p for p in page.split('"') if p.startswith("/sleeves/new?")).replace("&amp;", "&")
+    q = {k: v[0] for k, v in parse_qs(urlparse(href).query).items()}
+    assert (q["market"], q["allow_short"], q["demo_mirror"]) == ("perp", "1", "1")
+    assert not any(k.endswith(("__market", "__allow_short", "__demo_mirror")) for k in q)
+    form = c.get(href, auth=AUTH).text
+    assert '<option value="perp" selected>' in form and 'name="allow_short" value="1" checked' in form
+    assert 'name="demo_mirror" value="1" checked' in form
+
+    # Backtest these settings: the form's fields, as the page's link sends them (no name, reason or mirror).
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.012))
+    bt = {k: v for k, v in q.items() if k not in ("name", "from", "source", "demo_mirror")}
+    bt["risk_profile"] = "conservative"  # 1x: calm enough that the daily-loss pause doesn't end it early
+    result = c.get("/backtest?" + urlencode({**bt, "run": "1"}), auth=AUTH).text
+    assert "Couldn't run it" not in result, result[result.find("Couldn't"):][:300]
+    assert "Low-fee perpetual (simulated), long and short" in result
+    assert "0.02% maker, 0.05% taker" in result
+    run = store.backtests(limit=1)[0]
+    saved = store.sleeve(run["sleeve"])
+    assert saved.params.get("market") == "perp" and saved.params.get("allow_short") is True
+    fills = store.fills(saved.name, limit=100_000)
+    net, shorted = 0.0, False
+    for f in sorted(fills, key=lambda f: f["id"]):
+        shorted = shorted or (net <= 1e-12 and f["side"] == "SELL")
+        net += f["qty"] if f["side"] == "BUY" else -f["qty"]
+    assert shorted, "the backtest never went short"
+
+    # Start: the new strategy keeps the market, shorts and mirror.
+    data = {k: v for k, v in q.items() if k not in ("from", "source")}
+    assert c.post("/sleeves/new", data={**data, "reason": "long/short copy"}, auth=AUTH, headers=SAME,
+                  follow_redirects=False).status_code == 303
+    made = store.sleeve(q["name"]).params
+    assert (made["market"], made["allow_short"], made["demo_mirror"]) == ("perp", True, True)
+
+    # An old clone link, with the market as a model parameter, is refused rather than run as spot.
+    old = {**bt, "p_ping_pong__market": "perp", "run": "1"}
+    old.pop("market")
+    page = c.get("/backtest?" + urlencode(old), auth=AUTH).text
+    assert "Couldn't run it" in page and "market" in page
+    # And shorts on spot are refused, not dropped.
+    page = c.get("/backtest?" + urlencode({**bt, "market": "spot", "run": "1"}), auth=AUTH).text
+    assert "only on a perpetual" in page
