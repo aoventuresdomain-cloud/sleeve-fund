@@ -244,7 +244,7 @@ table.kv td:not(.num) { white-space: normal; }
 .range a.seg[aria-current] { background: var(--raised); color: var(--text); }
 .range a.seg:hover { text-decoration: none; color: var(--text); }
 .feed { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
-.feed li { display: grid; grid-template-columns: 116px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.feed li { display: grid; grid-template-columns: 150px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 .feed li:last-child { border-bottom: 0; }
 .feed .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .feed .what { overflow-wrap: anywhere; }

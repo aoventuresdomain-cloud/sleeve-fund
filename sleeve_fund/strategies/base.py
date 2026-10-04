@@ -131,8 +131,8 @@ class LongFlatConfig(StrategyConfig):
             leg = assumed_taker_fee + assumed_half_spread
             cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
             if take_profit <= cost:
-                raise ValueError(f"take_profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
-                                 f"({cost:.2%}): every target hit would lose money")
+                raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
+                                 f"({cost:.2%}), so every target hit would lose money")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Leave room for the taker fee and rounding so a full-size buy never rejects.
