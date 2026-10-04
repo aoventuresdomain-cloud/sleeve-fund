@@ -158,6 +158,12 @@ class MemoryJournal:
     def first_equity(self, sleeve: str) -> dict | None:
         return self.equity[0] if self.equity else None
 
+    def day_open_equity(self, sleeve: str, day_start) -> float | None:
+        before = [m for m in self.equity if m["ts"] < day_start]
+        if before:
+            return float(before[-1]["equity"])
+        return next((float(m["equity"]) for m in self.equity if m["ts"] >= day_start), None)
+
     def last_equity(self, sleeve: str) -> dict | None:
         return self.equity[-1] if self.equity else None
 

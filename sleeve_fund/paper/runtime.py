@@ -9,7 +9,7 @@ concurrency inside it.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sleeve_fund import risk
 from sleeve_fund.store import RELOAD, Store, utcnow
@@ -126,8 +126,16 @@ class SleeveRuntime:
         self.peak = max(self.peak, equity)
         if self._day != now.date():
             # The day opens at the equity last marked before midnight: the same thing in paper, which
-            # marks every few seconds, and in a backtest, which marks once a bar.
-            self._day, self._day_open = now.date(), self._last_equity if self._last_equity is not None else equity
+            # marks every few seconds, and in a backtest, which marks once a bar. The first tick after a
+            # (re)start reads it from the journal, so a restart mid-day, such as the reload a settings
+            # edit makes, can't lift the daily-loss pause by resetting the baseline (review round 8, B8-2).
+            if self._day is None and self._last_equity is None:
+                midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+                restored = self.store.day_open_equity(self.name, midnight)
+                self._day_open = restored if restored is not None else equity
+            else:
+                self._day_open = self._last_equity if self._last_equity is not None else equity
+            self._day = now.date()
         self._last_equity = equity
 
         flatten = False

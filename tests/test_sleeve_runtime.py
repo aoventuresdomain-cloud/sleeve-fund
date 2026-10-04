@@ -329,3 +329,26 @@ def test_a_settings_change_moves_the_open_positions_stop(store, instrument, chan
     strat._entry_px = entry["avg_px"]
     strat._restore_plan()
     assert (strat._stop_frac, strat._tp_frac) == ((0.04, 0.05) if changed else (0.5, None))
+
+
+@pytest.mark.parametrize("reload", [False, True])
+def test_a_reload_mid_day_keeps_the_days_opening_equity(store, reload):
+    """A settings edit reloads the strategy. The first tick after it must measure the day's loss from the
+    equity the day opened at, not from the equity at the reload, or the daily-loss pause never fires
+    (review round 8, B8-2: down 4%, an edit, then down 6.5% was never paused)."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2024, 3, 1, 23, 0, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    mark = {"cash": 0.0, "qty": 1.0}
+    assert rt.tick(equity=10_000, price=10_000, **mark) is None
+    t[0] += timedelta(hours=10)  # next day
+    assert rt.tick(equity=9_600, price=9_600, **mark) is None  # down 4%: under the 5% limit
+    if reload:
+        rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+        rt.on_start(0.008)
+    t[0] += timedelta(hours=1)
+    assert rt.tick(equity=9_350, price=9_350, **mark) == "flatten"  # down 6.5% on the day
+    assert store.sleeve("s1").status == "paused"
