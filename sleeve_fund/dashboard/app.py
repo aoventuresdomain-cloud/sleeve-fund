@@ -100,7 +100,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
-    templates.env.filters["ts"] = lambda t: t.strftime("%d %b %H:%M UTC") if t else "never"
+    # The year only when it isn't this one, as a backtest's or an old journal's dates need it.
+    templates.env.filters["ts"] = lambda t: (t.strftime("%d %b %H:%M UTC" if t.year == utcnow().year
+                                                        else "%d %b %Y %H:%M UTC") if t else "never")
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     def st() -> Store:
@@ -256,40 +258,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse(f"/sleeves/new?{urlencode({'error': str(exc), **kept})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
-    @app.get("/api/preview")
-    def preview_json(request: Request, _: str = Depends(require_pm)):
-        """Look-back of the form's settings on the venue's history, at the form's decision interval
-        (in-sample, not G1). Short intervals look back less far, so it answers while the form waits."""
-        from sleeve_fund.dashboard import preview
-        from sleeve_fund.paper.config import PAIR_RE
-
-        q = request.query_params
-        strategy, pair = q.get("strategy", ""), q.get("instrument", "").strip().upper()
+    def _tested(run_id: str | None) -> str:
+        """The period a saved backtest replayed, for its strategy screen."""
+        if not run_id:
+            return ""
         try:
-            if strategy not in REGISTRY:
-                raise ValueError("pick a strategy")
-            if not PAIR_RE.match(pair):
-                raise ValueError("enter an instrument like SOL/USD")
-            params = _form_params(q, strategy)
-            balance = float(q.get("starting_balance") or 10_000)
-            _profile_cap(q)  # validates the profile name
-            spec = q.get("bar_spec") if q.get("bar_spec") in ALLOWED_BAR_SPECS else BACKTEST_BAR_SPEC
-            minutes, fallback = spec_minutes(spec), ""
-            if minutes < 1440 and pair not in [r["pair"] for r in _stored()]:
-                minutes, fallback = 1440, (f"{pair} has no stored minute history here, so this looked back on daily "
-                                           "decisions instead of the interval you chose.")
-            days = LOOKBACK_DAYS.get(minutes)
-            out = preview.run(strategy, pair, params, starting=balance, minutes=minutes, days=days,
-                              risk_profile=q.get("risk_profile") or "balanced",
-                              fee_quote=resolve_fees(None, st()), spread_quote=resolve_spread(None, pair, st()))
-            out["every"], out["fallback"] = preview._every(minutes), fallback
-            return JSONResponse(out)
-        except (ValueError, TypeError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=422)
-        except OSError as exc:  # Kraken unreachable
-            return JSONResponse({"error": f"could not reach Kraken: {exc}"}, status_code=502)
-        except Exception as exc:  # noqa: BLE001 - the form shows the message instead of a blank chart
-            return JSONResponse({"error": f"look-back failed: {exc}"}, status_code=500)
+            r = st().backtest(run_id)["result"]
+        except KeyError:
+            return ""
+        return f"{r['from']} to {r['to']}" if r.get("from") and r.get("to") else ""
 
     @app.get("/sleeves/{name}", response_class=HTMLResponse)
     def sleeve_detail(request: Request, name: str, _: str = Depends(require_pm)):
@@ -297,6 +274,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             s = st().sleeve(name)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
+        bt_id = name[len(BACKTEST_PREFIX):] if is_backtest(name) else None
         x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
         fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
@@ -310,8 +288,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
-                    clone_qs=_clone_qs(s), path=gates.path_to_live(st(), x, _g1_of(s.strategy), st().accounts(), utcnow()),
-                    backtest_id=name[len(BACKTEST_PREFIX):] if is_backtest(name) else None)
+                    clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
+                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy), st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", _: str = Depends(require_pm)):
@@ -335,6 +313,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         position = trading.open_position(x, list(reversed(fills)), orders)
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        if is_backtest(name):
+            data["note"] = "Candles built from the run's price marks."
         return JSONResponse(data)
 
     @app.get("/api/sleeves/{name}/equity")
@@ -506,7 +486,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
-                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored())
+                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
+                    runs=st().backtests(limit=BACKTEST_KEEP))
 
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_page(request: Request, _: str = Depends(require_pm)):
@@ -621,9 +602,6 @@ def create_app(store: Store | None = None) -> FastAPI:
     return app
 
 
-# How far the form's Look-back goes at each decision interval: all of it for daily decisions, less for
-# short ones so the answer comes back while the form waits (the Backtest page runs longer ones).
-LOOKBACK_DAYS = {1: 30, 5: 90, 15: 365, 60: 365}
 BACKTEST_PERIODS = {"180": ("6 months", 180), "365": ("1 year", 365), "all": ("All available", None)}
 PAIR_RE = re.compile(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}")
 # How long the page waits for a backtest before showing its progress instead; most daily runs finish.
@@ -663,7 +641,7 @@ def _backtest_args(q) -> dict:
              f"{BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
-            "risk_profile": q.get("risk_profile") or "balanced", "title": title}
+            "risk_profile": q.get("risk_profile") or "balanced", "title": title, "bar_spec": bar_spec}
 
 
 def _stored() -> list[dict]:
@@ -697,7 +675,8 @@ def _run_backtest(store: Store, job, args: dict, key: str, q) -> str:
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     query = urlencode([(k, v) for k, v in q.items() if k != "run" and v != ""])
-    store.save_backtest(keep["journal"], run_id=job.id, key=key, title=args["title"], query=query, result=result)
+    store.save_backtest(keep["journal"], run_id=job.id, key=key, title=args["title"], query=query, result=result,
+                        bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return job.id
 
