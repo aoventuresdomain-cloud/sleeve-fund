@@ -293,7 +293,10 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
     assert r.oos_trades == 1
     gaps = oos_gaps(r)
     assert "No trades out-of-sample in 1 of 2 test windows" in gaps
-    assert "The conservative risk profile halted the strategy in 2 of 2 folds" in gaps
+    # Round 9, N6: halts before and inside a test window are told apart, so the counts agree.
+    assert ("The conservative risk profile halted the strategy in 2 of 2 folds: 1 in the training stretch, so "
+            "that test window sat flat at +0.0% throughout and 1 inside the test window, flat from then on "
+            "(1 of them closed a trade first)") in gaps
     enough = next(c for c in g1_checks(r, ledger) if c[0] == "Enough out-of-sample trades to judge")
     assert enough[1] == "FAIL" and enough[2].startswith("1 closed in the 2 walk-forward test windows")
     sheet = render(r, ledger)
@@ -359,7 +362,7 @@ def test_a_study_halted_before_every_test_window_is_not_judged_and_keeps_its_hol
     r = run_study(HOLD, _crashes(), instrument, dataset="syn-1440m", ledger=ledger, synthetic=True, holdout_days=20,
                   train_days=60, test_days=60, risk_profile="conservative", use_holdout=True)
     assert len(r.folds) == 2 and all(f.halted_before_test for f in r.folds)
-    assert r.not_judged.startswith("the risk guard halted 2 of 2 folds before their test windows began")
+    assert r.not_judged.startswith("the risk guard halted the strategy in 2 of 2 folds, leaving 2 of 2 test windows")
     assert r.holdout is None and "left closed, though asked for" in r.holdout_withheld
     assert not ledger.holdout_used("buy_and_hold", "syn-1440m")
     assert g1_verdict(g1_checks(r, ledger))[0] == NOT_JUDGED
@@ -415,3 +418,50 @@ def test_a_holdout_opened_at_one_bar_length_is_spent_at_every_other(tmp_path):
     ledger.record(idea="a", family="trend", params={}, dataset="kraken-btcusd-store-60m", stage="holdout", sharpe=0.1)
     assert ledger.holdout_used("a", "kraken-btcusd-store-15m") and ledger.holdout_used("a", "kraken-btcusd-store-1440m")
     assert not ledger.holdout_used("a", "kraken-ethusd-store-60m") and not ledger.holdout_used("b", "kraken-btcusd-store-60m")
+
+
+def _folds(*spec):
+    """Folds as (halted, halted_before_test, test_trades)."""
+    from types import SimpleNamespace
+
+    return [SimpleNamespace(halted="12 Mar 2022 (drawdown)" if h else "", halted_before_test=b, test_trades=t)
+            for h, b, t in spec]
+
+
+def test_a_study_whose_test_windows_are_mostly_blind_is_not_judged():
+    """Review round 9, N7: a 5-minute study with 5 of 6 folds halted and 4 of 6 test windows empty read
+    G1 FAIL on the 2 windows left. A window is blind when a halt kept it flat or left it without a trade;
+    with most windows blind the study is not judged. A window the signal simply never traded in, or one
+    halted after it traded, is still a result."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.research.study import StudyResult
+
+    def why(folds):
+        return StudyResult.not_judged.fget(SimpleNamespace(error_count=0, folds=folds,
+                                                           oos_trades=sum(f.test_trades for f in folds)))
+
+    reviewer = _folds((1, 1, 0), (1, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 3), (0, 0, 4))
+    assert why(reviewer).startswith("the risk guard halted the strategy in 5 of 6 folds, leaving 4 of 6 test "
+                                    "windows flat or without a trade, and out-of-sample closed 7 trades")
+    assert why(_folds((1, 1, 0), (1, 0, 2), (0, 0, 0), (0, 0, 0), (0, 0, 5), (0, 0, 1))) == ""  # 1 blind, 2 quiet
+    assert why(_folds((1, 1, 0), (1, 0, 0), (1, 0, 1), (0, 0, 4))) == ""  # half blind is not most
+    assert why(_folds((1, 1, 0), (0, 0, 0))) != ""  # no trade out-of-sample at all, with a halt behind it
+
+
+def test_checks_resting_on_missing_out_of_sample_are_not_failed_on_a_not_judged_sheet(tmp_path, instrument):
+    """Review round 9, N6: a NOT JUDGED sheet still showed red Fail chips for the Sharpe, robustness and
+    trade-count rows: they measure the out-of-sample the study didn't get."""
+    from sleeve_fund.research.tearsheet import NOT_APPLICABLE, NOT_JUDGED, OOS_CHECKS, g1_checks, g1_verdict
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(HOLD, _crashes(), instrument, dataset="syn-1440m", ledger=ledger, synthetic=True, holdout_days=0,
+                  train_days=60, test_days=60, risk_profile="conservative")
+    checks = g1_checks(r, ledger)
+    assert g1_verdict(checks)[0] == NOT_JUDGED
+    rows = {name: (verdict, ev) for name, verdict, ev in checks}
+    assert all(rows[name][0] in (NOT_APPLICABLE, "PASS") for name in OOS_CHECKS)
+    assert rows["Enough out-of-sample trades to judge"][0] == NOT_APPLICABLE
+    assert rows["Enough out-of-sample trades to judge"][1].startswith("not judged: 0 closed")
+    assert "| FAIL |" not in render(r, ledger)

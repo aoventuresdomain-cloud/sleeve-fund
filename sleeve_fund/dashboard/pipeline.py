@@ -9,7 +9,7 @@ from pathlib import Path
 from sleeve_fund.strategies import REGISTRY
 
 STAGES = ["Idea", "Tested", "Passed G1", "Paper", "Passed G2", "Live"]
-_CHECK = re.compile(r"^\|\s*([^|]*?)\s*\|\s*(PASS|FAIL|WARN|INFO|NOT JUDGED)\s*\|\s*([^|]*)\|", re.M)
+_CHECK = re.compile(r"^\|\s*([^|]*?)\s*\|\s*(PASS|FAIL|WARN|INFO|NOT JUDGED|N/A)\s*\|\s*([^|]*)\|", re.M)
 _DATASET = re.compile(r"^Dataset `([^`]+)`", re.M)
 _NAME = re.compile(r"^# Tear sheet: (\S+)", re.M)
 _TESTED = re.compile(r"^Tested on `([^`]+)` at (\d+)-minute bars", re.M)
@@ -27,7 +27,7 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
     unjudged = [(label, ev.strip()) for label, verdict, ev in rows if verdict == "NOT JUDGED"]
     if unjudged:  # neither a pass nor a fail: the study's runs can't be judged (tearsheet.g1_verdict)
         return "NOT JUDGED", "; ".join(ev or label for label, ev in unjudged), [label for label, _ in unjudged]
-    failed = [(label, ev.strip()) for label, verdict, ev in rows if verdict not in ("PASS", "INFO")]
+    failed = [(label, ev.strip()) for label, verdict, ev in rows if verdict not in ("PASS", "INFO", "N/A")]
     evidence = sharpe[2].strip()
     if failed:
         # Lead with what failed: a strong Sharpe beside "Fail" otherwise reads like a pass.

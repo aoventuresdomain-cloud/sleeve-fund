@@ -56,9 +56,9 @@ def test_a_backtest_is_saved_and_opens_in_the_paper_screens(client):
     assert all(o["sleeve"] != name for o in store.orders(limit=1000))
     assert all(e["sleeve"] != name for e in store.alerts(limit=1000))
     r = c.post(f"/sleeves/{name}/command", data={"command": "pause", "reason": "x"}, auth=AUTH, headers=SAME)
-    assert r.status_code == 400
+    assert "Not done: a saved backtest takes no commands." in r.text
     r = c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "x"}, auth=AUTH, headers=SAME)
-    assert r.status_code == 400
+    assert "Not done: " in r.text and store.pending_commands(name) == []
 
     # The trade table is rebuilt from the journal, with size and fees.
     assert "Size</th>" in page and "Fees</th>" in page

@@ -234,6 +234,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?kill_error=reason", status_code=303)
         _, _, summaries = book_data()
         targets = _kill_targets(summaries)
+        if not targets["all"]:
+            # Fired again, or nothing to sell: no decision to log, as nothing was done (review round 9, N1).
+            return RedirectResponse("/risk?killed=0", status_code=303)
         for x in targets["all"]:
             name = x["sleeve"].name
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
@@ -360,6 +363,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
+                    command_error=q.get("command_error", ""),
+                    # The journal's position, as the flatten and account checks read it: a stopped strategy's
+                    # last mark may be older than its last fill.
+                    held=0.0 if bt_id else max(st().journal_book(name, s.starting_balance)["qty"], 0.0),
                     costs=exit_costs(), reload=st().pending_reload(name),
                     position=position,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
@@ -469,7 +476,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
+            # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
     def _retired(account: str) -> bool:
@@ -620,7 +628,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         profile = _research_venue()
         try:
             if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
-                raise ValueError(f"instrument {pair!r} should look like BTC/USD")
+                raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
+                                 "like BTC/USD")
+            held = next((h for h in _stored_history(st()) if h["pair"] == pair and h["first"] is not None), None)
+            if held is not None:
+                return research_page(request, pre={"instrument": pair}, notice=(
+                    f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
+                    f"({held['state']}); the collector keeps it current, and a study can run on it now."))
             if profile.minute_loader is None:
                 raise ValueError(f"{profile.label} has no history loader")
             if profile.check_listed is not None:
@@ -628,10 +642,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                     profile.check_listed(pair)
                 except ValueError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - venue unreachable: ask anyway; the collector retries
+                except Exception as exc:  # noqa: BLE001 - venue unreachable
+                    # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
+                    # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
                     logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
+                    raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                                     "for; try again when the venue answers") from None
         except ValueError as exc:
-            return research_page(request, error=str(exc), pre={"instrument": pair}, collect=pair)
+            # No button to ask again: the same request would be refused the same way.
+            return research_page(request, error=str(exc), pre={"instrument": pair})
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
         notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
@@ -655,9 +674,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such tear sheet")
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
         # Results as status chips, so a FAIL can't be missed in a wall of text.
-        for word, tone in (("PASS", "running"), ("FAIL", "halted"), ("WARN", "paused"), ("INFO", "stopped"),
-                           ("NOT JUDGED", "paused")):
-            html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{word.capitalize()}</span></td>')
+        for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
+                                  ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),
+                                  ("N/A", "stopped", "Not judged")):
+            html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{label}</span></td>')
         return page(request, "tearsheet.html", title=sheet, body=html)
 
     @app.get("/decisions", response_class=HTMLResponse)
@@ -1100,7 +1120,7 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
-        "to_stop": (x["price"] / stop_px - 1) if stop_px and x["price"] else None,
+        "to_stop": (1 - stop_px / x["price"]) if stop_px and x["price"] else None,  # the drop from here (round 9, N3)
         "cap_used": min(x["exposure"] / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
     }

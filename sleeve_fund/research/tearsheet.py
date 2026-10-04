@@ -24,6 +24,9 @@ G1_CONFIDENCE = 0.95
 SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
 JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
+# A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
+NOT_APPLICABLE = "N/A"
+OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge")
 
 
 def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
@@ -34,7 +37,7 @@ def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
     unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED]
     if unjudged:
         return NOT_JUDGED, unjudged
-    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "INFO")]
+    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "INFO", NOT_APPLICABLE)]
     return ("FAIL" if failed else "PASS"), failed
 
 
@@ -110,30 +113,49 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
     ]
+    if why_not:
+        # Under a NOT JUDGED headline these can't fail: they measure the out-of-sample the study didn't get,
+        # and red Fail chips there read as a verdict (review round 9, N6).
+        checks = [(name, NOT_APPLICABLE if verdict == "FAIL" and name in OOS_CHECKS else verdict,
+                   f"not judged: {ev}" if verdict == "FAIL" and name in OOS_CHECKS else ev)
+                  for name, verdict, ev in checks]
     return checks
 
 
 def oos_gaps(r: StudyResult) -> str:
     """Why out-of-sample has test windows without a trade, in words, or '' when every window traded.
-    A halted fold reads +0.0% with a Sharpe of 0.00, which looks like a result and isn't one."""
+    A halted fold reads +0.0% with a Sharpe of 0.00, which looks like a result and isn't one. Halts
+    before a test window and inside one are told apart: only the first leaves the whole window flat,
+    so the counts can't seem to disagree (review round 9, N6)."""
+    n = len(r.folds)
     idle = [f for f in r.folds if f.test_trades == 0]
     halted = [f for f in r.folds if f.halted]
     if not idle and not halted:
         return ""
     words = []
     if idle:
-        words.append(f"**No trades out-of-sample in {len(idle)} of {len(r.folds)} test windows.**")
+        words.append(f"**No trades out-of-sample in {len(idle)} of {n} test windows.**")
     if halted:
         who = f"the {r.risk_profile} risk profile" if r.risk_profile else "the risk guard"
+        before = [f for f in halted if f.halted_before_test]
+        inside = [f for f in halted if not f.halted_before_test]
+        split = []
+        if before:
+            split.append(f"{len(before)} in the training stretch, so {'that' if len(before) == 1 else 'each'} "
+                         "test window sat flat at +0.0% throughout")
+        if inside:
+            traded = sum(1 for f in inside if f.test_trades)
+            split.append(f"{len(inside)} inside the test window, flat from then on"
+                         + (f" ({traded} of them closed a trade first)" if traded else ""))
         words.append(
-            f"{who[0].upper()}{who[1:]} halted the strategy in {len(halted)} of {len(r.folds)} folds: "
-            + "; ".join(f"the fold testing to {f.test_end:%b %Y} on {f.halted}" for f in halted)
-            + ". A halted run stays flat, as paper does until you resume it, so its test window shows +0.0%. "
-            "Each fold's run trades through its training stretch first, so the position carried into the test "
-            "is realistic; a halt there leaves the whole test window flat.")
+            f"{who[0].upper()}{who[1:]} halted the strategy in {len(halted)} of {n} folds: {' and '.join(split)}. "
+            + "; ".join(f"The fold testing to {f.test_end:%b %Y} halted on {f.halted}" for f in halted)
+            + ". A halted run stays flat, as paper does until you resume it. Each fold's run trades through its "
+            "training stretch first, so the position carried into the test is realistic.")
     quiet = [f for f in idle if not f.halted]
     if quiet:
-        words.append(f"In {len(quiet)} of them the signal never closed a trade inside the test window.")
+        words.append(f"In {len(quiet)} of the windows without a trade no halt was involved: the signal never "
+                     "closed a trade there.")
     return " ".join(words)
 
 

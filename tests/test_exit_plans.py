@@ -65,9 +65,9 @@ def test_a_target_only_edit_keeps_the_stop_to_the_tick(store, instrument, journa
     _edit(store, "Take-profit 2R after costs to 3R after costs")
     strat = _restart(store, instrument, stop_atr=2.0, take_profit_r=3.0)
     assert strat._stop_frac == 0.0143 and strat._replan_pending is None
-    assert strat._tp_frac == pytest.approx(r_target(3, 0.0143, COST))
+    assert strat._tp_frac == pytest.approx(r_target(3, 0.0143, COST), rel=1e-3)  # from the journaled 1R, rounded
     plan = store.exit_plan("s1", "E-1")
-    assert plan["kind"] == "edit" and plan["stop_frac"] == 0.0143 and plan["planned_r"] == pytest.approx(3.0, abs=0.02)
+    assert plan["kind"] == "edit" and plan["stop_frac"] == 0.0143 and plan["planned_r"] == 3.0
     (event,) = _applied(store)
     assert "stop at 98.57, 1.4% below the entry" in event["message"]
     # The next restart reads the plan back as it is: nothing is set again and nothing is said.
@@ -88,7 +88,8 @@ def test_a_new_market_stop_keeps_the_old_one_working_and_sits_at_the_swing_low(s
     strat._lows.extend([99.4, 99.0, 100.2])
     strat._replan(101.0)
     assert 100.0 * (1 - strat._stop_frac) == pytest.approx(99.0)  # at the low, not 1 - 99/101 below the entry
-    assert strat._tp_frac == pytest.approx(r_target(2, 0.01, COST)) and strat._replan_pending is None
+    # A tighter stop keeps the entry's 1R, so the 2R target is 2 of those (review round 9, N2).
+    assert strat._tp_frac == pytest.approx((2 * 30.19 / 1000 + 2 * COST) / (1 - COST)) and strat._replan_pending is None
     assert "at the lowest low of the last 3 bars (99)" in strat._stop_basis
     assert store.exit_plan("s1", "E-1")["stop_frac"] == pytest.approx(0.01)
 
@@ -128,3 +129,19 @@ def test_trades_measure_r_on_the_risk_after_an_edit_and_mark_it(store):
     assert t["r"] == pytest.approx(t["pnl"] / 45.6) and t["planned_r"] == 1.4 and t["exits_edited"]
     assert ("1R now", "45.60") in t["entry_items"] and ("Stop now", "3.0% below the entry") in t["entry_items"]
     assert not any(label == "Stop cfg" for label, _ in t["entry_items"])
+
+
+def test_an_r_target_after_a_tighter_stop_is_that_many_of_the_trades_1r(store, instrument):
+    """Review round 9, N2: after a tighter stop, a typed 3R target was set around the new stop but
+    recorded on the entry's larger risk, so the form said +3.00R and the trade +2.38R. The target is
+    now set from the trade's 1R, so what was typed is what is recorded."""
+    _sleeve(store)
+    _enter(store, ATR_ENTRY)
+    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to 1% below the entry; "
+                 "Take-profit 2R after costs to 3R after costs")
+    strat = _restart(store, instrument, stop_loss=0.01, take_profit_r=3.0)
+    plan = store.exit_plan("s1", "E-1")
+    assert plan["stop_frac"] == 0.01 and plan["risk_amount"] == 30.19 and plan["planned_r"] == 3.0
+    assert strat._tp_frac == pytest.approx((3 * 30.19 / 1000 + 2 * COST) / (1 - COST))
+    assert strat._tp_frac > r_target(3, 0.01, COST)  # wider than 3R of the new, smaller stop
+    assert ("Target now", f"{plan['tp_frac']:.1%} above the entry") in trading.plan_items(plan)
