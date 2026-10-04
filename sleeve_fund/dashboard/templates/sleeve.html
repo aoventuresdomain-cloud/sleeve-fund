@@ -78,30 +78,53 @@
 </div>
 
 <div class="tab-panel" id="tab-positions" role="tabpanel" data-panel="positions">
-<div class="grid">
-{% if position %}
-<section class="panel span-7" aria-labelledby="pos-h">
-  <div class="panel-head"><h2 id="pos-h">Open position</h2><span class="hint">{{ '%.6g'|format(position.qty) }} {{ base }} since {{ position.opened|ts }}, {{ money_signed(position.unrealised) }} unrealised ({{ position.unrealised_ret|pct1s }})</span></div>
-  <div class="why-grid">{{ why('Why it was bought', position.why, position.sig) }}</div>
+{# One card per question a PM asks of a position: how big, at what price, where it exits, what it has made. #}
+{% set realised = x.pnl - x.unrealised %}
+<section class="panel pos" aria-labelledby="pos-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="pos-h">{% if position %}Long {{ s.instrument }}{% else %}No open position{% endif %}</h2>
+    {% if position and position.opened %}<span class="right faint">since {{ position.opened|ts }} · held {{ position.held|held }}</span>{% endif %}</div>
+  <div class="pos-grid">
+    <div class="pos-card"><h3>Size</h3><dl>
+      <div><dt>Quantity</dt><dd>{% if position %}{{ '%.6g'|format(position.qty) }} {{ base }}{% else %}<span class="muted">0 {{ base }}</span>{% endif %}</dd></div>
+      <div><dt>Notional</dt><dd>{% if position %}{{ position.value|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt>Share of equity</dt><dd>{{ x.exposure|pct1 }} <span class="faint">cap {{ x.profile.max_position_pct|pct0 }}</span></dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>Price</h3><dl>
+      <div><dt>Entry</dt><dd>{% if position %}{{ position.entry_px|px }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt>Last</dt><dd>{{ x.price|px }}</dd></div>
+      <div><dt>Move</dt><dd>{% if position %}{{ signed(position.price / position.entry_px - 1) }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>Exits</h3><dl>
+      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% above entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}x the stop's distance</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px > risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
+      <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>
+      <div><dt>Realised {{ help('realised') }}</dt><dd>{{ money_signed(realised) }}</dd></div>
+      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }} <span class="faint">{{ x.ret|pct1s }}</span></dd></div>
+    </dl></div>
+  </div>
+  {% if position %}<details class="why-fold">
+    <summary><span class="k">Why it was bought</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
+    {{ why('Decision at ' ~ (position.opened|ts if position.opened else 'entry'), position.why, position.sig) }}
+  </details>{% endif %}
 </section>
-{% endif %}
-  <section class="panel span-5" aria-labelledby="risk-h">
-    <div class="panel-head"><h2 id="risk-h">Position and limits</h2></div>
-    <table class="compact kv">
-      <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
-      <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
-      <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
-      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
-      <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% elif s.params.take_profit_r %}{{ s.params.take_profit_r }}x the stop's distance{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
-      <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
-      <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
-      {% if not backtest_id %}<tr><th scope="row">Today's loss</th><td class="num">{{ usage(risk.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td></tr>
-      <tr><th scope="row">Worst drawdown</th><td class="num">{{ x.max_drawdown|pct1 }}</td></tr>
-      <tr><th scope="row">Reconciled</th><td class="num">{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches journal' }}</span> <span class="muted">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</td></tr>
-      <tr><th scope="row">Heartbeat</th><td class="num">{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</td></tr>{% endif %}
-    </table>
-  </section>
-</div>
+<section class="panel pos" aria-labelledby="lim-h">
+  <div class="panel-head"><h2 id="lim-h">Limits and health</h2></div>
+  <div class="pos-grid two">
+    <div class="pos-card"><h3>Limits used</h3><dl>
+      <div><dt>Position cap</dt><dd>{{ usage(risk.cap_used) }} <span class="faint">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></dd></div>
+      <div><dt>Drawdown</dt><dd>{{ usage(x.dd_used) }} <span class="faint">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></dd></div>
+      {% if not backtest_id %}<div><dt>Today's loss</dt><dd>{{ usage(risk.day_used) }} <span class="faint">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></dd></div>{% endif %}
+    </dl></div>
+    <div class="pos-card"><h3>Record</h3><dl>
+      <div><dt>Worst drawdown</dt><dd>{{ x.max_drawdown|pct1 }}</dd></div>
+      {% if not backtest_id %}<div><dt>Reconciled</dt><dd>{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches' }}</span> <span class="faint">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</dd></div>
+      <div><dt>Heartbeat</dt><dd>{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</dd></div>{% endif %}
+    </dl></div>
+  </div>
+</section>
 </div>
 
 <div class="tab-panel" id="tab-trades" role="tabpanel" data-panel="trades">

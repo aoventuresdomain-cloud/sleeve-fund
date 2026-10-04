@@ -576,12 +576,65 @@ def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, mo
     assert c.get("/api/sleeves/nope/candles", auth=AUTH).status_code == 404
     assert 'id="pc"' in c.get("/sleeves/sol-x", auth=AUTH).text
 
+    # Another instrument on the same chart: the venue's candles for it, none of this strategy's trades or exits.
+    asked = []
+    monkeypatch.setattr(KRAKEN, "ohlc_history", lambda pair, minutes: asked.append(pair) or kraken)
+    d = c.get("/api/sleeves/sol-x/candles?interval=4h&pair=eth/usd", auth=AUTH).json()
+    assert asked == ["ETH/USD"] and d["pair"] == "ETH/USD" and d["home"] == "SOL/USD" and len(d["candles"]) == 2
+    assert d["markers"] == [] and d["lines"] == [] and d["notes"] == {} and d["pairs"][0] == "SOL/USD"
+    assert c.get("/api/sleeves/sol-x/candles?pair=ETH", auth=AUTH).status_code == 400
+
+    def unknown(pair, minutes):
+        raise ValueError(f"no candles for {pair}")
+
+    monkeypatch.setattr(KRAKEN, "ohlc_history", unknown)
+    d = c.get("/api/sleeves/sol-x/candles?pair=ZZZ/USD", auth=AUTH).json()
+    assert d["candles"] == [] and d["note"] == "The venue has no candles for ZZZ/USD."
+    d = c.get("/api/sleeves/sol-x/candles?interval=4h&pair=SOL/USD", auth=AUTH).json()  # its own: back to the full chart
+    assert d["pair"] == d["home"] == "SOL/USD" and d["lines"]
+
+
+def test_instrument_list_is_the_venues_with_a_fallback(client, monkeypatch):
+    from sleeve_fund.dashboard import charts
+
+    listing = {"error": [], "result": {"XXBTZUSD": {"wsname": "XBT/USD"}, "XETHZUSD": {"wsname": "ETH/USD"},
+                                       "XDGEUR": {"wsname": "XDG/EUR"}, "ODD": {}}}
+    monkeypatch.setattr(charts, "_listed", {})
+    assert charts.instruments(lambda url: listing) == ["BTC/USD", "DOGE/EUR", "ETH/USD"]  # venue codes read as the usual names
+    assert charts.instruments(lambda url: 1 / 0) == ["BTC/USD", "DOGE/EUR", "ETH/USD"]  # cached for the day
+
+    c, _ = client
+
+    def down(*a, **k):
+        raise OSError("no route to the venue")
+
+    monkeypatch.setattr(charts, "instruments", down)
+    d = c.get("/api/instruments", auth=AUTH).json()
+    assert d["source"] == "fallback" and "BTC/USD" in d["instruments"]
+    monkeypatch.setattr(charts, "instruments", lambda: ["ETH/USD", "SOL/USD"])
+    assert c.get("/api/instruments", auth=AUTH).json() == {"instruments": ["ETH/USD", "SOL/USD"], "source": "venue"}
+    assert c.get("/api/instruments").status_code == 401
+
+
+def test_position_tab_is_compact_with_reason_folded(client):
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD", bar_spec="1-HOUR-LAST-INTERNAL", stop_loss_pct="8")
+    store.record_order("sol-x", order_id="O-1", side="BUY", qty=10, intent="entry", reason="RSI 25.1 below 30")
+    store.record_fill("sol-x", side="BUY", qty=10, price=90, fee=0.72, order_id="O-1", trade_id="t1")
+    store.record_equity("sol-x", equity=10_049.28, cash=9_099.28, qty=10, price=95, benchmark=10_000)
+    page = c.get("/sleeves/sol-x", auth=AUTH).text
+    tab = page[page.index('id="tab-positions"'):page.index('id="tab-trades"')]
+    for label in ("Size", "Quantity", "Notional", "Share of equity", "Entry", "Stop-loss", "Take-profit", "Unrealised", "Realised", "Total"):
+        assert f">{label}<" in tab or f">{label} " in tab, label
+    assert "10 SOL" in tab and "950.00 USD" in tab  # quantity in the instrument and notional in the quote
+    assert '<details class="why-fold">' in tab and "RSI 25.1 below 30" in tab
+
 
 def test_chart_helpers():
     from sleeve_fund.dashboard import charts
 
     assert charts.default_interval("1-DAY-LAST-EXTERNAL") == "1d"
-    assert charts.default_interval("5-MINUTE-LAST-INTERNAL") == "15m"
+    assert charts.default_interval("5-MINUTE-LAST-INTERNAL") == "5m"
     assert charts.default_interval("4-HOUR-LAST-EXTERNAL") == "4h"
 
 

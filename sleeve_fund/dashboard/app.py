@@ -361,7 +361,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                                                st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
-    def candles_json(name: str, interval: str = "", _: str = Depends(require_pm)):
+    def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
         from sleeve_fund.dashboard import charts
 
         try:
@@ -370,6 +370,21 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy") from None
         interval = interval if interval in charts.INTERVALS else charts.default_interval(s.bar_spec)
         minutes = charts.INTERVALS[interval]
+        pair = pair.strip().upper()
+        if pair and pair != s.instrument and not is_backtest(name):
+            # Another security on the same chart, for comparison: the venue's candles, without this strategy's trades.
+            if not PAIR_RE.fullmatch(pair):
+                raise HTTPException(400, "instrument must look like BASE/QUOTE")
+            try:
+                df, note = charts.candles(pair, minutes), ""
+            except (OSError, ValueError, KeyError):
+                df, note = charts.from_marks([], minutes), f"The venue has no candles for {pair}."
+            data = charts.payload(df, minutes, [], {}, [], "venue")
+            data.update(intervals=list(charts.INTERVALS), chosen=interval, pair=pair, home=s.instrument,
+                        pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
+            if note:
+                data["note"] = note
+            return JSONResponse(data)
         try:
             if is_backtest(name):  # the venue's recent candles aren't the replayed period
                 raise ValueError("backtest")
@@ -384,9 +399,19 @@ def create_app(store: Store | None = None) -> FastAPI:
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
                               limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
         return JSONResponse(data)
+
+    @app.get("/api/instruments")
+    def instruments_json(_: str = Depends(require_pm)):
+        from sleeve_fund.dashboard import charts
+
+        try:
+            return JSONResponse({"instruments": charts.instruments(), "source": "venue"})
+        except (OSError, ValueError, KeyError):  # venue unreachable: the usual ones, and any other can still be typed
+            return JSONResponse({"instruments": INSTRUMENT_HINTS, "source": "fallback"})
 
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, days: int | None = None, _: str = Depends(require_pm)):
@@ -994,6 +1019,11 @@ FEEDS = {
 def _feed(events: list[dict], kind: str) -> list[dict]:
     keep = FEEDS.get(kind, FEEDS["all"])
     return [e for e in events if keep(e)][:120]
+
+
+def _chart_pairs(home: str, book: list[str]) -> list[str]:
+    """The top of a chart's instrument dropdown: the strategy's own, then the book's. The venue's full list follows."""
+    return list(dict.fromkeys([home, *book]))
 
 
 def _risk_view(x: dict, position: dict | None = None) -> dict:

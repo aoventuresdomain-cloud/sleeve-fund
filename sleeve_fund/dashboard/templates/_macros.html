@@ -9,10 +9,16 @@
 {% macro why(label, text, items) %}<div class="why-block"><div class="k">{{ label }}</div>{% if text %}<p>{{ text }}</p>{% if items %}<dl class="sig">{% for k, v in items %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}</dl>{% endif %}{% else %}<p class="muted">Not recorded. This trade predates the order journal, which logs the reason when the order is sent.</p>{% endif %}</div>{% endmacro %}
 {% macro why_toggle(id) %}<button type="button" class="why-btn" aria-expanded="false" aria-controls="{{ id }}" data-why="{{ id }}">Why</button>{% endmacro %}
 {% macro price_chart(id, title, hint, intervals=True) %}<section class="panel price-chart" id="{{ id }}" aria-labelledby="{{ id }}-h">
-  <div class="panel-head"><h2 id="{{ id }}-h">{{ title }}</h2>{% if hint %}<span class="hint">{{ hint }}</span>{% endif %}{% if intervals %}<div class="right range pc-intervals" role="group" aria-label="Candle interval"></div>{% endif %}</div>
+  <div class="panel-head">{% if intervals %}<div class="pc-symbol">
+      <button type="button" class="pc-sym-btn" aria-haspopup="listbox" aria-expanded="false" aria-label="Instrument: {{ title }}. Choose another"><h2 id="{{ id }}-h" class="pc-title">{{ title }}</h2><span class="caret" aria-hidden="true">▾</span></button>
+      <div class="pc-pop pc-sym-pop" hidden><input type="search" placeholder="Search instruments" aria-label="Search instruments" autocomplete="off" spellcheck="false"><ul role="listbox" aria-label="Instruments"></ul></div>
+    </div><button type="button" class="pc-home toggle-link" hidden></button>{% else %}<h2 id="{{ id }}-h" class="pc-title">{{ title }}</h2>{% endif %}{% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+    <div class="right pc-tools"><div class="pc-ind"><button type="button" class="pc-ind-btn" aria-expanded="false">Indicators<span class="n" hidden></span></button><div class="pc-pop pc-ind-menu" hidden role="group" aria-label="Indicators"></div></div>{% if intervals %}<div class="range pc-intervals" role="group" aria-label="Candle interval"></div>{% endif %}</div></div>
   <div class="pc-legend" aria-hidden="true"></div>
   <div class="pc-canvas" role="img" aria-label="{{ title }} candlestick chart with trade markers"></div>
+  <div class="pc-subs"></div>
   <p class="empty pc-empty" hidden>No price history to chart yet.</p>
+  <p class="muted pc-other" hidden></p>
   <p class="muted pc-source" hidden>The venue couldn't be reached, so these candles are built from the strategy's own price marks.</p>
   <div class="why-grid pc-note" hidden aria-live="polite"></div>
   <p class="pc-foot">Tap a buy or sell arrow to see why it traded. Charts by <a href="https://www.tradingview.com/" rel="noopener" target="_blank">TradingView Lightweight Charts™</a>.</p>

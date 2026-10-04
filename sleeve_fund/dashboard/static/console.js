@@ -326,23 +326,111 @@ window.Console = (() => {
     });
   }
 
+  // Indicators, worked out in the browser from the candles on screen. Each instance has its own
+  // settings and colour; the list is remembered per browser. Oscillators get a strip under the price.
+  const nulls = (n) => Array(n).fill(null);
+  // Runs fn on the part of xs after its leading gaps, so indicators can be stacked (an EMA of a MACD).
+  const tail = (fn) => (xs, ...a) => { const f = xs.findIndex((v) => v != null); return f < 0 ? nulls(xs.length) : nulls(f).concat(fn(xs.slice(f), ...a)); };
+  const sma = tail((xs, n) => { let sum = 0; return xs.map((x, i) => { sum += x; if (i >= n) sum -= xs[i - n]; return i >= n - 1 ? sum / n : null; }); });
+  const ema = tail((xs, n) => {
+    const k = 2 / (n + 1), seed = sma(xs, n);
+    let prev = null;
+    return xs.map((x, i) => (prev = i < n - 1 ? null : prev == null ? seed[i] : x * k + prev * (1 - k)));
+  });
+  const wma = tail((xs, n) => xs.map((_, i) => {
+    if (i < n - 1) return null;
+    let s = 0; for (let j = 0; j < n; j++) s += xs[i - j] * (n - j);
+    return s / (n * (n + 1) / 2);
+  }));
+  const rolling = (xs, n, fn) => xs.map((_, i) => (i < n - 1 ? null : fn(xs.slice(i - n + 1, i + 1))));
+  const stdev = (xs, n, mid) => xs.map((_, i) => {
+    if (mid[i] == null) return null;
+    let v = 0; for (let j = i - n + 1; j <= i; j++) v += (xs[j] - mid[i]) ** 2;
+    return Math.sqrt(v / n);
+  });
+  const wilder = (xs, n) => {  // Wilder's smoothing, as RSI and ATR use it
+    const out = nulls(xs.length);
+    let avg = 0;
+    xs.forEach((x, i) => { if (i < n) { avg += x / n; if (i === n - 1) out[i] = avg; } else out[i] = avg = (avg * (n - 1) + x) / n; });
+    return out;
+  };
+  const rsi = (c, n) => {
+    const d = c.map((x, i) => (i ? x - c[i - 1] : 0)).slice(1);
+    const up = wilder(d.map((x) => Math.max(x, 0)), n), dn = wilder(d.map((x) => Math.max(-x, 0)), n);
+    return [null].concat(up.map((u, i) => (u == null ? null : dn[i] === 0 ? 100 : 100 - 100 / (1 + u / dn[i]))));
+  };
+  const trueRange = (k) => k.close.map((_, i) => (i ? Math.max(k.high[i] - k.low[i], Math.abs(k.high[i] - k.close[i - 1]), Math.abs(k.low[i] - k.close[i - 1])) : k.high[i] - k.low[i]));
+  const lo = (xs) => Math.min(...xs), hi = (xs) => Math.max(...xs);
+  const minus = (a, b) => a.map((v, i) => (v == null || b[i] == null ? null : v - b[i]));
+  const plus = (a, b, k = 1) => a.map((v, i) => (v == null || b[i] == null ? null : v + k * b[i]));
+  // pane: false draws on the price; otherwise a strip below. lines() returns [{vals, style?, alpha?, hist?}].
+  const LIB = {
+    sma: {name: "Simple moving average", short: "SMA", params: [["Length", 20]], lines: (k, [n]) => [{vals: sma(k.close, n)}]},
+    ema: {name: "Exponential moving average", short: "EMA", params: [["Length", 50]], lines: (k, [n]) => [{vals: ema(k.close, n)}]},
+    wma: {name: "Weighted moving average", short: "WMA", params: [["Length", 20]], lines: (k, [n]) => [{vals: wma(k.close, n)}]},
+    vwap: {name: "Rolling VWAP", short: "VWAP", params: [["Length", 20]], lines: (k, [n]) => {
+      const tp = k.close.map((c, i) => (c + k.high[i] + k.low[i]) / 3);
+      return [{vals: k.close.map((_, i) => {
+        if (i < n - 1) return null;
+        let pv = 0, v = 0; for (let j = i - n + 1; j <= i; j++) { pv += tp[j] * k.volume[j]; v += k.volume[j]; }
+        return v > 0 ? pv / v : null;
+      })}];
+    }},
+    bb: {name: "Bollinger bands", short: "BB", params: [["Length", 20], ["Width (σ)", 2]], lines: (k, [n, w]) => {
+      const mid = sma(k.close, n), sd = stdev(k.close, n, mid);
+      return [{vals: plus(mid, sd, w), alpha: 0.85}, {vals: mid, style: 2, alpha: 0.6}, {vals: plus(mid, sd, -w), alpha: 0.85}];
+    }},
+    kc: {name: "Keltner channels", short: "KC", params: [["Length", 20], ["Width (ATR)", 2]], lines: (k, [n, w]) => {
+      const mid = ema(k.close, n), atr = wilder(trueRange(k), n);
+      return [{vals: plus(mid, atr, w), alpha: 0.85}, {vals: mid, style: 2, alpha: 0.6}, {vals: plus(mid, atr, -w), alpha: 0.85}];
+    }},
+    dc: {name: "Donchian channels", short: "DC", params: [["Length", 20]], lines: (k, [n]) => {
+      const up = rolling(k.high, n, hi), dn = rolling(k.low, n, lo);
+      return [{vals: up, alpha: 0.85}, {vals: up.map((u, i) => (u == null ? null : (u + dn[i]) / 2)), style: 2, alpha: 0.6}, {vals: dn, alpha: 0.85}];
+    }},
+    rsi: {name: "Relative strength index", short: "RSI", pane: {min: 0, max: 100, guides: [30, 70], digits: 0}, params: [["Length", 14]], lines: (k, [n]) => [{vals: rsi(k.close, n)}]},
+    stoch: {name: "Stochastic", short: "Stoch", pane: {min: 0, max: 100, guides: [20, 80], digits: 0}, params: [["%K", 14], ["%D", 3]], lines: (k, [n, d]) => {
+      const kk = k.close.map((c, i) => { if (i < n - 1) return null; const l = lo(k.low.slice(i - n + 1, i + 1)), h = hi(k.high.slice(i - n + 1, i + 1)); return h > l ? (100 * (c - l)) / (h - l) : 50; });
+      return [{vals: kk}, {vals: sma(kk, d), style: 2, alpha: 0.7}];
+    }},
+    macd: {name: "MACD", short: "MACD", pane: {guides: [0]}, params: [["Fast", 12], ["Slow", 26], ["Signal", 9]], lines: (k, [f, sl, sg]) => {
+      const m = minus(ema(k.close, f), ema(k.close, sl)), sig = ema(m, sg);
+      return [{vals: minus(m, sig), hist: true}, {vals: m}, {vals: sig, style: 2, alpha: 0.7}];
+    }},
+    atr: {name: "Average true range", short: "ATR", pane: {}, params: [["Length", 14]], lines: (k, [n]) => [{vals: wilder(trueRange(k), n)}]},
+    roc: {name: "Rate of change %", short: "ROC", pane: {guides: [0], digits: 2}, params: [["Length", 10]], lines: (k, [n]) => [{vals: k.close.map((c, i) => (i >= n ? (c / k.close[i - n] - 1) * 100 : null))}]},
+  };
+  const IND_KEY = "pc-indicators-v2", IND_MAX = 20;
+  const PALETTE = ["--ind-1", "--ind-2", "--ind-3", "--ind-4", "--ind-5", "--ind-6", "--ind-7", "--ind-8"];
+  const loadInd = () => {
+    try {
+      const v = JSON.parse(localStorage.getItem(IND_KEY) || "[]");
+      return Array.isArray(v) ? v.filter((x) => x && LIB[x.type] && Array.isArray(x.p)).slice(0, IND_MAX) : [];
+    } catch (e) { return []; }
+  };
+  const saveInd = (v) => { try { localStorage.setItem(IND_KEY, JSON.stringify(v)); } catch (e) { /* private window: kept for this visit */ } };
+
   // TradingView-style price chart: candles, volume, a marker on every fill, and entry/stop/target
   // lines. Clicking a marker shows the reason journaled when the order was sent.
-  // src is the data itself, or an endpoint that takes ?interval=.
+  // src is the data itself, or an endpoint that takes ?interval= and ?pair= (another instrument, for comparison).
   function priceChart(boxId, src) {
     const box = document.getElementById(boxId);
     if (!box || !window.LightweightCharts) return;
     const $ = (sel) => box.querySelector(sel);
     const accent = css("--accent");
-    const fmt = (v) => (v >= 100 ? v.toLocaleString("en-GB", {minimumFractionDigits: 2, maximumFractionDigits: 2}) : v.toPrecision(5));
-    const chart = LightweightCharts.createChart($(".pc-canvas"), {
-      localization: {priceFormatter: fmt},
+    const fmt = (v) => (Math.abs(v) >= 100 ? v.toLocaleString("en-GB", {minimumFractionDigits: 2, maximumFractionDigits: 2}) : v.toPrecision(5));
+    const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+    const base = {
       autoSize: true,
       layout: {background: {type: "solid", color: css("--panel")}, textColor: css("--muted"), fontSize: 11, fontFamily: getComputedStyle(document.body).fontFamily, attributionLogo: true},
       grid: {vertLines: {visible: false}, horzLines: {color: css("--line")}},
-      rightPriceScale: {borderVisible: false, scaleMargins: {top: 0.08, bottom: 0.08}},
       timeScale: {borderVisible: false, rightOffset: 6, fixLeftEdge: true},
       crosshair: {mode: 0, vertLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}, horzLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}},
+    };
+    // The axis keeps counting down through the volume band; a price at or below zero there is no price, so leave it blank.
+    const chart = LightweightCharts.createChart($(".pc-canvas"), {...base,
+      localization: {priceFormatter: (v) => (v > 0 ? fmt(v) : "")},
+      rightPriceScale: {borderVisible: false, minimumWidth: 76, scaleMargins: {top: 0.08, bottom: 0.08}},
     });
     const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
     // Candles built from the sleeve's own marks have no range inside the bar, so they draw as a line instead.
@@ -351,7 +439,165 @@ window.Console = (() => {
     chart.priceScale("vol").applyOptions({scaleMargins: {top: 0.86, bottom: 0}});
     let main = candles;
     let lines = [], data = null;
-    const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+    // Indicators: config is the saved list; built holds each one's series and, for oscillators, its strip.
+    let config = loadInd(), built = [];
+    let syncing = false, mirroring = false;
+    const quiet = {priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false};
+    const colorOf = (c) => (c.color && /^#[0-9a-f]{6}$/i.test(c.color) ? c.color : css(PALETTE[0]));
+    const labelOf = (c) => `${LIB[c.type].short} ${c.p.join(", ")}`;
+    const strips = () => built.filter((b) => b.chart !== chart);
+    const teardown = () => {
+      built.forEach((b) => { if (b.chart === chart) b.series.forEach((s) => chart.removeSeries(s)); else { b.chart.remove(); b.box.remove(); } });
+      built = [];
+    };
+    const build = () => {
+      teardown();
+      config.forEach((c) => {
+        const def = LIB[c.type], color = colorOf(c);
+        let target = chart, wrap = null, legend = null;
+        if (def.pane) {
+          wrap = el("div", "pc-sub"); legend = el("div", "pc-sub-legend");
+          wrap.append(legend); $(".pc-subs").append(wrap);
+          const d = def.pane.digits ?? 2;
+          target = LightweightCharts.createChart(wrap, {...base, layout: {...base.layout, attributionLogo: false},
+            localization: {priceFormatter: (v) => v.toFixed(d)},
+            rightPriceScale: {borderVisible: false, minimumWidth: 76, scaleMargins: {top: 0.12, bottom: 0.08}}});
+        }
+        const shape = def.lines({close: [1], high: [1], low: [1], volume: [1]}, c.p);  // how many lines, and their style
+        const series = shape.map((ln) => (ln.hist
+          ? target.addHistogramSeries({...quiet, priceFormat: {type: "price", precision: def.pane?.digits ?? 2, minMove: 0.01}})
+          : target.addLineSeries({...quiet, color: rgba(color, ln.alpha ?? 1), lineWidth: def.pane ? 1.5 : 1.5, lineStyle: ln.style || 0,
+              ...(def.pane && def.pane.min != null ? {autoscaleInfoProvider: () => ({priceRange: {minValue: def.pane.min, maxValue: def.pane.max}})} : {})})));
+        if (def.pane) (def.pane.guides || []).forEach((g) => series[series.length - 1].createPriceLine({price: g, color: css("--line-strong"), lineWidth: 1, lineStyle: 2, axisLabelVisible: false}));
+        built.push({c, def, color, series, chart: target, box: wrap, legend, vals: []});
+      });
+      // Every strip follows the price chart's scroll and zoom, and the other way round.
+      strips().forEach((b) => {
+        b.chart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+          if (!r || syncing) return;
+          syncing = true; chart.timeScale().setVisibleLogicalRange(r); strips().forEach((o) => o !== b && o.chart.timeScale().setVisibleLogicalRange(r)); syncing = false;
+        });
+        b.chart.subscribeCrosshairMove((p) => { if (!mirroring) mirror(p.time, b); });
+      });
+      const last = strips().length;
+      chart.applyOptions({timeScale: {visible: !last}});
+      strips().forEach((b, i) => b.chart.applyOptions({timeScale: {visible: i === last - 1}}));
+      const badge = $(".pc-ind-btn .n");
+      badge.textContent = config.length; badge.hidden = !config.length;
+      if (data) fill();
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+      if (!r || syncing) return;
+      syncing = true; strips().forEach((b) => b.chart.timeScale().setVisibleLogicalRange(r)); syncing = false;
+    });
+    const fill = () => {
+      const t = data.candles.map((c) => c.time);
+      const k = {close: data.candles.map((c) => c.close), high: data.candles.map((c) => c.high), low: data.candles.map((c) => c.low),
+        volume: data.candles.map((c, i) => (data.volume[i] ? data.volume[i].value : 0))};
+      built.forEach((b) => {
+        const out = b.def.lines(k, b.c.p);
+        b.vals = out.map((ln) => ln.vals);
+        out.forEach((ln, j) => {
+          // Strips get a point per candle, blank where the indicator isn't defined yet, so all charts count bars alike.
+          const pts = b.chart === chart ? ln.vals.map((v, i) => (v == null ? null : {time: t[i], value: v})).filter(Boolean)
+            : ln.vals.map((v, i) => (v == null ? {time: t[i]} : ln.hist ? {time: t[i], value: v, color: rgba(v >= 0 ? css("--gain") : css("--loss"), 0.5)} : {time: t[i], value: v}));
+          b.series[j].setData(pts);
+        });
+        if (b.chart !== chart) b.chart.applyOptions({timeScale: {timeVisible: data.interval < 1440, secondsVisible: false}});
+      });
+      const r = chart.timeScale().getVisibleLogicalRange();
+      if (r) strips().forEach((b) => b.chart.timeScale().setVisibleLogicalRange(r));
+      legends(-1);
+    };
+    // Legends: overlays in the price legend, each strip's values in its own corner.
+    const valueText = (b, i) => {
+      const d = b.def.pane?.digits ?? null;
+      const at = b.vals.map((v) => (i >= 0 ? v[i] : v[v.length - 1]));
+      if (b.def.lines.length && b.series[0] && b.series[0].seriesType() === "Histogram") at.push(at.shift());  // MACD reads line, signal, histogram
+      const shown = at.filter((v) => v != null);
+      if (!shown.length) return "";
+      const f = (v) => (d != null ? v.toFixed(d) : b.def.pane ? +v.toPrecision(4) + "" : fmt(v));
+      return b.def.pane ? shown.map(f).join("  ") : shown.length === 3 ? `${f(shown[2])} – ${f(shown[0])}` : f(shown[0]);
+    };
+    const tag = (b, i) => {
+      const sp = el("span"), sw = el("i"); sw.style.background = b.color;
+      sp.append(sw, labelOf(b.c) + "  ", el("b", null, valueText(b, i)));
+      return sp;
+    };
+    let barText = "";
+    const legends = (i) => {
+      $(".pc-legend").replaceChildren(...(barText ? [el("span", null, barText)] : []), ...built.filter((b) => b.chart === chart).map((b) => tag(b, i)));
+      strips().forEach((b) => b.legend.replaceChildren(tag(b, i)));
+    };
+    const indexOf = (time) => (time && data ? data.candles.findIndex((c) => c.time === time) : -1);
+    // Moving over any strip or the price moves the crosshair on all of them.
+    const mirror = (time, from) => {
+      mirroring = true;
+      const i = indexOf(time);
+      if (from) { const c = data && data.candles[i]; if (c) chart.setCrosshairPosition(c.close, time, main); else chart.clearCrosshairPosition(); }
+      strips().forEach((b) => {
+        if (b === from) return;
+        const v = i >= 0 ? b.vals.map((x) => x[i]).find((x) => x != null) : null;
+        const s = b.series[b.vals.findIndex((x) => i >= 0 && x[i] != null)];
+        if (v != null && s) b.chart.setCrosshairPosition(v, time, s); else b.chart.clearCrosshairPosition();
+      });
+      mirroring = false;
+    };
+
+    // The indicator menu: what's on, each with its settings, colour and a remove button; then a list to add more.
+    const indBtn = $(".pc-ind-btn"), menu = $(".pc-ind-menu");
+    const commit = () => { saveInd(config); build(); drawMenu(); };
+    const drawMenu = () => {
+      const rows = config.map((c, idx) => {
+        const def = LIB[c.type], row = el("div", "row");
+        const col = el("input"); col.type = "color"; col.value = colorOf(c); col.setAttribute("aria-label", `${def.name} colour`);
+        col.addEventListener("change", () => { c.color = col.value; commit(); });
+        row.append(col, el("span", "nm", def.short));
+        row.querySelector(".nm").title = def.name;
+        def.params.forEach(([label], j) => {
+          const n = el("input"); n.type = "number"; n.min = label.includes("Width") ? 0.1 : 1; n.max = 500; n.step = label.includes("Width") ? 0.1 : 1;
+          n.value = c.p[j]; n.title = label; n.setAttribute("aria-label", `${def.name} ${label}`);
+          n.addEventListener("change", () => { const v = +n.value; if (v > 0 && v <= 500) { c.p[j] = label.includes("Width") ? v : Math.round(v); commit(); } else n.value = c.p[j]; });
+          row.append(n);
+        });
+        const x = el("button", "x", "×"); x.type = "button"; x.setAttribute("aria-label", `Remove ${labelOf(c)}`);
+        x.addEventListener("click", () => { config.splice(idx, 1); commit(); });
+        row.append(x);
+        return row;
+      });
+      const add = el("select");
+      add.setAttribute("aria-label", "Add an indicator");
+      add.append(new Option(config.length >= IND_MAX ? `Up to ${IND_MAX} indicators` : "+ Add indicator", ""));
+      [["On the price", false], ["Below the price", true]].forEach(([label, pane]) => {
+        const g = el("optgroup"); g.label = label;
+        Object.entries(LIB).filter(([, d]) => !!d.pane === pane).forEach(([key, d]) => g.append(new Option(d.name, key)));
+        add.append(g);
+      });
+      add.disabled = config.length >= IND_MAX;
+      add.addEventListener("change", () => {
+        const def = LIB[add.value];
+        if (!def) return;
+        config.push({type: add.value, p: def.params.map(([, v]) => v), color: css(PALETTE[config.length % PALETTE.length])});
+        commit();
+      });
+      menu.replaceChildren(...(rows.length ? rows : [el("div", "none", "No indicators yet.")]), add,
+        el("p", null, "Lengths count candles of the interval shown. Add the same indicator more than once with different settings."));
+    };
+    drawMenu();
+
+    // Pop-overs (instrument list, indicator menu): one open at a time, closed by Escape or a click elsewhere.
+    const pops = [];
+    const popover = (btn, pop, onOpen) => {
+      const set = (open) => { pop.hidden = !open; btn.setAttribute("aria-expanded", String(open)); if (open && onOpen) onOpen(); };
+      btn.addEventListener("click", () => { const open = pop.hidden; pops.forEach((p) => p.set(false)); set(open); });
+      pops.push({set, btn, pop});
+      return set;
+    };
+    popover(indBtn, menu);
+    document.addEventListener("click", (e) => pops.forEach((p) => { if (!p.pop.hidden && !p.pop.contains(e.target) && !p.btn.contains(e.target)) p.set(false); }));
+    box.addEventListener("keydown", (e) => { if (e.key === "Escape") pops.forEach((p) => { if (!p.pop.hidden) { p.set(false); p.btn.focus(); } }); });
+
     const showNote = (ids) => {
       const note = $(".pc-note");
       note.replaceChildren();
@@ -370,7 +616,8 @@ window.Console = (() => {
       });
       note.hidden = !note.childElementCount;
     };
-    let current = "";
+    let current = "", pair = "";
+    const marksNote = $(".pc-source").textContent;
     const render = (d, keepView = false) => {
       data = d;
       chart.applyOptions({timeScale: {timeVisible: d.interval < 1440, secondsVisible: false}});
@@ -383,18 +630,26 @@ window.Console = (() => {
       else { candles.setData(d.candles); area.setData([]); }
       // No traded volume (marks, or a venue that doesn't report it): leave the band empty rather than a row of zeros.
       const hasVol = d.volume.some((v) => v.value > 0);
+      vol.setData(hasVol ? d.volume : []);
       // Keep the candles clear of the volume band when there is one.
       chart.priceScale("right").applyOptions({scaleMargins: {top: 0.08, bottom: hasVol ? 0.18 : 0.06}});
-      vol.setData(hasVol ? d.volume : []);
       main.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")})));
       lines.forEach((l) => main.removePriceLine(l));
       lines = d.lines.map((l) => main.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
       if (!keepView) chart.timeScale().fitContent();
-      $(".pc-source").hidden = d.source !== "marks";
-      if (d.note) $(".pc-source").textContent = d.note;
+      fill();
+      $(".pc-source").hidden = d.source !== "marks" && !d.note;
+      $(".pc-source").textContent = d.note || marksNote;
       $(".pc-empty").hidden = d.candles.length > 0;
       if (!keepView) showNote([]);
+      // Another instrument than the strategy's own: say so, and offer the way back.
+      const other = d.home && d.pair && d.pair !== d.home;
+      if (d.pair) { $(".pc-title").textContent = d.pair; if (symBtn) symBtn.setAttribute("aria-label", `Instrument: ${d.pair}. Choose another`); }
+      const home = $(".pc-home"), otherNote = $(".pc-other");
+      if (home) { home.hidden = !other; home.textContent = other ? `Back to ${d.home}` : ""; }
+      if (otherNote) { otherNote.hidden = !other; otherNote.textContent = other ? `Comparison only. This strategy trades ${d.home}, so its trades and exits aren't drawn here.` : ""; }
+      if (d.pairs) ownPairs = d.pairs;
       const tabs = $(".pc-intervals");
       if (tabs && d.intervals) {
         tabs.replaceChildren(...d.intervals.map((k) => {
@@ -404,15 +659,73 @@ window.Console = (() => {
       }
     };
     const load = (interval, keepView = false) => {
-      if (typeof src !== "string") { render(src); return; }
+      if (typeof src !== "string") { render(src); return Promise.resolve(); }
       current = interval;
-      return fetch(src + (interval ? `?interval=${interval}` : ""), {cache: "no-store"}).then((r) => r.json()).then((d) => render(d, keepView));
+      const q = new URLSearchParams();
+      if (interval) q.set("interval", interval);
+      if (pair) q.set("pair", pair);
+      const asked = pair;
+      return fetch(src + (q.toString() ? `?${q}` : ""), {cache: "no-store"})
+        .then((r) => r.json().then((d) => { if (!r.ok) throw new Error(d.detail || "Couldn't load that instrument"); return d; }))
+        .then((d) => { if (asked === pair) render(d, keepView); });
     };
+
+    // The instrument dropdown: this strategy's instrument, the book's, then everything the venue lists, with a search box.
+    const symBtn = $(".pc-sym-btn");
+    let ownPairs = [], allPairs = null;
+    if (symBtn && typeof src === "string") {
+      const pop = $(".pc-sym-pop"), search = pop.querySelector("input"), list = pop.querySelector("ul");
+      let active = 0;
+      const pick = (v) => {
+        setOpen(false);
+        pair = data && v === data.home ? "" : v;
+        load(current).catch((e) => { $(".pc-source").hidden = false; $(".pc-source").textContent = e.message; });
+      };
+      const drawList = () => {
+        const q = search.value.trim().toUpperCase().replace(/[-_ ]/, "/");
+        const match = (p) => !q || p.includes(q) || p.replace("/", "").includes(q.replace("/", ""));
+        const shown = data ? data.pair : "";
+        const items = [];
+        const group = (label, xs) => {
+          const hits = xs.filter(match);
+          if (!hits.length) return;
+          const g = el("li", "grp", label); g.setAttribute("role", "presentation"); items.push(g);
+          hits.forEach((p) => {
+            const li = el("li", "opt", p); li.setAttribute("role", "option"); li.setAttribute("aria-selected", String(p === shown));
+            if (data && p === data.home) li.append(el("small", null, "this strategy"));
+            li.addEventListener("click", () => pick(p)); items.push(li);
+          });
+        };
+        group("This strategy and the book", ownPairs);
+        group(allPairs ? `All instruments (${allPairs.length})` : "Loading the venue's list…", (allPairs || []).filter((p) => !ownPairs.includes(p)));
+        // Something typed that isn't in any list: still offer it, the venue decides.
+        if (/^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/.test(q) && !ownPairs.includes(q) && !(allPairs || []).includes(q)) group("Other", [q]);
+        list.replaceChildren(...items);
+        active = 0; mark();
+      };
+      const opts = () => [...list.querySelectorAll("li.opt")];
+      const mark = () => opts().forEach((li, i) => { li.classList.toggle("on", i === active); if (i === active) li.scrollIntoView({block: "nearest"}); });
+      const setOpen = popover(symBtn, pop, () => {
+        search.value = ""; drawList(); search.focus({preventScroll: true});
+        if (!allPairs) fetch("/api/instruments", {cache: "no-store"}).then((r) => r.json()).then((d) => { allPairs = d.instruments || []; drawList(); }).catch(() => { allPairs = []; drawList(); });
+      });
+      search.addEventListener("input", drawList);
+      search.addEventListener("keydown", (e) => {
+        const o = opts();
+        if (e.key === "ArrowDown") { active = Math.min(active + 1, o.length - 1); mark(); e.preventDefault(); }
+        else if (e.key === "ArrowUp") { active = Math.max(active - 1, 0); mark(); e.preventDefault(); }
+        else if (e.key === "Enter") { e.preventDefault(); if (o[active]) pick(o[active].firstChild.textContent); }
+      });
+      $(".pc-home").addEventListener("click", () => { pair = ""; load(current); });
+    }
     // A sleeve's chart follows the market: new candles and fills appear without a reload.
     if (typeof src === "string") setInterval(() => { if (!document.hidden) load(current, true).catch(() => {}); }, 30000);
     chart.subscribeCrosshairMove((p) => {
       const bar = p.seriesData && p.seriesData.get(main);
-      $(".pc-legend").textContent = !bar ? "" : main === area ? `Price ${fmt(bar.value)}` : `O ${fmt(bar.open)}  H ${fmt(bar.high)}  L ${fmt(bar.low)}  C ${fmt(bar.close)}`;
+      barText = !bar ? "" : main === area ? `Price ${fmt(bar.value)}` : `O ${fmt(bar.open)}  H ${fmt(bar.high)}  L ${fmt(bar.low)}  C ${fmt(bar.close)}`;
+      const i = bar ? indexOf(p.time) : -1;
+      legends(i);
+      if (!mirroring) mirror(p.time, null);
     });
     chart.subscribeClick((p) => {
       if (!data || !p.time) return;
@@ -420,6 +733,7 @@ window.Console = (() => {
         : data.markers.filter((m) => m.time === p.time).map((m) => m.id);
       if (ids.length) showNote(ids);
     });
+    build();
     load("");
   }
 
