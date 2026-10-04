@@ -41,6 +41,24 @@ class BacktestResult:
 
 
 CHUNK_BARS = 100_000  # bars handed to the engine at a time
+# The share of each bar's traded volume the simulated venue offers this strategy's orders. The engine
+# turns a bar into four prints (open, high, low, close) of a quarter of its volume each, and a resting
+# order fills only against the prints that trade through its price, at most a print's size each. With
+# the whole volume on offer, a post-only order joining the queue could take half a bar's volume or
+# more, ahead of everyone already there, which flatters maker fills most where the maker fee saving is
+# the edge (minute to hourly bars). At a fifth, a resting order takes at most 5% of a bar's volume per
+# print it trades through, so about a tenth of the bar, and the rest waits for the next bar. A market
+# order takes the first print's share at the price and the rest one tick worse.
+BOOK_SHARE = 0.2
+
+
+def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
+    """The feed with each bar's volume cut to BOOK_SHARE, never to zero where something traded (a
+    zero-volume bar makes no market at all)."""
+    step = float(instrument.size_increment)
+    v = feed["volume"].astype(float)
+    shown = (v * BOOK_SHARE).where(v <= 0, (v * BOOK_SHARE).clip(lower=step))
+    return feed.assign(volume=shown)
 
 
 def run_backtest(
@@ -136,11 +154,13 @@ def run_backtest(
         else:
             bar_type = bar_type_for(instrument, bar_minutes)
             feed, feed_type = prices, bar_type
+        feed = _book_volume(feed, instrument)
         config = config_cls(
             instrument_id=instrument.id,
             bar_type=bar_type,
             assumed_taker_fee=float(instrument.taker_fee),
             assumed_half_spread=half_spread,
+            volume_scale=BOOK_SHARE,
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)

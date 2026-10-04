@@ -364,6 +364,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in eq],
             "benchmark": [round(v, 2) for v in bench],
             "drawdown": dd,
+            "worst": round(st().max_drawdown(name), 5),  # over every mark: the curve above is thinned or daily
             "fills": fills,
         })
 
@@ -501,7 +502,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
-                     "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}  # equity is daily
+                     "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily",  # equity is daily
+                     "worst": round(-result["strategy"]["max_drawdown"], 5)}  # over every mark, as the table
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
                     chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, g1_here=g1_here,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,

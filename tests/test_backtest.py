@@ -49,6 +49,9 @@ def _path(prices, closes):
     c = np.asarray(closes, dtype=float)
     df["close"], df["open"] = c, np.concatenate([[c[0]], c[:-1]])
     df["high"], df["low"] = np.maximum(df["open"], c), np.minimum(df["open"], c)
+    # Deep enough that the orders here fill whole within the share of each bar the venue shows
+    # (runner.BOOK_SHARE): these tests are about prices and levels, not liquidity.
+    df["volume"] = 1e6
     return df
 
 

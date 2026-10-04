@@ -20,7 +20,8 @@ from datetime import timedelta
 
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, OrderSide,
-                                   OrderStatus, Price, PriceType, Quantity, StopMarketOrder, TimeInForce, TriggerType)
+                                   OrderStatus, OrderType, Price, PriceType, Quantity, StopMarketOrder, TimeInForce,
+                                   TriggerType)
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
@@ -91,6 +92,7 @@ class LongFlatConfig(StrategyConfig):
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
+        volume_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -129,6 +131,8 @@ class LongFlatConfig(StrategyConfig):
             maker_wait_minutes = int(maker_wait_minutes)
         if max_participation is not None and not 0 < max_participation <= 1:
             raise ValueError(f"max_participation {max_participation} outside (0, 1]")
+        if not 0 < volume_scale <= 1:
+            raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
         if take_profit is not None:
@@ -164,6 +168,9 @@ class LongFlatConfig(StrategyConfig):
         # A buy is at most this share of what traded in the bar it decided on, in every mode, so a
         # backtest can't fill far more than the market traded and paper sizes the same way. None: no cap.
         self.max_participation = max_participation
+        # Backtest only: the share of each bar's volume the simulated venue was shown (see
+        # research.runner.BOOK_SHARE), so the strategy reads the bar's real volume back. 1 in paper.
+        self.volume_scale = volume_scale
         # None: every order is a market order and pays the taker fee. A number: entries, signal exits
         # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
         # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
@@ -187,8 +194,9 @@ class LongFlatStrategy(Strategy):
         self._entry_px = None  # average entry price of the open position
         self._entry_qty = 0.0
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
-        self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
-        self._last_order = None  # client order id of the last order sent, until the venue has it
+        self._pending_exit = None  # a sell waiting for every working order to close first
+        self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
+        self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
@@ -311,7 +319,7 @@ class LongFlatStrategy(Strategy):
         if bar.ts_event <= self._last_bar_ts:
             return False
         self._last_bar_ts = bar.ts_event
-        self._volumes.append(bar.volume.as_double())
+        self._volumes.append(bar.volume.as_double() / self._cfg.volume_scale)
         self.update_indicators(bar)
         return True
 
@@ -608,7 +616,7 @@ class LongFlatStrategy(Strategy):
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
-        self._last_order = order.client_order_id
+        self._sent.append(order.client_order_id)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
@@ -664,7 +672,8 @@ class LongFlatStrategy(Strategy):
             qty = min(left, self._position_qty(free=True)).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             self.log.info(f"post-only order {coid} {why}; the rest ({qty}) is below the minimum order size")
-            if self._backtest and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0:
+            if (self._backtest and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0
+                    and self._pending_exit is None):
                 self._rest_exits()
             return
         reason = f"{info['reason']}. The post-only order {why}, so the rest went at market"
@@ -689,33 +698,52 @@ class LongFlatStrategy(Strategy):
                 total += (b.free if free else b).as_decimal()
         return total
 
-    def _unsent(self, side=None):
-        """The last order, if it is still on its way to the venue (INITIALIZED): a backtest's market order
-        sent from inside a bar or tick fills only after that handler returns, so until then neither
-        the account nor orders_inflight shows it. A risk halt's flatten and the bar's own exit used
-        to both sell the whole position that way."""
-        if self._last_order is None:
-            return None
-        order = self.cache.order(self._last_order)
-        if order is None or order.status != OrderStatus.INITIALIZED or (side is not None and order.side != side):
-            return None
-        return order
+    def _unsent(self) -> list:
+        """Orders still on their way to the venue (INITIALIZED): a backtest's order sent from inside a bar,
+        tick or fill handler reaches the venue only after that handler returns, so until then neither
+        the account nor orders_open nor orders_inflight shows it. A risk halt's flatten and the bar's own
+        exit once both sold the whole position that way; so did a halt on the bar an entry filled, while
+        the entry's stop and target were still unsent, and the target then sold it a second time."""
+        unsent = []
+        for coid in self._sent:
+            order = self.cache.order(coid)
+            if order is not None and order.status == OrderStatus.INITIALIZED:
+                unsent.append(order)
+        self._sent = [o.client_order_id for o in unsent]
+        return unsent
+
+    def _working(self) -> list:
+        """Every order of this strategy not yet closed: resting at the venue, in flight, or not yet sent."""
+        iid = self._cfg.instrument_id
+        seen, working = set(), []
+        for order in (*self.cache.orders_open(instrument_id=iid, strategy_id=self.strategy_id),
+                      *self.cache.orders_inflight(instrument_id=iid, strategy_id=self.strategy_id), *self._unsent()):
+            if order.client_order_id not in seen and not order.is_closed:
+                seen.add(order.client_order_id)
+                working.append(order)
+        return working
 
     def _busy(self) -> bool:
-        return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or self._unsent() is not None
+        return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or bool(self._unsent())
 
     def _is_long(self) -> bool:
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
-        if self.cache.orders_open(instrument_id=self._cfg.instrument_id):
-            # A resting order (the backtest's stop, or a post-only order) holds part of the position or
-            # cash; cancel it and sell once the cancel confirms.
+        working = self._working()
+        if working:
+            # A working order (the backtest's stop and target, a post-only order, or any order not yet at
+            # the venue) holds part of the position or cash, or could still trade it. Cancel each one, and
+            # sell what is left once every one has closed (_resume_exit). A market order just fills.
             self._pending_exit = (intent, reason, values)
-            self.cancel_all_orders(self._cfg.instrument_id)
+            for order in working:
+                if order.order_type == OrderType.MARKET:
+                    continue
+                if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
+                    self._cancel_on_accept.add(str(order.client_order_id))  # the venue can't cancel it yet
+                elif order.status != OrderStatus.PENDING_CANCEL:
+                    self.cancel_order(order.client_order_id)
             return
-        if self._unsent(OrderSide.SELL) is not None:
-            return  # already selling everything; the account just doesn't show it yet
         step = self.instrument.size_increment.as_decimal()
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
@@ -822,6 +850,20 @@ class LongFlatStrategy(Strategy):
 
     def on_order_accepted(self, event) -> None:
         self._order_status(event, "accepted")
+        coid = str(event.client_order_id)
+        if coid in self._cancel_on_accept:  # a flatten was waiting for the venue to have this order
+            self._cancel_on_accept.discard(coid)
+            order = self.cache.order(event.client_order_id)
+            if order is not None and order.is_open and order.status != OrderStatus.PENDING_CANCEL:
+                self.cancel_order(order.client_order_id)
+
+    def _resume_exit(self, coid: str) -> None:
+        """An order closed: if a sell was waiting for every working order to close, send it now."""
+        self._cancel_on_accept.discard(coid)
+        if self._pending_exit is not None and not self._working():
+            intent, reason, values = self._pending_exit
+            self._pending_exit = None
+            self._sell_all(intent, reason, values)
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
@@ -829,10 +871,13 @@ class LongFlatStrategy(Strategy):
         info = self._maker.pop(coid, None)
         if info is not None:  # e.g. the price moved and a post-only order would have taken liquidity
             self._cancel_alert(coid)
-            self._finish_at_market(coid, info, f"was rejected ({getattr(event, 'reason', '') or 'no reason given'})")
+            if self._pending_exit is None:
+                self._finish_at_market(coid, info, f"was rejected ({getattr(event, 'reason', '') or 'no reason given'})")
+        self._resume_exit(coid)
 
     def on_order_denied(self, event) -> None:
         self._order_status(event, "denied")
+        self._resume_exit(str(event.client_order_id))
 
     def on_order_canceled(self, event) -> None:
         self._order_status(event, "canceled")
@@ -846,13 +891,11 @@ class LongFlatStrategy(Strategy):
         if info is not None and timed_out and self._pending_exit is None:
             wait = self._cfg.maker_wait_minutes
             self._finish_at_market(coid, info, f"was not filled within {wait} minute{'s' if wait != 1 else ''}")
-        if self._pending_exit is not None and not self.cache.orders_open(instrument_id=self._cfg.instrument_id):
-            intent, reason, values = self._pending_exit
-            self._pending_exit = None
-            self._sell_all(intent, reason, values)
+        self._resume_exit(coid)
 
     def on_order_expired(self, event) -> None:
         self._order_status(event, "expired")
+        self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
         coid = str(event.client_order_id)
@@ -871,26 +914,28 @@ class LongFlatStrategy(Strategy):
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
         if self._backtest:
-            if event.is_buy and done:
+            if event.is_buy and done and self._pending_exit is None:
                 self._rest_exits()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 self._exit_lock = True  # as in paper: no re-entry until the signal has gone flat
-        if self.runtime is None:
-            return
-        fee = event.commission.as_double() if event.commission is not None else 0.0
-        self.runtime.on_fill(
-            side="BUY" if event.is_buy else "SELL",
-            qty=event.last_qty.as_double(),
-            price=event.last_px.as_double(),
-            fee=fee,
-            order_id=str(event.client_order_id),
-            trade_id=str(event.trade_id),
-        )
+        if self.runtime is not None:
+            fee = event.commission.as_double() if event.commission is not None else 0.0
+            self.runtime.on_fill(
+                side="BUY" if event.is_buy else "SELL",
+                qty=event.last_qty.as_double(),
+                price=event.last_px.as_double(),
+                fee=fee,
+                order_id=str(event.client_order_id),
+                trade_id=str(event.trade_id),
+            )
+        if done:
+            self._resume_exit(coid)
 
     def _rest_exits(self) -> None:
         """Backtests: after an entry fills, rest the exits at the venue as real orders would sit there.
         (Paper and live watch every trade instead.) The stop is a sell stop at its level and the target
-        a sell limit at its level, linked one-cancels-the-other so only one can fill. Within a bar the
+        a sell limit at its level, linked one-updates-the-other: a fill on either shrinks the other by as
+        much, so together they never sell more than is held. A flatten cancels both first (_sell_all). Within a bar the
         extreme nearer the open trades first. A stop fills at its level, or at the open when the price
         gaps through it; a target fills at its level, never better, never worse."""
         cfg = self._cfg
@@ -934,6 +979,7 @@ class LongFlatStrategy(Strategy):
                 self.runtime.on_order(order_id=str(order.client_order_id), side="SELL", qty=float(qty), intent=intent,
                                       reason=reason, signal=signal, order_type=kind)
         for order, *_ in orders:
+            self._sent.append(order.client_order_id)
             self.submit_order(order)
 
     def on_stop(self) -> None:

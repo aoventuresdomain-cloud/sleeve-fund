@@ -119,7 +119,10 @@ def test_g1_needs_every_check_not_just_the_sharpe(tmp_path):
         rows = [sharpe] + [(label, "FAIL" if label == failing else v) for label, v in rest]
         _checks_sheet(tmp_path / "a.md", rows)
         assert pipeline.g1_for(tmp_path, "trend_filter", "BTC/USD", 1440) == "FAIL", failing
-        assert pipeline.sheet_facts(tmp_path / "a.md")["failed"] == [failing]
+        facts = pipeline.sheet_facts(tmp_path / "a.md")
+        assert facts["failed"] == [failing]
+        # Review R6-M3: the failed check is named first, not left behind a passing Sharpe line.
+        assert facts["evidence"].startswith(f"Failed: {failing} (e). ")
 
 
 def test_a_sheet_that_does_not_say_what_it_tested_badges_nothing(tmp_path):
