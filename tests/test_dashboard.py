@@ -1201,7 +1201,7 @@ def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
     assert "apply when it next starts" in store.events("btc-test")[0]["message"]
 
 
-def test_strategies_move_between_accounts_only_when_stopped_or_flat(client):
+def test_strategies_move_between_accounts_only_when_flat(client):
     c, store = client
     _new(c)
     store.create_account("desk-b", "paper")
@@ -1214,9 +1214,12 @@ def test_strategies_move_between_accounts_only_when_stopped_or_flat(client):
     store.record_order("btc-test", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="x")
     store.record_fill("btc-test", side="BUY", qty=0.1, price=100, fee=0.08, order_id="O-1", trade_id="t1")
     store.record_equity("btc-test", equity=5000, cash=4990, qty=0.1, price=100, benchmark=5000)
-    assert "flatten+it+before+moving" in move("desk-b") and store.account_of("btc-test") == "paper"
-    assert "disabled title=\"Stop or flatten it first" in c.get("/sleeves/btc-test", auth=AUTH).text
-    store.set_desired_state("btc-test", "stopped")  # stopped, position and all: nothing trades while it moves
+    assert "flatten+the+strategy+before+moving" in move("desk-b") and store.account_of("btc-test") == "paper"
+    assert "disabled title=\"Flatten it first" in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.set_desired_state("btc-test", "stopped")  # stopped still holds the position: it can't move (review round 8)
+    assert "flatten+the+strategy+before+moving" in move("desk-b") and store.account_of("btc-test") == "paper"
+    store.record_order("btc-test", order_id="O-2", side="SELL", qty=0.1, intent="exit", reason="x")
+    store.record_fill("btc-test", side="SELL", qty=0.1, price=100, fee=0.08, order_id="O-2", trade_id="t2")
     assert "locked+until+G2" in move("kraken-live")
     assert move("desk-b").endswith("saved=account#settings") and store.account_of("btc-test") == "desk-b"
     (d,) = store.decisions("btc-test", action="move_account")
@@ -1261,3 +1264,17 @@ def test_saved_backtests_have_no_settings_to_change(client):
     store.create_sleeve(name="bt:abc", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
                         starting_balance=1000)
     assert "backtest" in _settings(c, name="bt:abc", stop_loss_pct="5").headers["location"]
+
+
+@pytest.mark.parametrize("stop", [{"stop_atr": "2", "atr_bars": "10"}, {"stop_swing_bars": "20"}, {"stop_loss_pct": "5"}])
+def test_every_page_renders_with_each_kind_of_stop(client, stop):
+    """Review round 8 blocker: /risk returned 500 for an ATR or swing-low stop, which hid the kill switch."""
+    c, store = client
+    assert _new(c, **stop).status_code == 303
+    store.record_equity("btc-test", equity=5000, cash=4000, qty=0.01, price=100_000, benchmark=5000)
+    for path in ("/", "/risk", "/sleeves/btc-test", "/orders", "/trades", "/accounts", "/decisions", "/reports", "/ops",
+                 "/settings", "/research", "/alerts"):
+        r = c.get(path, auth=AUTH)
+        assert r.status_code == 200, path
+    risk = c.get("/risk", auth=AUTH).text
+    assert "Flatten everything" in risk and ("ATR (10 bars)" in risk or "20-bar low" in risk or "5.0% below" in risk)
