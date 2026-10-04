@@ -202,7 +202,7 @@ def test_entry_refused_when_its_stop_sits_too_near_liquidation():
 # --- paper: the restore order on a restart -------------------------------------
 
 
-def _record(path, meta, legs, px=60_000.0):
+def _record(path, meta, legs, px=60_000.0, size=1.0):
     """A recorded paper session: quotes and trades every second, the price moving by each leg's share
     over its minutes."""
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
@@ -222,7 +222,7 @@ def _record(path, meta, legs, px=60_000.0):
         for _ in range(minutes * 60 or 1):
             px *= step
             t = START + s * 1_000_000_000
-            rec.quote(QuoteTick(inst.id, Price(px - 0.5, 1), Price(px + 0.5, 1), Quantity(1, 8), Quantity(1, 8),
+            rec.quote(QuoteTick(inst.id, Price(px - 0.5, 1), Price(px + 0.5, 1), Quantity(size, 8), Quantity(size, 8),
                                 t, t + 1000))
             rec.trade(TradeTick(inst.id, Price(px, 1), Quantity(0.05, 8),
                                 AggressorSide.BUY if s % 2 else AggressorSide.SELL, TradeId(str(s)), t + 2000, t + 3000))
@@ -419,3 +419,87 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp
     assert liq["filled_qty"] > 0 and liq["status"] == "filled"
     # Nothing after it: the strategy is halted with the book closed.
     assert orders[-1] is liq
+
+
+def _ls_run(prices, instrument, seed, params, profile="balanced", n=600, volume=1.0):
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    closes = list(60_000 * np.exp(np.cumsum(rng.normal(0, 0.008, n))))
+    feed = _path(prices, closes)
+    feed["volume"] = volume  # the venue shows a share of it a bar, so orders fill in slices
+    return run_backtest("ping_pong", feed, instrument, {**PERP, **params}, half_spread=0, risk_profile=profile)
+
+
+def test_every_short_and_every_long_rests_its_stop_over_a_long_run(prices, instrument):
+    """Review round 11, B11-2 (5-year case): one exit that left a lot behind put the strategy's own entry
+    book out of phase with the venue for good, so every later short was booked as a reduction of a phantom
+    long and not one short rested a stop in five years. The book is now read from the venue on every fill:
+    each entry from flat, long or short, is followed by its stop on the other side."""
+    res = _ls_run(prices, instrument, 2, {"rise": 0.01, "dip": 0.005, "stop_loss": 0.015, "take_profit": 0.015})
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    filled = {o["order_id"] for o in orders if o["filled_qty"] > 0}
+    net, entries, pending = Decimal(0), {1: 0, -1: 0}, None
+    stops = {1: 0, -1: 0}
+    by_order = {}
+    for f in j.fills_:
+        by_order.setdefault(f["order_id"], []).append(f)
+    for o in orders:
+        if o["intent"] == "stop_loss":
+            side = 1 if o["side"] == "SELL" else -1  # a sell stop protects a long
+            stops[side] += 1
+            if pending == side:
+                pending = None
+        if o["order_id"] not in filled:
+            continue
+        before = net
+        for f in by_order[o["order_id"]]:
+            net += Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if o["intent"] == "entry" and before == 0 and net != 0:
+            assert pending is None, f"the {'long' if pending == 1 else 'short'} before this entry rested no stop"
+            pending = 1 if net > 0 else -1
+            entries[pending] += 1
+    assert entries[1] >= 3 and entries[-1] >= 3, entries
+    assert stops[-1] >= entries[-1] - 1 and stops[1] >= entries[1] - 1, (entries, stops)
+
+
+def test_nothing_opens_after_a_drawdown_halt(prices, instrument):
+    """Review round 11, B11-3: after a halt, an exit resting for a position the strategy wrongly thought
+    it held filled and opened a new short. Exits on a perp are reduce-only, and nothing new rests once the
+    strategy is halted: no fill after the halt grows the position."""
+    import numpy as np
+
+    # Short at 101.5, a rally through the drawdown limit (the wide stop never fires), then a fall through
+    # where the target rested.
+    closes = [100.0, 100.5, 100.8, 101.5, *np.linspace(101.5, 125, 20), *np.linspace(125, 70, 30)]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument, {**PERP, "stop_loss": 0.3, "take_profit": 0.2},
+                       half_spread=0, risk_profile="conservative")
+    halts = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+    assert halts, [e["kind"] for e in res.risk_events]
+    halted_at = halts[0]["ts"]
+    net = Decimal(0)
+    for f in res.journal.fills_:
+        before = net
+        net += Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if f["ts"] > halted_at:
+            assert abs(net) <= abs(before), (f, before, net)
+    assert abs(net) < Decimal("1e-8")
+
+
+def test_paper_shorts_rest_their_stop_after_exits_filled_in_slices(tmp_path):
+    """Review round 11, B11-2 in paper: with the top of the book thinner than the order, entries and exits
+    fill in slices whose float sum is short of the position; an exit then left a lot behind, the next short
+    was booked as a reduction and the paper strategy never stopped it out. Long, then short, then a 5% rally
+    through the short's 0.8% stop: the stop buys it back."""
+    from sleeve_fund.research.replay import replay
+
+    path = tmp_path / "slices.jsonl.gz"
+    _record(path, _meta(10_000, {"rise": 0.01, "dip": 0.005, "stop_loss": 0.008, **PERP}),
+            [(5, 0.0), (20, 0.015), (20, 0.05)], size=0.07828204)
+    orders, fills = replay(path, with_fills=True)
+    kinds = [(o["side"], o["intent"]) for o in orders if o["filled_qty"] > 0]
+    assert kinds[:3] == [("BUY", "entry"), ("SELL", "exit"), ("SELL", "entry")], kinds
+    assert ("BUY", "stop_loss") in kinds[3:], kinds
+    net = sum(Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1) for f in fills)
+    assert abs(net) < Decimal("1e-8")  # the stop closed the whole short

@@ -321,6 +321,12 @@ INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
 
 
+def exact_sum(a: float, b: float) -> float:
+    """Two quantities added as the decimals they print as: 0.05 + 0.28253027 is 0.33253027, not the float
+    sum 0.33253026999999996, so an order's filled quantity matches what was ordered."""
+    return float(Decimal(repr(float(a))) + Decimal(repr(float(b))))
+
+
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
@@ -551,7 +557,7 @@ class Store:
             if qty is not None:  # resized at the venue (a backtest's resting stop growing with its entry)
                 values["qty"] = qty
             if fill_qty:
-                filled = row.filled_qty + fill_qty
+                filled = exact_sum(row.filled_qty, fill_qty)
                 values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
                 values["filled_qty"] = filled
                 values["fee"] = row.fee + fee
