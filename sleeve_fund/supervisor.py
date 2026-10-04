@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sleeve_fund import accounts
+from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import Sleeve, Store, utcnow
@@ -28,6 +29,7 @@ from sleeve_fund.store import Sleeve, Store, utcnow
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
+ALERT_EVERY = 12  # polls between alert sends and uptime pings: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
@@ -139,10 +141,14 @@ class Supervisor:
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "_stopping", True))
+        alerts = Forwarder(self.store)
         self.store.event(None, "info", "supervisor_start", "supervisor started")
+        self.store.event(None, "info", "alerts_config", alerts.describe())
         loops = 0
         while not self._stopping:
             try:
+                if loops % ALERT_EVERY == 0:
+                    alerts.step()
                 if loops % KEY_CHECK_EVERY == 0:
                     self.check_keys()
                 if loops % FEE_CHECK_EVERY == 0:

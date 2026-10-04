@@ -56,9 +56,9 @@ def _data(instrument, rows: list[dict]) -> list:
     return out
 
 
-def replay(path: Path | str, with_fills: bool = False) -> list[dict] | tuple[list[dict], list[dict]]:
+def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict] | tuple[list[dict], list[dict]]:
     """The orders the recorded sleeve sends when replayed, oldest first, as the journal stores them;
-    with_fills, the fills too, oldest first."""
+    with_fills, the fills too, oldest first. store: the journal to replay into (in memory by default)."""
     from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
     from nautilus_trader.common import LoggerConfig, LogLevel
     from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
@@ -72,7 +72,7 @@ def replay(path: Path | str, with_fills: bool = False) -> list[dict] | tuple[lis
     s = h["sleeve"]
     fees = FeeSchedule(Decimal(s["maker_fee"]), Decimal(s["taker_fee"]))
     instrument = _instrument(h, fees)
-    store = Store.in_memory()
+    store = store or Store.in_memory()
     store.create_sleeve(name=s["name"], strategy=s["strategy"], instrument=s["instrument"], bar_spec=s["bar_spec"],
                         starting_balance=s["starting_balance"], risk_profile=s["risk_profile"], params=s["params"])
     runtime = SleeveRuntime(store, s["name"], tick_seconds=s["tick_seconds"])

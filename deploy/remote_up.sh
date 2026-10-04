@@ -25,6 +25,12 @@ umask 077
 grep -v '^DASHBOARD_PASSWORD=' .env > .env.tmp
 printf 'DASHBOARD_PASSWORD=%s\n' "$DASHBOARD_PASSWORD" >> .env.tmp
 mv .env.tmp .env
+# Optional alert settings follow their GitHub secrets too; an unset secret removes the line.
+for var in ALERT_WEBHOOK_URL HEALTHCHECK_PING_URL; do
+  grep -v "^$var=" .env > .env.tmp || true
+  if [ -n "${!var:-}" ]; then printf '%s=%s\n' "$var" "${!var}" >> .env.tmp; fi
+  mv .env.tmp .env
+done
 docker compose up -d --build --remove-orphans
 docker image prune -f >/dev/null
 docker compose ps

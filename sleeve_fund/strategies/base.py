@@ -54,6 +54,10 @@ class IdeaSpec:
 # not forward them, and we reject anything unrecognised so a typo in a sleeve file fails.
 # The most of a bar's traded volume one buy may take (see LongFlatConfig.max_participation).
 MAX_PARTICIPATION = 0.25
+# Paper's price watchdog: minutes without a trade or a quote before it warns, and before it treats the
+# feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
+STALE_PRICE_WARN_MINUTES = 5
+STALE_PRICE_RESTART_MINUTES = 15
 
 _BASE_FIELDS = {
     "strategy_id",
@@ -189,6 +193,7 @@ class LongFlatStrategy(Strategy):
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
         self._noted: set[str] = set()  # warnings already logged; each is said once until it clears
+        self._last_market_ns: int | None = None  # the latest trade or quote, for the price watchdog
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -214,8 +219,8 @@ class LongFlatStrategy(Strategy):
 
     @property
     def _backtest(self) -> bool:
-        """Replaying history (with or without a runtime): no live trade feed, so stops rest at the
-        simulated venue and take-profits are checked on each bar's high."""
+        """Replaying history (with or without a runtime): no live trade feed, so stops and targets rest
+        at the simulated venue."""
         return self.runtime is None or self.runtime.backtest
 
     def on_start(self) -> None:
@@ -229,6 +234,7 @@ class LongFlatStrategy(Strategy):
             return
         if self.recorder is not None:
             self.recorder.start(self.instrument)
+        self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
         if self._cfg.warmup_bars:
             if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
                 self._warm_from_history()
@@ -265,6 +271,7 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
+        self._market_seen()
         self._check_exits(self._last_close)
         self._maybe_tick()
 
@@ -277,6 +284,7 @@ class LongFlatStrategy(Strategy):
         if self._bid is None:
             self.log.info(f"first quote: bid {bid} ask {ask}")
         self._bid, self._ask = bid, ask
+        self._market_seen()
         if self.runtime is not None:
             self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
 
@@ -752,8 +760,35 @@ class LongFlatStrategy(Strategy):
         qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
         return cash + qty * price, cash, qty, price
 
+    def _market_seen(self) -> None:
+        self._last_market_ns = self.clock.timestamp_ns()
+        if self._noted & {"stale_price", "feed_dead"}:
+            self._noted -= {"stale_price", "feed_dead"}
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "info", "price_feed_back", "Market data is arriving again",
+                                         ts=self.runtime.now())
+
+    def _feed_dead(self) -> bool:
+        """Paper's price watchdog. The tick timer keeps the heartbeat going on its own, so a feed that
+        has gone silent would look healthy while every mark and guard check used a frozen price. Past
+        STALE_PRICE_WARN_MINUTES it says so; past STALE_PRICE_RESTART_MINUTES it stops reporting, and
+        the supervisor restarts the process, which reconnects to the venue."""
+        if self._backtest or self._last_market_ns is None:
+            return False
+        minutes = (self.clock.timestamp_ns() - self._last_market_ns) / 60e9
+        if minutes >= STALE_PRICE_WARN_MINUTES:
+            self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
+                       f"risk guard are using the last price, {self._price():,.6g}")
+        if minutes >= STALE_PRICE_RESTART_MINUTES:
+            self._note("feed_dead", f"No market data for {minutes:.0f} minutes: the price feed looks dead, so this "
+                       "process stops reporting and the supervisor restarts it to reconnect", level="error")
+            return True
+        return False
+
     def _on_tick(self, _event=None) -> None:
         self._last_tick_ns = self.clock.timestamp_ns()
+        if self._feed_dead():
+            return  # no heartbeat, so the supervisor restarts the process
         try:
             equity, cash, qty, price = self._mark()
             if price <= 0 or equity <= 0:

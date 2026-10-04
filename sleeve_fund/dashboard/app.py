@@ -176,8 +176,22 @@ def create_app(store: Store | None = None) -> FastAPI:
     def risk_page(request: Request, _: str = Depends(require_pm)):
         sleeves, frames, summaries = book_data()
         book = bookm.book_view(st(), summaries, frames)
+        running = [x for x in summaries if x["sleeve"].desired_state == "running"]
+        held = [x["sleeve"].name for x in summaries if x["sleeve"].desired_state != "running" and x["qty"] > 0]
         return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
-                    shell=shell(sleeves))
+                    shell=shell(sleeves), kill={"running": running, "held": held}, reasons=COMMON_REASONS)
+
+    @app.post("/book/flatten")
+    def book_flatten(reason: str = Form(...), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The book's kill switch: every running strategy sells to cash at market and pauses, each
+        with the PM's reason in its decision log. Stopped strategies have no process to sell with."""
+        if not reason.strip():
+            raise HTTPException(400, "a reason is required")
+        running = [s.name for s in st().sleeves() if s.desired_state == "running"]
+        for name in running:
+            st().command(name, "flatten", f"Book kill switch: {reason.strip()}", actor=actor)
+        st().decide(actor, "flatten everything", f"{reason.strip()} ({len(running)} strategies)")
+        return RedirectResponse("/risk", status_code=303)
 
     @app.get("/ops", response_class=HTMLResponse)
     def ops_page(request: Request, _: str = Depends(require_pm)):
