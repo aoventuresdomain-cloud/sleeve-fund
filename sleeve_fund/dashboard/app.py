@@ -1185,7 +1185,7 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "cap_used": min(abs(x["exposure"]) / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
+        "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
     }
 

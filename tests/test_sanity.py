@@ -410,7 +410,14 @@ def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp
     assert [r[:3] for r in paper] == [r[:3] for r in bt]
     for p, b in zip(paper, bt):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
-        assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
+        gap = (b[4] / p[4] - 1) * 1e4
+        if p[1] in RISK_EXITS:
+            # At 2x leverage the probe can hit the daily-loss pause. Paper closes on the trade that breaches
+            # it, the backtest at the close of the minute it judged at its worst price: the same minute and
+            # size, a price a few bp kinder to the backtest at most (a known gap, like a stop's).
+            assert -15 <= gap * (1 if p[0] == "BUY" else -1) <= 0.3, (p, b)
+        else:
+            assert abs(gap) <= 0.3, (p, b)
     spread_b = sum(r[3] * SPREAD / 2 for r in bt)
     assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     for side, intent, _, qty, px, fee in paper:  # paper's fee is the venue's taker fee alone
@@ -573,6 +580,7 @@ def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(st
 
 PERP = {"market": "perp", "allow_short": True}
 PERP_FEES = markets.LOW_FEE_PERP
+RISK_EXITS = {"risk_pause", "risk_halt", "liquidation", "liquidation_guard"}
 
 
 class ProbeLS(Probe):
@@ -627,7 +635,14 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
     assert [r[:3] for r in paper] == [r[:3] for r in bt]
     for p, b in zip(paper, bt):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
-        assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
+        gap = (b[4] / p[4] - 1) * 1e4
+        if p[1] in RISK_EXITS:
+            # At 2x leverage the probe can hit the daily-loss pause. Paper closes on the trade that breaches
+            # it, the backtest at the close of the minute it judged at its worst price: the same minute and
+            # size, a price a few bp kinder to the backtest at most (a known gap, like a stop's).
+            assert -15 <= gap * (1 if p[0] == "BUY" else -1) <= 0.3, (p, b)
+        else:
+            assert abs(gap) <= 0.3, (p, b)
     spread_b = sum(r[3] * SPREAD / 2 for r in bt)
     assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     taker = float(PERP_FEES.fees.taker)

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from sleeve_fund import risk
 from sleeve_fund.store import OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
 
+FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
 # How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
 SPREAD_EVERY = timedelta(hours=1)
@@ -56,6 +57,7 @@ class SleeveRuntime:
         self.name = sleeve_name
         sleeve = store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
+        self.cap = risk.position_cap(self.profile, sleeve.params)  # a perp's is its leverage cap
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
@@ -75,6 +77,10 @@ class SleeveRuntime:
         self.flatten_why: tuple[str, str] | None = None
         # A flatten the last process sent but may not have seen filled, owed on the first tick (sanity S-3).
         self._owed_flatten: tuple[str, str] | None = None
+        self._flatten_retries = 0
+        # The smallest position the strategy can close (its lot or the venue's minimum, set at start): less
+        # than this is dust a flatten can't sell, so it owes nothing (sanity, 4 Oct).
+        self.close_floor = 0.0
 
     def _restored_peak(self, starting_balance: float) -> float:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
@@ -160,15 +166,16 @@ class SleeveRuntime:
         return self.status == "running"
 
     def position_budget(self, equity: float) -> float:
-        return equity * self.profile.max_position_pct
+        return equity * self.cap
 
     # --- periodic tick ----------------------------------------------------------
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
-             guard_equity: float | None = None) -> str | None:
+             guard_equity: float | None = None, busy: bool = False) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
-        a perp), which the guard judges by when lower; the mark is still this tick's equity."""
+        a perp), which the guard judges by when lower; the mark is still this tick's equity.
+        busy: the strategy has an order working, so a flatten still owed waits for it rather than send another."""
         now = self.now()
         self.store.heartbeat(self.name)
         if self.progress is not None:
@@ -233,13 +240,26 @@ class SleeveRuntime:
                 self._set("running", "")
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
-        if self._owed_flatten is not None:
-            if not flatten and qty != 0 and self.status in ("paused", "halted"):
+        # A flatten is owed until the position is closed: one cut short by a restart (sanity S-3), or whose
+        # order the venue rejected, is sent again, up to FLATTEN_RETRIES times, never while an order is
+        # working, and never for dust or once the strategy is running again (a resume, an expired pause).
+        if flatten:
+            self._owed_flatten, self._flatten_retries = self.flatten_why, 0
+        elif self._owed_flatten is not None:
+            if self.status not in ("paused", "halted") or abs(qty) < max(self.close_floor, 1e-12):
+                self._owed_flatten = None
+            elif not busy and self._flatten_retries < FLATTEN_RETRIES:
+                self._flatten_retries += 1
                 flatten, self.flatten_why = True, self._owed_flatten
                 self.store.event(self.name, "warning", "flatten_retry",
-                                 f"still holding {qty:.12g} after a restart that cut a flatten short; selling "
-                                 f"again ({self._owed_flatten[1]})", ts=self.now())
-            self._owed_flatten = None
+                                 f"still holding {qty:.12g} after a flatten that didn't complete; closing it again "
+                                 f"(attempt {self._flatten_retries} of {FLATTEN_RETRIES}; {self._owed_flatten[1]})",
+                                 ts=self.now())
+            elif not busy and self._flatten_retries == FLATTEN_RETRIES:
+                self._flatten_retries += 1
+                self.store.event(self.name, "error", "flatten_failed",
+                                 f"still holding {qty:.12g} after {FLATTEN_RETRIES} attempts to close it; the PM must "
+                                 f"flatten it ({self._owed_flatten[1]})", ts=self.now())
         return "flatten" if flatten else None
 
     # --- reconciliation ----------------------------------------------------------

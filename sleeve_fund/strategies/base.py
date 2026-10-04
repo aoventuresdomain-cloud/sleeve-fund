@@ -808,6 +808,8 @@ class LongFlatStrategy(Strategy):
         behind it. Called straight after want_long() on the same bar, so it sees the same state.
         It is journaled with the order, so the reason is the one the strategy acted on. A strategy that
         decides with want_side gets the side (+1, 0 or -1) as `target`."""
+        if target is not True and target is not False and target < 0:
+            return "Signal to be short", {}
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
     def _on_bar_sided(self, bar: Bar) -> None:
@@ -924,6 +926,10 @@ class LongFlatStrategy(Strategy):
             return
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        if self._margin and self._backtest and self._exec_type is None:
+            # Fed only the bars it decides on, a backtest on a perp still judges each bar at its worst price
+            # (_on_exec_bar does it for every shorter execution bar), as paper judges every trade.
+            self._intrabar_guard(bar)
         self._maybe_tick()
         if self._pending_exit is not None:
             return
@@ -990,7 +996,7 @@ class LongFlatStrategy(Strategy):
 
     def _cap_pct(self) -> float:
         if self.runtime is not None:
-            return float(self.runtime.profile.max_position_pct)
+            return float(self.runtime.cap)
         return float(self._cfg.position_cap_pct) if self._cfg.position_cap_pct is not None else 1.0
 
     def _volume_cap(self, bar: Bar) -> Decimal | None:
@@ -1704,7 +1710,9 @@ class LongFlatStrategy(Strategy):
                     self.cancel_all_orders(self._cfg.instrument_id)
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
-            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard) == "flatten":
+            self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
+            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
+                                 busy=bool(self._working())) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")

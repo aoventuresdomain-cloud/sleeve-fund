@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sleeve_fund.research.metrics import trade_stats, trades
+from sleeve_fund.risk import position_cap
 from sleeve_fund.risk import profile as risk_profile
 from sleeve_fund.store import Sleeve, Store, utcnow
 
@@ -18,6 +19,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
     out = {
         "sleeve": s,
         "profile": prof,
+        "cap": position_cap(prof, s.params),  # a perpetual's is its leverage cap
         "equity": s.starting_balance,
         "benchmark": s.starting_balance,
         "ret": 0.0,
