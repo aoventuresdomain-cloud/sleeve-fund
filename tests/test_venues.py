@@ -34,7 +34,7 @@ def test_every_mode_uses_the_venue_profile_fees():
 
 
 def test_a_sleeve_file_cannot_override_the_venue_fees(tmp_path):
-    src = (ROOT / "configs" / "sleeves" / "btc_trend_daily.toml").read_text()
+    src = (ROOT / "configs" / "examples" / "btc_trend_daily.toml").read_text()
     path = tmp_path / "s.toml"
     path.write_text(src + "\n[fees]\nmaker = 0.001\ntaker = 0.002\n")
     with pytest.raises(ValueError, match="venue profile"):

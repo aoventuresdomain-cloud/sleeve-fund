@@ -3,7 +3,7 @@ from datetime import timedelta
 import pytest
 
 from sleeve_fund.store import Store, utcnow
-from sleeve_fund.supervisor import Proc, decide, seed
+from sleeve_fund.supervisor import Proc, clear, decide, seed
 
 
 class FakePopen:
@@ -48,12 +48,45 @@ def test_stale_heartbeat_restarts_only_after_grace(sleeve):
 
 
 def test_seed_is_idempotent(store):
-    paths = ["configs/sleeves/btc_trend_smoke.toml", "configs/sleeves/btc_trend_daily.toml"]
+    paths = ["configs/examples/btc_trend_smoke.toml", "configs/examples/btc_trend_daily.toml"]
     assert seed(store, paths) == ["btc-trend-smoke", "btc-trend-daily"]
     assert seed(store, paths) == []
     s = store.sleeve("btc-trend-smoke")
     assert s.params == {"fast": 5, "slow": 20, "max_notional": 1000}
     assert s.risk_profile == "aggressive"
+
+
+def test_the_seeded_strategies_are_the_two_test_strategies(store):
+    import glob
+
+    assert sorted(seed(store, sorted(glob.glob("configs/sleeves/*.toml")))) == ["ping-pong-test", "rsi-bands-test"]
+    assert store.sleeve("rsi-bands-test").bar_spec == "1-MINUTE-LAST-INTERNAL"
+
+
+def test_clear_puts_every_strategy_away_once_and_keeps_its_journal(store, sleeve, tmp_path):
+    """The PM's clean slate (4 Oct 2026): every strategy on the book is stopped and archived, its journal
+    untouched; the entry applies once, so restarts and strategies added afterwards are left alone."""
+    store.set_desired_state("s", "running")
+    store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    store.create_sleeve(name="old", strategy="buy_and_hold", instrument="ETH/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=500)
+    store.set_desired_state("old", "stopped")
+    store.archive("old")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "PM asked for a clean slate"\n')
+    assert clear(store, str(path)) == ["s"]
+    assert store.sleeve("s").desired_state == "stopped" and set(store.archived()) == {"s", "old"}
+    assert len(store.fills("s")) == 1
+    assert [d["action"] for d in store.decisions("s")][:2] in (["archive", "stop"], ["stop", "archive"])
+    seed(store, ["configs/sleeves/ping_pong_test.toml"])
+    assert clear(store, str(path)) == []  # applied already: the new strategy stays
+    assert "ping-pong-test" not in store.archived()
+    assert any(e["kind"] == "book_cleared" for e in store.events())
+
+
+def test_the_shipped_clear_file_reads(store):
+    assert clear(store, "configs/clear.toml") == []
+    assert store.decisions(action="clear")[0]["reason"].startswith("2026-10-04: ")
 
 
 def test_changed_settings_restart_a_running_strategy_once(store, sleeve, monkeypatch):

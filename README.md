@@ -26,16 +26,16 @@ interpreter. The Run and Debug panel has ready-made launch entries for everythin
 
 ```bash
 # Pipeline smoke test: 1-minute bars from live Kraken trades, trades within ~30 minutes
-python -m sleeve_fund.paper configs/sleeves/btc_trend_smoke.toml --minutes 30
+python -m sleeve_fund.paper configs/examples/btc_trend_smoke.toml --minutes 30
 
 # Idea #1 as it would really run: 50/200-day trend filter, warms up on Kraken history
-python -m sleeve_fund.paper configs/sleeves/btc_trend_daily.toml
+python -m sleeve_fund.paper configs/examples/btc_trend_daily.toml
 ```
 
 What happens: Kraken public WebSocket/REST feed into NautilusTrader, bars go to the strategy,
 orders go to the Nautilus sandbox matching engine (fed by the same live prices), and every fill
 pays Kraken's UK entry fee (0.40% maker, 0.80% taker). A sleeve is a TOML file in
-`configs/sleeves/`: strategy, instrument, bar size, paper balance, per-order cap, fees.
+`configs/sleeves/` (seeded into the database on start; `configs/examples/` holds ones that are not): strategy, instrument, bar size, paper balance, per-order cap.
 
 ## Research loop
 
@@ -58,7 +58,7 @@ G1's "beats buy-and-hold" means a higher out-of-sample Sharpe after fees.
 | `sleeve_fund/paper/` | Paper node (Kraken data + sandbox fills), sleeve config, safety guard |
 | `sleeve_fund/research/` | Backtest runner, walk-forward study, metrics, idea ledger, tear sheet |
 | `sleeve_fund/instruments.py` | Instruments and the fee model used everywhere |
-| `configs/sleeves/` | One TOML per paper sleeve |
+| `configs/sleeves/` | One TOML per strategy seeded on start; `configs/clear.toml` puts the book away once per entry |
 
 ## Known limits
 

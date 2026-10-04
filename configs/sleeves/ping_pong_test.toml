@@ -1,0 +1,16 @@
+# Test strategy 1 (PM, 4 Oct 2026): checks that entries, exits and fees match between backtest and
+# paper. Buys at the start, sells after a 1% rise in the close, buys again after a 0.5% dip.
+# The short leg is held flat until short positions exist.
+
+[sleeve]
+name = "ping-pong-test"
+strategy = "ping_pong"
+instrument = "BTC/USD"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
+starting_balance = 10000
+warmup_bars = 0
+risk_profile = "balanced"
+
+[params]
+rise = 0.01
+dip = 0.005

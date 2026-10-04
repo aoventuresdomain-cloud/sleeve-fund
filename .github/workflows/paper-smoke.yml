@@ -9,7 +9,7 @@ on:
       - "sleeve_fund/data.py"
       - "sleeve_fund/dashboard/preview.py"
       - "sleeve_fund/dashboard/charts.py"
-      - "configs/sleeves/**"
+      - "configs/**"
       - "scripts/paper_smoke.sh"
       - ".github/workflows/paper-smoke.yml"
   workflow_dispatch:

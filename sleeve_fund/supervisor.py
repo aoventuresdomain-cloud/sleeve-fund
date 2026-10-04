@@ -5,6 +5,7 @@ seconds the supervisor compares the database's desired_state with what is
 running, starts or stops processes, restarts crashed ones with backoff, and
 restarts any whose heartbeat goes stale.
 
+    python -m sleeve_fund.supervisor clear configs/clear.toml
     python -m sleeve_fund.supervisor seed configs/sleeves/*.toml
     python -m sleeve_fund.supervisor run
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import tomllib
 import signal
 import subprocess
 import sys
@@ -192,16 +194,48 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     return added
 
 
+def clear(store: Store, path: str) -> list[str]:
+    """Put away every strategy on the book, once per [[clear]] entry in the file: each is stopped and
+    archived, and its journal stays as it is (nothing is deleted). An entry already applied is skipped,
+    so this can run on every start; strategies added after it are never touched."""
+    with open(path, "rb") as fh:
+        entries = tomllib.load(fh).get("clear", [])
+    done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
+    cleared = []
+    for entry in entries:
+        key, reason = str(entry["id"]), str(entry["reason"]).strip()
+        if key in done:
+            continue
+        put_away = store.archived()
+        for s in store.sleeves():
+            if s.desired_state != "stopped":
+                store.set_desired_state(s.name, "stopped")
+                store.drop_pending(s.name, "lapsed: the strategy was stopped before it acted")
+                store.decide("system", "stop", reason, s.name)
+            if s.name not in put_away:
+                store.archive(s.name)
+                store.decide("system", "archive", reason, s.name)
+                cleared.append(s.name)
+        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away)")
+        store.event(None, "info", "book_cleared", f"{reason}: {', '.join(cleared) or 'nothing to put away'}")
+        done.add(key)
+    return cleared
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sd = sub.add_parser("seed", help="add sleeves from TOML files if missing")
     sd.add_argument("paths", nargs="+")
+    cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
+    cl.add_argument("path")
     sub.add_parser("run", help="supervise sleeve processes until stopped")
     args = ap.parse_args(argv)
     store = Store()
     if args.cmd == "seed":
         print("added:", seed(store, args.paths) or "nothing new")
+    elif args.cmd == "clear":
+        print("put away:", clear(store, args.path) or "nothing")
     else:
         Supervisor(store).run()
     return 0
