@@ -44,6 +44,8 @@ class BacktestResult:
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
+    # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
+    insurance: list = field(default_factory=list)
 
     @property
     def shorts(self) -> bool:
@@ -191,7 +193,9 @@ def run_backtest(
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
-            equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices, _opening_cash(starting_capital, runtime))
+            equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
+                                                    _opening_cash(starting_capital, runtime),
+                                                    [ts for ts, _ in strategy.insurance_log])
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
@@ -209,6 +213,7 @@ def run_backtest(
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
             funding=[{"ts": ts, "amount": a} for ts, a in strategy.funding_log],
+            insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
         )
@@ -237,11 +242,17 @@ def _opening_cash(starting_capital: float, runtime) -> float:
 
 def _perp_mark_to_market(
     fills: pd.DataFrame, funding: list[tuple], prices: pd.DataFrame, opening_cash: float,
+    insurance: list | tuple = (),
 ) -> tuple[pd.Series, pd.Series]:
     """A margin account keeps realised profit only, so value a perp book spot-style from the fills
     themselves: cash moves by every fill's notional and fee (a short sale adds cash), funding adds or
     takes its payments, and equity is cash plus the signed position at the close. Exposure is the
-    position's gross value over equity, signed: negative while short."""
+    position's gross value over equity, signed: negative while short.
+
+    insurance: the times the strategy closed past its bankruptcy price (LongFlatStrategy._cover_shortfall).
+    Isolated margin loses no more than the strategy's equity, so at each the insurance fund brings this
+    book's cash back to zero, by this book's own arithmetic (its fill prices carry the spread, and its fees
+    round apart from the venue's by fractions of a cent)."""
     idx = prices.index
     flows = []  # (ts, cash change, qty change)
     if fills is not None and not fills.empty:
@@ -255,6 +266,11 @@ def _perp_mark_to_market(
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
     for ts, amount in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
+    for ts in sorted(pd.Timestamp(t) for t in insurance):
+        before = [(c, q) for t, c, q in flows if t <= ts]
+        cash_now, qty_now = opening_cash + sum(c for c, _ in before), sum(q for _, q in before)
+        if cash_now < 0 and abs(qty_now) < 1e-9:  # flat: equity is cash
+            flows.append((ts, -cash_now, 0.0))
     if not flows:
         return (pd.Series(opening_cash, index=idx).rename("equity"),
                 pd.Series(0.0, index=idx).rename("exposure"))
@@ -263,9 +279,10 @@ def _perp_mark_to_market(
     df = df.groupby("ts").sum().sort_index().cumsum()
     df = df.reindex(df.index.union(idx)).sort_index().ffill().fillna(0.0).reindex(idx)
     cash = opening_cash + df["cash"]
-    position_value = df["qty"] * prices["close"]
+    qty = df["qty"].where(df["qty"].abs() >= 1e-9, 0.0)  # float residue of the fills' sum is flat (a lot is 1e-8)
+    position_value = qty * prices["close"]
     equity = cash + position_value
-    exposure = position_value / equity
+    exposure = (position_value / equity).where(position_value != 0, 0.0)
     return equity.rename("equity"), exposure.rename("exposure")
 
 

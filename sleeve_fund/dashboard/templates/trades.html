@@ -58,7 +58,7 @@
       <td class="num" data-m="hide">{{ t.qty|qty }} {{ t.pair.split('/')[0] }}{% if t.side == -1 %}<div class="sub">short</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ t.entry_px|px }}<div class="sub">{{ t.opened|ts }}</div></td>
       <td class="num" data-m="hide">{{ t.exit_px|px }}<div class="sub">{{ t.closed|ts }}</div></td>
-      <td class="num" data-m="hide">{{ t.held|held }}</td><td class="num" data-m="hide">{{ t.fees|money }}{% if t.funding|abs >= 0.005 %}<div class="sub" title="Funding over the trade: + received, − paid. P&amp;L is after fees and funding.">funding {{ t.funding|smoney }}</div>{% endif %}</td>
+      <td class="num" data-m="hide">{{ t.held|held }}</td><td class="num" data-m="hide">{{ t.fees|money }}{% if t.funding|abs >= 0.005 %}<div class="sub" title="Funding over the trade: + received, − paid. P&amp;L is after fees and funding.">funding {{ t.funding|smoney }}</div>{% endif %}{% if t.insurance %}<div class="sub" title="Closed past the bankruptcy price: under isolated margin the venue's insurance fund took the loss beyond the strategy's equity.">insurance fund {{ t.insurance|smoney }}</div>{% endif %}</td>
       <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td><td class="num" data-m="hide">{{ t.r|rmult }}{% if t.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td>
       <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>

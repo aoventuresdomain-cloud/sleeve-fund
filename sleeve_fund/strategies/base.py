@@ -349,6 +349,8 @@ class LongFlatStrategy(Strategy):
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
+        # (time, amount) for every shortfall the venue's insurance fund took past the bankruptcy price
+        self.insurance_log: list[tuple] = []
         # Backtest on a perp: the equity at the minute's worst price, for the risk guard (_intrabar_guard),
         # and that price when it went through the liquidation price.
         self._guard_equity: float | None = None
@@ -1569,6 +1571,25 @@ class LongFlatStrategy(Strategy):
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
                                          f"{price:,.6g} ({terms.funding_rate:.4%})", ts=ts)
 
+    def _cover_shortfall(self, price: float) -> None:
+        """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)
+        loses the strategy's equity and no more; the venue's insurance fund takes the rest. So once flat with
+        equity below zero, the shortfall comes back to cash, journaled, and equity ends at zero."""
+        equity = self._mark()[0]
+        if equity >= 0:
+            return
+        credit = math.ceil(-equity * 100) / 100  # to the cent, so no float residue leaves it a fraction below zero
+        self._cash_adj += credit
+        now = self.clock.utc_now()
+        self.insurance_log.append((now, credit))
+        if self.runtime is not None:
+            self.runtime.store.record_insurance(self.runtime.name, price=price, amount=round(credit, 8),
+                                                ts=self.runtime.now())
+            self.runtime.store.event(self.runtime.name, "error", "insurance_fund",
+                                     f"Closed at {price:,.6g}, past the bankruptcy price: the venue's insurance fund "
+                                     f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
+                                     "strategy's equity", ts=self.runtime.now())
+
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
         take it), or comes within the risk profile's minimum distance of it (cut back before the venue
@@ -1936,6 +1957,8 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
+        if self._margin and self._entry_side == 0:
+            self._cover_shortfall(px)
         if kept_id is not None and done:
             self._slice_done(coid)
         if done:

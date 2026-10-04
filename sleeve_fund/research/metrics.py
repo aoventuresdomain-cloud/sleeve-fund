@@ -113,7 +113,8 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
     ]
 
 
-def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = None) -> list[dict]:
+def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = None,
+           insurance: list[dict] | None = None) -> list[dict]:
     """Closed round trips (flat -> long -> flat, or flat -> short -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial fills are fine: a trip
@@ -128,6 +129,8 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
 
     funding: a perpetual's funding payments (ts, amount: + received, - paid). Each is booked to the trip
     open at its time, so a trip's P&L is after fees and funding; `funding` carries its share.
+    insurance: shortfalls the venue's insurance fund took past the bankruptcy price (ts, amount), booked
+    to the trip they closed, so its loss is capped at the margin as the strategy's equity is.
     """
     out, pos = [], ZERO
     trip: dict | None = None
@@ -159,13 +162,15 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
                 out.append(_trip(trip, r))
                 trip = None
     if funding:
-        _book_funding(out, funding)
+        _book_flows(out, funding, "funding")
+    if insurance:
+        _book_flows(out, insurance, "insurance")
     return out
 
 
-def _book_funding(trips: list[dict], funding: list[dict]) -> None:
-    """Add each funding payment to the trip open at its time (oldest-first trips; each payment once)."""
-    pays = sorted((f["ts"], f["amount"]) for f in funding if f.get("ts") is not None)
+def _book_flows(trips: list[dict], flows: list[dict], key: str) -> None:
+    """Add each cash flow to the trip open at its time (oldest-first trips; each flow once)."""
+    pays = sorted((f["ts"], f["amount"]) for f in flows if f.get("ts") is not None)
     i = 0
     for t in trips:
         if t["opened"] is None or t["closed"] is None:
@@ -176,7 +181,7 @@ def _book_funding(trips: list[dict], funding: list[dict]) -> None:
         while i < len(pays) and pays[i][0] <= t["closed"]:
             total += pays[i][1]
             i += 1
-        t["funding"] = total
+        t[key] = total
         t["pnl"] += total
         t["ret"] = t["pnl"] / t["cost"] if t["cost"] else 0.0
 
@@ -187,7 +192,7 @@ def _trip(t: dict, closing: dict) -> dict:
     out_qty = t["sold"] if side > 0 else t["bought"]
     pnl = side * (t["exit"] - t["entry"]) - t["fees"]
     return {"pnl": pnl, "ret": pnl / t["entry"] if t["entry"] else 0.0, "cost": t["entry"], "fees": t["fees"],
-            "funding": 0.0,
+            "funding": 0.0, "insurance": 0.0,
             "qty": qty, "side": side, "entry_px": t["entry"] / qty if qty else float("nan"),
             "exit_px": t["exit"] / out_qty if out_qty else float("nan"),
             "opened": t["opened"], "closed": closing.get("ts"),

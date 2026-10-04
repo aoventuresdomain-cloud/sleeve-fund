@@ -924,8 +924,6 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
                    for o in legs.values()), (e, legs)
 
 
-@pytest.mark.xfail(strict=True, reason="sanity 5 Oct: a gap past liquidation books a loss beyond the strategy's "
-                                       "isolated margin (equity goes negative); reported to the build thread")
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
 def test_isolated_margin_a_liquidation_never_loses_more_than_the_strategys_equity(strategy, gap):
     """Isolated margin (long/short verdict default): a liquidated position loses at most the margin behind
@@ -941,13 +939,13 @@ def _wilder(closes, n=14):
     """Wilder's RSI, written out from its definition, independent of the engine's indicators."""
     out = [None] * len(closes)
     ch = np.diff(np.asarray(closes, dtype=float))
-    g, l = np.clip(ch, 0, None), np.clip(-ch, 0, None)
+    g, lo = np.clip(ch, 0, None), np.clip(-ch, 0, None)
     if len(ch) < n:
         return out
-    ag, al = g[:n].mean(), l[:n].mean()
+    ag, al = g[:n].mean(), lo[:n].mean()
     for k in range(n, len(ch) + 1):
         if k > n:
-            ag, al = (ag * (n - 1) + g[k - 1]) / n, (al * (n - 1) + l[k - 1]) / n
+            ag, al = (ag * (n - 1) + g[k - 1]) / n, (al * (n - 1) + lo[k - 1]) / n
         out[k] = 100.0 if al == 0 and ag > 0 else 50.0 if al == ag == 0 else 100 - 100 / (1 + ag / al)
     return out
 

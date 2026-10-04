@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from sleeve_fund import markets
-from sleeve_fund.research.metrics import trades
+from sleeve_fund.research.metrics import fills_to_rows, trades
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import replay_book
 from test_backtest import _path
@@ -696,3 +696,18 @@ def test_an_open_shorts_exits_form_and_decision_log_say_above(client):  # noqa: 
     assert "saved=settings" in r.headers["location"], r.headers["location"]
     log = store.decisions("pp-x", limit=5)[0]["reason"]
     assert "Stop-loss 2% above the entry (short) to 1.5% above the entry (short)" in log
+
+
+def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
+    """Sanity 5 Oct: a gap far past the liquidation price booked a loss beyond the strategy's equity. Under
+    isolated margin the venue's insurance fund takes the rest: equity ends at zero, not below, and the trade's
+    P&L (after fees, funding and the insurance fund) is the margin lost, as equity says."""
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    assert res.insurance and res.insurance[0]["amount"] > 0
+    assert res.equity.min() >= 0 and res.equity.iloc[-1] < 0.05
+    trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
+    assert trips[-1]["insurance"] == pytest.approx(res.insurance[0]["amount"])
+    assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
+    assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
+    assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(0, abs=0.05)

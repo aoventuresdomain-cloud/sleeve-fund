@@ -120,14 +120,16 @@ def plan_items(plan: dict, side: int = 1) -> list[tuple[str, str]]:
 
 
 def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
-          plans: dict[str, dict] | None = None, shorts: bool = False, funding: list[dict] | None = None) -> list[dict]:
+          plans: dict[str, dict] | None = None, shorts: bool = False, funding: list[dict] | None = None,
+          insurance: list[dict] | None = None) -> list[dict]:
     """Closed round trips, newest first, with holding time and the journaled reason at each end.
     fills: newest first, as the store returns them. orders: journal rows keyed by order id. plans: exit
     plans set after entry (Store.exit_plans), by entry order id. shorts: a perpetual's journal, where a
-    sell from flat opens a short (metrics.trades). funding: a perpetual's payments, booked to each trip."""
+    sell from flat opens a short (metrics.trades). funding: a perpetual's payments, booked to each trip;
+    insurance: what the venue's insurance fund took past a trip's bankruptcy price."""
     exits = [e for e in events if e["kind"] in EXIT_EVENTS]
     out = []
-    for t in reversed(trades(list(reversed(fills)), shorts, funding)):
+    for t in reversed(trades(list(reversed(fills)), shorts, funding, insurance)):
         entry, exit_ = orders.get(t["entry_order"] or ""), orders.get(t["exit_order"] or "")
         if exit_:
             kind = exit_["intent"]
@@ -263,7 +265,8 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
             positions.append(pos)
         perp = markets.is_perp(x["sleeve"].params)
         for t in trips(fills, store.events(name, limit=5000), orders, plans, perp,
-                       store.funding(name, limit=1_000_000) if perp else None):
+                       store.funding(name, limit=1_000_000) if perp else None,
+                       store.insurance(name) if perp else None):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)
