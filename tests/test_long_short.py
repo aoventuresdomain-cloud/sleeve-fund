@@ -587,3 +587,21 @@ def test_header_trade_stats_and_g2_count_shorts_as_the_trades_tab_does():
     tab = trading.trips(store.fills("pp-ls"), [], {}, shorts=True)
     assert stats["trades"] == len(tab) == 4
     assert stats["wins"] == sum(1 for t in tab if t["pnl"] > 0) == 3
+
+
+def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
+    """Review round 11, M11-6: two shorts gain in a fall and lose in a rally; gross counts them, net offsets."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    for name, qty, px in (("short-a", -0.05, 60_000.0), ("short-b", -1.0, 3_000.0), ("long-c", 0.02, 60_000.0)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="ETH/USD" if px == 3_000 else "BTC/USD",
+                            bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                            params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
+        store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
+    # Positions: -3,000, -3,000 and +1,200. Gross 7,200 (24% of 30,000); net -4,800 (-16%).
+    page = c.get("/risk", auth=AUTH).text
+    assert "7,200.00 of 30,000.00" in page and "net −16% short" in page.replace("-16%", "−16%")
+    # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
+    assert "+960.00" in page and "−960.00" in page
+    assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]

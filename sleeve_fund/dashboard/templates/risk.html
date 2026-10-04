@@ -14,11 +14,11 @@
 {% elif kill.flattening %}<p class="banner warn" role="status">Waiting to sell: {{ kill.flattening|join(', ') }}. {{ 'Its' if kill.flattening|length == 1 else 'Their' }} process{{ 'es' if kill.flattening|length != 1 }} will sell at market and pause.</p>{% endif %}
 
 <section class="ledger" aria-label="Book risk">
-  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
+  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }} · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">of total capital</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
-  <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.scenarios[1].loss >= 0.5 }}">{{ (0 - risk.scenarios[1].loss)|smoney0 }}</div><div class="s">{{ risk.scenarios[1].loss_pct|pct1 }} of the book</div></div>
+  <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="lim-h">
@@ -40,15 +40,15 @@
 
 <div class="grid">
   <section class="panel span-7" aria-labelledby="stress-h">
-    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2></div>
+    <div class="panel-head"><h2 id="stress-h">What a sudden move would do</h2></div>
     <table class="compact">
-      <thead><tr><th>Fall</th><th class="num">Book loss</th><th class="num">Share of book</th><th>Strategies that would halt</th></tr></thead>
+      <thead><tr><th>Market move</th><th class="num">Book P&amp;L</th><th class="num">Share of book</th><th>Strategies that would halt</th></tr></thead>
       <tbody>{% for sc in risk.scenarios %}
-      <tr><td>{{ (sc.shock * 100)|round(0)|int }}%</td><td class="num loss">{{ '−{:,.2f}'.format(sc.loss) if sc.loss > 0.005 else '0.00' }}</td><td class="num">{{ sc.loss_pct|pct1 }}</td>
+      <tr><td>{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</td><td class="num {{ 'loss' if sc.pnl < -0.005 else ('gain' if sc.pnl > 0.005) }}">{{ sc.pnl|smoney }}</td><td class="num">{{ (0 - sc.loss_pct)|pct1s }}</td>
         <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
       {% endfor %}</tbody>
     </table>
-    <p class="muted" style="margin:8px 0 0;font-size:12px">Gap risk: stops fill after the fact.</p>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact.</p>
   </section>
   <section class="panel span-5" aria-labelledby="hist-h">
     <div class="panel-head"><h2 id="hist-h">Limits that fired</h2></div>

@@ -9,7 +9,9 @@ from pathlib import Path
 from sleeve_fund import backups
 from sleeve_fund.store import Store, utcnow
 
-SHOCKS = (-0.10, -0.20, -0.35, -0.50)
+# Market moves the stress table applies to every position at once: falls and rallies, so a short book's risk
+# (a rally) shows as plainly as a long book's.
+SHOCKS = (-0.50, -0.20, -0.10, -0.05, 0.05, 0.10, 0.20, 0.50)
 BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not_found", "tick_failed", "liquidation",
                 "liquidation_cut")
 
@@ -21,7 +23,9 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
         peak = store.peak_equity(s.name) or s.starting_balance
         shocks = []
         for shock in SHOCKS:
-            loss = x["position_value"] * -shock
+            # Signed: a long loses in a fall, a short in a rally. An isolated-margin strategy is liquidated
+            # before it loses more than its equity, so that is the most it can lose.
+            loss = min(x["position_value"] * -shock, max(x["equity"], 0.0))
             after = x["equity"] - loss
             dd_after = 1 - after / max(peak, x["equity"]) if peak else 0.0
             shocks.append({"loss": loss, "breach": dd_after >= p.max_drawdown})
@@ -38,10 +42,12 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     scenarios = []
     for i, shock in enumerate(SHOCKS):
         loss = sum(r["shocks"][i]["loss"] for r in rows if r["x"]["sleeve"].desired_state == "running")
-        scenarios.append({"shock": shock, "loss": loss, "loss_pct": loss / equity,
+        scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
     largest = max((a for a in book["allocation"] if a["name"] != "Cash"), key=lambda a: a["share"], default=None)
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
+            "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
+            "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
 
 
