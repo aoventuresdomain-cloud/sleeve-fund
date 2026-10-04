@@ -18,9 +18,12 @@
     <a class="button rail-new" href="/sleeves/new">+ New strategy</a>
     {# Primary destinations: on phones these are the bottom tab bar. #}
     <nav aria-label="Primary">
-      <a href="/" {{ 'aria-current=page' if here == '/' or is_sleeve }}>{{ icon('<path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>') }}<span>Portfolio</span></a>
-      <a href="/trades" {{ 'aria-current=page' if here.startswith('/trades') }}>{{ icon('<path d="M7 7h13l-4-4M17 17H4l4 4"/>') }}<span>Trades</span></a>
-      <a href="/orders" {{ 'aria-current=page' if here.startswith('/orders') }}>{{ icon('<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>') }}<span>Orders</span></a>
+      <a href="/" {{ 'aria-current=page' if here == '/' or here.startswith('/trades') or here.startswith('/orders') }}>{{ icon('<path d="M21 12A9 9 0 1 1 12 3v9z"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z"/>') }}<span>Portfolio</span></a>
+      {# Each strategy sits under the portfolio it belongs to; its trades and orders are tabs on its page. #}
+      <div class="strats" data-live="nav-strategies">
+        {% for x in shell.strategies %}<a href="/sleeves/{{ x.name }}" {{ 'aria-current=page' if here == '/sleeves/' ~ x.name }} title="{{ x.name }}: {{ x.status }}"><span class="sdot {{ x.status }}" aria-hidden="true"></span><span>{{ x.name }}</span></a>{% endfor %}
+      </div>
+      <button type="button" class="more-btn strats-btn" aria-haspopup="dialog" aria-controls="strats" data-open="strats" {{ 'aria-current=page' if is_sleeve }}>{{ icon('<path d="M3 17l5-5 4 4 8-8"/><path d="M14 8h6v6"/>') }}<span>Strategies</span></button>
       <a href="/alerts" data-live="nav-alerts" {{ 'aria-current=page' if here.startswith('/alerts') }}>{{ icon('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>') }}<span>Alerts</span>{% if shell.alerts %}<span class="count" aria-label="{{ shell.alerts }} open">{{ shell.alerts }}</span>{% endif %}</a>
       <button type="button" class="more-btn" aria-haspopup="dialog" aria-controls="more" data-open="more">{{ icon('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>') }}<span>More</span></button>
     </nav>
@@ -93,9 +96,22 @@
   <div class="sheet-body"></div>
   <a class="button" href="/sleeves/new">+ New strategy</a>
 </dialog>
+<dialog id="strats" class="sheet" aria-label="Strategies">
+  <div class="sheet-head"><strong>Strategies</strong><button type="button" class="quiet" data-close>Close</button></div>
+  <div class="sheet-body"><nav aria-label="Strategies">{% for x in shell.strategies %}<a href="/sleeves/{{ x.name }}" {{ 'aria-current=page' if request.url.path == '/sleeves/' ~ x.name }}><span class="sdot {{ x.status }}" aria-hidden="true"></span>{{ x.name }}<span class="faint" style="margin-left:auto;font-weight:400">{{ x.status|capitalize }}</span></a>{% else %}<p class="empty" style="padding:12px 10px">No strategies yet.</p>{% endfor %}</nav></div>
+  <a class="button" href="/sleeves/new">+ New strategy</a>
+</dialog>
 <script>
 (() => {
-  const sheet = document.getElementById("more"), btn = document.querySelector(".more-btn");
+  const strats = document.getElementById("strats");
+  document.querySelector(".strats-btn").addEventListener("click", () => strats.showModal());
+  strats.querySelector("[data-close]").addEventListener("click", () => strats.close());
+  strats.addEventListener("click", (e) => { if (e.target === strats) strats.close(); });
+})();
+</script>
+<script>
+(() => {
+  const sheet = document.getElementById("more"), btn = document.querySelector(".more-btn:not(.strats-btn)");
   sheet.querySelector(".sheet-body").append(document.querySelector("nav.secondary").cloneNode(true));
   btn.addEventListener("click", () => sheet.showModal());
   sheet.querySelector("[data-close]").addEventListener("click", () => sheet.close());

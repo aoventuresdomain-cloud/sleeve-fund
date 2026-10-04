@@ -8,7 +8,7 @@
 </div>
 <div class="grid">
   <section class="panel flush span-8" aria-labelledby="m-h">
-    <div class="panel-head"><h2 id="m-h">Book by month</h2><span class="hint">newest first</span></div>
+    <div class="panel-head"><h2 id="m-h">Book by month</h2></div>
     {% if m.rows %}
     <table class="responsive" data-hide-lg="7 8">
       <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Benchmark</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
@@ -21,7 +21,7 @@
     {% else %}<p class="empty" style="padding:4px 14px 14px">No marks yet. Months appear once strategies have run.</p>{% endif %}
   </section>
   <section class="panel span-4" aria-labelledby="dl-h">
-    <div class="panel-head"><h2 id="dl-h">Downloads</h2><span class="hint">CSV</span></div>
+    <div class="panel-head"><h2 id="dl-h">Downloads</h2></div>
     <form method="get" class="field" id="dl-form" style="margin-bottom:12px"><label for="dl-sleeve">For</label>
       <select id="dl-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option>{{ n }}</option>{% endfor %}</select></form>
     <table class="compact kv">
@@ -36,7 +36,7 @@
 </div>
 {% if m.grid %}
 <section class="panel flush" aria-labelledby="g-h">
-  <div class="panel-head"><h2 id="g-h">Strategies by month</h2><span class="hint">monthly return; shading shows size</span></div>
+  <div class="panel-head"><h2 id="g-h">Strategies by month</h2></div>
   <div style="overflow-x:auto"><table class="corr heat">
     <tr><th></th>{% for mo in m.months|reverse %}<th scope="col">{{ mo }}</th>{% endfor %}</tr>
     {% for n in m.sleeves %}<tr><th scope="row" class="row"><a href="/sleeves/{{ n }}">{{ n }}</a></th>

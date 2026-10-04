@@ -1,17 +1,17 @@
 {% extends "base.html" %}
 {% from "_stages.html" import stepper %}
 {% from "_fields.html" import pair_field, exit_fields %}
-{% block title %}Research · Multi-Strategy Fund{% endblock %}
+{% block title %}Models · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
-  <h1>Research</h1>
-  <p class="lede">Idea → G1 → paper → G2 → live.</p>
+  <h1>Models</h1>
+  <p class="lede">Each model moves from idea to G1, paper trading, G2 and live.</p>
 </div>
 <section class="ledger" aria-label="Research counters">
   <div><div class="k">Models</div><div class="v lead">{{ rows|length }}</div><div class="s">in the library</div></div>
   <div><div class="k">Passed G1</div><div class="v lead">{{ rows|selectattr('g1', 'equalto', 'PASS')|list|length }}</div><div class="s">on real data</div></div>
-  <div><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div></div>
-  <div><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div></div>
+  <div><div class="k">Ideas tested</div><div class="v lead">{{ counts.ideas }}</div><div class="s">by the research loop</div></div>
+  <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">parameter sets</div></div>
 </section>
 
 <section class="panel" style="margin-bottom:14px" aria-labelledby="study-h" id="study">
@@ -42,7 +42,7 @@
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="pipe-h">
-  <div class="panel-head"><h2 id="pipe-h">Pipeline</h2><span class="hint">furthest stage reached</span></div>
+  <div class="panel-head"><h2 id="pipe-h">Pipeline</h2></div>
   <table class="responsive">
     <thead><tr><th>Model</th><th>Stage</th><th>G1 on real data</th><th>Strategies</th><th></th></tr></thead>
     <tbody>{% for r in rows %}
@@ -57,7 +57,7 @@
 </section>
 
 <section class="panel flush" aria-labelledby="ts-h">
-  <div class="panel-head"><h2 id="ts-h">Tear sheets</h2><span class="hint">newest first</span></div>
+  <div class="panel-head"><h2 id="ts-h">Tear sheets</h2></div>
   {% if sheets %}
   <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th></tr></thead>
     <tbody>{% for s in sheets %}<tr>

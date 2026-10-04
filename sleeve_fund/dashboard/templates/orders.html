@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% from "_macros.html" import tag, why, why_toggle %}
+{% from "_macros.html" import tag, why, why_toggle, book_tabs %}
 {% block title %}Orders · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
-  <h1>Order blotter</h1>
+  <h1>Portfolio</h1>
   <div class="actions">
     <form class="inline" method="get" action="/orders">
       <input type="hidden" name="status" value="{{ tab }}">
@@ -14,9 +14,10 @@
     <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
   </div>
 </div>
+{{ book_tabs('orders') }}
 {% if backtest %}<div class="banner" role="status">Showing a saved backtest: the paper runtime replayed over history. <a href="/backtest/{{ backtest.run_id }}">Back to the result</a></div>{% endif %}
 
-<nav class="tabs" aria-label="Order status" data-live="order-tabs">
+<nav class="status-filter" aria-label="Order status" data-live="order-tabs">
   {% for k, label, n in tabs %}<a href="?status={{ k }}{{ '&sleeve=' ~ sleeve|urlencode if sleeve }}" {{ 'aria-current=page' if tab == k }}>{{ label }} <span class="n">{{ n }}</span></a>{% endfor %}
 </nav>
 

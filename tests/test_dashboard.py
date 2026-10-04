@@ -57,6 +57,8 @@ def test_create_sleeve_and_control_it(client):
     assert "5,100.00" in c.get("/", auth=AUTH).text
     page = c.get("/sleeves/btc-test", auth=AUTH)
     assert page.status_code == 200 and "Flatten" in page.text
+    # Listed under Portfolio in the rail, marked as the page you're on, with trades and orders as its tabs.
+    assert 'href="/sleeves/btc-test" aria-current=page' in page.text and 'data-tab="orders"' in page.text
     assert c.get("/api/sleeves/btc-test/equity", auth=AUTH).json()["equity"] == [5100.0]
 
     r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "testing"}, auth=AUTH,
@@ -174,6 +176,31 @@ def test_book_and_sleeve_chart_data(client):
     sleeve = c.get("/api/sleeves/btc-test/equity", auth=AUTH).json()
     assert sleeve["res"] == "intraday" and sleeve["fills"][0]["side"] == "BUY"
     assert c.get("/api/sleeves/nope/equity", auth=AUTH).status_code == 404
+
+
+def test_a_stopped_strategy_still_counts_in_the_book(client):
+    """Stopping a strategy must not rewrite the book: its cash is still the fund's."""
+    c, store = client
+    _new(c)
+    _new(c, name="eth-test", instrument="ETH/USD")
+    store.record_equity("btc-test", equity=5_500, cash=5_500, qty=0, price=60_000, benchmark=5_000)
+    store.record_equity("eth-test", equity=4_500, cash=4_500, qty=0, price=3_000, benchmark=5_000)
+    before = c.get("/api/book/equity", auth=AUTH).json()["equity"][-1]
+    store.set_desired_state("eth-test", "stopped")
+    after = c.get("/api/book/equity", auth=AUTH).json()["equity"][-1]
+    assert before == after == 10_000
+    assert "10,000.00" in c.get("/", auth=AUTH).text
+
+
+def test_short_ranges_read_every_mark(client):
+    c, store = client
+    _new(c)
+    store.record_equity("btc-test", equity=5_100, cash=5_100, qty=0, price=60_000, benchmark=5_050)
+    day = c.get("/api/book/equity?days=1", auth=AUTH).json()
+    assert day["res"] == "intraday" and day["equity"][-1] == 5_100 and len(day["t"]) == len(day["drawdown"])
+    week = c.get("/api/sleeves/btc-test/equity?days=7", auth=AUTH).json()
+    assert week["equity"][-1] == 5_100 and "fills" in week
+    assert c.get("/api/book/equity?days=3", auth=AUTH).status_code == 400
 
 
 def test_flatten_asks_for_confirmation_with_its_effect(client):
@@ -361,7 +388,7 @@ def test_order_blotter_tabs_and_csv(client):
     store.update_order("O-9", status="rejected", message="EOrder:Insufficient funds")
     store.record_order("sol-x", order_id="O-10", side="BUY", qty=3, intent="entry", reason="still working")
     page = c.get("/orders", auth=AUTH).text
-    assert "Order blotter" in page and "Stop-loss" in page and "EOrder:Insufficient funds" in page
+    assert "Portfolio views" in page and "Stop-loss" in page and "EOrder:Insufficient funds" in page
     rejected = c.get("/orders?status=rejected", auth=AUTH).text
     assert "test reject" in rejected and "still working" not in rejected
     assert "still working" in c.get("/orders?status=open", auth=AUTH).text
@@ -379,8 +406,11 @@ def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
     c, _ = client
     page = c.get(path, auth=AUTH).text
     assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
-    for href in ("/trades", "/orders", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
+    for href in ("/", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
         assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
+    assert 'id="strats"' in page  # every strategy is listed under Portfolio (a sheet on phones)
+    if path in ("/", "/trades", "/orders"):  # the book-wide blotters are tabs of the portfolio
+        assert 'href="/trades"' in page and 'href="/orders"' in page
 
 
 def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_sleeve(client, monkeypatch):

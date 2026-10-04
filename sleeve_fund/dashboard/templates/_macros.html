@@ -7,7 +7,7 @@
 {% macro why(label, text, items) %}<div class="why-block"><div class="k">{{ label }}</div>{% if text %}<p>{{ text }}</p>{% if items %}<dl class="sig">{% for k, v in items %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}</dl>{% endif %}{% else %}<p class="muted">Not recorded. This trade predates the order journal, which logs the reason when the order is sent.</p>{% endif %}</div>{% endmacro %}
 {% macro why_toggle(id) %}<button type="button" class="why-btn" aria-expanded="false" aria-controls="{{ id }}" data-why="{{ id }}">Why</button>{% endmacro %}
 {% macro price_chart(id, title, hint, intervals=True) %}<section class="panel price-chart" id="{{ id }}" aria-labelledby="{{ id }}-h">
-  <div class="panel-head"><h2 id="{{ id }}-h">{{ title }}</h2><span class="hint">{{ hint }}</span>{% if intervals %}<div class="right range pc-intervals" role="group" aria-label="Candle interval"></div>{% endif %}</div>
+  <div class="panel-head"><h2 id="{{ id }}-h">{{ title }}</h2>{% if hint %}<span class="hint">{{ hint }}</span>{% endif %}{% if intervals %}<div class="right range pc-intervals" role="group" aria-label="Candle interval"></div>{% endif %}</div>
   <div class="pc-legend" aria-hidden="true"></div>
   <div class="pc-canvas" role="img" aria-label="{{ title }} candlestick chart with trade markers"></div>
   <p class="empty pc-empty" hidden>No price history to chart yet.</p>
@@ -16,3 +16,9 @@
   <p class="pc-foot">Tap a buy or sell arrow to see why it traded. Charts by <a href="https://www.tradingview.com/" rel="noopener" target="_blank">TradingView Lightweight Charts™</a>.</p>
 </section>{% endmacro %}
 {% macro help(key) %}{% set t = glossary.get(key) %}{% if t %}<button type="button" class="help" data-help="{{ t }}" title="{{ t }}" aria-label="What does this mean?">?</button>{% endif %}{% endmacro %}
+{% macro book_tabs(active) %}<nav class="tabs desk-tabs" aria-label="Portfolio views">
+  <a href="/" {{ 'aria-current=page' if active == 'overview' }}>Overview</a>
+  <a href="/trades" {{ 'aria-current=page' if active == 'trades' }}>Positions and trades</a>
+  <a href="/orders" {{ 'aria-current=page' if active == 'orders' }}>Orders</a>
+</nav>{% endmacro %}
+{% macro pts(x) %}<span class="{{ 'gain' if x > 0.00005 else ('loss' if x < -0.00005 else 'muted') }}">{{ '+' if x > 0.00005 else ('−' if x < -0.00005 else '') }}{{ '%.1f'|format((x * 100)|abs) }} pts</span>{% endmacro %}
