@@ -29,6 +29,12 @@ class SpreadQuote:
             return f"{full}, the median of {self.samples:,} live quotes on {self.measured_at:%d %b %Y}"
         return f"{full}, assumed; no paper strategy has measured this instrument yet"
 
+    @property
+    def short(self) -> str:
+        """One line for a result's header: "0.10% spread (assumed)"."""
+        how = f"measured {self.measured_at.day} {self.measured_at:%b %Y}" if self.source == "measured" else "assumed"
+        return f"{2 * self.half_spread:.2%} spread ({how})"
+
 
 def resolve(venue: str | None, instrument: str, store=None) -> SpreadQuote:
     """The spread to charge for `instrument` (e.g. "BTC/USD") on `venue` now."""

@@ -21,14 +21,14 @@
 
 <div data-live="banners">
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
-{% if archived %}<div class="banner" role="status">Archived: hidden from the home page's strategy list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
+{% if archived %}<div class="banner" role="status">Archived.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
   {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
-{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the strategy to pick up ({{ pending|map(attribute='command')|join(', ') }}). Strategies check about every 30 seconds.</div>{% endif %}
+{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the strategy to pick up ({{ pending|map(attribute='command')|join(', ') }}).</div>{% endif %}
 </div>
 
 <section class="ledger" aria-label="Strategy figures">
@@ -37,11 +37,10 @@
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
   <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
-  <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% else %}none yet{% endif %}</div></div>
+  <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% if t.trades < 10 %} · <span class="warn" title="Win rate and expectancy mean little under 10 trades">n&lt;10</span>{% endif %}{% else %}none yet{% endif %}</div></div>
   <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
   <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
 </section>
-{% if t.trades and t.trades < 10 %}<p class="muted" style="margin:-6px 0 14px;font-size:12.5px">Only {{ t.trades }} closed trade{{ 's' if t.trades != 1 }}. Win rate and expectancy mean little until there are at least 10.</p>{% endif %}
 
 {{ price_chart("pc", s.instrument, "every fill marked; dashed lines show entry, stop and target") }}
 
@@ -122,7 +121,6 @@
   <ul class="checklist cols">{% for r in path %}{% set cls = 'ok' if r.ok else ('bad' if r.bad else 'todo') %}
     <li class="{{ cls }}"><span class="mark" aria-hidden="true">{{ '✓' if r.ok else ('!' if r.bad else ('?' if r.ok is none else '○')) }}</span><span><span class="sr-only">{{ 'Met' if r.ok else ('Problem' if r.bad else ('Your call' if r.ok is none else 'Not yet')) }}: </span>{{ r.label }}<small>{{ r.detail }}</small></span></li>{% endfor %}
   </ul>
-  <p class="muted" style="margin:10px 0 0;font-size:12.5px">This only reports evidence. Live trading stays locked until you approve G2, and then only on a live account whose key you install on the server.</p>
 </section>{% endif %}
 
 <div class="grid">
@@ -135,7 +133,6 @@
     <ul class="feed">{% for e in feed %}
       <li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what">{{ e.message }}</span></li>{% endfor %}
     </ul>{% else %}<p class="empty">Nothing in this view yet.</p>{% endif %}
-    {% if not backtest_id %}<p class="muted" style="margin:8px 0 0;font-size:12px">Routine reconciliation passes are left out; the latest result is under Position and limits.</p>{% endif %}
   </section>
   <section class="panel span-5" aria-labelledby="set-h">
     <div class="panel-head"><h2 id="set-h">Settings</h2><span class="hint">created {{ s.created_at|ts }}</span></div>

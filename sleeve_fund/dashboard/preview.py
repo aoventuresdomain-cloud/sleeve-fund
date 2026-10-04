@@ -7,6 +7,7 @@ form says so; G1 is still decided by the research loop.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -157,18 +158,25 @@ def _execution(res, wait, matched_on) -> dict:
     out = {"maker": bool(wait), "wait": wait, "matched_on": matched_on,
            "maker_orders": sides.count("MAKER"), "orders": len(sides)}
     if wait and matched_on is None:
-        out["note"] = ("There is no minute-by-minute history for this instrument here yet, so every maker order is "
-                       "assumed to miss and is charged the taker fee.")
+        out["note"] = "No minute history here: maker orders assumed to miss, charged the taker fee."
     elif wait:
-        out["note"] = (f"Maker orders were matched against {matched_on} bars: they count as filled only where the "
-                       "price traded through them, never on a touch.")
+        out["note"] = f"Maker fills matched on {matched_on} bars, trade-through only."
     return out
 
 
-def _every(minutes: int) -> str:
+def _every(minutes: int, short: bool = False) -> str:
+    if short:
+        return "daily" if minutes == 1440 else f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-min"
     return ("day" if minutes == 1440 else "minute" if minutes == 1 else
             f"{minutes // 60} hours" if minutes % 60 == 0 and minutes > 60 else "hour" if minutes == 60 else
             f"{minutes} minutes")
+
+
+def _halt_reason(message: str) -> str:
+    """"drawdown 20.3% hit the 20% limit; flattened, …" -> "DD 20.3%"."""
+    reason = message.split(";")[0]
+    m = re.match(r"drawdown ([\d.]+%)", reason)
+    return f"DD {m.group(1)}" if m else reason
 
 
 def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1440) -> dict:
@@ -182,16 +190,11 @@ def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1
     if halts:
         h = halts[0]
         out["halted"] = h["ts"].strftime("%d %b %Y")
-        reason = h["message"].split(";")[0]
-        notes.append(f"The risk guard halted this strategy on {out['halted']} ({reason}). In paper it would stay "
-                     "flat until you resume it, so from then on this backtest holds cash.")
+        notes.append(f"Halted {out['halted']} ({_halt_reason(h['message'])}), flat from then on.")
     if pauses:
-        notes.append(f"It paused for a day {len(pauses)} time{'s' if len(pauses) != 1 else ''} after a daily loss "
-                     "past the profile's limit, flattening each time, as paper would.")
+        notes.append(f"Paused a day {len(pauses)} time{'s' if len(pauses) != 1 else ''} (daily loss).")
     if risk_profile is not None and (halts or pauses):
-        every = _every(checked_minutes)
-        notes.append(f"The guard checked the book every {every}" + (
-            "; paper checks every 30 seconds, so it would act sooner." if checked_minutes > 1 else "."))
+        notes.append(f"Guard: {_every(checked_minutes, short=True)} bars" + ("; paper checks every 30 s." if checked_minutes > 1 else "."))
     out["note"] = " ".join(notes)
     return out
 
@@ -310,9 +313,9 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
-                   "source": spread.source},
+                   "short": spread.short, "source": spread.source},
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
-                         "source": quote_fees.source},
+                         "short": quote_fees.short, "source": quote_fees.source},
     }
     if detail:
         from sleeve_fund.dashboard import trading

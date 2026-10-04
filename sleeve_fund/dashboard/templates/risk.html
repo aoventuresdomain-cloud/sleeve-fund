@@ -4,7 +4,6 @@
 {% block content %}
 <div class="page-head">
   <h1>Risk</h1>
-  <p class="lede">Every limit across the book, what a sharp fall would cost, and every time a limit has fired. Limits are per strategy; the guard flattens and halts a strategy on its own.</p>
 </div>
 
 <section class="ledger" aria-label="Book risk">
@@ -42,7 +41,7 @@
         <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
       {% endfor %}</tbody>
     </table>
-    <p class="muted" style="margin:8px 0 0;font-size:12px">Uses current positions and each strategy's peak equity. Single-day falls of 20% have happened in the instruments this book trades; a stop-loss sells after the fact, at whatever price it gets.</p>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">Gap risk: stops fill after the fact.</p>
   </section>
   <section class="panel span-5" aria-labelledby="hist-h">
     <div class="panel-head"><h2 id="hist-h">Limits that fired</h2><span class="hint">halts, pauses, mismatches</span></div>

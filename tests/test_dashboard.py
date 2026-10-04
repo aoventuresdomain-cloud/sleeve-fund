@@ -373,7 +373,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     assert "33% invested" in page  # the benchmark is held at the balanced profile's cap
     form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest"
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
-    assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "carried over" in form
+    assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "From backtest." in form
     assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
     assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
 
@@ -562,7 +562,7 @@ def test_clone_with_changes_prefills_the_new_sleeve_form(client):
     assert q["instrument"] == "SOL/USD" and q["stop_loss_pct"] == "8" and q["max_notional"] == "500"
     assert q["p_trend_filter__fast"] == "10" and q["name"] == "sol-stops-v2" and q["from"] == "clone"
     form = c.get(href.replace("&amp;", "&"), auth=AUTH).text
-    assert "Settings copied from" in form and 'value="sol-stops-v2" data-touched=1' in form
+    assert "Cloned from" in form and 'value="sol-stops-v2" data-touched=1' in form
     # Submitting the clone unchanged (bar the reason) gives an identical second sleeve.
     form_data = {k: v for k, v in q.items() if k not in ("from", "source")}
     assert _new(c, **form_data, reason="same again").status_code == 303
@@ -583,7 +583,7 @@ def test_archive_hides_a_stopped_sleeve_and_restore_brings_it_back(client):
     assert post("archive").status_code == 303
     home = c.get("/", auth=AUTH).text
     assert "Archived strategies (1)" in home and home.count('href="/sleeves/btc-test"') == 1
-    assert "Archived: hidden" in c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Archived.</div>" in c.get("/sleeves/btc-test", auth=AUTH).text
     assert post("restore", reason="back in use").status_code == 303
     assert "Archived sleeves" not in c.get("/", auth=AUTH).text
     assert [d["action"] for d in store.decisions("btc-test")][:2] == ["restore", "archive"]
@@ -688,13 +688,13 @@ def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, mon
     preview._history.clear()
     q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&execution=maker&maker_wait_minutes=15"
     page = c.get(q, auth=AUTH).text
-    assert "1 of 1 as maker" in page and "matched against 1-minute bars" in page
+    assert "1 of 1 as maker" in page and "Maker fills matched on 1-minute bars" in page
     assert "maker_wait_minutes=15" in page and "execution=maker" in page  # carried to the paper strategy
 
     preview._history.clear()  # no stored minutes for this one: the page says every maker order paid taker
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
     page = c.get(q.replace("ETH/USD", "SOL/USD"), auth=AUTH).text
-    assert "0 of 1 as maker" in page and "assumed to miss and is charged the taker fee" in page
+    assert "0 of 1 as maker" in page and "maker orders assumed to miss, charged the taker fee" in page
 
 
 def test_backtest_guard_checks_stored_minutes_and_says_how_often(client, monkeypatch, tmp_path):
@@ -717,7 +717,7 @@ def test_backtest_guard_checks_stored_minutes_and_says_how_often(client, monkeyp
     preview._history.clear()
     d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive", detail=True)
     assert d["risk"]["checked_minutes"] == 1 and d["risk"]["pauses"] >= 1
-    assert "checked the book every minute." in d["risk"]["note"]
+    assert d["risk"]["note"].endswith("Guard: 1-min bars.")
     sell = next(f for f in d["fills"] if f["side"] == "SELL")
     assert sell["price"] > 0.8 * 2_000  # out near an 8% loss on a 50% position, not after the whole 40% fall
 
@@ -733,10 +733,10 @@ def test_backtest_page_says_when_the_risk_guard_halted(client, monkeypatch):
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: falling)
     q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&risk_profile=conservative"
     page = c.get(q, auth=AUTH).text
-    assert "The risk guard halted this strategy on" in page and "drawdown" in page
+    assert "Halted " in page and "(DD " in page
     preview._history.clear()
     page = c.get(q.replace("conservative", "aggressive"), auth=AUTH).text  # a 60% fall at a 50% cap is a 30% drawdown, short of 35%
-    assert "The risk guard halted" not in page
+    assert "Halted " not in page
 
 
 def test_backtest_charges_the_measured_spread_and_says_where_it_came_from(client, monkeypatch):
@@ -748,10 +748,10 @@ def test_backtest_charges_the_measured_spread_and_says_where_it_came_from(client
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
     q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold"
     page = c.get(q, auth=AUTH).text
-    assert "0.100% bid-ask spread, assumed" in page and " spread</div>" in page
+    assert "0.10% spread (assumed)" in page and " spread</div>" in page
     store.record_spread("KRAKEN", "ETH/USD", 0.0001, samples=900)
     page = c.get(q, auth=AUTH).text
-    assert "0.020% bid-ask spread, the median of 900 live quotes" in page
+    assert "0.02% spread (measured " in page
 
 
 def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, monkeypatch, tmp_path):
@@ -810,7 +810,7 @@ def test_intervals_say_what_is_stored_and_run_all_of_it(client, monkeypatch, tmp
     history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(400), cursor="x")
     preview._history.clear()
     form = c.get("/backtest", auth=AUTH).text
-    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form and "At most" not in form
+    assert "Intraday: ETH/USD (since" in form and "At most" not in form
     df = preview._intraday("ETH/USD", venue("kraken"), 1, None)
     assert len(df) >= 399 * 1440
 
@@ -857,13 +857,11 @@ def test_backtest_price_chart_marks_every_trade_over_years(monkeypatch):
 
 
 def test_settings_states_fees_as_they_are_charged(client):
-    """R3-M5: maker-first orders pay the maker rate, the spread is charged apart, and the published
-    rates say which tier and when they were read."""
+    """R3-M5: both rates, which tier and when they were read, and the spread charged apart."""
     c, _ = client
     page = c.get("/settings", auth=AUTH).text
     assert "Every order is charged the taker fee" not in page
-    assert "a maker-first order pays the maker rate" in page and "half the bid-ask spread" in page
-    assert "0.100% assumed" in page and "Tier 1, from the account&#39;s fee page, 3 Oct 2026" in page
+    assert "0.40% maker / 0.80% taker (Tier 1, 3 Oct 2026) · spread: measured, else 0.10%" in page
 
 
 def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
@@ -903,4 +901,4 @@ def test_the_guard_cadence_is_not_the_chart_spacing(client, monkeypatch, tmp_pat
     preview._history.clear()
     d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive")
     assert len(d["t"]) < d["days"]  # the chart is thinned
-    assert d["risk"]["checked_minutes"] == 15 and "every 15 minutes" in d["risk"]["note"]
+    assert d["risk"]["checked_minutes"] == 15 and "Guard: 15-min bars" in d["risk"]["note"]

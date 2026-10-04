@@ -34,6 +34,14 @@ class FeeQuote:
         basis = f" ({self.basis})" if self.basis else ""
         return f"{self.venue_label}: {rates}, published schedule{basis}; no account on this venue is connected yet"
 
+    @property
+    def short(self) -> str:
+        """One line for a result's header: "0.40/0.80% fees (Tier 1, 3 Oct 2026)"."""
+        rates = f"{float(self.fees.maker) * 100:.2f}/{float(self.fees.taker) * 100:.2f}% fees"
+        if self.source == "account":
+            return f"{rates} (account {self.account}, {self.fetched_at.day} {self.fetched_at:%b %Y})"
+        return f"{rates} ({self.basis or 'published'})"
+
 
 def resolve(venue: str | None = None, store=None) -> FeeQuote:
     """The fee schedule to use for `venue` now: the latest one fetched from a connected account,
