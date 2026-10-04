@@ -522,3 +522,41 @@ def test_a_flatten_cut_short_by_a_restart_still_sells_the_position(store, reason
     t[0] += timedelta(minutes=1)
     rt = _restarted(store, t)  # the sell never filled
     assert rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000) == "flatten"
+    rt = _restarted(store, t)  # sold this time: the next restart owes nothing
+    assert rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000) is None
+
+
+def test_a_restart_after_a_resume_never_sells_a_position_the_strategy_took_since(store):
+    """The other side of S-3: once the PM resumes, a later restart must not replay the old flatten and
+    sell a position the strategy opened afterwards."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    store.command("s1", "flatten", "Book kill switch: stop everything")
+    rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000)
+    store.command("s1", "resume", "carry on")
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+    for _ in range(2):
+        t[0] += timedelta(minutes=1)
+        rt = _restarted(store, t)
+        assert rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000) is None
+        assert store.sleeve("s1").status == "running"
+
+
+def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(store):
+    """A daily-loss pause flattens for 24 hours. A restart inside the pause owes the sell; one after it
+    has ended owes nothing, and the strategy trades again."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000)
+    t[0] += timedelta(minutes=1)
+    assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) == "flatten"  # a 10% day
+    assert store.sleeve("s1").status == "paused" and store.sleeve("s1").paused_until is not None
+    t[0] += timedelta(minutes=1)
+    assert _restarted(store, t).tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) == "flatten"
+    t[0] += timedelta(hours=25)
+    rt = _restarted(store, t)
+    assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) is None and rt.can_open()
