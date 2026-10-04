@@ -10,6 +10,7 @@ the decision log. Protected by one PM password (HTTP Basic, behind HTTPS).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -32,6 +33,7 @@ from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
+from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
@@ -39,8 +41,8 @@ from sleeve_fund.strategies import REGISTRY
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheets"))
-LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
+TEARSHEETS = study_run.TEARSHEETS
+LEDGER = study_run.LEDGER
 # Suggestions only: the field accepts any instrument Kraken spot lists.
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
@@ -79,6 +81,10 @@ def create_app(store: Store | None = None) -> FastAPI:
     app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store or Store()
     app.state.jobs = Jobs()
+    try:
+        study_run.seed(LEDGER, TEARSHEETS)
+    except OSError as exc:  # the pages still work; research shows what it has
+        logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
@@ -426,14 +432,37 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
-    @app.get("/research", response_class=HTMLResponse)
-    def research(request: Request, _: str = Depends(require_pm)):
+    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None):
         from sleeve_fund.dashboard import pipeline
 
         sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                          reverse=True)]
         return page(request, "research.html", sheets=sheets, counts=IdeaLedger(LEDGER).counts(),
-                    rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES)
+                    rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
+                    error=error, pre=pre or {}, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
+                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES)
+
+    @app.get("/research", response_class=HTMLResponse)
+    def research(request: Request, _: str = Depends(require_pm)):
+        job = app.state.jobs.get(request.query_params.get("job", ""))
+        view = dict(job.view(), ahead=app.state.jobs.ahead_of(job)) if job is not None else None
+        return research_page(request, job=view)
+
+    @app.post("/research/run")
+    async def research_run(request: Request, _: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Run a G1 study from the page, as `python -m sleeve_fund study --store` does, in the background."""
+        form = dict((await request.form()).items())
+        try:
+            req = _study_request(form)
+            req.validate()
+        except (ValueError, KeyError) as exc:
+            return research_page(request, error=str(exc), pre=form)
+        jobs = app.state.jobs
+        target = st().url if jobs.isolate and st().url else st()
+        key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
+        title = f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair}, {study_run._bars(req.minutes)} bars"
+        job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
+        return RedirectResponse(f"/research?job={job.id}", status_code=303)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -728,6 +757,39 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                         bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
+
+def _study_request(form: dict) -> "study_run.StudyRequest":
+    def num(name: str, default=None, cast=float):
+        v = str(form.get(name, "")).strip()
+        return cast(v) if v else default
+
+    def pct(name: str):
+        v = num(name)
+        return None if v is None else v / 100
+
+    strategy = str(form.get("strategy", ""))
+    if strategy not in REGISTRY:
+        raise ValueError(f"unknown model {strategy!r}")
+    profile = str(form.get("risk_profile", "balanced"))
+    if profile != "none" and profile not in PROFILES:
+        raise ValueError(f"unknown risk profile {profile!r}")
+    return study_run.StudyRequest(
+        strategy=strategy, pair=str(form.get("instrument", "")).strip().upper(),
+        minutes=num("minutes", 1440, int), risk_profile=None if profile == "none" else profile,
+        train_days=num("train_days", 3 * 365, int), test_days=num("test_days", 365, int),
+        holdout_days=num("holdout_days", 365, int), use_holdout=form.get("use_holdout") == "on",
+        stop_loss=pct("stop_loss_pct"), take_profit=pct("take_profit_pct"), risk_per_trade=pct("risk_per_trade_pct"))
+
+
+def run_study_job(progress, job_id: str, store: Store | str, req, ledger: str, tearsheets: str) -> str:
+    """Run one G1 study and write its tear sheet; returns the sheet's name. Runs in a process of its
+    own (see jobs.py), where `store` is the journal's database address."""
+    if isinstance(store, str):
+        store = Store(store)
+    path = study_run.run_store_study(req, store=store, progress=progress, ledger_path=Path(ledger),
+                                     out_dir=Path(tearsheets))
+    return path.stem
+
 
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
