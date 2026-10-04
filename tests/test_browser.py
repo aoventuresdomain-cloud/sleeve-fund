@@ -59,8 +59,8 @@ def site(tmp_path_factory):
             break
         time.sleep(0.05)
     form = {"name": "eth-trend", "strategy": "trend_filter", "instrument": "ETH/USD", "bar_spec": "1-DAY-LAST-EXTERNAL",
-            "starting_balance": "5000", "risk_profile": "balanced", "warmup_bars": "0", "execution": "maker",
-            "maker_wait_minutes": "15", "p_trend_filter__fast": "10", "p_trend_filter__slow": "30", "reason": "browser test"}
+            "starting_balance": "5000", "risk_profile": "balanced", "warmup_bars": "0",
+            "p_trend_filter__fast": "10", "p_trend_filter__slow": "30", "reason": "browser test"}
     r = httpx.post(f"{base}/sleeves/new", data=form, auth=("pm", PASSWORD), headers={"origin": base})
     assert r.status_code in (200, 303), r.text[:300]
     yield base
@@ -101,6 +101,7 @@ def test_page_runs_without_script_errors(site, browser, path):
     page.context.close()
 
 
+@pytest.mark.usefixtures("maker_on")
 @pytest.mark.parametrize("query", ["", "?instrument=ETH/USD&strategy=trend_filter&from=backtest"
                                        "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40&execution=maker"])
 def test_new_strategy_form_scripts_run(site, browser, query):
@@ -114,6 +115,7 @@ def test_new_strategy_form_scripts_run(site, browser, query):
     page.context.close()
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_order_type_shows_the_wait_only_for_maker_orders(site, browser):
     page, errors = _open(browser, f"{site}/backtest")
     assert page.is_hidden("#maker_wait_minutes")

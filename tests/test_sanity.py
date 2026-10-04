@@ -160,6 +160,7 @@ def _maker_run(px, inst, vol_per_minute, capital=10_000.0):
                 exec_prices=minutes, exec_minutes=1)
 
 
+@pytest.mark.usefixtures("maker_on")
 @pytest.mark.parametrize("name", list(INSTRUMENTS))
 def test_post_only_fills_pay_the_maker_fee_and_market_fills_the_taker_fee(name):
     inst, px = INSTRUMENTS[name]
@@ -176,6 +177,7 @@ CENT_ROUNDING = pytest.mark.xfail(strict=True, reason=(
     "all round the same way: $2.44 slices pay 0.41%, not 0.40%, and $1.20 slices pay nothing"))
 
 
+@pytest.mark.usefixtures("maker_on")
 @pytest.mark.parametrize("capital", [pytest.param(96.0, marks=CENT_ROUNDING), pytest.param(200.0, marks=CENT_ROUNDING),
                                      20_000.0, 1_000_000.0])
 def test_post_only_orders_filled_in_slices_still_pay_the_maker_rate_overall(capital):
@@ -200,6 +202,7 @@ def _cash(start, fills):
     return start + sum((f["qty"] * f["price"]) * (1 if f["side"] == "SELL" else -1) - f["fee"] for f in fills)
 
 
+@pytest.mark.usefixtures("maker_on")
 @pytest.mark.parametrize("name", list(INSTRUMENTS))
 @pytest.mark.parametrize("maker", [False, True])
 def test_books_add_up_and_every_full_exit_leaves_nothing(name, maker):

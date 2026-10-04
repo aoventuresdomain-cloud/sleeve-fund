@@ -224,6 +224,7 @@ def test_a_buy_the_volume_cap_blocks_says_so(prices, instrument):
     assert "share of the bar's volume" in note["message"] and "smallest order" in note["message"]
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_a_halt_on_the_bar_an_entry_fills_cancels_its_stop_and_target(instrument):
     """A maker entry filled and the drawdown halt fired on the same minute, while the entry's stop and
     target were not yet at the venue. The halt sold the position, and the target, still resting, sold it

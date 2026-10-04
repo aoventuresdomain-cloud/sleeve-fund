@@ -20,6 +20,10 @@ from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import Store
 from sleeve_fund.venues import venue
 
+# Maker-first orders are switched off by default; this file tests the post-only path, so it switches them on.
+pytestmark = pytest.mark.usefixtures("maker_on")
+
+
 START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, in nanoseconds
 SPREAD = 12.0  # $12 wide around each trade: a 1 bp half spread, big enough that dropping it shows
 
