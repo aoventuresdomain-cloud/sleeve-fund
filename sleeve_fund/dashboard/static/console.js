@@ -582,6 +582,7 @@ window.Console = (() => {
     exitFields(form);
     if (!form || !form.elements.execution) return;
     const wait = form.querySelector("[data-when-maker]");
+    if (!wait) return;  // maker-first orders switched off: market only
     const sync = () => { wait.hidden = form.elements.execution.value !== "maker"; };
     form.elements.execution.addEventListener("change", sync); sync();
   }

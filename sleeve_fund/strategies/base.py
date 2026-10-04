@@ -10,6 +10,7 @@ or simply in or out (want_long).
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 import traceback
@@ -81,6 +82,13 @@ _BASE_FIELDS = {
     "log_events",
     "log_commands",
 }
+
+
+def maker_orders_enabled() -> bool:
+    """Post-only (maker-first) orders are switched off: every order goes at market. At this size the maker
+    fill model cost more review findings than it saved in fees (PM, 4 Oct 2026), so it stays in the code
+    for when a strategy proves it needs it, behind SLEEVE_MAKER_ORDERS=1."""
+    return os.environ.get("SLEEVE_MAKER_ORDERS", "") == "1"
 
 
 def r_target(r: float, stop: float, leg: float) -> float:
@@ -172,6 +180,8 @@ class LongFlatConfig(StrategyConfig):
         if rebalance_band is not None and (stops or take_profit or take_profit_r or risk_per_trade):
             raise ValueError("stop-loss, take-profit and risk per trade work on all-or-nothing positions; "
                              "they can't be combined with rebalancing to a target weight yet")
+        if maker_wait_minutes is not None and not maker_orders_enabled():
+            raise ValueError("maker-first orders are switched off for now: every order goes at market, at the taker fee")
         if maker_wait_minutes is not None:
             if int(maker_wait_minutes) != maker_wait_minutes or maker_wait_minutes < 1:
                 raise ValueError("the wait before going to market must be a whole number of minutes, at least 1")

@@ -42,7 +42,7 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY
-from sleeve_fund.strategies.base import exit_warmup
+from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -91,6 +91,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     except OSError as exc:  # the pages still work; research shows what it has
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
+    templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -1369,6 +1370,8 @@ def _form_params(form, strategy: str) -> dict:
     execution = str(form.get("execution", "") or "market")
     if execution not in ("market", "maker"):
         raise ValueError("order type: market or maker first")
+    if execution == "maker" and not maker_orders_enabled():
+        raise ValueError("order type: maker-first orders are switched off for now; every order goes at market")
     if execution == "maker":
         try:
             params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)

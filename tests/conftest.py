@@ -33,3 +33,10 @@ def _no_swallowed_strategy_errors(capfd, request):
     for line in (out + err).splitlines():
         if ("Python " in line and ("failed" in line or "raised exception" in line)) or "strategy handler " in line or "sleeve tick failed" in line:
             pytest.fail(f"a strategy callback raised inside the engine: {line}")
+
+
+@pytest.fixture
+def maker_on(monkeypatch):
+    """Maker-first orders are switched off by default (strategies.base.maker_orders_enabled); the tests of
+    the post-only path switch them on."""
+    monkeypatch.setenv("SLEEVE_MAKER_ORDERS", "1")
