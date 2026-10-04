@@ -1142,3 +1142,122 @@ def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
     assert "data-costs=" in form
     r = _new(c, name="btc-two", stop_loss_pct="5", stop_atr="2")
     assert "one kind of stop" in r.headers["location"].replace("+", " ")
+
+
+def _settings(c, name="btc-test", **over):
+    form = {"risk_profile": "balanced", "instrument": "BTC/USD", "reason": "tighter risk", **over}
+    return c.post(f"/sleeves/{name}/settings", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+
+
+def test_risk_settings_change_in_place_with_a_reason_and_restart(client):
+    c, store = client
+    _new(c, stop_loss_pct="8", maker_wait_minutes="20", execution="maker")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'id="settings-form"' in page and 'value="8"' in page  # the form starts from the settings as they are
+    r = _settings(c, risk_profile="conservative", stop_atr="2", atr_bars="10", take_profit_r="3", max_notional="500")
+    assert r.headers["location"].endswith("saved=settings#settings")
+    s = store.sleeve("btc-test")
+    assert s.risk_profile == "conservative"
+    assert s.params == {"fast": 10, "slow": 30, "maker_wait_minutes": 20, "stop_atr": 2.0, "atr_bars": 10,
+                        "take_profit_r": 3.0, "max_notional": 500.0}  # the model and order type untouched
+    assert s.warmup_bars >= 11  # enough bars for the new stop's average true range
+    (d,) = store.decisions("btc-test", action="change_settings")
+    assert "Risk profile balanced to conservative" in d["reason"] and "Stop-loss 8% below the entry to 2 average" \
+        in d["reason"] and d["reason"].endswith("tighter risk")
+    assert store.pending_reload("btc-test") is not None
+    assert store.last_event("btc-test", ("exits_change",)) is not None
+    page = c.get("/sleeves/btc-test?saved=settings", auth=AUTH).text
+    assert "Restarting to trade under the changed settings" in page and "1 command" not in page
+    # A risk profile on its own leaves the open position's stop alone.
+    store.event("btc-test", "info", "marker", "-")
+    _settings(c, risk_profile="aggressive", stop_atr="2", atr_bars="10", take_profit_r="3", max_notional="500")
+    assert store.last_event("btc-test", ("exits_change", "settings_change", "marker"))["kind"] == "settings_change"
+
+
+@pytest.mark.parametrize("over, msg", [
+    ({"reason": ""}, "reason"),
+    ({"risk_profile": "reckless"}, "no+profile"),
+    ({"stop_loss_pct": "2", "stop_atr": "2"}, "stop"),
+    ({"stop_loss_pct": "8"}, "nothing+changed"),
+    ({"take_profit_pct": "0.5", "stop_loss_pct": "8"}, "cover"),
+])
+def test_bad_settings_changes_are_refused_and_keep_what_was_typed(client, over, msg):
+    c, store = client
+    _new(c, stop_loss_pct="8")
+    r = _settings(c, **{"stop_loss_pct": "8", **over})
+    loc = r.headers["location"]
+    assert "settings_error=" in loc and msg in loc.lower() and loc.endswith("#settings")
+    assert store.sleeve("btc-test").params.get("stop_loss") == 0.08 and store.pending_reload("btc-test") is None
+    if over.get("reason") != "":
+        assert "Not saved" in c.get(loc.split("#")[0], auth=AUTH).text
+
+
+def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
+    c, store = client
+    _new(c)
+    store.set_desired_state("btc-test", "stopped")
+    _settings(c, stop_loss_pct="5")
+    assert store.sleeve("btc-test").params["stop_loss"] == 0.05 and store.pending_reload("btc-test") is None
+    assert "apply when it next starts" in store.events("btc-test")[0]["message"]
+
+
+def test_strategies_move_between_accounts_only_when_stopped_or_flat(client):
+    c, store = client
+    _new(c)
+    store.create_account("desk-b", "paper")
+    store.create_account("kraken-live", "live")
+
+    def move(account, reason="reorganise"):
+        return c.post("/sleeves/btc-test/account", data={"account": account, "reason": reason}, auth=AUTH, headers=SAME,
+                      follow_redirects=False).headers["location"]
+
+    store.record_order("btc-test", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="x")
+    store.record_fill("btc-test", side="BUY", qty=0.1, price=100, fee=0.08, order_id="O-1", trade_id="t1")
+    store.record_equity("btc-test", equity=5000, cash=4990, qty=0.1, price=100, benchmark=5000)
+    assert "flatten+it+before+moving" in move("desk-b") and store.account_of("btc-test") == "paper"
+    assert "disabled title=\"Stop or flatten it first" in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.set_desired_state("btc-test", "stopped")  # stopped, position and all: nothing trades while it moves
+    assert "locked+until+G2" in move("kraken-live")
+    assert move("desk-b").endswith("saved=account#settings") and store.account_of("btc-test") == "desk-b"
+    (d,) = store.decisions("btc-test", action="move_account")
+    assert d["reason"] == "from paper to desk-b: reorganise"
+    assert "already+on" in move("desk-b")
+
+
+def test_account_notes_and_retiring(client):
+    c, store = client
+    store.create_account("desk-b", "paper", "old note")
+    _new(c, account="desk-b")
+
+    def post(path, **data):
+        return c.post(f"/accounts/desk-b/{path}", data=data, auth=AUTH, headers=SAME,
+                      follow_redirects=False).headers["location"]
+
+    assert "saved=desk-b" in post("note", note="Second desk", reason="clearer")
+    assert next(a for a in store.accounts() if a["name"] == "desk-b")["note"] == "Second desk"
+    page = c.get("/accounts", auth=AUTH).text
+    assert "btc-test still runs on it" in page and 'id="dlg-retire-desk-b"' in page
+    assert "still+runs+on+desk-b" in post("retire", action="retire", reason="tidy")
+    store.set_desired_state("btc-test", "stopped")
+    assert "saved=desk-b" in post("retire", action="retire", reason="tidy")
+    assert "Retired" in c.get("/accounts", auth=AUTH).text
+    # Nothing starts on, or moves onto, a retired account.
+    r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME)
+    assert r.status_code == 400 and "retired" in r.text
+    assert "retired" in _new(c, name="eth-new", account="desk-b").headers["location"]
+    assert "saved=desk-b" in post("retire", action="reinstate", reason="back in use")
+    assert c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
+                  follow_redirects=False).status_code == 303
+    actions = [d["action"] for d in store.decisions()]
+    assert {"account_note", "retire_account", "reinstate_account"} <= set(actions)
+    assert "be+retired" in c.post("/accounts/paper/retire", data={"action": "retire", "reason": "x"}, auth=AUTH,
+                                        headers=SAME, follow_redirects=False).headers["location"]
+    assert c.post("/accounts/desk-b/note", data={"note": "x", "reason": "x"}, auth=AUTH,
+                  headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_saved_backtests_have_no_settings_to_change(client):
+    c, store = client
+    store.create_sleeve(name="bt:abc", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=1000)
+    assert "backtest" in _settings(c, name="bt:abc", stop_loss_pct="5").headers["location"]

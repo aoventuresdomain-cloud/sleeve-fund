@@ -73,9 +73,13 @@ class Supervisor:
     def _start(self, name: str, proc: Proc) -> None:
         # Paper processes never need a venue key, so they don't inherit one.
         env = {k: v for k, v in os.environ.items() if not credential_var(k)}
+        reload = self.store.pending_reload(name)
         proc.popen = subprocess.Popen([self.python, "-m", "sleeve_fund.paper", "--db-sleeve", name], env=env)
         proc.started_at = utcnow()
         self.store.event(name, "info", "process_start", f"paper process started (pid {proc.popen.pid})")
+        if reload:  # a fresh process reads the settings as they are now
+            self.store.mark_applied(reload["id"])
+            self.store.event(name, "info", "settings_applied", "restarted to trade under the changed settings")
 
     def _stop(self, name: str, proc: Proc, why: str) -> None:
         if proc.alive:
@@ -109,6 +113,9 @@ class Supervisor:
             elif action == "restart_stale":
                 self.store.event(sleeve.name, "error", "heartbeat_stale", "no heartbeat for 3 minutes; restarting")
                 self._stop(sleeve.name, proc, "restart after stale heartbeat")
+                self._start(sleeve.name, proc)
+            elif action == "none" and proc.alive and self.store.pending_reload(sleeve.name):
+                self._stop(sleeve.name, proc, "restart for changed settings")
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again

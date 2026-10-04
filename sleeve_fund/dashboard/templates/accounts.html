@@ -6,24 +6,54 @@
   <div class="actions"><a class="button secondary" href="#add">Add an account</a></div>
   <p class="lede">Live keys stay on the server.</p>
 </div>
-{% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
+{% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>
+{% elif pre.get('saved') %}<div class="banner" role="status" data-once>Saved {{ pre.get('saved') }}.</div>{% endif %}
 
 <section class="panel flush" aria-labelledby="acc-h">
   <div class="panel-head"><h2 id="acc-h">Your accounts</h2></div>
   <table class="responsive">
-    <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Kraken key on the server</th><th>Note</th></tr></thead>
+    <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Kraken key on the server</th><th>Note</th><th></th></tr></thead>
     <tbody>{% for a in accounts %}
-    <tr id="acct-{{ a.name }}"><td><strong>{{ a.name }}</strong></td>
+    <tr id="acct-{{ a.name }}" {% if a.retired_at %}class="muted"{% endif %}><td><strong>{{ a.name }}</strong>{% if a.retired_at %} <span class="chip">Retired</span>{% endif %}</td>
       <td data-m="right"><span class="chip {{ a.kind }}">{{ 'Live' if a.kind == 'live' else 'Paper' }}</span></td>
       <td data-label="Strategies">{% for n in a.sleeves %}<a href="/sleeves/{{ n }}">{{ n }}</a>{{ ', ' if not loop.last }}{% else %}<span class="muted">None yet</span>{% endfor %}</td>
       <td data-m="right">{% if a.kind == 'paper' %}<span class="muted">Not needed</span>
         {% elif a.key_present %}<span class="gain">Installed</span> <span class="muted">checked {{ a.key_checked_at|ago }}</span>
         {% elif a.key_present is none %}<span class="warn">Not checked yet</span> <span class="muted">the server checks every minute</span>
         {% else %}<span class="warn">Not installed</span> <span class="muted">checked {{ a.key_checked_at|ago }}</span>{% endif %}</td>
-      <td data-m="hide" class="muted">{{ a.note }}</td></tr>
+      <td data-m="hide" class="muted">{{ a.note }}</td>
+      <td data-m="right" style="white-space:nowrap"><button type="button" class="quiet" data-open="dlg-note-{{ a.name }}">Edit note</button>
+        {% if a.name != 'paper' %}<button type="button" class="quiet" data-open="dlg-retire-{{ a.name }}">{{ 'Reinstate' if a.retired_at else 'Retire' }}</button>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
 </section>
+<datalist id="account-reasons"><option value="Tidying up"><option value="Account closed at the venue"><option value="Strategy reorganisation"></datalist>
+{% for a in accounts %}
+<dialog id="dlg-note-{{ a.name }}" aria-labelledby="dlg-note-{{ a.name }}-h">
+  <form method="post" action="/accounts/{{ a.name }}/note">
+    <h2 id="dlg-note-{{ a.name }}-h">Note for {{ a.name }}</h2>
+    <label for="n-{{ a.name }}">Note</label>
+    <input id="n-{{ a.name }}" name="note" maxlength="200" value="{{ a.note }}" placeholder="What this account is for">
+    <label for="nr-{{ a.name }}">Reason for the decision log</label>
+    <input id="nr-{{ a.name }}" name="reason" list="account-reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button>Save note</button></div>
+  </form>
+</dialog>
+{% if a.name != 'paper' %}
+{% set running = a.running %}
+<dialog id="dlg-retire-{{ a.name }}" aria-labelledby="dlg-retire-{{ a.name }}-h">
+  <form method="post" action="/accounts/{{ a.name }}/retire">
+    <h2 id="dlg-retire-{{ a.name }}-h">{{ 'Reinstate' if a.retired_at else 'Retire' }} {{ a.name }}</h2>
+    {% if a.retired_at %}<p>Strategies can be moved onto it and started on it again.</p>
+    {% elif running %}<p class="warn">{{ running|join(', ') }} still run{{ 's' if running|length == 1 }} on it. Stop {{ 'it' if running|length == 1 else 'them' }} or move {{ 'it' if running|length == 1 else 'them' }} to another account first.</p>
+    {% else %}<p>Nothing is deleted. No strategy can be moved onto it or started on it until you reinstate it{% if a.sleeves %}; {{ a.sleeves|join(', ') }} stay{{ 's' if a.sleeves|length == 1 }} assigned to it, stopped{% endif %}.</p>{% endif %}
+    <label for="rr-{{ a.name }}">Reason for the decision log</label>
+    <input id="rr-{{ a.name }}" name="reason" list="account-reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="action" value="{{ 'reinstate' if a.retired_at else 'retire' }}" {{ 'disabled' if running and not a.retired_at }}>{{ 'Reinstate account' if a.retired_at else 'Retire account' }}</button></div>
+  </form>
+</dialog>
+{% endif %}
+{% endfor %}
 
 <div class="grid" style="align-items:start">
   <section class="panel span-7" aria-labelledby="how-h">
@@ -57,4 +87,9 @@
     <button>Add account</button>
   </form>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/console.js"></script>
+<script>Console.dialogs();</script>
 {% endblock %}

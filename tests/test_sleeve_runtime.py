@@ -303,3 +303,29 @@ def test_a_restart_keeps_the_stop_its_entry_set(store, instrument, journaled):
     resets = [e for e in store.events("s1", limit=500) if e["kind"] == "stop_reset"]
     assert len(resets) == (0 if journaled else 1)
     assert [f["side"] for f in store.fills("s1")] == ["BUY"]
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_a_settings_change_moves_the_open_positions_stop(store, instrument, changed):
+    """A stop or target the PM changes on the Settings tab applies to the position already open: after
+    the restart that applies it, the new plan is set, not the one the entry journaled. (Checked on the
+    plan itself: a backtest rests exits at its venue only for entries it made, so it can't show this.)"""
+    from nautilus_trader.model import BarType
+
+    from sleeve_fund.strategies import REGISTRY
+
+    _sleeve(store)
+    prices = synthetic_ohlcv(days=60, seed=3)
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    run_backtest("buy_and_hold", prices.iloc[:25], instrument, {"stop_atr": 10.0}, runtime=rt)
+    (entry,) = [o for o in store.orders("s1") if o["intent"] == "entry"]
+    assert entry["signal"]["stop_frac"] == 0.5 and not entry["signal"].get("tp_frac")
+    if changed:
+        store.event("s1", "info", "exits_change", "Settings changed by PM: Stop-loss ... to 4% below the entry")
+    cls, config_cls = REGISTRY["buy_and_hold"]
+    strat = cls(config_cls(instrument_id=instrument.id, bar_type=BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL"),
+                           assumed_taker_fee=0.008, stop_loss=0.04, take_profit=0.05))
+    strat.runtime = SleeveRuntime(store, "s1")
+    strat._entry_px = entry["avg_px"]
+    strat._restore_plan()
+    assert (strat._stop_frac, strat._tp_frac) == ((0.04, 0.05) if changed else (0.5, None))

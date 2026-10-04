@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -297,6 +298,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             kinds = {a["name"]: a["kind"] for a in st().accounts()}
             if account not in kinds:
                 raise ValueError(f"account: no account called {account}")
+            if _retired(account):
+                raise ValueError(f"account: {account} is retired")
             if kinds[account] == "live":  # the shell's live lock: nothing trades real money before G2
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
             st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
@@ -341,8 +344,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
         position = trading.open_position(x, fills, orders)
+        q = request.query_params
+        # The settings form: what was typed when a change was refused, else the settings as they are.
+        typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
+        settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    account=st().account_of(name),
+                    account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
+                    settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
+                    costs=exit_costs(), reload=st().pending_reload(name),
                     position=position,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
@@ -426,6 +435,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             if command in ("start", "stop"):
                 if not reason.strip():
                     raise ValueError("a reason is required")
+                if command == "start" and _retired(st().account_of(name)):
+                    raise ValueError(f"its account {st().account_of(name)} is retired; move it to another "
+                                     "account or reinstate that one first")
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
@@ -439,6 +451,76 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
+
+    def _retired(account: str) -> bool:
+        return any(a["name"] == account and a["retired_at"] for a in st().accounts())
+
+    @app.post("/sleeves/{name}/settings")
+    async def sleeve_settings(request: Request, name: str, actor: str = Depends(require_pm),
+                              _o: None = Depends(same_origin)):
+        """Change a strategy's risk settings in place: risk profile, stop and target, risk per trade and
+        largest order. Logged with the PM's reason; a running strategy restarts to trade under them."""
+        from sleeve_fund.paper.config import MAX_WARMUP_BARS as MAX_STORED_WARMUP_BARS
+        from sleeve_fund.paper.config import from_store
+
+        form = dict(await request.form())
+        try:
+            s = st().sleeve(name)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        try:
+            reason = str(form.get("reason", "")).strip()
+            if not reason:
+                raise ValueError("a reason is required")
+            if is_backtest(name):
+                raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
+            if name in st().archived():
+                raise ValueError("restore the strategy before changing its settings")
+            profile = str(form.get("risk_profile", ""))
+            if profile not in PROFILES:
+                raise ValueError(f"risk profile: no profile called {profile}")
+            # Only the risk settings change; the model's own parameters and the order type stay as they are.
+            params = {k: v for k, v in s.params.items() if k not in RISK_KEYS}
+            params.update({k: v for k, v in _form_params(form, "").items() if k in RISK_KEYS})
+            cfg = from_store(replace(s, params=params, risk_profile=profile))
+            _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
+            changes = _risk_changes(s.risk_profile, s.params, profile, params)
+            if not changes:
+                raise ValueError("nothing changed")
+            cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
+            warmup = max(s.warmup_bars, min(cap, exit_warmup(params)))
+            restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup)
+            text = "; ".join(changes)
+            st().decide(actor, "change_settings", f"{text}. {reason}", name)
+            exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
+            # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
+            st().event(name, "info", "exits_change" if exits_changed else "settings_change",
+                       f"Settings changed by {actor}: {text}. " + ("Restarting to apply them."
+                                                                  if restart else "They apply when it next starts."))
+        except (ValueError, TypeError) as exc:
+            kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v and k != "reason"}
+            q = urlencode({"settings_error": str(exc), **{f"f_{k}": v for k, v in kept.items()}})
+            return RedirectResponse(f"/sleeves/{name}?{q}#settings", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?saved=settings#settings", status_code=303)
+
+    @app.post("/sleeves/{name}/account")
+    def sleeve_account(name: str, account: str = Form(...), reason: str = Form(...),
+                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        try:
+            s = st().sleeve(name)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        try:
+            if not reason.strip():
+                raise ValueError("a reason is required")
+            # Paper processes don't use the account yet (fees come from the venue's schedule), so a running,
+            # flat strategy moves without a restart.
+            old = st().move_sleeve(name, account, st().journal_book(name, s.starting_balance)["qty"])
+            st().decide(actor, "move_account", f"from {old} to {account}: {reason.strip()}", name)
+            st().event(name, "info", "account_move", f"Moved from account {old} to {account} by {actor}")
+        except ValueError as exc:
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'settings_error': str(exc)})}#settings", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?saved=account#settings", status_code=303)
 
     @app.post("/sleeves/{name}/archive")
     def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(...),
@@ -685,8 +767,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund import accounts as acc
 
         rows = st().accounts()
+        running = {s.name for s in st().sleeves() if s.desired_state == "running"}
         for r in rows:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
+            r["running"] = [n for n in r["sleeves"] if n in running]
         return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
 
     @app.post("/accounts/new")
@@ -703,6 +787,35 @@ def create_app(store: Store | None = None) -> FastAPI:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
             return RedirectResponse(f"/accounts?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
         return RedirectResponse(f"/accounts#acct-{name}", status_code=303)
+
+    @app.post("/accounts/{name}/note")
+    def account_note(name: str, note: str = Form(""), reason: str = Form(...),
+                     actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        try:
+            if not reason.strip():
+                raise ValueError("a reason is required")
+            st().set_account_note(name, note)
+            st().decide(actor, "account_note", f"{name}: note set to \"{note.strip()[:200]}\". {reason.strip()}")
+        except ValueError as exc:
+            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
+
+    @app.post("/accounts/{name}/retire")
+    def account_retire(name: str, action: str = Form(...), reason: str = Form(...),
+                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        try:
+            if not reason.strip():
+                raise ValueError("a reason is required")
+            if action == "retire":
+                st().retire_account(name)
+            elif action == "reinstate":
+                st().reinstate_account(name)
+            else:
+                raise ValueError("unknown action")
+            st().decide(actor, f"{action}_account", f"{name}: {reason.strip()}")
+        except ValueError as exc:
+            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request, _: str = Depends(require_pm)):
@@ -983,20 +1096,54 @@ def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
 EXIT_SETTINGS = {"stop_atr": float, "atr_bars": int, "stop_swing_bars": int, "take_profit_r": float}
 
 
-def _clone_qs(s) -> str:
-    """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
-    params = dict(s.params)
-    q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
-         "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
-         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name}
+# The settings the strategy's Settings tab changes in place (with the risk profile). Everything else in
+# params is the model's own or the order type, which stay as created.
+RISK_KEYS = ("max_notional", "stop_loss", "take_profit", "risk_per_trade", *EXIT_SETTINGS)
+
+
+def _risk_form(params: dict) -> dict:
+    """The risk settings in params as the form enters them (the % ones as percentages)."""
+    q = {}
     if "max_notional" in params:
-        q["max_notional"] = f"{params.pop('max_notional'):g}"
+        q["max_notional"] = f"{params['max_notional']:g}"
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # stored as fractions, entered as %
         if key in params:
-            q[f"{key}_pct"] = f"{params.pop(key) * 100:g}"
+            q[f"{key}_pct"] = f"{params[key] * 100:g}"
     for key in EXIT_SETTINGS:
         if key in params:
-            q[key] = f"{params.pop(key):g}"
+            q[key] = f"{params[key]:g}"
+    return q
+
+
+def _risk_words(profile: str, params: dict) -> dict[str, str]:
+    """Each risk setting in words, for the decision log's before and after."""
+    p = params
+    if p.get("stop_atr"):
+        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) below the entry"
+    elif p.get("stop_swing_bars"):
+        stop = f"under the lowest low of {p['stop_swing_bars']} bars"
+    elif p.get("stop_loss"):
+        stop = f"{p['stop_loss'] * 100:g}% below the entry"
+    else:
+        stop = "none"
+    target = (f"{p['take_profit_r']:g} times the stop's distance" if p.get("take_profit_r")
+              else f"{p['take_profit'] * 100:g}% above the entry" if p.get("take_profit") else "none")
+    return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
+            "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",
+            "Largest order": f"{p['max_notional']:,.2f}" if p.get("max_notional") else "no cap"}
+
+
+def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict) -> list[str]:
+    before, after = _risk_words(old_profile, old), _risk_words(new_profile, new)
+    return [f"{k} {before[k]} to {after[k]}" for k in before if before[k] != after[k]]
+
+
+def _clone_qs(s) -> str:
+    """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
+    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS}
+    q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
+         "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
+         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params)}
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})

@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from sleeve_fund import risk
-from sleeve_fund.store import Store, utcnow
+from sleeve_fund.store import RELOAD, Store, utcnow
 
 RECONCILE_EVERY = timedelta(hours=24)
 # How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
@@ -145,6 +145,8 @@ class SleeveRuntime:
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
         for cmd in self.store.pending_commands(self.name):
+            if cmd["command"] == RELOAD:
+                continue  # the supervisor's: it restarts this process under the new settings
             if cmd["command"] == "flatten":
                 flatten = True
                 self.flatten_why = self.flatten_why or ("pm_flatten", f"Flattened by PM: {cmd['reason']}")
