@@ -862,10 +862,26 @@ class Store:
             if journal.events_:
                 c.execute(insert(events_t), [{k: v for k, v in e.items() if k != "id"} | {"sleeve": name}
                                              for e in journal.events_])
+            # A run whose strategy raised must say so wherever it is opened (review round 8, R8-9). A run
+            # without a runtime journals no event of its own, so the result's words stand in for it.
+            if result.get("errors") and not any(e.get("kind") == "handler_failed" for e in journal.events_):
+                c.execute(insert(events_t).values(sleeve=name, ts=now, level="error", kind="handler_failed",
+                                                  message=result["errors"]))
             # To the microsecond, so runs saved in the same second still sort (and prune) in order.
             c.execute(insert(backtests_t).values(id=run_id, sleeve=name, key=key, title=title, query=query,
                                                  created_at=datetime.now(timezone.utc), result=json.dumps(result)))
         return name
+
+    def strategy_errors(self, sleeve: str, since_start: bool = False) -> int:
+        """How many times the strategy's own code raised, as journaled (handler_failed events); with
+        since_start, only since its process last started, so a fixed and restarted strategy reads clean."""
+        q = select(func.count()).select_from(events_t).where(events_t.c.sleeve == sleeve,
+                                                            events_t.c.kind == "handler_failed")
+        start = self.last_event(sleeve, ("process_start",)) if since_start else None
+        if start is not None:
+            q = q.where(events_t.c.id > start["id"])
+        with self.engine.connect() as c:
+            return int(c.execute(q).scalar() or 0)
 
     def backtest(self, run_id: str) -> dict:
         with self.engine.connect() as c:
@@ -883,8 +899,11 @@ class Store:
         return self.backtest(row.id) if row else None
 
     def backtests(self, limit: int = 50) -> list[dict]:
+        errored = (select(events_t.c.id).where(events_t.c.sleeve == backtests_t.c.sleeve,
+                                               events_t.c.kind == "handler_failed").exists())
         q = (select(backtests_t.c.id, backtests_t.c.sleeve, backtests_t.c.title, backtests_t.c.query,
-                    backtests_t.c.created_at).order_by(backtests_t.c.created_at.desc()).limit(limit))
+                    backtests_t.c.created_at, errored.label("errored"))
+             .order_by(backtests_t.c.created_at.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 

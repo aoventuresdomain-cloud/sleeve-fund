@@ -177,9 +177,11 @@ def _errors(errors: list) -> str:
     """The strategy's own errors during the run, which would otherwise make wrong results look fine."""
     if not errors:
         return ""
+    from sleeve_fund.strategies.base import handler_error_words
+
     name, what = errors[0]
-    return (f"The strategy hit {len(errors)} error{'s' if len(errors) != 1 else ''} during this run (first: {name}, "
-            f"{what}). Its orders after that may be wrong, so don't rely on these results.")
+    return (f"The strategy hit {len(errors)} error{'s' if len(errors) != 1 else ''} during this run, the first "
+            f"{handler_error_words(name, what)}. Its orders after that may be wrong, so don't rely on these results.")
 
 
 def _every(minutes: int, short: bool = False) -> str:

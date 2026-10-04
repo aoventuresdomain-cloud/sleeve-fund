@@ -22,6 +22,7 @@
 
 <div data-live="banners">
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
+{% if strategy_errors %}<div class="banner loss" role="alert">The strategy's code raised an error {{ strategy_errors }} time{{ 's' if strategy_errors != 1 }}{% if backtest_id %} during this run, so its results after that can't be relied on{% else %} since it last started; its orders after that may be wrong{% endif %}. The Activity tab has the details.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
@@ -161,7 +162,7 @@
   </section>
   <section class="panel span-5" aria-labelledby="dec-h">
     <div class="panel-head"><h2 id="dec-h">Decisions</h2></div>
-    <ul class="feed">{% for d in decisions %}<li><span class="when">{{ d.ts|ts }}</span><span class="what"><strong>{{ d.action|capitalize }}</strong> by {{ d.actor }}: {{ d.reason }}</span></li>{% else %}<li class="muted">None yet.</li>{% endfor %}</ul>
+    <ul class="feed">{% for d in decisions %}<li><span class="when">{{ d.ts|ts }}</span><span class="what"><strong>{{ d.action|action_words }}</strong> by {{ d.actor }}: {{ d.reason }}</span></li>{% else %}<li class="muted">None yet.</li>{% endfor %}</ul>
   </section>
 </div>
 </div>
