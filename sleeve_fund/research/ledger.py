@@ -66,5 +66,5 @@ class IdeaLedger:
 
 
 def _without_bars(dataset: str) -> str:
-    """A dataset name without its bar-length suffix ("kraken-btcusd-store-60m" -> "kraken-btcusd-store")."""
+    """A dataset name without its bar-length suffix ("venue-btcusd-store-60m" -> "venue-btcusd-store")."""
     return re.sub(r"-\d+m$", "", dataset)

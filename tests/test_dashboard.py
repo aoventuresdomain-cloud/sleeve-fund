@@ -1018,6 +1018,7 @@ def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatc
 
 def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     import time
+    from urllib.parse import parse_qs, urlparse
 
     from sleeve_fund import history
     from tests.test_research import _stored_minutes
@@ -1034,8 +1035,9 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     assert bad.status_code == 200 and "would take hours" in bad.text
     r = c.post("/research/run", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"].startswith("/research?job=")
-    job_id = r.headers["location"].split("=", 1)[1]
-    assert 'id="study-job"' in c.get(r.headers["location"], auth=AUTH).text
+    job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
+    running = c.get(r.headers["location"], auth=AUTH).text
+    assert 'id="study-job"' in running and 'value="240" selected' in running  # the form shows what is running
     for _ in range(600):
         j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
         if j["status"] not in ("queued", "running"):
@@ -1048,7 +1050,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     # Missing history is an error on the page, not a crash.
     r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
     for _ in range(200):
-        j = c.get(f"/api/backtest/jobs/{r.headers['location'].split('=', 1)[1]}", auth=AUTH).json()
+        j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
         if j["status"] not in ("queued", "running"):
             break
         time.sleep(0.05)

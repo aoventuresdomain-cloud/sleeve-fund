@@ -446,7 +446,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def research(request: Request, _: str = Depends(require_pm)):
         job = app.state.jobs.get(request.query_params.get("job", ""))
         view = dict(job.view(), ahead=app.state.jobs.ahead_of(job)) if job is not None else None
-        return research_page(request, job=view)
+        # The study's own settings come back on the redirect, so the form shows what is running.
+        pre = {k: v for k, v in request.query_params.items() if k != "job"}
+        return research_page(request, job=view, pre=pre)
 
     @app.post("/research/run")
     async def research_run(request: Request, _: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -462,7 +464,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
         title = f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair}, {study_run._bars(req.minutes)} bars"
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
-        return RedirectResponse(f"/research?job={job.id}", status_code=303)
+        return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
