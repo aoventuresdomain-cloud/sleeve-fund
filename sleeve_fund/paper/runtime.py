@@ -222,7 +222,9 @@ class SleeveRuntime:
         cash_tol = 0.01 * (1 + 2 * book["fills"])
         d_cash, d_qty = cash - book["cash"], qty - book["qty"]
         detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
-                  f"engine position {qty:g} vs journal {book['qty']:g} ({book['fills']} fills)")
+                  f"engine position {qty:.12g} vs journal {book['qty']:.12g}"
+                  # %g's 6 figures hid a 1e-7 gap on 9075.15 (review round 10, m1).
+                  + (f", {d_qty:+.3g} apart" if abs(d_qty) > qty_tolerance else "") + f" ({book['fills']} fills)")
         if abs(d_cash) <= cash_tol and abs(d_qty) <= qty_tolerance:
             self.store.event(self.name, "info", "reconcile", "engine matches journal: " + detail, ts=self.now())
             return True

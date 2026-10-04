@@ -35,7 +35,7 @@
     <thead><tr><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Value</th><th class="num">Unrealised</th><th class="num">Held</th><th class="num">Stop / target</th><th></th></tr></thead>
     <tbody>{% for p in h.positions %}{% set rid = 'pos-' ~ loop.index %}
     <tr><td><a href="/sleeves/{{ p.sleeve }}"><strong>{{ p.sleeve }}</strong></a> <span class="muted">{{ p.pair }}</span></td>
-      <td class="num" data-m="hide">{{ '%.6g'|format(p.qty) }} {{ p.pair.split('/')[0] }}</td>
+      <td class="num" data-m="hide">{{ p.qty|qty }} {{ p.pair.split('/')[0] }}</td>
       <td class="num" data-m="hide">{{ p.entry_px|px }}</td><td class="num" data-m="hide">{{ p.price|px }}</td>
       <td class="num" data-m="hide">{{ p.value|money }} <span class="muted">{{ p.weight|pct0 }}</span></td>
       <td class="num" data-m="right">{{ money_signed(p.unrealised) }} <span class="muted">{{ p.unrealised_ret|pct1s }}</span></td>
@@ -55,7 +55,7 @@
     <thead><tr><th>Closed</th><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for t in h.trades %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ t.closed|ts }}</td><td><a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a></td>
-      <td class="num" data-m="hide">{{ '%.6g'|format(t.qty) }} {{ t.pair.split('/')[0] }}</td>
+      <td class="num" data-m="hide">{{ t.qty|qty }} {{ t.pair.split('/')[0] }}</td>
       <td class="num" data-m="hide">{{ t.entry_px|px }}<div class="sub">{{ t.opened|ts }}</div></td>
       <td class="num" data-m="hide">{{ t.exit_px|px }}<div class="sub">{{ t.closed|ts }}</div></td>
       <td class="num" data-m="hide">{{ t.held|held }}</td><td class="num" data-m="hide">{{ t.fees|money }}</td>

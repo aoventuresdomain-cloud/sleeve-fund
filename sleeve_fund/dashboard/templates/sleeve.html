@@ -11,12 +11,13 @@
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
       {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
-      <button type="button" class="secondary" data-open="dlg-flatten" {{ 'disabled' if x.qty <= 0 }}>Flatten</button>
+      {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
+      <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif x.qty <= 0 %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held > 0 %}<button type="button" class="secondary" data-open="dlg-flatten">Flatten</button>{% endif %}
-      {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {{ 'disabled title="Flatten before archiving"' if x.qty > 0 }}>Archive</button>{% endif %}{% endif %}
+      {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty > 0 %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
@@ -43,7 +44,7 @@
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
   {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ x.qty|qty }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
   <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% if t.trades < 10 %} · <span class="warn" title="Win rate and expectancy mean little under 10 trades">n&lt;10</span>{% endif %}{% else %}none yet{% endif %}</div></div>
   <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
@@ -86,14 +87,14 @@
 <div class="grid">
 {% if position %}
 <section class="panel span-7" aria-labelledby="pos-h">
-  <div class="panel-head"><h2 id="pos-h">Open position</h2><span class="hint">{{ '%.6g'|format(position.qty) }} {{ base }} since {{ position.opened|ts }}, {{ money_signed(position.unrealised) }} unrealised ({{ position.unrealised_ret|pct1s }})</span></div>
+  <div class="panel-head"><h2 id="pos-h">Open position</h2><span class="hint">{{ position.qty|qty }} {{ base }} since {{ position.opened|ts }}, {{ money_signed(position.unrealised) }} unrealised ({{ position.unrealised_ret|pct1s }})</span></div>
   <div class="why-grid">{{ why('Why it was bought', position.why, position.sig) }}</div>
 </section>
 {% endif %}
   <section class="panel span-5" aria-labelledby="risk-h">
     <div class="panel-head"><h2 id="risk-h">Position and limits</h2></div>
     <table class="compact kv">
-      <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
+      <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ x.qty|qty }} {{ base }}{% else %}None{% endif %}</td></tr>
       <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
       <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
       <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} below the last price)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
@@ -117,7 +118,7 @@
   <table class="responsive" data-hide-md="3 4 8 10">
     <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for tr in trips[:50] %}{% set rid = 'tr-' ~ loop.index %}
-    <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ '%.4g'|format(tr.qty) }} {{ base }}</td>
+    <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ tr.qty|qty }} {{ base }}</td>
       <td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td>
       <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}{% if tr.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
@@ -144,7 +145,7 @@
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Fee</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody>{% for o in orders %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
-      <td class="num" data-m="hide">{{ '%.6g'|format(o.qty) }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
+      <td class="num" data-m="hide">{{ o.qty|qty }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
       <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
     {% endfor %}</tbody>
   </table>
@@ -228,8 +229,8 @@
 {% set dialogs = {
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
   'resume': ('Resume ' ~ s.name, 'The strategy trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
-  'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to sell ' ~ ('%.6g'|format(held)) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|money) if s.desired_state != 'running' else 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
-  'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty > 0 else ''),
+  'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to sell ' ~ (held|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|money) if s.desired_state != 'running' else 'Sells ' ~ (x.qty|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
+  'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ (x.qty|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty > 0 else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
   'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
