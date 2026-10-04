@@ -32,7 +32,7 @@ def _bars(minutes, years=3, seed=7, vol=0.6):
     o = np.r_[c[0], c[:-1]]
     idx = pd.date_range("2022-01-01", periods=n, freq=f"{minutes}min", tz="UTC") + pd.Timedelta(minutes=minutes)
     return pd.DataFrame({"open": o, "high": np.maximum(o, c) * 1.002, "low": np.minimum(o, c) * 0.998,
-                         "close": c, "volume": 10.0}, index=idx)  # stamped at the close
+                         "close": c, "volume": 1e6}, index=idx)  # stamped at the close; deep enough that no buy hits the volume cap
 
 
 def _reference_weights(close, minutes, fast, slow, vol_target, lookback_days=30, band=0.25):
