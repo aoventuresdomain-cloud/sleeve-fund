@@ -13,6 +13,7 @@ import time
 
 import pandas as pd
 
+from sleeve_fund.instruments import price_decimals
 from sleeve_fund.research.metrics import (fills_to_rows, max_drawdown, returns_from_equity, summary, trade_stats,
                                           trades)
 from sleeve_fund.research.runner import BOOK_SHARE, run_backtest
@@ -203,7 +204,7 @@ def _halt_reason(message: str) -> str:
 def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1440) -> dict:
     """What the runtime's risk guard did, in words the page shows. checked_minutes: how often it
     valued the book (paper does every 30 s)."""
-    halts = [e for e in events if e["kind"] == "risk_halt"]
+    halts = [e for e in events if e["kind"] in ("risk_halt", "reconcile_mismatch")]
     pauses = [e for e in events if e["kind"] == "risk_pause"]
     out = {"profile": risk_profile, "halted": None, "pauses": len(pauses), "checked_minutes": checked_minutes,
            "events": [{"t": e["ts"].strftime("%d %b %Y"), "kind": e["kind"], "message": e["message"]} for e in events]}
@@ -211,7 +212,8 @@ def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1
     if halts:
         h = halts[0]
         out["halted"] = h["ts"].strftime("%d %b %Y")
-        notes.append(f"Halted {out['halted']} ({_halt_reason(h['message'])}), flat from then on.")
+        why = "reconcile mismatch" if h["kind"] == "reconcile_mismatch" else _halt_reason(h["message"])
+        notes.append(f"Halted {out['halted']} ({why}), flat from then on.")
     if pauses:
         notes.append(f"Paused a day {len(pauses)} time{'s' if len(pauses) != 1 else ''} (daily loss).")
     if risk_profile is not None and (halts or pauses):
@@ -223,10 +225,6 @@ def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1
 def _finite(v):
     """JSON has no NaN or infinity; the form shows None as n/a."""
     return None if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))) else v
-
-
-def _precision(price: float) -> int:
-    return 2 if price >= 100 else 4 if price >= 1 else 6
 
 
 def benchmark(prices: pd.DataFrame, starting: float, taker_fee: float, cap: float = 1.0) -> pd.Series:
@@ -275,7 +273,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         raise ValueError(f"only {len(prices)} bars of {profile.label} history for {pair}; need at least 60")
     spread = spread_quote or spreads.resolve(profile.name, pair)
     base, quote = pair.split("/")
-    inst = profile.instrument(base, quote, price_precision=_precision(float(prices["close"].median())),
+    inst = profile.instrument(base, quote, price_precision=price_decimals(float(prices["close"].median())),
                               fees=quote_fees.fees)
     if risk_profile is not None:
         from sleeve_fund.risk import profile as risk_profile_of

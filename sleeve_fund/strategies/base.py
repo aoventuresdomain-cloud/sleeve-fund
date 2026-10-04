@@ -27,7 +27,7 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType,
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
-from sleeve_fund.instruments import BOOK_SHARE
+from sleeve_fund.instruments import BOOK_SHARE, lot_decimals
 from sleeve_fund.strategies.indicators import Atr
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -236,12 +236,13 @@ class LongFlatConfig(StrategyConfig):
 # Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar
 # that decides, the risk check's tick and the maker order's timer (review round 8, M8-3).
 REPORTED_HANDLERS = ("on_trade", "on_quote", "on_order_accepted", "on_order_rejected", "on_order_denied",
-                     "on_order_canceled", "on_order_expired", "on_order_filled", "on_bar", "_on_tick",
-                     "_maker_timeout")
+                     "on_order_canceled", "on_order_expired", "on_order_filled", "on_order_updated",
+                     "on_order_modify_rejected", "on_bar", "_on_tick", "_maker_timeout")
 _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_accepted": "an order accepted",
                   "on_order_rejected": "an order rejected", "on_order_denied": "an order denied",
                   "on_order_canceled": "an order cancelled", "on_order_expired": "an order expired",
-                  "on_order_filled": "an order filled", "on_bar": "a bar", "_on_tick": "the risk check",
+                  "on_order_filled": "an order filled", "on_order_updated": "an order resized",
+                  "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out",
                   "_settle_maker": "a post-only order's fees"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
@@ -307,6 +308,8 @@ class LongFlatStrategy(Strategy):
         # price until it does (_settle_maker), and the fee model to credit what a backtest would have
         # filled at the maker fee by then (set by the paper node with ScheduleFeeModel.maker_cap).
         self._settling: dict[str, object] = {}
+        self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
+        self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._fill_half_spread: dict[str, float] = {}
         self.fee_model = None
         # Replay only: the trade the simulated venue is filling on. Live, the data engine caches each trade
@@ -789,7 +792,7 @@ class LongFlatStrategy(Strategy):
         equity, _, qty, _ = self._mark()
         price = bar.close.as_decimal()
         diff = Decimal(str(equity * w)) - Decimal(str(qty)) * price
-        step = self.instrument.size_increment.as_decimal()
+        step = self._lot()
         signal = {**values, "from_weight": round(self._held_w or 0.0, 6), "to_weight": round(w, 6)}
         if diff > 0:
             account = self._account()
@@ -883,9 +886,9 @@ class LongFlatStrategy(Strategy):
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
-        step = self.instrument.size_increment.as_decimal()
+        step = self._lot()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
-        min_qty = self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
+        min_qty = self._min_qty()
         if qty <= 0 or qty < min_qty:
             self._note("buy_skipped", f"Buy skipped: the {size_by} limit ({float(budget):,.2f}) buys {qty}, below "
                        f"the smallest order the venue takes ({min_qty})")
@@ -998,7 +1001,7 @@ class LongFlatStrategy(Strategy):
         order = self.cache.order(ClientOrderId(coid))
         if order is None:
             return
-        step = self.instrument.size_increment.as_decimal()
+        step = self._lot()
         left = order.leaves_qty.as_decimal()
         if order.side == OrderSide.BUY:
             account, price = self._account(), Decimal(str(self._price()))
@@ -1103,9 +1106,15 @@ class LongFlatStrategy(Strategy):
         self._fill_half_spread.pop(coid, None)
         self._settling.pop(coid, None)
 
+    def _lot(self) -> Decimal:
+        """The smallest size an order carries: the instrument's step, never finer than the account can hold
+        the base currency in. A venue can list 8 lot decimals for a currency the engine keeps at 6 (XRP, ADA);
+        an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1)."""
+        return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
+
     def _min_qty(self) -> Decimal:
-        step = self.instrument.size_increment.as_decimal()
-        return self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
+        step = self._lot()
+        return max(self.instrument.min_quantity.as_decimal(), step) if self.instrument.min_quantity else step
 
     def _position_qty(self, free: bool = False) -> Decimal:
         """Quantity held, read from the account rather than positions, so a book restored from the
@@ -1167,7 +1176,7 @@ class LongFlatStrategy(Strategy):
                 elif order.status != OrderStatus.PENDING_CANCEL:
                     self.cancel_order(order.client_order_id)
             return
-        step = self.instrument.size_increment.as_decimal()
+        step = self._lot()
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
@@ -1255,7 +1264,7 @@ class LongFlatStrategy(Strategy):
                     self.runtime.store.event(self.runtime.name, "warning", "mark_unavailable", why)
                 return
             if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
-                tol = self.instrument.size_increment.as_double() / 2
+                tol = float(self._lot())  # one unit of the base currency (review round 9, B9-1)
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
                     self.cancel_all_orders(self._cfg.instrument_id)  # halted: no trading, no flattening
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
@@ -1278,6 +1287,8 @@ class LongFlatStrategy(Strategy):
             order = self.cache.order(event.client_order_id)
             if order is not None and order.is_open and order.status != OrderStatus.PENDING_CANCEL:
                 self.cancel_order(order.client_order_id)
+            return
+        self._resize_if_due()
 
     def _resume_exit(self, coid: str) -> None:
         """An order closed: if a sell was waiting for every working order to close, send it now."""
@@ -1373,10 +1384,19 @@ class LongFlatStrategy(Strategy):
                 self._stop_frac = self._tp_frac = None
                 self._replan_pending = self._plan_entry = None
         if self._backtest:
-            if event.is_buy and done and self._pending_exit is None:
+            if event.is_buy and self._pending_exit is None:
+                # On every entry fill, not only the last: a post-only entry can fill in slices through its
+                # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
                 self._rest_exits()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 self._exit_lock = True  # as in paper: no re-entry until the signal has gone flat
+                # Paper's stop cancels an entry still working before it sells (_sell_all); so does this.
+                for order in self._working():
+                    if order.side == OrderSide.BUY and order.status not in (OrderStatus.PENDING_CANCEL,):
+                        if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
+                            self._cancel_on_accept.add(str(order.client_order_id))
+                        else:
+                            self.cancel_order(order.client_order_id)
         if self.runtime is not None:
             fee = event.commission.as_double() if event.commission is not None else 0.0
             self.runtime.on_fill(
@@ -1401,7 +1421,11 @@ class LongFlatStrategy(Strategy):
         plan = {"stop_loss": self._stop_frac, "take_profit": self._tp_frac}
         if not any(plan.values()) or self._entry_px is None:
             return
-        qty = self._position_qty(free=True).quantize(self.instrument.size_increment.as_decimal(), rounding=ROUND_DOWN)
+        resting = self._resting_exits()
+        if resting:
+            self._resize_exits(resting, plan)
+            return
+        qty = self._position_qty(free=True).quantize(self._lot(), rounding=ROUND_DOWN)
         if qty < self._min_qty():
             return
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
@@ -1444,6 +1468,68 @@ class LongFlatStrategy(Strategy):
         for order, *_ in orders:
             self._sent.append(order.client_order_id)
             self.submit_order(order)
+
+    def _resting_exits(self) -> dict:
+        """The backtest's stop and target resting at the venue, by intent."""
+        out = {}
+        for order in self._working():
+            intent = self.decisions.get(str(order.client_order_id), {}).get("intent")
+            if order.side == OrderSide.SELL and intent in ("stop_loss", "take_profit"):
+                out[intent] = order
+        return out
+
+    def _resize_exits(self, resting: dict, plan: dict) -> None:
+        """A later slice of the entry filled: grow the resting stop and target to the whole position, at
+        levels from the new average entry. An exit the venue hasn't answered yet (sent, or mid-resize) is
+        resized once it does (_resize_if_due): skipping it left most of a position with no stop."""
+        qty = self._position_qty().quantize(self._lot(), rounding=ROUND_DOWN)
+        if qty < self._min_qty():
+            return
+        quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
+        for intent, order in resting.items():
+            frac = plan.get(intent)
+            if not frac:
+                continue
+            if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
+                self._resize_due = True  # in flight or mid-resize: resized again once the venue answers
+                continue
+            level = self._entry_px * (1 - frac if intent == "stop_loss" else 1 + frac)
+            px = Price(level, self.instrument.price_precision)
+            if ((order.quantity == quantity or (intent == "take_profit" and "stop_loss" in resting))
+                    and (order.trigger_price if intent == "stop_loss" else order.price) == px):
+                continue
+            if intent == "stop_loss":
+                self.modify_order(order.client_order_id, quantity=quantity, trigger_price=px)
+            elif "stop_loss" in resting:
+                # Linked one-updates-the-other, the venue gives the target the stop's new quantity itself;
+                # sending it here too makes the two resizes undo each other, back and forth.
+                if order.price != px:
+                    self.modify_order(order.client_order_id, price=px)
+            else:
+                self.modify_order(order.client_order_id, quantity=quantity, price=px)
+            what = "Stop-loss" if intent == "stop_loss" else "Take-profit"
+            self._resizing[str(order.client_order_id)] = (f"{what} resized to {qty.normalize():f} at {level:,.6g} as "
+                                                          f"more of the entry filled (average entry {self._entry_px:,.6g})")
+
+    def on_order_updated(self, event) -> None:
+        """The venue took a resize (_resize_exits): journal the new quantity once it holds, not when asked,
+        since the order can fill before the venue gets to it."""
+        coid = str(event.client_order_id)
+        why = self._resizing.pop(coid, None)
+        exit_ = self.decisions.get(coid, {}).get("intent") in ("stop_loss", "take_profit")
+        if (why is not None or exit_) and self.runtime is not None:  # a linked target follows its stop's size
+            self.runtime.store.update_order(coid, qty=event.quantity.as_double(), message=why)
+        self._resize_if_due()
+
+    def on_order_modify_rejected(self, event) -> None:
+        self._resizing.pop(str(event.client_order_id), None)
+        self._resize_if_due()
+
+    def _resize_if_due(self) -> None:
+        """Backtests: an entry slice filled while an exit couldn't be resized; size it to the position now."""
+        if self._resize_due and self._backtest and self._pending_exit is None:
+            self._resize_due = False
+            self._rest_exits()
 
     def on_stop(self) -> None:
         for coid in list(self._maker):

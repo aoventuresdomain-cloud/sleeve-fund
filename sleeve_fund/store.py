@@ -466,7 +466,8 @@ class Store:
                                               message=""))
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
-                     fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0) -> None:
+                     fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
+                     qty: float | None = None) -> None:
         """Move an order on (accepted, cancelled, rejected...) or add a fill to it. Unknown ids are ignored:
         orders sent before this journal existed have no row."""
         if status is not None and status not in ORDER_STATUSES:
@@ -476,6 +477,8 @@ class Store:
             if row is None:
                 return
             values = {"updated_at": utcnow()}
+            if qty is not None:  # resized at the venue (a backtest's resting stop growing with its entry)
+                values["qty"] = qty
             if fill_qty:
                 filled = row.filled_qty + fill_qty
                 values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
@@ -718,9 +721,12 @@ class Store:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
 
-    def peak_equity(self, sleeve: str) -> float | None:
+    def peak_equity(self, sleeve: str, since: datetime | None = None) -> float | None:
+        q = select(func.max(equity_t.c.equity)).where(equity_t.c.sleeve == sleeve)
+        if since is not None:
+            q = q.where(equity_t.c.ts >= since)
         with self.engine.connect() as c:
-            return c.execute(select(func.max(equity_t.c.equity)).where(equity_t.c.sleeve == sleeve)).scalar()
+            return c.execute(q).scalar()
 
     def max_drawdown(self, sleeve: str) -> float:
         """The deepest fall from a running peak over every mark kept, however many: the screens read only
