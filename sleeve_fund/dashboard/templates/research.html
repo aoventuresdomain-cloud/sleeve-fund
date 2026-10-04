@@ -52,7 +52,7 @@
     <tr><td data-label="Instrument">{{ h.pair }}</td>
       <td data-label="Stored from">{{ h.first.strftime('%d %b %Y') if h.first else '–' }}</td>
       <td data-label="Stored to">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
-      <td data-label="Collector">{% if h.state == 'current' %}<span class="chip running">Current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Catching up</span>{% else %}<span class="chip stopped">Asked for {{ h.requested.strftime('%d %b') }}</span> <span class="muted">nothing stored yet</span>{% endif %}</td></tr>
+      <td data-label="Collector">{% if h.state == 'current' %}<span class="chip running">Current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Catching up</span>{% else %}<span class="chip stopped">Asked for {{ h.requested.strftime('%d %b') }}</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="muted" style="padding:0 16px">No instrument has stored history yet.</p>{% endif %}
