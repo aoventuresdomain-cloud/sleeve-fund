@@ -62,3 +62,12 @@ def check(profile: RiskProfile, equity: float, peak: float, day_open: float) -> 
     if day_loss >= profile.daily_loss:
         return Breach("pause_day", f"daily loss {day_loss:.1%} hit the {profile.daily_loss:.0%} limit")
     return None
+
+
+def position_cap(p: RiskProfile, params: dict | None = None) -> float:
+    """The largest position as a multiple of equity: the profile's position cap on spot; on a perpetual
+    its leverage cap, which the PM chose to size by (4 Oct 2026), with the stop-to-liquidation and
+    liquidation-distance guards bounding it."""
+    from sleeve_fund import markets
+
+    return p.max_leverage if markets.is_perp(params) else p.max_position_pct

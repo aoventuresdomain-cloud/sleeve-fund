@@ -992,7 +992,7 @@ class LongFlatStrategy(Strategy):
 
     def _cap_pct(self) -> float:
         if self.runtime is not None:
-            return float(self.runtime.profile.max_position_pct)
+            return float(self.runtime.cap)
         return float(self._cfg.position_cap_pct) if self._cfg.position_cap_pct is not None else 1.0
 
     def _volume_cap(self, bar: Bar) -> Decimal | None:

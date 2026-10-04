@@ -301,9 +301,10 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert page.status_code == 200
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
-    assert "over the cap" not in html  # 3,007 of 10,050 is 30%, inside balanced's 33%
-    # A losing short grows: at 92,000 it is 46% of equity, past the 33% it was sized to.
-    store.record_equity("pp-ls", equity=10_000.0, cash=14_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
+    # A perp is capped by balanced's 2x leverage, not its 33% spot position cap (PM, 4 Oct 2026).
+    assert "of 200%" in html and "over the cap" not in html
+    # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 2x it was sized to.
+    store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
     assert "over the cap" in c.get("/sleeves/pp-ls", auth=AUTH).text
     # The 2% stop sits above the entry; the open short gains as the price falls.
     assert "61,812" in html
@@ -318,3 +319,15 @@ def test_default_explain_names_a_short():
     assert LongFlatStrategy.explain(None, None, -1)[0] == "Signal to be short"
     assert LongFlatStrategy.explain(None, None, 1)[0] == "Signal to be long"
     assert LongFlatStrategy.explain(None, None, False)[0] == "Signal to be flat"
+
+
+def test_a_perp_is_sized_by_the_leverage_cap(prices, instrument):
+    """PM, 4 Oct 2026: a perpetual's position is sized by the profile's leverage cap (2x on balanced),
+    not its spot position cap (33%); spot is unchanged."""
+    closes = [100.0, 100.2, 100.1, 100.3]
+    perp = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="balanced")
+    spot = run_backtest("ping_pong", _path(prices, closes), instrument, {}, half_spread=0, risk_profile="balanced")
+    notional = lambda r: float(r.fills.iloc[0]["filled_qty"]) * float(r.fills.iloc[0]["avg_px"])  # noqa: E731
+    assert 1.9 * 10_000 < notional(perp) <= 2 * 10_000
+    assert notional(spot) <= 0.33 * 10_000 + 1
+    assert perp.decisions[perp.fills.index[0]]["signal"]["sized_by"] in ("2x leverage cap", "balanced risk profile cap")

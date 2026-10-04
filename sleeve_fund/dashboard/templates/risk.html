@@ -31,7 +31,7 @@
       <td data-m="right">{{ x.profile.name|capitalize }}</td>
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
-      <td data-m="hide">{{ usage(r.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td>
+      <td data-m="hide">{{ usage(r.cap_used) }} <span class="muted">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
       <td data-m="hide">{% if r.has_stop %}{{ stop_words(s.params) }}{% else %}<span class="warn">None</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>

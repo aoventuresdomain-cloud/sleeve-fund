@@ -57,6 +57,7 @@ class SleeveRuntime:
         self.name = sleeve_name
         sleeve = store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
+        self.cap = risk.position_cap(self.profile, sleeve.params)  # a perp's is its leverage cap
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
@@ -165,7 +166,7 @@ class SleeveRuntime:
         return self.status == "running"
 
     def position_budget(self, equity: float) -> float:
-        return equity * self.profile.max_position_pct
+        return equity * self.cap
 
     # --- periodic tick ----------------------------------------------------------
 
