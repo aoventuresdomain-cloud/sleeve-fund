@@ -365,10 +365,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         events = st().events(name, limit=400)
         orders = trading.orders_by_id(st(), name)
         plans = st().exit_plans(name)
-        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, markets.is_perp(s.params))
+        perp = markets.is_perp(s.params)
+        funding = st().funding(name, limit=100_000) if perp else []
+        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
         position = trading.open_position(x, fills, orders, plans)
+        perp_x = trading.perp_view(x, position, funding) if perp else None
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -381,7 +384,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # last mark may be older than its last fill.
                     held=0.0 if bt_id else st().journal_book(name, s.starting_balance)["qty"],
                     costs=exit_costs(), reload=st().pending_reload(name),
-                    position=position,
+                    position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
@@ -763,10 +766,12 @@ def create_app(store: Store | None = None) -> FastAPI:
             for n in chosen:
                 orders = trading.orders_by_id(st(), n)
                 for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders,
-                                       st().exit_plans(n), _shorts(st(), n)):
+                                       st().exit_plans(n), _shorts(st(), n),
+                                       st().funding(n, limit=1_000_000) if _shorts(st(), n) else None):
                     rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
                                  if t["held"] else None})
-            cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
+            cols = ["sleeve", "opened", "closed", "held_hours", "side", "qty", "entry_px", "exit_px", "cost", "fees",
+                    "funding", "pnl",
                     "ret", "r", "planned_r", "exits_edited", "exit_kind", "entry_why", "exit_why", "entry_order",
                     "exit_order"]
         elif kind == "orders":
@@ -864,7 +869,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = dict(parse_qsl(row["query"]))
         result, name = row["result"], row["sleeve"]
         result["trips"] = trading.trips(st().fills(name, limit=1_000_000), st().events(name, limit=10_000),
-                                        trading.orders_by_id(st(), name), shorts=_shorts(st(), name))
+                                        trading.orders_by_id(st(), name), shorts=_shorts(st(), name),
+                                        funding=st().funding(name, limit=1_000_000) if _shorts(st(), name) else None)
         result["orders"] = sum(st().order_counts(name).values())
         rs = [t["r"] for t in result["trips"] if t["r"] is not None]
         result["expectancy_r"] = sum(rs) / len(rs) if rs else None

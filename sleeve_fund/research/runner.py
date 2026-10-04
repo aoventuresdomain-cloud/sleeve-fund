@@ -42,6 +42,8 @@ class BacktestResult:
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
+    # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
+    funding: list = field(default_factory=list)
 
     @property
     def shorts(self) -> bool:
@@ -206,6 +208,7 @@ def run_backtest(
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
+            funding=[{"ts": ts, "amount": a} for ts, a in strategy.funding_log],
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
         )

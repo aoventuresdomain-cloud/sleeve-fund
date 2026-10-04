@@ -605,3 +605,36 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
     # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
     assert "+960.00" in page and "−960.00" in page
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
+
+
+def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
+    """Review round 11, M11-5: the Position tab and header show what a perp adds, and every trade's P&L
+    is after fees and funding, in the Trades tab, the header and the export alike."""
+    from datetime import timedelta
+
+    from test_dashboard import AUTH
+
+    from sleeve_fund.store import utcnow
+
+    c, store = client
+    store.create_sleeve(name="pp-fund", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
+    t0 = utcnow() - timedelta(days=1)
+    fill = lambda side, px, h, oid: store.record_fill("pp-fund", side=side, qty=0.1, price=px, fee=1.0,  # noqa: E731
+                                                      order_id=oid, trade_id=oid, ts=t0 + timedelta(hours=h))
+    fill("SELL", 60_000.0, 0, "o1")  # short 0.1 at 60,000
+    store.record_funding("pp-fund", qty=-0.1, price=60_000.0, rate=0.0001, amount=0.6, ts=t0 + timedelta(hours=8))
+    fill("BUY", 59_000.0, 10, "o2")  # closes: +100 - 2 fees + 0.6 funding = 98.60
+    fill("SELL", 59_000.0, 11, "o3")  # a new short, still open
+    store.record_funding("pp-fund", qty=-0.1, price=59_000.0, rate=0.0001, amount=0.59, ts=t0 + timedelta(hours=16))
+    # cash = 10,000 + 6,000 - 5,900 + 5,900 - 3 fees + 1.19 funding; equity at 59,500 = cash - 5,950
+    cash = 10_000 + 6_000 - 5_900 + 5_900 - 3 + 1.19
+    store.record_equity("pp-fund", equity=cash - 5_950, cash=cash, qty=-0.1, price=59_500.0, benchmark=10_000)
+    html = c.get("/sleeves/pp-fund", auth=AUTH).text
+    liq = markets.liquidation_price(cash, -0.1, markets.LOW_FEE_PERP.maintenance_margin)
+    assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.0f}"[:5] in html and "above" in html
+    assert "+0.59" in html and "+1.19" in html  # last payment and since start
+    assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
+    assert "· 0.59× · liq" in html  # the header
+    csv = c.get("/exports/trades.csv?sleeve=pp-fund", auth=AUTH)
+    assert csv.status_code == 200 and "funding" in csv.text.splitlines()[0] and "98.6" in csv.text

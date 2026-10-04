@@ -44,7 +44,7 @@
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
   {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ "short " if x.qty < 0 }}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ "short " if x.qty < 0 }}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% if perp and perp.leverage %} · {{ '%.2f'|format(perp.leverage) }}×{% if perp.liq_px %} · liq {{ perp.liq_px|px }}{% endif %}{% endif %}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
   <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% if t.trades < 10 %} · <span class="warn" title="Win rate and expectancy mean little under 10 trades">n&lt;10</span>{% endif %}{% else %}none yet{% endif %}</div></div>
   <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
@@ -111,6 +111,18 @@
       <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }} <span class="faint">{{ x.ret|pct1s }}</span></dd></div>
     </dl></div>
   </div>
+  {% if perp %}<div class="pos-grid two">
+    <div class="pos-card"><h3>Margin <span class="faint">isolated</span></h3><dl>
+      <div><dt>Side and leverage</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }} {{ '%.2f'|format(perp.leverage) if perp.leverage else '–' }}× <span class="faint">cap {{ '%g'|format(x.cap) }}×</span>{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
+      <div><dt title="Under isolated margin the strategy's whole equity backs its one position">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
+      <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>Funding <span class="faint">{{ quote }}, + received</span></h3><dl>
+      <div><dt>Last payment</dt><dd>{% if perp.funding_last %}{{ perp.funding_last.amount|smoney }} <span class="faint">{{ perp.funding_last.ts|ts }} at {{ '%.4f%%'|format(perp.funding_last.rate * 100) }}</span>{% else %}<span class="muted">None yet</span>{% endif %}</dd></div>
+      <div><dt>This position</dt><dd>{{ perp.funding_open|smoney }}</dd></div>
+      <div class="total"><dt>Since start</dt><dd>{{ perp.funding_total|smoney }} <span class="faint">longs pay {{ '%.4f%%'|format(perp.funding_rate * 100) }} every 8h</span></dd></div>
+    </dl></div>
+  </div>{% endif %}
   {% if position %}<details class="why-fold">
     <summary><span class="k">{{ "Why it was sold short" if position.side < 0 else "Why it was bought" }}</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
     {{ why('Decision at ' ~ (position.opened|ts if position.opened else 'entry'), position.why, position.sig) }}
@@ -143,7 +155,7 @@
     <tbody>{% for tr in trips[:50] %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ tr.qty|qty }} {{ base }}{% if tr.side == -1 %}<div class="sub">short</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td>
-      <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}{% if tr.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
+      <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}{% if tr.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td><td class="num" data-m="hide">{{ tr.fees|money }}{% if tr.funding|abs >= 0.005 %}<div class="sub" title="Funding over the trade: + received, − paid. P&amp;L is after fees and funding.">funding {{ tr.funding|smoney }}</div>{% endif %}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">
       {{ why('Entry · ' ~ tr.opened|ts ~ ' at ' ~ tr.entry_px|px, tr.entry_why, tr.entry_items) }}
