@@ -13,7 +13,7 @@
       <tr><th scope="row">G2 approved by you</th><td><span class="warn">Not yet</span>: needs 6+ weeks of paper inside the backtest's range</td></tr>
       <tr><th scope="row">Server live switch</th><td><span class="warn">Off</span>: set by you on the server; not built yet</td></tr>
       {% set live = accounts|selectattr('kind', 'equalto', 'live')|list %}{% set keyed = live|selectattr('key_present')|list %}
-      <tr><th scope="row">Kraken trading key</th><td>{% if keyed %}<span class="gain">Installed</span> for {{ keyed|length }} of {{ live|length }} live account{{ 's' if live|length != 1 }}{% else %}<span class="warn">Not installed</span>{% endif %}: you place keys on the server; Claude never sees them. <a href="/accounts">Accounts</a></td></tr>
+      <tr><th scope="row">Kraken trading key</th><td>{% if keyed %}<span class="gain">Installed</span> for {{ keyed|length }} of {{ live|length }} live account{{ 's' if live|length != 1 }}{% else %}<span class="warn">Not installed</span>{% endif %}: keys are placed on the server and never leave it. <a href="/accounts">Accounts</a></td></tr>
     </table>
   </section>
   <section class="panel span-6" aria-labelledby="acc-h">
@@ -38,7 +38,7 @@
   <section class="panel span-5" aria-labelledby="fee-h">
     <div class="panel-head"><h2 id="fee-h">Costs and data</h2></div>
     <table class="compact kv">
-      {% for q in fee_quotes %}<tr><th scope="row">{{ q.venue_label }} fees</th><td>{{ q.text }}. Every order is charged the taker fee.{% if q.source == 'published' %} <span class="muted">Connect a live account with a query-only key and the server reads your own rates from the exchange every hour.</span>{% endif %}</td></tr>
+      {% for q in fee_quotes %}<tr><th scope="row">{{ q.venue_label }} fees</th><td>{{ q.text }}. Market orders and protective exits pay the taker rate; a maker-first order pays the maker rate on whatever fills while it rests. Orders that take liquidity also pay half the bid-ask spread: the median of a paper strategy's live quotes where one has run on the instrument, otherwise {{ q.assumed_spread }} assumed.{% if q.source == 'published' %} <span class="muted">Connect a live account with a query-only key and the server reads your own rates from the exchange every hour.</span>{% endif %}</td></tr>
       <tr><th scope="row">{{ q.venue_label }} prices</th><td>Public market data, no key</td></tr>{% endfor %}
       <tr><th scope="row">Balance checks</th><td>At every start and every 24 hours</td></tr>
       <tr><th scope="row">Outside alerts</th><td class="warn">Telegram not set up yet</td></tr>

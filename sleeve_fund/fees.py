@@ -23,6 +23,7 @@ class FeeQuote:
     account: str | None
     fetched_at: datetime | None
     venue_label: str
+    basis: str = ""  # published rates: which tier, and where and when they were read
 
     @property
     def text(self) -> str:
@@ -30,7 +31,8 @@ class FeeQuote:
         if self.source == "account":
             return (f"{self.venue_label}: {rates}, from account {self.account}, "
                     f"fetched {self.fetched_at:%d %b %Y %H:%M} UTC")
-        return f"{self.venue_label}: {rates}, published schedule; no account on this venue is connected yet"
+        basis = f" ({self.basis})" if self.basis else ""
+        return f"{self.venue_label}: {rates}, published schedule{basis}; no account on this venue is connected yet"
 
 
 def resolve(venue: str | None = None, store=None) -> FeeQuote:
@@ -46,4 +48,4 @@ def resolve(venue: str | None = None, store=None) -> FeeQuote:
     if row:
         fees = FeeSchedule(Decimal(str(row["maker"])), Decimal(str(row["taker"])))
         return FeeQuote(fees, "account", row["account"], row["fetched_at"], profile.label)
-    return FeeQuote(profile.fees, "published", None, None, profile.label)
+    return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)

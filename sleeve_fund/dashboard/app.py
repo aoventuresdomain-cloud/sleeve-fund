@@ -222,12 +222,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             if form.get("from") == "backtest" and form.get("bar_spec") != tested:
                 raise ValueError(f"interval: the backtest decided on {_bar_short(tested)}, so this strategy must "
                                  "too; backtest another interval before changing it")
+            bar_spec = str(form.get("bar_spec", ""))
+            # Blank means automatic: enough history for the model's longest look-back, as a backtest has.
+            auto = strategy in REGISTRY and bar_spec in ALLOWED_BAR_SPECS and not str(form.get("warmup_bars", "")).strip()
+            warmup = _warmup_for(strategy, form, bar_spec) if auto else int(form.get("warmup_bars", 0) or 0)
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
-                               bar_spec=str(form.get("bar_spec", "")),
-                               starting_balance=float(form.get("starting_balance", 0) or 0), params=params,
-                               warmup_bars=int(form.get("warmup_bars", 0) or 0),
-                               risk_profile=str(form.get("risk_profile", "")))
+                               bar_spec=bar_spec, starting_balance=float(form.get("starting_balance", 0) or 0),
+                               params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")))
             _check_strategy_params(cfg)
+            needed = REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec))
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -241,6 +244,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                                risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars)
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
+            if needed > cfg.warmup_bars:
+                # A warning (an alert) when the most that can load falls short; a note when it was chosen.
+                st().event(name, "warning" if auto else "info", "warmup_short",
+                           f"The model's longest look-back needs {needed:,} bars of history but {cfg.warmup_bars:,} "
+                           f"load at start, so until {needed:,} live bars have passed its signals can differ from "
+                           "a backtest's.")
         except (ValueError, TypeError) as exc:
             # Send the form back filled in, so a typo doesn't cost the PM everything they entered.
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
@@ -249,7 +258,8 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/api/preview")
     def preview_json(request: Request, _: str = Depends(require_pm)):
-        """Look-back of the form's settings on Kraken's recent daily history (in-sample, not G1)."""
+        """Look-back of the form's settings on the venue's history, at the form's decision interval
+        (in-sample, not G1). Short intervals look back less far, so it answers while the form waits."""
         from sleeve_fund.dashboard import preview
         from sleeve_fund.paper.config import PAIR_RE
 
@@ -263,10 +273,17 @@ def create_app(store: Store | None = None) -> FastAPI:
             params = _form_params(q, strategy)
             balance = float(q.get("starting_balance") or 10_000)
             _profile_cap(q)  # validates the profile name
-            return JSONResponse(preview.run(strategy, pair, params, starting=balance,
-                                            risk_profile=q.get("risk_profile") or "balanced",
-                                            fee_quote=resolve_fees(None, st()),
-                                            spread_quote=resolve_spread(None, pair, st())))
+            spec = q.get("bar_spec") if q.get("bar_spec") in ALLOWED_BAR_SPECS else BACKTEST_BAR_SPEC
+            minutes, fallback = spec_minutes(spec), ""
+            if minutes < 1440 and pair not in [r["pair"] for r in _stored()]:
+                minutes, fallback = 1440, (f"{pair} has no stored minute history here, so this looked back on daily "
+                                           "decisions instead of the interval you chose.")
+            days = LOOKBACK_DAYS.get(minutes)
+            out = preview.run(strategy, pair, params, starting=balance, minutes=minutes, days=days,
+                              risk_profile=q.get("risk_profile") or "balanced",
+                              fee_quote=resolve_fees(None, st()), spread_quote=resolve_spread(None, pair, st()))
+            out["every"], out["fallback"] = preview._every(minutes), fallback
+            return JSONResponse(out)
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
         except OSError as exc:  # Kraken unreachable
@@ -489,7 +506,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
-                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart)
+                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored())
 
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_page(request: Request, _: str = Depends(require_pm)):
@@ -594,7 +611,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def settings_page(request: Request, _: str = Depends(require_pm)):
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [resolve_fees(v.name, st()) for v in VENUES.values()]
+        fee_quotes = [{"venue_label": q.venue_label, "text": q.text, "source": q.source,
+                       "assumed_spread": f"{2 * v.assumed_half_spread:.3%}"}
+                      for v in VENUES.values() for q in [resolve_fees(v.name, st())]]
 
         return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
@@ -602,6 +621,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     return app
 
 
+# How far the form's Look-back goes at each decision interval: all of it for daily decisions, less for
+# short ones so the answer comes back while the form waits (the Backtest page runs longer ones).
+LOOKBACK_DAYS = {1: 30, 5: 90, 15: 365, 60: 365}
 BACKTEST_PERIODS = {"180": ("6 months", 180), "365": ("1 year", 365), "all": ("All available", None)}
 PAIR_RE = re.compile(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}")
 # How long the page waits for a backtest before showing its progress instead; most daily runs finish.
@@ -632,11 +654,25 @@ def _backtest_args(q) -> dict:
         raise ValueError("capital: between 100 and 1,000,000,000")
     params = _form_params(q, strategy)
     _profile_cap(q)  # validates the profile name
+    if spec_minutes(bar_spec) < 1440:
+        have = [r["pair"] for r in _stored()]
+        if pair not in have:
+            raise ValueError(f"interval: {pair} has no stored minute history here, so it can only be backtested on "
+                             f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}, {_bar_short(bar_spec)}, "
              f"{BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
             "risk_profile": q.get("risk_profile") or "balanced", "title": title}
+
+
+def _stored() -> list[dict]:
+    from sleeve_fund.dashboard import preview
+
+    try:
+        return preview.stored()
+    except OSError:  # an unreadable store reads as empty; the run itself says what failed
+        return []
 
 
 def _backtest_key(q, *costs: str) -> str:
@@ -841,15 +877,19 @@ def _profile_cap(q) -> float:
     return PROFILES[name].max_position_pct
 
 
+def _defaults(strategy: str) -> dict:
+    import importlib
+
+    return dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
+
+
 def _warmup_for(strategy: str, q, bar_spec: str = BACKTEST_BAR_SPEC) -> int:
     """Bars to load at start so the slowest indicator is ready on the sleeve's first bar, as the
     strategy itself says. Venue candles are capped at what the venue returns in one request; bars
     built from live trades load from the history store, up to the sleeve limit."""
-    import importlib
-
     from sleeve_fund.paper.config import MAX_WARMUP_BARS as MAX_STORED_WARMUP_BARS
 
-    params = dict(importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC.default_params)
+    params = _defaults(strategy)
     try:
         params.update(_form_params(q, strategy))
     except ValueError:

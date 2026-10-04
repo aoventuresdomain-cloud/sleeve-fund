@@ -47,9 +47,13 @@ def _tag(name: str) -> str:
 HISTORY_MAX_LAG = pd.Timedelta(hours=6)
 
 
-def history_loader(venue: str, pair: str, store=None):
+def history_loader(venue: str, pair: str, store=None, recent=None):
     """Loads a sleeve's warm-up bars from the venue history store (the latest complete bars at the
-    sleeve's interval), for bars the venue can't serve because they are built from live trades."""
+    sleeve's interval), for bars the venue can't serve because they are built from live trades.
+
+    recent: (pair, minutes) -> the venue's latest candles by open time, the newest still forming (a
+    venue profile's ohlc_history). The store's loader can be hours behind; these fill the bars between
+    its end and now, so the indicators run right up to the first live bar."""
     from sleeve_fund.data import bar_minutes, to_bars
     from sleeve_fund.history import HistoryStore
 
@@ -63,9 +67,25 @@ def history_loader(venue: str, pair: str, store=None):
             raise LookupError(f"the stored history for {pair} is {lag.total_seconds() / 3600:.0f} hours old")
         minutes = bar_minutes(bar_type)
         df = hs.read(venue, pair, minutes, start=cov.last - pd.Timedelta(minutes=minutes * (limit + 2)))
+        if recent is not None and len(df):
+            df = _top_up(df, recent, pair, minutes)
         return to_bars(df.tail(limit), instrument, bar_type)
 
     return load
+
+
+def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
+    """The stored bars plus the venue's complete candles after them, stamped at their close as the
+    store's are. A venue that can't serve this interval leaves the stored bars as they are; the
+    warm-up event then says how many bars are missing."""
+    try:
+        r = recent(pair, minutes)
+    except Exception:  # noqa: BLE001 - an unreachable venue or interval: warm up on what is stored
+        return df
+    r = r.iloc[:-1]  # the newest candle is still forming
+    r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
+    newer = r[r.index > df.index[-1]]
+    return pd.concat([df, newer[list(df.columns)]]) if len(newer) else df
 
 
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
@@ -115,7 +135,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
                 **sleeve.params,
             )
-        ).attach_runtime(runtime).attach_history(history or history_loader(profile.name, sleeve.instrument))
+        ).attach_runtime(runtime).attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
     )
     return node
 

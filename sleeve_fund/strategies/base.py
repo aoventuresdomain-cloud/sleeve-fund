@@ -9,6 +9,7 @@ or simply in or out (want_long).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -160,6 +161,7 @@ class LongFlatStrategy(Strategy):
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
         self._last_order = None  # client order id of the last order sent, until the venue has it
+        self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -210,7 +212,12 @@ class LongFlatStrategy(Strategy):
             if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
                 self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
             if self.runtime.backtest:
-                return  # a backtest marks and guards once a bar, from on_bar
+                # A backtest marks and guards from its bars: every execution bar when it is fed shorter
+                # bars than it decides on (paper does every 30 s), otherwise every decision bar.
+                if self._cfg.bar_type.is_composite():
+                    self._exec_type = self._cfg.bar_type.composite()
+                    self.subscribe_bars(self._exec_type)
+                return
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
             # Quotes put the venue's bid and ask in the simulated book (each trade updates it too), so
@@ -235,6 +242,13 @@ class LongFlatStrategy(Strategy):
         self._bid, self._ask = bid, ask
         if self.runtime is not None:
             self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+
+    def _on_exec_bar(self, bar: Bar) -> None:
+        """Backtest: value the book and run the risk guard on every execution bar, so a halt or a
+        daily-loss pause fires within the decision bar, as paper's 30-second ticks would."""
+        self._last_close = bar.close.as_double()
+        if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
+            self._on_tick()
 
     def _maybe_tick(self) -> None:
         if self.runtime is None:
@@ -270,14 +284,23 @@ class LongFlatStrategy(Strategy):
             bars, why = [], str(exc)
         else:
             why = "the history store has none"
+        level = "info" if bars else "warning"
         if bars:
             self.on_historical_bars(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from the history store"
+            # Bars between the last one loaded and the first live one are a hole the indicators skip.
+            step = bar_minutes(self._cfg.bar_type) * 60_000_000_000
+            missing = int((time.time_ns() - bars[-1].ts_event) // step)
+            if missing > 0:
+                level = "warning"
+                msg += (f"; the latest closed {missing * bar_minutes(self._cfg.bar_type)} minutes before now, so "
+                        f"{missing} bar{'s' if missing != 1 else ''} before the first live bar "
+                        f"{'are' if missing != 1 else 'is'} missing")
         else:
             msg = f"No warm-up bars loaded ({why}); the model waits for {want} live bars"
         self.log.info(msg)
         if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "info" if bars else "warning", "warmup", msg)
+            self.runtime.store.event(self.runtime.name, level, "warmup", msg)
 
     def want_long(self, bar: Bar) -> bool | None:
         """True = be long, False = be flat, None = not enough data yet (do nothing)."""
@@ -303,6 +326,9 @@ class LongFlatStrategy(Strategy):
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
     def on_bar(self, bar: Bar) -> None:
+        if self._exec_type is not None and bar.bar_type == self._exec_type:
+            self._on_exec_bar(bar)
+            return
         if not self._accept(bar):
             return
         self.log.info(f"bar {bar}")
