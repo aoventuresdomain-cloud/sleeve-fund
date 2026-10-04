@@ -7,7 +7,6 @@ at market on the trade that crosses the level; a backtest only sees whole bars, 
 the venue and fill at the level. Each exit lands in the same minute, at a price a few basis points
 apart, and sizes follow equity, so they drift by as much."""
 
-import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -185,31 +184,34 @@ def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_p
         assert abs(worse) <= 0.5, (t, b)
 
 
-_SETTLED = re.compile(r"filled ([\d.e-]+) on the first.*?it: ([\d.e-]+) \(")
-
-
 @pytest.mark.parametrize("size", [0.0005, 0.002])
-def test_where_little_trades_paper_settles_maker_fills_to_the_backtests(tmp_path, size):
-    """Thin trades: the backtest gives each post-only order at most BOOK_SHARE of what trades through
-    its price over its wait, then sends the rest at market. Paper's simulated venue fills the order
-    whole on the first trade through, so paper charges the maker fee on that share only and settles the
-    rest as the backtest's market order when the wait runs out (review round 8, M8-5). The settlement
-    rewrites that order's own fills, so no fee row goes negative or lands on another trade (review
-    round 9, M9-3). Paper's maker share is then within 10 points of the backtest's, and its P&L within
-    0.1% of capital."""
-    orders, fills, all_events, j = _maker_both(tmp_path, size=size, min_level="info")
-    events = [e for e in all_events if e["kind"] == "maker_fill_settled"]  # newest first
-    assert events and not [e for e in all_events if e["kind"] in ("maker_fill_above_tape", "reconcile_mismatch")]
-    settled_qty = sum(float(_SETTLED.search(e["message"]).group(1)) for e in events)
-    maker = sum(float(_SETTLED.search(e["message"]).group(2)) for e in events)
-    paper_qty = sum(f["qty"] for f in fills)
-    paper_share = (maker + paper_qty - settled_qty) / paper_qty  # orders not settled filled all at the maker fee
+def test_where_little_trades_paper_fills_maker_orders_in_slices_like_the_backtest(tmp_path, size):
+    """Thin trades: the backtest gives each post-only order BOOK_SHARE of what trades through its price over
+    its wait, then sends the rest at market. Paper's simulated venue would fill it whole on the first trade
+    through, so a stop or target in the wait found paper holding more (review round 9, M9-3). Paper keeps
+    the order itself and sends each slice the tape earns at market, charged at the limit with the maker fee:
+    its maker share is within 10 points of the backtest's and its P&L within 0.1% of capital."""
+    orders, fills, events, j = _maker_both(tmp_path, size=size, min_level="info")
+    assert not [e for e in events if e["kind"] == "reconcile_mismatch"]
+    kinds = {o["order_id"]: o for o in orders}
+    post = [f for f in fills if kinds[f["order_id"]]["order_type"] == "POST-ONLY LIMIT"]
+    assert post and len(post) > len({f["order_id"] for f in post})  # in slices
+    for f in post:  # each slice at its order's limit, with the maker fee
+        assert f["price"] == pytest.approx(kinds[f["order_id"]]["signal"]["limit_px"]), f
+        assert f["fee"] / (f["qty"] * f["price"]) == pytest.approx(0.004, abs=1e-6), f
+    # An order the tape didn't fill in its wait closes as cancelled, and the rest follows at market.
+    rests = {o["signal"].get("maker_order"): o for o in orders if o["order_type"] == "MARKET"}
+    short = [o for o in orders if o["order_type"] == "POST-ONLY LIMIT" and o["filled_qty"] < o["qty"] - 1e-9]
+    assert short
+    for o in short:
+        assert o["status"] == "canceled" and o["message"] == "was not filled within 5 minutes", o
+        assert 0 < rests[o["order_id"]]["qty"] <= o["qty"] - o["filled_qty"] + 1e-8  # as much as the cash allows
+    paper_share = sum(f["qty"] for f in post) / sum(f["qty"] for f in fills)
     bt_qty = sum(f["qty"] for f in j.fills_)
     bt_share = sum(f["qty"] for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT") / bt_qty
     assert bt_share < 0.7 and abs(paper_share - bt_share) <= 0.10, (paper_share, bt_share)
-    # Every fee row is a fee: between the maker rate and the taker rate plus half the spread.
     half = SPREAD / 2 / 60_000
-    for f in fills:
+    for f in fills:  # every fee row is a fee: between the maker rate and the taker rate plus half the spread
         assert 0.004 - 1e-6 <= f["fee"] / (f["qty"] * f["price"]) <= 0.008 + 2 * half + 1e-6, f
     last = j.equity[-1]["price"]
     paper, bt = _pnl(fills, last), _pnl(j.fills_, last)

@@ -152,8 +152,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         ).attach_runtime(runtime).attach_recorder(recorder)
         .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
     )
-    # Post-only fills pay the maker fee only on the share a backtest would fill (review round 8, M8-5).
-    fee_model.maker_cap = strategy.maker_allowance
+    # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
+    strategy.simulated_venue = True
     strategy.fee_model = fee_model
     node.add_strategy(strategy)
     return node

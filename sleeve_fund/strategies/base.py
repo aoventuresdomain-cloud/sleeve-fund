@@ -34,6 +34,7 @@ from sleeve_fund.strategies.indicators import Atr
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
 MAKER_INTENTS = ("entry", "exit", "rebalance")
+MINUTE_NS = 60_000_000_000
 
 
 @dataclass(frozen=True)
@@ -244,8 +245,7 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_canceled": "an order cancelled", "on_order_expired": "an order expired",
                   "on_order_filled": "an order filled", "on_order_updated": "an order resized",
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
-                  "_maker_timeout": "a post-only order's wait running out",
-                  "_settle_maker": "a post-only order's fees"}
+                  "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
 
 
@@ -300,24 +300,23 @@ class LongFlatStrategy(Strategy):
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
-        # Paper: volume traded through each working post-only order's price, to measure its fills by.
-        self._through: dict[str, float] = {}
-        self._tape_last = None  # the latest trade counted into _through (time, trade id)
-        self._maker_filled: dict[str, float] = {}  # paper: of each post-only order, how much was charged as maker
-        self._capped: dict[str, float] = {}  # paper: of each post-only order, how much was charged as taker
-        # Paper: post-only orders filled before their wait ran out, still counting what trades through their
-        # price until it does (_settle_maker), and the fee model to credit what a backtest would have
-        # filled at the maker fee by then (set by the paper node with ScheduleFeeModel.maker_cap).
-        self._settling: dict[str, object] = {}
-        self._fees_journaled: dict[str, float] = {}  # paper: each post-only order's fees as journaled
+        # Paper: the post-only orders this strategy holds itself rather than at the simulated venue, which
+        # would fill one whole on the first trade through its price. A backtest fills BOOK_SHARE of what
+        # trades through, a slice at a time, so paper does too: each slice goes at market as the tape earns
+        # it, charged as filled at the limit with the maker fee (_slice_maker; review round 9, M9-3). By
+        # client order id: the order, why it was sent, the minute bar building, what the tape has earned it,
+        # how much went as slices, and how many are in flight.
+        self._kept: dict[str, dict] = {}
+        self._closing: dict[str, dict] = {}  # kept orders closed with a slice still in flight
+        self._slices: dict[str, str] = {}  # each slice's client order id, to its kept order's
+        self._tape_last = None  # the latest trade counted (time, trade id)
+        # Paper and its replay (set by the node): post-only orders are kept here and sliced. Live, they rest
+        # at the venue, whose own queue decides.
+        self.simulated_venue = False
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
-        self._fill_half_spread: dict[str, float] = {}
         self.fee_model = None
-        # Replay only: the trade the simulated venue is filling on. Live, the data engine caches each trade
-        # before the venue and this strategy hear it; a replay's venue hears it first (maker_allowance).
-        self.venue_trade = None
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -432,7 +431,7 @@ class LongFlatStrategy(Strategy):
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
-        if (self._maker or self._settling) and not self._backtest:
+        if self._kept:
             self._tape(tick)
         self._check_exits(self._last_close)
         self._maybe_tick()
@@ -953,15 +952,22 @@ class LongFlatStrategy(Strategy):
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
-        self._sent.append(order.client_order_id)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
                                   order_type="POST-ONLY LIMIT" if maker else "MARKET")
-        self.submit_order(order)
+        if maker and self.simulated_venue:
+            self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
+                                "sent": Decimal(0), "inflight": 0}
+            if self.runtime is not None:
+                self.runtime.on_order_status(coid, "accepted")
+        else:
+            self._sent.append(order.client_order_id)
+            self.submit_order(order)
+            if maker:
+                self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if maker:
-            self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
 
@@ -981,11 +987,12 @@ class LongFlatStrategy(Strategy):
         """The post-only order has waited long enough: cancel what is left; the cancel's confirmation
         sends the rest at market (on_order_canceled), so nothing is sold or bought twice."""
         coid = event.name.removeprefix("maker-")
-        order = self.cache.order(ClientOrderId(coid))
-        if coid in self._settling:  # filled before its wait ran out: settle its fees now
-            self._settle_maker(coid, order)
-            self._forget_tape(coid)
+        if coid in self._kept:
+            wait = self._cfg.maker_wait_minutes
+            self._close_kept(coid, f"was not filled within {wait} minute{'s' if wait != 1 else ''}",
+                             at_market=self._pending_exit is None)
             return
+        order = self.cache.order(ClientOrderId(coid))
         if coid in self._maker and order is not None and not order.is_closed and self._pending_exit is None:
             self._fallback.add(coid)
             self.cancel_order(order.client_order_id)
@@ -999,20 +1006,21 @@ class LongFlatStrategy(Strategy):
             if order is None or order.is_closed:
                 self._maker.pop(coid)
                 self._cancel_alert(coid)
-        return bool(self._maker)
+        return bool(self._maker) or bool(self._kept)
 
     def _cancel_alert(self, coid: str) -> None:
         name = f"maker-{coid}"
         if name in self.clock.timer_names():
             self.clock.cancel_timer(name)
 
-    def _finish_at_market(self, coid: str, info: dict, why: str) -> None:
-        """Send the unfilled rest of a post-only order at market, sized to what the account can do now."""
-        order = self.cache.order(ClientOrderId(coid))
+    def _finish_at_market(self, coid: str, info: dict, why: str, order=None, left: Decimal | None = None) -> None:
+        """Send the unfilled rest of a post-only order at market, sized to what the account can do now.
+        order and left: a kept order (paper), and what of it was never sent as a slice."""
+        order = order or self.cache.order(ClientOrderId(coid))
         if order is None:
             return
         step = self._lot()
-        left = order.leaves_qty.as_decimal()
+        left = order.leaves_qty.as_decimal() if left is None else left
         if order.side == OrderSide.BUY:
             account, price = self._account(), Decimal(str(self._price()))
             bal = next((b for c, b in account.balances().items() if str(c.code) in self._codes("quote")),
@@ -1034,97 +1042,110 @@ class LongFlatStrategy(Strategy):
         self._submit(order.side, qty, info["intent"], reason, signal, market=True)
 
     def _tape(self, tick) -> None:
-        """Paper: count a trade towards each working post-only order whose price it traded through."""
+        """Paper: build each kept post-only order its own one-minute bars from the trades since it was sent,
+        and on each bar's close earn it what a backtest's venue fills from that bar (_earn)."""
         key = (tick.ts_event, str(tick.trade_id))
         if key == self._tape_last:
             return
         self._tape_last = key
-        px, size = tick.price.as_double(), tick.size.as_double()
-        for coid in (*self._maker, *self._settling):
-            order = self.cache.order(ClientOrderId(coid))
-            if order is None:
-                continue
-            limit = order.price.as_double()
-            if (px < limit) if order.is_buy else (px > limit):
-                self._through[coid] = self._through.get(coid, 0.0) + size
+        px, size, minute = tick.price.as_double(), tick.size.as_double(), tick.ts_event // MINUTE_NS
+        for coid, kept in list(self._kept.items()):
+            bar = kept["bar"]
+            if bar is not None and bar["minute"] != minute:
+                self._earn(coid, kept)
+                bar = None
+            if bar is None:
+                kept["bar"] = {"minute": minute, "prints": [px, px, px, px], "volume": size}
+            else:
+                p = bar["prints"]
+                p[1], p[2], p[3] = max(p[1], px), min(p[2], px), px
+                bar["volume"] += size
 
-    def maker_allowance(self, order, fill_qty: float) -> tuple[float, float]:
-        """Paper, asked by the fee model on each post-only fill: how much of it a backtest would fill at
-        the maker fee (BOOK_SHARE of the volume that traded through its price, less what was already
-        charged as maker), and half the spread now, which the rest pays with the taker fee. Paper's
-        simulated venue fills a post-only order whole once the price trades through, however little
-        traded; charging the rest as the market order it would have been keeps paper's maker fills to
-        the backtest's (review round 8, M8-5)."""
-        coid = str(order.client_order_id)
-        if self._backtest:
-            return fill_qty, 0.0  # the backtest's venue already fills only its share
-        last = (self.venue_trade() if self.venue_trade is not None else None) or self.cache.trade(self._cfg.instrument_id)
-        if last is not None:
-            self._tape(last)  # the trade that crossed it may not have reached this strategy yet
+    def _earn(self, coid: str, kept: dict) -> None:
+        """A backtest shows its venue each one-minute bar as four prints (open, high, low, close), each
+        carrying a quarter of BOOK_SHARE of the bar's volume, and a resting order fills at its limit from
+        each print that trades through it. Paper earns its kept order the same from the same bar, then
+        sends what that adds (_slice_maker)."""
+        bar, kept["bar"] = kept["bar"], None
+        limit = kept["order"].price.as_double()
+        through = sum(1 for p in bar["prints"] if ((p < limit) if kept["order"].is_buy else (p > limit)))
+        if through:
+            kept["earned"] += BOOK_SHARE * bar["volume"] / 4 * through
+            self._slice_maker(coid, kept)
+
+    def _slice_maker(self, coid: str, kept: dict) -> None:
+        """Paper: send at market the part of a kept post-only order the tape has earned so far (_earn). The
+        fee model charges the slice as filled at the limit with the maker fee (ScheduleFeeModel.maker_slices),
+        and the journal records it on the post-only order, so paper's fills, fees and position follow the
+        backtest's slice for slice."""
+        if self._pending_exit is not None:
+            return
+        order, step = kept["order"], self._lot()
+        earned = min(Decimal(str(kept["earned"])), order.quantity.as_decimal())
+        qty = earned.quantize(step, rounding=ROUND_DOWN) - kept["sent"]
         limit = order.price.as_double()
-        if last is None or ((last.price.as_double() >= limit) if order.is_buy else (last.price.as_double() <= limit)):
-            # The trade that filled it isn't in view: what traded through can't be counted, so the whole
-            # fill is charged as the market order it would have been, the cautious way, and it is said once.
-            self._note("crossing_trade_unseen", f"Post-only order {coid} filled on a trade this strategy couldn't "
-                       "see, so the whole fill was charged the taker fee and half the spread")
-        done = self._maker_filled.get(coid, 0.0)
-        maker = min(max(BOOK_SHARE * self._through.get(coid, 0.0) - done, 0.0), fill_qty)
-        self._maker_filled[coid] = done + maker
-        if fill_qty - maker > 1e-12:
-            self._capped[coid] = self._capped.get(coid, 0.0) + fill_qty - maker
-        self._fill_half_spread[coid] = self._half_spread()
-        return maker, self._fill_half_spread[coid]
-
-    def _settle_maker(self, coid: str, order) -> None:
-        """Paper, when a post-only order's wait runs out. A backtest fills it at the maker fee from the
-        volume that trades through its price over the whole wait, BOOK_SHARE of it, and sends the rest at
-        market when the wait runs out. Paper's venue fills it whole on the first trade through, and
-        maker_allowance charged the maker fee only on what had traded through by then, the rest the
-        taker fee and half the spread. Here paper settles the order to what the backtest would have done:
-        - what traded through since counts at the maker fee too;
-        - the rest is the backtest's market order, at the price now rather than this order's, with the
-          taker fee and half the spread on that.
-        The journal rewrites this order's own fills to that price and fee, so the trade they belong to
-        carries the settlement (review round 9, M9-3: it used to land on the next fill's fee, which went
-        negative and moved P&L and R to the next trade). The paper account can't be changed in place, so
-        the difference waits in ScheduleFeeModel.pending_credit until the next fill; marks and
-        reconcile count it meanwhile (_mark), and a restart rebuilds from the journal, which has it."""
-        charged = self._maker_filled.get(coid)
-        if charged is None or order is None or self.fee_model is None:
+        if order.is_buy:
+            account = self._account()
+            bal = next((b for c, b in account.balances().items() if str(c.code) in self._codes("quote")),
+                       None) if account else None
+            room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
+            affordable = bal.free.as_decimal() * room / Decimal(str(limit)) if bal is not None else Decimal(0)
+            qty = min(qty, affordable)
+        else:
+            qty = min(qty, self._position_qty(free=True))
+        qty = qty.quantize(step, rounding=ROUND_DOWN)
+        if qty <= 0 or qty < self._min_qty():
             return
-        filled = order.filled_qty.as_double()
-        through = self._through.get(coid, 0.0)
-        final = min(filled, BOOK_SHARE * through)
-        extra, taker = max(final - charged, 0.0), filled - final
-        if (taker <= 1e-12 and extra <= 1e-12) or filled <= 0:
-            return
-        fm, px, last = self.fee_model, float(order.avg_px or order.price.as_double()), self._price()
-        market = last if last > 0 else px
-        half = self._fill_half_spread.get(coid, 0.0)
-        fee = final * px * float(fm.fees.maker) + taker * market * (float(fm.fees.taker) + half)
-        shift = taker * (market - px)  # a buy at market now costs this much more; a sell brings this much more
-        was = self._fees_journaled.get(coid, 0.0)
-        credit = was - fee - (shift if order.is_buy else -shift)
-        fm.pending_credit += credit
-        settled_px = px + shift / filled
-        if self.runtime is not None:
-            self.runtime.store.settle_order(coid, price=settled_px, fee=fee)
-        msg = (f"Post-only order {coid} filled {filled:.8g} on the first trade through its price, and {through:.8g} "
-               f"traded through it before its wait ran out. Settled as a backtest fills it: {final:.8g} "
-               f"({BOOK_SHARE:.0%} of what traded through) at the maker fee, and {taker:.8g} as the market order sent "
-               f"when the wait ran out, at {market:,.6g} rather than {px:,.6g}. Its fills now read {settled_px:,.6g} "
-               f"with {fee:,.2f} in fees (were {px:,.6g} and {was:,.2f})")
-        self.log.info(msg)
-        if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "info", "maker_fill_settled", msg, ts=self.runtime.now())
+        piece = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=order.side,
+                                          quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
+                                          time_in_force=TimeInForce.GTC)
+        pid = str(piece.client_order_id)
+        self._slices[pid] = coid
+        self.decisions[pid] = kept["info"]
+        if self.fee_model is not None:
+            self.fee_model.maker_slices[pid] = (order.price.as_decimal(), order.is_buy)
+        kept["sent"] += qty
+        kept["inflight"] += 1
+        self._sent.append(piece.client_order_id)  # working until it closes, so a stop waits for it
+        self.submit_order(piece)
 
-    def _forget_tape(self, coid: str) -> None:
-        self._through.pop(coid, None)
-        self._maker_filled.pop(coid, None)
-        self._capped.pop(coid, None)
-        self._fill_half_spread.pop(coid, None)
-        self._settling.pop(coid, None)
-        self._fees_journaled.pop(coid, None)
+    def _close_kept(self, coid: str, why: str, at_market: bool = False) -> None:
+        """Paper: a kept post-only order ends: filled, out of time (the rest goes at market, as a backtest
+        sends it), or cancelled by a stop, a flatten, a halt or a shutdown. A slice still in flight finishes
+        first, and the order's journal row closes after it (_slice_done)."""
+        kept = self._kept.pop(coid, None)
+        if kept is None:
+            return
+        self._cancel_alert(coid)
+        kept["why"] = why
+        if kept["inflight"]:
+            self._closing[coid] = kept
+        else:
+            self._kept_closed(coid, kept)
+        left = kept["order"].quantity.as_decimal() - kept["sent"]
+        if at_market and left > 0:
+            self._finish_at_market(coid, kept["info"], why, order=kept["order"], left=left)
+
+    def _kept_closed(self, coid: str, kept: dict) -> None:
+        if self.runtime is not None and kept["sent"] < kept["order"].quantity.as_decimal():
+            self.runtime.on_order_status(coid, "canceled", kept["why"])
+
+    def _slice_done(self, pid: str, unfilled: float = 0.0) -> None:
+        """Paper: a slice closed. What it didn't fill (a denial, say) is the kept order's to send again."""
+        coid = self._slices.pop(pid)
+        if self.fee_model is not None:
+            self.fee_model.maker_slices.pop(pid, None)
+        kept = self._kept.get(coid) or self._closing.get(coid)
+        if kept is None:
+            return
+        kept["inflight"] -= 1
+        if unfilled > 0:
+            kept["sent"] -= Decimal(str(unfilled)).quantize(self._lot(), rounding=ROUND_DOWN)
+        if coid in self._closing:
+            if not kept["inflight"]:
+                self._kept_closed(coid, self._closing.pop(coid))
+        elif kept["sent"] >= kept["order"].quantity.as_decimal() and not kept["inflight"]:
+            self._close_kept(coid, "filled")  # every slice in: the journal has it filled
 
     def _lot(self) -> Decimal:
         """The smallest size an order carries: the instrument's step, never finer than the account can hold
@@ -1182,6 +1203,7 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
+        self._drop_kept(earn=self._pending_exit is None)
         working = self._working()
         if working:
             # A working order (the backtest's stop and target, a post-only order, or any order not yet at
@@ -1237,8 +1259,6 @@ class LongFlatStrategy(Strategy):
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
         cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
-        if self.fee_model is not None and not self._backtest:
-            cash += getattr(self.fee_model, "pending_credit", 0.0)  # settled in the journal, not yet in the account
         qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
         return cash + qty * price, cash, qty, price
 
@@ -1288,7 +1308,8 @@ class LongFlatStrategy(Strategy):
             if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
                 tol = float(self._lot())  # one unit of the base currency (review round 9, B9-1)
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
-                    self.cancel_all_orders(self._cfg.instrument_id)  # halted: no trading, no flattening
+                    self._drop_kept()  # halted: no trading, no flattening
+                    self.cancel_all_orders(self._cfg.instrument_id)
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
@@ -1322,6 +1343,8 @@ class LongFlatStrategy(Strategy):
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
+        if self._slice_ended(event):
+            return
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         if (order is not None and order.order_type == OrderType.STOP_MARKET and self._backtest
@@ -1354,21 +1377,39 @@ class LongFlatStrategy(Strategy):
         self._exit_lock = True
         self._sell_all("stop_loss", reason, {**signal, "price": price})
 
+    def _drop_kept(self, earn: bool = False) -> None:
+        """Paper: the decision behind every kept post-only order no longer stands; nothing more is sent.
+        earn: first earn each its minute so far. A backtest's venue fills a resting order from the prints
+        of the bar its stop fires in, before the stop sells it all with them (review round 9, M9-3)."""
+        for coid in list(self._kept):
+            if earn and self._kept[coid]["bar"] is not None:
+                self._earn(coid, self._kept[coid])
+            self._close_kept(coid, "")
+
+    def _slice_ended(self, event) -> bool:
+        """A slice closed without filling all of it (denied, rejected, cancelled or expired): settle its
+        kept order. True if it was a slice."""
+        pid = str(event.client_order_id)
+        if pid not in self._slices:
+            return False
+        order = self.cache.order(event.client_order_id)
+        self._slice_done(pid, order.leaves_qty.as_double() if order is not None else 0.0)
+        self._resume_exit(pid)
+        return True
+
     def on_order_denied(self, event) -> None:
         self._order_status(event, "denied")
+        if self._slice_ended(event):
+            return
         self._resume_exit(str(event.client_order_id))
 
     def on_order_canceled(self, event) -> None:
         self._order_status(event, "canceled")
+        if self._slice_ended(event):
+            return
         coid = str(event.client_order_id)
         info = self._maker.pop(coid, None)
         self._cancel_alert(coid)
-        if not self._backtest:
-            try:  # a report failing must not stop the rest going at market below
-                self._settle_maker(coid, self.cache.order(event.client_order_id))
-            except Exception as exc:
-                self._report("_settle_maker", exc)
-        self._forget_tape(coid)
         timed_out = coid in self._fallback
         self._fallback.discard(coid)
         # Only an order this strategy cancelled for time goes on at market: a cancel from a halt, a
@@ -1380,6 +1421,8 @@ class LongFlatStrategy(Strategy):
 
     def on_order_expired(self, event) -> None:
         self._order_status(event, "expired")
+        if self._slice_ended(event):
+            return
         self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
@@ -1388,13 +1431,16 @@ class LongFlatStrategy(Strategy):
         done = order is None or order.is_closed
         if coid in self._maker and done:
             self._maker.pop(coid)
-            if (not self._backtest and self._maker_filled.get(coid, 0.0) < order.filled_qty.as_double() - 1e-12
-                    and f"maker-{coid}" in self.clock.timer_names()):
-                self._settling[coid] = order  # keeps its timer: settled when the wait runs out
-            else:
-                self._cancel_alert(coid)
-                self._forget_tape(coid)
+            self._cancel_alert(coid)
         qty, px = event.last_qty.as_double(), event.last_px.as_double()
+        # Paper: a slice of a kept post-only order is the order's own fill, at its limit and the maker fee
+        # (the fee model charged it so; ScheduleFeeModel.maker_slices).
+        journal_id, fee = coid, (event.commission.as_double() if event.commission is not None else 0.0)
+        kept_id = self._slices.get(coid)
+        if kept_id is not None:
+            px = float(self.fee_model.maker_slices[coid][0]) if self.fee_model is not None else px
+            journal_id = kept_id
+            fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         if event.is_buy:
             cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
             self._entry_qty += qty
@@ -1427,23 +1473,10 @@ class LongFlatStrategy(Strategy):
                             else:
                                 self.cancel_order(order.client_order_id)
         if self.runtime is not None:
-            fee = event.commission.as_double() if event.commission is not None else 0.0
-            if self.fee_model is not None and not self._backtest:
-                # The paper account took an earlier order's settlement off this fill's commission; the journal
-                # already has it on that order (_settle_maker), so this fill keeps its own fee.
-                fee += getattr(self.fee_model, "credit_applied", {}).pop(coid, 0.0)
-                if coid in self._settling or not done:
-                    self._fees_journaled[coid] = self._fees_journaled.get(coid, 0.0) + fee
-                else:
-                    self._fees_journaled.pop(coid, None)
-            self.runtime.on_fill(
-                side="BUY" if event.is_buy else "SELL",
-                qty=event.last_qty.as_double(),
-                price=event.last_px.as_double(),
-                fee=fee,
-                order_id=str(event.client_order_id),
-                trade_id=str(event.trade_id),
-            )
+            self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
+                                 order_id=journal_id, trade_id=str(event.trade_id))
+        if kept_id is not None and done:
+            self._slice_done(coid)
         if done:
             self._resume_exit(coid)
 
@@ -1578,6 +1611,7 @@ class LongFlatStrategy(Strategy):
             self._rest_exits()
 
     def on_stop(self) -> None:
+        self._drop_kept()
         for coid in list(self._maker):
             self._cancel_alert(coid)
         self.cancel_all_orders(self._cfg.instrument_id)

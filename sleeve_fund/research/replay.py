@@ -91,12 +91,8 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
                             max_notional=s.get("max_notional"), assumed_taker_fee=float(fees.taker), warmup_bars=0,
                             **s["params"])
         strategy = strategy_cls(config).attach_runtime(runtime)
-        fee_model.maker_cap = strategy.maker_allowance  # as the paper node does
+        strategy.simulated_venue = True  # as the paper node does
         strategy.fee_model = fee_model
-        # Live, a trade is cached before the venue fills on it; this engine's venue fills first, so the
-        # strategy is shown the trade being filled on, as the cache would have it.
-        trades_at = {t.ts_init: t for t in data if type(t).__name__ == "TradeTick"}
-        strategy.venue_trade = lambda: trades_at.get(strategy.clock.timestamp_ns())
         engine.add_strategy(strategy)
         engine.run()
         orders = list(reversed(store.orders(s["name"], limit=100_000)))

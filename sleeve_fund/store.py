@@ -491,19 +491,6 @@ class Store:
                 values["message"] = message
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
-    def settle_order(self, order_id: str, *, price: float, fee: float) -> None:
-        """Rewrite an order's fills to a settled average price and total fee, the fee shared by quantity:
-        a paper post-only order settled to what a backtest would have filled (LongFlatStrategy._settle_maker)."""
-        with self.engine.begin() as c:
-            rows = c.execute(select(fills_t.c.id, fills_t.c.qty).where(fills_t.c.order_id == order_id)).all()
-            total = sum(r.qty for r in rows)
-            if total <= 0:
-                return
-            for r in rows:
-                c.execute(update(fills_t).where(fills_t.c.id == r.id).values(price=price, fee=fee * r.qty / total))
-            c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
-                      .values(avg_px=price, fee=fee, updated_at=utcnow()))
-
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
