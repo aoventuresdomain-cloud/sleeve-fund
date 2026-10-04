@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_stages.html" import stepper %}
+{% from "_fields.html" import pair_field, exit_fields %}
 {% block title %}Research · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -11,6 +12,33 @@
   <div><div class="k">Passed G1</div><div class="v lead">{{ rows|selectattr('g1', 'equalto', 'PASS')|list|length }}</div><div class="s">on real data</div></div>
   <div><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div></div>
   <div><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div></div>
+</section>
+
+<section class="panel" style="margin-bottom:14px" aria-labelledby="study-h" id="study">
+  <div class="panel-head"><h2 id="study-h">Run a G1 study</h2><span class="hint">walk-forward on the stored history, under paper's rules</span></div>
+  {% if job %}
+  <div class="bt-job" id="study-job" data-job="{{ job.id }}" aria-live="polite">
+    <p style="margin:0 0 6px"><b>{{ job.title }}</b></p>
+    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (job.progress * 100)|round|int }}"><div style="width:{{ (job.progress * 100)|round|int }}%"></div></div>
+    <p class="muted" id="study-job-text">{% if job.status == 'error' %}Couldn't run it: {{ job.error }}{% elif job.ahead %}{{ job.ahead }} run{{ 's' if job.ahead != 1 }} ahead.{% else %}{{ (job.progress * 100)|round|int }}% of the backtests done.{% endif %} The tear sheet opens when it's done.</p>
+  </div>
+  {% endif %}
+  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}</div>{% endif %}
+  <form method="post" action="/research/run" class="study-form">
+    <div class="grid2">
+      <div class="field"><label for="strategy">Model</label><select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == pre.get('strategy') }}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
+      {{ pair_field(instruments, pre) }}
+      <div class="field"><label for="minutes">Bars</label><select id="minutes" name="minutes">{% for m in study_minutes %}<option value="{{ m }}" {{ 'selected' if m|string == pre.get('minutes', '1440')|string }}>{{ 'Daily' if m == 1440 else (m // 60)|string ~ '-hour' if m % 60 == 0 else m|string ~ '-minute' }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: {{ p.max_position_pct|pct0 }} cap, {{ p.max_drawdown|pct0 }} halt</option>{% endfor %}<option value="none" {{ 'selected' if pre.get('risk_profile') == 'none' }}>None: no cap, no halt</option></select></div>
+      <div class="field"><label for="train_days">Train window, days</label><input id="train_days" name="train_days" type="number" min="30" step="1" value="{{ pre.get('train_days', 365) }}"></div>
+      <div class="field"><label for="test_days">Test window, days</label><input id="test_days" name="test_days" type="number" min="30" step="1" value="{{ pre.get('test_days', 180) }}"></div>
+      <div class="field"><label for="holdout_days">Holdout, most recent days</label><input id="holdout_days" name="holdout_days" type="number" min="0" step="1" value="{{ pre.get('holdout_days', 365) }}"></div>
+      <div class="field"><label class="check"><input type="checkbox" name="use_holdout" {{ 'checked' if pre.get('use_holdout') == 'on' }}> Open the holdout</label><p class="hint">Once per model and instrument; a second opening fails G1.</p></div>
+    </div>
+    <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('take_profit_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre) }}</details>
+    <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
+    <p style="margin:10px 0 0"><button>Run study</button></p>
+  </form>
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="pipe-h">
@@ -39,4 +67,25 @@
       <td data-m="hide" class="muted wrap">{{ s.evidence }}</td></tr>{% endfor %}</tbody></table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
 </section>
+{% endblock %}
+{% block scripts %}
+{% if job and job.status in ('queued', 'running') %}<script>
+(function () {
+  const box = document.getElementById("study-job"), bar = box.querySelector(".progress"), text = document.getElementById("study-job-text");
+  async function poll() {
+    try {
+      const r = await fetch("/api/backtest/jobs/" + box.dataset.job, {headers: {Accept: "application/json"}});
+      const j = await r.json();
+      if (!r.ok) { text.textContent = j.detail || "This study can't be found any more. Run it again."; return; }
+      if (j.status === "done") { location.href = "/research/" + encodeURIComponent(j.run_id); return; }
+      if (j.status === "error") { text.textContent = "Couldn't run it: " + j.error; box.classList.add("error-box"); return; }
+      const pct = Math.round(j.progress * 100);
+      bar.firstElementChild.style.width = pct + "%"; bar.setAttribute("aria-valuenow", pct);
+      text.textContent = j.ahead ? `${j.ahead} run${j.ahead === 1 ? "" : "s"} ahead.` : `${pct}% of the backtests done.`;
+    } catch (e) { /* a dropped request: try again */ }
+    setTimeout(poll, 1000);
+  }
+  setTimeout(poll, 1000);
+})();
+</script>{% endif %}
 {% endblock %}

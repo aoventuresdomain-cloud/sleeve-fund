@@ -1,0 +1,148 @@
+"""A G1 study on the venue history store, run the way the backtest page and paper run: the same fees
+(the connected account's, else the published schedule), the same measured spread, the strategy's
+risk profile with its halt and pause, and resting orders matched on shorter bars between decisions.
+
+The command line (python -m sleeve_fund study --store) and the Research page both run studies here,
+so a tear sheet means the same whichever started it."""
+
+from __future__ import annotations
+
+import importlib
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+# Where the server keeps research it writes: outside the code, which each deploy replaces.
+LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
+TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheets"))
+
+# Bar lengths a study can decide on. Shorter bars take hours a study and more memory than a job has
+# (review round 7: a 2-year 1-minute study ran past 90 minutes and 1.9 GB), and every result is
+# judged on daily returns anyway.
+STUDY_MINUTES = (1440, 240, 60, 15)
+# The most execution bars one backtest in a study replays: resting orders and the risk guard are
+# matched on the shortest bars that keep each run within this (as the backtest page does).
+EXEC_BAR_BUDGET = 150_000
+EXEC_STEPS = (1, 5, 15, 60)
+
+
+@dataclass(frozen=True)
+class StudyRequest:
+    strategy: str
+    pair: str  # BASE/QUOTE
+    venue: str | None = None
+    minutes: int = 1440
+    risk_profile: str | None = "balanced"  # None: uncapped and unguarded
+    train_days: int = 3 * 365
+    test_days: int = 365
+    holdout_days: int = 365
+    use_holdout: bool = False
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    risk_per_trade: float | None = None
+
+    def validate(self) -> None:
+        if self.minutes not in STUDY_MINUTES:
+            raise ValueError(f"studies decide on {', '.join(_bars(m) for m in STUDY_MINUTES)} bars; "
+                             f"{_bars(self.minutes)} bars would take hours")
+        for name in ("train_days", "test_days"):
+            if getattr(self, name) < 30:
+                raise ValueError(f"{name.replace('_', ' ')} must be at least 30")
+        if self.holdout_days < 0:
+            raise ValueError("holdout days can't be negative")
+        if "/" not in self.pair:
+            raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
+
+
+def _bars(minutes: int) -> str:
+    return "daily" if minutes == 1440 else f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-minute"
+
+
+def exec_step(span: pd.Timedelta, minutes: int) -> int | None:
+    """The execution-bar length for a run of `span` deciding on `minutes` bars, or None when the
+    decision bars are already as short as the budget allows."""
+    step = next((m for m in EXEC_STEPS if span / pd.Timedelta(minutes=m) <= EXEC_BAR_BUDGET), None)
+    return step if step is not None and step < minutes and minutes % step == 0 else None
+
+
+def spec_of(strategy: str):
+    try:
+        return importlib.import_module(f"sleeve_fund.strategies.{strategy}").SPEC
+    except (ModuleNotFoundError, AttributeError) as exc:
+        raise ValueError(f"no strategy module with a SPEC called {strategy!r}") from exc
+
+
+def dataset_name(venue: str, pair: str, minutes: int) -> str:
+    base, quote = pair.split("/")
+    return f"{venue}-{base}{quote}-store".lower() + (f"-{minutes}m" if minutes != 1440 else "")
+
+
+def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: Path | None = None,
+                    out_dir: Path | None = None, history=None) -> Path:
+    """Run the study and write its tear sheet; returns the tear sheet's path. store: the journal
+    (for the connected account's fees and the measured spread), if there is one."""
+    from sleeve_fund import spreads
+    from sleeve_fund.fees import resolve as resolve_fees
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.tearsheet import render
+    from sleeve_fund.venues import venue as venue_profile
+
+    req.validate()
+    spec = spec_of(req.strategy)
+    profile = venue_profile(req.venue)
+    history = history or HistoryStore()
+    try:
+        prices = history.read(profile.name, req.pair, req.minutes)
+    except KeyError:
+        raise ValueError(f"no stored {profile.label} history for {req.pair}; the history collector fills the store "
+                         "for each instrument a strategy trades") from None
+    if prices.empty:
+        raise ValueError(f"the {profile.label} history for {req.pair} has no {_bars(req.minutes)} bars yet")
+    fees = resolve_fees(profile.name, store)
+    spread = spreads.resolve(profile.name, req.pair, store)
+    base, quote = req.pair.split("/")
+    instrument = profile.instrument(base, quote, fees=fees.fees)
+    exec_prices = None
+    step = exec_step(prices.index[-1] - prices.index[0], req.minutes)
+    if step is not None:
+        exec_prices = history.read(profile.name, req.pair, step, start=prices.index[0] - pd.Timedelta(minutes=req.minutes))
+    ledger = IdeaLedger(ledger_path or LEDGER)
+    dataset = dataset_name(profile.name, req.pair, req.minutes)
+    result = run_study(
+        spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
+        train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
+        exits={"stop_loss": req.stop_loss, "take_profit": req.take_profit, "risk_per_trade": req.risk_per_trade},
+        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress)
+    result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
+    out = (out_dir or TEARSHEETS) / f"{spec.name}_{dataset}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render(result, ledger), encoding="utf-8")
+    return out
+
+
+def seed(ledger: Path | None = None, tearsheets: Path | None = None) -> None:
+    """On the server, research the dashboard writes lives outside the code (IDEA_LEDGER, TEARSHEET_DIR),
+    which each deploy replaces. Bring in the repository's record: every ledger line not there yet (the
+    counter only ever grows), and every tear sheet that is missing or older there."""
+    import shutil
+
+    ledger, tearsheets = ledger or LEDGER, tearsheets or TEARSHEETS
+    repo_ledger, repo_sheets = ROOT / "research" / "idea_ledger.jsonl", ROOT / "research" / "tearsheets"
+    if ledger.resolve() != repo_ledger.resolve() and repo_ledger.exists():
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        have = set(ledger.read_text(encoding="utf-8").splitlines()) if ledger.exists() else set()
+        new = [line for line in repo_ledger.read_text(encoding="utf-8").splitlines() if line.strip() and line not in have]
+        if new:
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write("".join(line + "\n" for line in new))
+    if tearsheets.resolve() != repo_sheets.resolve() and repo_sheets.is_dir():
+        tearsheets.mkdir(parents=True, exist_ok=True)
+        for src in repo_sheets.glob("*.md"):
+            dst = tearsheets / src.name
+            if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+                shutil.copy2(src, dst)

@@ -155,6 +155,30 @@ def test_an_hourly_study_is_judged_on_daily_returns(tmp_path, instrument):
         run_study(SPEC, hourly.iloc[::7], instrument, dataset="x", ledger=ledger)
 
 
+@pytest.mark.parametrize("minutes,start", [(15, "2022-01-01 23:45"), (5, "2022-01-01 23:55")])
+def test_a_study_on_bars_that_start_mid_day_counts_each_whole_day_once(tmp_path, instrument, minutes, start):
+    """Review round 7, R7-M1: 15- and 5-minute studies crashed in the tear sheet ("duplicate labels"):
+    a window starting at 23:45 put one day in two folds, and a part day at a window's end was passed
+    off as a whole one. Each fold now counts only the days wholly inside its test window."""
+    import numpy as np
+
+    idx = pd.date_range(start, periods=150 * 1440 // minutes, freq=f"{minutes}min", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.003, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    bars = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 1e6},
+                        index=idx)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, bars, instrument, dataset=f"syn-{minutes}m", ledger=ledger, synthetic=True, holdout_days=30,
+                  train_days=60, test_days=30, default_params={"fast": 20, "slow": 100}, use_holdout=True)
+    assert len(r.folds) == 2
+    days = pd.Series(r.oos_returns.index)
+    assert days.is_unique and (days.diff().dropna() >= pd.Timedelta("1D")).all()
+    assert 2 * 29 <= len(days) <= 2 * 30  # a test window starting at 23:45 loses the day it starts in
+    assert (days.dt.floor("1D") == days).all() and days.max() <= r.research_end
+    assert r.holdout is not None
+    render(r, ledger)  # the tear sheet no longer crashes
+
+
 def test_slow_regimes_count_as_few_independent_days():
     """Review round 6: the independence check looked one day back, so 60-day regimes with a lag-1
     autocorrelation of 0.3 passed G1 by luck 10.7% of the time. It now sums every autocorrelation
@@ -192,3 +216,57 @@ def test_cli_studies_hourly_bars_from_the_store(tmp_path, monkeypatch):
                  "--holdout-days", "60", "--train-days", "180", "--test-days", "90", "--out", str(tmp_path / "s.md")]) == 0
     sheet = (tmp_path / "s.md").read_text()
     assert "at 60-minute bars" in sheet and "kraken-btcusd-store-60m" in sheet
+
+
+def _stored_minutes(days, seed=6):
+    """`days` of minute bars ending today, for the history store."""
+    import numpy as np
+
+    now = pd.Timestamp.now(tz="UTC").floor("1D")
+    idx = pd.date_range(now - pd.Timedelta(days=days), periods=days * 1440, freq="1min", tz="UTC")
+    c = 2_000 * np.exp(np.cumsum(np.random.default_rng(seed).normal(0, 0.0008, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 5.0},
+                        index=idx)
+
+
+def test_a_store_study_runs_under_paper_rules(tmp_path):
+    """Review round 7: research ran without the paper risk rules or execution bars, so a study could
+    show a strategy trading on through a drawdown that halts it in paper. A store study now trades
+    under the risk profile (halt and pause included) with resting orders matched on shorter bars."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+
+    hist = HistoryStore(tmp_path / "hist")
+    hist.append("KRAKEN", "ETH/USD", _stored_minutes(130), cursor="x")
+    req = StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=240, risk_profile="conservative",
+                       train_days=60, test_days=30, holdout_days=30)
+    done = []
+    sheet = run_store_study(req, progress=done.append, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts",
+                            history=hist).read_text()
+    assert "trades under the conservative risk profile" in sheet and "drawdown halt" in sheet
+    assert "matched on 5-minute bars" in sheet  # 130 days fit the budget at 5 minutes
+    assert "Tested on `ETH/USD` at 240-minute bars" in sheet
+    assert done and done == sorted(done) and done[-1] <= 1
+    with pytest.raises(ValueError, match="would take hours"):
+        run_store_study(StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=1), history=hist)
+    with pytest.raises(ValueError, match="no stored Kraken spot history for SOL/USD"):
+        run_store_study(StudyRequest(strategy="buy_and_hold", pair="SOL/USD"), history=hist)
+
+
+def test_a_halt_in_research_leaves_the_strategy_flat_as_paper_would(tmp_path, instrument):
+    """The 60-minute study showed a 20% in-sample drawdown, past the balanced halt. Under a profile
+    the strategy goes flat at the halt and stays flat; the benchmark is never halted."""
+    import numpy as np
+
+    idx = pd.date_range("2022-01-01", periods=200, freq="1D", tz="UTC")
+    c = np.r_[np.linspace(100, 110, 60), np.linspace(110, 30, 40), np.linspace(30, 60, 100)]
+    daily = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1e6}, index=idx)
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(HOLD, daily, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=0,
+                  train_days=60, test_days=60, risk_profile="conservative")
+    eq = r.full_period.equity
+    assert eq.iloc[-1] == pytest.approx(eq.iloc[-30], rel=1e-9)  # flat since the halt, though the price rose
+    assert r.full_period_benchmark.equity.iloc[-1] > r.full_period_benchmark.equity.iloc[-30]

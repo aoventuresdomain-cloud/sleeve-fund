@@ -2,6 +2,7 @@
 
     python -m sleeve_fund study trend_filter --store --base BTC --quote USD
     python -m sleeve_fund study trend_filter --store --minutes 60 --train-days 365 --test-days 90 --holdout-days 90
+    (the Research page runs the same --store study from the browser)
     python -m sleeve_fund study trend_filter --data data/XBTUSD_1440.csv --base BTC --quote USD
     python -m sleeve_fund study trend_filter --synthetic
     python -m sleeve_fund counter
@@ -10,30 +11,37 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+import os
 import sys
 from pathlib import Path
 
 from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv
-from sleeve_fund.risk import profile as risk_profile
-from sleeve_fund.venues import venue
 from sleeve_fund.research.ledger import IdeaLedger
+from sleeve_fund.research.run import LEDGER, STUDY_MINUTES, TEARSHEETS, StudyRequest, run_store_study, spec_of
 from sleeve_fund.research.study import run_study
 from sleeve_fund.research.tearsheet import render
-
-ROOT = Path(__file__).resolve().parent.parent
+from sleeve_fund.venues import venue
 
 
 def _spec(name: str):
     try:
-        return importlib.import_module(f"sleeve_fund.strategies.{name}").SPEC
-    except (ModuleNotFoundError, AttributeError) as exc:
-        raise SystemExit(f"no strategy module with a SPEC called {name!r}") from exc
+        return spec_of(name)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _journal():
+    """On the server: the journal, for the connected account's fees and the measured spread."""
+    if not os.environ.get("DATABASE_URL"):
+        return None
+    from sleeve_fund.store import Store
+
+    return Store()
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="sleeve_fund")
-    ap.add_argument("--ledger", default=str(ROOT / "research" / "idea_ledger.jsonl"))
+    ap.add_argument("--ledger", default=str(LEDGER), help="idea counter (default: $IDEA_LEDGER, else the repository's)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("study", help="run a full G1 study and write a tear sheet")
@@ -45,8 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--base", default="BTC")
     st.add_argument("--quote", default="USD")
     st.add_argument("--venue", default=None, help="venue profile for fees (default: the default venue)")
-    st.add_argument("--minutes", type=int, default=1440,
-                    help="bar length with --store: 1440 daily, 60 hourly, 15, 5 or 1; judged on daily returns either way")
+    st.add_argument("--minutes", type=int, default=1440, choices=STUDY_MINUTES,
+                    help="bar length with --store: 1440 daily, 240, 60 or 15; judged on daily returns either way")
     st.add_argument("--holdout-days", type=int, default=365)
     st.add_argument("--train-days", type=int, default=3 * 365, help="walk-forward training window")
     st.add_argument("--test-days", type=int, default=365, help="walk-forward test window")
@@ -55,8 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--take-profit", type=float, help="exit if price rises this fraction above entry, e.g. 0.2")
     st.add_argument("--risk-per-trade", type=float, help="size so a stop-out loses this fraction of equity")
     st.add_argument("--risk-profile", default="balanced",
-                    help="cap positions (and the benchmark) as this paper risk profile does; 'none' for uncapped")
-    st.add_argument("--out", help="tear sheet path (default research/tearsheets/<strategy>_<dataset>.md)")
+                    help="trade under this paper risk profile (cap, drawdown halt, daily-loss pause); 'none' for "
+                         "uncapped and unguarded")
+    st.add_argument("--out", help="tear sheet path (default: $TEARSHEET_DIR, else research/tearsheets, "
+                                  "<strategy>_<dataset>.md)")
 
     sub.add_parser("counter", help="print the idea counter")
     args = ap.parse_args(argv)
@@ -71,28 +81,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     spec = _spec(args.strategy)
+    profile_name = None if args.risk_profile == "none" else args.risk_profile
+    if args.store:
+        req = StudyRequest(strategy=args.strategy, pair=f"{args.base}/{args.quote}", venue=args.venue,
+                           minutes=args.minutes, risk_profile=profile_name, train_days=args.train_days,
+                           test_days=args.test_days, holdout_days=args.holdout_days, use_holdout=args.use_holdout,
+                           stop_loss=args.stop_loss, take_profit=args.take_profit, risk_per_trade=args.risk_per_trade)
+        try:
+            out = run_store_study(req, store=_journal(), ledger_path=Path(args.ledger),
+                                  out_dir=Path(args.out).parent if args.out else None)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if args.out and out != Path(args.out):
+            out = out.rename(args.out)
+        print(f"tear sheet: {out}")
+        return 0
     if args.synthetic:
         prices, dataset = synthetic_ohlcv(), "synthetic"
-    elif args.store:
-        from sleeve_fund.history import HistoryStore
-
-        name = venue(args.venue).name
-        prices = HistoryStore().read(name, f"{args.base}/{args.quote}", args.minutes)
-        dataset = f"{name.lower()}-{args.base}{args.quote}-store".lower() + (
-            f"-{args.minutes}m" if args.minutes != 1440 else "")
     else:
         prices = load_kraken_ohlcvt(args.data)
         dataset = Path(args.data).stem
-    import os
-
     from sleeve_fund.fees import resolve
 
-    store = None
-    if os.environ.get("DATABASE_URL"):  # on the server: use the connected account's fetched rates
-        from sleeve_fund.store import Store
-
-        store = Store()
-    quote = resolve(args.venue, store)
+    quote = resolve(args.venue, _journal())
     print(f"fees: {quote.text}")
     instrument = venue(args.venue).instrument(args.base, args.quote, fees=quote.fees)
     result = run_study(
@@ -107,9 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         test_days=args.test_days,
         use_holdout=args.use_holdout,
         exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade},
-        position_cap=None if args.risk_profile == "none" else risk_profile(args.risk_profile).max_position_pct,
+        risk_profile=profile_name,
     )
-    out = Path(args.out) if args.out else ROOT / "research" / "tearsheets" / f"{spec.name}_{dataset}.md"
+    out = Path(args.out) if args.out else TEARSHEETS / f"{spec.name}_{dataset}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(result, ledger), encoding="utf-8")
     print(f"tear sheet: {out}")

@@ -67,7 +67,10 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
       HISTORY_DIR: /data/history
       BACKUP_DIR: /data/backups  # read only, to show the newest backup on the Operations page
-    volumes: [history:/data/history:ro, backups:/data/backups:ro]
+      # Studies run from the Research page, and the idea counter, kept apart from the code each deploy replaces.
+      IDEA_LEDGER: /data/research/idea_ledger.jsonl
+      TEARSHEET_DIR: /data/research/tearsheets
+    volumes: [history:/data/history:ro, backups:/data/backups:ro, research:/data/research]
     command: uvicorn --factory sleeve_fund.dashboard.app:create_app --host 0.0.0.0 --port 8000 --proxy-headers
 
   caddy:
@@ -84,5 +87,6 @@ services:
 volumes:
   backups:
   history:
+  research:
   pgdata:
   caddy_data:
