@@ -276,11 +276,11 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     wait = params.get("maker_wait_minutes")
     exec_prices, matched_on = None, None
     span = prices.index[-1] - prices.index[0]
-    step = _exec_step(span, minutes, bool(wait), risk_profile is not None) if fetch is None else None
-    if step is not None:
+    exec_step = _exec_step(span, minutes, bool(wait), risk_profile is not None) if fetch is None else None
+    if exec_step is not None:
         exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta(minutes=minutes),
-                                        prices.index[-1], step)
-        matched_on = None if exec_prices is None else f"{step}-minute"
+                                        prices.index[-1], exec_step)
+        matched_on = None if exec_prices is None else f"{exec_step}-minute"
     tick = None
     if progress is not None:
         t0, t1 = prices.index[0].to_pydatetime(), prices.index[-1].to_pydatetime()
@@ -290,7 +290,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
             progress(min(1.0, max(0.0, (now - t0).total_seconds() / whole)))
 
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
-                       exec_minutes=step if exec_prices is not None else 1, risk_profile=risk_profile,
+                       exec_minutes=exec_step if exec_prices is not None else 1, risk_profile=risk_profile,
                        half_spread=spread.half_spread, bar_minutes=minutes, progress=tick)
     if keep is not None:
         keep["journal"] = res.journal
@@ -322,7 +322,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "cap": cap,
         "data": {**_data_note(prices, minutes), "capped": cap_note(minutes, days)},
         "execution": _execution(res, wait, matched_on),
-        "risk": _risk(res.risk_events, risk_profile, step if exec_prices is not None else minutes),
+        "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "source": spread.source},
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
