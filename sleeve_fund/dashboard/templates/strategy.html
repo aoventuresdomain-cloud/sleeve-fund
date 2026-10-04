@@ -26,7 +26,7 @@
   </section>
   <section class="panel span-5">
     <div class="panel-head"><h2>Evidence</h2></div>
-    {% if r.sheets %}<ul class="feed">{% for s in r.sheets %}<li><span class="when">{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% else %}<span class="chip">n/a</span>{% endif %}</span><span class="what"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.dataset == 'synthetic' %} <span class="warn">synthetic data</span>{% endif %}<br><span class="muted">{{ s.evidence }}</span></span></li>{% endfor %}</ul>
+    {% if r.sheets %}<ul class="feed">{% for s in r.sheets %}<li><span class="when">{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% elif s.g1 == 'NOT JUDGED' %}<span class="chip paused">Not judged</span>{% else %}<span class="chip">n/a</span>{% endif %}</span><span class="what"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.dataset == 'synthetic' %} <span class="warn">synthetic data</span>{% endif %}<br><span class="muted">{{ s.evidence }}</span></span></li>{% endfor %}</ul>
     {% else %}<p class="empty">Not through the research loop yet.</p>{% endif %}
     <h2 style="margin:16px 0 8px">Strategies running it</h2>
     {% if r.sleeves %}<ul class="feed">{% for s in r.sleeves %}<li><span class="when">{{ chip(s.status) }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }}</span></span></li>{% endfor %}</ul>

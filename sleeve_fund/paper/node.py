@@ -98,6 +98,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     venue = profile.venue
     base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
     data_factory, data_config = profile.data_client()
+    fee_model = ScheduleFeeModel(sleeve.fees)
     balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
     if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
         balances = [Money(runtime.book["cash"], Currency.from_str(quote_code))]
@@ -117,7 +118,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 account_id=AccountId.from_str(f"{profile.name}-PAPER-{tag[:20]}"),
                 oms_type=OmsType.NETTING,
                 account_type=AccountType.CASH,
-                fee_model=ScheduleFeeModel(sleeve.fees),
+                fee_model=fee_model,
                 fill_model=fill_model(),
             ),
         )
@@ -134,7 +135,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                        "taker_fee": str(sleeve.fees.taker),
                        "tick_seconds": runtime.tick_seconds if runtime is not None else None},
         }
-    node.add_strategy(
+    strategy = (
         strategy_cls(
             config_cls(
                 instrument_id=InstrumentId.from_str(sleeve.instrument_id),
@@ -151,6 +152,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         ).attach_runtime(runtime).attach_recorder(recorder)
         .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
     )
+    # Post-only fills pay the maker fee only on the share a backtest would fill (review round 8, M8-5).
+    fee_model.maker_cap = strategy.maker_allowance
+    strategy.fee_model = fee_model
+    node.add_strategy(strategy)
     return node
 
 

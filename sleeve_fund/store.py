@@ -275,6 +275,9 @@ backtests_t = Table(
     Column("result", Text, nullable=False),
     Index("backtests_key", "key", "created_at"),
 )
+# Events that say the strategy's own code raised: a handler, or the risk check's tick (see
+# LongFlatStrategy._report).
+ERROR_KINDS = ("handler_failed", "tick_failed")
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
@@ -935,7 +938,7 @@ class Store:
                                              for e in journal.events_])
             # A run whose strategy raised must say so wherever it is opened (review round 8, R8-9). A run
             # without a runtime journals no event of its own, so the result's words stand in for it.
-            if result.get("errors") and not any(e.get("kind") == "handler_failed" for e in journal.events_):
+            if result.get("errors") and not any(e.get("kind") in ERROR_KINDS for e in journal.events_):
                 c.execute(insert(events_t).values(sleeve=name, ts=now, level="error", kind="handler_failed",
                                                   message=result["errors"]))
             # To the microsecond, so runs saved in the same second still sort (and prune) in order.
@@ -947,7 +950,7 @@ class Store:
         """How many times the strategy's own code raised, as journaled (handler_failed events); with
         since_start, only since its process last started, so a fixed and restarted strategy reads clean."""
         q = select(func.count()).select_from(events_t).where(events_t.c.sleeve == sleeve,
-                                                            events_t.c.kind == "handler_failed")
+                                                            events_t.c.kind.in_(ERROR_KINDS))
         start = self.last_event(sleeve, ("process_start",)) if since_start else None
         if start is not None:
             q = q.where(events_t.c.id > start["id"])
@@ -971,7 +974,7 @@ class Store:
 
     def backtests(self, limit: int = 50) -> list[dict]:
         errored = (select(events_t.c.id).where(events_t.c.sleeve == backtests_t.c.sleeve,
-                                               events_t.c.kind == "handler_failed").exists())
+                                               events_t.c.kind.in_(ERROR_KINDS)).exists())
         q = (select(backtests_t.c.id, backtests_t.c.sleeve, backtests_t.c.title, backtests_t.c.query,
                     backtests_t.c.created_at, errored.label("errored"))
              .order_by(backtests_t.c.created_at.desc()).limit(limit))

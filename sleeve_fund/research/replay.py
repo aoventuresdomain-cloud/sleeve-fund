@@ -78,17 +78,26 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
     runtime = SleeveRuntime(store, s["name"], tick_seconds=s["tick_seconds"])
     engine = BacktestEngine(BacktestEngineConfig(trader_id=TraderId.from_str("REPLAY-001"),
                                                  logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
+    fee_model = ScheduleFeeModel(fees)
     try:
         engine.add_venue(venue=instrument.id.venue, oms_type=OmsType.NETTING, account_type=AccountType.CASH,
                          base_currency=None, starting_balances=[_money(b) for b in h["balances"]],
-                         fee_model=ScheduleFeeModel(fees), fill_model=fill_model())
+                         fee_model=fee_model, fill_model=fill_model())
         engine.add_instrument(instrument)
-        engine.add_data(_data(instrument, rows))
+        data = _data(instrument, rows)
+        engine.add_data(data)
         strategy_cls, config_cls = REGISTRY[s["strategy"]]
         config = config_cls(instrument_id=instrument.id, bar_type=BarType.from_str(f"{instrument.id}-{s['bar_spec']}"),
                             max_notional=s.get("max_notional"), assumed_taker_fee=float(fees.taker), warmup_bars=0,
                             **s["params"])
-        engine.add_strategy(strategy_cls(config).attach_runtime(runtime))
+        strategy = strategy_cls(config).attach_runtime(runtime)
+        fee_model.maker_cap = strategy.maker_allowance  # as the paper node does
+        strategy.fee_model = fee_model
+        # Live, a trade is cached before the venue fills on it; this engine's venue fills first, so the
+        # strategy is shown the trade being filled on, as the cache would have it.
+        trades_at = {t.ts_init: t for t in data if type(t).__name__ == "TradeTick"}
+        strategy.venue_trade = lambda: trades_at.get(strategy.clock.timestamp_ns())
+        engine.add_strategy(strategy)
         engine.run()
         orders = list(reversed(store.orders(s["name"], limit=100_000)))
         return (orders, list(reversed(store.fills(s["name"], limit=100_000)))) if with_fills else orders

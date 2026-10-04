@@ -173,14 +173,15 @@ def _execution(res, wait, matched_on) -> dict:
     return out
 
 
-def _errors(errors: list) -> str:
+def _errors(errors: list, count: int = 0) -> str:
     """The strategy's own errors during the run, which would otherwise make wrong results look fine."""
     if not errors:
         return ""
     from sleeve_fund.strategies.base import handler_error_words
 
     name, what = errors[0]
-    return (f"The strategy hit {len(errors)} error{'s' if len(errors) != 1 else ''} during this run, the first "
+    n = max(count, len(errors))
+    return (f"The strategy hit {n:,} error{'s' if n != 1 else ''} during this run, the first "
             f"{handler_error_words(name, what)}. Its orders after that may be wrong, so don't rely on these results.")
 
 
@@ -346,7 +347,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "data": _data_note(prices, minutes),
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
-        "errors": _errors(res.handler_errors),
+        "errors": _errors(res.handler_errors, res.handler_error_count),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "short": spread.short, "source": spread.source},
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,

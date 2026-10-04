@@ -7,6 +7,7 @@ at market on the trade that crosses the level; a backtest only sees whole bars, 
 the venue and fill at the level. Each exit lands in the same minute, at a price a few basis points
 apart, and sizes follow equity, so they drift by as much."""
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -144,7 +145,7 @@ def test_the_risk_guard_acts_in_the_same_minute_on_ticks_and_bars(tmp_path):
     _same_trades(ticks, bar, {"risk_pause": (-100.0, 100.0)})
 
 
-def _maker_both(tmp_path, size):
+def _maker_both(tmp_path, size, min_level="warning"):
     """A maker strategy (post-only entries and exits, a 5-minute wait, 15-minute decisions) on both
     paths: paper replayed tick by tick, and the backtest on the same trades as minute bars with their
     true volume. Returns (paper orders, paper fills, paper events, backtest journal)."""
@@ -161,7 +162,7 @@ def _maker_both(tmp_path, size):
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
     res = run_backtest("trend_filter", decisions, INST, params=params, starting_capital=10_000, risk_profile="aggressive",
                        bar_minutes=15, exec_prices=bars, exec_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
-    return orders, fills, store.events("parity", limit=1000, min_level="warning"), res.journal
+    return orders, fills, store.events("parity", limit=1000, min_level=min_level), res.journal
 
 
 def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_path):
@@ -184,17 +185,36 @@ def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_p
         assert 0 <= worse <= 1.5, (t, b)
 
 
-def test_where_little_trades_paper_fills_more_maker_orders_and_says_so(tmp_path):
-    """Thin trades (0.0005 a second): the backtest gives each post-only order at most BOOK_SHARE of
-    what trades through its price, so most of each entry goes at market after the wait. Paper's
-    simulated venue fills them whole once the price is through, which is the known gap: each such
-    fill is reported in paper's events with what the backtest would have allowed."""
-    orders, fills, events, j = _maker_both(tmp_path, size=0.0005)
-    paper_maker = {o["order_id"] for o in orders if o["order_type"] == "POST-ONLY LIMIT"}
-    bt_entries = [f for f in j.fills_ if j.orders_[f["order_id"]]["intent"] == "entry"]
-    bt_maker = sum(f["qty"] for f in bt_entries if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT")
-    assert bt_maker < 0.25 * sum(f["qty"] for f in bt_entries)
-    assert all(f["order_id"] in paper_maker for f in fills)  # paper: every fill a maker fill
-    flagged = [e for e in events if e["kind"] == "maker_fill_above_tape"]
-    assert len(flagged) >= len(paper_maker) - 1
-    assert "a backtest would fill at most" in flagged[0]["message"] and f"({BOOK_SHARE:.0%})" in flagged[0]["message"]
+_SETTLED = re.compile(r"filled ([\d.e-]+) on the first.*?it: ([\d.e-]+) \(.*?([\d,.]+) (comes off|goes on)")
+
+
+@pytest.mark.parametrize("size", [0.0005, 0.002])
+def test_where_little_trades_paper_settles_maker_fills_to_the_backtests(tmp_path, size):
+    """Thin trades: the backtest gives each post-only order at most BOOK_SHARE of what trades through
+    its price over its wait, then sends the rest at market. Paper's simulated venue fills the order
+    whole on the first trade through, so paper charges the maker fee on that share only and settles the
+    rest as the backtest's market order when the wait runs out (review round 8, M8-5). Paper's maker
+    share is then within 10 points of the backtest's, and its P&L within 0.1% of capital."""
+    orders, fills, all_events, j = _maker_both(tmp_path, size=size, min_level="info")
+    events = [e for e in all_events if e["kind"] == "maker_fill_settled"]  # newest first
+    assert events and not [e for e in all_events if e["kind"] == "maker_fill_above_tape"]
+    settled_qty = sum(float(_SETTLED.search(e["message"]).group(1)) for e in events)
+    maker = sum(float(_SETTLED.search(e["message"]).group(2)) for e in events)
+    paper_qty = sum(f["qty"] for f in fills)
+    paper_share = (maker + paper_qty - settled_qty) / paper_qty  # orders not settled filled all at the maker fee
+    bt_qty = sum(f["qty"] for f in j.fills_)
+    bt_share = sum(f["qty"] for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT") / bt_qty
+    assert bt_share < 0.7 and abs(paper_share - bt_share) <= 0.10, (paper_share, bt_share)
+    # The settlement of the last order lands on the next fill's fee; there is none here, so count it in.
+    newest = _SETTLED.search(events[0]["message"])
+    pending = 0.0
+    if events[0]["ts"] >= fills[-1]["ts"]:
+        pending = float(newest.group(3).replace(",", "")) * (1 if newest.group(4) == "comes off" else -1)
+    last = j.equity[-1]["price"]
+    paper, bt = _pnl(fills, last) + pending, _pnl(j.fills_, last)
+    assert abs(paper - bt) <= 0.001 * 10_000, (paper, bt)
+
+
+def _pnl(fills, last):
+    cash = sum((1 if f["side"] == "SELL" else -1) * f["qty"] * f["price"] - f["fee"] for f in fills)
+    return cash + sum((-1 if f["side"] == "SELL" else 1) * f["qty"] for f in fills) * last

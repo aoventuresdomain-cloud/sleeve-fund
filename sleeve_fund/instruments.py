@@ -72,13 +72,29 @@ class ScheduleFeeModel(FeeModel):
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
         self.spread_paid: dict[str, float] = {}
+        # Paper only: maker_cap(order, fill_qty) -> (the part a backtest would fill at the maker fee, half
+        # the spread now). Paper's simulated venue fills a post-only order whole once the price trades
+        # through it; a backtest fills at most BOOK_SHARE of the volume that traded through. The rest is
+        # charged as the market order it would have been: the taker fee and half the spread (review
+        # round 8, M8-5). Set by the paper node to the strategy's LongFlatStrategy.maker_allowance.
+        self.maker_cap = None
+        # Paper only: fees to give back on the next fill, from post-only orders that a backtest would have
+        # filled at the maker fee by the end of their wait (LongFlatStrategy._settle_maker).
+        self.pending_credit = 0.0
 
     def rate_for(self, order) -> Decimal:
         return self.fees.maker if getattr(order, "is_post_only", False) else self.fees.taker
 
     def get_commission(self, order, fill_quantity, fill_px, instrument) -> Money:
         notional = fill_quantity.as_decimal() * fill_px.as_decimal()
-        charge = notional * self.rate_for(order)
+        credit, self.pending_credit = Decimal(str(self.pending_credit)), 0.0
+        if self.maker_cap is not None and getattr(order, "is_post_only", False):
+            maker_qty, half = self.maker_cap(order, fill_quantity.as_double())
+            maker = min(Decimal(str(maker_qty)), fill_quantity.as_decimal())
+            taker = (fill_quantity.as_decimal() - maker) * fill_px.as_decimal()
+            charge = maker * fill_px.as_decimal() * self.fees.maker + taker * (self.fees.taker + Decimal(str(half)))
+            return Money(float(charge - credit), instrument.quote_currency)
+        charge = notional * self.rate_for(order) - credit
         if self.half_spread and not getattr(order, "is_post_only", False):
             spread = notional * self.half_spread
             coid = str(order.client_order_id)
@@ -97,7 +113,7 @@ def fill_model():
 
 
 # The share of the volume that trades through a resting order's price which that order may take in a
-# backtest (sleeve_fund.research.runner). Paper's simulated venue can't be held to it: it fills a
-# post-only order in full once the price trades through, so paper measures each maker fill against it
-# instead (LongFlatStrategy._check_maker_fill).
+# backtest (sleeve_fund.research.runner). Paper's simulated venue fills a post-only order in full once
+# the price trades through, so paper charges the maker fee on this share only and the rest as a market
+# order (ScheduleFeeModel.maker_cap, LongFlatStrategy.maker_allowance).
 BOOK_SHARE = 0.2

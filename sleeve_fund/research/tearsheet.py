@@ -22,12 +22,18 @@ ROBUST_SHARE = 0.6
 # than the best of the variants tried would by luck.
 G1_CONFIDENCE = 0.95
 SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
+JUDGED_CHECK = "Runs complete enough to judge"
+NOT_JUDGED = "NOT JUDGED"
 
 
 def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
     """G1 passes only when every check that can fail passes: the Sharpe test, robustness, an unused
     holdout and enough trades. A strong Sharpe on three trades, or on a holdout already looked at,
-    is not evidence. Returns the verdict and the checks that failed."""
+    is not evidence. A study whose runs raised errors, or whose out-of-sample the risk guard left flat,
+    is not judged at all: neither a pass nor a fail. Returns the verdict and the checks that failed."""
+    unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED]
+    if unjudged:
+        return NOT_JUDGED, unjudged
     failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "INFO")]
     return ("FAIL" if failed else "PASS"), failed
 
@@ -62,7 +68,10 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     unjudged = math.isnan(beats)
     if unjudged:
         beats = 0.0  # too short, or too few independent days, to judge
+    why_not = r.not_judged
     checks = [
+        (JUDGED_CHECK, NOT_JUDGED if why_not else "PASS",
+         f"Not judged: {why_not}" if why_not else "no strategy errors, and out-of-sample traded"),
         (
             "Out-of-sample return vs benchmark after fees (shown, not the G1 test)",
             "INFO",
@@ -85,7 +94,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             "Holdout not used for tuning",
             "FAIL" if r.holdout_reused else "PASS",
             "holdout opened more than once" if r.holdout_reused else
-            ("opened once, for this read-out" if r.holdout else "untouched"),
+            ("opened once, for this read-out" if r.holdout else r.holdout_withheld or "untouched"),
         ),
         (
             "Variants tried disclosed",
@@ -126,6 +135,11 @@ def oos_gaps(r: StudyResult) -> str:
     if quiet:
         words.append(f"In {len(quiet)} of them the signal never closed a trade inside the test window.")
     return " ".join(words)
+
+
+def _halted_on(halted: str) -> str:
+    """' (halted 12 Mar 2026)' from a fold's halt words, for the folds table; '' when it wasn't."""
+    return f" (halted {halted.split(' (')[0]})" if halted else ""
 
 
 def _n(count: int, noun: str) -> str:
@@ -188,7 +202,11 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     checks = g1_checks(r, ledger)
     verdict, failed = g1_verdict(checks)
-    out.append(f"**G1: {verdict}**" + (f" (failed: {', '.join(failed)})" if failed else " (every check passed)"))
+    if verdict == NOT_JUDGED:
+        out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail, and the holdout stays "
+                   "unspent)")
+    else:
+        out.append(f"**G1: {verdict}**" + (f" (failed: {', '.join(failed)})" if failed else " (every check passed)"))
     out.append("")
     out.append("| Check | Result | Evidence |")
     out.append("| --- | --- | --- |")
@@ -240,7 +258,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     for f in r.folds:
         out.append(
             f"| {f.train_start:%b %Y} to {f.train_end:%b %Y} | {f.test_end:%b %Y} | {json.dumps(f.chosen)} "
-            f"| {_num(f.train_sharpe)} | {f.test_trades}{' (halted)' if f.halted else ''} | {_pct(f.test['cagr'])} "
+            f"| {_num(f.train_sharpe)} | {f.test_trades}{_halted_on(f.halted)} | {_pct(f.test['cagr'])} "
             f"| {_pct(f.benchmark_test['cagr'])} | {_num(f.test['sharpe'])} | {_num(f.benchmark_test['sharpe'])} |"
         )
     out.append("")

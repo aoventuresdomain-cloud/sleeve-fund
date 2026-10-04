@@ -655,7 +655,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such tear sheet")
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
         # Results as status chips, so a FAIL can't be missed in a wall of text.
-        for word, tone in (("PASS", "running"), ("FAIL", "halted"), ("WARN", "paused"), ("INFO", "stopped")):
+        for word, tone in (("PASS", "running"), ("FAIL", "halted"), ("WARN", "paused"), ("INFO", "stopped"),
+                           ("NOT JUDGED", "paused")):
             html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{word.capitalize()}</span></td>')
         return page(request, "tearsheet.html", title=sheet, body=html)
 
@@ -1121,6 +1122,7 @@ ACTION_WORDS = {"change_settings": "Changed settings", "move_account": "Moved ac
                 "account_note": "Account note", "retire_account": "Retired account",
                 "reinstate_account": "Reinstated account", "flatten everything": "Flattened everything"}
 KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Maker fill ahead of the tape",
+              "maker_fill_settled": "Maker fill settled", "crossing_trade_unseen": "Fill on an unseen trade",
               "risk_halt": "Risk halt", "risk_pause": "Risk pause", "reconcile_mismatch": "Reconcile mismatch",
               "instrument_not_found": "Instrument not found", "tick_failed": "Risk check failed",
               "mark_unavailable": "No price to value the book", "price_feed_back": "Price feed back",

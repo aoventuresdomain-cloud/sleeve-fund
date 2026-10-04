@@ -71,6 +71,31 @@ class StudyResult:
     venue: str = ""
     risk_profile: str | None = None
     settings: str = ""  # the risk profile, exits and windows the study ran with, so two sheets can be told apart
+    # Exceptions the strategy raised in its runs, as (run, handler, repr) for each run that raised, and
+    # how many in all: results built on a broken handler can't be judged (review round 8, M8-3).
+    errors: list = field(default_factory=list)
+    error_count: int = 0
+    holdout_withheld: str = ""  # why the holdout asked for was left closed
+
+    @property
+    def not_judged(self) -> str:
+        """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
+        - the strategy raised errors, so its orders after them may be wrong;
+        - the risk guard halted every fold, or halted folds left out-of-sample without a single trade:
+          a test window that sat flat is no information, and failing on it would spend the idea."""
+        if self.error_count:
+            from sleeve_fund.strategies.base import handler_error_words
+
+            run, handler, what = self.errors[0]
+            return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
+                    f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
+                    "orders after that may be wrong")
+        halted = [f for f in self.folds if f.halted]
+        if halted and (len(halted) == len(self.folds) or self.oos_trades == 0):
+            return (f"the risk guard halted {len(halted)} of {len(self.folds)} folds and out-of-sample closed "
+                    f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so the test windows sat flat "
+                    "rather than testing the idea")
+        return ""
 
     @property
     def round_trips(self) -> list[float]:
@@ -175,6 +200,8 @@ def run_study(
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
         raise ValueError(f"{exec_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
 
+    errors: list = []
+    error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
     total = 1 + len(combos) + 1 + folds_n * (len(combos) + 1) + (2 if use_holdout and holdout_days else 0)
     done = [0]
@@ -191,9 +218,13 @@ def run_study(
         fine = None
         if exec_minutes is not None and not benchmark:  # nothing rests, nothing to guard
             fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
-        return run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
-                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                            exec_minutes=exec_minutes or 1, half_spread=half_spread)
+        res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
+                           risk_profile=risk_profile if guarded else None, exec_prices=fine,
+                           exec_minutes=exec_minutes or 1, half_spread=half_spread)
+        if res.handler_errors:
+            errors.append((f"{name} {df.index[0]:%d %b %Y} to {df.index[-1]:%d %b %Y}", *res.handler_errors[0]))
+            error_count[0] += res.handler_error_count or len(res.handler_errors)
+        return res
 
     def log(params: dict, stage: str, sharpe: float) -> None:
         # Exit settings make it a different variant, so they count towards the idea counter.
@@ -276,6 +307,8 @@ def run_study(
         settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
                   f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
                   f"walk-forward {train_days} days training, {test_days} days testing"),
+        errors=errors,
+        error_count=error_count[0],
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
@@ -310,8 +343,11 @@ def run_study(
             "Paper watches both on every trade."
         )
 
-    # 3. Holdout, only on request, using the most recent fold's choice.
-    if use_holdout and holdout_days:
+    # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
+    # closed: opening it would spend it on no information (review round 8, M8-4).
+    if use_holdout and holdout_days and result.not_judged:
+        result.holdout_withheld = f"left closed, though asked for: G1 can't judge this study ({result.not_judged})"
+    elif use_holdout and holdout_days:
         result.holdout_reused = ledger.holdout_used(spec.name, dataset)
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)
