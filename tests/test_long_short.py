@@ -10,6 +10,7 @@ from sleeve_fund.research.metrics import trades
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import replay_book
 from test_backtest import _path
+from test_dashboard import client  # noqa: F401, F811 - the dashboard fixture
 
 PERP = {"market": "perp", "allow_short": True}
 
@@ -281,3 +282,27 @@ def test_a_restart_carries_a_short_through_a_restore_order(tmp_path):
     assert all(o["intent"] != "restore" for o in orders)
     # The cycle picked the short up from its entry: price flat at 60,000 is 1.6% below 61,000, past the 0.5% dip.
     assert orders and (orders[0]["side"], orders[0]["intent"]) == ("BUY", "exit")
+
+
+# --- dashboard -------------------------------------------------------------------
+
+
+def test_the_dashboard_shows_a_short(client):  # noqa: F811
+    from test_dashboard import AUTH
+
+    c, store = client
+    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
+    store.record_fill("pp-ls", side="BUY", qty=0.05, price=60_000.0, fee=1.5, order_id="o1", trade_id="t1")
+    store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o2", trade_id="t2")
+    store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o3", trade_id="t3")
+    store.record_equity("pp-ls", equity=10_050.0, cash=13_057.0, qty=-0.05, price=60_140.0, benchmark=10_000)
+    page = c.get("/sleeves/pp-ls", auth=AUTH)
+    assert page.status_code == 200
+    html = page.text
+    assert "Short BTC/USD" in html and "Why it was sold short" in html
+    # The 2% stop sits above the entry; the open short gains as the price falls.
+    assert "61,812" in html
+    trades_page = c.get("/trades", auth=AUTH).text
+    assert "short" in trades_page
+    assert c.get("/", auth=AUTH).status_code == 200
