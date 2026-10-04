@@ -11,7 +11,8 @@ import pandas as pd
 from sleeve_fund.dashboard import trading
 from sleeve_fund.venues import venue as venue_profile
 
-INTERVALS = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+# Every candle length the venue's OHLC endpoint serves, 1 minute to 1 week.
+INTERVALS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
 FORCED = {"stop_loss": "Stop", "take_profit": "Target", "risk_halt": "Halt", "risk_pause": "Pause", "pm_flatten": "Flatten"}
 _cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
 _lock = threading.Lock()
@@ -39,6 +40,25 @@ def candles(pair: str, minutes: int, fetch=None, venue: str | None = None) -> pd
     with _lock:
         _cache[key] = (time.time(), df)
     return df
+
+
+_listed: dict[str, tuple[float, list[str]]] = {}
+
+
+def instruments(get_json=None, venue: str | None = None) -> list[str]:
+    """Every BASE/QUOTE pair the venue lists, for the chart's instrument dropdown. Cached for a day;
+    raises OSError/ValueError when the venue can't be reached, and the caller falls back to a short list."""
+    profile = venue_profile(venue)
+    if profile.list_instruments is None:
+        raise OSError(f"{profile.label} has no instrument list")
+    with _lock:
+        hit = _listed.get(profile.name)
+        if hit and time.time() - hit[0] < 86400:
+            return hit[1]
+    pairs = profile.list_instruments(get_json)
+    with _lock:
+        _listed[profile.name] = (time.time(), pairs)
+    return pairs
 
 
 def from_marks(marks: list[dict], minutes: int) -> pd.DataFrame:
