@@ -1,7 +1,13 @@
+import os
+
 import pytest
 
 from sleeve_fund.data import synthetic_ohlcv
 from sleeve_fund.venues import venue
+
+# Backtests run in-process under test, where the tests' stand-in price feeds apply; the server runs
+# each in a process of its own (test_jobs.py covers that).
+os.environ.setdefault("BACKTEST_ISOLATE", "0")
 
 
 @pytest.fixture(scope="session")

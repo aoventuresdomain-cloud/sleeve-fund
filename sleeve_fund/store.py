@@ -322,6 +322,9 @@ def make_engine(url: str | None = None) -> Engine:
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
         self.engine = engine or make_engine(url)
+        # For another process to open the same journal; an in-memory database can't be shared.
+        url = None if engine is not None else (url or os.environ.get("DATABASE_URL", DEFAULT_URL))
+        self.url = None if url in (None, "sqlite://", "sqlite:///:memory:") else url
         metadata.create_all(self.engine)
 
     @classmethod

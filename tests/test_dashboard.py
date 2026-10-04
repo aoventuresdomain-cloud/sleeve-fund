@@ -798,25 +798,21 @@ def test_minute_backtests_need_the_history_store(client, monkeypatch, tmp_path):
     assert "Instruments with stored minutes: none yet" in page
 
 
-def test_intervals_say_what_is_stored_and_how_far_back_they_go(client, monkeypatch, tmp_path):
-    """R3-M2 and R3-M3: the backtest form lists the instruments with stored minutes, and a capped run
-    says it was capped."""
+def test_intervals_say_what_is_stored_and_run_all_of_it(client, monkeypatch, tmp_path):
+    """R3-M3 and round 4, R4-M2: the backtest form lists the instruments with stored minutes, and a
+    1-minute run takes all of the stored history, not the last year."""
     from sleeve_fund import history
     from sleeve_fund.dashboard import preview
-    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.venues import venue
 
     c, _ = client
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
-    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(70), cursor="x")
-    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(400), cursor="x")
     preview._history.clear()
     form = c.get("/backtest", auth=AUTH).text
-    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form
-    assert "At most the last year at 1 minute, 3 years at 5 minutes." in form
-
-    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
-                 auth=AUTH).text
-    assert "covers at most the last 1 year, so this one didn&#39;t run all the history" in page
+    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form and "At most" not in form
+    df = preview._intraday("ETH/USD", venue("kraken"), 1, None)
+    assert len(df) >= 399 * 1440
 
 
 def test_trade_built_intervals_get_a_warm_up_from_the_store():
