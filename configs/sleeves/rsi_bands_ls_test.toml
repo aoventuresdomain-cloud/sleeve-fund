@@ -1,0 +1,23 @@
+# Test strategy 2, long and short (PM, 4 Oct 2026): long when RSI(14) closes at or below 30 until it
+# reaches 55; short at or above 70 until it falls back to 50. Simulated on a low-fee perpetual (0.02%
+# maker, 0.05% taker, funding every 8 hours) on Kraken's live prices.
+# Added stopped: the PM (or the QA hand-over) starts it from the dashboard.
+
+[sleeve]
+name = "rsi-bands-ls-test"
+strategy = "rsi_bands"
+instrument = "BTC/USD"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
+starting_balance = 10000
+warmup_bars = 42                      # three RSI periods, from the stored history
+risk_profile = "balanced"
+start = false
+
+[params]
+rsi_period = 14
+long_entry = 30.0
+long_exit = 55.0
+short_entry = 70.0
+short_exit = 50.0
+market = "perp"
+allow_short = true

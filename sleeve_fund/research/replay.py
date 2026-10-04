@@ -63,6 +63,7 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
     from nautilus_trader.common import LoggerConfig, LogLevel
     from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
 
+    from sleeve_fund import markets
     from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
     from sleeve_fund.paper.runtime import SleeveRuntime
     from sleeve_fund.store import Store, utcnow
@@ -80,7 +81,10 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
                                                  logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
     fee_model = ScheduleFeeModel(fees)
     try:
-        engine.add_venue(venue=instrument.id.venue, oms_type=OmsType.NETTING, account_type=AccountType.CASH,
+        perp = markets.is_perp(s["params"])  # on margin, as the paper node ran it
+        engine.add_venue(venue=instrument.id.venue, oms_type=OmsType.NETTING,
+                         account_type=AccountType.MARGIN if perp else AccountType.CASH,
+                         default_leverage=markets.VENUE_LEVERAGE if perp else None,
                          base_currency=None, starting_balances=[_money(b) for b in h["balances"]],
                          fee_model=fee_model, fill_model=fill_model())
         engine.add_instrument(instrument)

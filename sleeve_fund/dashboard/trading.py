@@ -3,6 +3,7 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
+from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
 
@@ -101,13 +102,14 @@ def plan_items(plan: dict) -> list[tuple[str, str]]:
 
 
 def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
-          plans: dict[str, dict] | None = None) -> list[dict]:
+          plans: dict[str, dict] | None = None, shorts: bool = False) -> list[dict]:
     """Closed round trips, newest first, with holding time and the journaled reason at each end.
     fills: newest first, as the store returns them. orders: journal rows keyed by order id. plans: exit
-    plans set after entry (Store.exit_plans), by entry order id."""
+    plans set after entry (Store.exit_plans), by entry order id. shorts: a perpetual's journal, where a
+    sell from flat opens a short (metrics.trades)."""
     exits = [e for e in events if e["kind"] in EXIT_EVENTS]
     out = []
-    for t in reversed(trades(list(reversed(fills)))):
+    for t in reversed(trades(list(reversed(fills)), shorts)):
         entry, exit_ = orders.get(t["entry_order"] or ""), orders.get(t["exit_order"] or "")
         if exit_:
             kind = exit_["intent"]
@@ -139,18 +141,19 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
     return out
 
 
-def open_lot(fills: list[dict]) -> dict | None:
-    """The current position's opening fill, walking the journal (newest-first input) forwards."""
+def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
+    """The current position's opening fill, walking the journal (newest-first input) forwards. With
+    shorts (a perpetual), a sell from flat opens a short; on spot it is a journal read from mid-trip."""
     qty, opened = ZERO, None  # summed in Decimal, as metrics.trades does (review round 10, M10-4)
     for f in reversed(fills):
-        if f["side"] == "BUY":
-            if qty <= ZERO:
-                opened = f
-            qty += _dec(f["qty"])
-        else:
-            qty = max(qty - _dec(f["qty"]), ZERO)
-            if qty <= ZERO:
-                opened = None
+        before = qty
+        qty += _dec(f["qty"]) if f["side"] == "BUY" else -_dec(f["qty"])
+        if not shorts:
+            qty = max(qty, ZERO)
+        if qty == ZERO:
+            opened = None
+        elif before == ZERO or (before > ZERO) != (qty > ZERO):
+            opened = f  # opened from flat, or went through flat to the other side
     return opened
 
 
@@ -169,17 +172,19 @@ def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> t
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
                   plans: dict[str, dict] | None = None) -> dict | None:
     """An open position from a sleeve summary (with book extras), or None when flat."""
-    if x["qty"] <= 0 or not x["entry_px"]:
+    if not x["qty"] or not x["entry_px"]:
         return None
-    lot = open_lot(fills)
+    side = 1 if x["qty"] > 0 else -1
+    lot = open_lot(fills, shorts=markets.is_perp(x["sleeve"].params))
     entry = orders.get(lot["order_id"]) if lot else None
     plan = (plans or {}).get(lot["order_id"]) if lot else None
     sl, tp = exit_fracs(x["sleeve"].params, entry["signal"] if entry else None, plan)
-    cost = x["qty"] * x["entry_px"]
+    cost = abs(x["qty"]) * x["entry_px"]
     return {
         "sleeve": x["sleeve"].name,
         "pair": x["sleeve"].instrument,
         "qty": x["qty"],
+        "side": side,
         "entry_px": x["entry_px"],
         "price": x["price"],
         "value": x["position_value"],
@@ -187,8 +192,8 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "unrealised_ret": x["unrealised"] / cost if cost else 0.0,
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
-        "stop_px": x["entry_px"] * (1 - sl) if sl is not None else None,
-        "target_px": x["entry_px"] * (1 + tp) if tp else None,
+        "stop_px": x["entry_px"] * (1 - side * sl) if sl is not None else None,
+        "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
@@ -212,7 +217,7 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         pos = open_position(x, fills, orders, plans)
         if pos:
             positions.append(pos)
-        for t in trips(fills, store.events(name, limit=5000), orders, plans):
+        for t in trips(fills, store.events(name, limit=5000), orders, plans, markets.is_perp(x["sleeve"].params)):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)

@@ -10,7 +10,7 @@ from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrate
 
 SPEC = IdeaSpec(
     summary="Buys when RSI({rsi_period}) closes at or below {long_entry:g} and sells when it reaches {long_exit:g}; "
-            "the short side (at or above {short_entry:g}, back to {short_exit:g}) waits for short positions.",
+            "short at or above {short_entry:g} until it falls to {short_exit:g} (on a perpetual; held flat on spot).",
     name="rsi_bands",
     family="test",
     idea=(
@@ -20,8 +20,8 @@ SPEC = IdeaSpec(
     rules=(
         "On each bar close, with RSI(rsi_period) on the usual 0 to 100 scale. Flat: RSI <= long_entry goes "
         "long; RSI >= short_entry goes short. Long: until RSI >= long_exit. Short: until RSI <= short_exit. "
-        "A leg that ends checks the flat rules on the same bar. Short positions arrive with the long/short "
-        "build, so until then the short leg is held flat. All of its capital in or out; no stop-loss unless "
+        "A leg that ends checks the flat rules on the same bar. The short leg is a short position on a "
+        "perpetual with shorts allowed, and held flat on spot. All of its capital in or out; no stop-loss unless "
         "one is set."
     ),
     data_needs="1-minute OHLCV",
@@ -64,8 +64,9 @@ class RsiBands(LongFlatStrategy):
 
     def on_start(self) -> None:
         super().on_start()
-        if self.runtime is not None and self.runtime.book["qty"] > 0:
-            self._side = 1  # after a restart while long: the long leg is still on
+        if self.runtime is not None and self.runtime.book["qty"]:
+            # After a restart while holding: that leg is still on.
+            self._side = 1 if self.runtime.book["qty"] > 0 else -1
 
     def update_indicators(self, bar: Bar) -> None:
         self.rsi.handle_bar(bar)
@@ -83,18 +84,22 @@ class RsiBands(LongFlatStrategy):
                                             f"{c.long_exit:g}", {})
             elif rsi >= c.short_entry:
                 self._side, self._why = -1, (f"RSI {rsi:.1f} at or above {c.short_entry:g}: short until it falls to "
-                                             f"{c.short_exit:g} (held flat until short positions exist)", {})
+                                             f"{c.short_exit:g}", {})
             elif was == 0:
                 self._why = (f"RSI {rsi:.1f} between {c.long_entry:g} and {c.short_entry:g}: no position", {})
         return self._side
 
-    def want_long(self, bar: Bar) -> bool | None:
+    def want_side(self, bar: Bar) -> int | None:
         if not self.rsi.initialized:
             return None
         rsi = self.rsi.value * 100  # Nautilus RSI runs 0 to 1
         side = self.target_side(rsi)
         self._why = (self._why[0], {"rsi": rsi})
-        return side == 1  # long-only for now: the short leg is held flat
+        return side  # a short is taken only on a perpetual with allow_short
+
+    def want_long(self, bar: Bar) -> bool | None:
+        side = self.want_side(bar)
+        return None if side is None else side == 1  # spot: the short leg is held flat
 
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         return self._why

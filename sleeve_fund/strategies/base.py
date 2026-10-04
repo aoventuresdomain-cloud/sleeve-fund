@@ -2,9 +2,10 @@
 
 Every strategy is a plain NautilusTrader Strategy (no AI in the order path) plus
 an IdeaSpec that records where it came from and what it needs. The same class
-runs in backtest and in paper trading. Phase 1 is spot, so positions are long or
-flat: a strategy says what share of the sleeve to hold (target_weight, 0 to 1),
-or simply in or out (want_long).
+runs in backtest and in paper trading. On spot, positions are long or flat: a strategy
+says what share of the sleeve to hold (target_weight, 0 to 1), or simply in or out
+(want_long). On a perpetual (sleeve_fund.markets) a strategy with allow_short may also
+be short: it says which side to be on (want_side, +1, 0 or -1).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType,
                                    TriggerType)
 from nautilus_trader.trading import Strategy
 
+from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals
 from sleeve_fund.strategies.indicators import Atr
@@ -91,18 +93,45 @@ def maker_orders_enabled() -> bool:
     return os.environ.get("SLEEVE_MAKER_ORDERS", "") == "1"
 
 
-def r_target(r: float, stop: float, leg: float) -> float:
+def r_target(r: float, stop: float, leg: float, side: int = 1) -> float:
     """The target, as a share of the entry price, that makes r times what the stop loses, both after
-    costs: each leg pays `leg` (the taker fee and half the spread) on its notional. A stop-out loses
-    stop + leg + (1 - stop) * leg; a target hit makes tp - leg - (1 + tp) * leg. So "2R" pays 2R, not
-    2R before costs, which on a 2.3% stop at 0.85% a leg nets about +0.7R (review round 8, R8-M1)."""
-    return (r * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg)
+    costs: each leg pays `leg` (the taker fee and half the spread) on its notional. A long's stop-out
+    loses stop + leg + (1 - stop) * leg; a target hit makes tp - leg - (1 + tp) * leg. So "2R" pays 2R,
+    not 2R before costs, which on a 2.3% stop at 0.85% a leg nets about +0.7R (review round 8, R8-M1).
+    A short (side -1) buys back above the entry at its stop and below it at its target, so its stop leg
+    costs a little more and its target needs a little less (long/short verdict, the arithmetic for a short)."""
+    return (r * loss_at_stop(stop, leg, side) + 2 * leg) / (1 - side * leg)
 
 
-def _from_entry(stop: float) -> str:
-    """A stop's distance in words: "2.0% below the entry", or above it for a stop set from the market on
-    a position already in profit."""
-    return f"{stop:.1%} below the entry" if stop >= 0 else f"{-stop:.1%} above the entry"
+def loss_at_stop(stop: float, leg: float, side: int = 1) -> float:
+    """1R: the share of a position's entry value lost at its stop, costs included. The exit leg pays its
+    cost on the exit's value: below the entry for a long, above it for a short."""
+    return stop + leg + (1 - side * stop) * leg
+
+
+def gain_at_target(tp: float, leg: float, side: int = 1) -> float:
+    """The share of a position's entry value a target hit makes after both legs' costs."""
+    return tp - leg - (1 + side * tp) * leg
+
+
+def _from_entry(stop: float, side: int = 1) -> str:
+    """A stop's distance in words: "2.0% below the entry" for a long ("above" for a short), or the other
+    way for a stop set from the market on a position already in profit."""
+    below = (stop >= 0) == (side > 0)
+    return f"{abs(stop):.1%} {'below' if below else 'above'} the entry"
+
+
+def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float,
+                      maintenance: float) -> tuple[float | None, float]:
+    """The liquidation price of an entry of qty at close once it fills (the fee paid, the strategy's whole
+    equity as its isolated margin), and how far that is from close as a share of it (inf when none)."""
+    notional = qty * close
+    liq = markets.liquidation_price(cash - side * notional * (1 + side * fee), side * qty, maintenance)
+    return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
+
+
+def _side_word(side: int) -> str:
+    return "long" if side > 0 else "short" if side < 0 else "flat"
 
 
 def exit_warmup(params: dict) -> int:
@@ -135,6 +164,8 @@ class LongFlatConfig(StrategyConfig):
         maker_wait_minutes: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
         volume_scale: float = 1.0,
+        market: str = markets.SPOT,
+        allow_short: bool = False,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -195,6 +226,18 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
+        if market not in markets.MARKETS:
+            raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
+        if allow_short and market == markets.SPOT:
+            raise ValueError("short positions need a perpetual: set market to perp (or perp-venue-fees)")
+        if market != markets.SPOT:
+            if maker_wait_minutes is not None:
+                raise ValueError("maker-first orders aren't available on a perpetual yet: every order goes at market")
+            if rebalance_band is not None:
+                raise ValueError("rebalancing to a target weight isn't available on a perpetual yet")
+            if stop_swing_bars is not None:
+                raise ValueError("a stop at a recent low isn't available on a perpetual yet (a short needs the "
+                                 "recent high); use a % or an average-true-range stop")
         # A target in R is after costs by construction (r_target); a fixed one must clear them itself.
         if take_profit is not None:
             leg = assumed_taker_fee + assumed_half_spread
@@ -243,6 +286,11 @@ class LongFlatConfig(StrategyConfig):
         # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
         # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
         self.maker_wait_minutes = maker_wait_minutes
+        # spot: a cash account, long or flat. perp / perp-venue-fees: a perpetual on margin, with funding,
+        # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
+        self.market = market
+        self.allow_short = bool(allow_short)
+        self.perp = markets.terms({"market": market})
 
 
 # Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar
@@ -286,7 +334,24 @@ class LongFlatStrategy(Strategy):
         self._last_tick_ns = 0
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
-        self._entry_qty = 0.0
+        self._entry_qty = 0.0  # its size, unsigned
+        self._entry_side = 0  # +1 long, -1 short, 0 flat
+        # Perp only. A signal that turns a long short (or the other way) closes first; the new side opens
+        # as soon as the close has filled, as (side, bar, reason, values).
+        self._flip: tuple | None = None
+        # Paper on a perp: the sandbox's margin account can't be given a position at start, so a position
+        # carried over a restart is bought or sold again there, at no fee and unjournaled ("restore"),
+        # before anything else trades. _cash_adj then keeps the account's cash equal to the journal's:
+        # the restore filled at today's price, not the entry, and funding is the journal's alone.
+        self._restore: dict | None = None
+        self._restore_id: str | None = None
+        self._cash_adj = 0.0
+        self._funding_since = None  # the last time funding was settled up to
+        self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
+        # Backtest on a perp: the equity at the minute's worst price, for the risk guard (_intrabar_guard),
+        # and that price when it went through the liquidation price.
+        self._guard_equity: float | None = None
+        self._guard_price: float | None = None
         # This position's stop and target as shares of the entry price, fixed when it was entered
         # (from the % settings, or from the market for an ATR or swing-low stop); None when flat.
         self._stop_frac: float | None = None
@@ -386,6 +451,11 @@ class LongFlatStrategy(Strategy):
         return self
 
     @property
+    def _margin(self) -> bool:
+        """Trading a perpetual on a margin account (may go short) rather than spot in a cash account."""
+        return self._cfg.perp is not None
+
+    @property
     def _backtest(self) -> bool:
         """Replaying history (with or without a runtime): no live trade feed, so stops and targets rest
         at the simulated venue."""
@@ -412,9 +482,19 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
             book = self.runtime.book
-            if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
-                self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
+            if book["entry_px"] and (book["qty"] > 0 or (book["qty"] < 0 and self._margin)):  # carried over a restart
+                self._entry_px, self._entry_qty = book["entry_px"], abs(book["qty"])
+                self._entry_side = 1 if book["qty"] > 0 else -1
                 self._restore_plan()
+                if self._margin and not self.runtime.backtest:
+                    self._restore = {"qty": book["qty"], "entry": book["entry_px"]}
+            if self._margin:
+                # Funding owed for times the process was down while a position was held is settled on the
+                # first tick, at that tick's price.
+                last = self.runtime.store.funding(self.runtime.name, limit=1)
+                fills = self.runtime.store.fills(self.runtime.name, limit=1) if book["qty"] else []
+                marks = [r["ts"] for r in (*last, *fills)]
+                self._funding_since = max(marks) if marks else self.runtime.now()
             if self.runtime.backtest:
                 # A backtest marks and guards from its bars: every execution bar when it is fed shorter
                 # bars than it decides on (paper does every 30 s), otherwise every decision bar.
@@ -441,9 +521,16 @@ class LongFlatStrategy(Strategy):
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
+        if self._restore is not None:
+            self._send_restore()
+            return
         if self._kept:
             self._tape(tick)
-        self._check_exits(self._last_close)
+        if self._check_exits(self._last_close):
+            return
+        if self._margin and self._guard_breached(self._last_close):
+            self._on_tick()  # leveraged: the guards act on the trade, not on the next 30-second tick
+            return
         self._maybe_tick()
 
     def on_quote(self, quote) -> None:
@@ -458,11 +545,15 @@ class LongFlatStrategy(Strategy):
         self._market_seen()
         if self.runtime is not None:
             self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+        if self._restore is not None:
+            self._send_restore()
 
     def _on_exec_bar(self, bar: Bar) -> None:
         """Backtest: value the book and run the risk guard on every execution bar, so a halt or a
         daily-loss pause fires within the decision bar, as paper's 30-second ticks would."""
         self._last_close = bar.close.as_double()
+        if self._margin:
+            self._intrabar_guard(bar)
         if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
             self._on_tick()
 
@@ -495,11 +586,11 @@ class LongFlatStrategy(Strategy):
         c = self._cfg
         return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars or c.take_profit)
 
-    def _plan_exits(self, close: float) -> tuple[float | None, float | None, str] | None:
+    def _plan_exits(self, close: float, side: int = 1) -> tuple[float | None, float | None, str] | None:
         """This entry's stop and target as shares of the price, and how the stop was set; None while
         an ATR or swing-low stop hasn't seen enough bars to be set."""
         c = self._cfg
-        stop, basis = c.stop_loss, f"{c.stop_loss:.1%} below the entry" if c.stop_loss else ""
+        stop, basis = c.stop_loss, _from_entry(c.stop_loss, side) if c.stop_loss else ""
         if c.stop_atr:
             if not self._atr.initialized or close <= 0:
                 return None
@@ -515,15 +606,15 @@ class LongFlatStrategy(Strategy):
             if clamped != stop:
                 basis += f", held to {clamped:.1%}"
             stop = clamped
-        return stop, self._target_for(stop), basis
+        return stop, self._target_for(stop, side), basis
 
-    def _target_for(self, stop: float | None) -> float | None:
+    def _target_for(self, stop: float | None, side: int | None = None) -> float | None:
         """The target as a share of the entry price: the fixed % one, or r_target around this stop."""
         c = self._cfg
         if c.take_profit:
             return c.take_profit
         if c.take_profit_r and stop is not None and stop > 0:
-            return r_target(c.take_profit_r, stop, self._round_trip_cost())
+            return r_target(c.take_profit_r, stop, self._round_trip_cost(), side or self._entry_side or 1)
         return None
 
     def _stop_cfg(self) -> dict:
@@ -546,12 +637,14 @@ class LongFlatStrategy(Strategy):
         An entry journaled before stops were recorded gets the fixed % plan, or an ATR or swing-low stop
         set from the market once there are bars enough."""
         c, store, name = self._cfg, self.runtime.store, self.runtime.name
+        opened = "SELL" if self._entry_side < 0 else "BUY"
         entry = next((o for o in store.orders(name, limit=200)
-                      if o.get("intent") == "entry" and o.get("side") == "BUY"), None)
+                      if o.get("intent") == "entry" and o.get("side") == opened), None)
         self._plan_entry, self._replan_pending = entry, None
         if entry is None:
             if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
-                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+                self._stop_frac, self._tp_frac, self._stop_basis = (self._plan_exits(self._entry_px, self._entry_side or 1)
+                                                                    or (None, None, ""))
             return
         sig = entry.get("signal") or {}
         plan = store.exit_plan(name, entry["order_id"])
@@ -570,7 +663,8 @@ class LongFlatStrategy(Strategy):
                 last = store.last_event(name, ("exits_change",))
                 self._replan_pending = ("restart", last["id"] if last else 0)
             elif self._has_exits:
-                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+                self._stop_frac, self._tp_frac, self._stop_basis = (self._plan_exits(self._entry_px, self._entry_side or 1)
+                                                                    or (None, None, ""))
             return
         event_id = edits[-1]["id"]
         old_stop, old_tp, old_basis, old_cfg = base or (None, None, "", None)
@@ -582,7 +676,8 @@ class LongFlatStrategy(Strategy):
             self._set_plan(old_stop, self._target_for(old_stop), old_basis, "edit", event_id)
         elif not (c.stop_atr or c.stop_swing_bars):
             stop = c.stop_loss
-            self._set_plan(stop, self._target_for(stop), _from_entry(stop) if stop else "", "edit", event_id)
+            self._set_plan(stop, self._target_for(stop), _from_entry(stop, self._entry_side or 1) if stop else "",
+                           "edit", event_id)
         else:
             self._stop_frac, self._stop_basis = old_stop, old_basis
             self._tp_frac = c.take_profit or old_tp
@@ -592,7 +687,7 @@ class LongFlatStrategy(Strategy):
         """Set an ATR or swing-low stop from the market for a position already open: as a price level
         (the close less so many ATRs, or the swing low itself), then as a share of the entry price, so
         the stop sits where its words say. It only ever tightens the stop working until now."""
-        plan = self._plan_exits(close)
+        plan = self._plan_exits(close, self._entry_side or 1)
         if plan is None:
             self._note("stop_not_ready", ("The open position keeps its old stop until the new one can be set: "
                                           if self._stop_frac is not None else "The open position has no stop yet: ")
@@ -603,8 +698,9 @@ class LongFlatStrategy(Strategy):
         kind, event_id = self._replan_pending
         self._replan_pending = None
         distance, _, basis = plan
-        level = close * (1 - distance)
-        stop = 1 - level / self._entry_px
+        side = self._entry_side or 1
+        level = close * (1 - side * distance)
+        stop = side * (1 - level / self._entry_px)
         if self._stop_frac is not None and self._stop_frac < stop:
             basis = (f"kept: the new setting ({basis}) would put it lower, at {level:,.6g}, and a stop set "
                      f"from the market only ever tightens; {self._stop_basis or _from_entry(self._stop_frac)}")
@@ -620,24 +716,26 @@ class LongFlatStrategy(Strategy):
         sig = self._plan_entry.get("signal") or {}
         notional = self._entry_px * self._entry_qty
         cost = self._round_trip_cost()
+        side = self._entry_side or 1
         # A looser stop risks more than the entry did, and R is measured on the larger of the two, so
         # widening a stop can't flatter the trade's R multiple (review round 8, M8-1).
         risk = max(float(sig.get("risk_amount") or 0.0),
-                   notional * (stop + cost + (1 - stop) * cost) if stop is not None else 0.0) or None
+                   notional * loss_at_stop(stop, cost, side) if stop is not None else 0.0) or None
         if self._cfg.take_profit_r and not self._cfg.take_profit and risk:
             # An R target is so many of the trade's 1R. After a tighter stop that is still the entry's
             # risk, so the target is set from it: a typed 3R records +3.00R, not less (review round 9, N2).
-            tp = (self._cfg.take_profit_r * risk / notional + 2 * cost) / (1 - cost)
+            tp = (self._cfg.take_profit_r * risk / notional + 2 * cost) / (1 - side * cost)
             self._tp_frac = tp
-        planned = round((tp - cost - (1 + tp) * cost) * notional / risk, 2) if tp and risk else None
+        planned = round(gain_at_target(tp, cost, side) * notional / risk, 2) if tp and risk else None
         store, name, now = self.runtime.store, self.runtime.name, self.runtime.now()
         store.set_exit_plan(name, self._plan_entry["order_id"], kind=kind, ts=now, event_id=event_id,
                             stop_frac=None if stop is None else round(stop, 6), tp_frac=None if tp is None else round(tp, 6),
                             basis=basis, stop_cfg=self._stop_cfg(), risk_amount=None if risk is None else round(risk, 2),
                             planned_r=planned)
-        parts = [f"stop at {self._entry_px * (1 - stop):,.6g}, {_from_entry(stop)}" + (f" ({basis})" if basis and
-                 not basis.endswith("below the entry") else "") if stop is not None else "no stop",
-                 f"target at {self._entry_px * (1 + tp):,.6g}, {tp:.1%} above it" if tp else "no target"]
+        parts = [f"stop at {self._entry_px * (1 - side * stop):,.6g}, {_from_entry(stop, side)}" + (f" ({basis})" if basis and
+                 not basis.endswith("the entry") else "") if stop is not None else "no stop",
+                 f"target at {self._entry_px * (1 + side * tp):,.6g}, {tp:.1%} {'above' if side > 0 else 'below'} it"
+                 if tp else "no target"]
         if kind == "edit":
             store.event(name, "info", "exits_applied", "The open position now works to the new settings: "
                         f"{'; '.join(parts)} (entry {self._entry_px:,.6g})"
@@ -696,11 +794,123 @@ class LongFlatStrategy(Strategy):
         target = self.want_long(bar)
         return None if target is None else (1.0 if target else 0.0)
 
+    def want_side(self, bar: Bar) -> int | None:
+        """The side to be on from this bar's close: +1 long, 0 flat, -1 short (taken only with allow_short);
+        None = not enough data yet. The default is want_long's long or flat."""
+        w = self.target_weight(bar)
+        return None if w is None else (1 if w > 0 else 0)
+
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         """Why want_long() just said `target`: one plain-English sentence and the indicator values
         behind it. Called straight after want_long() on the same bar, so it sees the same state.
-        It is journaled with the order, so the reason is the one the strategy acted on."""
+        It is journaled with the order, so the reason is the one the strategy acted on. A strategy that
+        decides with want_side gets the side (+1, 0 or -1) as `target`."""
         return ("Signal to be long" if target else "Signal to be flat"), {}
+
+    def _on_bar_sided(self, bar: Bar) -> None:
+        """A perpetual's decision: be long, short or flat, all or nothing. Turning from one side to the
+        other closes first, and the new side opens once the close has filled (on_order_filled)."""
+        side = self.want_side(bar)
+        if side is None:
+            return
+        side = int(side)
+        if side < 0 and not self._cfg.allow_short:
+            side = 0
+        if self._exit_lock and self._exit_lock != side:
+            self._exit_lock = False  # the signal has moved off the side a stop or target closed
+        if self._busy() or self._pending_exit is not None:
+            return  # the last decision is still being carried out
+        current = self._pos_side()
+        if side == current:
+            return
+        close = bar.close.as_double()
+        reason, values = self.explain(bar, side)
+        values = {**values, "close": close}
+        if current != 0:
+            self._flip = (side, bar, reason, values) if side != 0 else None
+            self._sell_all("exit", reason, values)
+            return
+        self._open(side, bar, reason, values)
+
+    def _open(self, side: int, bar: Bar, reason: str, values: dict) -> None:
+        """Open a position on a perpetual, all of it at market: long (side 1) or short (-1). Sized by the
+        smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
+        trade and the bar's volume; refused when its stop would sit too near the liquidation price."""
+        if self._exit_lock == side:
+            return
+        if self.runtime is not None and not self.runtime.can_open():
+            return
+        close = bar.close.as_double()
+        if self._has_exits:
+            plan = self._plan_exits(close, side)
+            if plan is None:
+                self._note("stop_not_ready", "Entry held back: the stop is set from the last "
+                           f"{self._cfg.atr_bars} bars, and there aren't that many yet", level="info")
+                return
+            self._noted.discard("stop_not_ready")
+            self._stop_frac, self._tp_frac, self._stop_basis = plan
+            leg = self._round_trip_cost()
+            if self._tp_frac and gain_at_target(self._tp_frac, leg, side) <= 0:
+                self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
+                           "doesn't cover the round trip's fees and spread at the venue's spread now")
+                self._tp_frac = None
+            else:
+                self._noted.discard("target_below_costs")
+        equity, cash, _, _ = self._mark()
+        if equity <= 0:
+            self.log.warning("no equity to size from yet; skipping entry")
+            return
+        fee = Decimal(str(self._cfg.assumed_taker_fee))
+        room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
+        if self.runtime is not None:
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
+        elif self._cfg.position_cap_pct is not None:
+            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+        if self._cfg.max_notional is not None:
+            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+        if self._cfg.risk_per_trade and self._stop_frac:
+            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
+        if (cap := self._volume_cap(bar)) is not None:
+            limits["share of the bar's volume"] = cap
+        size_by = min(limits, key=limits.get)
+        budget = limits[size_by]
+        qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
+        if qty <= 0 or qty < self._min_qty():
+            self._note("buy_skipped", f"Entry skipped: the {size_by} limit ({float(budget):,.2f}) comes to {qty}, "
+                       f"below the smallest order the venue takes ({self._min_qty()})")
+            return
+        self._noted.discard("buy_skipped")
+        signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
+                  "budget": round(float(budget), 2)}
+        notional = float(qty) * close
+        liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
+                                          self._cfg.perp.maintenance_margin)
+        if liq is not None:
+            signal["liquidation_px"] = round(liq, 8)
+            signal["leverage"] = round(notional / equity, 4)
+            share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+            if self._stop_frac and self._stop_frac > share * distance:
+                self._note("entry_refused_liquidation",
+                           f"Entry refused: its {self._stop_frac:.2%} stop is more than {share:.0%} of the way to the "
+                           f"liquidation price {liq:,.6g} ({distance:.2%} away)")
+                return
+            self._noted.discard("entry_refused_liquidation")
+        if self._stop_frac:
+            loss = self._loss_at_stop(side)
+            signal["risk_amount"] = round(notional * loss, 2)
+            signal["stop_frac"] = round(self._stop_frac, 6)
+            if self._cfg.stop_atr:
+                signal["stop_basis"] = self._stop_basis
+            if self._tp_frac:
+                signal["tp_frac"] = round(self._tp_frac, 6)
+                signal["planned_r"] = round(gain_at_target(self._tp_frac, self._round_trip_cost(), side) / loss, 2)
+        elif self._tp_frac:
+            signal["tp_frac"] = round(self._tp_frac, 6)
+        if self._has_exits:
+            signal["stop_cfg"] = self._stop_cfg()
+        self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
         self._resize_if_due()
@@ -717,6 +927,11 @@ class LongFlatStrategy(Strategy):
         if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
         if self._check_exits(self._last_close):
+            return
+        if self._margin:
+            if self._restore is None:
+                self._apply_funding(self._last_close)
+                self._on_bar_sided(bar)
             return
         raw = self.target_weight(bar)
         if raw is None:
@@ -847,8 +1062,12 @@ class LongFlatStrategy(Strategy):
             return False
         if self._backtest:
             return False  # both exits rest at the venue (_rest_exits) and fill at their levels
+        if self._restore is not None:
+            return False  # the position isn't back at the simulated venue yet
+        side = self._entry_side or 1
         move = price / self._entry_px - 1
-        hit = ("stop_loss" if stop is not None and move <= -stop else "take_profit" if tp and move >= tp else None)
+        gain = side * move  # what the position made: a short gains as the price falls
+        hit = ("stop_loss" if stop is not None and gain <= -stop else "take_profit" if tp and gain >= tp else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
@@ -858,9 +1077,10 @@ class LongFlatStrategy(Strategy):
         level = stop if hit == "stop_loss" else tp
         reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
                   f"the {self._entry_px:,.6g} entry, past the "
-                  + (f"stop {_from_entry(level)}" if hit == "stop_loss" else f"{level:.1%} target"))
+                  + (f"stop {_from_entry(level, side)}" if hit == "stop_loss" else
+                     f"{level:.1%} target" + (" (below it, for a short)" if side < 0 else "")))
         values = {"entry_px": self._entry_px, "move": move, hit: level}
-        self._exit_lock = True
+        self._exit_lock = side if self._margin else True
         self._entry_px = None  # don't fire again while the sell is in flight
         self._sell_all(hit, reason, values)
         return True
@@ -926,12 +1146,12 @@ class LongFlatStrategy(Strategy):
             signal["stop_cfg"] = self._stop_cfg()
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
-    def _loss_at_stop(self) -> float:
+    def _loss_at_stop(self, side: int = 1) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
         and half the spread to buy, plus the same on what is left to sell. A 6% stop at 0.8% taker and a
-        0.05% half spread loses 7.65%, not 6%."""
+        0.05% half spread loses 7.65%, not 6%. A short's stop buys back above the entry (loss_at_stop)."""
         cost, stop = self._round_trip_cost(), self._stop_frac if self._stop_frac is not None else self._cfg.stop_loss
-        return stop + cost + (1 - stop) * cost
+        return loss_at_stop(stop, cost, side)
 
     def _round_trip_cost(self) -> float:
         """Each leg's cost as a share of its notional: the taker fee and half the spread."""
@@ -1176,9 +1396,32 @@ class LongFlatStrategy(Strategy):
         step = self._lot()
         return max(self.instrument.min_quantity.as_decimal(), step) if self.instrument.min_quantity else step
 
+    def _net_position(self) -> tuple[float, float]:
+        """Perp: the signed position at the simulated venue and its average entry there."""
+        net = notional = 0.0
+        for p in self.cache.positions_open(instrument_id=self._cfg.instrument_id):
+            q = p.signed_qty
+            net += q
+            notional += q * p.avg_px_open
+        return net, (notional / net if net else 0.0)
+
+    def _signed_qty(self) -> Decimal:
+        """The position: positive long, negative short."""
+        if self._margin:
+            return Decimal(repr(self._net_position()[0]))
+        return self._position_qty()
+
+    def _pos_side(self) -> int:
+        """+1 long, -1 short, 0 flat (less than the smallest order the venue takes)."""
+        q, step = self._signed_qty(), self._min_qty()
+        return 1 if q >= step else -1 if q <= -step else 0
+
     def _position_qty(self, free: bool = False) -> Decimal:
         """Quantity held, read from the account rather than positions, so a book restored from the
-        journal after a restart (a balance with no position object) is still recognised."""
+        journal after a restart (a balance with no position object) is still recognised. On a perp,
+        the size of the position, long or short."""
+        if self._margin:
+            return abs(self._signed_qty())
         account = self._account()
         if account is None:
             return Decimal(0)
@@ -1219,6 +1462,8 @@ class LongFlatStrategy(Strategy):
         return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or bool(self._unsent())
 
     def _is_long(self) -> bool:
+        if self._margin:
+            return self._pos_side() > 0
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
@@ -1241,7 +1486,118 @@ class LongFlatStrategy(Strategy):
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
-        self._submit(OrderSide.SELL, qty, intent, reason, dict(values or {}))
+        # A short is closed by buying it back.
+        side = OrderSide.BUY if self._margin and self._pos_side() < 0 else OrderSide.SELL
+        self._submit(side, qty, intent, reason, dict(values or {}))
+
+    # --- perpetuals: restore, funding, liquidation and intrabar guards ---------------
+
+    def _send_restore(self) -> None:
+        """Paper on a perp, after a restart: put the journal's position back at the simulated venue with
+        one market order, at no fee and unjournaled. The journal keeps the real entry; _cash_adj takes up
+        the difference from today's price when it fills (on_order_filled)."""
+        r = self._restore
+        if r is None or self._restore_id is not None or self.instrument is None:
+            return
+        qty = Decimal(repr(abs(r["qty"]))).quantize(self._lot(), rounding=ROUND_DOWN)
+        if qty < self._min_qty():
+            self._restore = None
+            return
+        order = self.order_factory.market(instrument_id=self._cfg.instrument_id,
+                                          order_side=OrderSide.BUY if r["qty"] > 0 else OrderSide.SELL,
+                                          quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
+                                          time_in_force=TimeInForce.GTC, tags=["restore"])
+        self._restore_id = str(order.client_order_id)
+        if self.fee_model is not None:
+            self.fee_model.free_orders.add(self._restore_id)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info", "restore_position",
+                                     f"Putting the {_side_word(1 if r['qty'] > 0 else -1)} position of {abs(r['qty']):.12g} "
+                                     "back at the simulated venue after the restart (no fee, not a trade)",
+                                     ts=self.runtime.now())
+        self.submit_order(order)
+
+    def _apply_funding(self, price: float) -> None:
+        """Exchange the perp's funding for every funding time since the last settlement while a position
+        is held: a long pays position x price x rate, a short receives it (negative rates the other way).
+        Booked to cash and journaled, so equity, the journal and reconciliation all carry it."""
+        terms = self._cfg.perp
+        if terms is None or price <= 0:
+            return
+        now = self.clock.utc_now()
+        since, self._funding_since = self._funding_since, now
+        if since is None:
+            return
+        qty = self._net_position()[0]
+        if qty == 0:
+            return
+        for ts in markets.funding_times(since, now, terms.funding_hours):
+            amount = -qty * price * terms.funding_rate
+            self._cash_adj += amount
+            self.funding_log.append((ts, amount))
+            if self.runtime is not None:
+                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=price, rate=terms.funding_rate,
+                                                  amount=round(amount, 8), ts=ts)
+                self.runtime.store.event(self.runtime.name, "info", "funding",
+                                         f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
+                                         f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
+                                         f"{price:,.6g} ({terms.funding_rate:.4%})", ts=ts)
+
+    def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
+        """The position closes at market once the price reaches its liquidation price (the venue would
+        take it), or comes within the risk profile's minimum distance of it (cut back before the venue
+        does), with the strategy's equity as the position's isolated margin."""
+        terms = self._cfg.perp
+        if terms is None or qty == 0 or price <= 0 or self._pending_exit is not None or self._busy():
+            return
+        liq = markets.liquidation_price(cash, qty, terms.maintenance_margin)
+        if liq is None:
+            return
+        side = 1 if qty > 0 else -1
+        crossed = price <= liq if side > 0 else price >= liq
+        distance = abs(price - liq) / price
+        floor = self.runtime.profile.min_liquidation_distance if self.runtime is not None else 0.0
+        if not crossed and distance >= floor:
+            return
+        intent = "liquidation" if crossed else "liquidation_guard"
+        reason = (f"Liquidated: the price {price:,.6g} reached the liquidation price {liq:,.6g}" if crossed else
+                  f"Cut to avoid liquidation: the price {price:,.6g} is {distance:.1%} from the liquidation price "
+                  f"{liq:,.6g}, inside the {floor:.0%} the risk profile keeps")
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "error" if crossed else "warning", intent, reason,
+                                     ts=self.runtime.now())
+        self._exit_lock = side
+        self._flip = None
+        self._sell_all(intent, reason, {"price": price, "liquidation_px": round(liq, 8), "distance": round(distance, 6)})
+
+    def _guard_breached(self, price: float) -> bool:
+        """Paper on a perp, on every trade: would the risk guard or the liquidation guard act at this price?
+        With leverage, waiting for the next 30-second tick lets a fast move run through both."""
+        if self.runtime is None or self._entry_px is None or self.runtime.status != "running":
+            return False
+        equity, cash, qty, _ = self._mark()
+        if equity <= 0:
+            return True
+        day_open = self.runtime._day_open or equity
+        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
+            return True
+        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
+
+    def _intrabar_guard(self, bar: Bar) -> None:
+        """Backtest on a perp: the risk guard judges each minute at its worst price for the position (the
+        low for a long, the high for a short), not its close, so a wick that recovers inside the minute
+        still halts it, as it would on paper's trades (long/short verdict, L3)."""
+        qty = self._net_position()[0]
+        if qty == 0 or self.runtime is None:
+            self._guard_equity = None
+            return
+        worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
+        _, cash, _, _ = self._mark()
+        self._guard_equity = cash + qty * worst
+        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        if liq is not None and (worst <= liq if qty > 0 else worst >= liq):
+            self._guard_price = worst
 
     # --- sleeve runtime hooks (paper/live only) --------------------------------
 
@@ -1278,6 +1634,13 @@ class LongFlatStrategy(Strategy):
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
         cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
+        if self._margin:
+            # A margin account holds realised money only; the journal keeps spot-style cash (a short holds
+            # its sale's proceeds), so take the open position's cost back out: cash = balance - qty x entry.
+            # _cash_adj carries the restore and funding, which the simulated venue knows nothing of.
+            qty, avg = self._net_position()
+            cash = cash - qty * avg + self._cash_adj
+            return cash + qty * price, cash, qty, price
         qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
         return cash + qty * price, cash, qty, price
 
@@ -1310,7 +1673,14 @@ class LongFlatStrategy(Strategy):
         self._last_tick_ns = self.clock.timestamp_ns()
         if self._feed_dead():
             return  # no heartbeat, so the supervisor restarts the process
+        if self._restore is not None:
+            # The carried-over position isn't back at the simulated venue yet: nothing to mark or guard
+            # against the journal until it is, but the strategy is alive.
+            self.runtime.store.heartbeat(self.runtime.name)
+            return
         try:
+            if self._margin:
+                self._apply_funding(self._price())
             equity, cash, qty, price = self._mark()
             if price <= 0 or equity <= 0:
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
@@ -1329,10 +1699,15 @@ class LongFlatStrategy(Strategy):
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
                     self._drop_kept()  # halted: no trading, no flattening
                     self.cancel_all_orders(self._cfg.instrument_id)
-            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price) == "flatten":
+            guard, self._guard_equity = self._guard_equity, None
+            worst, self._guard_price = self._guard_price, None
+            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
+                self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
+            elif self._margin:
+                self._liquidation_guard(cash, qty, worst or price)
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_tick", exc)
 
@@ -1362,6 +1737,9 @@ class LongFlatStrategy(Strategy):
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
+        if str(event.client_order_id) == self._restore_id:
+            self._restore_id = None  # sent again on the next price
+            return
         if self._slice_ended(event):
             return
         coid = str(event.client_order_id)
@@ -1381,7 +1759,7 @@ class LongFlatStrategy(Strategy):
         through it when the entry filled (a gap). Its linked target goes with it, so nothing would
         protect the position until the next decision. Sell at market instead, as paper does on the
         first trade past the stop."""
-        if not self._is_long():
+        if self._pos_side() == 0:
             return
         signal = self.decisions[coid]["signal"]
         price = self._price()
@@ -1393,7 +1771,7 @@ class LongFlatStrategy(Strategy):
         self.log.info(reason)
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "stop_rejected", reason, ts=self.runtime.now())
-        self._exit_lock = True
+        self._exit_lock = self._pos_side() if self._margin else True
         self._sell_all("stop_loss", reason, {**signal, "price": price})
 
     def _drop_kept(self, earn: bool = False) -> None:
@@ -1418,6 +1796,9 @@ class LongFlatStrategy(Strategy):
 
     def on_order_denied(self, event) -> None:
         self._order_status(event, "denied")
+        if str(event.client_order_id) == self._restore_id:
+            self._restore_id = None
+            return
         if self._slice_ended(event):
             return
         self._resume_exit(str(event.client_order_id))
@@ -1448,6 +1829,19 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed
+        if coid == self._restore_id:
+            # The carried-over position is back at the simulated venue, at today's price: keep the journal's
+            # cash by taking up the difference from the journal's entry. Not a trade, so not journaled.
+            q = event.last_qty.as_double() * (1 if event.is_buy else -1)
+            self._cash_adj += q * (event.last_px.as_double() - self._restore["entry"])
+            if done:
+                if self.runtime is not None:
+                    self.runtime.store.event(self.runtime.name, "info", "restore_filled",
+                                             f"Position back at the simulated venue at {event.last_px.as_double():,.6g}; "
+                                             f"the journal keeps its entry of {self._restore['entry']:,.6g}",
+                                             ts=self.runtime.now())
+                self._restore = self._restore_id = None
+            return
         if coid in self._maker and done:
             self._maker.pop(coid)
             self._cancel_alert(coid)
@@ -1460,33 +1854,38 @@ class LongFlatStrategy(Strategy):
             px = float(self.fee_model.maker_slices[coid][0]) if self.fee_model is not None else px
             journal_id = kept_id
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
-        if event.is_buy:
+        sign = 1 if event.is_buy else -1
+        opening = self._entry_side in (0, sign) and (self._margin or sign > 0)
+        if opening:
             cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
             self._entry_qty += qty
             self._entry_px = cost / self._entry_qty
+            self._entry_side = sign
         else:
             self._entry_qty = max(self._entry_qty - qty, 0.0)
             if self._entry_qty <= 1e-12:
-                self._entry_px, self._entry_qty = None, 0.0
+                self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
                 self._stop_frac = self._tp_frac = None
                 self._replan_pending = self._plan_entry = None
         if self._backtest:
-            if event.is_buy and self._pending_exit is None:
+            if opening and self._pending_exit is None:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
                 # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
                 self._rest_exits()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
-                self._exit_lock = True  # as in paper: no re-entry until the signal has gone flat
+                # As in paper: no re-entry until the signal has moved off the side that was closed.
+                self._exit_lock = -sign if self._margin else True
                 # Paper's stop sells the whole position and cancels an entry still working (_sell_all); so does
                 # this. A slice that filled after the stop last grew is sold at market with what is left.
                 intent = self.decisions[str(event.client_order_id)]["intent"]
-                if done and self._entry_qty > 1e-12 and self._is_long():
+                if done and self._entry_qty > 1e-12 and self._pos_side() != 0:
                     what = "Stop-loss" if intent == "stop_loss" else "Take-profit"
                     self._sell_all(intent, f"{what}: the rest of the position, which filled after the resting "
                                            "order was last sized", {"price": px})
                 else:
+                    entry_side = OrderSide.SELL if sign > 0 else OrderSide.BUY  # the side the closed position opened on
                     for order in self._working():
-                        if order.side == OrderSide.BUY and order.status not in (OrderStatus.PENDING_CANCEL,):
+                        if order.side == entry_side and order.status not in (OrderStatus.PENDING_CANCEL,):
                             if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
                                 self._cancel_on_accept.add(str(order.client_order_id))
                             else:
@@ -1498,6 +1897,11 @@ class LongFlatStrategy(Strategy):
             self._slice_done(coid)
         if done:
             self._resume_exit(coid)
+            if self._flip is not None and self._pending_exit is None and self._pos_side() == 0:
+                # Turning from one side to the other: the close has filled, so open the new side now.
+                side, bar, reason, values = self._flip
+                self._flip = None
+                self._open(side, bar, reason, values)
 
     def _rest_exits(self) -> None:
         """Backtests: after an entry fills, rest the exits at the venue as real orders would sit there.
@@ -1529,6 +1933,8 @@ class LongFlatStrategy(Strategy):
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit") if plan[k]}
         both = len(ids) == 2
+        side = self._entry_side or 1
+        exit_side, exit_word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
 
         def link(kind: str) -> dict:
             other = "take_profit" if kind == "stop_loss" else "stop_loss"
@@ -1538,31 +1944,33 @@ class LongFlatStrategy(Strategy):
         now = self.clock.timestamp_ns()
         if plan["stop_loss"]:
             stop = plan["stop_loss"]
-            level = self._entry_px * (1 - stop)
+            level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
-                self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], OrderSide.SELL, quantity,
+                self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], exit_side, quantity,
                 Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, False, False,
                 UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
-                f"Stop-loss: resting sell at {level:,.6g}, {stop:.1%} below the {self._entry_px:,.6g} entry"
+                f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
+                f"{self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through",
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
         if plan["take_profit"]:
             tp = plan["take_profit"]
-            level = self._entry_px * (1 + tp)
+            level = self._entry_px * (1 + side * tp)
             orders.append((LimitOrder(
-                self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], OrderSide.SELL, quantity,
+                self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], exit_side, quantity,
                 Price(level, self.instrument.price_precision), TimeInForce.GTC, False, False, False,
                 UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
-                f"Take-profit: resting sell at {level:,.6g}, {tp:.1%} above the {self._entry_px:,.6g} entry"
+                f"Take-profit: resting {exit_word} at {level:,.6g}, {tp:.1%} {'above' if side > 0 else 'below'} the "
+                f"{self._entry_px:,.6g} entry"
                 + (f" ({cfg.take_profit_r:g}R after costs)" if cfg.take_profit_r else "")
                 + "; fills at that level",
                 {"entry_px": round(self._entry_px, 8), "take_profit": round(tp, 6), "limit_px": round(level, 8)}))
         for order, intent, kind, reason, signal in orders:
             self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
             if self.runtime is not None:
-                self.runtime.on_order(order_id=str(order.client_order_id), side="SELL", qty=float(qty), intent=intent,
-                                      reason=reason, signal=signal, order_type=kind)
+                self.runtime.on_order(order_id=str(order.client_order_id), side="SELL" if side > 0 else "BUY",
+                                      qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind)
         for order, *_ in orders:
             self._sent.append(order.client_order_id)
             self.submit_order(order)
@@ -1570,9 +1978,10 @@ class LongFlatStrategy(Strategy):
     def _resting_exits(self) -> dict:
         """The backtest's stop and target resting at the venue, by intent."""
         out = {}
+        exit_side = OrderSide.BUY if self._entry_side < 0 else OrderSide.SELL
         for order in self._working():
             intent = self.decisions.get(str(order.client_order_id), {}).get("intent")
-            if order.side == OrderSide.SELL and intent in ("stop_loss", "take_profit"):
+            if order.side == exit_side and intent in ("stop_loss", "take_profit"):
                 out[intent] = order
         return out
 
@@ -1591,7 +2000,8 @@ class LongFlatStrategy(Strategy):
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 self._resize_due = True  # in flight or mid-resize: resized again once the venue answers
                 continue
-            level = self._entry_px * (1 - frac if intent == "stop_loss" else 1 + frac)
+            side = self._entry_side or 1
+            level = self._entry_px * (1 - side * frac if intent == "stop_loss" else 1 + side * frac)
             px = Price(level, self.instrument.price_precision)
             if ((order.quantity == quantity or (intent == "take_profit" and "stop_loss" in resting))
                     and (order.trigger_price if intent == "stop_loss" else order.price) == px):

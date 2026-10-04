@@ -12,12 +12,12 @@
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
       {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
-      <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif x.qty <= 0 %}disabled{% endif %}>Flatten</button>
+      <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not x.qty %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
-      {% if held > 0 %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
-      {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty > 0 %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
+      {% if held %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
+      {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
@@ -44,7 +44,7 @@
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
   {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ x.qty|qty }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
+  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ "short " if x.qty < 0 }}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
   <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% if t.trades < 10 %} · <span class="warn" title="Win rate and expectancy mean little under 10 trades">n&lt;10</span>{% endif %}{% else %}none yet{% endif %}</div></div>
   <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
@@ -54,7 +54,7 @@
 {# The strategy's own desk: headline figures stay on top, the detail sits in tabs. Without JavaScript every tab shows, one after another. #}
 <nav class="tabs desk-tabs" role="tablist" aria-label="Strategy views" data-tabs>
   <a href="#overview" role="tab" data-tab="overview">Overview</a>
-  <a href="#positions" role="tab" data-tab="positions">Position<span class="n">{{ 1 if x.qty > 0 else 0 }}</span></a>
+  <a href="#positions" role="tab" data-tab="positions">Position<span class="n">{{ 1 if x.qty else 0 }}</span></a>
   <a href="#trades" role="tab" data-tab="trades">Trades<span class="n">{{ trips|length }}</span></a>
   <a href="#orders" role="tab" data-tab="orders">Orders<span class="n">{{ orders|length }}</span></a>
   <a href="#activity" role="tab" data-tab="activity">Activity</a>
@@ -87,12 +87,12 @@
 {# One card per question a PM asks of a position: how big, at what price, where it exits, what it has made. #}
 {% set realised = x.pnl - x.unrealised %}
 <section class="panel pos" aria-labelledby="pos-h" style="margin-bottom:14px">
-  <div class="panel-head"><h2 id="pos-h">{% if position %}Long {{ s.instrument }}{% else %}No open position{% endif %}</h2>
+  <div class="panel-head"><h2 id="pos-h">{% if position %}{{ "Short" if position.side < 0 else "Long" }} {{ s.instrument }}{% else %}No open position{% endif %}</h2>
     {% if position and position.opened %}<span class="right faint">since {{ position.opened|ts }} · held {{ position.held|held }}</span>{% endif %}</div>
   <div class="pos-grid">
     <div class="pos-card"><h3>Size</h3><dl>
-      <div><dt>Quantity</dt><dd>{% if position %}{{ position.qty|qty }} {{ base }}{% else %}<span class="muted">0 {{ base }}</span>{% endif %}</dd></div>
-      <div><dt>Notional</dt><dd>{% if position %}{{ position.value|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt>Quantity</dt><dd>{% if position %}{{ position.qty|abs|qty }} {{ base }}{% else %}<span class="muted">0 {{ base }}</span>{% endif %}</dd></div>
+      <div><dt>Notional</dt><dd>{% if position %}{{ position.value|abs|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
       <div><dt>Share of equity</dt><dd>{{ x.exposure|pct1 }} <span class="faint">cap {{ x.profile.max_position_pct|pct0 }}</span></dd></div>
     </dl></div>
     <div class="pos-card"><h3>Price</h3><dl>
@@ -102,8 +102,8 @@
     </dl></div>
     <div class="pos-card"><h3>Exits</h3><dl>
       <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
-      <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% above entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
-      <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px > risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% {{ "below" if position and position.side < 0 else "above" }} entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
       <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>
@@ -112,7 +112,7 @@
     </dl></div>
   </div>
   {% if position %}<details class="why-fold">
-    <summary><span class="k">Why it was bought</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
+    <summary><span class="k">{{ "Why it was sold short" if position.side < 0 else "Why it was bought" }}</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
     {{ why('Decision at ' ~ (position.opened|ts if position.opened else 'entry'), position.why, position.sig) }}
   </details>{% endif %}
 </section>
@@ -141,7 +141,7 @@
   <table class="responsive" data-hide-md="3 4 8 10">
     <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for tr in trips[:50] %}{% set rid = 'tr-' ~ loop.index %}
-    <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ tr.qty|qty }} {{ base }}</td>
+    <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ tr.qty|qty }} {{ base }}{% if tr.side == -1 %}<div class="sub">short</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td>
       <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}{% if tr.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
@@ -202,7 +202,7 @@
     <table class="compact kv">
       <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
-      {% if not backtest_id %}{% set movable = x.qty <= 0 %}
+      {% if not backtest_id %}{% set movable = not x.qty %}
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
         <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
@@ -231,8 +231,8 @@
     <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
     <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
     {{ exit_fields(settings_pre, costs) }}
-    <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty > 0 %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
-    {% if x.qty > 0 %}<div class="field"><label class="check" style="margin-top:10px"><input type="checkbox" name="confirm_looser" value="1"> Accept a looser stop on the open position</label></div>{% endif %}
+    <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
+    {% if x.qty %}<div class="field"><label class="check" style="margin-top:10px"><input type="checkbox" name="confirm_looser" value="1"> Accept a looser stop on the open position</label></div>{% endif %}
     <div class="field" style="margin-top:12px"><label for="r-settings">Reason for the decision log</label><input id="r-settings" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason"></div>
     <button>Save settings</button>
     {% endif %}
@@ -252,8 +252,8 @@
 {% set dialogs = {
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
   'resume': ('Resume ' ~ s.name, 'The strategy trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
-  'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to sell ' ~ (held|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|money) if s.desired_state != 'running' else 'Sells ' ~ (x.qty|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
-  'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ (x.qty|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty > 0 else ''),
+  'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
+  'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
   'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),

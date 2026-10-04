@@ -14,6 +14,7 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
+from sleeve_fund import markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model
 from sleeve_fund.store import utcnow as _utcnow
@@ -41,6 +42,11 @@ class BacktestResult:
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
+
+    @property
+    def shorts(self) -> bool:
+        """Traded a perpetual: a sell from flat opens a short (metrics.trades)."""
+        return markets.is_perp(self.params)
 
 
 CHUNK_BARS = 100_000  # bars handed to the engine at a time
@@ -104,10 +110,12 @@ def run_backtest(
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    perp = markets.is_perp(params)
+    fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee))
     if half_spread is None:
         from sleeve_fund.venues import venue as venue_profile
 
-        half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
+        half_spread = markets.half_spread_for(params, venue_profile(str(instrument.id.venue)).assumed_half_spread)
     if not 0 <= half_spread < 0.05:
         raise ValueError(f"half spread {half_spread} outside [0, 5%)")
     if risk_profile is not None:
@@ -140,11 +148,13 @@ def run_backtest(
         engine.add_venue(
             venue=instrument.id.venue,
             oms_type=OmsType.NETTING,
-            account_type=AccountType.CASH,
+            # A perp trades on margin (it can go short); the venue's leverage is set above every profile's
+            # cap so our own leverage and liquidation guards, not the simulated venue, decide.
+            account_type=AccountType.MARGIN if perp else AccountType.CASH,
+            default_leverage=markets.VENUE_LEVERAGE if perp else None,
             base_currency=None,
-            starting_balances=_opening_balances(starting_capital, quote, base, runtime),
-            fee_model=(fee_model := ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee),
-                                                     half_spread=half_spread)),
+            starting_balances=_opening_balances(starting_capital, quote, base, runtime, perp),
+            fee_model=(fee_model := ScheduleFeeModel(fees, half_spread=half_spread)),
             fill_model=fill_model(),
             # Within a bar, the extreme nearer the open trades first: a bar that opens near its low hits a
             # stop before a target, rather than always high-then-low.
@@ -161,7 +171,7 @@ def run_backtest(
         config = config_cls(
             instrument_id=instrument.id,
             bar_type=bar_type,
-            assumed_taker_fee=float(instrument.taker_fee),
+            assumed_taker_fee=float(fees.taker),
             assumed_half_spread=half_spread,
             volume_scale=BOOK_SHARE,
             **params,
@@ -178,15 +188,18 @@ def run_backtest(
 
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
         account = engine.generate_account_report(instrument.id.venue)
-        equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
-        fees = _fees_paid(fills)
+        if perp:
+            equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices, _opening_cash(starting_capital, runtime))
+        else:
+            equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
+        fees_paid = _fees_paid(fills)
         return BacktestResult(
             strategy=strategy_name,
             params=params,
             equity=equity,
             exposure=exposure,
             fills=fills,
-            fees_paid=fees,
+            fees_paid=fees_paid,
             starting_capital=starting_capital,
             decisions=dict(strategy.decisions),
             risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
@@ -204,12 +217,53 @@ def run_backtest(
         engine.dispose()
 
 
-def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime) -> list[Money]:
-    """A sleeve runtime opens from its journal (as a paper restart does); research opens in cash."""
+def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:
+    """A sleeve runtime opens from its journal (as a paper restart does); research opens in cash. A
+    margin account holds only the quote currency (its positions are not balances)."""
     if runtime is None:
         return [Money(starting_capital, quote)]
     book = runtime.book
+    if perp:
+        return [Money(_opening_cash(starting_capital, runtime), quote)]
     return [Money(book["cash"], quote)] + ([Money(book["qty"], base)] if book["qty"] > 0 else [])
+
+
+def _opening_cash(starting_capital: float, runtime) -> float:
+    return starting_capital if runtime is None else float(runtime.book["cash"])
+
+
+def _perp_mark_to_market(
+    fills: pd.DataFrame, funding: list[tuple], prices: pd.DataFrame, opening_cash: float,
+) -> tuple[pd.Series, pd.Series]:
+    """A margin account keeps realised profit only, so value a perp book spot-style from the fills
+    themselves: cash moves by every fill's notional and fee (a short sale adds cash), funding adds or
+    takes its payments, and equity is cash plus the signed position at the close. Exposure is the
+    position's gross value over equity, signed: negative while short."""
+    idx = prices.index
+    flows = []  # (ts, cash change, qty change)
+    if fills is not None and not fills.empty:
+        for _, f in fills.iterrows():
+            qty = float(f["filled_qty"])
+            if qty == 0:
+                continue
+            side = 1.0 if str(f["side"]).endswith("BUY") else -1.0
+            fee = sum(float(str(m).split()[0]) for m in
+                      (f["commissions"] if isinstance(f["commissions"], (list, tuple)) else [f["commissions"]]))
+            flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
+    for ts, amount in funding:
+        flows.append((pd.Timestamp(ts), float(amount), 0.0))
+    if not flows:
+        return (pd.Series(opening_cash, index=idx).rename("equity"),
+                pd.Series(0.0, index=idx).rename("exposure"))
+    df = pd.DataFrame(flows, columns=["ts", "cash", "qty"])
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.groupby("ts").sum().sort_index().cumsum()
+    df = df.reindex(df.index.union(idx)).sort_index().ffill().fillna(0.0).reindex(idx)
+    cash = opening_cash + df["cash"]
+    position_value = df["qty"] * prices["close"]
+    equity = cash + position_value
+    exposure = position_value / equity
+    return equity.rename("equity"), exposure.rename("exposure")
 
 
 def _mark_to_market(

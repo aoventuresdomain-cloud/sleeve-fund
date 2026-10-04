@@ -100,6 +100,21 @@ fills_t = Table(
     Index("fills_sleeve_ts", "sleeve", "ts"),
 )
 
+# A perpetual's funding, exchanged at each funding time while a position is held (sleeve_fund.markets):
+# amount is what the strategy received (negative: paid), in the quote currency, booked to cash.
+funding_t = Table(
+    "funding",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("ts", TS, nullable=False),
+    Column("qty", Float, nullable=False),
+    Column("price", Float, nullable=False),
+    Column("rate", Float, nullable=False),
+    Column("amount", Float, nullable=False),
+    Index("funding_sleeve_ts", "sleeve", "ts"),
+)
+
 events_t = Table(
     "events",
     metadata,
@@ -290,6 +305,37 @@ INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
+def replay_book(fills, starting_balance: float, funding: float = 0.0) -> dict:
+    """Cash, signed position and average entry from fills in time order, plus funding received.
+
+    Spot-style cash: a buy costs qty * price + fee and a sell returns qty * price - fee, so a short holds
+    the sale's proceeds as cash against a negative position and equity is cash + qty * price on either
+    side. Fills that add to a position average its entry; fills that reduce it leave the entry alone; a
+    fill that crosses through flat opens the remainder at its own price. The position is summed in
+    Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
+    that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
+    goes negative; if it does, the negative stays visible so reconciliation catches it."""
+    cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    for f in fills:
+        n += 1
+        price = float(f["price"])
+        q = Decimal(repr(float(f["qty"])))
+        sign = 1 if f["side"] == "BUY" else -1
+        cash -= sign * float(f["qty"]) * price + float(f["fee"])
+        new = qty + sign * q
+        if abs(new) < DUST:  # float residue from a fill's own arithmetic, far below any lot
+            new = Decimal(0)
+        if new == 0:
+            entry = None
+        elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
+            entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
+        elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
+            entry = price
+        qty = new
+    return {"cash": cash + float(funding), "qty": float(qty), "entry_px": entry, "fills": n,
+            "funding": float(funding)}
+
+
 def is_backtest(name: str | None) -> bool:
     return bool(name) and name.startswith(BACKTEST_PREFIX)
 
@@ -404,7 +450,8 @@ class Store:
             c.execute(insert(sleeves_t).values(
                 name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
                 starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
-                desired_state=desired_state, status="starting", status_reason="", created_at=ts, updated_at=ts,
+                desired_state=desired_state, status="starting" if desired_state == "running" else "stopped",
+                status_reason="", created_at=ts, updated_at=ts,
             ))
         return self.sleeve(name)
 
@@ -785,32 +832,28 @@ class Store:
             return _rows(c.execute(q.order_by(fills_t.c.ts.desc(), fills_t.c.id.desc()).limit(limit)))
 
     def journal_book(self, sleeve: str, starting_balance: float) -> dict:
-        """Cash, position and average entry implied by the journal: the paper book's source of truth.
-
-        Fees are charged in the quote currency (as Kraken spot does), so a buy costs
-        qty * price + fee and a sell returns qty * price - fee.
-        """
+        """Cash, signed position and average entry implied by the journal: the paper book's source of
+        truth (replay_book), with the perp's funding booked to cash."""
         q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
         with self.engine.connect() as c:
             fills = _rows(c.execute(q))
-        # The position is summed in Decimal from each fill as written: a float sum of many XRP-sized fills
-        # carries noise of a few 1e-12 that could tip a one-lot difference over reconcile's tolerance.
-        cash, qty, entry = float(starting_balance), Decimal(0), None
-        for f in fills:
-            notional = f["qty"] * f["price"]
-            q = Decimal(repr(float(f["qty"])))
-            if f["side"] == "BUY":
-                entry = ((entry or 0.0) * float(qty) + notional) / float(qty + q)
-                cash -= notional + f["fee"]
-                qty += q
-            else:
-                cash += notional - f["fee"]
-                qty -= q
-                if abs(qty) < DUST:  # float residue from a fill's own arithmetic, far below any lot
-                    qty = Decimal(0)
-                if qty <= 0:  # a negative qty is left visible so reconciliation catches it
-                    entry = None
-        return {"cash": cash, "qty": float(qty), "entry_px": entry, "fills": len(fills)}
+        return replay_book(fills, starting_balance, self.funding_total(sleeve))
+
+    def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
+                       ts: datetime | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
+                                                amount=amount))
+
+    def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
+        q = select(funding_t).where(funding_t.c.sleeve == sleeve).order_by(funding_t.c.ts.desc()).limit(limit)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def funding_total(self, sleeve: str) -> float:
+        with self.engine.connect() as c:
+            return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
+                                   .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         q = select(events_t).where(events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))
@@ -958,6 +1001,9 @@ class Store:
                 c.execute(insert(fills_t), [{k: v for k, v in f.items() if k != "id"}
                                             | {"sleeve": name, "order_id": oid(f["order_id"])}
                                             for f in journal.fills_])
+            if getattr(journal, "funding_", None):
+                c.execute(insert(funding_t), [{k: v for k, v in f.items() if k != "id"} | {"sleeve": name}
+                                              for f in journal.funding_])
             if journal.orders_:
                 c.execute(insert(orders_t), [{k: v for k, v in o.items() if k != "id"}
                                              | {"sleeve": name, "order_id": oid(o["order_id"])}
@@ -1024,7 +1070,7 @@ class Store:
             # otherwise block deleting its event (a foreign key) and with it every later prune.
             c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
                                                                   .where(events_t.c.sleeve.in_(old)))))
-            for t in (equity_t, fills_t, orders_t, events_t, exit_plans_t):
+            for t in (equity_t, fills_t, funding_t, orders_t, events_t, exit_plans_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
             c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))

@@ -113,40 +113,62 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
     ]
 
 
-def trades(rows: list[dict]) -> list[dict]:
-    """Closed round trips (flat -> long -> flat) with P&L after fees, oldest first.
+def trades(rows: list[dict], shorts: bool = False) -> list[dict]:
+    """Closed round trips (flat -> long -> flat, or flat -> short -> flat) with P&L after fees, oldest first.
 
-    rows: fills in time order with side, qty, price, fee (quote currency). Partial
-    fills are fine: a trip closes when the position returns to zero. The position is summed in Decimal:
-    float sums of XRP-sized fills leave 1e-12-scale residue that kept trips open and merged them (round 10, M10-4).
+    rows: fills in time order with side, qty, price, fee (quote currency). Partial fills are fine: a trip
+    closes when the position returns to zero, and a single fill that goes through zero closes the trip and
+    opens the next with the rest (its fee split by quantity). `side` is 1 for a long trip, -1 for a short;
+    `cost` is the entry notional either way, and P&L is side x (exit notional - entry notional) - fees.
+    The position is summed in Decimal: float sums of XRP-sized fills leave 1e-12-scale residue that kept
+    trips open and merged them (round 10, M10-4).
+
+    A spot journal never sells short, so on spot a sell with nothing open can only be a journal read from
+    mid-trip; such rows are skipped unless shorts is set (a perpetual's journal).
     """
-    out, qty, cost, proceeds, fees = [], ZERO, 0.0, 0.0, 0.0
-    bought = sold = 0.0
-    opened = entry_order = None
+    out, pos = [], ZERO
+    trip: dict | None = None
     for r in rows:
-        q = _dec(r["qty"])
-        if r["side"] == "BUY":
-            if qty <= ZERO:
-                opened, entry_order = r.get("ts"), r.get("order_id")
-            qty += q
-            bought += r["qty"]
-            cost += r["qty"] * r["price"]
-        else:
-            if qty <= ZERO:
-                continue  # a sell with nothing open (e.g. journal started mid-trip)
-            qty -= q
-            sold += r["qty"]
-            proceeds += r["qty"] * r["price"]
-        fees += r["fee"]
-        if cost and qty <= ZERO:
-            pnl = proceeds - cost - fees
-            out.append({"pnl": pnl, "ret": pnl / cost, "cost": cost, "fees": fees, "qty": bought,
-                        "entry_px": cost / bought, "exit_px": proceeds / sold if sold else float("nan"),
-                        "opened": opened, "closed": r.get("ts"),
-                        # Journal order ids, so the dashboard can show why the trade was opened and closed.
-                        "entry_order": entry_order, "exit_order": r.get("order_id")})
-            qty, cost, proceeds, fees, bought, sold = ZERO, 0.0, 0.0, 0.0, 0.0, 0.0
+        q, sign = _dec(r["qty"]), (1 if r["side"] == "BUY" else -1)
+        if q <= ZERO:
+            continue
+        if pos == ZERO and sign < 0 and not shorts:
+            continue  # a sell with nothing open (e.g. journal started mid-trip)
+        fee_per = r["fee"] / float(q)
+        while q > ZERO:
+            if pos == ZERO:
+                trip = {"side": sign, "bought": 0.0, "sold": 0.0, "entry": 0.0, "exit": 0.0, "fees": 0.0,
+                        "opened": r.get("ts"), "entry_order": r.get("order_id")}
+            side = 1 if pos > ZERO or (pos == ZERO and sign > 0) else -1
+            # The part of this fill that adds to the position, or reduces it no further than flat.
+            part = q if sign == side else min(q, abs(pos))
+            n, f = float(part), float(part) * fee_per
+            trip["fees"] += f
+            if sign == side:
+                trip["bought" if side > 0 else "sold"] += n
+                trip["entry"] += n * r["price"]
+            else:
+                trip["sold" if side > 0 else "bought"] += n
+                trip["exit"] += n * r["price"]
+            pos += part * sign
+            q -= part
+            if pos == ZERO:
+                out.append(_trip(trip, r))
+                trip = None
     return out
+
+
+def _trip(t: dict, closing: dict) -> dict:
+    side = t["side"]
+    qty = t["bought"] if side > 0 else t["sold"]
+    out_qty = t["sold"] if side > 0 else t["bought"]
+    pnl = side * (t["exit"] - t["entry"]) - t["fees"]
+    return {"pnl": pnl, "ret": pnl / t["entry"] if t["entry"] else 0.0, "cost": t["entry"], "fees": t["fees"],
+            "qty": qty, "side": side, "entry_px": t["entry"] / qty if qty else float("nan"),
+            "exit_px": t["exit"] / out_qty if out_qty else float("nan"),
+            "opened": t["opened"], "closed": closing.get("ts"),
+            # Journal order ids, so the dashboard can show why the trade was opened and closed.
+            "entry_order": t["entry_order"], "exit_order": closing.get("order_id")}
 
 
 ZERO = Decimal(0)
@@ -180,9 +202,9 @@ def trade_stats(trips: list[dict]) -> dict:
     }
 
 
-def round_trips(fills: pd.DataFrame) -> list[float]:
+def round_trips(fills: pd.DataFrame, shorts: bool = False) -> list[float]:
     """Return per round trip after fees, from a backtest fills report."""
-    return [t["ret"] for t in trades(fills_to_rows(fills))]
+    return [t["ret"] for t in trades(fills_to_rows(fills), shorts)]
 
 
 def turnover_per_year(fills: pd.DataFrame, equity: pd.Series) -> float:

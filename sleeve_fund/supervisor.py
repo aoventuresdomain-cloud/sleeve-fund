@@ -187,15 +187,19 @@ class Supervisor:
 
 
 def seed(store: Store, paths: list[str]) -> list[str]:
-    """Insert sleeves from TOML files that aren't in the database yet. Never overwrites."""
+    """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
+    `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:
         cfg = load_sleeve(path)
         if cfg.name in existing:
             continue
-        store.create_sleeve(**to_store_kwargs(cfg))
-        store.decide("system", "create", f"seeded from {path}", cfg.name)
+        with open(path, "rb") as fh:
+            start = tomllib.load(fh).get("sleeve", {}).get("start", True)
+        store.create_sleeve(**to_store_kwargs(cfg), desired_state="running" if start else "stopped")
+        store.decide("system", "create", f"seeded from {path}" + ("" if start else " (stopped, to be started by the PM)"),
+                     cfg.name)
         added.append(cfg.name)
     return added
 

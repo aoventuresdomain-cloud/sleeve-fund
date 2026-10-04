@@ -249,6 +249,23 @@ def _data_note(prices: pd.DataFrame, minutes: int) -> dict:
     return {**q, "longest_end": q["longest_end"].isoformat() if q["longest_end"] is not None else None, "note": note}
 
 
+def _fee_view(params: dict, inst, quote_fees) -> dict:
+    """The schedule the run charged: a perpetual's own (sleeve_fund.markets), else the venue's."""
+    from decimal import Decimal
+
+    from sleeve_fund import markets
+    from sleeve_fund.instruments import FeeSchedule
+
+    t = markets.terms(params)
+    if t is not None and t.fees is not None:
+        text = f"{t.label}: {t.fees.maker:.2%} maker, {t.fees.taker:.2%} taker"
+        return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": t.label,
+                "source": "market"}
+    fees = markets.fees_for(params, FeeSchedule(Decimal(str(inst.maker_fee)), Decimal(str(inst.taker_fee))))
+    return {"maker": float(fees.maker), "taker": float(fees.taker), "text": quote_fees.text,
+            "short": quote_fees.short, "source": quote_fees.source}
+
+
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
         risk_profile: str | None = None, spread_quote=None, minutes: int = 1440, progress=None,
@@ -323,7 +340,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         m["max_drawdown"] = min(m["max_drawdown"], w)
         m["calmar"] = m["cagr"] / abs(m["max_drawdown"]) if m["max_drawdown"] < 0 else 0.0
     rows = fills_to_rows(res.fills)
-    trips = trades(rows)
+    trips = trades(rows, res.shorts)
     stats = trade_stats(trips)
     step = 1 if detail else max(1, len(equity) // 400)
     out = {
@@ -348,8 +365,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "errors": _errors(res.handler_errors, res.handler_error_count),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "short": spread.short, "source": spread.source},
-        "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
-                         "short": quote_fees.short, "source": quote_fees.source},
+        "fee_schedule": _fee_view(params, inst, quote_fees),
     }
     if detail:
         from sleeve_fund.dashboard import trading
@@ -357,7 +373,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         peak = equity.cummax()
         out["drawdown"] = [round(float(v), 6) for v in (1 - equity / peak)]
         out["fills"] = [{"t": r["ts"].isoformat(), "side": r["side"], "price": r["price"]} for r in rows]
-        out["trips"] = trading.trips(list(reversed(rows)), [], res.decisions)
+        out["trips"] = trading.trips(list(reversed(rows)), [], res.decisions, shorts=res.shorts)
         out["stats"] = {k: _finite(v) for k, v in stats.items()}
         out["strategy"].update(sortino=s["sortino"], calmar=s["calmar"])
         out["hold"].update(sortino=b["sortino"], calmar=b["calmar"])

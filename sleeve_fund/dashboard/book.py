@@ -47,7 +47,7 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
     last = store.last_equity(s.name)
     price = last["price"] if last else 0.0
     qty = last["qty"] if last else 0.0
-    unreal = qty * (price - book["entry_px"]) if book["entry_px"] and qty > 0 else 0.0
+    unreal = qty * (price - book["entry_px"]) if book["entry_px"] and qty else 0.0  # a short's qty is negative
     fill = store.fills(s.name, limit=1)
     rec = store.last_event(s.name, ("reconcile", "reconcile_mismatch"))
     tail = frame["equity"].tail(60).tolist() if len(frame) else []
@@ -176,16 +176,24 @@ def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | Non
 
 
 def allocation(summaries: list[dict], equity: float) -> list[dict]:
-    """Capital by instrument (open positions) plus cash, as shares of book equity."""
+    """Capital by instrument (open positions) plus cash, as shares of book equity. A short is its own row
+    with a negative value (its sale proceeds sit in cash, so cash can exceed equity). `bar` is the row's
+    width in the allocation bar: positions by gross value, cash filling what is left."""
     by_asset: dict[str, float] = {}
     for x in summaries:
         base = x["sleeve"].instrument.split("/")[0]
-        if x["position_value"] > 0:
-            by_asset[base] = by_asset.get(base, 0.0) + x["position_value"]
-    rows = [{"name": k, "value": v} for k, v in sorted(by_asset.items(), key=lambda kv: -kv[1])]
-    rows.append({"name": "Cash", "value": sum(x["cash"] for x in summaries)})
+        if x["position_value"]:
+            key = base if x["position_value"] > 0 else f"{base} short"
+            by_asset[key] = by_asset.get(key, 0.0) + x["position_value"]
+    rows = [{"name": k, "value": v} for k, v in sorted(by_asset.items(), key=lambda kv: -abs(kv[1]))]
+    gross = sum(abs(r["value"]) for r in rows)
+    scale = max(equity, gross) if equity > 0 else gross
     for r in rows:
         r["share"] = r["value"] / equity if equity else 0.0
+        r["bar"] = abs(r["value"]) / scale if scale else 0.0
+    cash = sum(x["cash"] for x in summaries)
+    rows.append({"name": "Cash", "value": cash, "share": cash / equity if equity else 0.0,
+                 "bar": max(0.0, 1 - sum(r["bar"] for r in rows))})
     return rows
 
 

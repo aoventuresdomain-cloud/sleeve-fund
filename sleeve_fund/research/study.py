@@ -105,7 +105,7 @@ class StudyResult:
 
     @property
     def round_trips(self) -> list[float]:
-        return round_trips(self.full_period.fills)
+        return round_trips(self.full_period.fills, self.full_period.shorts)
 
     @property
     def oos_trades(self) -> int:
@@ -248,7 +248,7 @@ def run_study(
         res = bt(spec.name, research, params)
         m = summary(daily_returns(res.equity))
         log(params, "sensitivity", m["sharpe"])
-        rows.append({**params, **m, "round_trips": len(round_trips(res.fills)), "fees": res.fees_paid})
+        rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid})
         if params == default_params:
             full_default = res
     if full_default is None:
@@ -283,7 +283,7 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=summary(b_ret),
-                test_trades=sum(1 for t in trades(fills_to_rows(run.fills))
+                test_trades=sum(1 for t in trades(fills_to_rows(run.fills), run.shorts)
                                 if t["closed"] is not None and _utc(t["closed"]) >= _utc(test_idx[0])),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),

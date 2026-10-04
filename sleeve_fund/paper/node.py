@@ -30,7 +30,7 @@ from nautilus_trader.model import (
     TraderId,
 )
 
-from sleeve_fund import spreads
+from sleeve_fund import markets, spreads
 from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
@@ -99,11 +99,19 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
     data_factory, data_config = profile.data_client()
     fee_model = ScheduleFeeModel(sleeve.fees)
+    perp = markets.is_perp(sleeve.params)
     balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
     if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
-        balances = [Money(runtime.book["cash"], Currency.from_str(quote_code))]
-        if runtime.book["qty"] > 0:
-            balances.append(Money(runtime.book["qty"], Currency.from_str(base_code)))
+        book = runtime.book
+        if perp:
+            # A margin account holds the quote currency only. The position is put back by a restore order
+            # at start (LongFlatStrategy._send_restore); the account opens with the cash it had when the
+            # position was opened, so after that restore its cash equals the journal's.
+            balances = [Money(book["cash"] + book["qty"] * (book["entry_px"] or 0.0), Currency.from_str(quote_code))]
+        else:
+            balances = [Money(book["cash"], Currency.from_str(quote_code))]
+            if book["qty"] > 0:
+                balances.append(Money(book["qty"], Currency.from_str(base_code)))
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -117,7 +125,9 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 starting_balances=balances,
                 account_id=AccountId.from_str(f"{profile.name}-PAPER-{tag[:20]}"),
                 oms_type=OmsType.NETTING,
-                account_type=AccountType.CASH,
+                # A perpetual trades on margin so it can go short; our own guards set its leverage.
+                account_type=AccountType.MARGIN if perp else AccountType.CASH,
+                default_leverage=markets.VENUE_LEVERAGE if perp else None,
                 fee_model=fee_model,
                 fill_model=fill_model(),
             ),
@@ -180,7 +190,10 @@ def main(argv: list[str] | None = None) -> int:
         quote = resolve(getattr(row, "venue", None), store)
         sleeve = from_store(row, fee_schedule=quote.fees)
         runtime = SleeveRuntime(store, sleeve.name)
-        store.event(sleeve.name, "info", "fees", f"Charging {quote.text}")
+        perp = markets.terms(sleeve.params)
+        store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
+                    f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "
+                    "live prices; funding every 8 hours from our own ledger")
     else:
         sleeve = load_sleeve(args.sleeve)
     recorder = None
