@@ -63,7 +63,7 @@
       <section class="ledger compact" aria-label="Trade figures">
         <div><div class="k">Trades</div><div class="v">{{ ts.trades }}</div><div class="s">{% if ts.trades < 10 %}too few to judge{% else %}{{ ts.wins }} won{% endif %}</div></div>
         <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
-        <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade</div></div>
+        <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade{% if result.expectancy_r is not none %} · {{ result.expectancy_r|rmult }}{% endif %}</div></div>
         <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
         <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">{% if result.execution.maker %}{{ result.execution.maker_orders }} of {{ result.execution.orders }} as maker{% else %}of {{ result.start|money }}{% endif %}{% if result.spread.paid %}, plus {{ result.spread.paid|money }} spread{% endif %}</div></div>
         <div><div class="k">Time in market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
@@ -83,15 +83,15 @@
       <div class="panel-head"><h2 id="bt-tr-h">Every trade</h2><span class="hint">open Why for the signal behind each entry and exit</span></div>
       {% if result.trips %}
       <table class="responsive tight" data-hide-xl="3 4" data-hide-lg="3 4 5 7" data-hide-md="3 4 5 6 7">
-        <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th>Exit</th><th></th></tr></thead>
+        <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th>Exit</th><th></th></tr></thead>
         <tbody>{% for t in result.trips|reverse %}{% set rid = 'bt-' ~ loop.index %}
         <tr><td data-m="hide">{{ t.opened.strftime(dfmt) }}</td><td>{{ t.closed.strftime(dfmt) }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
           <td class="num" data-m="hide">{{ '%g'|format(t.qty) }}</td>
           <td class="num" data-m="hide">{{ t.entry_px|px }}</td><td class="num" data-m="hide">{{ t.exit_px|px }}</td>
           <td class="num" data-m="hide">{{ t.fees|money }}</td>
-          <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td>
+          <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td><td class="num" data-m="hide">{{ t.r|rmult }}</td>
           <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td><td data-m="right">{{ why_toggle(rid) }}</td></tr>
-        <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
+        <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">
           {{ why('Entry · ' ~ t.opened.strftime(dfmt) ~ ' at ' ~ t.entry_px|px, t.entry_why, t.entry_items) }}
           {{ why(t.reason ~ ' · ' ~ t.closed.strftime(dfmt) ~ ' at ' ~ t.exit_px|px, t.exit_why, t.exit_items) }}
         </div></td></tr>

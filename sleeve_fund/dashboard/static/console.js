@@ -372,7 +372,7 @@ window.Console = (() => {
       ];
       const sl = $("stop_loss_pct").value, tp = $("take_profit_pct").value, rpt = $("risk_per_trade_pct").value;
       if (sl || tp) items.push(`Exit any trade ${[sl && `${sl}% below entry`, tp && `${tp}% above entry`].filter(Boolean).join(" or ")}.`);
-      if (rpt) items.push(sl ? `Size each trade to lose about ${rpt}% of capital if the stop is hit.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      if (rpt) items.push(sl ? `Size each trade to lose about ${rpt}% of capital if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
       if ($("execution").value === "maker") items.push(`Rest each signal order as a post-only limit for the maker fee, and send whatever hasn't filled after ${$("maker_wait_minutes").value || 15} minutes at market. Protective exits go at market.`);
       if ($("max_notional").value) items.push(`Never place a single order above ${money.format(Number($("max_notional").value))} ${quote}.`);
       const ul = document.getElementById("summary");

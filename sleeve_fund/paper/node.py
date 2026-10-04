@@ -31,6 +31,7 @@ from nautilus_trader.model import (
     Venue,
 )
 
+from sleeve_fund import spreads
 from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
@@ -131,6 +132,9 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 bar_type=BarType.from_str(sleeve.bar_type),
                 max_notional=sleeve.max_notional,
                 assumed_taker_fee=float(sleeve.fees.taker),
+                # Sizing to a loss at the stop uses live quotes; this covers the moments before the first.
+                assumed_half_spread=spreads.resolve(profile.name, sleeve.instrument,
+                                                    runtime.store if runtime is not None else None).half_spread,
                 warmup_bars=sleeve.warmup_bars,
                 strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
                 **sleeve.params,

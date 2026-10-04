@@ -137,6 +137,7 @@ def run_backtest(
             instrument_id=instrument.id,
             bar_type=bar_type,
             assumed_taker_fee=float(instrument.taker_fee),
+            assumed_half_spread=half_spread,
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)

@@ -77,6 +77,7 @@ class LongFlatConfig(StrategyConfig):
         cash_buffer: float = 0.01,
         max_notional: float | None = None,
         assumed_taker_fee: float | None = None,
+        assumed_half_spread: float = 0.0,
         warmup_bars: int = 0,
         stop_loss: float | None = None,
         take_profit: float | None = None,
@@ -95,6 +96,8 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError("assumed_taker_fee is required: pass the venue profile's taker fee")
         if not 0 <= assumed_taker_fee < 0.05:
             raise ValueError(f"assumed_taker_fee {assumed_taker_fee} outside [0, 0.05)")
+        if not 0 <= assumed_half_spread < 0.05:
+            raise ValueError(f"assumed_half_spread {assumed_half_spread} outside [0, 0.05)")
         if warmup_bars < 0:
             raise ValueError("warmup_bars must be >= 0")
         if not 0 <= cash_buffer < 0.5:
@@ -122,7 +125,7 @@ class LongFlatConfig(StrategyConfig):
         if max_participation is not None and not 0 < max_participation <= 1:
             raise ValueError(f"max_participation {max_participation} outside (0, 1]")
         if risk_per_trade is not None and stop_loss is None:
-            raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
+            raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Leave room for the taker fee and rounding so a full-size buy never rejects.
@@ -131,6 +134,9 @@ class LongFlatConfig(StrategyConfig):
         self.max_notional = max_notional
         # Venue instruments may not carry fee rates (some venues leave them out), so sizing uses this.
         self.assumed_taker_fee = assumed_taker_fee
+        # Half the bid-ask spread a market order pays, for sizing to a loss at the stop. Paper uses the
+        # live quotes when it has them.
+        self.assumed_half_spread = assumed_half_spread
         # Live/paper only: bars to request from the venue at start to warm indicators.
         self.warmup_bars = warmup_bars
         # Optional exits on top of the strategy's own signal, as fractions of the entry price.
@@ -492,7 +498,7 @@ class LongFlatStrategy(Strategy):
             limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
         if self._cfg.risk_per_trade:
             equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss))
+            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop()))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -505,7 +511,30 @@ class LongFlatStrategy(Strategy):
             return
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
                   "budget": round(float(budget), 2)}
+        if self._cfg.stop_loss:
+            # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
+            loss = self._loss_at_stop()
+            signal["risk_amount"] = round(float(qty * bar.close.as_decimal()) * loss, 2)
+            if self._cfg.take_profit:  # what the target makes, after the same costs, in R
+                tp, cost = self._cfg.take_profit, self._round_trip_cost()
+                signal["planned_r"] = round((tp - cost - (1 + tp) * cost) / loss, 2)
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
+
+    def _loss_at_stop(self) -> float:
+        """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
+        and half the spread to buy, plus the same on what is left to sell. A 6% stop at 0.8% taker and a
+        0.05% half spread loses 7.65%, not 6%."""
+        cost, stop = self._round_trip_cost(), self._cfg.stop_loss
+        return stop + cost + (1 - stop) * cost
+
+    def _round_trip_cost(self) -> float:
+        """Each leg's cost as a share of its notional: the taker fee and half the spread."""
+        return self._cfg.assumed_taker_fee + self._half_spread()
+
+    def _half_spread(self) -> float:
+        if self._bid is not None and self._ask is not None and self._bid > 0 and self._ask >= self._bid:
+            return (self._ask - self._bid) / (self._ask + self._bid)
+        return self._cfg.assumed_half_spread
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
         """Send an order, journaling it with its reason first so the record exists before the venue sees
