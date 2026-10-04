@@ -74,7 +74,25 @@ def test_risk_per_trade_sizes_from_the_stop(prices, instrument):
     res = run_backtest("buy_and_hold", _path(prices, closes), instrument,
                        {"stop_loss": 0.05, "risk_per_trade": 0.01}, starting_capital=10_000)
     notional = float(res.fills["filled_qty"].iloc[0]) * float(res.fills["avg_px"].iloc[0])
-    assert notional == pytest.approx(10_000 * 0.01 / 0.05, rel=0.03)  # ~2,000, not the whole sleeve
+    cost = float(instrument.taker_fee) + res.half_spread  # each leg: the taker fee and half the spread
+    loss_at_stop = 0.05 + cost + 0.95 * cost
+    assert notional == pytest.approx(10_000 * 0.01 / loss_at_stop, rel=0.03)  # ~1,500, not the whole sleeve
+
+
+def test_a_stopped_trade_loses_its_risk_budget_with_costs_and_reads_minus_one_r(prices, instrument):
+    """Round 4, R4-M7: a 6% stop sized to lose 1% lost 1.3%, because sizing left out fees and spread."""
+    from sleeve_fund.dashboard import trading
+
+    closes = [10_000.0] * 10 + [10_000.0 * 0.99**i for i in range(1, 30)]
+    res = run_backtest("buy_and_hold", _path(prices, closes), instrument,
+                       {"stop_loss": 0.06, "risk_per_trade": 0.01, "take_profit": 0.18}, starting_capital=10_000,
+                       risk_profile="aggressive")
+    assert len(res.fills) == 2
+    assert res.equity.iloc[-1] == pytest.approx(10_000 * 0.99, abs=10_000 * 0.0006)  # 1% lost, give or take
+    j = res.journal
+    (trip,) = trading.trips(j.fills(limit=10), j.events(limit=100), {o["order_id"]: o for o in j.orders()})
+    assert trip["r"] == pytest.approx(-1.0, abs=0.06)
+    assert 2.0 < trip["planned_r"] < 3.0  # an 18% target is under 3R once costs come off both ends
 
 
 @pytest.mark.parametrize("bad", [{"stop_loss": 0}, {"stop_loss": 0.9}, {"risk_per_trade": 0.01}, {"take_profit": -1}])
