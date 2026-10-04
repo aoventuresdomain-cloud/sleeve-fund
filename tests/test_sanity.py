@@ -1,0 +1,378 @@
+"""Fast sanity checks: the engine's arithmetic, one rule at a time, in well under a minute.
+
+The end-to-end review replays whole strategies through every screen. These checks sit beside it and
+catch the cheap, embarrassing mistakes quickly: a fee that doesn't follow the size of the trade, a
+maker fill charged the taker rate, books that don't add up, a position left open after a full exit,
+an R that isn't the stop distance, and paper entering or exiting differently from the backtest on
+the same prices.
+
+They trade a probe strategy defined here (not one of the shipped strategies, which come and go): it
+goes long for `period` decision bars, then flat for `period`, on the clock, so paper and the backtest
+decide on exactly the same bars. Run them alone with:  pytest -m sanity
+"""
+
+from __future__ import annotations
+
+from datetime import timezone
+
+import numpy as np
+import pandas as pd
+import pytest
+from nautilus_trader.model import Bar
+
+from sleeve_fund.instruments import BOOK_SHARE
+from sleeve_fund.paper.recorder import Recorder
+from sleeve_fund.research.replay import replay
+from sleeve_fund.research.runner import run_backtest
+from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
+from sleeve_fund.venues import venue
+
+pytestmark = pytest.mark.sanity
+
+K = venue("KRAKEN")
+MAKER, TAKER = float(K.fees.maker), float(K.fees.taker)
+HALF = 0.0005  # a 5 bp half spread on orders that take liquidity
+CENT = 0.005  # fees are kept to the cent, so any one fee may be half a cent out
+
+# Three price scales: a large price, a sub-dollar one and a sub-cent one.
+INSTRUMENTS = {
+    "BTC": (K.instrument("BTC", "USD", price_precision=1), 60_000.0),
+    "XRP": (K.instrument("XRP", "USD", price_precision=5), 0.5),
+    "DOGE": (K.instrument("DOGE", "USD", price_precision=7), 0.08),
+}
+
+
+class ProbeConfig(LongFlatConfig):
+    def __init__(self, *, period: int = 5, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.period = period
+
+
+class Probe(LongFlatStrategy):
+    """Long for `period` bars, flat for `period` bars, by the bar's close time, so every path decides
+    on the same bars whatever it has seen before."""
+
+    def __init__(self, config: ProbeConfig) -> None:
+        super().__init__(config)
+        self.step = config.bar_type.spec.timedelta.total_seconds() * 1e9
+        self.period = config.period
+
+    def want_long(self, bar: Bar) -> bool | None:
+        return (int(bar.ts_event // self.step) // self.period) % 2 == 1
+
+
+@pytest.fixture(autouse=True)
+def _probe(monkeypatch):
+    monkeypatch.setitem(REGISTRY, "probe", (Probe, ProbeConfig))
+
+
+def _bars(px, n=240, minutes=60, vol=None, seed=1, sigma=0.003):
+    rng = np.random.default_rng(seed)
+    c = px * np.exp(np.cumsum(rng.normal(0, sigma, n)))
+    o = np.r_[px, c[:-1]]
+    idx = pd.date_range("2025-01-01", periods=n, freq=f"{minutes}min", tz="UTC") + pd.Timedelta(minutes=minutes)
+    volume = vol if vol is not None else 1e9 / px  # deep: the volume cap never binds unless asked to
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c) * 1.001, "low": np.minimum(o, c) * 0.999,
+                         "close": c, "volume": volume}, index=idx)
+
+
+def _run(prices, inst, params=None, capital=10_000.0, profile="aggressive", minutes=60, **kw):
+    params = {"period": 5, **(params or {})}
+    return run_backtest("probe", prices, inst, params, starting_capital=capital, risk_profile=profile,
+                        bar_minutes=minutes, half_spread=kw.pop("half_spread", HALF), **kw)
+
+
+def _entries(j):
+    return [o for o in j.orders_.values() if o["intent"] == "entry" and o["filled_qty"] > 0]
+
+
+def _notional(fills):
+    return sum(f["qty"] * f["price"] for f in fills)
+
+
+# --- fees -------------------------------------------------------------------------------------------
+
+
+def _rate(order):
+    """What the venue charges this order on its notional, as the journal books it: the maker fee on a
+    post-only order, else the taker fee plus the half spread (a backtest books the spread as a cost)."""
+    return MAKER if order["order_type"] == "POST-ONLY LIMIT" else TAKER + HALF
+
+
+def _assert_every_fee(j):
+    assert j.fills_, "no fills"
+    for f in j.fills_:
+        expected = f["qty"] * f["price"] * _rate(j.orders_[f["order_id"]])
+        assert f["fee"] == pytest.approx(expected, abs=CENT), (f, expected)
+
+
+@pytest.mark.parametrize("capital", [100.0, 10_000.0, 1_000_000.0])
+@pytest.mark.parametrize("name", list(INSTRUMENTS))
+def test_every_fill_pays_its_rate_on_its_own_notional(name, capital):
+    inst, px = INSTRUMENTS[name]
+    j = _run(_bars(px), inst, capital=capital).journal
+    _assert_every_fee(j)
+    total = sum(f["fee"] for f in j.fills_)
+    assert total == pytest.approx(_notional(j.fills_) * (TAKER + HALF), rel=1e-3, abs=CENT * len(j.fills_))
+
+
+# Each sizing knob, at two settings: the entry's notional must follow the knob by the expected ratio,
+# and the fees must follow the notional. "Sized by" must name the knob, so the PM can see what set it.
+SIZING = {
+    "starting capital": (dict(capital=10_000.0), dict(capital=100_000.0), 10.0, "aggressive risk profile cap"),
+    "risk profile": (dict(profile="conservative"), dict(profile="aggressive"), 0.50 / 0.20, "risk profile cap"),
+    "largest order": (dict(params={"max_notional": 400.0}), dict(params={"max_notional": 4_000.0}), 10.0,
+                      "largest order cap"),
+    "risk per trade": (dict(params={"stop_loss": 0.05, "risk_per_trade": 0.002}),
+                       dict(params={"stop_loss": 0.05, "risk_per_trade": 0.01}), 5.0, "risk per trade"),
+    "volume": (dict(capital=1e6, vol=2.0), dict(capital=1e6, vol=20.0), 10.0, "share of the bar's volume"),
+}
+
+
+@pytest.mark.parametrize("knob", list(SIZING))
+def test_fees_follow_the_size_whatever_sets_it(knob):
+    small, large, ratio, sized_by = SIZING[knob]
+    inst, px = INSTRUMENTS["BTC"]
+    runs = []
+    for setting in (small, large):
+        setting = dict(setting)
+        prices = _bars(px, vol=setting.pop("vol", None))
+        runs.append(_run(prices, inst, **setting).journal)
+    first = [_entries(j)[0] for j in runs]
+    for o in first:
+        assert sized_by in o["signal"]["sized_by"], o["signal"]
+    size = [o["filled_qty"] * o["avg_px"] for o in first]
+    assert size[1] / size[0] == pytest.approx(ratio, rel=0.01), size
+    fees = [sum(f["fee"] for f in j.fills_) for j in runs]
+    traded = [_notional(j.fills_) for j in runs]
+    assert fees[1] / fees[0] == pytest.approx(traded[1] / traded[0], rel=0.01), (fees, traded)
+    for f, t in zip(fees, traded):
+        assert f / t == pytest.approx(TAKER + HALF, rel=1e-3), (f, t)
+
+
+def _maker_run(px, inst, vol_per_minute, capital=10_000.0):
+    """15-minute decisions on 1-minute execution bars, post-only orders waiting 5 minutes."""
+    minutes = _bars(px, n=15 * 120, minutes=1, vol=vol_per_minute, sigma=0.0006)
+    decisions = minutes.resample("15min", label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    return _run(decisions, inst, {"maker_wait_minutes": 5}, capital=capital, minutes=15,
+                exec_prices=minutes, exec_minutes=1)
+
+
+@pytest.mark.parametrize("name", list(INSTRUMENTS))
+def test_post_only_fills_pay_the_maker_fee_and_market_fills_the_taker_fee(name):
+    inst, px = INSTRUMENTS[name]
+    j = _maker_run(px, inst, vol_per_minute=1e9 / px).journal
+    kinds = {j.orders_[f["order_id"]]["order_type"] for f in j.fills_}
+    assert "POST-ONLY LIMIT" in kinds
+    _assert_every_fee(j)
+    maker = [f for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT"]
+    assert sum(f["fee"] for f in maker) / _notional(maker) == pytest.approx(MAKER, rel=1e-3)
+
+
+CENT_ROUNDING = pytest.mark.xfail(strict=True, reason=(
+    "NEW (sanity S-1): every fee is rounded to the cent (Nautilus keeps USD to 2 dp), so equal small slices "
+    "all round the same way: $2.44 slices pay 0.41%, not 0.40%, and $1.20 slices pay nothing"))
+
+
+@pytest.mark.parametrize("capital", [pytest.param(96.0, marks=CENT_ROUNDING), pytest.param(200.0, marks=CENT_ROUNDING),
+                                     20_000.0, 1_000_000.0])
+def test_post_only_orders_filled_in_slices_still_pay_the_maker_rate_overall(capital):
+    """Thin minutes: each post-only order fills a slice at a time (BOOK_SHARE of what trades), so small
+    accounts get many small fills. Rounding each to the cent must not move the total off the rate."""
+    inst, px = INSTRUMENTS["BTC"]
+    j = _maker_run(px, inst, vol_per_minute=capital / px / 4, capital=capital).journal
+    maker = [f for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT"]
+    assert len(maker) > len({f["order_id"] for f in maker}), "expected slices"
+    _assert_every_fee(j)
+    assert sum(f["fee"] for f in maker) / _notional(maker) == pytest.approx(MAKER, rel=0.01)
+
+
+# --- the books --------------------------------------------------------------------------------------
+
+
+def _held(fills):
+    return sum(f["qty"] if f["side"] == "BUY" else -f["qty"] for f in fills)
+
+
+def _cash(start, fills):
+    return start + sum((f["qty"] * f["price"]) * (1 if f["side"] == "SELL" else -1) - f["fee"] for f in fills)
+
+
+@pytest.mark.parametrize("name", list(INSTRUMENTS))
+@pytest.mark.parametrize("maker", [False, True])
+def test_books_add_up_and_every_full_exit_leaves_nothing(name, maker):
+    inst, px = INSTRUMENTS[name]
+    res = _maker_run(px, inst, vol_per_minute=1e9 / px) if maker else _run(_bars(px), inst)
+    j = res.journal
+    lot = float(inst.size_increment)
+    # Once an exit (and any rest of it sent at market) has filled, nothing is left: not a lot, not dust.
+    intent = lambda f: j.orders_[f["order_id"]]["intent"]  # noqa: E731
+    held, exits = 0.0, 0
+    for i, f in enumerate(j.fills_):
+        held += f["qty"] if f["side"] == "BUY" else -f["qty"]
+        after = j.fills_[i + 1] if i + 1 < len(j.fills_) else None
+        if intent(f) != "entry" and (after is None or intent(after) == "entry"):
+            exits += 1
+            assert abs(held) < lot / 2, (f, held)
+    assert exits >= 5
+    # Cash and position from the fills are the journal's own, and equity is cash plus the position
+    # at the last price.
+    last = j.equity[-1]
+    assert last["qty"] == pytest.approx(_held(j.fills_), abs=lot / 2)
+    # The venue keeps cash to the cent on every fill (its notional and its fee), the journal's fills
+    # don't: at most a cent apart per fill.
+    assert last["cash"] == pytest.approx(_cash(10_000.0, j.fills_), abs=0.01 * len(j.fills_))
+    assert last["equity"] == pytest.approx(last["cash"] + last["qty"] * last["price"], abs=0.01)
+    # The backtest's own equity curve ends at the same value.
+    assert float(res.equity.iloc[-1]) == pytest.approx(last["equity"], rel=1e-5)
+
+
+def test_research_equity_is_cash_plus_position_from_the_fills_report():
+    """The research path (no risk profile) reports from the venue's fills; the same arithmetic holds."""
+    inst, px = INSTRUMENTS["BTC"]
+    prices = _bars(px)
+    res = run_backtest("probe", prices, inst, {"period": 5}, starting_capital=10_000, bar_minutes=60, half_spread=HALF)
+    f = res.fills
+    qty = f["filled_qty"].astype(float) * np.where(f["side"].astype(str).str.endswith("BUY"), 1, -1)
+    cash = 10_000 - (qty * f["avg_px"].astype(float)).sum() - res.fees_paid
+    equity = cash + qty.sum() * prices["close"].iloc[-1]
+    assert float(res.equity.iloc[-1]) == pytest.approx(equity, abs=0.01 * len(f) + 0.01)
+    assert res.fees_paid / (f["filled_qty"].astype(float) * f["avg_px"].astype(float)).sum() == pytest.approx(TAKER, rel=1e-3)
+
+
+# --- R ----------------------------------------------------------------------------------------------
+
+
+def _drops(px, stop, n=200, minutes=60):
+    """Bars that drift up, with a clean drop through any stop every 10 bars: the stop fills at its level."""
+    c = [px]
+    for i in range(1, n):
+        c.append(c[-1] * (1 - 2.5 * stop if i % 10 == 7 else 1.0005))
+    c = np.array(c)
+    o = np.r_[px, c[:-1]]
+    idx = pd.date_range("2025-01-01", periods=n, freq=f"{minutes}min", tz="UTC") + pd.Timedelta(minutes=minutes)
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c) * 1.0001, "low": np.minimum(o, c) * 0.9999,
+                         "close": c, "volume": 1e9 / px}, index=idx)
+
+
+@pytest.mark.parametrize("risk", [0.005, 0.02])
+def test_one_r_is_the_loss_at_the_stop_and_a_stop_loses_one_r(risk):
+    inst, px = INSTRUMENTS["BTC"]
+    stop = 0.02
+    j = _run(_drops(px, stop), inst, {"period": 2, "stop_loss": stop, "risk_per_trade": risk}).journal
+    entries = _entries(j)
+    assert entries
+    for o in entries:
+        s = o["signal"]
+        loss = stop + (TAKER + HALF) + (1 - stop) * (TAKER + HALF)
+        assert s["risk_amount"] == pytest.approx(o["filled_qty"] * s["close"] * loss, abs=0.01), s
+    stopped = [o for o in j.orders_.values() if o["intent"] == "stop_loss" and o["status"] == "filled"]
+    assert len(stopped) >= 3
+    by_order = {}
+    for f in j.fills_:
+        by_order.setdefault(f["order_id"], []).append(f)
+    for o in stopped:
+        entry = max((e for e in entries if e["ts"] <= o["ts"]), key=lambda e: e["ts"])
+        cost = sum(f["qty"] * f["price"] + f["fee"] for f in by_order[entry["order_id"]])
+        got = sum(f["qty"] * f["price"] - f["fee"] for f in by_order[o["order_id"]])
+        realised_r = (got - cost) / entry["signal"]["risk_amount"]
+        assert realised_r == pytest.approx(-1.0, abs=0.02), (entry, o, realised_r)
+        # And the stop sold at its level, not somewhere else on the bar.
+        assert o["avg_px"] == pytest.approx(entry["avg_px"] * (1 - stop), rel=2e-4), o
+
+
+# --- paper and the backtest on the same prices ------------------------------------------------------
+
+START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, in nanoseconds
+SPREAD = 12.0  # $12 wide around each BTC trade
+TICK_INST = K.instrument("BTC", "USD", price_precision=1)
+
+
+def _record(path, prices, params, profile="aggressive", size=1.0):
+    """A paper session with one trade a second, the quote following each trade."""
+    from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
+
+    rec = Recorder(path)
+    rec.meta = {"balances": ["10000.00 USD"],
+                "sleeve": {"name": "sanity", "strategy": "probe", "instrument": "BTC/USD",
+                           "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000,
+                           "risk_profile": profile, "params": params, "max_notional": None,
+                           "maker_fee": str(K.fees.maker), "taker_fee": str(K.fees.taker), "tick_seconds": 30}}
+    rec.start(TICK_INST)
+    stamps = []
+    for s, px in enumerate(np.round(prices, 1)):
+        t = START + s * 1_000_000_000
+        rec.trade(TradeTick(TICK_INST.id, Price(px, 1), Quantity(size, 8),
+                            AggressorSide.BUY if s % 2 else AggressorSide.SELL, TradeId(str(s)), t, t + 1000))
+        rec.quote(QuoteTick(TICK_INST.id, Price(px - SPREAD / 2, 1), Price(px + SPREAD / 2, 1), Quantity(1, 8),
+                            Quantity(1, 8), t + 2000, t + 3000))
+        stamps.append(t)
+    rec.close()
+    return pd.Series(np.round(prices, 1), index=pd.to_datetime(stamps, utc=True))
+
+
+def _per_order(fills, intents):
+    """(side, intent, minute, qty, all-in price, fee) per order, in fill order. The all-in price
+    includes the fee and spread: paper pays the spread in its price and the backtest with its fee."""
+    out = {}
+    for f in fills:
+        side, qty, notional, fee, _ = out.get(f["order_id"], (f["side"], 0.0, 0.0, 0.0, None))
+        out[f["order_id"]] = (side, qty + f["qty"], notional + f["qty"] * f["price"], fee + f["fee"], f["ts"])
+    rows = []
+    for k, (side, qty, notional, fee, ts) in out.items():
+        t = pd.Timestamp(ts).tz_convert(timezone.utc)
+        minute = t if t == t.floor("1min") else t.ceil("1min")
+        rows.append((side, intents[k], minute, qty, (notional + fee if side == "BUY" else notional - fee) / qty, fee))
+    return rows
+
+
+def _paper_and_backtest(tmp_path, prices, params):
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params)
+    orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
+    paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders})
+    bars = trades.resample("1min", closed="left", label="right").ohlc()
+    bars["volume"] = 60 / BOOK_SHARE  # the same trades as liquidity on both paths
+    res = run_backtest("probe", bars, TICK_INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+                       bar_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
+    j = res.journal
+    return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
+
+
+def test_paper_and_backtest_enter_and_exit_at_the_same_prices(tmp_path):
+    """Signal entries and exits are market orders on both paths: same minute, same size, and the same
+    all-in price to within rounding (0.3 bp). The fees then match too."""
+    s = np.arange(180 * 60)
+    prices = 60_000 * (1 + 0.01 * np.sin(s / 700) + 0.001 * np.sin(s / 11))
+    paper, bt = _paper_and_backtest(tmp_path, prices, {"period": 7})
+    assert len(paper) >= 20
+    assert [r[:3] for r in paper] == [r[:3] for r in bt]
+    for p, b in zip(paper, bt):
+        assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
+        assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
+    fee_p, fee_b = sum(r[5] for r in paper), sum(r[5] for r in bt)
+    # Paper's fee is the venue's alone (its price carries the spread); the backtest's includes the spread.
+    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
+    assert fee_b - spread_b == pytest.approx(fee_p, rel=0.005), (fee_p, fee_b, spread_b)
+
+
+def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
+    """With a stop and a target: paper sells on the trade through the level, the backtest at the level,
+    so prices may differ by a few bp (the same bounds as tests/test_tick_bar_parity.py), never the minute."""
+    s = np.arange(240 * 60)
+    prices = 60_000 * (1 + 0.012 * np.sin(s / 500) + 0.0015 * np.sin(s / 13))
+    params = {"period": 9, "stop_loss": 0.004, "take_profit": 0.025}
+    paper, bt = _paper_and_backtest(tmp_path, prices, params)
+    intents = {r[1] for r in paper}
+    assert {"entry", "stop_loss"} <= intents or {"entry", "take_profit"} <= intents, intents
+    assert [r[:2] for r in paper] == [r[:2] for r in bt]
+    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+    for p, b in zip(paper, bt):
+        assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
+        lo, hi = tol[p[1]]
+        assert lo <= (b[4] / p[4] - 1) * 1e4 <= hi, (p, b)
+        # Signal orders in the same minute; a stop or target in the same minute or the next (paper's
+        # stop sits off its fill at the ask, the backtest's off the bar's trade price: half a spread apart).
+        late = (b[2] - p[2]).total_seconds()
+        assert late == 0 if p[1] in ("entry", "exit") else 0 <= late <= 60, (p, b)
