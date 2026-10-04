@@ -115,6 +115,24 @@ funding_t = Table(
     Index("funding_sleeve_ts", "sleeve", "ts"),
 )
 
+# The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
+# failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
+mirror_t = Table(
+    "demo_mirror",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("fill_id", Integer, nullable=False),
+    Column("ts", TS, nullable=False),
+    Column("status", String(16), nullable=False),  # start, filled, skipped, error
+    Column("instrument", String(32), nullable=False, server_default=""),
+    Column("amount", Float, nullable=False, server_default="0"),  # signed, in the mirror venue's units
+    Column("price", Float),
+    Column("order_id", String(64), nullable=False, server_default=""),
+    Column("message", Text, nullable=False, server_default=""),
+    Index("demo_mirror_sleeve_fill", "sleeve", "fill_id"),
+)
+
 events_t = Table(
     "events",
     metadata,
@@ -854,6 +872,45 @@ class Store:
         with self.engine.connect() as c:
             return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
                                    .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+
+    def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
+        """A strategy's fills with ids above fill_id, oldest first."""
+        q = (select(fills_t).where(fills_t.c.sleeve == sleeve, fills_t.c.id > fill_id)
+             .order_by(fills_t.c.id).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def last_fill_id(self, sleeve: str) -> int:
+        with self.engine.connect() as c:
+            return int(c.execute(select(func.coalesce(func.max(fills_t.c.id), 0))
+                                 .where(fills_t.c.sleeve == sleeve)).scalar() or 0)
+
+    def record_mirror(self, sleeve: str, *, fill_id: int, status: str, instrument: str = "", amount: float = 0.0,
+                      price: float | None = None, order_id: str = "", message: str = "",
+                      ts: datetime | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(mirror_t.insert().values(sleeve=sleeve, fill_id=fill_id, ts=ts or utcnow(), status=status,
+                                               instrument=instrument, amount=amount, price=price,
+                                               order_id=order_id, message=message))
+
+    def mirror_watermark(self, sleeve: str) -> int | None:
+        """The last fill the mirror has dealt with for a strategy, or None if it has never run for it."""
+        with self.engine.connect() as c:
+            return c.execute(select(func.max(mirror_t.c.fill_id)).where(mirror_t.c.sleeve == sleeve)).scalar()
+
+    def mirror_rows(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
+        q = select(mirror_t)
+        if sleeve:
+            q = q.where(mirror_t.c.sleeve == sleeve)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(mirror_t.c.id.desc()).limit(limit)))
+
+    def mirror_positions(self) -> dict[str, float]:
+        """The net position the mirror has put on per mirror instrument: what its account should hold."""
+        q = (select(mirror_t.c.instrument, func.sum(mirror_t.c.amount)).where(mirror_t.c.status == "filled")
+             .group_by(mirror_t.c.instrument))
+        with self.engine.connect() as c:
+            return {i: float(a or 0.0) for i, a in c.execute(q)}
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         q = select(events_t).where(events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))
