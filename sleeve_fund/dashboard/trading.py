@@ -60,6 +60,10 @@ def signal_items(signal: dict | None) -> list[tuple[str, str]]:
             label, text = "Size set by", str(v)
         elif k in ("budget", "equity", "peak_equity"):
             label, text = {"budget": "Budget", "equity": "Equity", "peak_equity": "Peak equity"}[k], f"{v:,.2f}"
+        elif k == "risk_amount":
+            label, text = "Loss at stop (1R)", f"{v:,.2f}"
+        elif k == "planned_r":
+            label, text = "Target in R", f"{v:+.2f}R"
         else:
             label, text = k.replace("_", " ").capitalize(), (f"{v:,.6g}" if isinstance(v, float) else str(v))
         out.append((label, text))
@@ -104,6 +108,10 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict]) -> lis
             exit_items=signal_items(exit_["signal"]) if exit_ else [],
             held=(t["closed"] - t["opened"]) if t["opened"] and t["closed"] else None,
         )
+        # R: the trade's P&L over what it would have lost at its stop, as sized at entry.
+        risk = (entry or {}).get("signal", {}).get("risk_amount")
+        t["r"] = t["pnl"] / risk if risk else None
+        t["planned_r"] = (entry or {}).get("signal", {}).get("planned_r")
         out.append(t)
     return out
 

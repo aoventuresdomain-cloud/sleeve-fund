@@ -100,6 +100,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
+    templates.env.filters["rmult"] = lambda r: "–" if r is None else f"{r:+.2f}R"
     # The year only when it isn't this one, as a backtest's or an old journal's dates need it.
     templates.env.filters["ts"] = lambda t: (t.strftime("%d %b %H:%M UTC" if t.year == utcnow().year
                                                         else "%d %b %Y %H:%M UTC") if t else "never")
@@ -541,6 +542,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         result["trips"] = trading.trips(st().fills(name, limit=1_000_000), st().events(name, limit=10_000),
                                         trading.orders_by_id(st(), name))
         result["orders"] = sum(st().order_counts(name).values())
+        rs = [t["r"] for t in result["trips"] if t["r"] is not None]
+        result["expectancy_r"] = sum(rs) / len(rs) if rs else None
         return backtest_form(request, q, result=result, saved=row)
 
     @app.get("/trades", response_class=HTMLResponse)
