@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 from nautilus_trader.model import Bar
 
+from sleeve_fund import markets
 from sleeve_fund.instruments import BOOK_SHARE
 from sleeve_fund.paper.recorder import Recorder
 from sleeve_fund.research.replay import replay
@@ -291,8 +292,13 @@ SPREAD = 12.0  # $12 wide around each BTC trade
 TICK_INST = K.instrument("BTC", "USD", price_precision=1)
 
 
+def _fees(params):
+    return markets.fees_for(params, K.fees)
+
+
 def _record(path, prices, params, profile="aggressive", size=1.0, strategy="probe"):
-    """A paper session with one trade a second, the quote following each trade."""
+    """A paper session with one trade a second, the quote following each trade. It charges what the paper
+    node would: the venue's fees on spot, the market's on a perpetual (paper.config.SleeveConfig.fees)."""
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
     rec = Recorder(path)
@@ -300,7 +306,8 @@ def _record(path, prices, params, profile="aggressive", size=1.0, strategy="prob
                 "sleeve": {"name": "sanity", "strategy": strategy, "instrument": "BTC/USD",
                            "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000,
                            "risk_profile": profile, "params": params, "max_notional": None,
-                           "maker_fee": str(K.fees.maker), "taker_fee": str(K.fees.taker), "tick_seconds": 30}}
+                           "maker_fee": str(_fees(params).maker), "taker_fee": str(_fees(params).taker),
+                           "tick_seconds": 30}}
     rec.start(TICK_INST)
     stamps = []
     for s, px in enumerate(np.round(prices, 1)):
@@ -560,3 +567,172 @@ def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(st
     t[0] += timedelta(hours=25)
     rt = _restarted(store, t)
     assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) is None and rt.can_open()
+
+
+# --- long and short on a perpetual ----------------------------------------------------------------
+
+PERP = {"market": "perp", "allow_short": True}
+PERP_FEES = markets.LOW_FEE_PERP
+
+
+class ProbeLS(Probe):
+    """Long for `period` decision bars, then short for `period`, then flat for `period`, on the clock."""
+
+    def want_side(self, bar):
+        return (1, -1, 0)[(int(bar.ts_event // self.step) // self.period) % 3]
+
+
+class ProbeShort(Probe):
+    """Short from the first bar, and stays short."""
+
+    def want_side(self, bar):
+        return -1
+
+
+@pytest.fixture(autouse=True)
+def _probe_ls(monkeypatch):
+    monkeypatch.setitem(REGISTRY, "probe_ls", (ProbeLS, ProbeConfig))
+    monkeypatch.setitem(REGISTRY, "probe_short", (ProbeShort, ProbeConfig))
+
+
+def _ls_bars(closes, minutes=60, start="2025-10-03"):
+    c = np.asarray(closes, dtype=float)
+    o = np.r_[c[0], c[:-1]]
+    idx = pd.date_range(start, periods=len(c), freq=f"{minutes}min", tz="UTC") + pd.Timedelta(minutes=minutes)
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c,
+                         "volume": 1e12 / float(c[0])}, index=idx)
+
+
+LS_CASES = {
+    "probe_ls": ({"period": 7}, lambda s: 60_000 * (1 + 0.01 * np.sin(s / 700) + 0.001 * np.sin(s / 11))),
+    **TEST_STRATEGIES,
+}
+
+
+@pytest.mark.parametrize("strategy", list(LS_CASES))
+def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
+    """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
+    replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
+    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee."""
+    params, path = LS_CASES[strategy]
+    params = {**params, **PERP}
+    paper, bt = _paper_and_backtest(tmp_path, path(np.arange(240 * 60)), params, strategy=strategy,
+                                    profile="balanced")
+    # The backtest's last bar closes on the last trade; paper's would close on a trade after it, which never
+    # comes. An order on that bar alone is an edge of the recording, not a difference.
+    end = pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=240)
+    bt = [r for r in bt if r[2] < end]
+    assert ("SELL", "entry") in {r[:2] for r in paper}, paper  # it went short
+    assert ("BUY", "exit") in {r[:2] for r in paper}, paper  # and bought the short back
+    assert [r[:3] for r in paper] == [r[:3] for r in bt]
+    for p, b in zip(paper, bt):
+        assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
+        assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
+    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
+    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    taker = float(PERP_FEES.fees.taker)
+    for side, _, _, qty, px, fee in paper:
+        assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
+
+
+def test_paper_sells_short_at_the_bid_and_buys_it_back_at_the_ask(tmp_path):
+    """A short sale takes the bid and its cover takes the ask, like any market order: never the other side
+    of the book, which would hand the short the spread. (The recording quotes $6 either side of each trade.)"""
+    params = {"period": 7, **PERP}
+    prices = LS_CASES["probe_ls"][1](np.arange(180 * 60))
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="balanced", strategy="probe_ls")
+    orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    shorts = [f for f in fills if intent[f["order_id"]] == "entry" and f["side"] == "SELL"]
+    assert shorts
+    for f in fills:
+        ts = pd.Timestamp(f["ts"]).tz_convert(timezone.utc)
+        last = trades[trades.index < ts].iloc[-1]  # the quote in force follows the last trade before the fill
+        adverse = (f["price"] - last) * (1 if f["side"] == "BUY" else -1)
+        assert adverse == pytest.approx(SPREAD / 2, abs=0.11), (intent[f["order_id"]], f, last)
+
+
+def _trips(j):
+    from sleeve_fund.research.metrics import trades
+
+    return trades(list(j.fills_), shorts=True)
+
+
+def test_every_trip_long_or_short_makes_its_price_move_less_its_fees():
+    """P&L sign: a long gains on a rise, a short on a fall, each by quantity x the move less its fees."""
+    s = np.arange(0, 400 * 60, 60)
+    c = 60_000 * (1 + 0.03 * np.sin(s / 9_000) + 0.004 * np.sin(s / 700))
+    j = run_backtest("probe_ls", _ls_bars(c, minutes=60), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
+                     risk_profile="balanced", bar_minutes=60, half_spread=HALF).journal
+    trips = _trips(j)
+    assert {t["side"] for t in trips} == {1, -1}, trips
+    for t in trips:
+        move = t["side"] * t["qty"] * (t["exit_px"] - t["entry_px"])
+        assert t["pnl"] == pytest.approx(move - t["fees"], abs=0.02), t
+        assert (t["pnl"] + t["fees"] > 0) == (t["side"] * (t["exit_px"] - t["entry_px"]) > 0), t
+
+
+def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
+    """Funding every 8 hours at 0.01% of the position's value: a long pays it, a short receives it. Equity
+    is the opening cash, every fill's cash flow and fee, the funding, and the position at the close."""
+    s = np.arange(0, 24 * 9 * 3600, 3600)
+    c = 60_000 * (1 + 0.01 * np.sin(s / 50_000))
+    bars = _ls_bars(c, minutes=60)
+    res = run_backtest("probe_ls", bars, TICK_INST, {"period": 24, **PERP}, starting_capital=10_000,
+                       risk_profile="balanced", bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    held, cash = 0.0, 10_000.0
+    for f in j.fills_:
+        sign = 1 if f["side"] == "BUY" else -1
+        held += sign * f["qty"]
+        cash -= sign * f["qty"] * f["price"] + f["fee"]
+    rows = j.funding_
+    # One payment at every funding time a position was held through: none missed, none doubled.
+    held_at, pos = [], 0.0
+    for f in j.fills_:
+        pos += f["qty"] if f["side"] == "BUY" else -f["qty"]
+        held_at.append((pd.Timestamp(f["ts"]), pos))
+    marks = markets.funding_times(bars.index[0].to_pydatetime(), bars.index[-1].to_pydatetime(), PERP_FEES.funding_hours)
+    owed = [t for t in marks if abs(next((q for ts, q in reversed(held_at) if ts < t), 0.0)) > 0]
+    assert sorted(pd.Timestamp(r["ts"]) for r in rows) == [pd.Timestamp(t) for t in owed]
+    longs = [r for r in rows if r["qty"] > 0]
+    shorts = [r for r in rows if r["qty"] < 0]
+    assert longs and shorts
+    for r in rows:
+        assert r["amount"] == pytest.approx(-r["qty"] * r["price"] * float(PERP_FEES.funding_rate), rel=1e-6), r
+    assert all(r["amount"] < 0 for r in longs) and all(r["amount"] > 0 for r in shorts)
+    total = sum(r["amount"] for r in rows)
+    assert res.equity.iloc[-1] == pytest.approx(cash + total + held * c[-1], abs=0.05)
+
+
+@pytest.mark.parametrize("profile", ["conservative", "balanced", "aggressive"])
+def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_would_liquidate(profile):
+    """A short caught in a steady rally to three times its price: the daily-loss pause and the drawdown halt
+    (or, failing those, the liquidation guard) buy the whole short back at market, the book ends flat, and
+    the venue never liquidates it."""
+    c = np.r_[np.full(10, 60_000.0), np.linspace(60_000, 180_000, 200)]
+    res = run_backtest("probe_short", _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000, risk_profile=profile, bar_minutes=60,
+                       half_spread=HALF)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_guard" in {o["intent"] for o in orders}
+    for opened, closed in zip(orders[::2], orders[1::2]):  # each short, then what bought it back
+        assert (opened["side"], opened["intent"]) == ("SELL", "entry"), opened
+        assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_guard")
+        assert closed["filled_qty"] == pytest.approx(opened["filled_qty"])  # the whole short
+    assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
+    assert res.equity.iloc[-1] > 0
+
+
+@pytest.mark.parametrize("reason", ["PM flatten", "Book kill switch: stop everything"])
+def test_a_flatten_of_a_short_cut_short_by_a_restart_buys_it_back(store, reason):
+    """S-3 on a short: the flatten is owed again after a restart while a short is still held."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    store.command("s1", "flatten", reason)
+    assert rt.tick(equity=10_000, cash=13_000, qty=-0.05, price=60_000) == "flatten"
+    t[0] += timedelta(minutes=1)
+    assert _restarted(store, t).tick(equity=10_000, cash=13_000, qty=-0.05, price=60_000) == "flatten"
+
