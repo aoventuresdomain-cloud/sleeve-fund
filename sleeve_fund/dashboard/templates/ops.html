@@ -49,8 +49,9 @@
   <table class="compact kv">
     <tr><th scope="row">Risk guard</th><td>On for every strategy: halts at the drawdown limit, pauses at the daily-loss limit.</td></tr>
     <tr><th scope="row">Balance reconciliation</th><td>On: at every start and every 24 hours; a mismatch halts the strategy.</td></tr>
-    <tr><th scope="row">Outside alerts (Telegram)</th><td><span class="warn">Not set up yet.</span> Planned for M2.</td></tr>
-    <tr><th scope="row">Dead man's switch</th><td><span class="warn">Not set up yet.</span> Planned for M2: alerts if the server itself goes quiet.</td></tr>
+    <tr><th scope="row">Price watchdog</th><td>On: a strategy with no trade or quote for 5 minutes warns; after 15 it restarts to reconnect.</td></tr>
+    <tr><th scope="row">Outside alerts</th><td>{% if ops.alerts and 'not set up' not in ops.alerts.message %}{{ ops.alerts.message }}{% elif ops.alerts %}<span class="warn">{{ ops.alerts.message }}</span>{% else %}<span class="warn">Not reported yet: the supervisor says at start.</span>{% endif %}</td></tr>
+    <tr><th scope="row">Database backup</th><td>{% if ops.backup %}<span class="{{ 'warn' if ops.backup.stale }}">Last {{ ops.backup.age|held }} ago</span>, {{ ops.backup.bytes|bytes }}; {{ ops.backup.count }} kept on this server. Lightsail snapshots cover losing the server itself.{% else %}<span class="warn">None yet.</span> The backup service writes one a night.{% endif %}</td></tr>
     <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>
   </table>
 </section>

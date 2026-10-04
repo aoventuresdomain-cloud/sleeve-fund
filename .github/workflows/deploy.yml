@@ -5,8 +5,10 @@ name: deploy
 # Optional variable DEPLOY_USER: login user (default root; AWS Lightsail Ubuntu uses ubuntu, with sudo).
 #   DASHBOARD_PASSWORD   the PM dashboard password (letters and digits; no $)
 # Optional: SITE_ADDRESS (defaults to <DEPLOY_HOST>.sslip.io for free HTTPS without a domain).
+# Optional: ALERT_WEBHOOK_URL and HEALTHCHECK_PING_URL (see sleeve_fund/alerts.py).
 # No exchange credentials are involved: this stack is paper only.
-# Deploys only a commit whose tests passed: it runs when the tests workflow finishes green on main.
+# Deploys only a commit whose tests passed: it runs when the tests workflow finishes green on main,
+# and a manual run checks that the tests passed on the commit it ships.
 on:
   workflow_run:
     workflows: [tests]
@@ -17,6 +19,7 @@ concurrency: deploy
 jobs:
   deploy:
     runs-on: ubuntu-24.04
+    permissions: { contents: read, actions: read }
     env:
       USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
     if: >-
@@ -27,6 +30,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}  # exactly the commit that was tested
+      - name: Require green tests for this commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on $GITHUB_SHA; wait for the tests workflow"; exit 1; }
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -48,11 +58,14 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
           SITE_ADDRESS: ${{ secrets.SITE_ADDRESS }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
         run: |
           SITE="${SITE_ADDRESS:-$HOST.sslip.io}"
           # Secrets go over stdin, never on a command line.
-          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q\n' "$DASHBOARD_PASSWORD" "$SITE" | \
-            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS bash /opt/sleeve-fund/deploy/remote_up.sh'
+          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q ALERT_WEBHOOK_URL=%q HEALTHCHECK_PING_URL=%q\n' \
+            "$DASHBOARD_PASSWORD" "$SITE" "$ALERT_WEBHOOK_URL" "$HEALTHCHECK_PING_URL" | \
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
       - name: Check the sleeves are live
         env:

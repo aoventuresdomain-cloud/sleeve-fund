@@ -13,7 +13,7 @@ RECORDINGS = Path(__file__).parent / "data" / "replay"
 START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, in nanoseconds
 
 
-def _synthetic(path, minutes=90, maker_wait=None, bar_spec="1-MINUTE-LAST-INTERNAL"):
+def _synthetic(path, minutes=90, maker_wait=None, bar_spec="1-MINUTE-LAST-INTERNAL", silent=(0, 0)):
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
     from sleeve_fund.venues import venue
@@ -28,6 +28,8 @@ def _synthetic(path, minutes=90, maker_wait=None, bar_spec="1-MINUTE-LAST-INTERN
                            "tick_seconds": 30}}
     rec.start(inst)
     for s in range(minutes * 60):
+        if silent[0] * 60 <= s < silent[1] * 60:
+            continue  # the feed says nothing
         px = 60_000 + 300 * math.sin(s / 600) + 20 * math.sin(s / 7)
         t = START + s * 1_000_000_000
         rec.quote(QuoteTick(inst.id, Price(px - 0.5, 1), Price(px + 0.5, 1), Quantity(1, 8), Quantity(1, 8),
@@ -69,3 +71,22 @@ def test_recorded_paper_session_replays_to_the_same_orders(recording):
         o["ts"] = datetime.fromisoformat(o["ts"])
     assert sent, "the recording should include at least one order to be worth replaying"
     assert comparable(replay(recording)) == comparable(sent)
+
+
+def test_a_silent_feed_is_flagged_then_restarted(tmp_path):
+    """Review rounds 1 to 5: no stale-price watchdog. The tick timer keeps the heartbeat going by
+    itself, so a feed gone quiet looked healthy while marks and the risk guard used a frozen price."""
+    from sleeve_fund.store import Store
+
+    path = _synthetic(tmp_path / "gap.jsonl.gz", minutes=40, silent=(10, 30))  # twenty silent minutes
+    store = Store.in_memory()
+    replay(path, store=store)
+    events = list(reversed(store.events("replay-test", limit=500)))
+    kinds = [e["kind"] for e in events if e["kind"] in ("stale_price", "feed_dead", "price_feed_back")]
+    assert kinds == ["stale_price", "feed_dead", "price_feed_back"]  # each said once
+    warn, dead = (next(e for e in events if e["kind"] == k) for k in ("stale_price", "feed_dead"))
+    assert dead["level"] == "error" and "restarts it" in dead["message"]
+    assert (dead["ts"] - warn["ts"]).total_seconds() == pytest.approx(600, abs=60)
+    back = next(e for e in events if e["kind"] == "price_feed_back")
+    marks = [m["ts"] for m in store.equity_series("replay-test", limit=100_000)]
+    assert not [t for t in marks if dead["ts"] < t < back["ts"]]  # no marks, no heartbeat: the supervisor restarts it

@@ -646,6 +646,18 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(events_t.c.id.desc()).limit(limit)))
 
+    def events_after(self, after_id: int, min_level: str = "warning", limit: int = 500) -> list[dict]:
+        """Paper and live events newer than an id, oldest first: what the alert forwarder sends on."""
+        q = (select(events_t).where(events_t.c.id > after_id, _not_backtest(events_t.c.sleeve),
+                                    events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))
+             .order_by(events_t.c.id).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def last_event_id(self) -> int:
+        with self.engine.connect() as c:
+            return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
+
     def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
              .order_by(events_t.c.id.desc()).limit(1))

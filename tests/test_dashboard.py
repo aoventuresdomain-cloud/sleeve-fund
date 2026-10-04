@@ -194,11 +194,34 @@ def test_risk_page_stress_and_limits(client):
     assert "drawdown 21% hit the 20% limit" in page
 
 
-def test_ops_page_shows_processes_and_safety_nets(client):
+def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch):
+    import os
+    import time
+
+    from sleeve_fund.alerts import Forwarder
+
     c, store = client
     _new(c)
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "none"))
     page = c.get("/ops", auth=AUTH).text
-    assert "Strategy processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page
+    assert "Strategy processes" in page and "btc-test" in page and "Database size" in page
+    assert "Price watchdog" in page and "Database backup" in page and "None yet" in page
+
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    (folder / "sleeve_fund-old.dump").write_bytes(b"x" * 10)
+    os.utime(folder / "sleeve_fund-old.dump", (time.time() - 3 * 86400,) * 2)
+    monkeypatch.setenv("BACKUP_DIR", str(folder))
+    store.event(None, "info", "alerts_config", Forwarder(store, environ={}).describe())
+    page = c.get("/ops", auth=AUTH).text
+    assert "Last 3" in page and '<span class="warn">Last' in page  # three days old: flagged
+    assert "Alerts are not set up" in page
+    (folder / "sleeve_fund-new.dump").write_bytes(b"x" * 2048)
+    store.event(None, "info", "alerts_config",
+                Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/T/secret"}).describe())
+    page = c.get("/ops", auth=AUTH).text
+    assert "2 kept" in page and '<span class="">Last' in page
+    assert "Alerts go to hooks.example.com" in page and "secret" not in page
 
 
 def test_preview_runs_settings_on_history(monkeypatch):
@@ -920,3 +943,25 @@ def test_a_backtest_chart_covers_its_whole_period(client):
                             ts=t0 + timedelta(days=i))
     d = c.get(f"/api/sleeves/{BACKTEST_PREFIX}r1/candles?interval=1d", auth=AUTH).json()
     assert len(d["candles"]) == 5 * 365 and d["source"] == "marks"
+
+
+def test_the_book_kill_switch_flattens_every_running_strategy(client):
+    """Review rounds 1 to 5: no book kill switch. One button on Risk sells every running strategy to
+    cash and pauses it, each with the PM's reason; a stopped one is named, since it can't sell."""
+    c, store = client
+    _new(c)
+    _new(c, name="eth-test", instrument="ETH/USD")
+    store.record_equity("btc-test", equity=5100, cash=3000, qty=0.02, price=105000, benchmark=5050)
+    store.record_equity("eth-test", equity=5000, cash=4000, qty=0.3, price=3300, benchmark=5000)
+    store.set_desired_state("eth-test", "stopped")
+    page = c.get("/risk", auth=AUTH).text
+    assert "Flatten everything" in page and "eth-test still hold" in page
+    assert c.post("/book/flatten", data={"reason": " "}, auth=AUTH, headers=SAME).status_code == 400
+    r = c.post("/book/flatten", data={"reason": "Market event; standing aside"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303
+    (cmd,) = store.pending_commands("btc-test")
+    assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
+    assert store.pending_commands("eth-test") == []
+    assert store.decisions()[0]["action"] == "flatten everything"
+    assert c.post("/book/flatten", data={"reason": "x"}, auth=AUTH).status_code in (400, 403)  # same origin only

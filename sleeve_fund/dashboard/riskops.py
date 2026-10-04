@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sleeve_fund.store import Store, utcnow
+
+BACKUP_STALE = timedelta(hours=26)  # nightly, with room for a slow dump
 
 SHOCKS = (-0.10, -0.20, -0.35, -0.50)
 BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not_found", "tick_failed")
@@ -65,7 +69,23 @@ def ops_view(store: Store, summaries: list[dict]) -> dict:
         "memory": _meminfo(),
         "load": load,
         "cpus": os.cpu_count() or 1,
+        "backup": latest_backup(Path(os.environ.get("BACKUP_DIR", "/data/backups")), now),
+        "alerts": store.last_event(None, ("alerts_config",)),
     }
+
+
+def latest_backup(folder: Path, now: datetime) -> dict | None:
+    """The newest nightly database dump the backup service wrote, or None if there is none here."""
+    try:
+        newest = max(folder.glob("*.dump"), key=lambda f: f.stat().st_mtime, default=None)
+    except OSError:
+        return None
+    if newest is None:
+        return None
+    st = newest.stat()
+    age = now - datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    return {"name": newest.name, "bytes": st.st_size, "age": age, "stale": age > BACKUP_STALE,
+            "count": len(list(folder.glob("*.dump")))}
 
 
 def _meminfo() -> dict | None:

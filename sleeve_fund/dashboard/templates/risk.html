@@ -4,6 +4,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Risk</h1>
+  {% if kill.running %}<button type="button" class="danger" data-open="dlg-kill">Flatten everything</button>{% endif %}
 </div>
 
 <section class="ledger" aria-label="Book risk">
@@ -50,4 +51,24 @@
     {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}
   </section>
 </div>
+{% if kill.running %}
+<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
+<dialog id="dlg-kill" aria-labelledby="dlg-kill-h">
+  <form method="post" action="/book/flatten">
+    <h2 id="dlg-kill-h">Flatten everything</h2>
+    {% set holding = kill.running|selectattr('qty', 'gt', 0)|list %}
+    <p>All {{ kill.running|length }} running strateg{{ 'y' if kill.running|length == 1 else 'ies' }} sell to cash at market, paying the taker fee, then pause until you resume each one.
+      {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ holding|sum(attribute='position_value')|money }} in all.{% endif %}
+      {% if kill.held %}Stopped strategies have no process to sell with: {{ kill.held|join(', ') }} still hold positions.{% endif %}</p>
+    <label for="r-kill">Reason for the decision log</label>
+    <input id="r-kill" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger">Sell everything and pause</button></div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/console.js"></script>
+<script>Console.dialogs();</script>
 {% endblock %}
