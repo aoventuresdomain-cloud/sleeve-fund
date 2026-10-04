@@ -13,11 +13,11 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from nautilus_trader.indicators import SimpleMovingAverage
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.indicators import Sma
 
 SPEC = IdeaSpec(
     summary="Long while the {fast}-bar average is above the {slow}-bar average, otherwise flat in cash.",
@@ -66,7 +66,7 @@ class _Ema:
     def __init__(self, span: int) -> None:
         self.alpha, self.span, self.count, self.value = 2 / (span + 1), span, 0, 0.0
 
-    def update(self, x: float) -> None:
+    def update_raw(self, x: float) -> None:
         self.value = x if self.count == 0 else self.alpha * x + (1 - self.alpha) * self.value
         self.count += 1
 
@@ -75,26 +75,10 @@ class _Ema:
         return self.count >= self.span
 
 
-class _Sma:
-    def __init__(self, period: int) -> None:
-        self._ind = SimpleMovingAverage(period)
-
-    def update(self, bar: Bar) -> None:
-        self._ind.handle_bar(bar)
-
-    @property
-    def initialized(self) -> bool:
-        return self._ind.initialized
-
-    @property
-    def value(self) -> float:
-        return self._ind.value
-
-
 class TrendFilter(LongFlatStrategy):
     def __init__(self, config: TrendFilterConfig) -> None:
         super().__init__(config)
-        make = _Ema if config.ema else _Sma
+        make = _Ema if config.ema else Sma
         self.fast, self.slow = make(config.fast), make(config.slow)
         per_day = 1440 / bar_minutes(config.bar_type)
         self._ann = math.sqrt(365 * per_day)
@@ -117,7 +101,7 @@ class TrendFilter(LongFlatStrategy):
     def update_indicators(self, bar: Bar) -> None:
         c = bar.close.as_double()
         for avg in (self.fast, self.slow):
-            avg.update(c if isinstance(avg, _Ema) else bar)
+            avg.update_raw(c)
         prev, self._prev_close = self._prev_close, c
         if not self._cfg.vol_target or not prev:
             return  # volatility only sizes vol-targeted positions; skip it otherwise

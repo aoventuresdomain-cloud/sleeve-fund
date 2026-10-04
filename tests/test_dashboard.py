@@ -892,3 +892,25 @@ def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
     assert store.sleeve("long-warm").warmup_bars == 50_000
     (e,) = [e for e in store.events("long-warm") if e["kind"] == "warmup_short"]
     assert e["level"] == "warning" and "needs 60,000 bars" in e["message"]
+
+
+def test_the_guard_cadence_is_not_the_chart_spacing(client, monkeypatch, tmp_path):
+    """Round 4, NEW-2: over a long run the chart thins its points, and that spacing once overwrote
+    how often the note said the guard checked the book."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    import numpy as np
+
+    m = _wavy_minutes(820)
+    crash = np.ones(len(m))
+    crash[800 * 1440:801 * 1440] = np.linspace(1.0, 0.6, 1440)
+    crash[801 * 1440:] = 0.6
+    for col in ("open", "high", "low", "close"):
+        m[col] = m[col] * crash
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", m, cursor="x")
+    preview._history.clear()
+    d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive")
+    assert len(d["t"]) < d["days"]  # the chart is thinned
+    assert d["risk"]["checked_minutes"] == 15 and "every 15 minutes" in d["risk"]["note"]

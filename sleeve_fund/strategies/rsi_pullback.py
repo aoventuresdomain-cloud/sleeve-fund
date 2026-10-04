@@ -3,15 +3,11 @@ exit on an ATR trailing stop. Shows how a plain-English idea maps onto the templ
 
 from __future__ import annotations
 
-from nautilus_trader.indicators import (
-    AverageTrueRange,
-    ExponentialMovingAverage,
-    RelativeStrengthIndex,
-    SimpleMovingAverage,
-)
+from nautilus_trader.indicators import ExponentialMovingAverage, RelativeStrengthIndex
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.indicators import Atr, Sma
 
 SPEC = IdeaSpec(
     summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
@@ -55,8 +51,8 @@ class RsiPullback(LongFlatStrategy):
         self.c = config
         self.rsi = RelativeStrengthIndex(config.rsi_period)
         self.ema = ExponentialMovingAverage(config.ema_period)
-        self.vol = SimpleMovingAverage(config.vol_period)
-        self.atr = AverageTrueRange(config.atr_period)
+        self.vol = Sma(config.vol_period)
+        self.atr = Atr(config.atr_period)
         self._prev_vol_avg = None
         self._peak = None
 
