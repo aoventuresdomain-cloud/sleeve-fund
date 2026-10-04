@@ -25,30 +25,23 @@ services:
       # Optional: where warnings and errors are sent, and an outside monitor's ping (sleeve_fund/alerts.py).
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       HEALTHCHECK_PING_URL: ${HEALTHCHECK_PING_URL:-}
-    volumes: [history:/data/history:ro]
+      BACKUP_DIR: /data/backups  # read only: a late or failed backup raises an alert
+    volumes: [history:/data/history:ro, backups:/data/backups:ro]
     env_file:
       - path: kraken.env
         required: false
     command: sh -c "python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run"
 
-  # A compressed dump of the journal every night, the newest 14 kept, written whole or not at all.
-  # On this machine only: Lightsail snapshots, or a copy elsewhere, cover losing the machine itself.
+  # A compressed dump of the journal every night, proved by restoring it into a scratch database,
+  # the newest 14 kept (deploy/backup.sh). On this machine only: a copy elsewhere covers losing it.
   backup:
     image: postgres:16
     restart: unless-stopped
     depends_on: { db: { condition: service_healthy } }
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD}
-    volumes: [backups:/backups]
-    entrypoint: ["bash", "-c"]
-    command:
-      - |
-        while true; do
-          f=/backups/sleeve_fund-$$(date -u +%Y%m%d-%H%M).dump
-          if pg_dump -h db -U sleeve -d sleeve_fund -Fc -f "$$f.part"; then mv "$$f.part" "$$f"; else rm -f "$$f.part"; fi
-          ls -1t /backups/*.dump 2>/dev/null | tail -n +15 | xargs -r rm -f
-          sleep 86400
-        done
+    volumes: [backups:/backups, ./deploy/backup.sh:/backup.sh:ro]
+    entrypoint: ["bash", "/backup.sh"]
 
   # Keeps every instrument's minute history current from its venue, into the shared store that
   # research and the backtest page read. Public market data only, no keys.

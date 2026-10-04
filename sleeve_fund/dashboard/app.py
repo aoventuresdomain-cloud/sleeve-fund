@@ -176,21 +176,37 @@ def create_app(store: Store | None = None) -> FastAPI:
     def risk_page(request: Request, _: str = Depends(require_pm)):
         sleeves, frames, summaries = book_data()
         book = bookm.book_view(st(), summaries, frames)
-        running = [x for x in summaries if x["sleeve"].desired_state == "running"]
-        held = [x["sleeve"].name for x in summaries if x["sleeve"].desired_state != "running" and x["qty"] > 0]
+        kill = _kill_targets(summaries)
         return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
-                    shell=shell(sleeves), kill={"running": running, "held": held}, reasons=COMMON_REASONS)
+                    shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
+                    kill_error=request.query_params.get("kill_error"))
+
+    def _kill_targets(summaries) -> dict:
+        """Who the kill switch acts on: every strategy still trading (running and not halted) and every
+        one holding a position, stopped or halted included. A halted, flat strategy is left as it is."""
+        trading = [x for x in summaries if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
+        held = [x for x in summaries if x["qty"] > 0 and x not in trading]
+        return {"trading": trading, "held": held, "all": trading + held,
+                "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"]}
 
     @app.post("/book/flatten")
-    def book_flatten(reason: str = Form(...), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
-        """The book's kill switch: every running strategy sells to cash at market and pauses, each
-        with the PM's reason in its decision log. Stopped strategies have no process to sell with."""
-        if not reason.strip():
-            raise HTTPException(400, "a reason is required")
-        running = [s.name for s in st().sleeves() if s.desired_state == "running"]
-        for name in running:
-            st().command(name, "flatten", f"Book kill switch: {reason.strip()}", actor=actor)
-        st().decide(actor, "flatten everything", f"{reason.strip()} ({len(running)} strategies)")
+    def book_flatten(reason: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The book's kill switch: every strategy still trading or holding a position sells to cash at
+        market and pauses, each with the PM's reason in its decision log. A stopped strategy holding a
+        position is started so its process can sell; it pauses once flat, as the others do."""
+        why = reason.strip()
+        if not why:
+            return RedirectResponse("/risk?kill_error=reason", status_code=303)
+        _, _, summaries = book_data()
+        targets = _kill_targets(summaries)
+        for x in targets["all"]:
+            name = x["sleeve"].name
+            st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
+            if x["sleeve"].desired_state != "running":
+                st().set_desired_state(name, "running")
+                st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
+        n = len(targets["all"])
+        st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse("/risk", status_code=303)
 
     @app.get("/ops", response_class=HTMLResponse)
@@ -375,6 +391,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if not reason.strip():
                     raise ValueError("a reason is required")
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
+                if command == "stop":
+                    # A command still waiting when its process stops would act on the next start, maybe
+                    # weeks later; it lapses instead, and the decision log says so.
+                    st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
             else:
                 st().command(name, command, reason, actor=actor)
