@@ -16,6 +16,7 @@ def client(tmp_path, monkeypatch):
     from sleeve_fund.dashboard import app as app_mod
 
     monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
     store = Store(f"sqlite:///{tmp_path}/t.db")
     return TestClient(app_mod.create_app(store)), store
 
@@ -1029,3 +1030,44 @@ def test_an_age_never_reads_minus_zero():
     from sleeve_fund.dashboard.app import _held
 
     assert _held(timedelta(seconds=-2)) == "0 min" and _held(timedelta(minutes=5)) == "5 min"
+
+
+def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
+    import time
+    from urllib.parse import parse_qs, urlparse
+
+    from sleeve_fund import history
+    from test_research import _stored_minutes
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(130), cursor="x")
+    form = {"strategy": "buy_and_hold", "instrument": "eth/usd", "minutes": "240", "risk_profile": "conservative",
+            "train_days": "60", "test_days": "30", "holdout_days": "30"}
+    assert 'action="/research/run"' in c.get("/research", auth=AUTH).text
+    # Another site can't start one, and a bad form says what is wrong without starting anything.
+    assert c.post("/research/run", data=form, auth=AUTH, headers={"Origin": "https://evil.example"}).status_code == 403
+    bad = c.post("/research/run", data={**form, "minutes": "1"}, auth=AUTH, headers=SAME)
+    assert bad.status_code == 200 and "would take hours" in bad.text
+    r = c.post("/research/run", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith("/research?job=")
+    job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
+    running = c.get(r.headers["location"], auth=AUTH).text
+    assert 'id="study-job"' in running and 'value="240" selected' in running  # the form shows what is running
+    for _ in range(600):
+        j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
+        if j["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    assert j["status"] == "done", j
+    assert j["run_id"] == "buy_and_hold_kraken-ethusd-store-240m"
+    assert "conservative risk profile" in c.get(f"/research/{j['run_id']}", auth=AUTH).text
+    assert (tmp_path / "idea_ledger.jsonl").exists()  # counted in the server's ledger, not the repository's
+    # Missing history is an error on the page, not a crash.
+    r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    for _ in range(200):
+        j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
+        if j["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    assert j["status"] == "error" and "no stored Kraken spot history for SOL/USD" in j["error"]

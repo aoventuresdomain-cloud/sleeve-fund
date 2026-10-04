@@ -27,7 +27,9 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
     evidence = sharpe[2].strip()
     if failed:
         # Lead with what failed: a strong Sharpe beside "Fail" otherwise reads like a pass.
-        evidence = "Failed: " + "; ".join(f"{label} ({ev})" if ev else label for label, ev in failed) + ". " + evidence
+        evidence = "Failed: " + "; ".join(f"{label} ({ev})" if ev else label for label, ev in failed) + "."
+        if not any(label.startswith("G1 test") for label, _ in failed):  # else its evidence is already there
+            evidence += " " + sharpe[2].strip()
     return ("FAIL" if failed else "PASS"), evidence, [label for label, _ in failed]
 
 

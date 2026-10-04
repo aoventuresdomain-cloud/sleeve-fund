@@ -24,10 +24,26 @@ def _intraday(series: pd.Series) -> bool:
 
 
 def daily_closes(equity: pd.Series) -> pd.Series:
-    """An equity curve at its daily closes (stamped at the close, midnight UTC); daily curves as they are."""
+    """An equity curve at its daily closes (stamped at the close, midnight UTC); daily curves as they are.
+
+    Only whole days count: a curve that ends mid-day has no close for that day yet, so the part day
+    is left out rather than passed off as a full one. A curve that starts mid-day opens its first day
+    with its first mark (nothing is held before the first bar), so that day's move still counts."""
     if not _intraday(equity):
         return equity
-    return equity.resample("1D", closed="right", label="right").last().dropna()
+    closes = equity.resample("1D", closed="right", label="right").last().dropna()
+    if len(closes) and closes.index[-1] > equity.index[-1]:
+        closes = closes.iloc[:-1]
+    start = equity.index[0].floor("1D")
+    if equity.index[0] > start:
+        closes = pd.concat([pd.Series([equity.iloc[0]], index=[start]), closes])
+    return closes
+
+
+def whole_days(returns: pd.Series, first_close: pd.Timestamp, bar: pd.Timedelta) -> pd.Series:
+    """The daily returns whose whole day lies at or after a window's first bar (closing at
+    first_close, `bar` long), so a day that straddles the window's start never counts for it."""
+    return returns[returns.index - pd.Timedelta("1D") >= first_close - bar]
 
 
 def daily_returns(equity: pd.Series) -> pd.Series:

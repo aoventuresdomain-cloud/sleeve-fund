@@ -7,6 +7,7 @@ strategy found after 200 tries is judged against a 200-try bar.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +57,14 @@ class IdeaLedger:
         ]
 
     def holdout_used(self, idea: str, dataset: str) -> bool:
+        """Whether this idea's holdout on this data was opened before, at any bar length: the same days
+        seen once on daily bars are not fresh on hourly ones."""
+        base = _without_bars(dataset)
         return any(
-            e["stage"] == "holdout" and e["idea"] == idea and e["dataset"] == dataset for e in self.entries()
+            e["stage"] == "holdout" and e["idea"] == idea and _without_bars(e["dataset"]) == base for e in self.entries()
         )
+
+
+def _without_bars(dataset: str) -> str:
+    """A dataset name without its bar-length suffix ("venue-btcusd-store-60m" -> "venue-btcusd-store")."""
+    return re.sub(r"-\d+m$", "", dataset)

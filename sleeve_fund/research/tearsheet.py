@@ -5,13 +5,11 @@ from __future__ import annotations
 import json
 import math
 
-import pandas as pd
 
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
     deflated_sharpe_probability,
-    expected_max_sharpe,
     sharpe_beats_probability,
     summary,
     years_covered,
@@ -104,6 +102,15 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     return checks
 
 
+def _n(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _span(minutes: int) -> str:
+    return f"{minutes / 1440:g} days" if minutes >= 1440 and minutes % 1440 == 0 else (
+        f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
+
+
 def render(r: StudyResult, ledger: IdeaLedger) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
@@ -112,8 +119,6 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     full_b = summary(daily_returns(r.full_period_benchmark.equity))
     counts = ledger.counts()
     trial_sharpes = ledger.sharpes()
-    sharpe_std = float(pd.Series(trial_sharpes).std(ddof=1)) if len(trial_sharpes) > 1 else 0.0
-    hurdle = expected_max_sharpe(counts["variants"], sharpe_std)
     dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
     years_full = years_covered(r.full_period.equity)
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
@@ -144,6 +149,10 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append(f"**What the code does:** {spec.rules}")
     out.append("")
+    if r.bar_minutes < 1440:
+        out.append(f"*Windows above count bars. These are {r.bar_minutes}-minute bars, so a \"50-day\" average here is "
+                   f"50 bars, {_span(50 * r.bar_minutes)}.*")
+        out.append("")
     out.append(f"**Known weaknesses:** {spec.known_weaknesses or 'none recorded'}")
     out.append("")
     out.append("## G1 checks")
@@ -189,7 +198,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append(f"- Turnover: {r.turnover:.1f}x average equity a year")
     out.append(f"- Fees paid: {r.full_period.fees_paid:,.0f} on {r.full_period.starting_capital:,.0f} starting capital; "
                f"fee drag {fee_drag:.2%} of average equity a year")
-    out.append(f"- Time in the market: {r.full_period.exposure.gt(0.5).mean():.0%}")
+    out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append("")
     out.append("## Walk-forward folds")
     out.append("")
@@ -216,18 +225,17 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## Idea counter")
     out.append("")
-    out.append(f"- {counts['ideas']} ideas and {counts['variants']} distinct variants tested so far "
+    out.append(f"- {_n(counts['ideas'], 'idea')} and {_n(counts['variants'], 'distinct variant')} tested so far "
                f"({counts['evaluations']} evaluations including walk-forward refits). By family: "
                + ", ".join(f"{k} {v}" for k, v in counts["ideas_by_family"].items()))
-    out.append(f"- Luck hurdle: the best of {counts['variants']} skill-less variants would show a Sharpe of about "
-               f"{hurdle:.2f} by chance.")
     out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
                "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
     out.append("")
     out.append("## Caveats")
     out.append("")
-    out.append("- Orders fill at the daily close that triggered them and pay the taker fee. Real fills will be a little "
-               "worse (spread and slippage are not yet modelled).")
+    out.append("- Signal orders go to the venue as the bar that triggered them closes: at market, paying the taker fee "
+               "and half the bid-ask spread, or post-only first when the strategy waits for a maker fill. Slippage "
+               "beyond the spread is not modelled.")
     out.append("- Returns are in the quote currency, not pounds. GBP returns and UK capital gains tax are not included.")
     for note in r.notes:
         out.append(f"- {note}")
