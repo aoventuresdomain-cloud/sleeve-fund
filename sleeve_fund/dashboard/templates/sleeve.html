@@ -5,7 +5,7 @@
 {% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
-  <h1>{{ s.name }}</h1> {{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>
+  <h1>{{ s.name }}</h1> {% if backtest_id %}<span class="chip">Backtest</span>{% else %}{{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}
   <div class="actions">
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
@@ -14,13 +14,13 @@
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {{ 'disabled title="Flatten before archiving"' if x.qty > 0 }}>Archive</button>{% endif %}{% endif %}
-    <a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>
+    {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
 </div>
 
 <div data-live="banners">
-{% if backtest_id %}<div class="banner" role="status">A saved backtest: the paper runtime replayed over history, journaled as paper journals. It never trades, takes no commands and is not in the book.</div>{% endif %}
+{% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived: hidden from the home page's strategy list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
@@ -33,7 +33,7 @@
 
 <section class="ledger" aria-label="Strategy figures">
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
-  <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>
+  {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
   <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">benchmark: {{ x.bench_ret|pct1s }}</div></div>
   <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty > 0 %}{{ '%.4g'|format(x.qty) }} {{ base }} · {{ x.position_value|money }}{% else %}all cash{% endif %}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
@@ -43,7 +43,7 @@
 </section>
 {% if t.trades and t.trades < 10 %}<p class="muted" style="margin:-6px 0 14px;font-size:12.5px">Only {{ t.trades }} closed trade{{ 's' if t.trades != 1 }}. Win rate and expectancy mean little until there are at least 10.</p>{% endif %}
 
-{{ price_chart("pc", s.instrument ~ " on Kraken", "every fill marked; dashed lines show entry, stop and target") }}
+{{ price_chart("pc", s.instrument, "every fill marked; dashed lines show entry, stop and target") }}
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h">
@@ -64,10 +64,10 @@
       <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
       <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
-      <tr><th scope="row">Today's loss</th><td class="num">{{ usage(risk.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td></tr>
+      {% if not backtest_id %}<tr><th scope="row">Today's loss</th><td class="num">{{ usage(risk.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td></tr>
       <tr><th scope="row">Worst drawdown</th><td class="num">{{ x.max_drawdown|pct1 }}</td></tr>
       <tr><th scope="row">Reconciled</th><td class="num">{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches journal' }}</span> <span class="muted">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</td></tr>
-      <tr><th scope="row">Heartbeat</th><td class="num">{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</td></tr>
+      <tr><th scope="row">Heartbeat</th><td class="num">{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</td></tr>{% endif %}
     </table>
   </section>
 </div>
@@ -117,13 +117,13 @@
   {% else %}<p class="empty" style="padding:4px 14px 14px">No orders journaled yet. Each order is recorded here with its reason when it is sent.</p>{% endif %}
 </section>
 
-<section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
+{% if not backtest_id %}<section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="g2-h">Path to live {{ help('g2') }}</h2><span class="hint">{{ path|selectattr('ok')|list|length }} of {{ path|length }} G2 conditions met</span></div>
   <ul class="checklist cols">{% for r in path %}{% set cls = 'ok' if r.ok else ('bad' if r.bad else 'todo') %}
     <li class="{{ cls }}"><span class="mark" aria-hidden="true">{{ '✓' if r.ok else ('!' if r.bad else ('?' if r.ok is none else '○')) }}</span><span><span class="sr-only">{{ 'Met' if r.ok else ('Problem' if r.bad else ('Your call' if r.ok is none else 'Not yet')) }}: </span>{{ r.label }}<small>{{ r.detail }}</small></span></li>{% endfor %}
   </ul>
   <p class="muted" style="margin:10px 0 0;font-size:12.5px">This only reports evidence. Live trading stays locked until you approve G2, and then only on a live account whose key you install on the server.</p>
-</section>
+</section>{% endif %}
 
 <div class="grid">
   <section class="panel span-7" aria-labelledby="feed-h">
@@ -135,14 +135,14 @@
     <ul class="feed">{% for e in feed %}
       <li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what">{{ e.message }}</span></li>{% endfor %}
     </ul>{% else %}<p class="empty">Nothing in this view yet.</p>{% endif %}
-    <p class="muted" style="margin:8px 0 0;font-size:12px">Routine reconciliation passes are left out; the latest result is under Position and limits.</p>
+    {% if not backtest_id %}<p class="muted" style="margin:8px 0 0;font-size:12px">Routine reconciliation passes are left out; the latest result is under Position and limits.</p>{% endif %}
   </section>
   <section class="panel span-5" aria-labelledby="set-h">
     <div class="panel-head"><h2 id="set-h">Settings</h2><span class="hint">created {{ s.created_at|ts }}</span></div>
     <table class="compact kv">
       <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
-      <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>
+      {% if not backtest_id %}<tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>{% endif %}
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}

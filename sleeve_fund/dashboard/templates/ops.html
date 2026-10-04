@@ -39,7 +39,7 @@
   <section class="panel span-6" aria-labelledby="jr-h">
     <div class="panel-head"><h2 id="jr-h">Journal</h2><span class="hint">rows kept</span></div>
     <table class="compact kv">
-      {% for name, label in [('equity', 'Equity marks'), ('fills', 'Fills'), ('events', 'Events'), ('decisions', 'Decisions'), ('commands', 'PM commands'), ('sleeves', 'Sleeves')] %}
+      {% for name, label in [('equity', 'Equity marks'), ('fills', 'Fills'), ('events', 'Events'), ('decisions', 'Decisions'), ('commands', 'PM commands'), ('sleeves', 'Strategies'), ('backtests', 'Saved backtests')] %}
       <tr><th scope="row">{{ label }}</th><td class="num">{{ '{:,}'.format(ops.tables[name]) }}</td></tr>{% endfor %}
     </table>
   </section>

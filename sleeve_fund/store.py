@@ -482,7 +482,7 @@ class Store:
             rows = _rows(c.execute(select(accounts_t).order_by(accounts_t.c.created_at, accounts_t.c.name)))
             keys = {r["account"]: r for r in _rows(c.execute(select(account_keys_t)))}
             links = _rows(c.execute(select(sleeve_accounts_t)))
-            names = [r[0] for r in c.execute(select(sleeves_t.c.name))]
+            names = [r[0] for r in c.execute(select(sleeves_t.c.name).where(_not_backtest(sleeves_t.c.name)))]
         assigned = {r["sleeve"]: r["account"] for r in links}
         for r in rows:
             r["sleeves"] = [n for n in names if assigned.get(n, "paper") == r["name"]]
@@ -663,8 +663,8 @@ class Store:
 
     def ack(self, event_id: int, actor: str, note: str = "") -> None:
         with self.engine.begin() as c:
-            ev = c.execute(select(events_t.c.level).where(events_t.c.id == event_id)).first()
-            if ev is None or ev.level == "info":
+            ev = c.execute(select(events_t.c.level, events_t.c.sleeve).where(events_t.c.id == event_id)).first()
+            if ev is None or ev.level == "info" or is_backtest(ev.sleeve):  # a saved backtest raises no alerts
                 raise KeyError(f"no alert {event_id}")
             if c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == event_id)).first() is None:
                 c.execute(insert(acks_t).values(event_id=event_id, ts=utcnow(), actor=actor, note=note.strip()))
@@ -676,10 +676,16 @@ class Store:
             return _rows(c.execute(q))
 
     def table_sizes(self) -> dict[str, int]:
+        """Rows kept for paper and live; saved backtests' journals are counted once, as runs."""
         out = {}
         with self.engine.connect() as c:
-            for t in (sleeves_t, equity_t, fills_t, orders_t, events_t, commands_t, decisions_t):
-                out[t.name] = c.execute(select(func.count()).select_from(t)).scalar() or 0
+            for t, col in ((sleeves_t, "name"), (equity_t, "sleeve"), (fills_t, "sleeve"), (orders_t, "sleeve"),
+                           (events_t, "sleeve"), (commands_t, None), (decisions_t, None)):
+                q = select(func.count()).select_from(t)
+                if col:
+                    q = q.where(_not_backtest(t.c[col]))
+                out[t.name] = c.execute(q).scalar() or 0
+            out["backtests"] = c.execute(select(func.count()).select_from(backtests_t)).scalar() or 0
         return out
 
     def database_bytes(self) -> int | None:
@@ -698,15 +704,17 @@ class Store:
 
     # --- saved backtests ------------------------------------------------------------
 
-    def save_backtest(self, journal, *, run_id: str, key: str, title: str, query: str, result: dict) -> str:
+    def save_backtest(self, journal, *, run_id: str, key: str, title: str, query: str, result: dict,
+                      bar_spec: str | None = None) -> str:
         """Copy a backtest's in-memory journal (sleeve_fund.paper.journal) into these tables under its
-        own name, with the result the backtest page shows. Returns the backtest's strategy name."""
+        own name, with the result the backtest page shows. Returns the backtest's strategy name.
+        `bar_spec` is the interval the PM picked, where the run's own bars only match its length."""
         name = BACKTEST_PREFIX + run_id
         src = journal.sleeve_row
         now = utcnow()
         with self.engine.begin() as c:
             c.execute(insert(sleeves_t).values(
-                name=name, strategy=src.strategy, instrument=src.instrument, bar_spec=src.bar_spec,
+                name=name, strategy=src.strategy, instrument=src.instrument, bar_spec=bar_spec or src.bar_spec,
                 params=src.params, starting_balance=src.starting_balance, risk_profile=src.risk_profile,
                 warmup_bars=0, desired_state="stopped", status="stopped", status_reason="backtest",
                 paused_until=None, heartbeat_at=None, created_at=now, updated_at=now))
@@ -762,6 +770,10 @@ class Store:
                                                .order_by(backtests_t.c.created_at.desc()).offset(keep))]
             if not old:
                 return 0
+            # Acknowledgements are refused on backtest events, but one from before that rule would
+            # otherwise block deleting its event (a foreign key) and with it every later prune.
+            c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
+                                                                  .where(events_t.c.sleeve.in_(old)))))
             for t in (equity_t, fills_t, orders_t, events_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))

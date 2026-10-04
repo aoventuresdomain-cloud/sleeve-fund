@@ -95,15 +95,9 @@ def client(tmp_path, monkeypatch):
     {"strategy": "rsi_pullback", "p_rsi_pullback__vol_period": "1500", "p_rsi_pullback__atr_period": "1500",
      "p_rsi_pullback__ema_period": "1500"},
 ])
-def test_a_long_average_previews_instead_of_killing_the_dashboard(client, params):
-    r = client.get("/api/preview", params={"instrument": "BTC/USD", "risk_profile": "balanced", **params}, auth=AUTH)
-    assert r.status_code == 200, r.text[:300]
-    assert r.json()["days"] == 2600
-
-
-def test_a_2000_bar_trend_filter_backtests_and_trades(client):
-    r = client.get("/backtest?run=1&instrument=BTC/USD&strategy=trend_filter&p_trend_filter__fast=50"
-                   "&p_trend_filter__slow=2000&risk_profile=balanced&period=all", auth=AUTH)
+def test_a_long_average_backtests_instead_of_killing_the_dashboard(client, params):
+    r = client.get("/backtest", params={"run": "1", "instrument": "BTC/USD", "risk_profile": "balanced",
+                                        "period": "all", **params}, auth=AUTH)
     assert r.status_code == 200 and "Couldn't run it" not in r.text and "Every trade" in r.text
 
 

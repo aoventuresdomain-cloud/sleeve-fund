@@ -290,6 +290,7 @@ window.Console = (() => {
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
       if (!keepView) chart.timeScale().fitContent();
       $(".pc-source").hidden = d.source !== "marks";
+      if (d.note) $(".pc-source").textContent = d.note;
       $(".pc-empty").hidden = d.candles.length > 0;
       if (!keepView) showNote([]);
       const tabs = $(".pc-intervals");
@@ -342,7 +343,7 @@ window.Console = (() => {
     });
   }
 
-  // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary, run the look-back.
+  // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary.
   function sleeveForm() {
     const form = document.getElementById("sleeve-form");
     if (!form) return;
@@ -385,46 +386,13 @@ window.Console = (() => {
     wizard(form);
     orderFields("sleeve-form");
 
-    let chart;
-    document.getElementById("run-preview").addEventListener("click", async (ev) => {
-      const box = document.getElementById("preview");
-      const btn = ev.currentTarget;
-      btn.disabled = true; btn.textContent = "Running…";
+    // A backtest of exactly these settings, in a new tab, so the form keeps what was typed.
+    const bt = document.getElementById("bt-these");
+    bt.addEventListener("click", () => {
       const q = new URLSearchParams(new FormData(form));
-      try {
-        const r = await fetch(`/api/preview?${q}`);
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
-        const f = (x, digits = 1) => (x === null || x === undefined ? "n/a" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(digits)}%`);
-        const n = (x) => (x === null || x === undefined ? "n/a" : x.toFixed(2));
-        box.innerHTML = `<div class="chart" style="height:150px"><canvas id="pv"></canvas></div>
-          <table class="compact"><thead><tr><th></th><th class="num">These settings</th><th class="num">Buy-and-hold</th></tr></thead><tbody>
-          <tr><td>Return</td><td class="num">${f(d.strategy.total_return)}</td><td class="num">${f(d.hold.total_return)}</td></tr>
-          <tr><td>Sharpe</td><td class="num">${n(d.strategy.sharpe)}</td><td class="num">${n(d.hold.sharpe)}</td></tr>
-          <tr><td>Worst drawdown</td><td class="num">${f(d.strategy.max_drawdown)}</td><td class="num">${f(d.hold.max_drawdown)}</td></tr>
-          <tr><td>Closed trades</td><td class="num">${d.trades.trades}${d.trades.trades ? ` · ${f(d.trades.win_rate, 0).replace("+", "")} won` : ""}</td><td class="num">1</td></tr>
-          <tr><td>Fees paid</td><td class="num">${money.format(d.fees)}</td><td class="num"></td></tr></tbody></table>
-          <p class="muted" style="margin:8px 0 0;font-size:12px">${d.pair}, ${d.from} to ${d.to} (${d.days} days), deciding every ${d.every || "day"}. In-sample: a sense check, not a G1 test.</p>`;
-        if (d.fallback) box.appendChild(Object.assign(document.createElement("p"), {className: "banner warn", style: "margin:6px 0 0;font-size:12px", textContent: d.fallback}));
-        if (d.risk && d.risk.note) box.appendChild(Object.assign(document.createElement("p"), {className: d.risk.halted ? "banner warn" : "muted", style: "margin:6px 0 0;font-size:12px", textContent: d.risk.note}));
-        if (d.execution && d.execution.note) box.appendChild(Object.assign(document.createElement("p"), {className: "muted", style: "margin:6px 0 0;font-size:12px", textContent: `${d.execution.maker_orders} of ${d.execution.orders} orders filled as maker. ${d.execution.note}`}));
-        if (chart) chart.destroy();
-        chart = new Chart(document.getElementById("pv"), {
-          type: "line",
-          data: {labels: d.t.map(day), datasets: [
-            {label: "These settings", data: d.equity, borderColor: css("--accent"), borderWidth: 1.6, pointRadius: 0},
-            {label: "Buy-and-hold", data: d.benchmark, borderColor: css("--muted"), borderWidth: 1.1, borderDash: [4, 3], pointRadius: 0}]},
-          options: {maintainAspectRatio: false, animation: false, interaction: {mode: "index", intersect: false},
-            plugins: {legend: {labels: {color: css("--text"), boxWidth: 12, boxHeight: 2}}},
-            scales: {x: {ticks: {color: css("--muted"), maxTicksLimit: 4, maxRotation: 0}, grid: {display: false}},
-                     y: {ticks: {color: css("--muted"), maxTicksLimit: 4, callback: (v) => money.format(v)}, grid: {color: css("--line")}}}},
-        });
-      } catch (e) {
-        box.innerHTML = "";
-        box.appendChild(Object.assign(document.createElement("p"), {className: "loss", textContent: `Look-back not available: ${e.message}`}));
-      } finally {
-        btn.disabled = false; btn.textContent = "Run again";
-      }
+      ["name", "reason", "warmup_bars", "tested_bar_spec", "from", "account"].forEach((k) => q.delete(k));
+      q.set("run", "1");
+      bt.href = `/backtest?${q}`;
     });
   }
 
