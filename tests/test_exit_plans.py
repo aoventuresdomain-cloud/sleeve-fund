@@ -81,7 +81,7 @@ def test_a_new_market_stop_keeps_the_old_one_working_and_sits_at_the_swing_low(s
     it is set, it sits at the level its words name (the swing low itself), as a share of the entry."""
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to under the lowest low of 3 bars")
+    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
     strat = _restart(store, instrument, stop_swing_bars=3, take_profit_r=2.0)
     assert strat._stop_frac == 0.0143 and strat._replan_pending == ("edit", store.last_event("s1", ("exits_change",))["id"])
     assert _applied(store) == []
@@ -98,7 +98,7 @@ def test_a_market_stop_set_after_entry_only_tightens(store, instrument):
     stop is a % edit, which the settings tab checks against the position's size (M8-1)."""
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to under the lowest low of 3 bars")
+    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
     strat = _restart(store, instrument, stop_swing_bars=3)
     strat._lows.extend([97.0, 99.0, 100.2])
     strat._replan(101.0)

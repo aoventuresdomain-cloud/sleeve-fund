@@ -44,6 +44,7 @@ class Fold:
     # When the risk guard halted the run before the test window ended: the day, why, and whether
     # it was in the training stretch the run traded through first. A halted fold is flat from then on.
     halted: str = ""
+    halted_before_test: bool = False  # halted in the training stretch: the whole test window sat flat
 
 
 @dataclass
@@ -81,8 +82,9 @@ class StudyResult:
     def not_judged(self) -> str:
         """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
         - the strategy raised errors, so its orders after them may be wrong;
-        - the risk guard halted every fold, or halted folds left out-of-sample without a single trade:
-          a test window that sat flat is no information, and failing on it would spend the idea."""
+        - the risk guard halted every fold before its test window, or halts before the test left
+          out-of-sample without a single trade: a test window that sat flat is no information, and
+          failing on it would spend the idea. A halt inside a test window is a result, and is judged."""
         if self.error_count:
             from sleeve_fund.strategies.base import handler_error_words
 
@@ -90,11 +92,11 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
-        halted = [f for f in self.folds if f.halted]
-        if halted and (len(halted) == len(self.folds) or self.oos_trades == 0):
-            return (f"the risk guard halted {len(halted)} of {len(self.folds)} folds and out-of-sample closed "
-                    f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so the test windows sat flat "
-                    "rather than testing the idea")
+        flat = [f for f in self.folds if f.halted_before_test]
+        if flat and (len(flat) == len(self.folds) or self.oos_trades == 0):
+            return (f"the risk guard halted {len(flat)} of {len(self.folds)} folds before their test windows began "
+                    f"and out-of-sample closed {self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so the "
+                    "test windows sat flat rather than testing the idea")
         return ""
 
     @property
@@ -280,6 +282,7 @@ def run_study(
                 test_trades=sum(1 for t in trades(fills_to_rows(run.fills))
                                 if t["closed"] is not None and _utc(t["closed"]) >= _utc(test_idx[0])),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
+                halted_before_test=_halted_before(run.risk_events, test_idx[0]),
             )
         )
         oos_parts.append(test_ret)
@@ -366,6 +369,10 @@ def _utc(ts) -> pd.Timestamp:
     return t.tz_localize("UTC") if t.tzinfo is None else t
 
 
+def _halted_before(events: list[dict], test_start: pd.Timestamp) -> bool:
+    return any(e["kind"] == "risk_halt" and _utc(e["ts"]) < _utc(test_start) for e in events)
+
+
 def _halt_words(events: list[dict], test_start: pd.Timestamp, test_end: pd.Timestamp) -> str:
     """'12 Mar 2026 (drawdown 20.3% hit the 20% limit), in the training stretch' for the first halt
     at or before the test window's end, else ''."""
@@ -388,7 +395,7 @@ def _exit_words(exits: dict) -> str:
         words.append(f"stop-loss {exits['stop_atr']:g} average true ranges (over {exits.get('atr_bars', 14)} bars) "
                      "below entry, set at each entry")
     if "stop_swing_bars" in exits:
-        words.append(f"stop-loss under the lowest low of the last {exits['stop_swing_bars']} bars, set at each entry")
+        words.append(f"stop-loss at the lowest low of the last {exits['stop_swing_bars']} bars, set at each entry")
     if "take_profit" in exits:
         words.append(f"take-profit {exits['take_profit']:.1%} above entry")
     if "take_profit_r" in exits:

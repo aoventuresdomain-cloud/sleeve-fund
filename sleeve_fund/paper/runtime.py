@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from sleeve_fund import risk
-from sleeve_fund.store import RELOAD, Store, utcnow
+from sleeve_fund.store import OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
 
 RECONCILE_EVERY = timedelta(hours=24)
 # How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
@@ -84,6 +84,13 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")
+        if not self.backtest:
+            # Paper's venue is simulated in the process, so orders still working when it stopped went
+            # with it; without this they would read "Working" for ever (review round 8, m8-9).
+            for o in self.store.orders(self.name, statuses=OPEN_ORDER_STATUSES, limit=1000):
+                self.store.update_order(o["order_id"], status="canceled",
+                                        message="cancelled when the strategy restarted: paper's simulated venue "
+                                                "went with the process that sent it")
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
                              f"book restored from {self.book['fills']} journal fills: "

@@ -16,8 +16,9 @@ export PGHOST=${PGHOST:-db} PGUSER=${PGUSER:-sleeve}
 json_text() {  # a JSON string's inside: control characters to spaces, backslashes and quotes escaped
   printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
-why() {  # the first 200 characters of the last error, as one line
-  head -c 200 "$DIR/last_error.txt" | iconv -c -f utf-8 -t utf-8 2>/dev/null || head -c 200 "$DIR/last_error.txt"
+why() {  # the first 200 bytes of the last error, a character cut in two dropped (iconv -c exits 1 when it
+  # drops one, which must not print the raw bytes a second time)
+  { head -c 200 "$DIR/last_error.txt" | iconv -c -f utf-8 -t utf-8 2>/dev/null; true; }
 }
 status() {  # ok, file, message, restored counts (JSON object)
   printf '{"ts": "%s", "ok": %s, "file": "%s", "message": "%s", "restored": %s}\n' \

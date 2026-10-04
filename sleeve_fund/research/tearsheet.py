@@ -203,8 +203,8 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     checks = g1_checks(r, ledger)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
-        out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail, and the holdout stays "
-                   "unspent)")
+        out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
+                   + (", and the holdout stays unspent)" if r.holdout_days else ")"))
     else:
         out.append(f"**G1: {verdict}**" + (f" (failed: {', '.join(failed)})" if failed else " (every check passed)"))
     out.append("")

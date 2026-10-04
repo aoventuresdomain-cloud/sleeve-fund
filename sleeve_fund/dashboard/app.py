@@ -1245,7 +1245,7 @@ def _risk_words(profile: str, params: dict) -> dict[str, str]:
     if p.get("stop_atr"):
         stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) below the entry"
     elif p.get("stop_swing_bars"):
-        stop = f"under the lowest low of {p['stop_swing_bars']} bars"
+        stop = f"at the lowest low of {p['stop_swing_bars']} bars"
     elif p.get("stop_loss"):
         stop = f"{p['stop_loss'] * 100:g}% below the entry"
     else:

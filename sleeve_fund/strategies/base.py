@@ -209,7 +209,7 @@ class LongFlatConfig(StrategyConfig):
         # Optional sizing: lose at most this fraction of equity if the stop is hit.
         self.risk_per_trade = risk_per_trade
         # Or a stop set from the market at each entry: this many average true ranges (over atr_bars
-        # bars) below the close, or just under the lowest low of the last stop_swing_bars bars.
+        # bars) below the close, or at the lowest low of the last stop_swing_bars bars.
         self.stop_atr = stop_atr
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)

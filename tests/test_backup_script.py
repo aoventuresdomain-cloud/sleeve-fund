@@ -75,3 +75,13 @@ def test_the_research_record_is_archived_beside_the_dumps(tmp_path):
     assert len(archives) == 14 and archives[-1].name == "research-20261004-0015.tar.gz"
     with tarfile.open(archives[-1]) as t:
         assert "./idea_ledger.jsonl" in t.getnames()
+
+
+def test_an_error_cut_inside_a_character_is_said_once(tmp_path):
+    """Review round 8, m8-1: cutting the error at 200 bytes can split a character; iconv drops it and
+    exits 1, and the old fallback then printed the raw text a second time, split character and all."""
+    (tmp_path / "b").mkdir()
+    (tmp_path / "research" / "tearsheets").mkdir(parents=True)
+    error = "e" * 199 + "é and more after the cut"
+    bad = _round(tmp_path, 0, False, error)
+    assert bad["ok"] is False and "e" * 199 in bad["message"] and "e" * 200 not in bad["message"]

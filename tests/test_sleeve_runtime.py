@@ -352,3 +352,16 @@ def test_a_reload_mid_day_keeps_the_days_opening_equity(store, reload):
     t[0] += timedelta(hours=1)
     assert rt.tick(equity=9_350, price=9_350, **mark) == "flatten"  # down 6.5% on the day
     assert store.sleeve("s1").status == "paused"
+
+
+def test_a_restart_closes_the_orders_the_last_process_left_working(store):
+    """Review round 8, m8-9: a reload while a post-only order was working left it "Working" for ever.
+    Paper's venue is simulated in the process, so its orders end with it."""
+    _sleeve(store)
+    rt = SleeveRuntime(store, "s1")
+    rt.on_order(order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="Signal to be long", signal={},
+                order_type="POST-ONLY LIMIT")
+    rt.on_order_status("O-1", "accepted")
+    SleeveRuntime(store, "s1").on_start(0.008)
+    (o,) = store.orders("s1")
+    assert o["status"] == "canceled" and "restarted" in o["message"]

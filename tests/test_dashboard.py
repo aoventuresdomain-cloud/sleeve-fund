@@ -1440,3 +1440,67 @@ def test_a_run_whose_strategy_raised_is_flagged_and_not_offered_for_paper(client
     screen = c.get(f"/sleeves/{name}", auth=AUTH).text
     assert "The strategy's code raised an error 1 time during this run" in screen
     assert "raised an error" not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+STOP_KINDS = {"pct": {"stop_loss": 0.03, "take_profit": 0.06},
+              "atr": {"stop_atr": 2.0, "atr_bars": 14, "take_profit_r": 2.0},
+              "swing": {"stop_swing_bars": 10, "take_profit_r": 1.5}}
+STATES = ("running", "paused", "halted", "stopped", "holding")  # holding: stopped with a position
+
+
+def test_every_page_renders_for_every_stop_type_and_strategy_state(client, monkeypatch):
+    """Review round 8, m8-T: the Risk page crashed for any strategy with an ATR or swing-low stop, and
+    the kill switch lives there. Every page renders with each kind of stop in each state, with and
+    without an open position, its stop edited or not."""
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard import charts
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import utcnow
+
+    monkeypatch.setattr(charts, "candles", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    c, store = client
+    names = []
+    for kind, exits in STOP_KINDS.items():
+        for state in STATES:
+            name = f"{kind}-{state}"
+            names.append(name)
+            store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                                starting_balance=5_000, params={"fast": 10, "slow": 30, **exits},
+                                risk_profile="balanced")
+            if state in ("running", "paused", "halted", "holding"):
+                rt = SleeveRuntime(store, name)
+                basis = {"atr": "2 x the 14-bar average true range (1,000)",
+                         "swing": "at the lowest low of the last 10 bars (48,500)"}.get(kind)
+                sig = {"stop_frac": 0.03, "tp_frac": 0.07, "risk_amount": 70.0, "planned_r": 2.0,
+                       "stop_cfg": {k: v for k, v in exits.items() if k.startswith(("stop", "atr"))},
+                       **({"stop_basis": basis} if basis else {})}
+                rt.on_order(order_id=f"{name}-E", side="BUY", qty=0.03, intent="entry", reason="Signal to be long",
+                            signal=sig)
+                rt.on_fill(side="BUY", qty=0.03, price=50_000.0, fee=12.0, order_id=f"{name}-E", trade_id=f"{name}-T")
+                store.record_equity(name, equity=4_950.0, cash=3_488.0, qty=0.03, price=48_700.0, benchmark=4_990.0)
+                if kind == "atr":  # this one had its stop edited while open
+                    store.set_exit_plan(name, f"{name}-E", kind="edit", stop_frac=0.02, tp_frac=0.07,
+                                        risk_amount=70.0, planned_r=2.4)
+            if state == "paused":
+                store.set_status(name, "paused", "daily loss 5.1% hit the 5% limit", paused_until=utcnow() + timedelta(hours=8))
+            elif state == "halted":
+                store.set_status(name, "halted", "drawdown 20.4% hit the 20% limit")
+            elif state in ("stopped", "holding"):
+                store.set_desired_state(name, "stopped")
+                store.set_status(name, "stopped", "process stopped")
+            else:
+                store.set_status(name, "running")
+    pages = ["/", "/trades", "/orders", "/alerts", "/risk", "/reports", "/settings", "/ops", "/accounts", "/decisions",
+             "/research", "/sleeves/new"]
+    for n in names:
+        pages += [f"/sleeves/{n}", f"/api/sleeves/{n}/equity", f"/api/sleeves/{n}/candles", f"/trades?sleeve={n}"]
+    for path in pages:
+        r = c.get(path, auth=AUTH)
+        assert r.status_code == 200, (path, r.text[:300])
+    risk = c.get("/risk", auth=AUTH).text
+    assert "Flatten everything" in risk
+    swing = c.get("/sleeves/swing-holding", auth=AUTH).text
+    assert "48,500" in swing and "Accept a looser stop on the open position" in swing
+    edited = c.get("/sleeves/atr-running", auth=AUTH).text
+    assert "49,000.00" in edited and "edited by the PM" in edited  # the edited plan: 2% under the 50,000 entry

@@ -32,7 +32,7 @@
     <div class="field" data-stop="pct"><label for="stop_loss_pct">Stop, % below entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.01" placeholder="e.g. 5" value="{{ pre.get('stop_loss_pct', '') }}"></div>
     <div class="field" data-stop="atr"><label for="stop_atr">Stop, average true ranges below entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>
     <div class="field" data-stop="atr"><label for="atr_bars">Average true range over, bars</label><input id="atr_bars" name="atr_bars" type="number" min="2" max="500" step="1" value="{{ pre.get('atr_bars', 14) }}"></div>
-    <div class="field" data-stop="swing"><label for="stop_swing_bars">Stop under the lowest low of the last, bars</label><input id="stop_swing_bars" name="stop_swing_bars" type="number" min="2" max="500" step="1" placeholder="e.g. 20" value="{{ pre.get('stop_swing_bars', '') }}"></div>
+    <div class="field" data-stop="swing"><label for="stop_swing_bars">Stop at the lowest low of the last, bars</label><input id="stop_swing_bars" name="stop_swing_bars" type="number" min="2" max="500" step="1" placeholder="e.g. 20" value="{{ pre.get('stop_swing_bars', '') }}"></div>
   </div>
   <div class="grid2">
     <div class="field"><label for="tp_kind">Take-profit</label><select id="tp_kind" data-kind="tp">

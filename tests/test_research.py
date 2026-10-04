@@ -298,7 +298,8 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
     assert enough[1] == "FAIL" and enough[2].startswith("1 closed in the 2 walk-forward test windows")
     sheet = render(r, ledger)
     assert "> **No trades out-of-sample in 1 of 2 test windows.**" in sheet
-    assert "| 0 (halted) |" in sheet and "| 1 (halted) |" in sheet
+    assert "| 0 (halted 29 Mar 2022) |" in sheet and "| 1 (halted 27 Mar 2022) |" in sheet  # halt dates per fold
+    assert "**G1: FAIL**" in sheet  # one test window traded into its halt: a result, judged
     assert "kept in the repository" not in sheet
     import sleeve_fund.research.tearsheet as tearsheet
 
@@ -332,3 +333,85 @@ def test_a_study_on_history_still_being_collected_says_where_it_ends(tmp_path):
                        holdout_days=0)
     sheet = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts", history=hist).read_text()
     assert "The stored history ends" in sheet and "the collector is still catching up" in sheet
+
+
+def _crashes(days=200, at=(20, 75)):
+    """Daily closes that fall 70% over the 20 days after each of `at`, flat in between, then rise."""
+    import numpy as np
+
+    c = np.full(days, 100.0)
+    for start in at:
+        c[start:] *= np.r_[np.linspace(1, 0.3, 20), np.full(max(days - start - 20, 0), 0.3)][:days - start]
+    c[at[-1] + 25:] *= np.linspace(1, 1.5, days - at[-1] - 25)
+    idx = pd.date_range("2022-01-01", periods=days, freq="1D", tz="UTC")
+    return pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1e6}, index=idx)
+
+
+def test_a_study_halted_before_every_test_window_is_not_judged_and_keeps_its_holdout(tmp_path, instrument):
+    """Review round 8, M8-4: a study whose runs all halted in training read G1 FAIL on test windows that
+    sat flat, and opened (spent) the holdout on it. It now reads "not judged", which is neither a pass
+    nor a fail, and the holdout it asked for stays closed."""
+    from sleeve_fund.dashboard.pipeline import sheet_facts
+    from sleeve_fund.research.tearsheet import NOT_JUDGED, g1_checks, g1_verdict
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(HOLD, _crashes(), instrument, dataset="syn-1440m", ledger=ledger, synthetic=True, holdout_days=20,
+                  train_days=60, test_days=60, risk_profile="conservative", use_holdout=True)
+    assert len(r.folds) == 2 and all(f.halted_before_test for f in r.folds)
+    assert r.not_judged.startswith("the risk guard halted 2 of 2 folds before their test windows began")
+    assert r.holdout is None and "left closed, though asked for" in r.holdout_withheld
+    assert not ledger.holdout_used("buy_and_hold", "syn-1440m")
+    assert g1_verdict(g1_checks(r, ledger))[0] == NOT_JUDGED
+    sheet = tmp_path / "s.md"
+    sheet.write_text(render(r, ledger))
+    assert "**G1: NOT JUDGED**" in sheet.read_text() and sheet_facts(sheet)["g1"] == NOT_JUDGED
+
+
+@pytest.mark.strategy_errors
+def test_a_study_whose_strategy_raises_is_not_judged(tmp_path, instrument, monkeypatch):
+    """Review round 8, M8-3: studies and tear sheets ignored the strategy's own errors, so a broken
+    signal read as a result. The errors are counted, and G1 doesn't judge the study."""
+    from sleeve_fund.research.tearsheet import NOT_JUDGED, g1_checks, g1_verdict
+    from sleeve_fund.strategies import buy_and_hold
+
+    def broken(self, bar):
+        raise ZeroDivisionError("float division by zero")
+
+    monkeypatch.setattr(buy_and_hold.BuyAndHold, "want_long", broken)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(buy_and_hold.SPEC, synthetic_ohlcv(days=200, seed=4), instrument, dataset="syn", ledger=ledger,
+                  synthetic=True, holdout_days=20, train_days=60, test_days=60, use_holdout=True)
+    assert r.error_count > 100 and r.errors[0][1:] == ("on_bar", "ZeroDivisionError('float division by zero')")
+    assert "handling a bar: float division by zero (ZeroDivisionError)" in r.not_judged
+    assert g1_verdict(g1_checks(r, ledger))[0] == NOT_JUDGED and r.holdout is None
+
+
+def test_a_study_charges_the_spread_it_is_given(tmp_path, instrument):
+    """Review round 8, m8-T: research ran with no spread and every test still passed."""
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    r = run_study(HOLD, synthetic_ohlcv(days=200, seed=4), instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"),
+                  synthetic=True, holdout_days=0, train_days=60, test_days=60, half_spread=0.001)
+    assert r.full_period.half_spread == 0.001 and r.full_period.spread_paid > 0
+    assert "0.100% of the price as half the bid-ask spread" in r.fee_note
+
+
+def test_whole_days_drops_the_day_a_window_starts_part_way_through():
+    """Review round 8, m8-T: a test window whose first bar starts at noon must not count that day."""
+    from sleeve_fund.research.metrics import whole_days
+
+    days = pd.date_range("2022-01-01", periods=5, freq="1D", tz="UTC")  # each return stamped at the day's close
+    returns = pd.Series([0.01, 0.02, 0.03, 0.04, 0.05], index=days)
+    bar = pd.Timedelta(minutes=15)
+    kept = whole_days(returns, pd.Timestamp("2022-01-01 12:15", tz="UTC"), bar)  # first bar 12:00 to 12:15
+    assert list(kept.index) == list(days[2:])  # not 2 Jan's close: that day began before the window
+    assert list(whole_days(returns, pd.Timestamp("2022-01-01 00:15", tz="UTC"), bar).index) == list(days[1:])
+
+
+def test_a_holdout_opened_at_one_bar_length_is_spent_at_every_other(tmp_path):
+    """Review round 8, m8-T: the same days seen once on hourly bars are not fresh on 15-minute ones."""
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    ledger.record(idea="a", family="trend", params={}, dataset="kraken-btcusd-store-60m", stage="holdout", sharpe=0.1)
+    assert ledger.holdout_used("a", "kraken-btcusd-store-15m") and ledger.holdout_used("a", "kraken-btcusd-store-1440m")
+    assert not ledger.holdout_used("a", "kraken-ethusd-store-60m") and not ledger.holdout_used("b", "kraken-btcusd-store-60m")

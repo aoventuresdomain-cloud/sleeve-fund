@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--risk-per-trade", type=float, help="size so a stop-out loses this fraction of equity")
     st.add_argument("--stop-atr", type=float, help="instead of --stop-loss: a stop this many average true ranges below entry")
     st.add_argument("--atr-bars", type=int, help="bars the average true range is taken over (default 14)")
-    st.add_argument("--stop-swing-bars", type=int, help="instead of --stop-loss: a stop under the lowest low of this many bars")
+    st.add_argument("--stop-swing-bars", type=int, help="instead of --stop-loss: a stop at the lowest low of this many bars")
     st.add_argument("--take-profit-r", type=float, help="instead of --take-profit: a target this many stop distances up")
     st.add_argument("--risk-profile", default="balanced",
                     help="trade under this paper risk profile (cap, drawdown halt, daily-loss pause); 'none' for "
