@@ -9,17 +9,30 @@ from pathlib import Path
 from sleeve_fund.strategies import REGISTRY
 
 STAGES = ["Idea", "Tested", "Passed G1", "Paper", "Passed G2", "Live"]
-_G1 = re.compile(r"^\|\s*G1 test[^|]*\|\s*(PASS|FAIL|WARN)\s*\|\s*([^|]*)\|", re.M)
+_CHECK = re.compile(r"^\|\s*([^|]*?)\s*\|\s*(PASS|FAIL|WARN|INFO)\s*\|\s*([^|]*)\|", re.M)
 _DATASET = re.compile(r"^Dataset `([^`]+)`", re.M)
 _NAME = re.compile(r"^# Tear sheet: (\S+)", re.M)
 _TESTED = re.compile(r"^Tested on `([^`]+)` at (\d+)-minute bars", re.M)
 
 
+def _g1(text: str) -> tuple[str | None, str, list[str]]:
+    """(verdict, Sharpe evidence, failed checks) from a sheet's check rows. G1 passes only when every
+    check that can fail passed, whatever the Sharpe row says, so sheets written before the verdict
+    line existed are read the same strict way."""
+    rows = _CHECK.findall(text)
+    sharpe = next((r for r in rows if r[0].startswith("G1 test")), None)
+    if sharpe is None:
+        return None, "", []
+    failed = [label for label, verdict, _ in rows if verdict not in ("PASS", "INFO")]
+    return ("FAIL" if failed else "PASS"), sharpe[2].strip(), failed
+
+
 def sheet_facts(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
-    g1, ds, name, tested = _G1.search(text), _DATASET.search(text), _NAME.search(text), _TESTED.search(text)
+    ds, name, tested = _DATASET.search(text), _NAME.search(text), _TESTED.search(text)
+    g1, evidence, failed = _g1(text)
     return {"name": path.stem, "strategy": name.group(1) if name else None,
-            "g1": g1.group(1) if g1 else None, "evidence": g1.group(2).strip() if g1 else "",
+            "g1": g1, "evidence": evidence, "failed": failed,
             "dataset": ds.group(1) if ds else "unknown", "mtime": path.stat().st_mtime,
             # Sheets from before the instrument and bars were written down can't vouch for either.
             "instrument": tested.group(1).upper() if tested else None,
@@ -31,8 +44,10 @@ def _sheets(tearsheets: Path) -> list[dict]:
 
 
 def _real(sheets: list[dict], strategy: str) -> list[dict]:
-    """A strategy's sheets on real data (synthetic runs prove plumbing, not edge), newest first."""
-    return [s for s in sheets if s["strategy"] == strategy and s["dataset"] != "synthetic"]
+    """A strategy's sheets on real data (synthetic runs prove plumbing, not edge; a sheet that doesn't
+    say what it was tested on proves nothing), newest first."""
+    return [s for s in sheets if s["strategy"] == strategy and s["dataset"] not in ("synthetic", "unknown")
+            and "synthetic" not in s["dataset"]]
 
 
 def g1_for(tearsheets: Path, strategy: str, instrument: str, minutes: int) -> str | None:
@@ -73,7 +88,9 @@ def strategies(tearsheets: Path, sleeves: list) -> list[dict]:
         else:
             stage = 1 if mine else 0
         where = [f"{i} {_every(m)}" for i, m in sorted(k for k, v in latest.items() if v == "PASS")]
+        observing = [s for s in running if s not in backed]
         out.append({"name": name, "spec": spec, "sheets": mine, "g1": g1, "passed_on": passed_on, "passed_where": where,
-                    "stage": stage,
-                    "sleeves": running, "observation": len(backed) < len(running)})
+                    "stage": stage, "sleeves": running, "observation": bool(observing),
+                    "observing": [{"name": s.name, "where": f"{s.instrument} {_every(spec_minutes(s.bar_spec))}"}
+                                  for s in observing]})
     return out

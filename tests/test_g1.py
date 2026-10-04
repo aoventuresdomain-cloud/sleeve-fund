@@ -51,6 +51,7 @@ def test_a_strategy_on_another_instrument_is_an_observation(tmp_path):
     assert not row(sleeve("BTC/USD", "1-DAY-LAST-EXTERNAL"))["observation"]
     assert row(sleeve("ETH/USD", "1-DAY-LAST-EXTERNAL"))["observation"]
     assert row(sleeve("BTC/USD", "1-HOUR-LAST-INTERNAL"))["observation"]
+    assert row(sleeve("ETH/USD", "1-DAY-LAST-EXTERNAL"))["observing"] == [{"name": "x", "where": "ETH/USD daily"}]
 
 
 def test_a_higher_sharpe_by_luck_does_not_clear_the_bar():
@@ -98,3 +99,60 @@ def test_the_bar_length_tested_is_read_from_the_prices(bars, minutes):
     from sleeve_fund.research.study import bar_minutes_of
 
     assert bar_minutes_of(pd.DataFrame({"close": 1.0}, index=bars)) == minutes
+
+
+def _checks_sheet(path, rows, dataset="kraken-btcusd-store"):
+    body = "\n".join(f"| {label} | {verdict} | e |" for label, verdict in rows)
+    path.write_text(f"# Tear sheet: trend_filter\n\nTested on `BTC/USD` at 1440-minute bars on `KRAKEN`\n\n"
+                    f"Dataset `{dataset}` · x\n\n| Check | Result | Evidence |\n| --- | --- | --- |\n{body}\n")
+
+
+def test_g1_needs_every_check_not_just_the_sharpe(tmp_path):
+    """Review R5-B1: a strong Sharpe on three trades, or on a holdout already opened, is not a pass."""
+    sharpe = ("G1 test: out-of-sample Sharpe clearly beats benchmark after fees", "PASS")
+    rest = [("Out-of-sample return vs benchmark after fees (shown, not the G1 test)", "INFO"),
+            ("Holds up when parameters move", "PASS"), ("Holdout not used for tuning", "PASS"),
+            ("Variants tried disclosed", "PASS"), ("Enough trades to judge", "PASS")]
+    _checks_sheet(tmp_path / "a.md", [sharpe, *rest])
+    assert pipeline.g1_for(tmp_path, "trend_filter", "BTC/USD", 1440) == "PASS"
+    for failing in ("Enough trades to judge", "Holdout not used for tuning", "Holds up when parameters move"):
+        rows = [sharpe] + [(label, "FAIL" if label == failing else v) for label, v in rest]
+        _checks_sheet(tmp_path / "a.md", rows)
+        assert pipeline.g1_for(tmp_path, "trend_filter", "BTC/USD", 1440) == "FAIL", failing
+        assert pipeline.sheet_facts(tmp_path / "a.md")["failed"] == [failing]
+
+
+def test_a_sheet_that_does_not_say_what_it_tested_badges_nothing(tmp_path):
+    (tmp_path / "a.md").write_text("# Tear sheet: trend_filter\n\nTested on `BTC/USD` at 1440-minute bars\n\n"
+                                   "| G1 test: x | PASS | e |\n")
+    assert pipeline.g1_for(tmp_path, "trend_filter", "BTC/USD", 1440) is None
+
+
+def test_the_tear_sheet_states_the_verdict_from_every_check():
+    from sleeve_fund.research.tearsheet import g1_verdict
+
+    checks = [("G1 test: x", "PASS", ""), ("Shown", "INFO", ""), ("Enough trades to judge", "FAIL", "")]
+    assert g1_verdict(checks) == ("FAIL", ["Enough trades to judge"])
+    assert g1_verdict(checks[:2]) == ("PASS", [])
+
+
+def test_the_block_grows_with_persistence_and_drifting_returns_are_not_judged():
+    """Review R5-M4: a 10-day block understated the luck in persistent P&L."""
+    from sleeve_fund.research.metrics import block_length, independent_days
+
+    rng = np.random.default_rng(1)
+    noise = rng.normal(size=1095)
+    persistent = np.empty_like(noise)
+    persistent[0] = noise[0]
+    for i in range(1, len(noise)):
+        persistent[i] = 0.6 * persistent[i - 1] + noise[i]
+    assert block_length(noise) < 10 < block_length(persistent)
+    assert independent_days(noise) > 900 and independent_days(persistent) < 400
+    drifting = np.empty_like(noise)
+    drifting[0] = noise[0]
+    for i in range(1, len(noise)):
+        drifting[i] = 0.9 * drifting[i - 1] + noise[i]
+    idx = pd.date_range("2021-01-01", periods=len(noise))
+    bench = pd.Series(rng.normal(0.0005, 0.03, len(noise)), idx)
+    p, _ = sharpe_beats_probability(pd.Series(0.01 + 0.001 * drifting, idx), bench, 1)
+    assert np.isnan(p)  # about 58 independent days: nothing to judge, however good it looks

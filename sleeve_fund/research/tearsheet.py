@@ -23,6 +23,15 @@ ROBUST_SHARE = 0.6
 # G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
 # than the best of the variants tried would by luck.
 G1_CONFIDENCE = 0.95
+SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
+
+
+def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
+    """G1 passes only when every check that can fail passes: the Sharpe test, robustness, an unused
+    holdout and enough trades. A strong Sharpe on three trades, or on a holdout already looked at,
+    is not evidence. Returns the verdict and the checks that failed."""
+    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "INFO")]
+    return ("FAIL" if failed else "PASS"), failed
 
 
 def _pct(x: float) -> str:
@@ -52,8 +61,9 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     trips = len(r.round_trips)
     counts = ledger.counts()
     beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
-    if math.isnan(beats):
-        beats = 0.0  # too short an out-of-sample period to judge
+    unjudged = math.isnan(beats)
+    if unjudged:
+        beats = 0.0  # too short, or too few independent days, to judge
     checks = [
         (
             "Out-of-sample return vs benchmark after fees (shown, not the G1 test)",
@@ -61,10 +71,12 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"CAGR {_pct(oos['cagr'])} vs {_pct(bench['cagr'])}",
         ),
         (
-            "G1 test: out-of-sample Sharpe clearly beats benchmark after fees",
+            SHARPE_CHECK,
             "PASS" if oos["sharpe"] > bench["sharpe"] and beats >= G1_CONFIDENCE else "FAIL",
-            f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; {_share(beats)} likely to beat it by more than "
-            f"the best of {counts['variants']} variants would by luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}",
+            f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; " + (
+                "too few independent out-of-sample days to judge" if unjudged else
+                f"{_share(beats)} likely to beat it by more than the best of {counts['variants']} variants would by "
+                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}"),
         ),
         (
             "Holds up when parameters move",
@@ -83,7 +95,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"{counts['variants']} variants across {counts['ideas']} ideas so far",
         ),
         (
-            # A Sharpe built on a handful of trades is luck, not evidence, so this one can fail G1.
+            # A Sharpe built on a handful of trades is luck, not evidence, so this one fails G1.
             "Enough trades to judge",
             "PASS" if trips >= MIN_ROUND_TRIPS else "FAIL",
             f"{trips} closed trades over the research period (bar: {MIN_ROUND_TRIPS}); turnover {r.turnover:.1f}x a year",
@@ -114,7 +126,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
         out.append("> **Synthetic data.** This run only proves the pipeline works. The numbers say nothing about the strategy.")
         out.append("")
     out.append(
-        f"Tested on `{r.instrument}` at {r.bar_minutes}-minute bars"
+        f"Tested on `{r.instrument}` at {r.bar_minutes}-minute bars" + (f" on `{r.venue}`" if r.venue else "")
     )
     out.append("")
     out.append(
@@ -136,14 +148,20 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
+    checks = g1_checks(r, ledger)
+    verdict, failed = g1_verdict(checks)
+    out.append(f"**G1: {verdict}**" + (f" (failed: {', '.join(failed)})" if failed else " (every check passed)"))
+    out.append("")
     out.append("| Check | Result | Evidence |")
     out.append("| --- | --- | --- |")
-    for name, verdict, evidence in g1_checks(r, ledger):
-        out.append(f"| {name} | {verdict} | {evidence} |")
+    for name, result, evidence in checks:
+        out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
-    out.append("G1 \"beats buy-and-hold\" means a higher out-of-sample Sharpe after fees (PM decision, 3 Oct 2026), by "
-               f"more than luck across every variant tried, with {G1_CONFIDENCE:.0%} confidence (paired block bootstrap). "
-               "These checks inform the G1 decision; they don't make it.")
+    out.append("The PM's G1 rule (3 Oct 2026) is a higher out-of-sample Sharpe than buy-and-hold after fees. The build "
+               f"applies it strictly: by more than luck across every variant tried, at {G1_CONFIDENCE:.0%} confidence "
+               "(paired block bootstrap, blocks as long as the returns' persistence), with enough trades, an unused "
+               "holdout and robustness to parameter moves. The confidence bar is the build's, pending the PM's choice. "
+               f"Variants are counted from `{ledger.path.name}`, which is kept in the repository.")
     out.append("")
     out.append("## Results after fees")
     out.append("")
