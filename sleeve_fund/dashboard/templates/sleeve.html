@@ -14,6 +14,8 @@
       <button type="button" class="secondary" data-open="dlg-flatten" {{ 'disabled' if x.qty <= 0 }}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
+      {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
+      {% if held > 0 %}<button type="button" class="secondary" data-open="dlg-flatten">Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {{ 'disabled title="Flatten before archiving"' if x.qty > 0 }}>Archive</button>{% endif %}{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
@@ -34,6 +36,8 @@
 {% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
 {% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}
 </div>
+{# Outside the live part: the next refresh, without the query, would drop it before it is read. #}
+{% if command_error %}<div class="banner loss" role="alert" data-once>Not done: {{ command_error }}.</div>{% endif %}
 
 <section class="ledger" aria-label="Strategy figures">
   <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
@@ -92,7 +96,7 @@
       <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
       <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
       <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
-      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
+      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} below the last price)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% elif s.params.take_profit_r %}{{ s.params.take_profit_r }}R after costs{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
       <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
@@ -224,7 +228,7 @@
 {% set dialogs = {
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
   'resume': ('Resume ' ~ s.name, 'The strategy trades again on its next signal.' ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
-  'flatten': ('Flatten ' ~ s.name, 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
+  'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to sell ' ~ ('%.6g'|format(held)) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|money) if s.desired_state != 'running' else 'Sells ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('%.6g'|format(x.qty)) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty > 0 else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty > 0 else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),

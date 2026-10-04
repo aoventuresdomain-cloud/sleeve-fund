@@ -27,7 +27,7 @@
       <option value="" {{ 'selected' if not stop_kind }}>None</option>
       <option value="pct" {{ 'selected' if stop_kind == 'pct' }}>A % below the entry</option>
       <option value="atr" {{ 'selected' if stop_kind == 'atr' }}>Average true ranges below the entry</option>
-      <option value="swing" {{ 'selected' if stop_kind == 'swing' }}>Under the recent low</option>
+      <option value="swing" {{ 'selected' if stop_kind == 'swing' }}>At the recent low</option>
     </select></div>
     <div class="field" data-stop="pct"><label for="stop_loss_pct">Stop, % below entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.01" placeholder="e.g. 5" value="{{ pre.get('stop_loss_pct', '') }}"></div>
     <div class="field" data-stop="atr"><label for="stop_atr">Stop, average true ranges below entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>

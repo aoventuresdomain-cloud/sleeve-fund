@@ -82,9 +82,10 @@ class StudyResult:
     def not_judged(self) -> str:
         """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
         - the strategy raised errors, so its orders after them may be wrong;
-        - the risk guard halted every fold before its test window, or halts before the test left
-          out-of-sample without a single trade: a test window that sat flat is no information, and
-          failing on it would spend the idea. A halt inside a test window is a result, and is judged."""
+        - the risk guard left most test windows blind, or out-of-sample without a single trade. A window
+          is blind when a halt before it began kept it flat, or a halt left it without a trade: no
+          information, and failing on it would spend the idea (review round 9, N7). A halt inside a
+          test window that still traded is a result, and so is a window the signal never traded in."""
         if self.error_count:
             from sleeve_fund.strategies.base import handler_error_words
 
@@ -92,11 +93,13 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
-        flat = [f for f in self.folds if f.halted_before_test]
-        if flat and (len(flat) == len(self.folds) or self.oos_trades == 0):
-            return (f"the risk guard halted {len(flat)} of {len(self.folds)} folds before their test windows began "
-                    f"and out-of-sample closed {self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so the "
-                    "test windows sat flat rather than testing the idea")
+        blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.test_trades == 0)]
+        if blind and (2 * len(blind) > len(self.folds) or self.oos_trades == 0):
+            halted = sum(1 for f in self.folds if f.halted)
+            return (f"the risk guard halted the strategy in {halted} of {len(self.folds)} folds, leaving {len(blind)} "
+                    f"of {len(self.folds)} test windows flat or without a trade, and out-of-sample closed "
+                    f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so most of it sat flat rather "
+                    "than testing the idea")
         return ""
 
     @property

@@ -609,6 +609,11 @@ class LongFlatStrategy(Strategy):
         # widening a stop can't flatter the trade's R multiple (review round 8, M8-1).
         risk = max(float(sig.get("risk_amount") or 0.0),
                    notional * (stop + cost + (1 - stop) * cost) if stop is not None else 0.0) or None
+        if self._cfg.take_profit_r and not self._cfg.take_profit and risk:
+            # An R target is so many of the trade's 1R. After a tighter stop that is still the entry's
+            # risk, so the target is set from it: a typed 3R records +3.00R, not less (review round 9, N2).
+            tp = (self._cfg.take_profit_r * risk / notional + 2 * cost) / (1 - cost)
+            self._tp_frac = tp
         planned = round((tp - cost - (1 + tp) * cost) * notional / risk, 2) if tp and risk else None
         store, name, now = self.runtime.store, self.runtime.name, self.runtime.now()
         store.set_exit_plan(name, self._plan_entry["order_id"], kind=kind, ts=now, event_id=event_id,

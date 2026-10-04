@@ -92,7 +92,7 @@ def plan_items(plan: dict) -> list[tuple[str, str]]:
         s = plan["stop_frac"]
         out.append(("Stop now", f"{s:.1%} below the entry" if s >= 0 else f"{-s:.1%} above the entry"))
     if plan.get("tp_frac"):
-        out.append(("Target now", f"{plan['tp_frac']:.1%}"))
+        out.append(("Target now", f"{plan['tp_frac']:.1%} above the entry"))
     if plan.get("risk_amount"):
         out.append(("1R now", f"{plan['risk_amount']:,.2f}"))
     if plan.get("planned_r") is not None:

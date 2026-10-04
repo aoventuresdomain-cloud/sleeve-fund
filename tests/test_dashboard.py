@@ -125,7 +125,7 @@ def test_command_needs_reason(client):
     c, _ = client
     _new(c)
     r = c.post("/sleeves/btc-test/command", data={"command": "pause", "reason": " "}, auth=AUTH, headers=SAME)
-    assert r.status_code == 400
+    assert r.status_code == 200 and "Not done: every command needs a reason." in r.text
 
 
 def test_research_and_tearsheet(client):
@@ -1026,8 +1026,13 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     again = c.get("/risk", auth=AUTH).text
     assert "Waiting to sell: btc-test, eth-test." in again and "Selling to cash…" in again
     assert 'data-open="dlg-kill"' not in again
-    c.post("/book/flatten", data={"reason": "again"}, auth=AUTH, headers=SAME)
+    logged = len(store.decisions())
+    second = c.post("/book/flatten", data={"reason": "again"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert len(store.pending_commands("btc-test")) == 1 and len(store.pending_commands("eth-test")) == 1
+    # Round 9, N1: a second fire logged "0 strategies" and its banner said "0 strategies are selling".
+    assert second.headers["location"] == "/risk?killed=0" and len(store.decisions()) == logged
+    said = c.get(second.headers["location"], auth=AUTH).text
+    assert "Nothing more to sell: btc-test, eth-test are already selling to cash. Nothing was logged." in said
     # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
@@ -1165,6 +1170,21 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     assert req["instrument"] == "SOL/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
     again = c.post("/research/history", data={"instrument": "SOL/USD"}, auth=AUTH, headers=SAME)
     assert "SOL/USD was already asked for" in again.text and len(store.history_requests("KRAKEN")) == 1
+    # Review round 9, N5: a stored pair was asked for again, a mistyped one offered a button that failed the
+    # same way, and with the venue unreachable any pair was asked for, to sit "Asked for" for good.
+    stored = c.post("/research/history", data={"instrument": "eth/usd"}, auth=AUTH, headers=SAME)
+    assert "ETH/USD is already stored, from" in stored.text and "a study can run on it now" in stored.text
+    typo = c.post("/research/history", data={"instrument": "btcusd"}, auth=AUTH, headers=SAME)
+    assert "BTCUSD isn&#39;t an instrument: write it as base and quote with a slash, like BTC/USD" in typo.text
+    assert "Collect BTCUSD history</button>" not in typo.text and "Collect FOO/USD history</button>" not in bad.text
+
+    def unreachable(pair):
+        raise ConnectionError("403 Forbidden")
+
+    monkeypatch.setattr(KRAKEN, "check_listed", unreachable)
+    down = c.post("/research/history", data={"instrument": "ZZZQ/USD"}, auth=AUTH, headers=SAME)
+    assert "couldn&#39;t reach Kraken spot to check it lists ZZZQ/USD, so nothing was asked for" in down.text
+    assert len(store.history_requests("KRAKEN")) == 1
     # A study on it before anything is stored says so, without offering to ask again.
     form = {"strategy": "buy_and_hold", "instrument": "SOL/USD", "minutes": "240", "train_days": "60",
             "test_days": "30", "holdout_days": "0"}
@@ -1281,6 +1301,20 @@ def test_loosening_the_stop_on_an_open_position_is_checked_against_its_size(clie
     assert "saved=settings" in _settings(c, stop_loss_pct="2").headers["location"]  # tighter: no question
 
 
+def test_the_kill_banner_counts_the_strategies_it_names(client):
+    """Review round 9, N1: with one already selling, the banner said "2 strategies" and named 4."""
+    c, store = client
+    _new(c)
+    _new(c, name="eth-test", instrument="ETH/USD")
+    store.record_equity("btc-test", equity=5100, cash=3000, qty=0.02, price=105000, benchmark=5050)
+    store.record_equity("eth-test", equity=5000, cash=4000, qty=0.3, price=3300, benchmark=5000)
+    c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "de-risk"}, auth=AUTH, headers=SAME)
+    r = c.post("/book/flatten", data={"reason": "Market event"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.headers["location"] == "/risk?killed=1"  # only eth-test was new
+    fired = c.get(r.headers["location"], auth=AUTH).text
+    assert "Kill switch fired: 2 strategies are selling to cash at market (btc-test, eth-test)" in fired
+
+
 def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
     """Review round 8, M8-2: the journal's position decides, not the desired state. An account a stopped
     strategy still holds a position on can't be retired, and a flatten for a stopped strategy starts it to
@@ -1294,8 +1328,13 @@ def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
     rt.on_order(order_id="E-1", side="BUY", qty=0.01, intent="entry", reason="Signal to be long", signal={})
     rt.on_fill(side="BUY", qty=0.01, price=50_000.0, fee=4.0, order_id="E-1", trade_id="T-1")
     store.set_desired_state("btc-test", "stopped")
+    store.record_equity("btc-test", equity=10_000, cash=10_000, qty=0.0, price=50_000, benchmark=10_000)  # a stale mark
     page = c.get("/accounts", auth=AUTH).text
     assert "btc-test is stopped but still holds a position on it" in page
+    # Round 9, R9-M1: the page told the PM to flatten it first but offered no Flatten. The journal decides.
+    head = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'data-open="dlg-start">Start' in head and 'data-open="dlg-flatten">Flatten' in head
+    assert "It is stopped, so it starts only to sell 0.01 BTC (about 500.00 USD) at market" in head
     r = c.post("/accounts/desk-b/retire", data={"action": "retire", "reason": "tidy"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert "still+holds+a+position" in r.headers["location"]
@@ -1306,8 +1345,11 @@ def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
     assert [x["command"] for x in store.pending_commands("btc-test")] == ["flatten"]
     _new(c, name="eth-flat", instrument="ETH/USD")
     store.set_desired_state("eth-flat", "stopped")
+    assert 'data-open="dlg-flatten"' not in c.get("/sleeves/eth-flat", auth=AUTH).text
+    # Round 9, N8: a stale page reaching this got raw JSON; the refusal is said on the page.
     r = c.post("/sleeves/eth-flat/command", data={"command": "flatten", "reason": "x"}, auth=AUTH, headers=SAME)
-    assert r.status_code == 400 and "nothing to flatten" in r.text
+    assert r.status_code == 200 and "application/json" not in r.headers["content-type"]
+    assert "Not done: it is stopped and holds no position, so there is nothing to flatten." in r.text
 
 
 def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
@@ -1364,7 +1406,7 @@ def test_account_notes_and_retiring(client):
     assert "Retired" in c.get("/accounts", auth=AUTH).text
     # Nothing starts on, or moves onto, a retired account.
     r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME)
-    assert r.status_code == 400 and "retired" in r.text
+    assert "Not done: its account desk-b is retired" in r.text and store.sleeve("btc-test").desired_state != "running"
     assert "retired" in _new(c, name="eth-new", account="desk-b").headers["location"]
     assert "saved=desk-b" in post("retire", action="reinstate", reason="back in use")
     assert c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
@@ -1395,7 +1437,7 @@ def test_every_page_renders_with_each_kind_of_stop(client, stop):
         r = c.get(path, auth=AUTH)
         assert r.status_code == 200, path
     risk = c.get("/risk", auth=AUTH).text
-    assert "Flatten everything" in risk and ("ATR (10 bars)" in risk or "20-bar low" in risk or "5.0% below" in risk)
+    assert "Flatten everything" in risk and ("ATR (10 bars)" in risk or "lowest low of 20 bars" in risk or "5.0% below" in risk)
 
 
 def test_raw_labels_read_as_words(client):
@@ -1504,3 +1546,16 @@ def test_every_page_renders_for_every_stop_type_and_strategy_state(client, monke
     assert "48,500" in swing and "Accept a looser stop on the open position" in swing
     edited = c.get("/sleeves/atr-running", auth=AUTH).text
     assert "49,000.00" in edited and "edited by the PM" in edited  # the edited plan: 2% under the 50,000 entry
+
+
+def test_the_stop_distance_is_the_drop_from_the_last_price():
+    """Review round 9, N3: "Stop-loss 3,746.20 (80.9% away)" with the price at 6,775.98 divided by the stop;
+    the drop from here is 44.7%."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.dashboard.app import _risk_view
+
+    x = {"price": 6775.98, "exposure": 0.5, "day_ret": 0.0,
+         "profile": SimpleNamespace(max_position_pct=1.0, daily_loss=0.05)}
+    view = _risk_view(x, {"stop_px": 3746.20, "target_px": None})
+    assert round(view["to_stop"], 3) == 0.447
