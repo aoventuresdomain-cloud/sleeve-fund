@@ -564,3 +564,26 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
     # And shorts on spot are refused, not dropped.
     page = c.get("/backtest?" + urlencode({**bt, "market": "spot", "run": "1"}), auth=AUTH).text
     assert "only on a perpetual" in page
+
+
+def test_header_trade_stats_and_g2_count_shorts_as_the_trades_tab_does():
+    """Review round 11, M11-4: the header's closed trades, win rate and profit factor (and the G2 checklist's
+    trade count) paired a perpetual's fills as spot, ignoring shorts: "1 trade" against 3 on the Trades tab."""
+    from sleeve_fund.dashboard import trading
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+    from sleeve_fund.store import Store
+
+    store = Store.in_memory()
+    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={**PERP})
+    legs = [("BUY", 0.05, 60_000), ("SELL", 0.05, 60_600),  # a long
+            ("SELL", 0.05, 60_600), ("BUY", 0.05, 60_000),  # a short
+            ("BUY", 0.05, 60_000), ("SELL", 0.10, 59_000),  # a long, then one sell through flat into a short
+            ("BUY", 0.05, 58_000)]
+    for n, (side, qty, px) in enumerate(legs):
+        store.record_fill("pp-ls", side=side, qty=qty, price=px, fee=1.0, order_id=f"o{n}", trade_id=f"t{n}")
+    s = store.sleeve("pp-ls")
+    stats = sleeve_summary(store, s)["trades"]
+    tab = trading.trips(store.fills("pp-ls"), [], {}, shorts=True)
+    assert stats["trades"] == len(tab) == 4
+    assert stats["wins"] == sum(1 for t in tab if t["pnl"] > 0) == 3
