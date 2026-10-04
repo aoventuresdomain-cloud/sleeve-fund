@@ -1,6 +1,7 @@
 """Command line entry point.
 
     python -m sleeve_fund study trend_filter --store --base BTC --quote USD
+    python -m sleeve_fund study trend_filter --store --minutes 60 --train-days 365 --test-days 90 --holdout-days 90
     python -m sleeve_fund study trend_filter --data data/XBTUSD_1440.csv --base BTC --quote USD
     python -m sleeve_fund study trend_filter --synthetic
     python -m sleeve_fund counter
@@ -38,13 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     st = sub.add_parser("study", help="run a full G1 study and write a tear sheet")
     st.add_argument("strategy")
     src = st.add_mutually_exclusive_group(required=True)
-    src.add_argument("--store", action="store_true", help="daily bars from the venue history store (the server's)")
+    src.add_argument("--store", action="store_true", help="bars from the venue history store (the server's)")
     src.add_argument("--data", help="Kraken OHLCVT daily CSV")
     src.add_argument("--synthetic", action="store_true", help="random-walk data, pipeline check only")
     st.add_argument("--base", default="BTC")
     st.add_argument("--quote", default="USD")
     st.add_argument("--venue", default=None, help="venue profile for fees (default: the default venue)")
+    st.add_argument("--minutes", type=int, default=1440,
+                    help="bar length with --store: 1440 daily, 60 hourly, 15, 5 or 1; judged on daily returns either way")
     st.add_argument("--holdout-days", type=int, default=365)
+    st.add_argument("--train-days", type=int, default=3 * 365, help="walk-forward training window")
+    st.add_argument("--test-days", type=int, default=365, help="walk-forward test window")
     st.add_argument("--use-holdout", action="store_true", help="open the holdout (logged; do this once)")
     st.add_argument("--stop-loss", type=float, help="exit if price falls this fraction below entry, e.g. 0.08")
     st.add_argument("--take-profit", type=float, help="exit if price rises this fraction above entry, e.g. 0.2")
@@ -72,8 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.history import HistoryStore
 
         name = venue(args.venue).name
-        prices = HistoryStore().read(name, f"{args.base}/{args.quote}", 1440)
-        dataset = f"{name.lower()}-{args.base}{args.quote}-store".lower()
+        prices = HistoryStore().read(name, f"{args.base}/{args.quote}", args.minutes)
+        dataset = f"{name.lower()}-{args.base}{args.quote}-store".lower() + (
+            f"-{args.minutes}m" if args.minutes != 1440 else "")
     else:
         prices = load_kraken_ohlcvt(args.data)
         dataset = Path(args.data).stem
@@ -97,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         ledger=ledger,
         synthetic=args.synthetic,
         holdout_days=args.holdout_days,
+        train_days=args.train_days,
+        test_days=args.test_days,
         use_holdout=args.use_holdout,
         exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade},
         position_cap=None if args.risk_profile == "none" else risk_profile(args.risk_profile).max_position_pct,

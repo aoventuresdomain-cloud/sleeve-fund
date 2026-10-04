@@ -1,4 +1,6 @@
-"""Performance metrics. The venue trades every day, so annualisation uses 365."""
+"""Performance metrics. The venue trades every day, so annualisation uses 365. Everything is judged
+on daily returns, whatever the bar length: an hourly or minute strategy's curve is cut to its daily
+closes first (daily_returns), so its Sharpe is annualised as daily and its bootstrap blocks are days."""
 
 from __future__ import annotations
 
@@ -14,6 +16,31 @@ EULER_GAMMA = 0.5772156649
 
 def returns_from_equity(equity: pd.Series) -> pd.Series:
     return equity.pct_change().dropna()
+
+
+def _intraday(series: pd.Series) -> bool:
+    return (len(series) > 2 and isinstance(series.index, pd.DatetimeIndex)
+            and pd.Series(series.index).diff().median() < pd.Timedelta("1D"))
+
+
+def daily_closes(equity: pd.Series) -> pd.Series:
+    """An equity curve at its daily closes (stamped at the close, midnight UTC); daily curves as they are."""
+    if not _intraday(equity):
+        return equity
+    return equity.resample("1D", closed="right", label="right").last().dropna()
+
+
+def daily_returns(equity: pd.Series) -> pd.Series:
+    """Day-on-day returns of an equity curve at any bar length."""
+    return returns_from_equity(daily_closes(equity))
+
+
+def years_covered(series: pd.Series) -> float:
+    """The time a curve covers, in years: its span plus one bar."""
+    if len(series) < 2 or not isinstance(series.index, pd.DatetimeIndex):
+        return max(len(series) / PERIODS_PER_YEAR, 1e-9)
+    bar = pd.Series(series.index).diff().median()
+    return max((series.index[-1] - series.index[0] + bar) / pd.Timedelta(days=PERIODS_PER_YEAR), 1e-9)
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -135,8 +162,7 @@ def turnover_per_year(fills: pd.DataFrame, equity: pd.Series) -> float:
     if fills is None or fills.empty:
         return 0.0
     notional = (fills["filled_qty"].astype(float) * fills["avg_px"].astype(float)).sum()
-    years = max(len(equity) / PERIODS_PER_YEAR, 1e-9)
-    return float(notional / equity.mean() / years)
+    return float(notional / equity.mean() / years_covered(equity))
 
 
 def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
@@ -177,34 +203,39 @@ def deflated_sharpe_probability(returns: pd.Series, n_trials: int, trial_sharpes
     return float(NormalDist().cdf((sr - hurdle) * math.sqrt(n - 1) / denom))
 
 
-def block_length(x: np.ndarray) -> int:
-    """The circular-bootstrap block length a series needs to keep its own persistence: Politis and
-    White (2004), with Patton, Politis and White's (2009) correction. Slow trend P&L, which stays up or
-    down for weeks, needs blocks of weeks; a short fixed block resamples it as if each day were new
-    and makes luck look like skill."""
+def _long_run(x: np.ndarray) -> tuple[float, float, float, int]:
+    """(variance, long-run variance, the weighted sum Politis and White's block length uses, n) of a
+    series, from its autocovariances under a flat-top kernel whose width the data picks: the first lag
+    after which k_n autocorrelations in a row are insignificant, doubled."""
     x = np.asarray(x, dtype=float)
     n = len(x)
     x = x - x.mean()
     k_n = max(5, math.ceil(math.log10(n)))
     m_max = math.ceil(math.sqrt(n)) + k_n
-    b_max = math.ceil(min(3 * math.sqrt(n), n / 3))
     var = float(x @ x) / n
     if var <= 0:
-        return 1
+        return 0.0, 0.0, 0.0, n
     acv = np.array([float(x[: n - k] @ x[k:]) / n for k in range(m_max + 1)])
     rho = np.abs(acv[1:] / var)
     threshold = 2 * math.sqrt(math.log10(n) / n)
-    # The first lag after which k_n autocorrelations in a row are insignificant.
     m_hat = next((m for m in range(len(rho) - k_n + 1) if (rho[m:m + k_n] < threshold).all()), m_max)
     m = min(2 * max(m_hat, 1), m_max)
     lags = np.arange(-m, m + 1)
     t = np.abs(lags) / m
     flat_top = np.where(t <= 0.5, 1.0, np.where(t <= 1, 2 * (1 - t), 0.0))
     acv_l = acv[np.abs(lags)]
-    g = float((flat_top * np.abs(lags) * acv_l).sum())
-    spectrum0 = float((flat_top * acv_l).sum())
-    if spectrum0 <= 0:
+    return var, float((flat_top * acv_l).sum()), float((flat_top * np.abs(lags) * acv_l).sum()), n
+
+
+def block_length(x: np.ndarray) -> int:
+    """The circular-bootstrap block length a series needs to keep its own persistence: Politis and
+    White (2004), with Patton, Politis and White's (2009) correction. Slow trend P&L, which stays up or
+    down for weeks, needs blocks of weeks; a short fixed block resamples it as if each day were new
+    and makes luck look like skill."""
+    var, spectrum0, g, n = _long_run(x)
+    if var <= 0 or spectrum0 <= 0:
         return 1
+    b_max = math.ceil(min(3 * math.sqrt(n), n / 3))
     b = (2 * g * g / ((4 / 3) * spectrum0 ** 2)) ** (1 / 3) * n ** (1 / 3)
     return int(min(max(math.ceil(b), 1), b_max))
 
@@ -213,15 +244,18 @@ MIN_INDEPENDENT_DAYS = 250
 
 
 def independent_days(x: np.ndarray) -> float:
-    """Roughly how many independent observations a daily series holds: n (1 - rho) / (1 + rho), with
-    rho its lag-1 autocorrelation. Returns that drift for weeks at a time carry far less evidence than
-    their day count, and no bootstrap recovers it."""
+    """Roughly how many independent observations a daily series holds: n times its variance over its
+    long-run variance (every autocorrelation that matters, summed, not just yesterday's). Returns that
+    drift for weeks or months at a time carry far less evidence than their day count, and no bootstrap
+    recovers it: 60-day regimes with a lag-1 autocorrelation of only 0.3 hold about one observation in
+    twenty. Never more than n."""
     x = np.asarray(x, dtype=float)
     if len(x) < 3 or x.std() == 0:
         return float(len(x))
-    rho = float(np.corrcoef(x[:-1], x[1:])[0, 1])
-    rho = min(max(rho, 0.0), 0.99)
-    return len(x) * (1 - rho) / (1 + rho)
+    var, spectrum0, _, n = _long_run(x)
+    if spectrum0 <= var:
+        return float(n)  # no persistence (or mean reversion): every day counts
+    return n * var / spectrum0
 
 
 def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials: int, *, block: int | None = None,
