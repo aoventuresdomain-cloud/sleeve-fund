@@ -7,7 +7,7 @@
 </div>
 <form class="panel filters" method="get" action="/decisions">
   <div class="field"><label for="f-sleeve">Strategy</label><select id="f-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if f.query.sleeve == n }}>{{ n }}</option>{% endfor %}</select></div>
-  <div class="field"><label for="f-action">Action</label><select id="f-action" name="action"><option value="">All actions</option>{% for a in actions %}<option value="{{ a }}" {{ 'selected' if f.query.action == a }}>{{ a|capitalize }}</option>{% endfor %}</select></div>
+  <div class="field"><label for="f-action">Action</label><select id="f-action" name="action"><option value="">All actions</option>{% for a in actions %}<option value="{{ a }}" {{ 'selected' if f.query.action == a }}>{{ a|action_words }}</option>{% endfor %}</select></div>
   <div class="field"><label for="f-from">From</label><input id="f-from" type="date" name="from" value="{{ f.raw['from'] }}"></div>
   <div class="field"><label for="f-to">To</label><input id="f-to" type="date" name="to" value="{{ f.raw['to'] }}"></div>
   <div class="field"><button>Filter</button> {% if f.qs %}<a href="/decisions" style="margin-left:8px">Clear</a>{% endif %}</div>
@@ -16,7 +16,7 @@
 <table class="responsive">
   <thead><tr><th>Time</th><th>Who</th><th>Action</th><th></th><th>Reason</th></tr></thead>
   <tbody>
-  {% for d in decisions %}<tr><td data-m="hide">{{ d.ts|ts }}</td><td data-m="hide">{{ d.actor }}</td><td><strong>{{ d.action|capitalize }}</strong>{% if d.sleeve %} <a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% endif %}</td><td data-m="right" class="muted">{{ d.ts|ago }}</td><td class="wrap">{{ d.reason }}</td></tr>
+  {% for d in decisions %}<tr><td data-m="hide">{{ d.ts|ts }}</td><td data-m="hide">{{ d.actor }}</td><td><strong>{{ d.action|action_words }}</strong>{% if d.sleeve %} <a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% endif %}</td><td data-m="right" class="muted">{{ d.ts|ago }}</td><td class="wrap">{{ d.reason }}</td></tr>
   {% else %}<tr><td colspan="5" class="empty" style="padding-left:14px">{{ 'Nothing matches these filters.' if f.qs else 'No decisions yet. Every control you use is recorded here with its reason.' }}</td></tr>{% endfor %}
   </tbody>
 </table>

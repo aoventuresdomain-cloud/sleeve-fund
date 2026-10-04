@@ -109,6 +109,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
+    templates.env.filters["action_words"] = action_words
+    templates.env.filters["kind_words"] = kind_words
     templates.env.filters["rmult"] = lambda r: "–" if r is None else f"{r:+.2f}R"
     # The year only when it isn't this one, as a backtest's or an old journal's dates need it.
     templates.env.filters["ts"] = lambda t: (t.strftime("%d %b %H:%M UTC" if t.year == utcnow().year
@@ -212,9 +214,14 @@ def create_app(store: Store | None = None) -> FastAPI:
     def _kill_targets(summaries) -> dict:
         """Who the kill switch acts on: every strategy still trading (running and not halted) and every
         one holding a position, stopped or halted included. A halted, flat strategy is left as it is."""
-        trading = [x for x in summaries if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
-        held = [x for x in summaries if x["qty"] > 0 and x not in trading]
-        return {"trading": trading, "held": held, "all": trading + held,
+        # One already told to flatten is waiting on its process, not a target again: firing twice would
+        # queue a second sale (review round 8, R8-11).
+        flattening = [x["sleeve"].name for x in summaries
+                      if any(c["command"] == "flatten" for c in st().pending_commands(x["sleeve"].name))]
+        live = [x for x in summaries if x["sleeve"].name not in flattening]
+        trading = [x for x in live if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
+        held = [x for x in live if x["qty"] > 0 and x not in trading]
+        return {"trading": trading, "held": held, "all": trading + held, "flattening": flattening,
                 "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"]}
 
     @app.post("/book/flatten")
@@ -358,6 +365,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
+                    strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec)),
                                                                st().accounts(), utcnow()))
 
@@ -1085,7 +1093,32 @@ def _held(td) -> str:
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{secs / 60:.0f} min"
 
 
-DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten"]
+DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten", "change_settings", "move_account", "archive",
+                    "restore", "flatten everything", "create_account", "account_note", "retire_account",
+                    "reinstate_account"]
+# The decision log's actions and the feeds' event kinds as the PM reads them (review round 8, R8-4, R8-9).
+ACTION_WORDS = {"change_settings": "Changed settings", "move_account": "Moved account", "create_account": "Created account",
+                "account_note": "Account note", "retire_account": "Retired account",
+                "reinstate_account": "Reinstated account", "flatten everything": "Flattened everything"}
+KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Maker fill ahead of the tape",
+              "risk_halt": "Risk halt", "risk_pause": "Risk pause", "reconcile_mismatch": "Reconcile mismatch",
+              "instrument_not_found": "Instrument not found", "tick_failed": "Risk check failed",
+              "mark_unavailable": "No price to value the book", "price_feed_back": "Price feed back",
+              "heartbeat_stale": "Heartbeat late", "process_crash": "Process crashed", "process_start": "Process started",
+              "process_stop": "Process stopped", "supervisor_error": "Supervisor error",
+              "supervisor_start": "Supervisor started", "fee_fetch_failed": "Couldn't fetch fees", "fees": "Fees",
+              "alert_send_failed": "Couldn't send alert", "alerts_sent": "Alerts sent", "alerts_config": "Alerts set up",
+              "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
+              "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "warmup_short": "Short warm-up",
+              "account_move": "Moved account"}
+
+
+def action_words(action: str) -> str:
+    return ACTION_WORDS.get(action) or action.replace("_", " ").capitalize()
+
+
+def kind_words(kind: str) -> str:
+    return KIND_WORDS.get(kind) or kind.replace("_", " ").capitalize()
 
 
 def _decision_filters(request: Request) -> dict:

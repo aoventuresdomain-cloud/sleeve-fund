@@ -187,3 +187,18 @@ def test_a_send_that_trickles_is_cut_off_and_reported(monkeypatch):
     assert took < 3
     (failed,) = [e for e in store.events(limit=10) if e["kind"] == "alert_send_failed"]
     assert "TimeoutError" in failed["message"]
+
+
+def test_a_status_that_records_no_result_is_a_failure(tmp_path):
+    """Review round 8, R8-10: a status.json of {} read healthy on Ops while the alert said it failed."""
+    from sleeve_fund import backups
+    from sleeve_fund.store import utcnow
+
+    (tmp_path / "sleeve_fund-a.dump").write_bytes(b"x")
+    for text in ("{}", '{"ok": "yes"}'):
+        (tmp_path / "status.json").write_text(text)
+        kind, words = backups.problem(tmp_path, utcnow())
+        assert kind == "failed" and "doesn't say whether the last run worked" in words
+    (tmp_path / "status.json").write_text('{"ts": "2026-10-04T02:00:00Z", "ok": true, "message": "ok"}')
+    check = backups.latest(tmp_path, utcnow())["check"]
+    assert check["ok"] is True and check["checked"].isoformat() == "2026-10-04T02:00:00+00:00"

@@ -252,13 +252,16 @@ def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch)
                 Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/T/secret"}).describe())
     page = c.get("/ops", auth=AUTH).text
     assert "2 kept" in page and '<span class="">Last' in page
-    assert "automatic daily snapshot of the whole server" in page
-    (folder / "status.json").write_text('{"ok": true, "message": "x", "restored": {"sleeves": 3, "orders": 40, '
-                                        '"fills": 41, "events": 900}}')
-    assert "Restored into a scratch database and read back (3 strategies, 40 orders, 900 events)" in c.get(
-        "/ops", auth=AUTH).text
+    assert "Off-site: Lightsail's automatic daily snapshots" in page
+    (folder / "status.json").write_text('{"ts": "2026-10-04T02:00:00Z", "ok": true, "message": "x", "restored": '
+                                        '{"sleeves": 3, "orders": 40, "fills": 41, "events": 900}}')
+    assert ("Restored into a scratch database and read back (3 strategies, 40 orders, 41 fills, 900 events), "
+            in c.get("/ops", auth=AUTH).text)
     (folder / "status.json").write_text('{"ok": false, "message": "pg_dump failed: disk full"}')
-    assert "Last run failed: pg_dump failed: disk full." in c.get("/ops", auth=AUTH).text
+    assert '<span class="loss">Last run failed: pg_dump failed: disk full.' in c.get("/ops", auth=AUTH).text
+    # A status with no result is a failure, as the alert says, not a silent pass (review round 8, R8-10).
+    (folder / "status.json").write_text("{}")
+    assert "doesn&#39;t say whether the last run worked" in c.get("/ops", auth=AUTH).text
     assert "Alerts go to hooks.example.com" in page and "secret" not in page
 
 
@@ -1018,6 +1021,13 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     assert store.pending_commands("sol-test") == []
     assert store.decisions()[0]["action"] == "flatten everything" and "(2 strategies)" in store.decisions()[0]["reason"]
     assert c.post("/book/flatten", data={"reason": "x"}, auth=AUTH).status_code in (400, 403)  # same origin only
+    # Firing again sells nothing twice: both are already waiting to sell, named, and the button rests
+    # (review round 8, R8-11).
+    again = c.get("/risk", auth=AUTH).text
+    assert "Waiting to sell: btc-test, eth-test." in again and "Selling to cash…" in again
+    assert 'data-open="dlg-kill"' not in again
+    c.post("/book/flatten", data={"reason": "again"}, auth=AUTH, headers=SAME)
+    assert len(store.pending_commands("btc-test")) == 1 and len(store.pending_commands("eth-test")) == 1
     # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
@@ -1332,3 +1342,47 @@ def test_every_page_renders_with_each_kind_of_stop(client, stop):
         assert r.status_code == 200, path
     risk = c.get("/risk", auth=AUTH).text
     assert "Flatten everything" in risk and ("ATR (10 bars)" in risk or "20-bar low" in risk or "5.0% below" in risk)
+
+
+def test_raw_labels_read_as_words(client):
+    """Review round 8, R8-4 and R8-9: decisions showed "Move_account" and alerts "maker fill above tape"."""
+    c, store = client
+    _new(c)
+    store.decide("pm", "move_account", "from paper to desk-b: grouping", "btc-test")
+    store.decide("pm", "change_settings", "Risk profile balanced to conservative. tighter", "btc-test")
+    store.event("btc-test", "warning", "maker_fill_above_tape", "Post-only order O-1 has filled more")
+    page = c.get("/decisions", auth=AUTH).text
+    assert "<strong>Moved account</strong>" in page and "<strong>Changed settings</strong>" in page
+    assert '<option value="move_account" >Moved account</option>' in page
+    assert "Move_account" not in page and "Change_settings" not in page
+    assert "Maker fill ahead of the tape" in c.get("/alerts", auth=AUTH).text
+
+
+def test_a_run_whose_strategy_raised_is_flagged_and_not_offered_for_paper(client):
+    """Review round 8, R8-9: a run with handler errors still offered "Start a paper strategy with these
+    settings", and neither Saved runs nor its strategy screen said anything was wrong."""
+    from sleeve_fund.paper.journal import MemoryJournal
+    from sleeve_fund.strategies.base import handler_error_words
+
+    def journal():
+        j = MemoryJournal()
+        j.create_sleeve(name="bt", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000)
+        return j
+
+    c, store = client
+    words = handler_error_words("on_order_filled", "ZeroDivisionError('float division by zero')")
+    assert words == "handling an order filled: float division by zero (ZeroDivisionError)"
+    assert handler_error_words("on_quote", ValueError("bad quote")) == "handling a quote: bad quote (ValueError)"
+    _new(c)
+    j = journal()
+    result = {"errors": f"The strategy hit 1 error during this run, the first {words}.", "pair": "BTC/USD"}
+    name = store.save_backtest(j, run_id="err1", key="k", title="Errored run", query="", result=result)
+    store.save_backtest(journal(), run_id="ok1", key="k2", title="Clean run",
+                        query="", result={"pair": "BTC/USD"})
+    runs = {r["id"]: r for r in store.backtests()}
+    assert runs["err1"]["errored"] and not runs["ok1"]["errored"]
+    assert store.strategy_errors(name) == 1
+    screen = c.get(f"/sleeves/{name}", auth=AUTH).text
+    assert "The strategy's code raised an error 1 time during this run" in screen
+    assert "raised an error" not in c.get("/sleeves/btc-test", auth=AUTH).text

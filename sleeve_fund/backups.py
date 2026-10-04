@@ -41,7 +41,15 @@ def _status(path: Path) -> dict | None:
         out = json.loads(text)
     except ValueError:
         return {"ok": False, "message": "the backup's status file isn't valid, so the last run's result is unknown"}
-    return out if isinstance(out, dict) else {"ok": False, "message": "the backup's status file isn't valid"}
+    if not isinstance(out, dict):
+        return {"ok": False, "message": "the backup's status file isn't valid"}
+    if not isinstance(out.get("ok"), bool):  # e.g. {}: no result recorded is not a pass (review round 8, R8-10)
+        return {"ok": False, "message": "the backup's status file doesn't say whether the last run worked"}
+    try:
+        out["checked"] = datetime.fromisoformat(str(out.get("ts", "")).replace("Z", "+00:00"))
+    except ValueError:
+        out["checked"] = None
+    return out
 
 
 def problem(folder: Path, now: datetime) -> tuple[str, str] | None:

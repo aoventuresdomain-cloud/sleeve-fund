@@ -9,6 +9,7 @@ or simply in or out (want_long).
 
 from __future__ import annotations
 
+import re
 import time
 import traceback
 from collections import deque
@@ -229,6 +230,22 @@ class LongFlatConfig(StrategyConfig):
 # Handlers whose exceptions the engine would swallow without a trace (on_bar and timers it logs).
 REPORTED_HANDLERS = ("on_trade", "on_quote", "on_order_accepted", "on_order_rejected", "on_order_denied",
                      "on_order_canceled", "on_order_expired", "on_order_filled")
+_HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_accepted": "an order accepted",
+                  "on_order_rejected": "an order rejected", "on_order_denied": "an order denied",
+                  "on_order_canceled": "an order cancelled", "on_order_expired": "an order expired",
+                  "on_order_filled": "an order filled"}
+
+
+def handler_error_words(handler: str, exc: BaseException | str) -> str:
+    """'handling an order filled: float division by zero (ZeroDivisionError)', for the PM rather than a
+    Python repr. exc: the exception, or its repr as a run keeps it."""
+    if isinstance(exc, BaseException):
+        kind, what = type(exc).__name__, str(exc)
+    else:
+        m = re.fullmatch(r"(\w+)\((['\"])(.*)\2\)", exc)
+        kind, what = (m.group(1), m.group(3)) if m else ("", exc)
+    where = _HANDLER_WORDS.get(handler, handler.replace("_", " "))
+    return f"handling {where}: {what or 'no message'}" + (f" ({kind})" if kind else "")
 
 
 class LongFlatStrategy(Strategy):
@@ -299,7 +316,8 @@ class LongFlatStrategy(Strategy):
                 if self.runtime is not None:
                     try:
                         self.runtime.store.event(self.runtime.name, "error", "handler_failed",
-                                                 f"{name} failed: {exc!r}", ts=self.runtime.now())
+                                                 f"The strategy failed {handler_error_words(name, exc)}. Its "
+                                                 "orders after this may be wrong.", ts=self.runtime.now())
                     except Exception:  # the journal itself failing must not hide the first error
                         pass
         run.__name__ = name
