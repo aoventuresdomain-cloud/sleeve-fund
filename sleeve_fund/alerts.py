@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import urllib.request
 from datetime import timedelta
 from pathlib import Path
@@ -29,7 +30,8 @@ from sleeve_fund import backups
 from sleeve_fund.store import Store, utcnow
 
 MAX_LINES = 10  # alerts listed in one message; the rest are counted
-TIMEOUT = 8
+TIMEOUT = 8  # per socket read
+TOTAL = 20  # for a whole send: a far end that trickles bytes resets TIMEOUT on every read
 BACKUP_CHECK = timedelta(hours=1)
 _THROUGH = re.compile(r"through event #(\d+)")
 
@@ -40,13 +42,37 @@ def post(url: str, text: str) -> None:
     else:
         req = urllib.request.Request(url, data=json.dumps({"text": text, "content": text}).encode(), method="POST",
                                      headers={"Content-Type": "application/json"})
+    _within(TOTAL, _open, req)
+
+
+def ping(url: str) -> None:
+    _within(TOTAL, _open, url)
+
+
+def _open(req) -> None:
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         r.read()
 
 
-def ping(url: str) -> None:
-    with urllib.request.urlopen(url, timeout=TIMEOUT) as r:
-        r.read()
+def _within(seconds: float, fn, *args) -> None:
+    """fn(*args), or TimeoutError once `seconds` have passed. A send still going then finishes or
+    fails on a thread of its own, bounded by its socket timeout; its result is dropped."""
+    out: list[BaseException | None] = []
+
+    def run():
+        try:
+            fn(*args)
+            out.append(None)
+        except BaseException as exc:  # noqa: BLE001 - handed back to the caller
+            out.append(exc)
+
+    t = threading.Thread(target=run, daemon=True, name="alert-send")
+    t.start()
+    t.join(seconds)
+    if not out:
+        raise TimeoutError(f"no answer within {seconds:g} s")
+    if out[0] is not None:
+        raise out[0]
 
 
 def where(url: str | None) -> str:
@@ -97,9 +123,10 @@ class Forwarder:
             return
         self._backup_checked = now
         issue = backups.problem(self.backup_dir, now)
-        if issue and issue.split(":")[0] != self._backup_said:
-            self.store.event(None, "warning", "backup_problem", issue)
-        self._backup_said = issue.split(":")[0] if issue else None
+        kind = issue[0] if issue else None
+        if issue and kind != self._backup_said:
+            self.store.event(None, "warning", "backup_problem", issue[1])
+        self._backup_said = kind
 
     def step(self) -> None:
         self.check_backup()

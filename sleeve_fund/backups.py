@@ -29,22 +29,32 @@ def latest(folder: Path, now: datetime) -> dict | None:
 
 
 def _status(path: Path) -> dict | None:
+    """The last run's result; None if there is none yet. A result that can't be read is a failure,
+    never a pass: the backup that wrote it went wrong somehow (review round 7)."""
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        return {"ok": False, "message": f"couldn't read the backup's status file ({exc.strerror or exc})"}
+    try:
+        out = json.loads(text)
+    except ValueError:
+        return {"ok": False, "message": "the backup's status file isn't valid, so the last run's result is unknown"}
+    return out if isinstance(out, dict) else {"ok": False, "message": "the backup's status file isn't valid"}
 
 
-def problem(folder: Path, now: datetime) -> str | None:
-    """What is wrong with the backups, in a sentence for an alert, or None if the last one is sound."""
+def problem(folder: Path, now: datetime) -> tuple[str, str] | None:
+    """What is wrong with the backups, as (kind, a sentence for an alert), or None if the last one is
+    sound. The kind stays the same while the problem does, though the sentence may not (an age grows)."""
     b = latest(folder, now)
     if b is None:
-        return "No database backup has been written yet"
+        return "none", "No database backup has been written yet"
     check = b["check"]
     if check is not None and not check.get("ok"):
-        return f"The last database backup failed: {check.get('message') or 'no reason given'}"
+        return "failed", f"The last database backup failed: {check.get('message') or 'no reason given'}"
     if b["stale"]:
-        hours = b["age"].total_seconds() / 3600 if b["age"] is not None else None
-        return (f"The newest database backup is {hours:.0f} hours old" if hours is not None
-                else "No database dump is on disk")
+        if b["age"] is None:
+            return "no_dump", "No database dump is on disk"
+        return "stale", f"The newest database backup is {b['age'].total_seconds() / 3600:.0f} hours old"
     return None

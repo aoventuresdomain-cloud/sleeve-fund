@@ -41,7 +41,23 @@ jobs:
           ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success \
                --json databaseId --jq length)
           [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
+      - name: Still main's newest commit
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHIP: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # A run that waited behind another deploy may be shipping a commit main has since moved past;
+          # the newer commit's own run ships that one, so this run stops rather than roll the server back.
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$tip" = "$SHIP" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main is now at $tip, past this commit; its own run deploys it. Nothing shipped."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Configure SSH
+        if: steps.tip.outputs.current == 'true'
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -50,6 +66,7 @@ jobs:
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
       - name: Ship code
+        if: steps.tip.outputs.current == 'true'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
@@ -58,6 +75,7 @@ jobs:
           rsync -az --delete --exclude .git --exclude .env --exclude kraken.env --exclude data --rsync-path="sudo rsync" \
             -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
       - name: Start stack
+        if: steps.tip.outputs.current == 'true'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
@@ -72,6 +90,7 @@ jobs:
             ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
       - name: Check the sleeves are live
+        if: steps.tip.outputs.current == 'true'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |

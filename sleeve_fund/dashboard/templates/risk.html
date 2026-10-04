@@ -6,7 +6,8 @@
   <h1>Risk</h1>
   {% if kill.all %}<button type="button" class="danger" data-open="dlg-kill">Flatten everything</button>{% endif %}
 </div>
-{% if kill_error %}<p class="banner warn">Nothing was sold: the kill switch needs a reason for the decision log.</p>{% endif %}
+{% if kill_error %}<p class="banner warn" data-once>Nothing was sold: the kill switch needs a reason for the decision log.</p>{% endif %}
+{% if killed %}<p class="banner" data-once role="status">Kill switch fired: {{ 'the strategy is' if killed == '1' else killed ~ ' strategies are' }} selling to cash at market and will stay paused until you resume {{ 'it' if killed == '1' else 'each one' }}. Each order shows on Orders as it fills.</p>{% endif %}
 
 <section class="ledger" aria-label="Book risk">
   <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }}</div></div>
@@ -58,7 +59,8 @@
   <form method="post" action="/book/flatten">
     <h2 id="dlg-kill-h">Flatten everything</h2>
     {% set n = kill.all|length %}{% set holding = kill.all|selectattr('qty', 'gt', 0)|list %}
-    <p>{{ 'The one strategy still trading or holding a position sells' if n == 1 else 'All ' ~ n ~ ' strategies still trading or holding a position sell' }} to cash at market, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
+    <p>{% if n == 1 %}{{ kill.all[0].sleeve.name }}, the one strategy still trading or holding a position, sells{% else %}{{ 'Both' if n == 2 else 'All ' ~ n }} strategies still trading or holding a position sell{% endif %} to cash at market, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
+      {% set dayp = kill.all|selectattr('sleeve.paused_until')|map(attribute='sleeve.name')|list %}{% if dayp %}{{ dayp|join(', ') }} {{ 'is' if dayp|length == 1 else 'are' }} on a daily-loss pause, which then lasts until you resume too, not 24 hours.{% endif %}
       {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ holding|sum(attribute='position_value')|money }} in all.{% endif %}
       {% if kill.stopped %}{{ kill.stopped|join(', ') }} {{ 'is' if kill.stopped|length == 1 else 'are' }} stopped, so {{ 'it starts' if kill.stopped|length == 1 else 'they start' }} just to sell.{% endif %}</p>
     <label for="r-kill">Reason for the decision log</label>
