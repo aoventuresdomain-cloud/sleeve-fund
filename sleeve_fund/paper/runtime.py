@@ -104,7 +104,12 @@ class SleeveRuntime:
             self.now = now
         if self.status in ("halted",):
             self.store.event(self.name, "warning", "restart", "restarted while halted; stays halted until resumed", ts=self.now())
-        elif self.status == "paused" and self.paused_until and self.paused_until > self.now():
+        elif self.status == "paused" and self.paused_until is None:
+            # The PM's pause, flatten or the book kill switch: no end time, so only a resume lifts it. Any
+            # restart (a settings edit's reload, a stale heartbeat, a crash) keeps it (review round 10, B10-3).
+            self.store.event(self.name, "info", "restart", "restarted while paused by the PM; stays paused until "
+                             "resumed", ts=self.now())
+        elif self.status == "paused" and self.paused_until > self.now():
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")

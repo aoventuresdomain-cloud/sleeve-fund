@@ -107,8 +107,14 @@ class Supervisor:
                 proc.crashes += 1
                 delay = min(MAX_BACKOFF, 10 * 2 ** (proc.crashes - 1))
                 proc.next_start = now + timedelta(seconds=delay)
-                self.store.set_status(sleeve.name, "error", f"process exited with code {code}; restarting in {delay}s")
-                self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
+                if sleeve.status in ("paused", "halted"):
+                    # A crash must not lift a pause or a halt: the status (and a pause's end time) stays, and
+                    # the restarted process keeps it (review round 10, B10-3). The crash is in the events.
+                    self.store.event(sleeve.name, "error", "process_crash",
+                                     f"exit code {code}; restart in {delay}s, still {sleeve.status}")
+                else:
+                    self.store.set_status(sleeve.name, "error", f"process exited with code {code}; restarting in {delay}s")
+                    self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
             elif action == "stop":
                 self._stop(sleeve.name, proc, "stopped by PM")
                 self.store.set_status(sleeve.name, "stopped", "stopped by PM")
