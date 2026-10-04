@@ -10,6 +10,7 @@ or simply in or out (want_long).
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -50,6 +51,9 @@ class IdeaSpec:
 # StrategyConfig is a native type: Python passes the same keyword arguments to its
 # __new__, which reads the base fields (strategy_id etc.) from them. So __init__ must
 # not forward them, and we reject anything unrecognised so a typo in a sleeve file fails.
+# The most of a bar's traded volume one buy may take (see LongFlatConfig.max_participation).
+MAX_PARTICIPATION = 0.25
+
 _BASE_FIELDS = {
     "strategy_id",
     "order_id_tag",
@@ -80,6 +84,7 @@ class LongFlatConfig(StrategyConfig):
         position_cap_pct: float | None = None,
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
+        max_participation: float | None = MAX_PARTICIPATION,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -114,6 +119,8 @@ class LongFlatConfig(StrategyConfig):
                 raise ValueError(f"the wait before going to market ({maker_wait_minutes:g} minutes) must be shorter than "
                                  f"one bar ({bar_minutes(bar_type)} minutes), so each order settles before the next decision")
             maker_wait_minutes = int(maker_wait_minutes)
+        if max_participation is not None and not 0 < max_participation <= 1:
+            raise ValueError(f"max_participation {max_participation} outside (0, 1]")
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / stop distance)")
         self.instrument_id = instrument_id
@@ -137,6 +144,9 @@ class LongFlatConfig(StrategyConfig):
         # None: once in, hold until the signal says out (all-or-nothing). A number: when the target
         # weight moves more than this share away from the weight last traded to, trade back to it.
         self.rebalance_band = rebalance_band
+        # A buy is at most this share of what traded in the bar it decided on, in every mode, so a
+        # backtest can't fill far more than the market traded and paper sizes the same way. None: no cap.
+        self.max_participation = max_participation
         # None: every order is a market order and pays the taker fee. A number: entries, signal exits
         # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
         # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
@@ -163,6 +173,8 @@ class LongFlatStrategy(Strategy):
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
         self._last_order = None  # client order id of the last order sent, until the venue has it
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
+        # Volumes of the last day's decision bars, for the participation cap on buys.
+        self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -277,6 +289,7 @@ class LongFlatStrategy(Strategy):
         if bar.ts_event <= self._last_bar_ts:
             return False
         self._last_bar_ts = bar.ts_event
+        self._volumes.append(bar.volume.as_double())
         self.update_indicators(bar)
         return True
 
@@ -388,6 +401,16 @@ class LongFlatStrategy(Strategy):
             return float(self.runtime.profile.max_position_pct)
         return float(self._cfg.position_cap_pct) if self._cfg.position_cap_pct is not None else 1.0
 
+    def _volume_cap(self, bar: Bar) -> Decimal | None:
+        """The most a buy may be worth on this bar: max_participation of what traded in an average bar
+        over the last day (the bar itself for daily bars), so one quiet minute doesn't shrink an order
+        a deep book would fill. Exits are not capped, since getting out matters more; entries capped
+        this way keep them in proportion."""
+        if self._cfg.max_participation is None or not self._volumes:
+            return None
+        avg = sum(self._volumes) / len(self._volumes)
+        return Decimal(str(avg * self._cfg.max_participation)) * bar.close.as_decimal()
+
     def _rebalance(self, bar: Bar, w: float, reason: str, values: dict) -> bool:
         """Trade part of the position so it is worth `w` of the sleeve's equity at this close."""
         equity, _, qty, _ = self._mark()
@@ -405,6 +428,8 @@ class LongFlatStrategy(Strategy):
             budget = min(diff, bal.free.as_decimal() * (Decimal(1) - fee - Decimal(str(self._cfg.cash_buffer))))
             if self._cfg.max_notional is not None:
                 budget = min(budget, Decimal(str(self._cfg.max_notional)))
+            if (cap := self._volume_cap(bar)) is not None:
+                budget = min(budget, cap)
             side, size = OrderSide.BUY, (budget / price).quantize(step, rounding=ROUND_DOWN)
         else:
             side = OrderSide.SELL
@@ -479,6 +504,8 @@ class LongFlatStrategy(Strategy):
         if self._cfg.risk_per_trade:
             equity = self._mark()[0] or float(free.as_decimal())
             limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._cfg.stop_loss))
+        if (cap := self._volume_cap(bar)) is not None:
+            limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         step = self.instrument.size_increment.as_decimal()

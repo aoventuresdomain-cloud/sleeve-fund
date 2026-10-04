@@ -201,21 +201,23 @@ def test_ops_page_shows_processes_and_safety_nets(client):
     assert "Strategy processes" in page and "btc-test" in page and "Dead man" in page and "Database size" in page
 
 
-def test_preview_runs_the_form_settings_on_history(client, monkeypatch):
+def test_preview_runs_settings_on_history(monkeypatch):
     from sleeve_fund.dashboard import preview
     from sleeve_fund.data import synthetic_ohlcv
 
-    c, _ = client
     preview._history.clear()
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=2, start_price=150))
-    q = {"strategy": "trend_filter", "instrument": "sol/usd", "p_trend_filter__fast": "10",
-         "p_trend_filter__slow": "40", "stop_loss_pct": "8", "starting_balance": "5000"}
-    d = c.get("/api/preview", params=q, auth=AUTH).json()
+    d = preview.run("trend_filter", "SOL/USD", {"fast": 10, "slow": 40, "stop_loss": 0.08}, starting=5000)
     assert d["pair"] == "SOL/USD" and d["days"] == 400 and d["equity"][0] == pytest.approx(5000, rel=0.01)
     assert set(d["strategy"]) >= {"sharpe", "max_drawdown"} and d["trades"]["trades"] >= 1
-    bad = c.get("/api/preview", params={**q, "p_trend_filter__fast": "50"}, auth=AUTH)  # fast must be < slow
-    assert bad.status_code == 422 and "error" in bad.json()
-    assert c.get("/api/preview", params={**q, "instrument": "nonsense"}, auth=AUTH).status_code == 422
+
+
+def test_the_new_strategy_form_backtests_its_settings_instead_of_a_look_back(client):
+    """Round 4, R4-M8: the Look-back ran other bars and a shorter period than the backtest beside it."""
+    c, _ = client
+    form = c.get("/sleeves/new", auth=AUTH).text
+    assert 'id="bt-these"' in form and "Look-back" not in form
+    assert c.get("/api/preview?instrument=BTC/USD", auth=AUTH).status_code == 404
 
 
 def test_research_pipeline_and_strategy_pages(client):
@@ -357,7 +359,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     c, _ = client
     preview._history.clear()
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
-    assert "How testing works" in c.get("/backtest", auth=AUTH).text
+    assert "Saved runs" in c.get("/backtest", auth=AUTH).text
     q = ("/backtest?run=1&instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5"
          "&p_trend_filter__slow=20&starting_balance=5000&period=365")
     page = c.get(q, auth=AUTH).text
@@ -750,8 +752,6 @@ def test_backtest_charges_the_measured_spread_and_says_where_it_came_from(client
     store.record_spread("KRAKEN", "ETH/USD", 0.0001, samples=900)
     page = c.get(q, auth=AUTH).text
     assert "0.020% bid-ask spread, the median of 900 live quotes" in page
-    d = c.get("/api/preview", params={"instrument": "ETH/USD", "strategy": "buy_and_hold"}, auth=AUTH).json()
-    assert d["spread"]["source"] == "measured" and d["spread"]["paid"] > 0
 
 
 def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, monkeypatch, tmp_path):
@@ -798,31 +798,21 @@ def test_minute_backtests_need_the_history_store(client, monkeypatch, tmp_path):
     assert "Instruments with stored minutes: none yet" in page
 
 
-def test_intervals_say_what_is_stored_and_how_far_back_they_go(client, monkeypatch, tmp_path):
-    """R3-M2 and R3-M3: the Look-back tests the form's own interval (or says it fell back to daily),
-    the backtest form lists the instruments with stored minutes, and a capped run says it was capped."""
+def test_intervals_say_what_is_stored_and_run_all_of_it(client, monkeypatch, tmp_path):
+    """R3-M3 and round 4, R4-M2: the backtest form lists the instruments with stored minutes, and a
+    1-minute run takes all of the stored history, not the last year."""
     from sleeve_fund import history
     from sleeve_fund.dashboard import preview
-    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.venues import venue
 
     c, _ = client
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
-    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(70), cursor="x")
-    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(400), cursor="x")
     preview._history.clear()
     form = c.get("/backtest", auth=AUTH).text
-    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form
-    assert "At most the last year at 1 minute, 3 years at 5 minutes." in form
-
-    q = {"instrument": "ETH/USD", "strategy": "buy_and_hold", "bar_spec": "1-HOUR-LAST-INTERNAL"}
-    d = c.get("/api/preview", params=q, auth=AUTH).json()
-    assert d["minutes"] == 60 and d["every"] == "hour" and d["fallback"] == ""
-    d = c.get("/api/preview", params={**q, "instrument": "SOL/USD"}, auth=AUTH).json()
-    assert d["minutes"] == 1440 and "looked back on daily decisions" in d["fallback"]
-
-    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
-                 auth=AUTH).text
-    assert "covers at most the last 1 year, so this one didn&#39;t run all the history" in page
+    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form and "At most" not in form
+    df = preview._intraday("ETH/USD", venue("kraken"), 1, None)
+    assert len(df) >= 399 * 1440
 
 
 def test_trade_built_intervals_get_a_warm_up_from_the_store():
@@ -892,3 +882,25 @@ def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
     assert store.sleeve("long-warm").warmup_bars == 50_000
     (e,) = [e for e in store.events("long-warm") if e["kind"] == "warmup_short"]
     assert e["level"] == "warning" and "needs 60,000 bars" in e["message"]
+
+
+def test_the_guard_cadence_is_not_the_chart_spacing(client, monkeypatch, tmp_path):
+    """Round 4, NEW-2: over a long run the chart thins its points, and that spacing once overwrote
+    how often the note said the guard checked the book."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    import numpy as np
+
+    m = _wavy_minutes(820)
+    crash = np.ones(len(m))
+    crash[800 * 1440:801 * 1440] = np.linspace(1.0, 0.6, 1440)
+    crash[801 * 1440:] = 0.6
+    for col in ("open", "high", "low", "close"):
+        m[col] = m[col] * crash
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", m, cursor="x")
+    preview._history.clear()
+    d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive")
+    assert len(d["t"]) < d["days"]  # the chart is thinned
+    assert d["risk"]["checked_minutes"] == 15 and "every 15 minutes" in d["risk"]["note"]

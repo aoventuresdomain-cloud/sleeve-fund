@@ -17,7 +17,7 @@
     <div class="grid2">
       <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
       <div class="field"><label for="bt_bar_spec">Decision interval</label><select id="bt_bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == bar_spec }}>{{ bar_label(b).split(' (')[0] }}{{ ' (from live trades in paper)' if b.endswith('INTERNAL') else '' }}</option>{% endfor %}</select>
-        <p class="hint">Shorter than a day needs stored minute history: {% if stored %}{% for r in stored %}{{ r.pair }} (since {{ r.since.strftime('%b %Y') }}){{ ', ' if not loop.last }}{% endfor %}{% else %}none stored yet{% endif %}. At most the last year at 1 minute, 3 years at 5 minutes.</p></div>
+        <p class="hint">Shorter than a day needs stored minute history: {% if stored %}{% for r in stored %}{{ r.pair }} (since {{ r.since.strftime('%b %Y') }}){{ ', ' if not loop.last }}{% endfor %}{% else %}none stored yet{% endif %}.</p></div>
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
     <div class="grid2">
@@ -34,12 +34,12 @@
     <section class="panel bt-job" id="bt-job" data-job="{{ job.id }}" aria-live="polite">
       <div class="panel-head"><h2>Running: {{ job.title }}</h2></div>
       <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (job.progress * 100)|round|int }}"><div style="width:{{ (job.progress * 100)|round|int }}%"></div></div>
-      <p class="muted" id="bt-job-text">{% if job.ahead %}Waiting for {{ job.ahead }} run{{ 's' if job.ahead != 1 }} ahead of it.{% else %}{{ (job.progress * 100)|round|int }}% of the period replayed.{% endif %} The result opens here when it's done, and it's saved, so you can leave this page and find it under Saved runs.</p>
+      <p class="muted" id="bt-job-text">{% if job.ahead %}Waiting for {{ job.ahead }} run{{ 's' if job.ahead != 1 }} ahead of it.{% else %}{{ (job.progress * 100)|round|int }}% of the period replayed.{% endif %} The result opens here when it's done. It's saved, so you can leave and reopen it from Saved runs below.</p>
     </section>
   {% endif %}
   {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }} <a class="m-jump" href="#bt-form">Change the settings</a></div>{% endif %}
   {% if result %}
-    {% set s, h, ts = result.strategy, result.hold, result.stats %}
+    {% set s, h, ts = result.strategy, result.hold, result.stats %}{% set dfmt = '%d %b %Y %H:%M' if result.minutes < 1440 else '%d %b %Y' %}
     <section class="panel bt-head">
       <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days, after fees: {{ result.fee_schedule.text }}. Orders that take liquidity also pay half the spread: {{ result.spread.text }}</span>
         <a class="m-jump" href="#bt-form">Change the settings</a>
@@ -48,7 +48,6 @@
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
       {% if result.risk.note %}<p class="banner {{ 'warn' if result.risk.halted else '' }}" style="margin:0 0 10px">{{ result.risk.note }}</p>{% endif %}
-      {% if result.data.capped %}<p class="banner" style="margin:0 0 10px">{{ result.data.capped }}</p>{% endif %}
       {% if result.data.note %}<p class="banner warn" style="margin:0 0 10px">{{ result.data.note }}</p>{% endif %}
       {% if result.execution.note %}<p class="{{ 'banner warn' if result.execution.matched_on is none else 'muted' }}" style="margin:0 0 10px;font-size:12.5px">{{ result.execution.note }}</p>{% endif %}
       <table class="compare">
@@ -86,32 +85,30 @@
       <table class="responsive tight" data-hide-xl="3 4" data-hide-lg="3 4 5 7" data-hide-md="3 4 5 6 7">
         <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th>Exit</th><th></th></tr></thead>
         <tbody>{% for t in result.trips|reverse %}{% set rid = 'bt-' ~ loop.index %}
-        <tr><td data-m="hide">{{ t.opened.strftime('%d %b %Y') }}</td><td>{{ t.closed.strftime('%d %b %Y') }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
+        <tr><td data-m="hide">{{ t.opened.strftime(dfmt) }}</td><td>{{ t.closed.strftime(dfmt) }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
           <td class="num" data-m="hide">{{ '%g'|format(t.qty) }}</td>
           <td class="num" data-m="hide">{{ t.entry_px|px }}</td><td class="num" data-m="hide">{{ t.exit_px|px }}</td>
           <td class="num" data-m="hide">{{ t.fees|money }}</td>
           <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td>
           <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td><td data-m="right">{{ why_toggle(rid) }}</td></tr>
         <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
-          {{ why('Entry · ' ~ t.opened.strftime('%d %b %Y') ~ ' at ' ~ t.entry_px|px, t.entry_why, t.entry_items) }}
-          {{ why(t.reason ~ ' · ' ~ t.closed.strftime('%d %b %Y') ~ ' at ' ~ t.exit_px|px, t.exit_why, t.exit_items) }}
+          {{ why('Entry · ' ~ t.opened.strftime(dfmt) ~ ' at ' ~ t.entry_px|px, t.entry_why, t.entry_items) }}
+          {{ why(t.reason ~ ' · ' ~ t.closed.strftime(dfmt) ~ ' at ' ~ t.exit_px|px, t.exit_why, t.exit_items) }}
         </div></td></tr>
         {% endfor %}</tbody>
       </table>
       {% else %}<p class="empty" style="padding:4px 14px 14px">No completed trades in this period. The model may still be holding, or its entry never triggered. Try a longer period or looser settings.</p>{% endif %}
     </section>
-  {% elif not error %}
-    <section class="panel">
-      <div class="panel-head"><h2>How testing works here</h2></div>
-      <ol class="steps-list">
-        <li><strong>Backtest</strong> (this page): see how settings would have traded over the venue's history, with fees. It's quick, and you can change anything.</li>
-        <li><strong>Paper strategy</strong>: when a result looks worth watching, start it on paper with one click. It trades live Kraken prices with simulated money.</li>
-        <li><strong>Evidence</strong>: G1 needs the research loop's out-of-sample tests. G2 needs at least six weeks of paper results inside the backtest's range.</li>
-        <li><strong>Live</strong>: only after you approve G2, and only on a Kraken account whose key you install on the server.</li>
-      </ol>
-      <p class="muted" style="margin:0">Pick an instrument and a model on the left and press Run backtest. The address of the result page can be bookmarked or shared.</p>
-    </section>
   {% endif %}
+    <section class="panel flush" aria-labelledby="runs-h" id="runs">
+      <div class="panel-head"><h2 id="runs-h">Saved runs</h2><span class="hint">the latest 50 are kept</span></div>
+      {% if runs %}
+      <table class="compact">
+        <thead><tr><th>Run</th><th>Saved</th></tr></thead>
+        <tbody>{% for r in runs %}<tr{{ ' aria-current="true"' if saved and saved.id == r.id }}><td><a href="/backtest/{{ r.id }}">{{ r.title }}</a></td><td class="muted">{{ r.created_at|ts }}</td></tr>{% endfor %}</tbody>
+      </table>
+      {% else %}<p class="empty" style="padding:4px 14px 14px">None yet. Pick an instrument and a model, then press Run backtest.</p>{% endif %}
+    </section>
   </div>
 </div>
 {% endblock %}

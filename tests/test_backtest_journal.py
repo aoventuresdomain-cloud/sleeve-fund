@@ -119,3 +119,58 @@ def test_the_memory_journal_matches_the_database_journal():
     slow = SleeveRuntime(db, "backtest", tick_seconds=86_400)
     got = orders(fast)
     assert got and got == orders(slow)
+
+
+def test_a_backtest_screen_shows_no_paper_only_panels(client):
+    """Round 4, R4-M3 and R4-M6: no paper chip, Today, heartbeat, reconcile, account, path to live or
+    Clone on a saved run, and its dates carry the year."""
+    c, store = client
+    r = c.get(RUN + "&bar_spec=1-DAY-LAST-EXTERNAL", auth=AUTH, follow_redirects=False)
+    run_id = r.headers["location"].rsplit("/", 1)[1]
+    screen = c.get(f"/sleeves/bt:{run_id}", auth=AUTH).text
+    assert '<span class="chip">Backtest</span>' in screen and "Not in the book." in screen
+    for gone in ("since midnight", "Heartbeat", "Reconciled", "Path to live", "Clone with changes",
+                 'href="/accounts#acct-', "on Kraken"):
+        assert gone not in screen, gone
+    first = store.fills(f"bt:{run_id}", limit=1_000_000)[-1]["ts"]
+    assert first.strftime("%d %b %Y") in screen  # synthetic history starts years ago, so the year shows
+    candles = c.get(f"/api/sleeves/bt:{run_id}/candles", auth=AUTH).json()
+    assert candles["note"] == "Candles built from the run's price marks."
+
+
+def test_backtests_stay_out_of_accounts_counts_and_alerts(client):
+    """Round 4, R4-M5: accounts, the journal counts and alert acknowledgements ignore saved runs, and
+    an acknowledgement made before that rule can't block pruning."""
+    from sleeve_fund.store import acks_t, utcnow
+
+    c, store = client
+    r = c.get(RUN, auth=AUTH, follow_redirects=False)
+    name = "bt:" + r.headers["location"].rsplit("/", 1)[1]
+    assert all(name not in a["sleeves"] for a in store.accounts())
+    sizes = store.table_sizes()
+    assert sizes["sleeves"] == 0 and sizes["fills"] == 0 and sizes["backtests"] == 1
+    assert "Saved backtests" in c.get("/ops", auth=AUTH).text
+
+    store.event(name, "warning", "risk_pause", "paused in the replay")
+    ev = store.events(name, limit=1)[0]
+    with pytest.raises(KeyError):
+        store.ack(ev["id"], "PM")
+    with store.engine.begin() as conn:  # as an older build could have written it
+        conn.execute(acks_t.insert().values(event_id=ev["id"], ts=utcnow(), actor="PM", note=""))
+    assert store.prune_backtests(keep=0) == 1 and store.backtests() == []
+
+
+def test_saved_runs_are_listed_and_keep_the_chosen_interval(client, monkeypatch, tmp_path):
+    """Round 4, R4-M4 and B4-5: an hourly run on bars built from trades is saved as that, not as the
+    venue's hourly candles its replay used."""
+    from sleeve_fund import history
+    from test_dashboard import _wavy_minutes
+
+    c, store = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(20), cursor="x")
+    r = c.get(RUN + "&bar_spec=1-HOUR-LAST-INTERNAL", auth=AUTH, follow_redirects=False)
+    run_id = r.headers["location"].rsplit("/", 1)[1]
+    assert store.sleeve(f"bt:{run_id}").bar_spec == "1-HOUR-LAST-INTERNAL"
+    page = c.get("/backtest", auth=AUTH).text
+    assert "Saved runs" in page and f'href="/backtest/{run_id}"' in page and "Trend filter on ETH/USD" in page
