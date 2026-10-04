@@ -179,7 +179,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         kill = _kill_targets(summaries)
         return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
                     shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
-                    kill_error=request.query_params.get("kill_error"))
+                    kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
         """Who the kill switch acts on: every strategy still trading (running and not halted) and every
@@ -207,7 +207,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
         n = len(targets["all"])
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
-        return RedirectResponse("/risk", status_code=303)
+        return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
     @app.get("/ops", response_class=HTMLResponse)
     def ops_page(request: Request, _: str = Depends(require_pm)):
@@ -796,8 +796,9 @@ def _risk_view(x: dict) -> dict:
 def _held(td) -> str:
     if td is None:
         return ""
-    hours = td.total_seconds() / 3600
-    return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{td.total_seconds() / 60:.0f} min"
+    secs = max(td.total_seconds(), 0.0)  # a file stamped a moment after the clock read is 0, not -0
+    hours = secs / 3600
+    return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{secs / 60:.0f} min"
 
 
 DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten"]
