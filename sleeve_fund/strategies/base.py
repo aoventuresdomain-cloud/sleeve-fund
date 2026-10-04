@@ -926,6 +926,10 @@ class LongFlatStrategy(Strategy):
             return
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        if self._margin and self._backtest and self._exec_type is None:
+            # Fed only the bars it decides on, a backtest on a perp still judges each bar at its worst price
+            # (_on_exec_bar does it for every shorter execution bar), as paper judges every trade.
+            self._intrabar_guard(bar)
         self._maybe_tick()
         if self._pending_exit is not None:
             return
