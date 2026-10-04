@@ -61,6 +61,8 @@ class StudyResult:
     holdout_reused: bool = False
     fee_note: str = ""
     notes: list[str] = field(default_factory=list)
+    instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
+    bar_minutes: int = 1440
 
     @property
     def round_trips(self) -> list[float]:
@@ -82,6 +84,13 @@ def grid(param_grid: dict[str, list]) -> list[dict]:
     combos = [dict(zip(keys, values)) for values in itertools.product(*(param_grid[k] for k in keys))]
     # Strategies may reject nonsensical combos (e.g. fast >= slow); filter those here.
     return [c for c in combos if not ("fast" in c and "slow" in c and c["fast"] >= c["slow"])]
+
+
+def bar_minutes_of(prices: pd.DataFrame) -> int:
+    """The bar length of a price table, from the usual gap between its rows."""
+    if len(prices) < 2:
+        return 1440
+    return max(1, round(pd.Series(prices.index).diff().median() / pd.Timedelta(minutes=1)))
 
 
 def run_study(
@@ -193,6 +202,8 @@ def run_study(
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
+        instrument=str(instrument.id.symbol),
+        bar_minutes=bar_minutes_of(prices),
         fee_note=(f"{instrument.id.venue}: {float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} "
                   "taker, taker charged on every order"),
     )

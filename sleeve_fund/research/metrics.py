@@ -175,3 +175,30 @@ def deflated_sharpe_probability(returns: pd.Series, n_trials: int, trial_sharpes
     kurt = float(r.kurt()) + 3
     denom = math.sqrt(max(1 - skew * sr + (kurt - 1) / 4 * sr**2, 1e-12))
     return float(NormalDist().cdf((sr - hurdle) * math.sqrt(n - 1) / denom))
+
+
+def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials: int, *, block: int = 10,
+                             n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """How sure we can be that the strategy's Sharpe truly beats the benchmark's, out of sample, once
+    the variants tried are allowed for. Returns (probability, hurdle), Sharpes annualised.
+
+    The two daily return series are resampled together in blocks of `block` days (keeping volatility
+    clusters and the pairing between them), 2,000 times. Each resample gives a Sharpe difference; the
+    hurdle is the difference the best of `n_trials` skill-less variants would show by luck alone
+    (expected_max_sharpe, with the resamples' spread as the no-skill error). The probability is the
+    share of resamples above it. Fixed seed, so a tear sheet reads the same every time."""
+    pair = pd.concat([strategy, benchmark], axis=1, join="inner").dropna()
+    n = len(pair)
+    if n < max(60, 3 * block):
+        return float("nan"), float("nan")
+    x = pair.to_numpy(dtype=float)
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, n, size=(n_boot, -(-n // block)))
+    idx = ((starts[:, :, None] + np.arange(block)) % n).reshape(n_boot, -1)[:, :n]  # circular blocks
+    sample = x[idx]  # (n_boot, n, 2)
+    mean, std = sample.mean(axis=1), sample.std(axis=1, ddof=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sharpe = np.where(std > 0, mean / std, 0.0) * math.sqrt(PERIODS_PER_YEAR)
+    diff = sharpe[:, 0] - sharpe[:, 1]
+    hurdle = expected_max_sharpe(n_trials, float(diff.std(ddof=1)))
+    return float((diff > hurdle).mean()), hurdle

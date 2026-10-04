@@ -96,7 +96,11 @@ def test_study_caps_strategy_and_benchmark_like_paper(tmp_path, instrument):
         first = res.exposure[res.exposure > 0].iloc[0]
         assert 0.3 < first <= 0.34
     assert any("capped at 33%" in n for n in r.notes)
-    assert "capped at 33%" in render(r, kw["ledger"])
+    sheet = render(r, kw["ledger"])
+    assert "capped at 33%" in sheet
+    # Round 4, B5: the sheet says what it tested, and G1 needs more than a higher Sharpe by luck.
+    assert "Tested on `BTC/USD` at 1440-minute bars" in sheet
+    assert "likely to beat it by more than the best of" in sheet and "bar: 95%" in sheet
     with pytest.raises(ValueError):
         run_study(SPEC, prices, instrument, position_cap=1.5, **kw)
 

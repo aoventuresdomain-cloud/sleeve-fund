@@ -45,7 +45,7 @@
         <a class="m-jump" href="#bt-form">Change the settings</a>
         {% if saved %}<span class="bt-links">Saved run: <a href="/orders?sleeve={{ saved.sleeve|urlencode }}">{{ result.orders }} orders</a> · <a href="/trades?sleeve={{ saved.sleeve|urlencode }}">trades</a> · <a href="/sleeves/{{ saved.sleeve|urlencode }}">strategy screen</a></span>{% endif %}
         <a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a></div>
-      {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
+      {% if g1_here != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data for {{ result.pair }} at this interval. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
       {% if result.risk.note %}<p class="banner {{ 'warn' if result.risk.halted else '' }}" style="margin:0 0 10px">{{ result.risk.note }}</p>{% endif %}
       {% if result.data.note %}<p class="banner warn" style="margin:0 0 10px">{{ result.data.note }}</p>{% endif %}
