@@ -832,6 +832,103 @@ def test_a_crash_under_a_leveraged_long_is_sold_by_the_guards_before_the_venue_w
     assert res.equity.iloc[-1] > 0
 
 
+def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():
+    """B11-2: a perp exit closes the whole position, to zero in the venue's exact quantities, not to a float
+    residue a lot below it; so the entry that follows, on either side, opens a fresh position and rests its
+    own stop and target on the far side, the whole of its quantity, every time."""
+    from decimal import Decimal
+
+    j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, "stop_loss": 0.05, "take_profit": 0.2, **PERP},
+                     starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=HALF).journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    held = Decimal(0)
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        held += Decimal(str(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] != "entry":
+            assert held == 0, (f, held)  # every exit leaves exactly nothing
+    entries = [i for i, o in enumerate(orders) if o["intent"] == "entry"]
+    assert len(entries) > 10 and {orders[i]["side"] for i in entries} == {"BUY", "SELL"}
+    for i in entries:
+        e = orders[i]
+        assert e["signal"].get("stop_frac") == pytest.approx(0.05), e
+        far = "SELL" if e["side"] == "BUY" else "BUY"
+        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
+        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        assert all(o["side"] == far and o["qty"] == pytest.approx(e["filled_qty"]) for o in legs.values()), legs
+
+
+@pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
+def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no_more(profile, strategy, gap):
+    """M11-3: a price that jumps past the liquidation price between bars, with no bar near it for the guards
+    to act on, is liquidated: one order with the 'liquidation' intent closes the whole position, the book is
+    flat after it, and the strategy is halted (no entry after it)."""
+    c = np.r_[np.full(10, 60_000.0), np.full(20, gap)]
+    res = run_backtest(strategy, _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000,
+                       risk_profile=profile, bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    assert [o["intent"] for o in orders] == ["entry", "liquidation"], orders
+    opened, closed = orders
+    assert closed["side"] != opened["side"] and closed["filled_qty"] == pytest.approx(opened["filled_qty"])
+    liq = opened["signal"]["liquidation_px"]
+    assert (gap > liq) if opened["side"] == "SELL" else (gap < liq)  # the gap went past it
+    assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
+
+
+@pytest.mark.xfail(strict=True, reason="sanity 5 Oct: a gap past liquidation books a loss beyond the strategy's "
+                                       "isolated margin (equity goes negative); reported to the build thread")
+@pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
+def test_isolated_margin_a_liquidation_never_loses_more_than_the_strategys_equity(strategy, gap):
+    """Isolated margin (long/short verdict default): a liquidated position loses at most the margin behind
+    it, the strategy's equity; the venue's insurance fund takes any shortfall past the bankruptcy price. So
+    a strategy's equity never goes below zero, and never pulls the rest of the fund down with it."""
+    c = np.r_[np.full(10, 60_000.0), np.full(20, gap)]
+    res = run_backtest(strategy, _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000,
+                       risk_profile="aggressive", bar_minutes=60, half_spread=HALF)
+    assert res.equity.min() >= 0, res.equity.min()
+
+
+def _wilder(closes, n=14):
+    """Wilder's RSI, written out from its definition, independent of the engine's indicators."""
+    out = [None] * len(closes)
+    ch = np.diff(np.asarray(closes, dtype=float))
+    g, l = np.clip(ch, 0, None), np.clip(-ch, 0, None)
+    if len(ch) < n:
+        return out
+    ag, al = g[:n].mean(), l[:n].mean()
+    for k in range(n, len(ch) + 1):
+        if k > n:
+            ag, al = (ag * (n - 1) + g[k - 1]) / n, (al * (n - 1) + l[k - 1]) / n
+        out[k] = 100.0 if al == 0 and ag > 0 else 50.0 if al == ag == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def test_rsi_bands_trades_on_the_standard_rsi_at_its_bands():
+    """M11-1: rsi_bands decides on Wilder's RSI(14), the one the chart draws and that 'RSI' means: every
+    order's journaled RSI equals RSI recomputed from the closes, and each obeys its band (long in at 30 or
+    under and out at 55 or over; short in at 70 or over and out at 50 or under)."""
+    s = np.arange(0, 240 * 60, 60)
+    c = np.round(TEST_STRATEGIES["rsi_bands"][1](s), 1)  # at the instrument's price precision
+    bars = _ls_bars(c, minutes=1)
+    j = run_backtest("rsi_bands", bars, TICK_INST, PERP, starting_capital=10_000, risk_profile="balanced",
+                     bar_minutes=1, half_spread=HALF).journal
+    rsi = dict(zip(bars.index, _wilder(c)))
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    seen = set()
+    for o in orders:
+        if o["intent"] not in ("entry", "exit"):
+            continue
+        r = o["signal"]["rsi"]
+        assert r == pytest.approx(rsi[pd.Timestamp(o["ts"])], abs=1e-6), o
+        band = {("BUY", "entry"): r <= 30, ("SELL", "exit"): r >= 55,
+                ("SELL", "entry"): r >= 70, ("BUY", "exit"): r <= 50}[(o["side"], o["intent"])]
+        assert band, o
+        seen.add((o["side"], o["intent"]))
+    assert seen == {("BUY", "entry"), ("SELL", "exit"), ("SELL", "entry"), ("BUY", "exit")}, seen
+
+
 @pytest.mark.parametrize("reason", ["PM flatten", "Book kill switch: stop everything"])
 def test_a_flatten_of_a_short_cut_short_by_a_restart_buys_it_back(store, reason):
     """S-3 on a short: the flatten is owed again after a restart while a short is still held."""
