@@ -359,7 +359,11 @@ window.Console = (() => {
         desc.textContent = desc.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => (k in vals ? vals[k] : m));
       }
       const opt = $("strategy").selectedOptions[0];
-      document.getElementById("g1-note").hidden = opt.dataset.g1 === "PASS";
+      // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
+      const minutes = {MINUTE: 1, HOUR: 60, DAY: 1440};
+      const [step, unit] = document.getElementById("bar_spec").value.split("-");
+      const here = `${($("instrument").value || "").toUpperCase()}@${Number(step) * (minutes[unit] || 0)}`;
+      document.getElementById("g1-note").hidden = (opt.dataset.g1 || "").split("|").includes(here);
       const prof = $("risk_profile").selectedOptions[0].dataset;
       const pair = ($("instrument").value || "").toUpperCase();
       const quote = pair.split("/")[1] || "";

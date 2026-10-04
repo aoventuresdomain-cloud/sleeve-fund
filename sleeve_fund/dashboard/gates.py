@@ -27,7 +27,8 @@ def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], no
     keyed = [a["name"] for a in accounts if a["kind"] == "live" and a["key_present"]]
     return [
         {"label": "Strategy passed G1", "ok": g1 == "PASS",
-         "detail": "on real data, out of sample" if g1 == "PASS" else "not yet; paper results alone are not evidence"},
+         "detail": "on real data, out of sample, for this instrument and interval" if g1 == "PASS"
+         else "not for this instrument and interval yet; paper results alone are not evidence"},
         {"label": "Six weeks of paper trading", "ok": days >= PAPER_DAYS,
          "detail": f"{days} of {PAPER_DAYS} days" if days < PAPER_DAYS else f"{days} days"},
         {"label": f"At least {MIN_TRADES} closed trades", "ok": trades >= MIN_TRADES,

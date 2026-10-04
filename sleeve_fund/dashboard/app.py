@@ -202,7 +202,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     def new_sleeve_form(request: Request, _: str = Depends(require_pm), error: str = "", strategy: str = ""):
         from sleeve_fund.dashboard import pipeline
 
-        g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
+        g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         chosen = strategy if strategy in REGISTRY else "trend_filter"
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
                     bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
@@ -289,7 +289,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
-                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy), st().accounts(), utcnow()))
+                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec)),
+                                                               st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", _: str = Depends(require_pm)):
@@ -477,13 +478,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The sleeve must decide on the bars that were tested, with indicators warm from its first bar.
         carry = {k: v for k, v in q.items() if k not in ("run", "period") and v}
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
-        g1 = {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
+        g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
+        pair = q.get("instrument", "").strip().upper()
+        g1_here = pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec)) if pair else None
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
                      "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily"}  # equity is daily
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
-                    chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1,
+                    chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, g1_here=g1_here,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
@@ -822,10 +825,10 @@ def _strategy_choices() -> list[dict]:
     return out
 
 
-def _g1_of(strategy: str) -> str | None:
+def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
     from sleeve_fund.dashboard import pipeline
 
-    return {r["name"]: r["g1"] for r in pipeline.strategies(TEARSHEETS, [])}.get(strategy)
+    return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes)
 
 
 def _clone_qs(s) -> str:

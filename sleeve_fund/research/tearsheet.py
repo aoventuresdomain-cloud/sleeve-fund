@@ -13,12 +13,16 @@ from sleeve_fund.research.metrics import (
     deflated_sharpe_probability,
     expected_max_sharpe,
     returns_from_equity,
+    sharpe_beats_probability,
     summary,
 )
 from sleeve_fund.research.study import StudyResult
 
 MIN_ROUND_TRIPS = 10
 ROBUST_SHARE = 0.6
+# G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
+# than the best of the variants tried would by luck.
+G1_CONFIDENCE = 0.95
 
 
 def _pct(x: float) -> str:
@@ -47,6 +51,9 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = len(r.round_trips)
     counts = ledger.counts()
+    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
+    if math.isnan(beats):
+        beats = 0.0  # too short an out-of-sample period to judge
     checks = [
         (
             "Out-of-sample return vs benchmark after fees (shown, not the G1 test)",
@@ -54,9 +61,10 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"CAGR {_pct(oos['cagr'])} vs {_pct(bench['cagr'])}",
         ),
         (
-            "G1 test: out-of-sample Sharpe beats benchmark after fees",
-            "PASS" if oos["sharpe"] > bench["sharpe"] else "FAIL",
-            f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}",
+            "G1 test: out-of-sample Sharpe clearly beats benchmark after fees",
+            "PASS" if oos["sharpe"] > bench["sharpe"] and beats >= G1_CONFIDENCE else "FAIL",
+            f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; {_share(beats)} likely to beat it by more than "
+            f"the best of {counts['variants']} variants would by luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}",
         ),
         (
             "Holds up when parameters move",
@@ -106,6 +114,10 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
         out.append("> **Synthetic data.** This run only proves the pipeline works. The numbers say nothing about the strategy.")
         out.append("")
     out.append(
+        f"Tested on `{r.instrument}` at {r.bar_minutes}-minute bars"
+    )
+    out.append("")
+    out.append(
         f"Dataset `{r.dataset}` · research period {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y} · "
         f"holdout: last {r.holdout_days} days {'(opened)' if r.holdout else '(untouched)'} · "
         f"fees: {r.fee_note}"
@@ -129,7 +141,9 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     for name, verdict, evidence in g1_checks(r, ledger):
         out.append(f"| {name} | {verdict} | {evidence} |")
     out.append("")
-    out.append("G1 \"beats buy-and-hold\" means a higher out-of-sample Sharpe after fees (PM decision, 3 Oct 2026). These checks inform the G1 decision; they don't make it.")
+    out.append("G1 \"beats buy-and-hold\" means a higher out-of-sample Sharpe after fees (PM decision, 3 Oct 2026), by "
+               f"more than luck across every variant tried, with {G1_CONFIDENCE:.0%} confidence (paired block bootstrap). "
+               "These checks inform the G1 decision; they don't make it.")
     out.append("")
     out.append("## Results after fees")
     out.append("")
