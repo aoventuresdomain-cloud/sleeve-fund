@@ -158,3 +158,36 @@ def test_the_guard_checks_every_execution_bar_like_paper(instrument):
     # Every minute: noticed as the loss passes 8%, about a 16% fall at a 50% position.
     px = pause_sell(exec_prices=m, exec_minutes=1)
     assert 82.0 < px < 85.0
+
+
+def test_a_buy_takes_at_most_a_quarter_of_what_trades(prices, instrument):
+    """Review round 3, R3-M6: a backtest filled 98 units on a bar that traded 1. Buys are now capped at
+    a quarter of an average bar's volume over the last day, in every mode, and the journal says so."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    thin = prices.iloc[:30].copy()
+    thin["volume"] = 1.0
+    rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                                    starting_balance=1_000_000, risk_profile="aggressive")
+    run_backtest("buy_and_hold", thin, instrument, runtime=rt)
+    (buy,) = [o for o in rt.store.orders(limit=100) if o["side"] == "BUY"]
+    assert buy["qty"] == pytest.approx(0.25, abs=1e-8)
+    assert buy["signal"]["sized_by"] == "share of the bar's volume"
+
+    deep = prices.iloc[:30].copy()
+    deep["volume"] = 1e9
+    res = run_backtest("buy_and_hold", deep, instrument, starting_capital=1_000_000, risk_profile="aggressive")
+    assert _notional(res.fills.iloc[0]) == pytest.approx(500_000, rel=0.02)  # the profile cap, not volume
+
+
+def test_the_participation_cap_can_be_set_or_turned_off(instrument):
+    from nautilus_trader.model import BarType
+
+    from sleeve_fund.strategies.trend_filter import TrendFilterConfig
+
+    bt = BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL")
+    assert TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.008).max_participation == 0.25
+    assert TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.008,
+                             max_participation=None).max_participation is None
+    with pytest.raises(ValueError, match="max_participation"):
+        TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.008, max_participation=2)
