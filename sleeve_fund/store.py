@@ -621,6 +621,21 @@ class Store:
         with self.engine.connect() as c:
             return {r.sleeve: _aware(r.archived_at) for r in c.execute(select(sleeve_archive_t))}
 
+    def book_start(self) -> datetime | None:
+        """When the current book began: the latest clean slate (supervisor.clear), or None if never cleared."""
+        with self.engine.connect() as c:
+            row = c.execute(select(decisions_t.c.ts).where(decisions_t.c.action == "clear")
+                            .order_by(decisions_t.c.ts.desc()).limit(1)).first()
+        return _aware(row[0]) if row else None
+
+    def previous_book(self) -> dict[str, datetime]:
+        """Strategies put away by the latest clean slate, or before it, and not brought back since: an
+        earlier book's. Their history stays and their pages still open; the book's figures leave them out."""
+        start = self.book_start()
+        if start is None:
+            return {}
+        return {name: at for name, at in self.archived().items() if at <= start}
+
     def archive(self, sleeve: str) -> None:
         """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
         s = self.sleeve(sleeve)

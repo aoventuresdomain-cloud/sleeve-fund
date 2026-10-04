@@ -112,6 +112,15 @@
 </details>
 {% endif %}
 
+{% if earlier %}
+<details class="panel archived" style="margin-bottom:14px">
+  <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away when a new book began on {{ book_start.strftime('%d %b %Y') }}; kept with their history, and left out of this book's figures</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for s in earlier %}
+    <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+
 <div class="grid">
   <section class="panel span-5" aria-labelledby="alloc-h">
     <div class="panel-head"><h2 id="alloc-h">Allocation</h2></div>
