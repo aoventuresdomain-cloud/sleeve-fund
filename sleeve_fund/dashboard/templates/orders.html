@@ -13,7 +13,6 @@
     </form>
     <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
   </div>
-  <p class="lede">Every order the strategies have sent, newest first, with what it was for and the reason recorded when it was sent.</p>
 </div>
 {% if backtest %}<div class="banner" role="status">Showing a saved backtest: the paper runtime replayed over history. <a href="/backtest/{{ backtest.run_id }}">Back to the result</a></div>{% endif %}
 
@@ -55,6 +54,5 @@
   <p class="empty" style="padding:14px">{% if tab == 'open' %}No orders working. Strategies trade at market, so an order is normally open for seconds.{% elif tab == 'all' %}No orders yet. Each order a strategy sends is listed here with its reason. <a href="/sleeves/new">Start a new strategy</a>{% else %}None in this view.{% endif %}</p>
   {% endif %}
 </section>
-<p class="muted" style="font-size:12px">Orders are journaled from this release onwards. Earlier trades still appear under <a href="/trades">Positions and trades</a>, without a recorded reason.</p>
 {% endblock %}
 {% block scripts %}<script src="/static/console.js"></script><script>Console.whys();</script>{% endblock %}

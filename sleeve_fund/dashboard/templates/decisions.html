@@ -4,7 +4,6 @@
 <div class="page-head">
   <h1>Decision log</h1>
   <div class="actions"><a class="button secondary" href="/decisions.csv{{ '?' ~ f.qs if f.qs }}">Download CSV</a></div>
-  <p class="lede">Every create, start, stop, pause, flatten and resume, with who made it and why. Newest first.</p>
 </div>
 <form class="panel filters" method="get" action="/decisions">
   <div class="field"><label for="f-sleeve">Strategy</label><select id="f-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if f.query.sleeve == n }}>{{ n }}</option>{% endfor %}</select></div>
