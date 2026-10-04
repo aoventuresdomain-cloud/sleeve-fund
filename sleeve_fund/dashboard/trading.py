@@ -87,14 +87,31 @@ def order_view(o: dict) -> dict:
     return o
 
 
-def plan_items(plan: dict) -> list[tuple[str, str]]:
-    """An exit plan set after entry (see Store.set_exit_plan), as (label, text) pairs for display."""
+def exit_ways(params: dict | None, side: int | None = None) -> dict[str, str]:
+    """Which way a stop and a target sit from the entry, in words: for the side held, or, with no
+    position, for every side the strategy can take (a long/short perpetual: both)."""
+    if side and side < 0:
+        return {"stop": "above", "tp": "below", "swing": "highest high", "swing_short": "high"}
+    try:
+        perp = markets.is_perp(params)
+    except ValueError:  # an unknown market typed into a form: the form refuses it on submit
+        perp = False
+    if not side and perp and (params or {}).get("allow_short"):
+        return {"stop": "below (a short: above)", "tp": "above (a short: below)",
+                "swing": "lowest low (a short: highest high)", "swing_short": "low (a short: high)"}
+    return {"stop": "below", "tp": "above", "swing": "lowest low", "swing_short": "low"}
+
+
+def plan_items(plan: dict, side: int = 1) -> list[tuple[str, str]]:
+    """An exit plan set after entry (see Store.set_exit_plan), as (label, text) pairs for display.
+    side: the position's, so a short's stop reads above its entry."""
     out = [("Exits", "edited by the PM" if plan["kind"] == "edit" else "set again after a restart")]
+    away, toward = ("below", "above") if side > 0 else ("above", "below")
     if plan.get("stop_frac") is not None:
         s = plan["stop_frac"]
-        out.append(("Stop now", f"{s:.1%} below the entry" if s >= 0 else f"{-s:.1%} above the entry"))
+        out.append(("Stop now", f"{s:.1%} {away} the entry" if s >= 0 else f"{-s:.1%} {toward} the entry"))
     if plan.get("tp_frac"):
-        out.append(("Target now", f"{plan['tp_frac']:.1%} above the entry"))
+        out.append(("Target now", f"{plan['tp_frac']:.1%} {toward} the entry"))
     if plan.get("risk_amount"):
         out.append(("1R now", f"{plan['risk_amount']:,.2f}"))
     if plan.get("planned_r") is not None:
@@ -137,7 +154,7 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
         t["planned_r"] = plan["planned_r"] if plan else sig.get("planned_r")
         t["exits_edited"] = bool(plan and plan["kind"] == "edit")
         if plan:
-            t["entry_items"] = t["entry_items"] + plan_items(plan)
+            t["entry_items"] = t["entry_items"] + plan_items(plan, t["side"])
         out.append(t)
     return out
 
@@ -196,7 +213,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "stop_px": x["entry_px"] * (1 - side * sl) if sl is not None else None,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "why": entry["reason"] if entry else None,
-        "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan) if plan else []),
+        "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
         "weight": x["position_value"] / x["equity"] if x["equity"] else 0.0,
     }

@@ -94,6 +94,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
+    templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -559,7 +560,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             _check_strategy_params(cfg, half_spread)
             _check_open_stop(st(), s, params, PROFILES[profile], float(cfg.fees.taker) + half_spread,
                              bool(form.get("confirm_looser")))
-            changes = _risk_changes(s.risk_profile, s.params, profile, params)
+            held = st().journal_book(name, s.starting_balance)["qty"]
+            changes = _risk_changes(s.risk_profile, s.params, profile, params, (held > 0) - (held < 0))
             if not changes:
                 raise ValueError("nothing changed")
             cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
@@ -633,7 +635,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     instruments=[h["pair"] for h in stored] or INSTRUMENT_HINTS, stored=stored, collect=collect,
                     notice=notice, request_years=REQUEST_YEARS, history_venue=_research_venue().label,
                     research_venue=_research_venue().name.lower(), spent_holdouts=spent,
-                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs())
+                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True))
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -783,12 +785,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "unknown export")
         return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
 
-    def exit_costs() -> dict:
+    def exit_costs(backtest: bool = False) -> dict:
         """What each leg of a trade costs, for the plan line under the exit fields: the taker fee and
         each instrument's half spread (measured, else the venue's assumption), exactly as the backtest
-        and paper charge them, so the form and the backtest quote the same round trip."""
+        and paper charge them, so the form and the backtest quote the same round trip. `markets`: a
+        perpetual's own taker fee, and in a backtest its assumed half spread (paper pays the live one)."""
         default = resolve_spread(None, "?/?", None).half_spread
-        return {"taker": float(resolve_fees(None, st()).fees.taker), "default_spread": default,
+        venue_fees = resolve_fees(None, st()).fees
+        per_market = {}
+        for m in markets.MARKETS:
+            t = markets.terms({"market": m})
+            if t is None:
+                continue
+            per_market[m] = {"taker": float(markets.fees_for({"market": m}, venue_fees).taker)}
+            if backtest and t.half_spread is not None:
+                per_market[m]["half_spread"] = t.half_spread
+        return {"taker": float(venue_fees.taker), "default_spread": default, "markets": per_market,
                 "spreads": {p: resolve_spread(None, p, st()).half_spread for p in INSTRUMENT_HINTS}}
 
     def backtest_form(request: Request, q, *, result=None, error="", job=None, saved=None):
@@ -819,7 +831,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
-                    runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs())
+                    runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs(backtest=True))
 
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_page(request: Request, _: str = Depends(require_pm)):
@@ -1336,26 +1348,29 @@ def _risk_form(params: dict) -> dict:
     return q
 
 
-def _risk_words(profile: str, params: dict) -> dict[str, str]:
-    """Each risk setting in words, for the decision log's before and after."""
+def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
+    """Each risk setting in words, for the decision log's before and after, in the terms of the position
+    held (side: 1 long, -1 short, 0 flat): a short's stop is above its entry (review round 11, M11-7)."""
     p = params
+    w = trading.exit_ways(params, side)
+    held = " (short)" if side < 0 else ""
     if p.get("stop_atr"):
-        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) below the entry"
+        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
     elif p.get("stop_swing_bars"):
-        stop = f"at the lowest low of {p['stop_swing_bars']} bars"
+        stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):
-        stop = f"{p['stop_loss'] * 100:g}% below the entry"
+        stop = f"{p['stop_loss'] * 100:g}% {w['stop']} the entry{held}"
     else:
         stop = "none"
     target = (f"{p['take_profit_r']:g}R after costs" if p.get("take_profit_r")
-              else f"{p['take_profit'] * 100:g}% above the entry" if p.get("take_profit") else "none")
+              else f"{p['take_profit'] * 100:g}% {w['tp']} the entry{held}" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
             "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",
             "Largest order": f"{p['max_notional']:,.2f}" if p.get("max_notional") else "no cap"}
 
 
-def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict) -> list[str]:
-    before, after = _risk_words(old_profile, old), _risk_words(new_profile, new)
+def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict, side: int = 0) -> list[str]:
+    before, after = _risk_words(old_profile, old, side), _risk_words(new_profile, new, side)
     return [f"{k} {before[k]} to {after[k]}" for k in before if before[k] != after[k]]
 
 

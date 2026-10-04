@@ -242,7 +242,7 @@
     <input type="hidden" name="instrument" value="{{ s.instrument }}">
     <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
     <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
-    {{ exit_fields(settings_pre, costs) }}
+    {{ exit_fields(settings_pre, costs, position.side if position else none, s.params) }}
     <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
     {% if x.qty %}<div class="field"><label class="check" style="margin-top:10px"><input type="checkbox" name="confirm_looser" value="1"> Accept a looser stop on the open position</label></div>{% endif %}
     <div class="field" style="margin-top:12px"><label for="r-settings">Reason for the decision log</label><input id="r-settings" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason"></div>

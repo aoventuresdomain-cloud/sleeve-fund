@@ -15,32 +15,35 @@
 {% endfor %}
 {% endmacro %}
 
-{% macro exit_fields(pre, costs=none) %}
+{% macro exit_fields(pre, costs=none, side=none, params=none) %}
 {# One stop and one target, each set one way: the kind is read back from whichever value is filled in.
    The plan line under them (console.js exitPlan) prices the plan in R with the same costs the backtest
    and paper charge. #}
 {% set stop_kind = 'atr' if pre.get('stop_atr') else 'swing' if pre.get('stop_swing_bars') else 'pct' if pre.get('stop_loss_pct') else '' %}
 {% set tp_kind = 'r' if pre.get('take_profit_r') else 'pct' if pre.get('take_profit_pct') else '' %}
-<div class="exit-fields" {% if costs %}data-costs="{{ costs|tojson|forceescape }}"{% endif %}>
+{# Which way the stop and target sit: for the side held (side), else for every side the strategy can take,
+   the form's own market and shorts fields, or the strategy's (params). console.js redoes it as they change. #}
+{% set w = exit_ways(params if params is not none else pre, side) %}
+<div class="exit-fields" {% if costs %}data-costs="{{ costs|tojson|forceescape }}"{% endif %}{% if side %} data-side="{{ side }}"{% endif %}{% if params is not none %} data-market="{{ params.get('market', 'spot') }}" data-shorts="{{ '1' if params.get('allow_short') else '' }}"{% endif %}>
   <div class="grid2">
     <div class="field"><label for="stop_kind">Stop-loss</label><select id="stop_kind" data-kind="stop">
       <option value="" {{ 'selected' if not stop_kind }}>None</option>
-      <option value="pct" {{ 'selected' if stop_kind == 'pct' }}>A % below the entry</option>
-      <option value="atr" {{ 'selected' if stop_kind == 'atr' }}>Average true ranges below the entry</option>
-      <option value="swing" {{ 'selected' if stop_kind == 'swing' }}>At the recent low</option>
+      <option value="pct" {{ 'selected' if stop_kind == 'pct' }} data-exit-tpl="A % {stop} the entry">A % {{ w.stop }} the entry</option>
+      <option value="atr" {{ 'selected' if stop_kind == 'atr' }} data-exit-tpl="Average true ranges {stop} the entry">Average true ranges {{ w.stop }} the entry</option>
+      <option value="swing" {{ 'selected' if stop_kind == 'swing' }} data-exit-tpl="At the recent {swing_short}">At the recent {{ w.swing_short }}</option>
     </select></div>
-    <div class="field" data-stop="pct"><label for="stop_loss_pct">Stop, % below entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.01" placeholder="e.g. 5" value="{{ pre.get('stop_loss_pct', '') }}"></div>
-    <div class="field" data-stop="atr"><label for="stop_atr">Stop, average true ranges below entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>
+    <div class="field" data-stop="pct"><label for="stop_loss_pct" data-exit-tpl="Stop, % {stop} entry">Stop, % {{ w.stop }} entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.01" placeholder="e.g. 5" value="{{ pre.get('stop_loss_pct', '') }}"></div>
+    <div class="field" data-stop="atr"><label for="stop_atr" data-exit-tpl="Stop, average true ranges {stop} entry">Stop, average true ranges {{ w.stop }} entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>
     <div class="field" data-stop="atr"><label for="atr_bars">Average true range over, bars</label><input id="atr_bars" name="atr_bars" type="number" min="2" max="500" step="1" value="{{ pre.get('atr_bars', 14) }}"></div>
-    <div class="field" data-stop="swing"><label for="stop_swing_bars">Stop at the lowest low of the last, bars</label><input id="stop_swing_bars" name="stop_swing_bars" type="number" min="2" max="500" step="1" placeholder="e.g. 20" value="{{ pre.get('stop_swing_bars', '') }}"></div>
+    <div class="field" data-stop="swing"><label for="stop_swing_bars" data-exit-tpl="Stop at the {swing} of the last, bars">Stop at the {{ w.swing }} of the last, bars</label><input id="stop_swing_bars" name="stop_swing_bars" type="number" min="2" max="500" step="1" placeholder="e.g. 20" value="{{ pre.get('stop_swing_bars', '') }}"></div>
   </div>
   <div class="grid2">
     <div class="field"><label for="tp_kind">Take-profit</label><select id="tp_kind" data-kind="tp">
       <option value="" {{ 'selected' if not tp_kind }}>None</option>
-      <option value="pct" {{ 'selected' if tp_kind == 'pct' }}>A % above the entry</option>
+      <option value="pct" {{ 'selected' if tp_kind == 'pct' }} data-exit-tpl="A % {tp} the entry">A % {{ w.tp }} the entry</option>
       <option value="r" {{ 'selected' if tp_kind == 'r' }}>A multiple of the risk (R), after costs</option>
     </select></div>
-    <div class="field" data-tp="pct"><label for="take_profit_pct">Target, % above entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.01" placeholder="e.g. 15" value="{{ pre.get('take_profit_pct', '') }}"></div>
+    <div class="field" data-tp="pct"><label for="take_profit_pct" data-exit-tpl="Target, % {tp} entry">Target, % {{ w.tp }} entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.01" placeholder="e.g. 15" value="{{ pre.get('take_profit_pct', '') }}"></div>
     <div class="field" data-tp="r"><label for="take_profit_r">Target in R, after costs</label><input id="take_profit_r" name="take_profit_r" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 2" value="{{ pre.get('take_profit_r', '') }}"></div>
     <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
   </div>

@@ -1,6 +1,7 @@
 """Long and short on a perpetual (plan L1-L3, 4 Oct 2026): the margin account, short and flipping trades,
 funding, the liquidation price and guard, trade pairing, and a paper restart that carries a short."""
 
+import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -638,3 +639,60 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     assert "· 0.59× · liq" in html  # the header
     csv = c.get("/exports/trades.csv?sleeve=pp-fund", auth=AUTH)
     assert csv.status_code == 200 and "funding" in csv.text.splitlines()[0] and "98.6" in csv.text
+
+
+# --- review round 11, M11-7: exits in the position's own terms -----------------
+
+
+def test_a_short_swing_stop_rests_at_the_highest_high(prices, instrument):
+    closes = [100.0, 100.5, 100.8, 101.5, 102.0, 103.0, 104.6, 104.6]
+    feed = _path(prices, closes)
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "stop_swing_bars": 3}, half_spread=0)
+    shorts = [d for d in res.decisions.values() if d["intent"] == "entry" and d["signal"].get("side") == "short"]
+    stops = [d for d in res.decisions.values() if d["intent"] == "stop_loss" and "resting buy" in d["reason"]]
+    assert shorts and stops
+    entry_px, level = stops[0]["signal"]["entry_px"], stops[0]["signal"]["trigger"]
+    assert level > entry_px and "above the" in stops[0]["reason"] and "highest high" in stops[0]["reason"]
+    assert "lowest low" not in stops[0]["reason"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_exit_plan_line_prices_a_short_as_the_strategy_does():
+    import json
+    import re
+    import subprocess
+    from pathlib import Path
+
+    from sleeve_fund.strategies.base import gain_at_target, loss_at_stop, r_target
+
+    js = (Path(__file__).parent.parent / "sleeve_fund" / "dashboard" / "static" / "console.js").read_text()
+    math = re.search(r"^  const exitMath = \{.*?^  \};$", js, re.S | re.M).group(0)
+    cases = [(stop, tp, leg, side) for stop in (0.01, 0.03) for tp in (0.02, 0.1) for leg in (0.0006, 0.0085)
+             for side in (1, -1)]
+    script = math + f"\nconsole.log(JSON.stringify({json.dumps(cases)}.map(([s, t, l, d]) => "\
+        "[exitMath.loss(s, l, d), exitMath.gain(t, l, d), exitMath.rTarget(2, s, l, d)])));"
+    got = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    for (stop, tp, leg, side), (loss, gain, rt) in zip(cases, got):
+        assert loss == pytest.approx(loss_at_stop(stop, leg, side), abs=1e-15)
+        assert gain == pytest.approx(gain_at_target(tp, leg, side), abs=1e-15)
+        assert rt == pytest.approx(r_target(2, stop, leg, side), abs=1e-15)
+
+
+def test_an_open_shorts_exits_form_and_decision_log_say_above(client):  # noqa: F811
+    from test_dashboard import AUTH, SAME
+
+    c, store = client
+    store.create_sleeve(name="pp-x", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
+    flat = c.get("/sleeves/pp-x", auth=AUTH).text
+    assert "A % below (a short: above) the entry" in flat  # flat and long/short: both ways
+    store.record_fill("pp-x", side="SELL", qty=0.05, price=60_000.0, fee=1.5, order_id="o1", trade_id="t1")
+    store.record_equity("pp-x", equity=10_000.0, cash=12_998.5, qty=-0.05, price=60_000.0, benchmark=10_000)
+    html = c.get("/sleeves/pp-x", auth=AUTH).text
+    assert 'data-side="-1"' in html and "A % above the entry" in html and "Target, % below entry" in html
+    assert "61,200" in html  # the 2% stop rests above the entry
+    form = {"risk_profile": "balanced", "stop_loss_pct": "1.5", "reason": "tighter"}
+    r = c.post("/sleeves/pp-x/settings", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "saved=settings" in r.headers["location"], r.headers["location"]
+    log = store.decisions("pp-x", limit=5)[0]["reason"]
+    assert "Stop-loss 2% above the entry (short) to 1.5% above the entry (short)" in log
