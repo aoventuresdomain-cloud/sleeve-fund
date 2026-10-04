@@ -542,13 +542,14 @@ class Store:
             c.execute(account_retired_t.delete().where(account_retired_t.c.account == name))
 
     def move_sleeve(self, sleeve: str, account: str, qty: float) -> str:
-        """Move a strategy to another account; returns the account it left. Only while it is stopped or
-        flat (qty is its position now), so no position ever changes hands between accounts."""
-        s = self.sleeve(sleeve)
+        """Move a strategy to another account; returns the account it left. Only while it is flat (qty is
+        its position now, from the journal), so no position ever changes hands between accounts, whether
+        the strategy is running or stopped (review round 8)."""
+        self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest has no account")
-        if s.desired_state == "running" and abs(qty) > 1e-12:
-            raise ValueError("stop the strategy or flatten it before moving it: a position can't change accounts")
+        if abs(qty) > 1e-12:
+            raise ValueError("flatten the strategy before moving it: a position can't change accounts")
         target = self._account(account)
         if target["retired_at"]:
             raise ValueError(f"{account} is retired")

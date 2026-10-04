@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
+{% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
@@ -91,7 +91,7 @@
       <tr><th scope="row">Position</th><td class="num">{% if x.qty > 0 %}{{ '%.6g'|format(x.qty) }} {{ base }}{% else %}None{% endif %}</td></tr>
       <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
       <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
-      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif s.params.stop_loss %}{{ (s.params.stop_loss * 100)|round(1) }}% below entry{% elif s.params.stop_atr %}{{ s.params.stop_atr }} ATR ({{ s.params.atr_bars or 14 }} bars) below entry{% elif s.params.stop_swing_bars %}Under the {{ s.params.stop_swing_bars }}-bar low{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
+      <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% elif s.params.take_profit_r %}{{ s.params.take_profit_r }}x the stop's distance{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
       <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
@@ -173,9 +173,9 @@
     <table class="compact kv">
       <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
-      {% if not backtest_id %}{% set movable = s.desired_state != 'running' or x.qty <= 0 %}
+      {% if not backtest_id %}{% set movable = x.qty <= 0 %}
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
-        <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Stop or flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
+        <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}
@@ -244,7 +244,7 @@
 <dialog id="dlg-move" aria-labelledby="dlg-move-h">
   <form method="post" action="/sleeves/{{ s.name }}/account">
     <h2 id="dlg-move-h">Move {{ s.name }} to another account</h2>
-    <p>Its history stays with the strategy. Only a stopped or flat strategy can move, so no position changes accounts.</p>
+    <p>Its history stays with the strategy. Only a flat strategy can move, so no position changes accounts.</p>
     <label for="move-to">Account</label>
     <select id="move-to" name="account" required>{% for a in accounts if a.name != account %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' or a.retired_at }}>{{ a.name }} ({{ 'retired' if a.retired_at else 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select>
     <label for="r-move">Reason for the decision log</label>
