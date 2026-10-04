@@ -1021,7 +1021,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     from urllib.parse import parse_qs, urlparse
 
     from sleeve_fund import history
-    from tests.test_research import _stored_minutes
+    from test_research import _stored_minutes
 
     c, _ = client
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
