@@ -162,7 +162,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.paper", description="Run one paper sleeve")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("sleeve", nargs="?", type=Path, help="sleeve TOML, e.g. configs/sleeves/btc_trend_smoke.toml")
+    src.add_argument("sleeve", nargs="?", type=Path, help="sleeve TOML, e.g. configs/examples/btc_trend_smoke.toml")
     src.add_argument("--db-sleeve", help="run the named sleeve from the database (journal, controls, risk guard)")
     ap.add_argument("--minutes", type=float, default=0, help="stop after N minutes (0 = run until Ctrl+C)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

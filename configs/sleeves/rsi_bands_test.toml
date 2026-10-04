@@ -1,0 +1,18 @@
+# Test strategy 2 (PM, 4 Oct 2026): long when RSI(14) closes at or below 30 until it reaches 55;
+# short at 70 until 50 (held flat until short positions exist).
+
+[sleeve]
+name = "rsi-bands-test"
+strategy = "rsi_bands"
+instrument = "BTC/USD"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
+starting_balance = 10000
+warmup_bars = 42                      # three RSI periods, from the stored history
+risk_profile = "balanced"
+
+[params]
+rsi_period = 14
+long_entry = 30.0
+long_exit = 55.0
+short_entry = 70.0
+short_exit = 50.0

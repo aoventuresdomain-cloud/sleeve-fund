@@ -1,0 +1,7 @@
+# Clean slates for the book. On every start the supervisor applies each entry it hasn't applied yet:
+# every strategy then on the book is stopped and archived. Journals stay (nothing is deleted), and an
+# archived strategy can be brought back from its page. Strategies seeded afterwards are untouched.
+
+[[clear]]
+id = "2026-10-04"
+reason = "PM asked to remove every existing strategy and start again with two test strategies"

@@ -42,7 +42,7 @@ import urllib.request, urllib.error
 try: urllib.request.urlopen('http://localhost:8000/'); print(200)
 except urllib.error.HTTPError as e: print(e.code)")
 echo "dashboard: with password $CODE, without $NOAUTH"
-[ "$HEART" -ge 3 ] || { echo "FAIL: expected 3 heartbeating sleeves (BTC smoke, BTC daily, SUI)"; exit 1; }
+[ "$HEART" -ge 3 ] || { echo "FAIL: expected 3 heartbeating sleeves (the two seeded test strategies and SUI)"; exit 1; }
 [ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }

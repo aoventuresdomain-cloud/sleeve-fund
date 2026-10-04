@@ -1596,3 +1596,26 @@ def test_sub_dollar_numbers_read_in_full(client):
     page = c.get("/orders", auth=AUTH).text
     assert "9,926.15" in page and "filled</div>" not in page
     assert "0.076500" in page  # the average price at the decimals the Why text uses
+
+
+def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, tmp_path):
+    """PM, 4 Oct 2026: the book's equity starts again from the new strategies; the strategies the clean
+    slate put away keep their history, their pages and a "Previous book" list, and can be brought back."""
+    from sleeve_fund.supervisor import clear
+
+    c, store = client
+    store.create_sleeve(name="old-one", strategy="trend_filter", instrument="BTC/USD",
+                        bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=7000)
+    store.record_equity("old-one", equity=6500, cash=6500, qty=0, price=1, benchmark=7000)
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "new book"\n')
+    clear(store, str(path))
+    store.create_sleeve(name="new-one", strategy="ping_pong", instrument="BTC/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10000)
+    assert set(store.previous_book()) == {"old-one"}
+    home = c.get("/", auth=AUTH).text
+    assert "10,000.00" in home and "17,000.00" not in home  # the book starts from the new strategy only
+    assert "Previous book (1)" in home and 'href="/sleeves/old-one"' in home
+    assert c.get("/sleeves/old-one", auth=AUTH).status_code == 200
+    store.unarchive("old-one")  # brought back: it rejoins the book
+    assert store.previous_book() == {}
