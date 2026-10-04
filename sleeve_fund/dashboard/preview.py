@@ -72,7 +72,9 @@ def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFram
 
 
 # Short bars mean a lot of rows: a year of 1-minute bars is 525,600, and the engine holds every bar
-# in memory. These caps keep a dashboard backtest inside the server's memory and under a minute.
+# in memory. A year at 1 minute takes about 20 s and 0.7 GB (measured 4 Oct 2026, with the backtest
+# journal in memory); the server has 4 GB shared with paper trading, so longer runs wait for the
+# engine to be fed in chunks.
 MAX_DAYS = {1: 365, 5: 365 * 3}
 INTRADAY_CACHE_SECONDS = 15 * 60
 CHART_CANDLES = 720  # what the price chart shows at most
@@ -182,14 +184,16 @@ def _data_note(prices: pd.DataFrame, minutes: int) -> dict:
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
-        risk_profile: str | None = None, spread_quote=None, minutes: int = 1440) -> dict:
+        risk_profile: str | None = None, spread_quote=None, minutes: int = 1440, progress=None,
+        keep: dict | None = None) -> dict:
     """Backtest these settings on the venue's history, deciding on bars of `minutes` (daily by default). days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
     cap is the risk profile's largest position as a share of equity, applied exactly as paper does,
     and the buy-and-hold benchmark is held at the same exposure. risk_profile runs the paper runtime
     itself (cap, drawdown halt, daily-loss pause, journal) and sets cap from the profile. spread_quote
     (sleeve_fund.spreads.resolve) is the spread charged on orders that take liquidity; without one,
-    the venue's assumption."""
+    the venue's assumption. progress(fraction done) is called as the run goes; keep, when given,
+    receives the run's journal under "journal" (with a risk profile), for Store.save_backtest."""
     from sleeve_fund import spreads
     from sleeve_fund.fees import resolve
 
@@ -219,9 +223,19 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
             exec_prices = execution_history(pair, profile.name, prices.index[0] - pd.Timedelta(minutes=minutes),
                                             prices.index[-1], step)
             matched_on = None if exec_prices is None else f"{step}-minute"
+    tick = None
+    if progress is not None:
+        t0, t1 = prices.index[0].to_pydatetime(), prices.index[-1].to_pydatetime()
+        whole = max((t1 - t0).total_seconds(), 1.0)
+
+        def tick(now):
+            progress(min(1.0, max(0.0, (now - t0).total_seconds() / whole)))
+
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
                        exec_minutes=5 if matched_on == "5-minute" else 1, risk_profile=risk_profile,
-                       half_spread=spread.half_spread, bar_minutes=minutes)
+                       half_spread=spread.half_spread, bar_minutes=minutes, progress=tick)
+    if keep is not None:
+        keep["journal"] = res.journal
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     if minutes < 1440:  # judge returns day by day, whatever the bar length, so Sharpe is annualised right
         equity, bench = _daily(res.equity), _daily(bench)

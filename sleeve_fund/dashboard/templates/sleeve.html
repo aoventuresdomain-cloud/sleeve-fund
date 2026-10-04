@@ -7,7 +7,8 @@
 <div class="page-head" data-live="head">
   <h1>{{ s.name }}</h1> {{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>
   <div class="actions">
-    {% if s.desired_state == 'running' %}
+    {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
+    {% elif s.desired_state == 'running' %}
       {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {{ 'disabled' if x.qty <= 0 }}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
@@ -19,6 +20,7 @@
 </div>
 
 <div data-live="banners">
+{% if backtest_id %}<div class="banner" role="status">A saved backtest: the paper runtime replayed over history, journaled as paper journals. It never trades, takes no commands and is not in the book.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived: hidden from the home page's strategy list. Its history and decisions stay here, and its cash still counts in the book.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
@@ -163,7 +165,7 @@
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
   'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
-<div data-live="dialogs" data-live-forms>
+{% if not backtest_id %}<div data-live="dialogs" data-live-forms>
 <datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
 <dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
@@ -176,7 +178,7 @@
   </form>
 </dialog>
 {% endfor %}
-</div>
+</div>{% endif %}
 {% endblock %}
 
 {% block scripts %}

@@ -16,8 +16,8 @@ from typing import Any
 from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
-from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, Price, PriceType, Quantity,
-                                   TimeInForce)
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, OrderStatus, Price, PriceType,
+                                   Quantity, TimeInForce)
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
@@ -159,6 +159,7 @@ class LongFlatStrategy(Strategy):
         self._entry_qty = 0.0
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
+        self._last_order = None  # client order id of the last order sent, until the venue has it
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -318,7 +319,7 @@ class LongFlatStrategy(Strategy):
         w = min(max(float(raw), 0.0), 1.0, self._cap_pct())
         if w == 0:
             self._exit_lock = False
-        if self.cache.orders_inflight(strategy_id=self.strategy_id) or self._maker_working():
+        if self._busy() or self._maker_working():
             return  # the last decision is still being carried out
         is_long = self._is_long()
         close = bar.close.as_double()
@@ -387,7 +388,7 @@ class LongFlatStrategy(Strategy):
         cfg = self._cfg
         if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
             return False
-        if self.cache.orders_inflight(strategy_id=self.strategy_id):
+        if self._busy():
             return False
         move = price / self._entry_px - 1
         if self._backtest:
@@ -479,6 +480,7 @@ class LongFlatStrategy(Strategy):
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
+        self._last_order = order.client_order_id
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
@@ -559,6 +561,21 @@ class LongFlatStrategy(Strategy):
                 total += (b.free if free else b).as_decimal()
         return total
 
+    def _unsent(self, side=None):
+        """The last order, if it is still on its way to the venue (INITIALIZED): a backtest's market order
+        sent from inside a bar or tick fills only after that handler returns, so until then neither
+        the account nor orders_inflight shows it. A risk halt's flatten and the bar's own exit used
+        to both sell the whole position that way."""
+        if self._last_order is None:
+            return None
+        order = self.cache.order(self._last_order)
+        if order is None or order.status != OrderStatus.INITIALIZED or (side is not None and order.side != side):
+            return None
+        return order
+
+    def _busy(self) -> bool:
+        return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or self._unsent() is not None
+
     def _is_long(self) -> bool:
         return self._position_qty() >= self._min_qty()
 
@@ -569,6 +586,8 @@ class LongFlatStrategy(Strategy):
             self._pending_exit = (intent, reason, values)
             self.cancel_all_orders(self._cfg.instrument_id)
             return
+        if self._unsent(OrderSide.SELL) is not None:
+            return  # already selling everything; the account just doesn't show it yet
         step = self.instrument.size_increment.as_decimal()
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():

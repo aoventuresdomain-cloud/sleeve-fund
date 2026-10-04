@@ -1,7 +1,7 @@
 """What turns a strategy into a sleeve: journal, PM controls and the risk guard.
 
 A strategy gets a SleeveRuntime in paper and live, and backtests run with the same
-runtime on a throwaway journal (SleeveRuntime.for_backtest), so sizing, halts, pauses
+runtime on an in-memory journal (SleeveRuntime.for_backtest), so sizing, halts, pauses
 and the journal behave identically in every mode. Research runs without one. The runtime
 is called from the strategy's own thread (a timer and fill events), so there is no
 concurrency inside it.
@@ -9,7 +9,7 @@ concurrency inside it.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sleeve_fund import risk
 from sleeve_fund.store import Store, utcnow
@@ -24,12 +24,17 @@ class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and
     # rests its stop at the simulated venue instead of watching every trade.
     backtest = False
+    # Backtests: called with the simulated time at every tick, so a long run can report how far it is.
+    progress = None
 
     @classmethod
     def for_backtest(cls, *, strategy: str, instrument: str, bar_spec: str, starting_balance: float,
                      risk_profile: str, params: dict | None = None, bar_seconds: int = 86_400) -> "SleeveRuntime":
-        """The paper runtime on an in-memory journal, ticking on the backtest's clock once a bar."""
-        store = Store.in_memory()
+        """The paper runtime on an in-memory journal, ticking on the backtest's clock once a bar.
+        Store.save_backtest copies the journal into the real one when the run is worth keeping."""
+        from sleeve_fund.paper.journal import MemoryJournal
+
+        store = MemoryJournal()
         store.create_sleeve(name="backtest", strategy=strategy, instrument=instrument, bar_spec=bar_spec,
                             starting_balance=starting_balance, risk_profile=risk_profile, params=params or {})
         rt = cls(store, "backtest", tick_seconds=bar_seconds)
@@ -106,6 +111,8 @@ class SleeveRuntime:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now."""
         now = self.now()
         self.store.heartbeat(self.name)
+        if self.progress is not None:
+            self.progress(now)
         if price <= 0:
             return None
         if self.bench_base_price is None:

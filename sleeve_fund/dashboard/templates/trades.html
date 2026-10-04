@@ -8,13 +8,14 @@
   <div class="actions">
     <form class="inline" method="get" action="/trades">
       <label class="sr-only" for="t-sleeve">Strategy</label>
-      <select id="t-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <select id="t-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% if backtest %}<option value="{{ sleeve }}" selected>Backtest {{ backtest.run_id }}</option>{% endif %}{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
       <noscript><button>Show</button></noscript>
     </form>
-    <a class="button secondary" href="/exports/trades.csv{{ '?sleeve=' ~ sleeve if sleeve }}">Download CSV</a>
+    <a class="button secondary" href="/exports/trades.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
   </div>
   <p class="lede">What is held now and every closed round trip, after fees. Open <strong>Why</strong> on any row for the signal the model acted on, recorded when it sent the order.</p>
 </div>
+{% if backtest %}<div class="banner" role="status">Showing a saved backtest: the paper runtime replayed over history. <a href="/backtest/{{ backtest.run_id }}">Back to the result</a></div>{% endif %}
 
 <section class="ledger" aria-label="Trade figures">
   <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div><div class="s">{{ h.exposure|money }} gross exposure</div></div>

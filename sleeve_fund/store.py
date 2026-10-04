@@ -8,6 +8,7 @@ runs. Tables are plain and typed so reports and BI tools can query them directly
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,9 +26,11 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    delete,
     event,
     func,
     insert,
+    or_,
     select,
     update,
 )
@@ -214,9 +217,37 @@ sleeve_archive_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
 )
+# A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
+# fills, equity marks and events) in the ordinary tables under a sleeve named BACKTEST_PREFIX + id, so
+# the run opens in the same Orders, Trades and strategy screens as paper. A new table: CREATE TABLE.
+backtests_t = Table(
+    "backtests",
+    metadata,
+    Column("id", String(16), primary_key=True),
+    Column("sleeve", String(64), nullable=False),
+    Column("key", String(64), nullable=False),  # the settings that made it, hashed, to reuse a fresh run
+    Column("title", Text, nullable=False),
+    Column("query", Text, nullable=False),  # the backtest page's settings, as a query string
+    Column("created_at", TS, nullable=False),
+    # JSON text, not a JSON column: statistics such as a Sharpe ratio can be NaN, which Python's json
+    # round-trips but Postgres's json type refuses.
+    Column("result", Text, nullable=False),
+    Index("backtests_key", "key", "created_at"),
+)
+# Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
+BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
+
+
+def is_backtest(name: str | None) -> bool:
+    return bool(name) and name.startswith(BACKTEST_PREFIX)
+
+
+def _not_backtest(col):
+    """Rows that belong to paper or live (or to no strategy), not to a saved backtest."""
+    return or_(col.is_(None), ~col.like(BACKTEST_PREFIX + "%"))
 
 
 def utcnow() -> datetime:
@@ -332,9 +363,14 @@ class Store:
             raise KeyError(f"no strategy {name!r}")
         return Sleeve.from_row(row)
 
-    def sleeves(self) -> list[Sleeve]:
+    def sleeves(self, include_backtests: bool = False) -> list[Sleeve]:
+        """Paper and live strategies. Saved backtests are left out unless asked for: they never run,
+        count towards the book, or raise alerts."""
+        q = select(sleeves_t).order_by(sleeves_t.c.created_at, sleeves_t.c.id)
+        if not include_backtests:
+            q = q.where(_not_backtest(sleeves_t.c.name))
         with self.engine.connect() as c:
-            rows = c.execute(select(sleeves_t).order_by(sleeves_t.c.created_at, sleeves_t.c.id)).all()
+            rows = c.execute(q).all()
         return [Sleeve.from_row(r) for r in rows]
 
     def _update_sleeve(self, name: str, **values) -> None:
@@ -344,6 +380,8 @@ class Store:
     def set_desired_state(self, name: str, state: str) -> None:
         if state not in {"running", "stopped"}:
             raise ValueError(f"bad desired state {state!r}")
+        if is_backtest(name):
+            raise ValueError("a saved backtest can't be started")
         self._update_sleeve(name, desired_state=state)
 
     def set_status(self, name: str, status: str, reason: str = "", paused_until: datetime | None = None) -> None:
@@ -405,8 +443,7 @@ class Store:
 
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
         q = select(orders_t)
-        if sleeve:
-            q = q.where(orders_t.c.sleeve == sleeve)
+        q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         if statuses:
             q = q.where(orders_t.c.status.in_(statuses))
         with self.engine.connect() as c:
@@ -414,8 +451,7 @@ class Store:
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
-        if sleeve:
-            q = q.where(orders_t.c.sleeve == sleeve)
+        q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         with self.engine.connect() as c:
             return {s: n for s, n in c.execute(q)}
 
@@ -562,8 +598,7 @@ class Store:
 
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         q = select(fills_t)
-        if sleeve:
-            q = q.where(fills_t.c.sleeve == sleeve)
+        q = q.where(fills_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(fills_t.c.sleeve))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(fills_t.c.ts.desc(), fills_t.c.id.desc()).limit(limit)))
 
@@ -594,8 +629,7 @@ class Store:
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         q = select(events_t).where(events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))
-        if sleeve:
-            q = q.where(events_t.c.sleeve == sleeve)
+        q = q.where(events_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(events_t.c.sleeve))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(events_t.c.id.desc()).limit(limit)))
 
@@ -611,7 +645,7 @@ class Store:
         q = (select(events_t, acks_t.c.ts.label("acked_at"), acks_t.c.actor.label("acked_by"),
                     acks_t.c.note.label("ack_note"))
              .select_from(events_t.outerjoin(acks_t, acks_t.c.event_id == events_t.c.id))
-             .where(events_t.c.level.in_(("warning", "error"))))
+             .where(events_t.c.level.in_(("warning", "error")), _not_backtest(events_t.c.sleeve)))
         if not include_acked:
             q = q.where(acks_t.c.event_id.is_(None))
         with self.engine.connect() as c:
@@ -622,7 +656,8 @@ class Store:
 
     def open_alert_count(self) -> int:
         q = (select(func.count()).select_from(events_t.outerjoin(acks_t, acks_t.c.event_id == events_t.c.id))
-             .where(events_t.c.level.in_(("warning", "error")), acks_t.c.event_id.is_(None)))
+             .where(events_t.c.level.in_(("warning", "error")), acks_t.c.event_id.is_(None),
+                    _not_backtest(events_t.c.sleeve)))
         with self.engine.connect() as c:
             return c.execute(q).scalar() or 0
 
@@ -635,7 +670,8 @@ class Store:
                 c.execute(insert(acks_t).values(event_id=event_id, ts=utcnow(), actor=actor, note=note.strip()))
 
     def events_of(self, kinds: tuple[str, ...], limit: int = 100) -> list[dict]:
-        q = select(events_t).where(events_t.c.kind.in_(kinds)).order_by(events_t.c.id.desc()).limit(limit)
+        q = (select(events_t).where(events_t.c.kind.in_(kinds), _not_backtest(events_t.c.sleeve))
+             .order_by(events_t.c.id.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
@@ -660,6 +696,78 @@ class Store:
             return None
         return None
 
+    # --- saved backtests ------------------------------------------------------------
+
+    def save_backtest(self, journal, *, run_id: str, key: str, title: str, query: str, result: dict) -> str:
+        """Copy a backtest's in-memory journal (sleeve_fund.paper.journal) into these tables under its
+        own name, with the result the backtest page shows. Returns the backtest's strategy name."""
+        name = BACKTEST_PREFIX + run_id
+        src = journal.sleeve_row
+        now = utcnow()
+        with self.engine.begin() as c:
+            c.execute(insert(sleeves_t).values(
+                name=name, strategy=src.strategy, instrument=src.instrument, bar_spec=src.bar_spec,
+                params=src.params, starting_balance=src.starting_balance, risk_profile=src.risk_profile,
+                warmup_bars=0, desired_state="stopped", status="stopped", status_reason="backtest",
+                paused_until=None, heartbeat_at=None, created_at=now, updated_at=now))
+            marks = journal.marks_to_keep()
+            if marks:
+                c.execute(insert(equity_t), [dict(m, sleeve=name) for m in marks])
+            # Client order ids repeat from run to run (and orders.order_id is unique), so each run's are
+            # prefixed with its id, on the orders and on the fills that carry them.
+            def oid(x: str) -> str:
+                return f"{run_id}-{x}"[:64]
+
+            if journal.fills_:
+                c.execute(insert(fills_t), [{k: v for k, v in f.items() if k != "id"}
+                                            | {"sleeve": name, "order_id": oid(f["order_id"])}
+                                            for f in journal.fills_])
+            if journal.orders_:
+                c.execute(insert(orders_t), [{k: v for k, v in o.items() if k != "id"}
+                                             | {"sleeve": name, "order_id": oid(o["order_id"])}
+                                             for o in journal.orders_.values()])
+            if journal.events_:
+                c.execute(insert(events_t), [{k: v for k, v in e.items() if k != "id"} | {"sleeve": name}
+                                             for e in journal.events_])
+            # To the microsecond, so runs saved in the same second still sort (and prune) in order.
+            c.execute(insert(backtests_t).values(id=run_id, sleeve=name, key=key, title=title, query=query,
+                                                 created_at=datetime.now(timezone.utc), result=json.dumps(result)))
+        return name
+
+    def backtest(self, run_id: str) -> dict:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(backtests_t).where(backtests_t.c.id == run_id)))
+        if not rows:
+            raise KeyError(f"no backtest {run_id!r}")
+        return rows[0] | {"result": json.loads(rows[0]["result"])}
+
+    def fresh_backtest(self, key: str, since: datetime) -> dict | None:
+        """The latest run of exactly these settings made since `since`, to show again rather than rerun."""
+        q = (select(backtests_t.c.id).where(backtests_t.c.key == key, backtests_t.c.created_at >= since)
+             .order_by(backtests_t.c.created_at.desc()).limit(1))
+        with self.engine.connect() as c:
+            row = c.execute(q).first()
+        return self.backtest(row.id) if row else None
+
+    def backtests(self, limit: int = 50) -> list[dict]:
+        q = (select(backtests_t.c.id, backtests_t.c.sleeve, backtests_t.c.title, backtests_t.c.query,
+                    backtests_t.c.created_at).order_by(backtests_t.c.created_at.desc()).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def prune_backtests(self, keep: int = 50) -> int:
+        """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""
+        with self.engine.begin() as c:
+            old = [r.sleeve for r in c.execute(select(backtests_t.c.sleeve)
+                                               .order_by(backtests_t.c.created_at.desc()).offset(keep))]
+            if not old:
+                return 0
+            for t in (equity_t, fills_t, orders_t, events_t):
+                c.execute(delete(t).where(t.c.sleeve.in_(old)))
+            c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
+            c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))
+        return len(old)
+
     # --- PM commands and decisions ----------------------------------------------
 
     def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:
@@ -667,6 +775,8 @@ class Store:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
             raise ValueError("every command needs a reason")
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest takes no commands")
         self.sleeve(sleeve)  # raises if unknown
         with self.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
