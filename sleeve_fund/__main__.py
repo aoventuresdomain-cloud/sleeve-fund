@@ -62,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--stop-loss", type=float, help="exit if price falls this fraction below entry, e.g. 0.08")
     st.add_argument("--take-profit", type=float, help="exit if price rises this fraction above entry, e.g. 0.2")
     st.add_argument("--risk-per-trade", type=float, help="size so a stop-out loses this fraction of equity")
+    st.add_argument("--stop-atr", type=float, help="instead of --stop-loss: a stop this many average true ranges below entry")
+    st.add_argument("--atr-bars", type=int, help="bars the average true range is taken over (default 14)")
+    st.add_argument("--stop-swing-bars", type=int, help="instead of --stop-loss: a stop under the lowest low of this many bars")
+    st.add_argument("--take-profit-r", type=float, help="instead of --take-profit: a target this many stop distances up")
     st.add_argument("--risk-profile", default="balanced",
                     help="trade under this paper risk profile (cap, drawdown halt, daily-loss pause); 'none' for "
                          "uncapped and unguarded")
@@ -86,7 +90,9 @@ def main(argv: list[str] | None = None) -> int:
         req = StudyRequest(strategy=args.strategy, pair=f"{args.base}/{args.quote}", venue=args.venue,
                            minutes=args.minutes, risk_profile=profile_name, train_days=args.train_days,
                            test_days=args.test_days, holdout_days=args.holdout_days, use_holdout=args.use_holdout,
-                           stop_loss=args.stop_loss, take_profit=args.take_profit, risk_per_trade=args.risk_per_trade)
+                           stop_loss=args.stop_loss, take_profit=args.take_profit, risk_per_trade=args.risk_per_trade,
+                           stop_atr=args.stop_atr, stop_swing_bars=args.stop_swing_bars, atr_bars=args.atr_bars,
+                           take_profit_r=args.take_profit_r)
         try:
             out = run_store_study(req, store=_journal(), ledger_path=Path(args.ledger),
                                   out_dir=Path(args.out).parent if args.out else None)
@@ -117,7 +123,9 @@ def main(argv: list[str] | None = None) -> int:
         train_days=args.train_days,
         test_days=args.test_days,
         use_holdout=args.use_holdout,
-        exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade},
+        exits={"stop_loss": args.stop_loss, "take_profit": args.take_profit, "risk_per_trade": args.risk_per_trade,
+               "stop_atr": args.stop_atr, "stop_swing_bars": args.stop_swing_bars, "take_profit_r": args.take_profit_r,
+               **({"atr_bars": args.atr_bars} if args.stop_atr and args.atr_bars else {})},
         risk_profile=profile_name,
     )
     out = Path(args.out) if args.out else TEARSHEETS / f"{spec.name}_{dataset}.md"

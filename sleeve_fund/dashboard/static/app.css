@@ -572,3 +572,8 @@ table.movers .mv i { position: absolute; top: 0; height: 8px; border-radius: 2px
 table.movers .mv i.gain { background: var(--gain); } table.movers .mv i.loss { background: var(--loss); }
 table.movers tfoot th, table.movers tfoot td { border-top: 1px solid var(--line-strong); border-bottom: 0; color: var(--text); font-weight: 550; }
 td.health { line-height: 1.35; }
+
+/* --- exit plan under the stop and target fields ----------------------------- */
+.exit-fields .grid2 + .grid2 { margin-top: 12px; }
+.exit-plan { margin: 12px 0 0; padding: 9px 12px; border-radius: var(--r-sm); background: var(--neutral-bg); font-size: 13px; line-height: 1.5; }
+.exit-plan.warn { background: var(--warn-bg); }

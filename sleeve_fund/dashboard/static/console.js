@@ -476,9 +476,7 @@ window.Console = (() => {
         `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}.`,
         `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
-      const sl = $("stop_loss_pct").value, tp = $("take_profit_pct").value, rpt = $("risk_per_trade_pct").value;
-      if (sl || tp) items.push(`Exit any trade ${[sl && `${sl}% below entry`, tp && `${tp}% above entry`].filter(Boolean).join(" or ")}.`);
-      if (rpt) items.push(sl ? `Size each trade to lose about ${rpt}% of capital if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      items.push(...exitFields(form)());
       if ($("execution").value === "maker") items.push(`Rest each signal order as a post-only limit for the maker fee, and send whatever hasn't filled after ${$("maker_wait_minutes").value || 15} minutes at market. Protective exits go at market.`);
       if ($("max_notional").value) items.push(`Never place a single order above ${money.format(Number($("max_notional").value))} ${quote}.`);
       const ul = document.getElementById("summary");
@@ -502,9 +500,83 @@ window.Console = (() => {
     });
   }
 
+  // Exits: one kind of stop and one kind of target, with only the chosen one's inputs live, and a plan
+  // line pricing it in R with the costs the backtest and paper charge (the form's data-costs).
+  // Returns the plain-English exit sentences for the new-sleeve summary.
+  function exitFields(form) {
+    const box = form && form.querySelector(".exit-fields");
+    if (!box) return () => [];
+    if (box.exitDescribe) return box.exitDescribe;
+    const costs = box.dataset.costs ? JSON.parse(box.dataset.costs) : null;
+    const line = box.querySelector(".exit-plan");
+    const kind = {stop: box.querySelector("[data-kind=stop]"), tp: box.querySelector("[data-kind=tp]")};
+    const num = (n) => { const i = form.elements[n]; return i && !i.disabled && i.value !== "" ? Number(i.value) : null; };
+    const p2 = (x) => `${(x * 100).toFixed(2)}%`;
+    const rr = (x) => `${x >= 0 ? "+" : ""}${x.toFixed(2)}R`;
+    const sync = () => {
+      for (const k of ["stop", "tp"]) {
+        box.querySelectorAll(`[data-${k}]`).forEach((f) => {
+          const on = f.dataset[k] === kind[k].value;
+          f.hidden = !on;
+          f.querySelectorAll("input").forEach((i) => { i.disabled = !on; });
+        });
+      }
+      box.querySelector("[data-needs-stop]").hidden = !!kind.stop.value;
+      const rOpt = kind.tp.querySelector("option[value=r]");
+      rOpt.disabled = !kind.stop.value;  // a multiple of the stop's distance needs a stop
+      if (rOpt.disabled && kind.tp.value === "r") { kind.tp.value = ""; sync(); return; }
+      if (!line || !costs) return;
+      const pair = ((form.elements.instrument && form.elements.instrument.value) || "").toUpperCase();
+      const half = pair in costs.spreads ? costs.spreads[pair] : costs.default_spread;
+      const leg = costs.taker + half;  // each way: the taker fee and half the spread
+      const s = num("stop_loss_pct") !== null ? num("stop_loss_pct") / 100 : null;
+      const r = num("take_profit_r");
+      const t = num("take_profit_pct") !== null ? num("take_profit_pct") / 100 : (r !== null && s !== null ? r * s : null);
+      const parts = [];
+      let warn = false;
+      const loss = s !== null ? s + leg + (1 - s) * leg : null;  // 1R: what a stop-out loses, costs included
+      if (loss !== null) parts.push(`A stop-out loses 1R = ${p2(loss)} of the position: the ${p2(s)} stop plus ${p2(loss - s)} in fees and spread.`);
+      else if (kind.stop.value === "atr" || kind.stop.value === "swing") parts.push("The stop is set from the market at each entry, so 1R differs from trade to trade; each trade's R shows in the backtest.");
+      if (t !== null) {
+        const trip = leg + (1 + t) * leg, gain = t - trip;
+        if (gain <= 0) { warn = true; parts.push(`The ${p2(t)} target doesn't cover the ${p2(trip)} round trip, so every target hit would lose money. It can't be saved.`); }
+        else if (loss !== null) {
+          const R = gain / loss;
+          parts.push(`The target makes ${rr(R)} after costs (${p2(t)} less a ${p2(trip)} round trip), ${(t / s).toFixed(1)}:1 before costs.`);
+          if (R < 0.25) { warn = true; parts.push(`That is almost nothing for the risk: costs alone take ${p2(trip)}.`); }
+        } else parts.push(`The target makes ${p2(gain)} after a ${p2(trip)} round trip.`);
+      } else if (r !== null) {
+        const eg = 0.03, egLoss = eg + leg + (1 - eg) * leg, egT = r * eg;
+        parts.push(`The target is ${r}:1 before costs. On a 3% stop, for example, it makes ${rr((egT - leg - (1 + egT) * leg) / egLoss)} after costs.`);
+      }
+      line.hidden = !parts.length;
+      line.classList.toggle("warn", warn);
+      line.textContent = parts.join(" ");
+    };
+    kind.stop.addEventListener("change", sync); kind.tp.addEventListener("change", sync);
+    form.addEventListener("input", sync);
+    sync();
+    box.exitDescribe = () => {
+      sync();  // the summary may be asked before this form's own input listener has run
+      const out = [], r = num("take_profit_r"), atr = num("stop_atr"), swing = num("stop_swing_bars");
+      const stop = num("stop_loss_pct") !== null ? `${num("stop_loss_pct")}% below entry`
+        : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) below entry`
+        : swing !== null ? `just under the lowest low of the last ${swing} bars` : null;
+      const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% above entry`
+        : r !== null ? `${r} times the stop's distance above entry` : null;
+      if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);
+      if (line && !line.hidden) out.push(line.textContent);
+      const rpt = num("risk_per_trade_pct");
+      if (rpt) out.push(stop ? `Size each trade to lose about ${rpt}% of capital if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      return out;
+    };
+    return box.exitDescribe;
+  }
+
   // Order type: the wait only matters for maker-first orders, so it shows only then.
   function orderFields(formId) {
     const form = document.getElementById(formId);
+    exitFields(form);
     if (!form || !form.elements.execution) return;
     const wait = form.querySelector("[data-when-maker]");
     const sync = () => { wait.hidden = form.elements.execution.value !== "maker"; };

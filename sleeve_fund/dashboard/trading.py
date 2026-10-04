@@ -131,14 +131,22 @@ def open_lot(fills: list[dict]) -> dict | None:
     return opened
 
 
+def exit_fracs(params: dict, signal: dict | None) -> tuple[float | None, float | None]:
+    """The open position's stop and target as shares of its entry price: what its entry journaled
+    (an ATR or swing-low stop is set at entry), else the strategy's fixed % settings."""
+    sig = signal or {}
+    if "stop_frac" in sig or "tp_frac" in sig:
+        return sig.get("stop_frac"), sig.get("tp_frac")
+    return params.get("stop_loss"), params.get("take_profit")
+
+
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict]) -> dict | None:
     """An open position from a sleeve summary (with book extras), or None when flat."""
     if x["qty"] <= 0 or not x["entry_px"]:
         return None
     lot = open_lot(fills)
     entry = orders.get(lot["order_id"]) if lot else None
-    params = x["sleeve"].params
-    sl, tp = params.get("stop_loss"), params.get("take_profit")
+    sl, tp = exit_fracs(x["sleeve"].params, entry["signal"] if entry else None)
     cost = x["qty"] * x["entry_px"]
     return {
         "sleeve": x["sleeve"].name,

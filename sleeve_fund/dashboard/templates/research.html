@@ -24,7 +24,7 @@
   </div>
   {% endif %}
   {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}</div>{% endif %}
-  <form method="post" action="/research/run" class="study-form">
+  <form method="post" action="/research/run" class="study-form" id="study-form">
     <div class="grid2">
       <div class="field"><label for="strategy">Model</label><select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == pre.get('strategy') }}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
       {{ pair_field(instruments, pre) }}
@@ -35,7 +35,7 @@
       <div class="field"><label for="holdout_days">Holdout, most recent days</label><input id="holdout_days" name="holdout_days" type="number" min="0" step="1" value="{{ pre.get('holdout_days', 365) }}"></div>
       <div class="field"><label class="check"><input type="checkbox" name="use_holdout" {{ 'checked' if pre.get('use_holdout') == 'on' }}> Open the holdout</label><p class="hint">Once per model and instrument; a second opening fails G1.</p></div>
     </div>
-    <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('take_profit_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre) }}</details>
+    <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('stop_atr') or pre.get('stop_swing_bars') or pre.get('take_profit_pct') or pre.get('take_profit_r') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre, costs) }}</details>
     <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
     <p style="margin:10px 0 0"><button>Run study</button></p>
   </form>
@@ -69,6 +69,8 @@
 </section>
 {% endblock %}
 {% block scripts %}
+<script src="/static/console.js"></script>
+<script>Console.orderFields("study-form");</script>
 {% if job and job.status in ('queued', 'running') %}<script>
 (function () {
   const box = document.getElementById("study-job"), bar = box.querySelector(".progress"), text = document.getElementById("study-job-text");

@@ -286,7 +286,7 @@ def run_study(
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
     if exits:
         result.notes.append(
-            "Exits on top of the signal: " + ", ".join(f"{k.replace('_', ' ')} {v:.1%}" for k, v in exits.items())
+            "Exits on top of the signal: " + _exit_words(exits)
             + ". Both rest at the venue: the stop fills at its level (at market at once if the price is already "
             "through it), the target at its level, and within a bar the extreme nearer the open trades first. "
             "Paper watches both on every trade."
@@ -305,3 +305,21 @@ def run_study(
         result.holdout_benchmark = summary(hb_ret)
         log(chosen, "holdout", result.holdout["sharpe"])
     return result
+
+
+def _exit_words(exits: dict) -> str:
+    words = []
+    if "stop_loss" in exits:
+        words.append(f"stop-loss {exits['stop_loss']:.1%} below entry")
+    if "stop_atr" in exits:
+        words.append(f"stop-loss {exits['stop_atr']:g} average true ranges (over {exits.get('atr_bars', 14)} bars) "
+                     "below entry, set at each entry")
+    if "stop_swing_bars" in exits:
+        words.append(f"stop-loss under the lowest low of the last {exits['stop_swing_bars']} bars, set at each entry")
+    if "take_profit" in exits:
+        words.append(f"take-profit {exits['take_profit']:.1%} above entry")
+    if "take_profit_r" in exits:
+        words.append(f"take-profit {exits['take_profit_r']:g} times the stop's distance above entry")
+    if "risk_per_trade" in exits:
+        words.append(f"each trade sized to lose {exits['risk_per_trade']:.1%} of equity at the stop")
+    return ", ".join(words)
