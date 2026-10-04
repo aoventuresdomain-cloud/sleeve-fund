@@ -40,7 +40,7 @@ services:
     depends_on: { db: { condition: service_healthy } }
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD}
-    volumes: [backups:/backups, ./deploy/backup.sh:/backup.sh:ro]
+    volumes: [backups:/backups, research:/research:ro, ./deploy/backup.sh:/backup.sh:ro]
     entrypoint: ["bash", "/backup.sh"]
 
   # Keeps every instrument's minute history current from its venue, into the shared store that

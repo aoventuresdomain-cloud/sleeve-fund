@@ -6,9 +6,12 @@
 # A failed night is tried again an hour later, not a day. The result goes to status.json beside the
 # dumps, which the Operations page and the supervisor's alerts read. These dumps sit on this
 # machine's disk; the server's automatic Lightsail snapshots are the copy that survives losing it.
+# The research the dashboard writes (the idea ledger that counts every variant tried, and the tear
+# sheets) is not in the database, so each night it is archived beside the dumps too, the newest 14 kept.
 set -uo pipefail
 DIR=${BACKUP_DIR:-/backups}
 DB=${BACKUP_DB:-sleeve_fund}
+RESEARCH=${RESEARCH_DIR:-/research}
 export PGHOST=${PGHOST:-db} PGUSER=${PGUSER:-sleeve}
 json_text() {  # a JSON string's inside: control characters to spaces, backslashes and quotes escaped
   printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -48,6 +51,11 @@ while true; do
     fi
     dropdb --if-exists restore_check 2>/dev/null
   fi
+  if [ -d "$RESEARCH" ] && [ -n "$(ls -A "$RESEARCH" 2>/dev/null)" ]; then
+    r="$DIR/research-$(date -u +%Y%m%d-%H%M).tar.gz"
+    if tar -czf "$r.part" -C "$RESEARCH" . 2>"$DIR/last_error.txt"; then mv "$r.part" "$r"; else rm -f "$r.part"; fi
+  fi
+  ls -1t "$DIR"/research-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
   ls -1t "$DIR"/*.dump 2>/dev/null | tail -n +15 | xargs -r rm -f
   ls -1t "$DIR"/*.dump.failed 2>/dev/null | tail -n +2 | xargs -r rm -f
   [ -n "${BACKUP_ONCE:-}" ] && break  # one round, for testing

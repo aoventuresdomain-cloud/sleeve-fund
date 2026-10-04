@@ -995,6 +995,12 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     store.set_desired_state("btc-test", "running")
     store.record_equity("btc-test", equity=5100, cash=5100, qty=0.0, price=105000, benchmark=5050)
     assert "btc-test, the one strategy still trading or holding a position, sells" in c.get("/risk", auth=AUTH).text
+    from datetime import timedelta
+
+    from sleeve_fund.store import utcnow
+
+    store.set_status("btc-test", "paused", "daily loss 5.2%", utcnow() + timedelta(hours=20))
+    assert "btc-test is on a daily-loss pause, which then lasts until you resume too" in c.get("/risk", auth=AUTH).text
 
 
 def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatch, tmp_path):

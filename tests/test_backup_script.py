@@ -37,13 +37,15 @@ def _round(tmp_path: Path, minute: int, restore_ok: bool, error: str = "") -> di
         f'#!/usr/bin/env bash\ncase "$*" in *%M*) echo 20261004-{minute:04d};; *) /bin/date "$@";; esac\n')
     (tmp_path / "bin" / "date").chmod(0o755)
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b"),
-           "BACKUP_ONCE": "1"}
+           "BACKUP_ONCE": "1", "RESEARCH_DIR": str(tmp_path / "research")}
     subprocess.run(["bash", str(SCRIPT)], env=env, check=True, timeout=30)
     return json.loads((tmp_path / "b" / "status.json").read_text())
 
 
 def test_a_failing_backup_writes_valid_status_and_never_pushes_out_good_dumps(tmp_path):
     (tmp_path / "b").mkdir()
+    (tmp_path / "research" / "tearsheets").mkdir(parents=True)
+    (tmp_path / "research" / "idea_ledger.jsonl").write_text('{"idea": "x"}\n')
     ok = _round(tmp_path, 0, True)
     assert ok["ok"] is True and ok["restored"]["orders"] == 5
     for minute in range(1, 4):
@@ -59,3 +61,17 @@ def test_a_failing_backup_writes_valid_status_and_never_pushes_out_good_dumps(tm
         _round(tmp_path, minute, True)
     good = sorted(p.name for p in (tmp_path / "b").glob("*.dump"))
     assert len(good) == 14 and good[0] == "sleeve_fund-20261004-0042.dump"
+
+
+def test_the_research_record_is_archived_beside_the_dumps(tmp_path):
+    import tarfile
+
+    (tmp_path / "b").mkdir()
+    (tmp_path / "research").mkdir()
+    (tmp_path / "research" / "idea_ledger.jsonl").write_text('{"idea": "x"}\n')
+    for minute in range(16):
+        _round(tmp_path, minute, True)
+    archives = sorted((tmp_path / "b").glob("research-*.tar.gz"))
+    assert len(archives) == 14 and archives[-1].name == "research-20261004-0015.tar.gz"
+    with tarfile.open(archives[-1]) as t:
+        assert "./idea_ledger.jsonl" in t.getnames()
