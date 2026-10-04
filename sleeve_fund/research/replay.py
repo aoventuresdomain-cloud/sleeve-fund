@@ -32,6 +32,15 @@ def _instrument(h: dict, fees):
     )
 
 
+def _money(text: str):
+    """A recorded balance. Money.from_str only knows registered currencies, and a venue's own codes
+    (Kraken's ZUSD, XXBT) are made on the fly by Currency.from_str, as the live adapter does."""
+    from nautilus_trader.model import Currency, Money
+
+    amount, code = text.split()
+    return Money(Decimal(amount), Currency.from_str(code))
+
+
 def _data(instrument, rows: list[dict]) -> list:
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
@@ -51,7 +60,7 @@ def replay(path: Path | str) -> list[dict]:
     """The orders the recorded sleeve sends when replayed, oldest first, as the journal stores them."""
     from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
     from nautilus_trader.common import LoggerConfig, LogLevel
-    from nautilus_trader.model import AccountType, BarType, Money, OmsType, TraderId
+    from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
 
     from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
     from sleeve_fund.paper.runtime import SleeveRuntime
@@ -70,7 +79,7 @@ def replay(path: Path | str) -> list[dict]:
                                                  logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
     try:
         engine.add_venue(venue=instrument.id.venue, oms_type=OmsType.NETTING, account_type=AccountType.CASH,
-                         base_currency=None, starting_balances=[Money.from_str(b) for b in h["balances"]],
+                         base_currency=None, starting_balances=[_money(b) for b in h["balances"]],
                          fee_model=ScheduleFeeModel(fees), fill_model=fill_model())
         engine.add_instrument(instrument)
         engine.add_data(_data(instrument, rows))
