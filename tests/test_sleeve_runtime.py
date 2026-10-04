@@ -489,3 +489,76 @@ def test_a_crash_keeps_a_pause_and_its_end_time(store):
     rt = SleeveRuntime(store, "s1")
     rt.on_start(0.008)
     assert store.sleeve("s1").status == "paused" and not rt.can_open()
+def _restart(store, t):
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    return rt
+
+
+@pytest.mark.parametrize("command,reason,sells", [
+    ("flatten", "PM flatten", True),
+    ("flatten", "Book kill switch: stop everything", True),
+    ("pause", "PM pause", False),  # a pause keeps the position, before and after a restart
+])
+def test_a_flatten_cut_short_by_a_restart_sells_again(store, command, reason, sells):
+    """Sanity S-3: a flatten is marked done when its sell is sent. If the process stops before the fill,
+    the restart still holds the position, so the first tick sells again, once, with the reason kept."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restart(store, t)
+    store.command("s1", command, reason)
+    held = {"equity": 10_000, "cash": 7_000, "qty": 0.05, "price": 60_000}
+    assert rt.tick(**held) == ("flatten" if command == "flatten" else None)
+    t[0] += timedelta(minutes=1)
+    rt = _restart(store, t)  # the sell never filled
+    assert rt.tick(**held) == ("flatten" if sells else None)
+    if sells:
+        assert rt.flatten_why[0] == "pm_flatten" and reason in rt.flatten_why[1]
+        assert store.last_event("s1", ("flatten_retry",)) is not None
+    t[0] += timedelta(seconds=5)
+    assert rt.tick(**held) is None  # once per start: the strategy's own sell is in flight
+    assert store.sleeve("s1").status == "paused"
+    rt = _restart(store, t)
+    assert rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000) is None  # sold: nothing owed
+
+
+def test_a_risk_halt_cut_short_sells_again_but_a_resume_or_a_reconcile_halt_does_not(store):
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restart(store, t)
+    rt.tick(equity=10_000, cash=0, qty=1.0, price=10_000)
+    t[0] += timedelta(hours=1)
+    assert rt.tick(equity=7_000, cash=0, qty=1.0, price=7_000) == "flatten"  # 30% down: halt
+    assert store.sleeve("s1").status == "halted"
+    rt = _restart(store, t)
+    assert rt.tick(equity=7_000, cash=0, qty=1.0, price=7_000) == "flatten"
+    assert rt.flatten_why[0] == "risk_halt"
+    store.command("s1", "resume", "checked")
+    rt.tick(equity=7_000, cash=0, qty=1.0, price=7_000)
+    assert store.sleeve("s1").status == "running"
+    # A reconcile halt never trades or corrects, before a restart or after one.
+    assert not rt.reconcile(cash=123.0, qty=1.0)
+    rt = _restart(store, t)
+    assert store.sleeve("s1").status == "halted"
+    assert rt.tick(equity=7_000, cash=0, qty=1.0, price=7_000) is None
+
+
+def test_an_expired_daily_loss_pause_owes_nothing_after_a_restart(store):
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 1, tzinfo=timezone.utc)]
+    rt = _restart(store, t)
+    rt.tick(equity=10_000, cash=0, qty=1.0, price=10_000)
+    t[0] += timedelta(hours=1)
+    assert rt.tick(equity=9_400, cash=0, qty=1.0, price=9_400) == "flatten"  # 6% today: daily pause
+    assert store.sleeve("s1").status == "paused"
+    rt = _restart(store, t)
+    assert rt.tick(equity=9_400, cash=0, qty=1.0, price=9_400) == "flatten"  # still paused: sell again
+    t[0] += timedelta(hours=25)
+    rt = _restart(store, t)
+    assert rt.tick(equity=9_400, cash=0, qty=1.0, price=9_400) is None
