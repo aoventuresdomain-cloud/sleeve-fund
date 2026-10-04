@@ -134,6 +134,9 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
         f"Tested on `{r.instrument}` at {r.bar_minutes}-minute bars" + (f" on `{r.venue}`" if r.venue else "")
     )
     out.append("")
+    if r.settings:
+        out.append(f"Settings: {r.settings}")
+        out.append("")
     out.append(
         f"Dataset `{r.dataset}` · research period {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y} · "
         f"holdout: last {r.holdout_days} days {'(opened)' if r.holdout else '(untouched)'} · "

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -131,8 +132,15 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress)
     result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
-    out = (out_dir or TEARSHEETS) / f"{spec.name}_{dataset}.md"
+    # Every run keeps its own sheet: a re-run with other exits, profile or windows is new evidence, not a
+    # replacement for the old (review round 8, R8-M3). The newest sheet per instrument and bars decides G1.
+    stem = f"{spec.name}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    out = (out_dir or TEARSHEETS) / f"{stem}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while out.exists():  # two runs in the same second
+        n += 1
+        out = out.with_name(f"{stem}-{n}.md")
     out.write_text(render(result, ledger), encoding="utf-8")
     return out
 

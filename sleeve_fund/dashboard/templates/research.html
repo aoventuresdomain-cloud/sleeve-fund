@@ -61,7 +61,7 @@
   {% if sheets %}
   <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th></tr></thead>
     <tbody>{% for s in sheets %}<tr>
-      <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a></td>
+      <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.settings %}<div class="muted" style="font-size:12px;white-space:normal">{{ s.settings }}</div>{% endif %}</td>
       <td data-m="right">{% if s.dataset == 'synthetic' %}<span class="warn">Synthetic</span>{% else %}{{ s.dataset }}{% endif %}</td>
       <td>{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
       <td data-m="hide" class="muted wrap">{{ s.evidence }}</td></tr>{% endfor %}</tbody></table>

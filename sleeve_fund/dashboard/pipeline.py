@@ -13,6 +13,7 @@ _CHECK = re.compile(r"^\|\s*([^|]*?)\s*\|\s*(PASS|FAIL|WARN|INFO)\s*\|\s*([^|]*)
 _DATASET = re.compile(r"^Dataset `([^`]+)`", re.M)
 _NAME = re.compile(r"^# Tear sheet: (\S+)", re.M)
 _TESTED = re.compile(r"^Tested on `([^`]+)` at (\d+)-minute bars", re.M)
+_SETTINGS = re.compile(r"^Settings: (.+)$", re.M)
 
 
 def _g1(text: str) -> tuple[str | None, str, list[str]]:
@@ -35,11 +36,12 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
 
 def sheet_facts(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
-    ds, name, tested = _DATASET.search(text), _NAME.search(text), _TESTED.search(text)
+    ds, name, tested, settings = _DATASET.search(text), _NAME.search(text), _TESTED.search(text), _SETTINGS.search(text)
     g1, evidence, failed = _g1(text)
     return {"name": path.stem, "strategy": name.group(1) if name else None,
             "g1": g1, "evidence": evidence, "failed": failed,
             "dataset": ds.group(1) if ds else "unknown", "mtime": path.stat().st_mtime,
+            "settings": settings.group(1) if settings else "",
             # Sheets from before the instrument and bars were written down can't vouch for either.
             "instrument": tested.group(1).upper() if tested else None,
             "minutes": int(tested.group(2)) if tested else None}

@@ -1,3 +1,4 @@
+import re
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1096,8 +1097,20 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
             break
         time.sleep(0.05)
     assert j["status"] == "done", j
-    assert j["run_id"] == "buy_and_hold_kraken-ethusd-store-240m"
-    assert "conservative risk profile" in c.get(f"/research/{j['run_id']}", auth=AUTH).text
+    assert re.fullmatch(r"buy_and_hold_kraken-ethusd-store-240m_\d{8}-\d{6}", j["run_id"])
+    first = j["run_id"]
+    assert "conservative risk profile" in c.get(f"/research/{first}", auth=AUTH).text
+    # A re-run with other exits is new evidence beside the old, not a replacement (review round 8, R8-M3).
+    r = c.post("/research/run", data={**form, "stop_loss_pct": "5"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    for _ in range(200):
+        j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
+        if j["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    assert j["status"] == "done" and j["run_id"] != first
+    listing = c.get("/research", auth=AUTH).text
+    assert f'/research/{first}"' in listing and f'/research/{j["run_id"]}"' in listing
+    assert "exits: the signal only" in listing and "exits: stop-loss 5.0% below entry" in listing
     assert (tmp_path / "idea_ledger.jsonl").exists()  # counted in the server's ledger, not the repository's
     # Missing history is an error on the page, not a crash.
     r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)

@@ -65,6 +65,7 @@ class StudyResult:
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
     bar_minutes: int = 1440
     venue: str = ""
+    settings: str = ""  # the risk profile, exits and windows the study ran with, so two sheets can be told apart
 
     @property
     def round_trips(self) -> list[float]:
@@ -258,6 +259,9 @@ def run_study(
         instrument=str(instrument.id.symbol),
         bar_minutes=minutes,
         venue=str(instrument.id.venue),
+        settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
+                  f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
+                  f"walk-forward {train_days} days training, {test_days} days testing"),
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
