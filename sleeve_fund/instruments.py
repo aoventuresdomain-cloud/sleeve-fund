@@ -94,3 +94,10 @@ def fill_model():
     from nautilus_trader.execution import DefaultFillModel
 
     return DefaultFillModel(prob_fill_on_limit=0.0, prob_slippage=0.0)
+
+
+# The share of the volume that trades through a resting order's price which that order may take in a
+# backtest (sleeve_fund.research.runner). Paper's simulated venue can't be held to it: it fills a
+# post-only order in full once the price trades through, so paper measures each maker fill against it
+# instead (LongFlatStrategy._check_maker_fill).
+BOOK_SHARE = 0.2

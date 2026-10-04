@@ -155,16 +155,31 @@ def execution_history(pair: str, venue: str, start, end, minutes: int):
 
 def _execution(res, wait, matched_on) -> dict:
     filled = res.fills[res.fills["filled_qty"].astype(float) > 0] if not res.fills.empty else res.fills
-    sides = list(filled["liquidity_side"]) if not filled.empty else []
+    # A resting target also fills as the passive side, but it is charged the taker fee (it isn't
+    # post-only), so only post-only orders count as maker here, as the fee model charges them.
+    post_only = [coid for coid in filled.index
+                 if res.decisions.get(str(coid), {}).get("signal", {}).get("order_type") == "maker"]
+    sides = list(filled.loc[post_only, "liquidity_side"]) if post_only else []
     out = {"maker": bool(wait), "wait": wait, "matched_on": matched_on,
-           "maker_orders": sides.count("MAKER"), "orders": len(sides)}
+           "maker_orders": sides.count("MAKER"), "orders": len(filled)}
     if wait and matched_on is None:
         out["note"] = "No minute history here: maker orders assumed to miss, charged the taker fee."
     elif wait:
         out["note"] = (f"Maker fills matched on {matched_on} bars: only on trades through the limit, and at most "
                        f"{BOOK_SHARE / 4:.0%} of a bar's volume per price it trades through, so a large order "
-                       "fills over several bars.")
+                       "fills over several bars. Paper's simulated venue fills a post-only order in full once the "
+                       "price trades through it, so on a thin market paper shows more maker fills than this, and "
+                       "says so on each one.")
     return out
+
+
+def _errors(errors: list) -> str:
+    """The strategy's own errors during the run, which would otherwise make wrong results look fine."""
+    if not errors:
+        return ""
+    name, what = errors[0]
+    return (f"The strategy hit {len(errors)} error{'s' if len(errors) != 1 else ''} during this run (first: {name}, "
+            f"{what}). Its orders after that may be wrong, so don't rely on these results.")
 
 
 def _every(minutes: int, short: bool = False) -> str:
@@ -329,6 +344,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "data": _data_note(prices, minutes),
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
+        "errors": _errors(res.handler_errors),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "short": spread.short, "source": spread.source},
         "fee_schedule": {"maker": float(inst.maker_fee), "taker": float(inst.taker_fee), "text": quote_fees.text,
