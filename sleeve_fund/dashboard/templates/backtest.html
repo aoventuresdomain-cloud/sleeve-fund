@@ -63,7 +63,7 @@
       <section class="ledger compact" aria-label="Trade figures">
         <div><div class="k">Trades</div><div class="v">{{ ts.trades }}</div><div class="s">{% if ts.trades < 10 %}too few to judge{% else %}{{ ts.wins }} won{% endif %}</div></div>
         <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ ts.win_rate|pctn0 if ts.win_rate is not none else 'n/a' }}</div><div class="s">after fees</div></div>
-        <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">per trade{% if result.expectancy_r is not none %} · {{ result.expectancy_r|rmult }}{% endif %}</div></div>
+        <div><div class="k">Expectancy {{ help('expectancy') }}</div><div class="v">{{ ts.expectancy|pctn if ts.expectancy is not none else 'n/a' }}</div><div class="s">{% if result.expectancy_r is not none %}{{ result.expectancy_r|rmult }} {% endif %}per trade</div></div>
         <div><div class="k">Profit factor {{ help('profit_factor') }}</div><div class="v">{{ ts.profit_factor|numn if ts.profit_factor is not none else 'n/a' }}</div><div class="s">won ÷ lost</div></div>
         <div><div class="k">Fees</div><div class="v">{{ result.fees|money }}</div><div class="s">{% if result.execution.maker %}{{ result.execution.maker_orders }} of {{ result.execution.orders }} as maker{% else %}of {{ result.start|money }}{% endif %}{% if result.spread.paid %}, plus {{ result.spread.paid|money }} spread{% endif %}</div></div>
         <div><div class="k">Time in market {{ help('in_market') }}</div><div class="v">{{ result.exposure|pct0 }}</div><div class="s">of the time</div></div>
