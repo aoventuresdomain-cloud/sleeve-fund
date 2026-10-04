@@ -3,7 +3,7 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
-from sleeve_fund.research.metrics import trade_stats, trades
+from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
@@ -141,15 +141,15 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
 
 def open_lot(fills: list[dict]) -> dict | None:
     """The current position's opening fill, walking the journal (newest-first input) forwards."""
-    qty, opened = 0.0, None
+    qty, opened = ZERO, None  # summed in Decimal, as metrics.trades does (review round 10, M10-4)
     for f in reversed(fills):
         if f["side"] == "BUY":
-            if qty <= 1e-12:
+            if qty <= ZERO:
                 opened = f
-            qty += f["qty"]
+            qty += _dec(f["qty"])
         else:
-            qty = max(qty - f["qty"], 0.0)
-            if qty <= 1e-12:
+            qty = max(qty - _dec(f["qty"]), ZERO)
+            if qty <= ZERO:
                 opened = None
     return opened
 

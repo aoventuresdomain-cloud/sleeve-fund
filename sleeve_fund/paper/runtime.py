@@ -9,6 +9,8 @@ concurrency inside it.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from datetime import datetime, timedelta, timezone
 
 from sleeve_fund import risk
@@ -225,7 +227,9 @@ class SleeveRuntime:
         book = self.store.journal_book(self.name, self.starting_balance)
         # Each fill can round the cash by up to a cent (notional and fee), so allow for that.
         cash_tol = 0.01 * (1 + 2 * book["fills"])
-        d_cash, d_qty = cash - book["cash"], qty - book["qty"]
+        d_cash = cash - book["cash"]
+        # Compared in Decimal, each side as written, so float noise can't tip a one-lot gap into a halt.
+        d_qty = float(Decimal(repr(float(qty))) - Decimal(repr(float(book["qty"]))))
         detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
                   f"engine position {qty:.12g} vs journal {book['qty']:.12g}"
                   # %g's 6 figures hid a 1e-7 gap on 9075.15 (review round 10, m1).

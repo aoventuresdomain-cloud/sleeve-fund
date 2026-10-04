@@ -7,7 +7,7 @@ import re
 
 # Any credential-looking variable for a venue we connect to. The paper process
 # needs none; if one is present the environment is wrong, so refuse to start.
-_CREDENTIAL_ENV = re.compile(r"^(KRAKEN|BINANCE|COINBASE|IB|BYBIT|OKX)_.*(KEY|SECRET|PASSPHRASE|TOKEN)", re.I)
+_CREDENTIAL_ENV = re.compile(r"^(KRAKEN|BINANCE|COINBASE|IB|BYBIT|OKX|DERIBIT)_.*(KEY|SECRET|PASSPHRASE|TOKEN)", re.I)
 # Live account keys for any venue, as VenueProfile.key_env names them: <VENUE>_API_KEY__<ACCOUNT>.
 _ACCOUNT_KEY_ENV = re.compile(r"^[A-Z0-9]+_API_(KEY|SECRET)__", re.I)
 

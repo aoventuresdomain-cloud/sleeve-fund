@@ -4,6 +4,8 @@ closes first (daily_returns), so its Sharpe is annualised as daily and its boots
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import math
 from statistics import NormalDist
 
@@ -115,34 +117,44 @@ def trades(rows: list[dict]) -> list[dict]:
     """Closed round trips (flat -> long -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial
-    fills are fine: a trip closes when the position returns to (about) zero.
+    fills are fine: a trip closes when the position returns to zero. The position is summed in Decimal:
+    float sums of XRP-sized fills leave 1e-12-scale residue that kept trips open and merged them (round 10, M10-4).
     """
-    out, qty, cost, proceeds, fees = [], 0.0, 0.0, 0.0, 0.0
+    out, qty, cost, proceeds, fees = [], ZERO, 0.0, 0.0, 0.0
     bought = sold = 0.0
     opened = entry_order = None
     for r in rows:
+        q = _dec(r["qty"])
         if r["side"] == "BUY":
-            if qty <= 1e-12:
+            if qty <= ZERO:
                 opened, entry_order = r.get("ts"), r.get("order_id")
-            qty += r["qty"]
+            qty += q
             bought += r["qty"]
             cost += r["qty"] * r["price"]
         else:
-            if qty <= 0:
+            if qty <= ZERO:
                 continue  # a sell with nothing open (e.g. journal started mid-trip)
-            qty -= r["qty"]
+            qty -= q
             sold += r["qty"]
             proceeds += r["qty"] * r["price"]
         fees += r["fee"]
-        if cost and qty <= 1e-12:
+        if cost and qty <= ZERO:
             pnl = proceeds - cost - fees
             out.append({"pnl": pnl, "ret": pnl / cost, "cost": cost, "fees": fees, "qty": bought,
                         "entry_px": cost / bought, "exit_px": proceeds / sold if sold else float("nan"),
                         "opened": opened, "closed": r.get("ts"),
                         # Journal order ids, so the dashboard can show why the trade was opened and closed.
                         "entry_order": entry_order, "exit_order": r.get("order_id")})
-            qty, cost, proceeds, fees, bought, sold = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            qty, cost, proceeds, fees, bought, sold = ZERO, 0.0, 0.0, 0.0, 0.0, 0.0
     return out
+
+
+ZERO = Decimal(0)
+
+
+def _dec(x) -> Decimal:
+    """A fill quantity as the decimal it was written as (the shortest repr of the float)."""
+    return Decimal(repr(float(x)))
 
 
 def trade_stats(trips: list[dict]) -> dict:
