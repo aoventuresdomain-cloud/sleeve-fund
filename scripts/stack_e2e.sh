@@ -11,6 +11,13 @@ SITE_ADDRESS=localhost
 ENV
 trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker compose down -v' EXIT
 docker compose up -d --build
+q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
+# The supervisor applies configs/clear.toml before it starts; a strategy added before that is put away
+# with the rest. So add SUI only once the supervisor is up (the dashboard can be ready first).
+for i in $(seq 1 90); do
+  [ "$(q "select count(*) from events where kind = 'supervisor_start'" 2>/dev/null || echo 0)" -ge 1 ] && break
+  sleep 2
+done
 # Prove any asset works: add a non-BTC sleeve through the dashboard form, as the PM would.
 for i in $(seq 1 30); do
   docker compose exec -T dashboard python -c "
@@ -26,7 +33,6 @@ urllib.request.urlopen(req)" && break
 done
 echo "waiting ${WAIT}s for sleeves to connect and mark..."
 sleep "$WAIT"
-q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
 echo "sleeves:"; q "select name, instrument, status, heartbeat_at from sleeves order by id"
 HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")
 MARKS=$(q "select count(*) from equity")
