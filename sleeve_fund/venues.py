@@ -31,6 +31,8 @@ class VenueProfile:
     daily_history: Callable[[str], pd.DataFrame]
     # (pair, minutes) -> candles including the forming one, for charts
     ohlc_history: Callable[[str, int], pd.DataFrame] | None = None
+    # (get_json=None) -> every BASE/QUOTE pair the venue lists, for the chart's instrument dropdown
+    list_instruments: Callable[..., list[str]] | None = None
     # (pair, fetch=None) -> (base, quote) as the venue's own instrument data names them
     asset_codes: Callable[..., tuple[str, str]] = lambda pair, fetch=None: tuple(pair.split("/"))  # type: ignore[assignment]
     # () -> (factory, config) for the live market data client; None if paper can't run here yet
@@ -110,6 +112,17 @@ _ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 def _norm(code: str) -> str:
     return _ALIASES.get(code, code)
+
+
+def kraken_instruments(get_json=None) -> list[str]:
+    """Every pair Kraken lists, named as people write them (XBT/USD -> BTC/USD), from its public pair list."""
+    from sleeve_fund.data import _get_json
+
+    data = (get_json or _get_json)(ASSET_PAIRS_URL)
+    if data.get("error"):
+        raise ValueError(f"Kraken: {'; '.join(data['error'])}")
+    return sorted({"/".join(_norm(c) for c in info["wsname"].split("/"))
+                   for info in data.get("result", {}).values() if "/" in info.get("wsname", "")})
 
 
 def kraken_sign(path: str, data: str, nonce: str, secret: str) -> str:
@@ -226,6 +239,7 @@ KRAKEN = register(VenueProfile(
     fee_basis="Tier 1, 3 Oct 2026",
     daily_history=_kraken_daily,
     ohlc_history=_kraken_ohlc,
+    list_instruments=kraken_instruments,
     asset_codes=kraken_asset_codes,
     data_client=_kraken_data_client,
     fetch_fees=kraken_account_fees,

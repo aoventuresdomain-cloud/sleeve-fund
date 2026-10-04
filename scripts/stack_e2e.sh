@@ -32,6 +32,7 @@ HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2
 MARKS=$(q "select count(*) from equity")
 ERRS=$(q "select count(*) from events where level = 'error'")
 echo "heartbeating sleeves: $HEART, equity marks: $MARKS, error events: $ERRS"
+q "select ts, sleeve, kind, message from events where level = 'error' order by id"
 q "select ts, sleeve, level, kind, message from events order by id" | tail -20
 CODE=$(docker compose exec -T dashboard python -c "
 import base64, urllib.request
@@ -64,6 +65,8 @@ RECONCILED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 
 ERRS=$(q "select count(*) from events where level = 'error'")
 HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")
 echo "restored: $RESTORED, reconciled: $RECONCILED, error events: $ERRS, heartbeating: $HEART"
+# Name any error so a red run says what went wrong without the full logs.
+q "select ts, sleeve, kind, message from events where level = 'error' order by id"
 [ "$RESTORED" -ge 1 ] || { echo "FAIL: SUI position not restored from the journal"; exit 1; }
 [ "$RECONCILED" -ge 2 ] || { echo "FAIL: expected a reconciliation before and after the restart"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events after restart (a reconcile mismatch?)"; exit 1; }

@@ -1004,8 +1004,11 @@ class Store:
     def backtests(self, limit: int = 50) -> list[dict]:
         errored = (select(events_t.c.id).where(events_t.c.sleeve == backtests_t.c.sleeve,
                                                events_t.c.kind.in_(ERROR_KINDS)).exists())
+        # A run the risk guard halted says so in the list, not only on its result page (round 10, m7).
+        halted = (select(sleeves_t.c.name).where(sleeves_t.c.name == backtests_t.c.sleeve,
+                                                 sleeves_t.c.status == "halted").exists())
         q = (select(backtests_t.c.id, backtests_t.c.sleeve, backtests_t.c.title, backtests_t.c.query,
-                    backtests_t.c.created_at, errored.label("errored"))
+                    backtests_t.c.created_at, errored.label("errored"), halted.label("halted"))
              .order_by(backtests_t.c.created_at.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
