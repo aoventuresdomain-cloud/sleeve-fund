@@ -71,17 +71,17 @@
       </section>
     </section>
 
-    {{ price_chart("pc", result.pair ~ " " ~ result.chart_label, "every backtest trade marked", intervals=False) }}
+    {{ price_chart("pc", result.pair ~ " " ~ result.chart_label, "", intervals=False) }}
 
     <section class="panel" aria-labelledby="bt-curve-h">
       <div class="panel-head"><h2 id="bt-curve-h">Equity against buy-and-hold</h2>
-        <div class="right range" role="group" aria-label="Range"><button type="button" data-range="90">3M</button><button type="button" data-range="180">6M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div></div>
+        <div class="right chart-tools"><button type="button" class="toggle" data-compare aria-pressed="true" title="Show return against buying and holding the instrument">vs buy-and-hold</button><div class="range" role="group" aria-label="Range"><button type="button" data-range="90">3M</button><button type="button" data-range="180">6M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div></div></div>
       <div class="chart"><canvas id="eq" aria-label="Backtest equity and buy-and-hold by day"></canvas></div>
       <div class="chart short"><canvas id="dd" aria-label="Backtest drawdown by day"></canvas></div>
     </section>
 
     <section class="panel flush" aria-labelledby="bt-tr-h">
-      <div class="panel-head"><h2 id="bt-tr-h">Every trade</h2><span class="hint">open Why for the signal behind each entry and exit</span></div>
+      <div class="panel-head"><h2 id="bt-tr-h">Every trade</h2></div>
       {% if result.trips %}
       <table class="responsive tight" data-hide-xl="3 4" data-hide-lg="3 4 5 7" data-hide-md="3 4 5 6 7">
         <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th>Exit</th><th></th></tr></thead>
@@ -102,7 +102,7 @@
     </section>
   {% endif %}
     <section class="panel flush" aria-labelledby="runs-h" id="runs">
-      <div class="panel-head"><h2 id="runs-h">Saved runs</h2><span class="hint">the latest 50 are kept</span></div>
+      <div class="panel-head"><h2 id="runs-h">Saved runs</h2></div>
       {% if runs %}
       <table class="compact">
         <thead><tr><th>Run</th><th>Saved</th></tr></thead>
@@ -140,6 +140,6 @@
 <script>
 Console.strategyPicker("bt-form"); Console.orderFields("bt-form"); Console.whys();
 {% if chart %}Console.priceChart("pc", JSON.parse(document.getElementById("bt-price").textContent));
-Console.pair(JSON.parse(document.getElementById("bt-data").textContent), "eq", "dd", ["Strategy", "Buy-and-hold"]);{% endif %}
+Console.pair(JSON.parse(document.getElementById("bt-data").textContent), "eq", "dd", ["Strategy", "Buy-and-hold"], {compare: true});{% endif %}
 </script>
 {% endblock %}

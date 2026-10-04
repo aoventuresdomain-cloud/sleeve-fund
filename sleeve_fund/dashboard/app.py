@@ -120,6 +120,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves = st().sleeves() if sleeves is None else sleeves
         now = utcnow()
         wanted = [x for x in sleeves if x.desired_state == "running"]
+        put_away = st().archived()
         return {
             "mode": "paper",  # live mode arrives with the G2 work; until then nothing can trade real money
             "live_locked": True,
@@ -130,6 +131,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "running": sum(1 for x in sleeves if x.status == "running"),
             "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
             "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
+            # The rail lists every strategy not put away, so each is one click from anywhere.
+            "strategies": [{"name": x.name, "status": x.status} for x in sleeves if x.name not in put_away],
         }
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
@@ -166,11 +169,27 @@ def create_app(store: Store | None = None) -> FastAPI:
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves))
 
+    def _recent_json(sleeves, days: int, daily) -> JSONResponse:
+        """The last day or week at fine resolution, in the shape the charts read."""
+        if days not in bookm.RECENT_STEP:
+            raise HTTPException(400, "days must be 1 or 7")
+        cutoff = utcnow() - timedelta(days=days)
+        prior = daily["equity"][daily.index < cutoff] if len(daily) else daily
+        curve = bookm.recent_curve(st(), sleeves, days, float(prior.max()) if len(prior) else None)
+        return JSONResponse({
+            "res": "intraday",
+            "t": [t.isoformat() for t in curve.index],
+            "equity": [round(v, 2) for v in curve["equity"]],
+            "benchmark": [round(v, 2) for v in curve["benchmark"]],
+            "drawdown": [round(v, 5) for v in curve["drawdown"]],
+        })
+
     @app.get("/api/book/equity")
-    def book_equity_json(_: str = Depends(require_pm)):
-        _, frames, summaries = book_data()
-        active = [x for x in summaries if x["sleeve"].desired_state == "running"] or summaries
-        curve = bookm.book_curve(active, frames)
+    def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
+        sleeves, frames, summaries = book_data()
+        curve = bookm.book_curve(summaries, frames)  # every strategy, as the book figures count it
+        if days:
+            return _recent_json(sleeves, days, curve)
         return JSONResponse({
             "t": [t.isoformat() for t in curve.index],
             "equity": [round(v, 2) for v in curve["equity"]],
@@ -358,11 +377,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         return JSONResponse(data)
 
     @app.get("/api/sleeves/{name}/equity")
-    def equity_json(name: str, _: str = Depends(require_pm)):
+    def equity_json(name: str, days: int | None = None, _: str = Depends(require_pm)):
         try:
             s = st().sleeve(name)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
+        if days:
+            resp = _recent_json([s], days, bookm.daily(st(), name))
+            body = json.loads(resp.body)
+            cutoff = utcnow() - timedelta(days=days)
+            body["fills"] = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
+                             for f in st().fills(name, limit=2000) if f["ts"] >= cutoff]
+            return JSONResponse(body)
         rows = st().equity_series(name, limit=500_000)
         intraday = bool(rows) and (rows[-1]["ts"] - rows[0]["ts"]).total_seconds() < 3 * 86400
         if intraday:

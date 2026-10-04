@@ -26,7 +26,7 @@
 
 <div class="grid">
   <section class="panel span-6" aria-labelledby="srv-h">
-    <div class="panel-head"><h2 id="srv-h">Server</h2><span class="hint">as seen by the dashboard</span></div>
+    <div class="panel-head"><h2 id="srv-h">Server</h2></div>
     <table class="compact kv">
       <tr><th scope="row">Version</th><td class="num">{{ shell.version }}</td></tr>
       <tr><th scope="row">Disk</th><td class="num">{{ usage(ops.disk.share) }} <span class="muted">{{ ops.disk.used|bytes }} of {{ ops.disk.total|bytes }}</span></td></tr>
@@ -36,7 +36,7 @@
     </table>
   </section>
   <section class="panel span-6" aria-labelledby="jr-h">
-    <div class="panel-head"><h2 id="jr-h">Journal</h2><span class="hint">rows kept</span></div>
+    <div class="panel-head"><h2 id="jr-h">Journal</h2></div>
     <table class="compact kv">
       {% for name, label in [('equity', 'Equity marks'), ('fills', 'Fills'), ('events', 'Events'), ('decisions', 'Decisions'), ('commands', 'PM commands'), ('sleeves', 'Strategies'), ('backtests', 'Saved backtests')] %}
       <tr><th scope="row">{{ label }}</th><td class="num">{{ '{:,}'.format(ops.tables[name]) }}</td></tr>{% endfor %}

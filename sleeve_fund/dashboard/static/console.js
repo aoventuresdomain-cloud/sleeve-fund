@@ -7,16 +7,14 @@ window.Console = (() => {
     const n = parseInt(c.length === 4 ? c.slice(1).replace(/./g, "$&$&") : c.slice(1, 7), 16);
     return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
   };
-  // A round axis floor for negative percentages: -6.8 becomes -8, -23 becomes -25, -79 becomes -80.
   // A round axis range with about five steps of 1, 2, 2.5 or 5 times a power of ten, padded so lines don't touch the edges.
-  const niceRange = (lo, hi) => {
-    const pad = Math.max((hi - lo) * 0.06, 0.5);
+  const niceRange = (lo, hi, minPad = 0.5) => {
+    const pad = Math.max((hi - lo) * 0.06, minPad);
     lo -= pad; hi += pad;
     const raw = (hi - lo) / 5, mag = 10 ** Math.floor(Math.log10(raw));
     const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
     return {min: Math.floor(lo / step) * step, max: Math.ceil(hi / step) * step, step};
   };
-  const niceFloor = (v) => { const step = v > -10 ? 2 : v > -30 ? 5 : 10; return Math.floor(v / step) * step; };
   // A dashed hairline under the cursor, like a trading terminal.
   const crosshair = {id: "crosshair", afterDatasetsDraw(c) {
     const a = c.getActiveElements();
@@ -92,20 +90,25 @@ window.Console = (() => {
     });
   }
 
-  // Two charts on one time axis: return against the benchmark on top, drawdown underneath.
-  // Both series are rebased to 0% at the start of the chosen range, so they share one honest scale
-  // whatever the range, and the legend reads out the values under the cursor.
-  function pair(url, eqId, ddId, labels) {
+  // Two charts on one time axis: growth on top, drawdown underneath.
+  // By default the top chart shows equity in money, scaled to its own range, so day-to-day growth is
+  // readable. "Compare" rebases equity and buy-and-hold to 0% at the start of the range so the two
+  // share one honest scale. The legend reads out the hovered day: value, change on the day, drawdown.
+  // opts.compare starts in compare mode (the backtest, whose point is the comparison).
+  function pair(url, eqId, ddId, labels, opts = {}) {
     const eqEl = document.getElementById(eqId), ddEl = document.getElementById(ddId);
     if (!eqEl || !window.Chart) return;
+    const scope = eqEl.closest("section") || document;
     // url may be the data itself (the backtest page embeds its result) or an endpoint to fetch.
     (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
       if (!d.t.length) { eqEl.parentElement.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; ddEl.parentElement.remove(); return; }
       const grid = css("--line"), muted = css("--muted"), faint = css("--faint"), accent = css("--accent");
       Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
       Chart.defaults.font.size = 11;
-      const yWidth = (s) => { s.width = 56; };
-      const pctTick = (v) => `${v > 0 ? "+" : ""}${Number(v.toFixed(Math.abs(v) < 10 ? 1 : 0))}%`;
+      const yWidth = (s) => { s.width = 64; };
+      const pctTick = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Number(Math.abs(v).toFixed(Math.abs(v) < 10 ? 1 : 0))}%`;
+      let compare = !!opts.compare, step = 1;
+      const moneyTick = (v) => v.toLocaleString("en-GB", {maximumFractionDigits: step < 1 ? 2 : 0, minimumFractionDigits: step < 1 ? 2 : 0});
       const base = {
         maintainAspectRatio: false, animation: false, interaction: {mode: "index", intersect: false},
         plugins: {legend: {display: false}, tooltip: {enabled: false}},
@@ -114,74 +117,102 @@ window.Console = (() => {
         const {ctx, chartArea} = c.chart;
         if (!chartArea) return null;
         const g = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-        g.addColorStop(0, rgba(accent, 0.28)); g.addColorStop(1, rgba(accent, 0));
+        g.addColorStop(0, rgba(accent, 0.24)); g.addColorStop(1, rgba(accent, 0));
         return g;
       };
+      // Dates under the drawdown chart: one label per week, month or quarter boundary, never a
+      // squeezed row of every other day. tickAt maps a point's index to its label.
+      let tickAt = {};
+      const xTicks = {color: muted, autoSkip: false, maxRotation: 0, padding: 6, align: "center",
+                      callback: (_v, i) => tickAt[i] ?? null};
       const eq = new Chart(eqEl, {
         type: "line",
         data: {labels: [], datasets: [
-          {label: labels[0], data: [], borderColor: accent, backgroundColor: fade, fill: "origin", borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, pointHoverBackgroundColor: accent, pointHoverBorderWidth: 0, tension: 0},
-          {label: labels[1], data: [], borderColor: faint, borderWidth: 1.3, borderDash: [3, 3], pointRadius: 0, pointHoverRadius: 3, pointHoverBackgroundColor: muted, tension: 0},
+          {label: labels[0], data: [], borderColor: accent, backgroundColor: fade, fill: "start", borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, pointHoverBackgroundColor: accent, pointHoverBorderWidth: 0, tension: 0},
+          {label: labels[1], data: [], borderColor: muted, borderWidth: 1.3, borderDash: [3, 3], pointRadius: 0, pointHoverRadius: 3, pointHoverBackgroundColor: muted, tension: 0},
           {label: "Buys", data: [], showLine: false, pointStyle: "triangle", pointRadius: 4.5, pointHoverRadius: 4.5, pointBackgroundColor: css("--gain"), pointBorderWidth: 0},
           {label: "Sells", data: [], showLine: false, pointStyle: "triangle", rotation: 180, pointRadius: 4.5, pointHoverRadius: 4.5, pointBackgroundColor: css("--loss"), pointBorderWidth: 0},
         ]},
         options: {...base,
           scales: {x: {display: false},
-                   y: {position: "right", afterFit: yWidth, ticks: {color: muted, padding: 8, callback: pctTick}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
+                   y: {position: "right", afterFit: yWidth, ticks: {color: muted, padding: 8, callback: (v) => (compare ? pctTick(v) : moneyTick(v))}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
         plugins: [crosshair],
       });
       const dd = new Chart(ddEl, {
         type: "line",
         data: {labels: [], datasets: [{label: "Drawdown", data: [], borderColor: css("--loss"), backgroundColor: css("--loss-bg"), fill: "origin", borderWidth: 1.2, pointRadius: 0, pointHoverRadius: 3, pointHoverBackgroundColor: css("--loss"), tension: 0}]},
         options: {...base,
-          scales: {x: {ticks: {color: muted, autoSkip: true, autoSkipPadding: 40, maxRotation: 0, padding: 6, align: "inner"}, grid: {display: false}, border: {display: false}},
-                   y: {position: "right", max: 0, afterFit: yWidth, ticks: {color: muted, maxTicksLimit: 3, padding: 8, callback: pctTick}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
+          scales: {x: {ticks: xTicks, grid: {display: false}, border: {display: false}},
+                   y: {position: "right", max: 0, afterFit: yWidth, ticks: {color: muted, padding: 8, callback: pctTick}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
         plugins: [crosshair],
       });
 
-      // The legend doubles as the readout: range figures at rest, the hovered day's figures under the cursor.
+      // The legend doubles as the readout: the range's figures at rest, the hovered day's under the cursor.
       let legend = eqEl.parentElement.previousElementSibling;
       if (!legend || !legend.classList.contains("chart-legend")) {
         legend = Object.assign(document.createElement("div"), {className: "chart-legend"});
         legend.setAttribute("aria-live", "off");
         eqEl.parentElement.before(legend);
       }
-      const signed = (x) => (x === null || x === undefined || Number.isNaN(x) ? "n/a" : `${x >= 0 ? "+" : ""}${x.toFixed(2)}%`);
-      let view = null;
+      // Two decimals, or three when a small daily move would otherwise read as 0.00%.
+      const pct = (x) => (x === null || x === undefined || !Number.isFinite(x) ? "n/a"
+        : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(x !== 0 && Math.abs(x) < 0.01 ? 3 : 2)}%`);
+      const cash = (x) => x.toLocaleString("en-GB", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      const scash = (x) => `${x >= 0 ? "+" : "−"}${cash(Math.abs(x))}`;
+      const tone = (x) => (x > 0 ? "gain" : x < 0 ? "loss" : "");
+      // cur is the series on screen: the daily history, or the last day or week at minutes' resolution.
+      let cur = d;
+      const isIntra = () => cur.res === "intraday";
+      let view = null, hovering = false;
       const readout = (i) => {
-        const at = i ?? view.ret.length - 1;
-        const when = i === null || i === undefined ? `${view.lab[0]} to ${view.lab[view.lab.length - 1]}` : view.lab[at];
+        const rest = i === null || i === undefined;
+        const at = rest ? view.eq.length - 1 : i;
         legend.innerHTML = "";
-        const item = (cls, name, value, tone) => {
+        const item = (cls, name, value, t) => {
           const s = document.createElement("span");
           if (cls !== null) s.append(Object.assign(document.createElement("i"), {className: cls}));
           s.append(name);
-          s.append(Object.assign(document.createElement("b"), {textContent: value, className: tone || ""}));
+          s.append(Object.assign(document.createElement("b"), {textContent: value, className: t || ""}));
           legend.append(s);
         };
-        item("", labels[0], signed(view.ret[at]), view.ret[at] >= 0 ? "gain" : "loss");
-        item("bench", labels[1], signed(view.bench[at]));
-        item(null, i === null || i === undefined ? "Worst drawdown" : "Drawdown", signed(i === null || i === undefined ? view.worst : view.dd[at]));
-        legend.append(Object.assign(document.createElement("span"), {textContent: when, className: "faint"}));
+        if (compare) {
+          item("", labels[0], pct(view.ret[at]), tone(view.ret[at]));
+          item("bench", labels[1], pct(view.bench[at]));
+        } else if (rest) {
+          const first = view.eq[0], last = view.eq[at], ch = last - first;
+          item("", labels[0], cash(last));
+          item(null, "Change", `${scash(ch)} (${pct(first ? (ch / first) * 100 : NaN)})`, tone(ch));
+        } else {
+          item("", labels[0], cash(view.eq[at]));
+          const prev = at > 0 ? view.eq[at - 1] : (view.prior ?? null);
+          if (prev !== null) {
+            const ch = view.eq[at] - prev;
+            item(null, isIntra() ? "Since the previous point" : "On the day", `${scash(ch)} (${pct(prev ? (ch / prev) * 100 : NaN)})`, tone(ch));
+          }
+        }
+        item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
+        legend.append(Object.assign(document.createElement("span"), {textContent: rest ? `${view.full[0]} to ${view.full[view.full.length - 1]}` : view.full[at], className: "faint"}));
       };
       const hover = (_e, els) => readout(els.length ? els[0].index : null);
       eq.options.onHover = hover; dd.options.onHover = hover;
-      [eqEl, ddEl].forEach((el) => el.addEventListener("mouseleave", () => { readout(null); sync(null); }));
       // Hovering either chart moves the hairline on both.
       const sync = (i) => [eq, dd].forEach((c) => {
         c.setActiveElements(i === null ? [] : [{datasetIndex: 0, index: i}]);
         c.tooltip.setActiveElements(i === null ? [] : [{datasetIndex: 0, index: i}], {x: 0, y: 0});
         c.update("none");
       });
+      [eqEl, ddEl].forEach((el) => {
+        el.addEventListener("mouseenter", () => { hovering = true; });
+        el.addEventListener("mouseleave", () => { hovering = false; readout(null); sync(null); });
+      });
       eqEl.addEventListener("mousemove", () => { const a = eq.getActiveElements(); if (a.length) { dd.setActiveElements([{datasetIndex: 0, index: a[0].index}]); dd.tooltip.setActiveElements([{datasetIndex: 0, index: a[0].index}], {x: 0, y: 0}); dd.update("none"); } });
       ddEl.addEventListener("mousemove", () => { const a = dd.getActiveElements(); if (a.length) { eq.setActiveElements([{datasetIndex: 0, index: a[0].index}]); eq.tooltip.setActiveElements([{datasetIndex: 0, index: a[0].index}], {x: 0, y: 0}); eq.update("none"); } });
 
-      const intraday = d.res === "intraday";
-      const times = d.t.map((x) => Date.parse(x));
-      // Place each fill on the curve at the first point at or after it.
+      let times = [];
+      // Place each fill on the curve at the first point at or after it; fills before the first point are off the chart.
       const fillIdx = (side) => {
         const out = new Set();
-        (d.fills || []).filter((f) => f.side === side).forEach((f) => {
+        (cur.fills || []).filter((f) => f.side === side && Date.parse(f.t) >= times[0]).forEach((f) => {
           const ft = Date.parse(f.t);
           let i = times.findIndex((x) => x >= ft);
           if (i < 0) i = times.length - 1;
@@ -189,41 +220,109 @@ window.Console = (() => {
         });
         return out;
       };
-      const buys = fillIdx("BUY"), sells = fillIdx("SELL");
       const rebase = (arr, from) => {
         const b = arr.slice(from).find((v) => v !== null && v !== undefined && v > 0);
         return arr.slice(from).map((v) => (v === null || v === undefined || !b ? null : (v / b - 1) * 100));
       };
-      const show = (n) => {
-        const from = n ? Math.max(0, d.t.length - n) : 0;
-        const span = (times[times.length - 1] - times[from]) / 864e5;
-        // Short ranges show the day, long ones the month and year; intraday adds the time.
-        const opts = intraday && span < 3 ? {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"}
-          : span > 200 ? {month: "short", year: "2-digit"} : {day: "2-digit", month: "short"};
-        const lab = times.slice(from).map((t) => new Date(t).toLocaleString("en-GB", {...opts, timeZone: "UTC"}));
-        const ret = rebase(d.equity, from), bench = rebase(d.benchmark, from);
-        view = {lab, ret, bench, dd: d.drawdown.slice(from).map((x) => -x * 100)};
+      // en-GB writes September as "Sept"; trading screens use three letters throughout.
+      const fmtDate = (t, o) => new Date(t).toLocaleString("en-GB", {...o, timeZone: "UTC"}).replace("Sept", "Sep");
+      // Boundaries for the date axis, thinned so labels never touch at any width.
+      const boundaries = (ts) => {
+        const span = (ts[ts.length - 1] - ts[0]) / 864e5;
+        const out = {};
+        if (isIntra() && span < 8) {
+          // A day reads in hours; a week in days, the date at each midnight.
+          const every = span <= 0.5 ? 1 : span <= 1.5 ? 3 : 24;  // hours between labels
+          let prev = null;
+          ts.forEach((t, i) => {
+            const k = Math.floor(t / (every * 36e5));
+            if (prev !== null && k !== prev) out[i] = every === 24 ? fmtDate(t, {weekday: "short", day: "2-digit"}) : fmtDate(t, {hour: "2-digit", minute: "2-digit"});
+            prev = k;
+          });
+        } else {
+          const unit = span <= 45 ? "week" : span <= 420 ? "month" : "quarter";
+          let prev = null, first = true;
+          ts.forEach((t, i) => {
+            const dt = new Date(t), y = dt.getUTCFullYear(), m = dt.getUTCMonth();
+            const k = unit === "week" ? Math.floor((t / 864e5 + 3) / 7) : unit === "month" ? y * 12 + m : y * 4 + Math.floor(m / 3);
+            if (prev !== null && k !== prev) {
+              out[i] = unit === "week" ? fmtDate(t, {day: "2-digit", month: "short"})
+                : first || m === 0 ? fmtDate(t, {month: "short", year: "numeric"}) : fmtDate(t, {month: "short"});
+              first = false;
+            }
+            prev = k;
+          });
+        }
+        const keys = Object.keys(out).map(Number);
+        // Measured from the box, not the last drawn chart area, which is stale while the layout settles.
+        const room = Math.max(1, Math.floor(((ddEl.parentElement.clientWidth || 600) - 64) / 72));
+        const stride = Math.ceil(keys.length / room);
+        if (stride > 1) keys.forEach((k, n) => { if (n % stride) delete out[k]; });
+        return out;
+      };
+      const ddSteps = [-1, -2, -4, -6, -8, -10, -20, -30, -40, -60, -80, -100];
+      // The range on screen: a number of daily points (0 for all), or days of minute-level marks.
+      let range = {n: 0};
+      const show = () => {
+        const from = range.n ? Math.max(0, cur.t.length - range.n) : 0;
+        times = cur.t.map((x) => Date.parse(x));
+        const buys = fillIdx("BUY"), sells = fillIdx("SELL");
+        const ts = times.slice(from);
+        const full = ts.map((t) => fmtDate(t, isIntra() ? {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"} : {day: "2-digit", month: "short", year: "numeric"}));
+        const eqv = cur.equity.slice(from), ret = rebase(cur.equity, from), bench = rebase(cur.benchmark, from);
+        view = {full, eq: eqv, ret, bench, prior: from > 0 ? cur.equity[from - 1] : (cur.prior ?? null), dd: cur.drawdown.slice(from).map((x) => -x * 100)};
         // The whole run's worst comes from every mark, as the tables show it; the curve is daily or
         // thinned and can miss a fall that recovered between its points. A shorter range reads the curve.
-        view.worst = from === 0 && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
-        eq.data.labels = lab; eq.data.datasets[0].data = ret; eq.data.datasets[1].data = bench;
-        eq.data.datasets[2].data = ret.map((v, i) => (buys.has(i + from) ? v : null));
-        eq.data.datasets[3].data = ret.map((v, i) => (sells.has(i + from) ? v : null));
-        const vals = [...ret, ...bench].filter((v) => v !== null);
-        const r = niceRange(Math.min(0, ...vals), Math.max(0, ...vals));
+        view.worst = cur === d && from === 0 && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
+        const top = compare ? ret : eqv;
+        eq.data.labels = full; eq.data.datasets[0].data = top;
+        eq.data.datasets[1].data = compare ? bench : [];
+        eq.data.datasets[0].fill = compare ? "origin" : "start";
+        eq.data.datasets[2].data = top.map((v, i) => (buys.has(i + from) ? v : null));
+        eq.data.datasets[3].data = top.map((v, i) => (sells.has(i + from) ? v : null));
+        const vals = (compare ? [...ret, ...bench] : eqv).filter((v) => v !== null && v !== undefined);
+        const lo = Math.min(...vals), hi = Math.max(...vals);
+        // Compare mode keeps 0% in view; money mode fits the equity line, padded so a flat line isn't a wall.
+        const r = compare ? niceRange(Math.min(0, lo), Math.max(0, hi)) : niceRange(lo, hi, Math.max(hi * 0.0005, 0.5));
+        step = r.step;
         Object.assign(eq.options.scales.y, {min: r.min, max: r.max}); eq.options.scales.y.ticks.stepSize = r.step;
-        // Drawdown axis fits the worst point in view, so a shallow drawdown isn't a flat line at the top.
+        // Drawdown axis fits the worst point in view, on round steps: 0, half way, the floor.
         const worst = Math.min(...view.dd);
-        dd.options.scales.y.min = worst > -1 ? -1 : niceFloor(worst * 1.1);
-        dd.data.labels = lab; dd.data.datasets[0].data = view.dd;
+        const floor = ddSteps.find((s) => s <= worst * 1.1) ?? -100;
+        Object.assign(dd.options.scales.y, {min: floor}); dd.options.scales.y.ticks.stepSize = -floor / 2;
+        dd.data.labels = full; dd.data.datasets[0].data = view.dd;
+        tickAt = boundaries(ts);
         eq.update(); dd.update();
-        readout(null);
+        if (!hovering) readout(null);
       };
-      document.querySelectorAll("[data-range]").forEach((b) => b.addEventListener("click", () => {
-        document.querySelectorAll("[data-range]").forEach((o) => o.setAttribute("aria-pressed", o === b ? "true" : "false"));
-        show(parseInt(b.dataset.range, 10));
+      const live = typeof url === "string";
+      const withDays = (days) => url + (url.includes("?") ? "&" : "?") + "days=" + days;
+      // Fetches what the current range needs. Live charts call this again every minute, so today's
+      // move shows as it happens; a backtest's embedded result never changes.
+      const load = () => {
+        if (!live) { cur = d; return Promise.resolve(); }
+        return fetch(range.days ? withDays(range.days) : url).then((r) => r.json()).then((x) => {
+          if (range.days) cur = x; else { d = x; cur = x; }
+        });
+      };
+      const buttons = scope.querySelectorAll("[data-range], [data-days]");
+      buttons.forEach((b) => b.addEventListener("click", () => {
+        buttons.forEach((o) => o.setAttribute("aria-pressed", o === b ? "true" : "false"));
+        range = b.dataset.days ? {days: parseInt(b.dataset.days, 10), n: 0} : {n: parseInt(b.dataset.range, 10)};
+        if (!range.days) cur = d;
+        (range.days ? load() : Promise.resolve()).then(() => { if (cur.t.length) show(); });
       }));
-      show(0);
+      scope.querySelectorAll("[data-compare]").forEach((b) => {
+        b.setAttribute("aria-pressed", String(compare));
+        b.addEventListener("click", () => { compare = !compare; b.setAttribute("aria-pressed", String(compare)); show(); });
+      });
+      if (live) setInterval(() => {
+        if (document.hidden || hovering) return;
+        load().then(() => { if (cur.t.length) show(); }).catch(() => {});  // the strip already says when updates stop
+      }, 60000);
+      // Charts drawn inside a hidden tab get their width when it opens; recount the date labels then.
+      new ResizeObserver(() => { if (view) { tickAt = boundaries(times.slice(range.n ? Math.max(0, cur.t.length - range.n) : 0)); dd.update("none"); } }).observe(ddEl.parentElement);
+      show();
     });
   }
 
@@ -242,7 +341,7 @@ window.Console = (() => {
       layout: {background: {type: "solid", color: css("--panel")}, textColor: css("--muted"), fontSize: 11, fontFamily: getComputedStyle(document.body).fontFamily, attributionLogo: true},
       grid: {vertLines: {visible: false}, horzLines: {color: css("--line")}},
       rightPriceScale: {borderVisible: false, scaleMargins: {top: 0.08, bottom: 0.08}},
-      timeScale: {borderVisible: false, rightOffset: 6},
+      timeScale: {borderVisible: false, rightOffset: 6, fixLeftEdge: true},
       crosshair: {mode: 0, vertLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}, horzLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}},
     });
     const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
@@ -463,5 +562,42 @@ window.Console = (() => {
     show(0, false);
   }
 
-  return {sortable, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+
+  // Tabs on a strategy page: one panel at a time, chosen by the URL hash so links and the back
+  // button work. A hash that points inside a panel (an activity filter link) opens that panel.
+  // Without JavaScript every panel shows, one after another.
+  function tabs() {
+    const bar = document.querySelector("[data-tabs]");
+    if (!bar) return;
+    const links = [...bar.querySelectorAll("[data-tab]")];
+    const panels = [...document.querySelectorAll("[data-panel]")];
+    const show = () => {
+      const id = decodeURIComponent(location.hash.slice(1));
+      // Panels' ids differ from their tab names, so the browser never jumps past the header to one.
+      const named = id && document.querySelector(`[data-panel="${CSS.escape(id)}"]`);
+      const target = named || (id && document.getElementById(id));
+      const panel = named || (target && target.closest("[data-panel]")) || panels[0];
+      panels.forEach((p) => { p.hidden = p !== panel; });
+      links.forEach((a) => {
+        const on = a.dataset.tab === panel.dataset.panel;
+        a.setAttribute("aria-selected", String(on));
+        if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+      });
+      // Charts sized while hidden need a nudge once their panel is visible.
+      window.dispatchEvent(new Event("resize"));
+      if (target && target !== panel) target.scrollIntoView({block: "start"});
+    };
+
+    bar.addEventListener("click", (e) => {
+      const a = e.target.closest("[data-tab]");
+      if (!a) return;
+      e.preventDefault();
+      history.replaceState(null, "", "#" + a.dataset.tab);
+      show();
+    });
+    window.addEventListener("hashchange", show);
+    show();
+  }
+
+  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

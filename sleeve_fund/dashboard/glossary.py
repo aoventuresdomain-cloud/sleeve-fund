@@ -19,6 +19,7 @@ GLOSSARY = {
     "unrealised": "Gain or loss on open positions, marked at the last price. It becomes realised when sold, and the exit fee is not included yet.",
     "realised": "Profit or loss on closed trades, after entry and exit fees.",
     "exposure_cap": "The most of a strategy's equity its risk profile lets it hold in open positions.",
+    "correlation": "Correlation of daily returns. 1 means two strategies move in lockstep, 0 unrelated, below 0 opposite. Low correlation is what spreads risk; darker cells are more alike.",
     "g1": "Gate 1: the strategy beat buy-and-hold out of sample on real data, with enough trades, after fees. Decided by the research loop.",
     "g2": "Gate 2: at least six weeks of paper trading whose results sit inside the backtest's range. Only you can approve it, and only then can a strategy trade real money.",
 }

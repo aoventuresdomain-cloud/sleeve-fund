@@ -74,6 +74,14 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail nav.secondary { margin-top: 6px; }
 .rail nav .group { padding: 14px 8px 4px; font-size: 11.5px; font-weight: 500; color: var(--faint); }
 .rail .more-btn { display: none; }
+/* Strategies under Portfolio: an indented list on a guide line, each with its status dot. */
+.rail .strats { display: flex; flex-direction: column; gap: 1px; margin: 1px 0 4px 15px; padding-left: 9px; border-left: 1px solid var(--line); }
+.rail nav .strats a { gap: 9px; padding: 5px 8px; font-size: 13px; font-weight: 450; }
+.rail nav .strats a span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.sdot.running { background: var(--gain); }
+.sdot.halted, .sdot.error { background: var(--loss); }
+.sdot.paused, .sdot.starting { background: var(--warn); }
 dialog.sheet { border: 1px solid var(--line-strong); border-radius: 16px; background: var(--panel); color: var(--text); padding: 0; width: min(420px, calc(100vw - 24px)); box-shadow: var(--shadow); }
 dialog.sheet::backdrop { background: rgba(0,0,0,0.55); backdrop-filter: blur(2px); }
 .sheet-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
@@ -121,7 +129,7 @@ main > h2 { margin: 24px 0 10px; }
 .ledger .k { color: var(--muted); font-size: 12px; display: flex; align-items: center; white-space: nowrap; }
 .ledger .v { font-size: 19px; font-weight: 500; letter-spacing: -0.025em; white-space: nowrap; margin-top: 3px; line-height: 1.25; }
 .ledger .v.lead { font-size: 28px; font-weight: 550; letter-spacing: -0.035em; line-height: 1.15; }
-.ledger .s { color: var(--faint); font-size: 11.5px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ledger .s { color: var(--faint); font-size: 11.5px; margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
 
 /* --- panels and grid -------------------------------------------------------- */
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); margin-bottom: 16px; }
@@ -278,7 +286,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .rail nav a svg, .rail .more-btn svg { width: 20px; height: 20px; }
   .rail nav a[aria-current="page"] { background: none; color: var(--text); }
   .rail .count { position: absolute; top: 4px; left: calc(50% + 6px); margin: 0; }
-  .rail .rail-new, .rail nav.secondary { display: none; }
+  .rail .rail-new, .rail nav.secondary, .rail .strats { display: none; }
   .rail .more-btn { display: flex; align-items: center; border: 0; background: none; color: var(--muted); }
   .rail .more-btn:hover { filter: none; }
   .rail .more-btn[aria-current] { color: var(--text); }
@@ -511,10 +519,56 @@ nav.tabs a[aria-current] { border-bottom-color: var(--accent); }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--gain) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; color: var(--muted); margin: -4px 0 8px; min-height: 18px; }
 .chart-legend b { font-weight: 550; color: var(--text); margin-left: 4px; }
-.chart-legend i { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: 3px; margin-right: 6px; background: var(--accent); }
-.chart-legend i.bench { background: none; border-top: 2px dotted var(--muted); height: 0; }
+.chart-legend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; vertical-align: 3px; margin-right: 6px; background: var(--accent); }
+.chart-legend i.bench { background: none; border-top: 2px dashed var(--muted); height: 0; }
 
 /* A backtest running in the background. */
 .progress { height: 6px; border-radius: 3px; background: var(--neutral-bg); overflow: hidden; margin: 4px 0 10px; }
 .progress > div { height: 100%; background: var(--accent); transition: width .4s ease; }
 .bt-links { font-size: 12.5px; color: var(--muted); }
+
+/* Strategy page tabs: stay in reach under the strip while scrolling a long table. */
+nav.desk-tabs { position: sticky; top: var(--strip); z-index: 5; background: var(--bg); margin-top: 6px; }
+.tab-panel[hidden] { display: none; }
+.tab-panel > section + section, .tab-panel > .grid + section { margin-top: 14px; }
+.tab-panel .grid { align-items: start; }
+
+/* Chart tools: the compare switch beside the range picker. */
+.chart-tools { align-items: center; gap: 10px !important; flex-wrap: wrap; justify-content: flex-end; }
+button.toggle { display: inline-flex; align-items: center; gap: 7px; background: none; border: 1px solid var(--line-strong); color: var(--muted);
+  padding: 3px 10px 3px 8px; font-size: 12px; font-weight: 500; border-radius: 999px; }
+button.toggle::before { content: ""; width: 14px; height: 0; border-top: 2px dashed var(--muted); }
+button.toggle:hover { color: var(--text); filter: none; }
+button.toggle[aria-pressed="true"] { color: var(--text); background: var(--neutral-bg); }
+button.toggle[aria-pressed="true"]::before { border-top-color: var(--text); }
+/* Path to live: one line with a segment per condition; the list opens on demand. */
+details.g2 summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; flex-wrap: wrap; }
+details.g2 summary::-webkit-details-marker { display: none; }
+details.g2 summary h2 { margin: 0; }
+details.g2[open] summary { margin-bottom: 14px; }
+details.g2 .g2-more { margin-left: auto; }
+details.g2 .g2-more::after { content: " ▾"; }
+details.g2[open] .g2-more::after { content: " ▴"; }
+.g2-bar { display: inline-flex; gap: 3px; }
+.g2-bar i { width: 18px; height: 6px; border-radius: 2px; background: var(--neutral-bg); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.g2-bar i.ok { background: var(--gain); box-shadow: none; }
+.g2-bar i.bad { background: var(--loss); box-shadow: none; }
+/* Order status filter: a segmented control under the page tabs. */
+nav.status-filter { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: 8px; background: var(--neutral-bg); margin-bottom: 14px; }
+nav.status-filter a { padding: 4px 10px; font-size: 12.5px; font-weight: 500; color: var(--muted); border-radius: 6px; }
+nav.status-filter a:hover { color: var(--text); text-decoration: none; }
+nav.status-filter a[aria-current] { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.25); }
+nav.status-filter .n { margin-left: 4px; color: var(--faint); font-size: 11.5px; }
+
+/* Portfolio right column: what moved the book above what needs attention. */
+.col-stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.col-stack > .panel:last-child { flex: 1; }
+table.movers td, table.movers th { padding-left: 0; }
+table.movers td:first-child { max-width: 0; width: 38%; overflow: hidden; text-overflow: ellipsis; }
+table.movers .bar-col { width: 26%; padding: 0 8px; }
+table.movers .mv { position: relative; display: block; height: 8px; }
+table.movers .mv::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--line-strong); }
+table.movers .mv i { position: absolute; top: 0; height: 8px; border-radius: 2px; }
+table.movers .mv i.gain { background: var(--gain); } table.movers .mv i.loss { background: var(--loss); }
+table.movers tfoot th, table.movers tfoot td { border-top: 1px solid var(--line-strong); border-bottom: 0; color: var(--text); font-weight: 550; }
+td.health { line-height: 1.35; }

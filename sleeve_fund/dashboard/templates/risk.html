@@ -18,7 +18,7 @@
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="lim-h">
-  <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2><span class="hint">bars show how much of each limit is used</span></div>
+  <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>
   <table class="responsive" data-hide-md="2 5 7">
     <thead><tr><th>Strategy</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop-loss</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
@@ -36,7 +36,7 @@
 
 <div class="grid">
   <section class="panel span-7" aria-labelledby="stress-h">
-    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2><span class="hint">every position falls at once, before any stop can act</span></div>
+    <div class="panel-head"><h2 id="stress-h">What a sudden fall would cost</h2></div>
     <table class="compact">
       <thead><tr><th>Fall</th><th class="num">Book loss</th><th class="num">Share of book</th><th>Strategies that would halt</th></tr></thead>
       <tbody>{% for sc in risk.scenarios %}
@@ -47,7 +47,7 @@
     <p class="muted" style="margin:8px 0 0;font-size:12px">Gap risk: stops fill after the fact.</p>
   </section>
   <section class="panel span-5" aria-labelledby="hist-h">
-    <div class="panel-head"><h2 id="hist-h">Limits that fired</h2><span class="hint">halts, pauses, mismatches</span></div>
+    <div class="panel-head"><h2 id="hist-h">Limits that fired</h2></div>
     {% if risk.history %}
     <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message }}</span></li>{% endfor %}</ul>
     {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}

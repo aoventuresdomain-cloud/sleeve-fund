@@ -578,6 +578,13 @@ class Store:
             rows = _rows(c.execute(q.limit(limit)))
         return rows[::-1]
 
+    def equity_since(self, sleeve: str, ts: datetime) -> list[dict]:
+        """Every mark at or after ts, oldest first."""
+        q = (select(equity_t).where(equity_t.c.sleeve == sleeve, equity_t.c.ts >= ts)
+             .order_by(equity_t.c.ts, equity_t.c.id))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
     def last_equity(self, sleeve: str) -> dict | None:
         rows = self.equity_series(sleeve, limit=1)
         return rows[0] if rows else None

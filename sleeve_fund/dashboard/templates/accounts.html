@@ -9,7 +9,7 @@
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
 
 <section class="panel flush" aria-labelledby="acc-h">
-  <div class="panel-head"><h2 id="acc-h">Your accounts</h2><span class="hint">live trading is locked until G2 is approved</span></div>
+  <div class="panel-head"><h2 id="acc-h">Your accounts</h2></div>
   <table class="responsive">
     <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Kraken key on the server</th><th>Note</th></tr></thead>
     <tbody>{% for a in accounts %}
@@ -25,7 +25,7 @@
   </table>
 </section>
 
-<div class="grid">
+<div class="grid" style="align-items:start">
   <section class="panel span-7" aria-labelledby="how-h">
     <div class="panel-head"><h2 id="how-h">Connect a Kraken sub-account</h2></div>
     <details class="more-fields"><summary>Five steps, about ten minutes</summary>

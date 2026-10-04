@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, help %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, help, book_tabs %}
 {% block title %}Trades · Multi-Strategy Fund{% endblock %}
 {% block content %}
 {% set st = h.stats %}
 <div class="page-head">
-  <h1>Positions and trades</h1>
+  <h1>Portfolio</h1>
   <div class="actions">
     <form class="inline" method="get" action="/trades">
       <label class="sr-only" for="t-sleeve">Strategy</label>
@@ -14,6 +14,7 @@
     <a class="button secondary" href="/exports/trades.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
   </div>
 </div>
+{{ book_tabs('trades') }}
 {% if backtest %}<div class="banner" role="status">Showing a saved backtest: the paper runtime replayed over history. <a href="/backtest/{{ backtest.run_id }}">Back to the result</a></div>{% endif %}
 
 <section class="ledger" aria-label="Trade figures">
@@ -28,7 +29,7 @@
 </section>
 
 <section class="panel flush" aria-labelledby="pos-h">
-  <div class="panel-head"><h2 id="pos-h">Open positions</h2><span class="hint">marked to the last Kraken price</span></div>
+  <div class="panel-head"><h2 id="pos-h">Open positions</h2></div>
   {% if h.positions %}
   <table class="responsive" data-hide-md="4 7 8">
     <thead><tr><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Value</th><th class="num">Unrealised</th><th class="num">Held</th><th class="num">Stop / target</th><th></th></tr></thead>
@@ -48,7 +49,7 @@
 </section>
 
 <section class="panel flush" aria-labelledby="tr-h">
-  <div class="panel-head"><h2 id="tr-h">Closed trades</h2><span class="hint">entry to exit, after both fees, newest first</span></div>
+  <div class="panel-head"><h2 id="tr-h">Closed trades</h2></div>
   {% if h.trades %}
   <table class="responsive" data-hide-md="3 6 7 9">
     <thead><tr><th>Closed</th><th>Strategy</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Held</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th>Exit</th><th></th></tr></thead>

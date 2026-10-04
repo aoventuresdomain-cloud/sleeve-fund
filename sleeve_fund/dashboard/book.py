@@ -81,7 +81,9 @@ def spark_path(values: list[float], w: int = 96, h: int = 24) -> str:
 
 
 def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
-    active = [x for x in summaries if x["sleeve"].desired_state == "running"] or summaries
+    # Every strategy counts, stopped and archived ones included: their cash is still the fund's, and
+    # stopping one must never rewrite the book's past.
+    active = summaries
     start = sum(x["sleeve"].starting_balance for x in active)
     equity = sum(x["equity"] for x in active)
     curve = book_curve(active, frames)
@@ -136,6 +138,38 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.Dat
         for col in ("equity", "benchmark"):
             out[col] += f[col].reindex(out.index).ffill().fillna(base) if f is not None else base
     peak = out["equity"].cummax()
+    out["drawdown"] = 1 - out["equity"] / peak
+    return out
+
+
+# Resolution of the short ranges: five-minute points for a day, half-hourly for a week.
+RECENT_STEP = {1: "5min", 7: "30min"}
+
+
+def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | None = None) -> pd.DataFrame:
+    """Equity and benchmark summed over the given strategies at fine resolution for the last `days`.
+    A strategy without a mark in a step carries its last value; one with no mark yet counts as its
+    starting balance. prior_peak is the highest equity before the window, so drawdown is measured from
+    the real peak rather than from the start of the window."""
+    now = utcnow()
+    step = RECENT_STEP.get(days, "30min")
+    since = pd.Timestamp(now - pd.Timedelta(days=days)).floor(step)
+    idx = pd.date_range(since, pd.Timestamp(now).floor(step), freq=step)
+    out = pd.DataFrame(index=idx, data={"equity": 0.0, "benchmark": 0.0})
+    for s in sleeves:
+        before = store.equity_at_or_before(s.name, since.to_pydatetime())
+        rows = store.equity_since(s.name, since.to_pydatetime())
+        for col in ("equity", "benchmark"):
+            start = before[col] if before else s.starting_balance
+            if rows:
+                ser = pd.Series([r[col] for r in rows], index=pd.to_datetime([r["ts"] for r in rows], utc=True))
+                ser = ser.resample(step).last().reindex(idx).ffill().fillna(start)
+            else:
+                ser = pd.Series(start, index=idx)
+            out[col] += ser
+    peak = out["equity"].cummax()
+    if prior_peak:
+        peak = peak.clip(lower=prior_peak)
     out["drawdown"] = 1 - out["equity"] / peak
     return out
 

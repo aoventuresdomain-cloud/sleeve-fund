@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, help %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, help, book_tabs, pts %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
@@ -12,6 +12,7 @@
     After fees.
   </p>
 </div>
+{{ book_tabs('overview') }}
 
 {% if summaries or archived %}
 <section class="ledger" aria-label="Book figures">
@@ -28,14 +29,30 @@
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h">
-    <div class="panel-head"><h2 id="curve-h">Book equity against buy-and-hold</h2>
-      <div class="right range" role="group" aria-label="Range">
-        <button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button>
+    <div class="panel-head"><h2 id="curve-h">Book equity</h2>
+      <div class="right chart-tools">
+        <button type="button" class="toggle" data-compare aria-pressed="false" title="Show return against buying and holding the instrument">vs buy-and-hold</button>
+        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
       </div></div>
-    <div class="chart"><canvas id="eq" aria-label="Book equity and buy-and-hold by day"></canvas></div>
+    <div class="chart"><canvas id="eq" aria-label="Book equity by day"></canvas></div>
     <div class="chart short"><canvas id="dd" aria-label="Book drawdown by day"></canvas></div>
   </section>
-  <section class="panel span-4" aria-labelledby="alerts-h">
+  <div class="span-4 col-stack">
+  {% set movers = summaries|sort(attribute='day_pnl')|reverse|list %}
+  {% set scale = [movers|map(attribute='day_pnl')|map('abs')|max, 0.01]|max if movers else 1 %}
+  <section class="panel" aria-labelledby="move-h">
+    <div class="panel-head"><h2 id="move-h">What moved the book</h2></div>
+    <table class="compact movers">
+      <thead><tr><th>Strategy</th><th class="bar-col" aria-hidden="true"></th><th class="num">Today</th><th class="num">Month</th></tr></thead>
+      <tbody>{% for x in movers %}{% set w = (x.day_pnl|abs / scale * 50)|round(1) %}
+        <tr><td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a></td>
+          <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if x.day_pnl >= 0 else 'loss' }}" style="{{ 'left:50%' if x.day_pnl >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
+          <td class="num">{{ money_signed(x.day_pnl) }}</td><td class="num">{{ money_signed(x.mtd_pnl) }}</td></tr>{% endfor %}
+      </tbody>
+      <tfoot><tr><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(book.day_pnl) }}</td><td class="num">{{ money_signed(book.mtd_pnl) }}</td></tr></tfoot>
+    </table>
+  </section>
+  <section class="panel" aria-labelledby="alerts-h">
     <div class="panel-head"><h2 id="alerts-h">Needs attention</h2><a class="right" href="/alerts">All alerts</a></div>
     {% if alerts %}
     <ul class="alerts">
@@ -47,6 +64,7 @@
     {% if alerts|length > 6 %}<p class="muted" style="margin:8px 0 0">{{ alerts|length - 6 }} more in <a href="/alerts">Alerts</a>.</p>{% endif %}
     {% else %}<p class="empty">Nothing needs you. Warnings and errors from any strategy land here.</p>{% endif %}
   </section>
+  </div>
 </div>
 
 <section class="panel flush" aria-labelledby="sleeves-h" style="margin-bottom:14px">
@@ -55,7 +73,7 @@
     <thead><tr>
       <th data-sort="text">Strategy</th><th data-sort="text">Status</th><th>Last 60 days</th>
       <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
-      <th class="num" data-sort="num" title="Strategy return minus buy-and-hold return over the same period">vs buy-and-hold</th>
+      <th class="num" data-sort="num" title="Strategy return minus buy-and-hold return over the same period, in percentage points">vs buy-and-hold</th>
       <th class="num" data-sort="num">Exposure</th><th class="num" data-sort="num">Closed trades</th>
       <th data-sort="num">Drawdown of limit</th><th>Health</th>
     </tr></thead>
@@ -64,16 +82,16 @@
     {% for x in summaries %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
-      <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span></td>
+      <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
       <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
       <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
       <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
       <td class="num" data-v="{{ x.ret }}" data-label="Since start">{{ signed(x.ret) }}</td>
-      <td class="num" data-v="{{ x.ret - x.bench_ret }}" data-m="right" data-label="vs buy-and-hold">{{ signed(x.ret - x.bench_ret) }}</td>
+      <td class="num" data-v="{{ x.ret - x.bench_ret }}" data-m="right" data-label="vs buy-and-hold">{{ pts(x.ret - x.bench_ret) }}</td>
       <td class="num" data-v="{{ x.exposure }}" data-m="hide">{{ x.exposure|pct0 }}</td>
       <td class="num" data-v="{{ x.trades.trades }}" data-m="hide">{{ x.trades.trades }}{% if x.trades.trades %} <span class="muted">· {{ x.trades.win_rate|pct0 }} won</span>{% endif %}</td>
       <td data-v="{{ x.dd_used }}" data-m="hide">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
-      <td data-m="hide">
+      <td data-m="hide" class="health">
         {% if s.desired_state == 'stopped' %}<span class="muted">Stopped</span>
         {% elif x.healthy %}<span title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot ok"></span>{{ s.heartbeat_at|ago }}</span>
         {% else %}<span class="loss" title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot stale"></span>Silent {{ s.heartbeat_at|ago }}</span>{% endif %}
@@ -96,23 +114,23 @@
 
 <div class="grid">
   <section class="panel span-5" aria-labelledby="alloc-h">
-    <div class="panel-head"><h2 id="alloc-h">Allocation</h2><span class="hint">share of total capital</span></div>
+    <div class="panel-head"><h2 id="alloc-h">Allocation</h2></div>
     {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
-    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.share * 100)|round(2) }}%; background: {{ 'var(--neutral-bg)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
+    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.share * 100)|round(2) }}%; background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
     <table class="compact">
       <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
-      <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--neutral-bg)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
+      <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
     </table>
   </section>
   <section class="panel span-7" aria-labelledby="corr-h">
-    <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2><span class="hint">correlation of daily returns, 1 = in lockstep</span></div>
+    <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2> {{ help('correlation') }}</div>
     {% if book.correlation.matrix %}
     <div style="overflow-x:auto"><table class="corr">
       <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
       {% for row in book.correlation.matrix %}{% set ri = loop.index0 %}{% set rn = book.correlation.names[ri] %}
       <tr><th scope="row" class="row">{{ rn }}</th>{% for v in row %}
         {% if loop.index0 == ri %}<td class="self">·</td>{% elif v is none %}<td class="faint">n/a</td>
-        {% else %}<td style="background: color-mix(in srgb, {{ 'var(--loss)' if v >= 0 else 'var(--accent)' }} {{ (v|abs * 55)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
+        {% else %}<td style="background: color-mix(in srgb, var(--accent) {{ ([v, 0]|max * 60)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
       {% endfor %}</tr>{% endfor %}
     </table></div>
     {% else %}<p class="empty">Needs two strategies with at least 20 days of history.</p>{% endif %}
