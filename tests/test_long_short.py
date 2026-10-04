@@ -163,7 +163,7 @@ def test_long_only_perp_holds_the_short_leg_flat(prices, instrument):
 
 def test_rsi_bands_shorts_a_rally_on_a_perp(prices, instrument):
     # A slide pushes RSI under 30 (long), a rebound past 55 sells; the rally past 70 now opens a short.
-    # (A chop to start, not a flat line: RSI of a flat line reads as overbought.)
+    # (A chop to start, so RSI begins near 50.)
     closes = ([100.0 + (0.3 if i % 2 else -0.3) for i in range(20)] + [100 - i for i in range(1, 12)]
               + [89 + 1.5 * i for i in range(1, 15)] + [110.0] * 5)
     res = run_backtest("rsi_bands", _path(prices, closes), instrument, {"rsi_period": 5, **PERP}, half_spread=0)

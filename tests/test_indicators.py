@@ -3,25 +3,30 @@ the whole process once its period passes 1,024. Strategies use our own averages,
 engine's below that limit and have none above it."""
 
 import ast
+import json
 import random
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from nautilus_trader.indicators import AverageTrueRange, SimpleMovingAverage
 
 from sleeve_fund.data import synthetic_ohlcv
 from sleeve_fund.store import Store
-from sleeve_fund.strategies.indicators import Atr, Sma
+from sleeve_fund.strategies.indicators import Atr, Rsi, Sma
 from sleeve_fund.venues import KRAKEN
 
 AUTH = ("pm", "test-pw")
 SAME = {"origin": "http://testserver"}
 STRATEGIES = Path(__file__).parent.parent / "sleeve_fund" / "strategies"
 # Engine indicators a strategy may use: checked below to survive a period far past 1,024.
-SAFE_ENGINE_INDICATORS = {"ExponentialMovingAverage", "RelativeStrengthIndex"}
+# Not RelativeStrengthIndex: it smooths exponentially, not as the standard RSI the chart draws (strategies.indicators.Rsi).
+SAFE_ENGINE_INDICATORS = {"ExponentialMovingAverage"}
 
 
 def _bars(n, seed=1):
@@ -113,3 +118,74 @@ def test_a_minute_strategy_with_a_2400_bar_average_can_be_created(client):
             "reason": "t", "p_trend_filter__fast": "600", "p_trend_filter__slow": "2400"}
     r = client.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.headers["location"] == "/sleeves/slow-tf"
+
+
+# --- RSI: the standard (Wilder) RSI in the strategies and on the chart (review round 11, M11-1) ---------
+
+def _reference(closes, n):
+    """Wilder's RSI written out from its definition: the mean of the first n gains and losses, then
+    Wilder's smoothing."""
+    d = np.diff(closes)
+    gains, losses = np.clip(d, 0, None), np.clip(-d, 0, None)
+    out = [None] * len(closes)
+    ag, al = gains[:n].mean(), losses[:n].mean()
+    for i in range(n, len(d) + 1):
+        if i > n:
+            ag = (ag * (n - 1) + gains[i - 1]) / n
+            al = (al * (n - 1) + losses[i - 1]) / n
+        out[i] = 50.0 if ag == al == 0 else 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def _closes(seed=3, n=300):
+    return list(100 * np.exp(np.cumsum(np.random.default_rng(seed).normal(0, 0.01, n))))
+
+
+def test_wilder_rsi_matches_its_definition():
+    closes = _closes()
+    rsi, got = Rsi(14), []
+    for c in closes:
+        rsi.update_raw(c)
+        got.append(rsi.value if rsi.initialized else None)
+    assert got[:14] == [None] * 14 and got[14] is not None  # 14 changes need 15 closes
+    assert got == pytest.approx(_reference(closes, 14), abs=1e-9)
+
+
+def test_textbook_values():
+    # The 14 changes alternate +1 and -1 (7 each): RSI 50; a rise after it lifts it, a fall drops it.
+    rsi = Rsi(14)
+    for c in [100 + (i % 2) for i in range(15)]:
+        rsi.update_raw(c)
+    assert rsi.value == pytest.approx(50.0)
+    flat = Rsi(5)
+    for _ in range(10):
+        flat.update_raw(100.0)
+    assert flat.initialized and flat.value == 50.0  # a flat line is neutral, not overbought
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_chart_draws_the_same_rsi():
+    js = (STRATEGIES.parent / "dashboard" / "static" / "console.js").read_text()
+    parts = [re.search(rf"^  const {name} = .*?^  }};$", js, re.S | re.M).group(0) for name in ("wilder", "rsi")]
+    nulls = re.search(r"^  const nulls = .*;$", js, re.M).group(0)
+    closes = _closes(seed=5) + [100.0] * 30  # ends flat, so the neutral case is drawn too
+    script = "\n".join([nulls, *parts, f"console.log(JSON.stringify(rsi({json.dumps(closes)}, 14)));"])
+    drawn = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    assert drawn == pytest.approx(_reference(closes, 14), abs=1e-9)
+
+
+def test_rsi_bands_trades_the_standard_rsi(prices, instrument):
+    """The reasons rsi_bands journals quote the RSI the chart shows at that bar."""
+    from sleeve_fund.research.runner import run_backtest
+    from test_backtest import _path
+
+    closes = [round(c, 1) for c in _closes(seed=9, n=200)]  # on the instrument's tick, as the venue prices them
+    res = run_backtest("rsi_bands", _path(prices, closes), instrument, {"rsi_period": 5}, half_spread=0)
+    ref = _reference(closes, 5)
+    assert res.decisions
+    for d in res.decisions.values():
+        if d["intent"] != "entry":
+            continue
+        quoted = float(re.search(r"RSI ([\d.]+)", d["reason"]).group(1))
+        assert any(r is not None and abs(r - quoted) < 0.051 for r in ref), d["reason"]
+        assert min(abs(r - d["signal"]["rsi"]) for r in ref if r is not None) < 1e-6

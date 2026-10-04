@@ -3,10 +3,10 @@ short when it reaches the high band until it falls back to the short exit."""
 
 from __future__ import annotations
 
-from nautilus_trader.indicators import RelativeStrengthIndex
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.indicators import Rsi
 
 SPEC = IdeaSpec(
     summary="Buys when RSI({rsi_period}) closes at or below {long_entry:g} and sells when it reaches {long_exit:g}; "
@@ -54,7 +54,7 @@ class RsiBands(LongFlatStrategy):
     def __init__(self, config: RsiBandsConfig) -> None:
         super().__init__(config)
         self.c = config
-        self.rsi = RelativeStrengthIndex(config.rsi_period)
+        self.rsi = Rsi(config.rsi_period)  # the standard RSI, as the chart draws it
         self._side = 0  # the leg the rules are on: +1 long, -1 short, 0 flat
         self._why = ("", {})
 
@@ -92,7 +92,7 @@ class RsiBands(LongFlatStrategy):
     def want_side(self, bar: Bar) -> int | None:
         if not self.rsi.initialized:
             return None
-        rsi = self.rsi.value * 100  # Nautilus RSI runs 0 to 1
+        rsi = self.rsi.value
         side = self.target_side(rsi)
         self._why = (self._why[0], {"rsi": rsi})
         return side  # a short is taken only on a perpetual with allow_short

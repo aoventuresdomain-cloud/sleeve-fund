@@ -393,8 +393,10 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
 TEST_STRATEGIES = {
     "ping_pong": ({"rise": 0.01, "dip": 0.005},
                   lambda s: 60_000 * (1 + 0.015 * np.sin(s / 600) + 0.001 * np.sin(s / 17) + 2e-6 * s)),
+    # Wilder's RSI(14), the standard one, is smoother than the engine's exponential RSI it once traded on
+    # (review round 11, M11-1): a 1.2% swing over about 40 minutes takes it past both bands.
     "rsi_bands": ({},
-                  lambda s: 60_000 * (1 + 0.004 * np.sin(s / 240) + 0.0008 * np.sin(s / 29))),
+                  lambda s: 60_000 * (1 + 0.006 * np.sin(s / 400) + 0.0008 * np.sin(s / 29))),
 }
 
 
