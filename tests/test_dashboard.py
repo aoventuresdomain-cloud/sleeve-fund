@@ -904,3 +904,21 @@ def test_the_guard_cadence_is_not_the_chart_spacing(client, monkeypatch, tmp_pat
     d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive")
     assert len(d["t"]) < d["days"]  # the chart is thinned
     assert d["risk"]["checked_minutes"] == 15 and "every 15 minutes" in d["risk"]["note"]
+
+
+def test_a_backtest_chart_covers_its_whole_period(client):
+    """Review round 5, R5-M6: a 5-year run's price chart showed only the last 720 candles, about 23 of
+    60 months at daily candles, beside an equity panel covering all five years."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.store import BACKTEST_PREFIX
+
+    c, store = client
+    name, t0 = BACKTEST_PREFIX + "r1", datetime(2021, 1, 1, tzinfo=timezone.utc)
+    store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=1000)
+    for i in range(5 * 365):
+        store.record_equity(name, equity=1000, cash=1000, qty=0, price=100 + i % 50, benchmark=1000,
+                            ts=t0 + timedelta(days=i))
+    d = c.get(f"/api/sleeves/{BACKTEST_PREFIX}r1/candles?interval=1d", auth=AUTH).json()
+    assert len(d["candles"]) == 5 * 365 and d["source"] == "marks"

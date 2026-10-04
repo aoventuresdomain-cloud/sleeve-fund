@@ -191,3 +191,33 @@ def test_the_participation_cap_can_be_set_or_turned_off(instrument):
                              max_participation=None).max_participation is None
     with pytest.raises(ValueError, match="max_participation"):
         TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.008, max_participation=2)
+
+
+def _volume_run(prices, instrument, volume):
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    bars = prices.iloc[:30].copy()
+    bars["volume"] = volume
+    rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                                    starting_balance=1_000_000, risk_profile="aggressive")
+    run_backtest("buy_and_hold", bars, instrument, runtime=rt)
+    buys = [o for o in rt.store.orders(limit=100) if o["side"] == "BUY"]
+    return buys, rt.store.events(rt.name, limit=100)
+
+
+def test_bars_with_no_volume_do_not_silence_the_strategy(prices, instrument):
+    """Review round 5, R5-M3: on zero-volume bars the cap allowed nothing, so no entries and no word why.
+    With nothing traded there is nothing to take a share of: the cap stands aside, once, and says so.
+    The engine makes no market on a bar where nothing traded, and its rejections are journaled too."""
+    buys, events = _volume_run(prices, instrument, 0.0)
+    assert buys and all(b["signal"]["sized_by"] == "aggressive risk profile cap" for b in buys)
+    (note,) = [e for e in events if e["kind"] == "no_volume"]
+    assert "volume cap is off" in note["message"]
+    assert any(e["kind"] == "order_rejected" and "No market" in e["message"] for e in events)
+
+
+def test_a_buy_the_volume_cap_blocks_says_so(prices, instrument):
+    buys, events = _volume_run(prices, instrument, 1e-8)  # a quarter of it rounds to nothing
+    assert buys == []
+    (note,) = [e for e in events if e["kind"] == "buy_skipped"]  # said once, not every bar
+    assert "share of the bar's volume" in note["message"] and "smallest order" in note["message"]

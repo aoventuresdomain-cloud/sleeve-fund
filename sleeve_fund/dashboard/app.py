@@ -313,7 +313,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         orders = trading.orders_by_id(st(), name)
         x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
         position = trading.open_position(x, list(reversed(fills)), orders)
-        data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source)
+        # A live screen shows the latest candles; a backtest's chart covers its whole period.
+        data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
+                              limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."

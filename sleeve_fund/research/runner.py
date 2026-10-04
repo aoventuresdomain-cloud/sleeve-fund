@@ -125,6 +125,9 @@ def run_backtest(
             fee_model=(fee_model := ScheduleFeeModel(FeeSchedule(instrument.maker_fee, instrument.taker_fee),
                                                      half_spread=half_spread)),
             fill_model=fill_model(),
+            # Within a bar, the extreme nearer the open trades first: a bar that opens near its low hits a
+            # stop before a target, rather than always high-then-low.
+            bar_adaptive_high_low_ordering=True,
         )
         engine.add_instrument(instrument)
         if exec_prices is not None and not exec_prices.empty:

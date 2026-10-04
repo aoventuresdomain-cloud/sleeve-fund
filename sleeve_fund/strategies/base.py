@@ -18,8 +18,9 @@ from typing import Any
 from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
-from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, OrderStatus, Price, PriceType,
-                                   Quantity, TimeInForce)
+from nautilus_trader.core import UUID4
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, OrderSide,
+                                   OrderStatus, Price, PriceType, Quantity, StopMarketOrder, TimeInForce, TriggerType)
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
@@ -126,6 +127,12 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"max_participation {max_participation} outside (0, 1]")
         if risk_per_trade is not None and stop_loss is None:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
+        if take_profit is not None:
+            leg = assumed_taker_fee + assumed_half_spread
+            cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
+            if take_profit <= cost:
+                raise ValueError(f"take_profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
+                                 f"({cost:.2%}): every target hit would lose money")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Leave room for the taker fee and rounding so a full-size buy never rejects.
@@ -181,6 +188,7 @@ class LongFlatStrategy(Strategy):
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
+        self._noted: set[str] = set()  # warnings already logged; each is said once until it clears
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -366,7 +374,7 @@ class LongFlatStrategy(Strategy):
         self._maybe_tick()
         if self._pending_exit is not None:
             return
-        if self._check_exits(self._last_close, high=bar.high.as_double()):
+        if self._check_exits(self._last_close):
             return
         raw = self.target_weight(bar)
         if raw is None:
@@ -415,7 +423,22 @@ class LongFlatStrategy(Strategy):
         if self._cfg.max_participation is None or not self._volumes:
             return None
         avg = sum(self._volumes) / len(self._volumes)
+        if avg <= 0:
+            # Nothing traded all day: a gap filled with flat bars, or a feed without volume. There is
+            # nothing to take a share of, so the cap stands aside rather than block every entry unseen.
+            self._note("no_volume", "No traded volume over the last day, so the volume cap is off until there is")
+            return None
+        self._noted.discard("no_volume")
         return Decimal(str(avg * self._cfg.max_participation)) * bar.close.as_decimal()
+
+    def _note(self, kind: str, msg: str, level: str = "warning") -> None:
+        """Log a warning and put it in the strategy's events, once until it clears (_noted.discard)."""
+        if kind in self._noted:
+            return
+        self._noted.add(kind)
+        self.log.warning(msg)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, level, kind, msg, ts=self.runtime.now())
 
     def _rebalance(self, bar: Bar, w: float, reason: str, values: dict) -> bool:
         """Trade part of the position so it is worth `w` of the sleeve's equity at this close."""
@@ -434,37 +457,39 @@ class LongFlatStrategy(Strategy):
             budget = min(diff, bal.free.as_decimal() * (Decimal(1) - fee - Decimal(str(self._cfg.cash_buffer))))
             if self._cfg.max_notional is not None:
                 budget = min(budget, Decimal(str(self._cfg.max_notional)))
-            if (cap := self._volume_cap(bar)) is not None:
-                budget = min(budget, cap)
+            capped = (cap := self._volume_cap(bar)) is not None and cap < budget
+            if capped:
+                budget = cap
             side, size = OrderSide.BUY, (budget / price).quantize(step, rounding=ROUND_DOWN)
+            if capped and 0 < size and size >= self._min_qty():
+                signal["sized_by"] = "share of the bar's volume"
         else:
             side = OrderSide.SELL
             size = min((-diff / price).quantize(step, rounding=ROUND_DOWN), self._position_qty(free=True))
         if size <= 0 or size < self._min_qty():
+            if side == OrderSide.BUY and capped:
+                self._note("buy_skipped", f"Buy skipped: {self._cfg.max_participation:.0%} of the bar's average "
+                           f"volume is worth {cap:,.2f}, below the smallest order the venue takes")
             return False
+        self._noted.discard("buy_skipped")
         self._submit(side, size, "rebalance", reason, signal)
         return True
 
-    def _check_exits(self, price: float, high: float | None = None) -> bool:
+    def _check_exits(self, price: float) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent.
 
         Paper and live call this on every trade, so both levels are watched tick by tick. A
-        backtest only sees whole bars: its stop rests at the venue (_rest_stop), which fills at
-        the level, or at the open if the bar gaps through it, and the target is checked on the
-        bar's high but sold at the close. When one bar touches both, the stop wins, and a target
-        exit is never priced better than the close."""
+        backtest only sees whole bars, so both exits rest at the venue instead (_rest_exits)."""
         cfg = self._cfg
         if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
             return False
         if self._busy():
             return False
-        move = price / self._entry_px - 1
         if self._backtest:
-            peak = max(high or price, price) / self._entry_px - 1
-            hit = "take_profit" if cfg.take_profit and peak >= cfg.take_profit else None
-        else:
-            hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
-                   else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
+            return False  # both exits rest at the venue (_rest_exits) and fill at their levels
+        move = price / self._entry_px - 1
+        hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
+               else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
@@ -518,8 +543,10 @@ class LongFlatStrategy(Strategy):
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
         min_qty = self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
         if qty <= 0 or qty < min_qty:
-            self.log.warning(f"buy size {qty} below minimum {min_qty}; skipping")
+            self._note("buy_skipped", f"Buy skipped: the {size_by} limit ({float(budget):,.2f}) buys {qty}, below "
+                       f"the smallest order the venue takes ({min_qty})")
             return
+        self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
                   "budget": round(float(budget), 2)}
         if self._cfg.stop_loss:
@@ -630,7 +657,7 @@ class LongFlatStrategy(Strategy):
         if qty <= 0 or qty < self._min_qty():
             self.log.info(f"post-only order {coid} {why}; the rest ({qty}) is below the minimum order size")
             if self._backtest and order.side == OrderSide.BUY and order.filled_qty.as_double() > 0:
-                self._rest_stop()
+                self._rest_exits()
             return
         reason = f"{info['reason']}. The post-only order {why}, so the rest went at market"
         signal = {**{k: v for k, v in info["signal"].items() if k != "price"}, "maker_order": coid}
@@ -810,9 +837,9 @@ class LongFlatStrategy(Strategy):
                 self._entry_px, self._entry_qty = None, 0.0
         if self._backtest:
             if event.is_buy and done:
-                self._rest_stop()
-            elif self.decisions.get(str(event.client_order_id), {}).get("intent") == "stop_loss":
-                self._exit_lock = True
+                self._rest_exits()
+            elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
+                self._exit_lock = True  # as in paper: no re-entry until the signal has gone flat
         if self.runtime is None:
             return
         fee = event.commission.as_double() if event.commission is not None else 0.0
@@ -825,35 +852,54 @@ class LongFlatStrategy(Strategy):
             trade_id=str(event.trade_id),
         )
 
-    def _rest_stop(self) -> None:
-        """Backtests: after an entry fills, rest a sell stop at the stop-loss level, as a real stop
-        order would sit at the venue. (Paper and live watch every trade instead.) Bars are matched open, high, low, close, so it fills at
-        the level within the bar, or at the open when the price gaps through it."""
-        if not self._cfg.stop_loss or self._entry_px is None:
+    def _rest_exits(self) -> None:
+        """Backtests: after an entry fills, rest the exits at the venue as real orders would sit there.
+        (Paper and live watch every trade instead.) The stop is a sell stop at its level and the target
+        a sell limit at its level, linked one-cancels-the-other so only one can fill. Within a bar the
+        extreme nearer the open trades first. A stop fills at its level, or at the open when the price
+        gaps through it; a target fills at its level, never better, never worse."""
+        cfg = self._cfg
+        if not (cfg.stop_loss or cfg.take_profit) or self._entry_px is None:
             return
         qty = self._position_qty(free=True).quantize(self.instrument.size_increment.as_decimal(), rounding=ROUND_DOWN)
         if qty < self._min_qty():
             return
-        level = self._entry_px * (1 - self._cfg.stop_loss)
-        order = self.order_factory.stop_market(
-            instrument_id=self._cfg.instrument_id,
-            order_side=OrderSide.SELL,
-            quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
-            trigger_price=Price(level, self.instrument.price_precision),
-            time_in_force=TimeInForce.GTC,
-        )
-        self.decisions[str(order.client_order_id)] = {
-            "intent": "stop_loss",
-            "reason": (f"Stop-loss: resting sell at {level:,.6g}, {self._cfg.stop_loss:.1%} below the "
-                       f"{self._entry_px:,.6g} entry; fills at that level, or the open if the price gaps through"),
-            "signal": {"entry_px": round(self._entry_px, 8), "stop_loss": self._cfg.stop_loss,
-                       "trigger": round(level, 8)},
-        }
-        if self.runtime is not None:
-            d = self.decisions[str(order.client_order_id)]
-            self.runtime.on_order(order_id=str(order.client_order_id), side="SELL", qty=float(qty), intent="stop_loss",
-                                  reason=d["reason"], signal=d["signal"], order_type="STOP")
-        self.submit_order(order)
+        quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
+        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit")
+               if getattr(cfg, k)}
+        both = len(ids) == 2
+
+        def link(kind: str) -> dict:
+            other = "take_profit" if kind == "stop_loss" else "stop_loss"
+            return {"contingency_type": ContingencyType.OUO, "linked_order_ids": [ids[other]]} if both else {}
+
+        orders = []
+        now = self.clock.timestamp_ns()
+        if cfg.stop_loss:
+            level = self._entry_px * (1 - cfg.stop_loss)
+            orders.append((StopMarketOrder(
+                self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], OrderSide.SELL, quantity,
+                Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, False, False,
+                UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
+                f"Stop-loss: resting sell at {level:,.6g}, {cfg.stop_loss:.1%} below the {self._entry_px:,.6g} entry; "
+                "fills at that level, or the open if the price gaps through",
+                {"entry_px": round(self._entry_px, 8), "stop_loss": cfg.stop_loss, "trigger": round(level, 8)}))
+        if cfg.take_profit:
+            level = self._entry_px * (1 + cfg.take_profit)
+            orders.append((LimitOrder(
+                self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], OrderSide.SELL, quantity,
+                Price(level, self.instrument.price_precision), TimeInForce.GTC, False, False, False,
+                UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
+                f"Take-profit: resting sell at {level:,.6g}, {cfg.take_profit:.1%} above the {self._entry_px:,.6g} "
+                "entry; fills at that level",
+                {"entry_px": round(self._entry_px, 8), "take_profit": cfg.take_profit, "limit_px": round(level, 8)}))
+        for order, intent, kind, reason, signal in orders:
+            self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
+            if self.runtime is not None:
+                self.runtime.on_order(order_id=str(order.client_order_id), side="SELL", qty=float(qty), intent=intent,
+                                      reason=reason, signal=signal, order_type=kind)
+        for order, *_ in orders:
+            self.submit_order(order)
 
     def on_stop(self) -> None:
         for coid in list(self._maker):
