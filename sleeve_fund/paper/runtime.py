@@ -73,6 +73,8 @@ class SleeveRuntime:
         self._spread_since = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
         self.flatten_why: tuple[str, str] | None = None
+        # A flatten the last process sent but may not have seen filled, owed on the first tick (sanity S-3).
+        self._owed_flatten: tuple[str, str] | None = None
 
     def _restored_peak(self, starting_balance: float) -> float:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
@@ -122,11 +124,28 @@ class SleeveRuntime:
                 self.store.update_order(o["order_id"], status="canceled",
                                         message="cancelled when the strategy restarted: paper's simulated venue "
                                                 "went with the process that sent it")
+        self._owed_flatten = self._interrupted_flatten()
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
                              f"book restored from {self.book['fills']} journal fills: "
                              f"cash {self.book['cash']:,.2f}, position {self.book['qty']:g}", ts=self.now())
         self.store.event(self.name, "info", "start", f"strategy started ({self.profile.name} risk profile)", ts=self.now())
+
+    def _interrupted_flatten(self) -> tuple[str, str] | None:
+        """The flatten to send again after a restart, as (intent, reason), or None. A flatten is marked done
+        when its sell is sent, not when it fills, so a process that stopped in between came back paused or
+        halted and still holding, with nothing to sell it (sanity S-3). The latest PM flatten (the kill
+        switch's too), risk halt or daily-loss pause that no resume has followed is owed again whenever a
+        position is still held; a reconcile halt never flattens, and an expired daily-loss pause is over."""
+        if self.backtest or self.status not in ("paused", "halted"):
+            return None
+        last = self.store.last_event(self.name, ("pm_flatten", "risk_halt", "risk_pause", "pm_resume"))
+        if last is None or last["kind"] == "pm_resume":
+            return None
+        if last["kind"] == "risk_pause" and not (self.paused_until and self.paused_until > self.now()):
+            return None
+        label = {"pm_flatten": "Flattened by PM", "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause"}
+        return last["kind"], f"{label[last['kind']]}, sent again after a restart: {last['message']}"
 
     def on_stop(self) -> None:
         if self.status in ("running", "starting"):
@@ -210,6 +229,13 @@ class SleeveRuntime:
                 self._set("running", "")
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
+        if self._owed_flatten is not None:
+            if not flatten and qty != 0 and self.status in ("paused", "halted"):
+                flatten, self.flatten_why = True, self._owed_flatten
+                self.store.event(self.name, "warning", "flatten_retry",
+                                 f"still holding {qty:.12g} after a restart that cut a flatten short; selling "
+                                 f"again ({self._owed_flatten[1]})", ts=self.now())
+            self._owed_flatten = None
         return "flatten" if flatten else None
 
     # --- reconciliation ----------------------------------------------------------

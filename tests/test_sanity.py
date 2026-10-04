@@ -509,9 +509,6 @@ def test_a_pm_stop_survives_any_number_of_restarts_until_resumed(store, command,
     assert store.sleeve("s1").status == "running" and rt.can_open()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "NEW (sanity S-3): a flatten is marked done when it is sent, not when the position is sold, so a process "
-    "that stops before the sell fills restarts paused and still holding, and nothing sells it"))
 @pytest.mark.parametrize("reason", ["PM flatten", "Book kill switch: stop everything"])
 def test_a_flatten_cut_short_by_a_restart_still_sells_the_position(store, reason):
     """The kill switch promises cash. If the process stops between sending the sell and its fill (the
