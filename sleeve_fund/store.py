@@ -39,6 +39,9 @@ from sqlalchemy.engine import Engine
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
 COMMANDS = {"pause", "resume", "flatten"}
+# Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
+# changed (Store.change_settings).
+RELOAD = "reload"
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -209,6 +212,14 @@ spreads_t = Table(
     Column("half_spread", Float, nullable=False),  # median (ask - bid) / 2 / mid
     Column("samples", Integer, nullable=False),
     Column("measured_at", TS, nullable=False),
+)
+# Accounts the PM has retired: no strategy can be moved onto one or started on one. A separate table,
+# so it arrives as a plain CREATE TABLE; reinstating deletes the row.
+account_retired_t = Table(
+    "account_retired",
+    metadata,
+    Column("account", String(41), ForeignKey("accounts.name"), primary_key=True),
+    Column("retired_at", TS, nullable=False),
 )
 # Stopped sleeves the PM has put away. Their history stays; they just leave the everyday lists.
 sleeve_archive_t = Table(
@@ -484,6 +495,7 @@ class Store:
             self._ensure_paper_account(c)
             rows = _rows(c.execute(select(accounts_t).order_by(accounts_t.c.created_at, accounts_t.c.name)))
             keys = {r["account"]: r for r in _rows(c.execute(select(account_keys_t)))}
+            retired = {r["account"]: _aware(r["retired_at"]) for r in _rows(c.execute(select(account_retired_t)))}
             links = _rows(c.execute(select(sleeve_accounts_t)))
             names = [r[0] for r in c.execute(select(sleeves_t.c.name).where(_not_backtest(sleeves_t.c.name)))]
         assigned = {r["sleeve"]: r["account"] for r in links}
@@ -492,7 +504,61 @@ class Store:
             k = keys.get(r["name"])
             r["key_present"] = bool(k["present"]) if k else None  # None: the supervisor hasn't checked yet
             r["key_checked_at"] = k["checked_at"] if k else None
+            r["retired_at"] = retired.get(r["name"])
         return rows
+
+    def _account(self, name: str) -> dict:
+        row = next((a for a in self.accounts() if a["name"] == name), None)
+        if row is None:
+            raise ValueError(f"no account called {name}")
+        return row
+
+    def set_account_note(self, name: str, note: str) -> None:
+        self._account(name)
+        with self.engine.begin() as c:
+            c.execute(update(accounts_t).where(accounts_t.c.name == name).values(note=note.strip()[:200]))
+
+    def retire_account(self, name: str) -> None:
+        """Retire an account no running strategy uses. Its strategies stay assigned (their history
+        names it), but none can start on it until it is reinstated or they move."""
+        from sleeve_fund.accounts import PAPER
+
+        a = self._account(name)
+        if name == PAPER:
+            raise ValueError("the shared paper account can't be retired")
+        if a["retired_at"]:
+            raise ValueError(f"{name} is already retired")
+        running = [s.name for s in self.sleeves() if s.name in a["sleeves"] and s.desired_state == "running"]
+        if running:
+            raise ValueError(f"{', '.join(running)} still run{'s' if len(running) == 1 else ''} on {name}; "
+                             "stop or move them first")
+        with self.engine.begin() as c:
+            c.execute(insert(account_retired_t).values(account=name, retired_at=utcnow()))
+
+    def reinstate_account(self, name: str) -> None:
+        if not self._account(name)["retired_at"]:
+            raise ValueError(f"{name} isn't retired")
+        with self.engine.begin() as c:
+            c.execute(account_retired_t.delete().where(account_retired_t.c.account == name))
+
+    def move_sleeve(self, sleeve: str, account: str, qty: float) -> str:
+        """Move a strategy to another account; returns the account it left. Only while it is stopped or
+        flat (qty is its position now), so no position ever changes hands between accounts."""
+        s = self.sleeve(sleeve)
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest has no account")
+        if s.desired_state == "running" and abs(qty) > 1e-12:
+            raise ValueError("stop the strategy or flatten it before moving it: a position can't change accounts")
+        target = self._account(account)
+        if target["retired_at"]:
+            raise ValueError(f"{account} is retired")
+        if target["kind"] == "live":  # the shell's live lock: nothing trades real money before G2
+            raise ValueError("live accounts are locked until G2 is approved; choose a paper account")
+        old = self.account_of(sleeve)
+        if old == account:
+            raise ValueError(f"{sleeve} is already on {account}")
+        self.assign_account(sleeve, account)
+        return old
 
     def account_of(self, sleeve: str) -> str:
         with self.engine.connect() as c:
@@ -827,6 +893,25 @@ class Store:
                                                 created_at=utcnow()))
         self.decide(actor, command, reason, sleeve)
 
+    def change_settings(self, sleeve: str, *, risk_profile: str, params: dict, warmup_bars: int) -> bool:
+        """Save new risk settings. A running strategy is restarted by the supervisor to trade under
+        them (True); a stopped one picks them up when it next starts (False)."""
+        s = self.sleeve(sleeve)
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
+        self._update_sleeve(sleeve, risk_profile=risk_profile, params=params, warmup_bars=warmup_bars)
+        if s.desired_state != "running":
+            return False
+        with self.engine.begin() as c:
+            if not c.execute(select(commands_t.c.id).where(commands_t.c.sleeve == sleeve, commands_t.c.command == RELOAD,
+                                                           commands_t.c.applied_at.is_(None))).first():
+                c.execute(insert(commands_t).values(sleeve=sleeve, command=RELOAD, reason="settings changed",
+                                                    created_at=utcnow()))
+        return True
+
+    def pending_reload(self, sleeve: str) -> dict | None:
+        return next((c for c in self.pending_commands(sleeve) if c["command"] == RELOAD), None)
+
     def pending_commands(self, sleeve: str) -> list[dict]:
         q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None))
              .order_by(commands_t.c.id))
@@ -838,7 +923,8 @@ class Store:
         pending = self.pending_commands(sleeve)
         for cmd in pending:
             self.mark_applied(cmd["id"])
-            self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", sleeve)
+            if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them
+                self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", sleeve)
         return len(pending)
 
     def mark_applied(self, command_id: int) -> None:

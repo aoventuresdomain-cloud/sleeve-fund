@@ -443,13 +443,17 @@ class LongFlatStrategy(Strategy):
     def _restore_plan(self) -> None:
         """After a restart with a position open: the stop and target its entry journaled. Fixed %
         exits need no journal; an ATR or swing-low stop set at entry is read back, or, for an entry
-        journaled before stops were recorded, set again from the market on the next bar (_replan)."""
+        journaled before stops were recorded, set again from the market on the next bar (_replan).
+        When the PM has changed the settings since the entry, the new ones are set the same way."""
         c = self._cfg
         if not self._has_exits:
             return
         entry = next((o for o in self.runtime.store.orders(self.runtime.name, limit=200)
                       if o.get("intent") == "entry" and o.get("side") == "BUY"), None)
         sig = (entry or {}).get("signal") or {}
+        changed = self.runtime.store.last_event(self.runtime.name, ("exits_change",))
+        if entry and changed and changed["ts"] > entry["ts"]:
+            sig = {}  # the PM changed the stop or target since this entry: the new ones apply to it too
         if "stop_frac" in sig or "tp_frac" in sig:
             self._stop_frac, self._tp_frac = sig.get("stop_frac"), sig.get("tp_frac")
             self._stop_basis = sig.get("stop_basis", "")

@@ -142,6 +142,9 @@ class MemoryJournal:
         levels = LEVELS[LEVELS.index(min_level):]
         return [e for e in reversed(self.events_) if e["level"] in levels][:limit]
 
+    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
+        return next((e for e in reversed(self.events_) if e["kind"] in kinds), None)
+
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
         rows = sorted(self.orders_.values(), key=lambda o: (o["ts"], o["id"]), reverse=True)
         return [o for o in rows if not statuses or o["status"] in statuses][:limit]

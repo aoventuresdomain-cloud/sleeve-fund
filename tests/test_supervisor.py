@@ -7,6 +7,8 @@ from sleeve_fund.supervisor import Proc, decide, seed
 
 
 class FakePopen:
+    pid = 1
+
     def __init__(self, alive=True, code=None):
         self._alive, self.returncode = alive, code
 
@@ -52,3 +54,39 @@ def test_seed_is_idempotent(store):
     s = store.sleeve("btc-trend-smoke")
     assert s.params == {"fast": 5, "slow": 20, "max_notional": 1000}
     assert s.risk_profile == "aggressive"
+
+
+def test_changed_settings_restart_a_running_strategy_once(store, sleeve, monkeypatch):
+    """Saving new settings restarts the running process so it trades under them; the strategy itself
+    never acts on the reload, and a stopped strategy just picks them up when it starts."""
+    import subprocess
+
+    from sleeve_fund.supervisor import Supervisor
+
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, env=None: started.append(args) or FakePopen())
+    sup = Supervisor(store)
+    sup.step()
+    assert len(started) == 1
+    assert store.change_settings("s", risk_profile="conservative", params={}, warmup_bars=0)
+    assert store.change_settings("s", risk_profile="conservative", params={"stop_loss": 0.05}, warmup_bars=0)
+    assert len(store.pending_commands("s")) == 1  # two saves, one restart
+    monkeypatch.setattr(sup, "_stop", lambda name, proc, why: setattr(proc, "popen", None))
+    sup.step()
+    assert len(started) == 2 and store.pending_reload("s") is None
+    assert any(e["kind"] == "settings_applied" for e in store.events("s"))
+    sup.step()
+    assert len(started) == 2
+    store.set_desired_state("s", "stopped")
+    assert store.change_settings("s", risk_profile="balanced", params={}, warmup_bars=0) is False
+    assert store.pending_reload("s") is None and store.sleeve("s").risk_profile == "balanced"
+
+
+def test_the_strategy_leaves_a_reload_to_the_supervisor(store, sleeve):
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    store.change_settings("s", risk_profile="balanced", params={}, warmup_bars=0)
+    rt = SleeveRuntime(store, "s")
+    rt.on_start(0.008)
+    rt.tick(equity=1000, cash=1000, qty=0, price=1)
+    assert store.pending_reload("s") is not None

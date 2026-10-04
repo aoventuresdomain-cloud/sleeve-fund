@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_fields.html" import exit_fields %}
 {% from "_macros.html" import chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
@@ -28,7 +29,9 @@
   {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
-{% if pending %}<div class="banner warn" role="status">{{ pending|length }} command{{ 's' if pending|length != 1 }} waiting for the strategy to pick up ({{ pending|map(attribute='command')|join(', ') }}).</div>{% endif %}
+{% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
+{% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
+{% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}
 </div>
 
 <section class="ledger" aria-label="Strategy figures">
@@ -170,15 +173,41 @@
     <table class="compact kv">
       <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
-      {% if not backtest_id %}<tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a></td></tr>{% endif %}
+      {% if not backtest_id %}{% set movable = s.desired_state != 'running' or x.qty <= 0 %}
+      <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
+        <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Stop or flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}
-      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
+      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, average true ranges below entry', 'atr_bars': 'Average true range over, bars', 'stop_swing_bars': 'Stop under the lowest low of, bars', 'take_profit_r': 'Target, times the stop distance'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
         <td>{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ (v * 100)|round(2) }}%{% elif k == 'max_notional' %}{{ v|money }} {{ quote }}{% elif k == 'maker_wait_minutes' %}Maker first, the rest at market after {{ v }} min{% else %}{{ v }}{% endif %}</td></tr>
       {% endfor %}
     </table>
+    {% if not backtest_id %}
+    {% set changes = decisions|selectattr('action', 'in', ['change_settings', 'move_account'])|list %}
+    {% if changes %}
+    <h3 style="margin:16px 0 6px;font-size:13px">Changes</h3>
+    <table class="compact"><tbody>{% for d in changes[:10] %}<tr><td class="muted" style="white-space:nowrap">{{ d.ts|ts }}</td><td style="white-space:normal">{{ d.reason }} <span class="muted">({{ d.actor }})</span></td></tr>{% endfor %}</tbody></table>
+    {% endif %}
+    {% endif %}
   </section>
+  {% if not backtest_id %}
+  <form class="panel span-5" method="post" action="/sleeves/{{ s.name }}/settings" id="settings-form" aria-labelledby="edit-h">
+    <div class="panel-head"><h2 id="edit-h">Change risk settings</h2></div>
+    {% if settings_error %}<div class="error-box" style="margin-bottom:12px" role="alert">Not saved: {{ settings_error }}</div>
+    {% elif saved == 'settings' %}<div class="banner" style="margin-bottom:12px" role="status">Saved{{ ': restarting to trade under them' if reload else '' }}.</div>
+    {% elif saved == 'account' %}<div class="banner" style="margin-bottom:12px" role="status">Moved to {{ account }}.</div>{% endif %}
+    {% if archived %}<p class="muted">Restore the strategy to change its settings.</p>{% else %}
+    <input type="hidden" name="instrument" value="{{ s.instrument }}">
+    <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
+    <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
+    {{ exit_fields(settings_pre, costs) }}
+    <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty > 0 %} The open position takes the new stop and target too{% if s.params.get('stop_atr') or s.params.get('stop_swing_bars') or settings_pre.get('stop_atr') or settings_pre.get('stop_swing_bars') %}; one set from the market is set again on the first bar after the restart{% endif %}.{% endif %}</p>
+    <div class="field" style="margin-top:12px"><label for="r-settings">Reason for the decision log</label><input id="r-settings" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason"></div>
+    <button>Save settings</button>
+    {% endif %}
+  </form>
+  {% endif %}
 </div>
 </div>
 
@@ -212,6 +241,17 @@
   </form>
 </dialog>
 {% endfor %}
+<dialog id="dlg-move" aria-labelledby="dlg-move-h">
+  <form method="post" action="/sleeves/{{ s.name }}/account">
+    <h2 id="dlg-move-h">Move {{ s.name }} to another account</h2>
+    <p>Its history stays with the strategy. Only a stopped or flat strategy can move, so no position changes accounts.</p>
+    <label for="move-to">Account</label>
+    <select id="move-to" name="account" required>{% for a in accounts if a.name != account %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' or a.retired_at }}>{{ a.name }} ({{ 'retired' if a.retired_at else 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select>
+    <label for="r-move">Reason for the decision log</label>
+    <input id="r-move" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button>Move strategy</button></div>
+  </form>
+</dialog>
 </div>{% endif %}
 {% endblock %}
 
@@ -219,5 +259,5 @@
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.tabs(); Console.dialogs(); Console.whys(); Console.priceChart("pc", "/api/sleeves/{{ s.name }}/candles"); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
+<script>Console.tabs(); Console.dialogs(); Console.orderFields("settings-form"); Console.whys(); Console.priceChart("pc", "/api/sleeves/{{ s.name }}/candles"); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
 {% endblock %}
