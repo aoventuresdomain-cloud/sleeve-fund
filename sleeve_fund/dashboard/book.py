@@ -81,8 +81,9 @@ def spark_path(values: list[float], w: int = 96, h: int = 24) -> str:
 
 
 def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
-    # Every strategy counts, stopped and archived ones included: their cash is still the fund's, and
-    # stopping one must never rewrite the book's past.
+    # Every strategy in the current book counts, stopped and archived ones included: their cash is still the
+    # fund's, and stopping one must never rewrite the book's past. A clean slate starts a new book; the
+    # strategies it put away are an earlier book's, so the caller leaves them out (Store.previous_book).
     active = summaries
     start = sum(x["sleeve"].starting_balance for x in active)
     equity = sum(x["equity"] for x in active)

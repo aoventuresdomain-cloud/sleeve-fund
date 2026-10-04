@@ -123,9 +123,14 @@ def create_app(store: Store | None = None) -> FastAPI:
     def st() -> Store:
         return app.state.store
 
+    def current_sleeves():
+        """The current book's strategies: every one except those an earlier clean slate put away."""
+        earlier = st().previous_book()
+        return [s for s in st().sleeves() if s.name not in earlier]
+
     def shell(sleeves=None) -> dict:
         """What the frame shows on every page: mode, health and open alerts."""
-        sleeves = st().sleeves() if sleeves is None else sleeves
+        sleeves = current_sleeves() if sleeves is None else sleeves
         now = utcnow()
         wanted = [x for x in sleeves if x.desired_state == "running"]
         put_away = st().archived()
@@ -160,7 +165,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return x
 
     def book_data():
-        sleeves = st().sleeves()
+        sleeves = current_sleeves()
         frames = {s.name: bookm.daily(st(), s.name) for s in sleeves}
         summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[s.name]) for s in sleeves]
         return sleeves, frames, summaries
@@ -173,8 +178,10 @@ def create_app(store: Store | None = None) -> FastAPI:
     def home(request: Request, _: str = Depends(require_pm)):
         sleeves, frames, summaries = book_data()
         put_away = st().archived()
+        earlier = st().previous_book()
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
+                    earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves))
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
