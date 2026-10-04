@@ -37,6 +37,7 @@ from sleeve_fund.strategies.indicators import Atr
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
 MAKER_INTENTS = ("entry", "exit", "rebalance")
+OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
 MINUTE_NS = 60_000_000_000
 
 
@@ -1180,14 +1181,18 @@ class LongFlatStrategy(Strategy):
         signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
         signal.setdefault("price", last)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
+        # On a perp every exit is reduce-only: whatever the strategy's own book says, the venue never lets an
+        # exit open the other side (review round 11, B11-3).
+        reduce = self._margin and intent not in OPENING_INTENTS
         if maker:
             px = Price(self._maker_price(side, last, tick), self.instrument.price_precision)
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
-                                             price=px, time_in_force=TimeInForce.GTC, post_only=True)
+                                             price=px, time_in_force=TimeInForce.GTC, post_only=True,
+                                             reduce_only=reduce)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
         else:
             order = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=side,
-                                              quantity=quantity, time_in_force=TimeInForce.GTC)
+                                              quantity=quantity, time_in_force=TimeInForce.GTC, reduce_only=reduce)
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
@@ -1874,7 +1879,9 @@ class LongFlatStrategy(Strategy):
         if coid in self._maker and done:
             self._maker.pop(coid)
             self._cancel_alert(coid)
-        qty, px = self._held_qty(event.last_qty.as_double()), event.last_px.as_double()
+        # The quantity's own decimal, as the nearest float: as_double() can land a float away (1015.315545 read
+        # 1015.3155449999999), and those differences summed into merged round trips (round 11, M10-4).
+        qty, px = self._held_qty(float(event.last_qty.as_decimal())), event.last_px.as_double()
         # Paper: a slice of a kept post-only order is the order's own fill, at its limit and the maker fee
         # (the fee model charged it so; ScheduleFeeModel.maker_slices).
         journal_id, fee = coid, (event.commission.as_double() if event.commission is not None else 0.0)
@@ -1884,18 +1891,21 @@ class LongFlatStrategy(Strategy):
             journal_id = kept_id
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
-        opening = self._entry_side in (0, sign) and (self._margin or sign > 0)
-        if opening:
-            cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
-            self._entry_qty += qty
-            self._entry_px = cost / self._entry_qty
-            self._entry_side = sign
+        if self._margin:
+            opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
         else:
-            self._entry_qty = max(self._entry_qty - qty, 0.0)
-            if self._entry_qty < float(self._lot()) / 2:  # less than half a lot is flat: no order can trade it
-                self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
-                self._stop_frac = self._tp_frac = None
-                self._replan_pending = self._plan_entry = None
+            opening = self._entry_side in (0, sign) and sign > 0
+            if opening:
+                cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
+                self._entry_qty += qty
+                self._entry_px = cost / self._entry_qty
+                self._entry_side = sign
+            else:
+                self._entry_qty = max(self._entry_qty - qty, 0.0)
+                if self._entry_qty < float(self._lot()) / 2:  # less than half a lot is flat: no order can trade it
+                    self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
+                    self._stop_frac = self._tp_frac = None
+                    self._replan_pending = self._plan_entry = None
         if self._backtest:
             if opening and self._pending_exit is None:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
@@ -1932,6 +1942,31 @@ class LongFlatStrategy(Strategy):
                 self._flip = None
                 self._open(side, bar, reason, values)
 
+    def _track_entry(self, sign: int, filled: Decimal, qty: float, px: float) -> bool:
+        """Perp: the entry book after a fill, read from the venue's position (already updated when the fill
+        arrives), never kept up incrementally: one exit that left a lot behind once put the incremental
+        book out of phase for good, booking every later short as a reduction of a phantom long, so no
+        short ever rested a stop (review round 11, B11-2). Less than half a lot is flat. Returns whether
+        the fill opened or added to the position (and so needs its exits rested)."""
+        post = self._signed_qty()
+        half = self._lot() / 2
+        side = 0 if abs(post) < half else (1 if post > 0 else -1)
+        pre = post - sign * filled
+        if side == 0:
+            self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
+            self._stop_frac = self._tp_frac = None
+            self._replan_pending = self._plan_entry = None
+            return False
+        opening = side == sign and abs(post) > abs(pre)
+        if opening and self._entry_side == side and self._entry_px is not None:
+            # Added to the same side: the average entry of what was held and this fill.
+            held = float(abs(post)) - qty
+            self._entry_px = (self._entry_px * held + px * qty) / float(abs(post))
+        elif opening or self._entry_side != side or self._entry_px is None:
+            self._entry_px = px  # opened from flat, or this fill went through flat and opened the other side
+        self._entry_qty, self._entry_side = float(abs(post)), side
+        return opening
+
     def _rest_exits(self) -> None:
         """Backtests: after an entry fills, rest the exits at the venue as real orders would sit there.
         (Paper and live watch every trade instead.) The stop is a sell stop at its level and the target
@@ -1943,6 +1978,8 @@ class LongFlatStrategy(Strategy):
         plan = {"stop_loss": self._stop_frac, "take_profit": self._tp_frac}
         if not any(plan.values()) or self._entry_px is None:
             return
+        if self.runtime is not None and self.runtime.status != "running":
+            return  # halted, paused or flattening: nothing new rests (review round 11, B11-3)
         resting = self._resting_exits()
         if resting:
             # At most one resize per moment of the run. The simulated venue matches its resting orders against
@@ -1976,7 +2013,7 @@ class LongFlatStrategy(Strategy):
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], exit_side, quantity,
-                Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, False, False,
+                Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, self._margin, False,
                 UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
                 f"{self._entry_px:,.6g} entry"
@@ -1988,7 +2025,7 @@ class LongFlatStrategy(Strategy):
             level = self._entry_px * (1 + side * tp)
             orders.append((LimitOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], exit_side, quantity,
-                Price(level, self.instrument.price_precision), TimeInForce.GTC, False, False, False,
+                Price(level, self.instrument.price_precision), TimeInForce.GTC, False, self._margin, False,
                 UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
                 f"Take-profit: resting {exit_word} at {level:,.6g}, {tp:.1%} {'above' if side > 0 else 'below'} the "
                 f"{self._entry_px:,.6g} entry"

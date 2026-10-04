@@ -11,7 +11,7 @@ from __future__ import annotations
 import itertools
 from datetime import datetime
 
-from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, utcnow
+from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, exact_sum, utcnow
 
 _FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
@@ -123,7 +123,7 @@ class MemoryJournal:
         if qty is not None:
             row["qty"] = qty
         if fill_qty:
-            filled = row["filled_qty"] + fill_qty
+            filled = exact_sum(row["filled_qty"], fill_qty)
             row["avg_px"] = ((row["avg_px"] or 0.0) * row["filled_qty"] + fill_qty * fill_px) / filled
             row["filled_qty"] = filled
             row["fee"] += fee
