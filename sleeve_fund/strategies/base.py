@@ -37,7 +37,7 @@ class IdeaSpec:
     family: str  # e.g. trend, momentum, vol-target; the idea counter groups by this
     idea: str  # the PM's words
     rules: str  # what the code actually does
-    asset_class: str = "crypto_spot"
+    asset_class: str = "spot"
     data_needs: str = "daily OHLCV"
     benchmark: str = "buy_and_hold"
     default_risk_profile: str = "balanced"

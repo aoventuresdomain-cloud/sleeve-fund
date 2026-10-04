@@ -22,7 +22,7 @@
       <td class="cell-name"><a href="/strategies/{{ r.name }}">{{ r.name|replace('_', ' ') }}</a><span class="sub2">{{ r.spec.family }}</span></td>
       <td data-m="right">{{ stepper(r.stage, stages, r.observation) }}</td>
       <td data-label="G1">{% if r.g1 == 'PASS' %}<span class="chip running">Passed</span> <span class="muted">{{ r.passed_where|join(', ') }}</span>{% elif r.g1 == 'FAIL' %}<span class="chip halted">Failed</span>{% elif r.sheets %}<span class="muted">Synthetic only</span>{% else %}<span class="muted">Not tested</span>{% endif %}</td>
-      <td data-m="right">{% if r.sleeves %}{{ r.sleeves|length }} running{% if r.observation %} <span class="warn" title="Running on paper without a real G1 pass">· observation</span>{% endif %}{% else %}<span class="muted">None</span>{% endif %}</td>
+      <td data-m="right">{% if r.sleeves %}{{ r.sleeves|length }} running{% if r.observation %} <span class="warn" title="No G1 pass for: {{ r.observing|map(attribute='name')|join(', ') }}">· {{ r.observing|length }} of {{ r.sleeves|length }} observation</span>{% endif %}{% else %}<span class="muted">None</span>{% endif %}</td>
       <td data-m="hide" class="num"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest</a> <a class="button secondary" href="/sleeves/new?strategy={{ r.name }}">New strategy</a></td>
     </tr>{% endfor %}</tbody>
   </table>

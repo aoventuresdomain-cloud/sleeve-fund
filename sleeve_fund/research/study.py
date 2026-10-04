@@ -63,6 +63,7 @@ class StudyResult:
     notes: list[str] = field(default_factory=list)
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
     bar_minutes: int = 1440
+    venue: str = ""
 
     @property
     def round_trips(self) -> list[float]:
@@ -204,6 +205,7 @@ def run_study(
         oos_benchmark_returns=pd.concat(bench_parts),
         instrument=str(instrument.id.symbol),
         bar_minutes=bar_minutes_of(prices),
+        venue=str(instrument.id.venue),
         fee_note=(f"{instrument.id.venue}: {float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} "
                   "taker, taker charged on every order"),
     )

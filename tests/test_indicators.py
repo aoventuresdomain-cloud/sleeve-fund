@@ -59,6 +59,12 @@ def test_our_averages_have_no_period_limit():
 def test_strategies_only_use_engine_indicators_that_survive_long_periods():
     for path in STRATEGIES.glob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
+            # The module itself, however imported, would let any indicator in unchecked.
+            whole = (isinstance(node, ast.Import) and any(a.name.startswith("nautilus_trader.indicators")
+                                                          for a in node.names)) or (
+                isinstance(node, ast.ImportFrom) and node.module == "nautilus_trader"
+                and any(a.name == "indicators" for a in node.names))
+            assert not whole, f"{path.name} imports the engine's indicators module; import the names it needs"
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("nautilus_trader.indicators"):
                 names = {a.name for a in node.names}
                 assert names <= SAFE_ENGINE_INDICATORS, (

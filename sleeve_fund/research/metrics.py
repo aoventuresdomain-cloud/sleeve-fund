@@ -177,21 +177,76 @@ def deflated_sharpe_probability(returns: pd.Series, n_trials: int, trial_sharpes
     return float(NormalDist().cdf((sr - hurdle) * math.sqrt(n - 1) / denom))
 
 
-def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials: int, *, block: int = 10,
+def block_length(x: np.ndarray) -> int:
+    """The circular-bootstrap block length a series needs to keep its own persistence: Politis and
+    White (2004), with Patton, Politis and White's (2009) correction. Slow trend P&L, which stays up or
+    down for weeks, needs blocks of weeks; a short fixed block resamples it as if each day were new
+    and makes luck look like skill."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    x = x - x.mean()
+    k_n = max(5, math.ceil(math.log10(n)))
+    m_max = math.ceil(math.sqrt(n)) + k_n
+    b_max = math.ceil(min(3 * math.sqrt(n), n / 3))
+    var = float(x @ x) / n
+    if var <= 0:
+        return 1
+    acv = np.array([float(x[: n - k] @ x[k:]) / n for k in range(m_max + 1)])
+    rho = np.abs(acv[1:] / var)
+    threshold = 2 * math.sqrt(math.log10(n) / n)
+    # The first lag after which k_n autocorrelations in a row are insignificant.
+    m_hat = next((m for m in range(len(rho) - k_n + 1) if (rho[m:m + k_n] < threshold).all()), m_max)
+    m = min(2 * max(m_hat, 1), m_max)
+    lags = np.arange(-m, m + 1)
+    t = np.abs(lags) / m
+    flat_top = np.where(t <= 0.5, 1.0, np.where(t <= 1, 2 * (1 - t), 0.0))
+    acv_l = acv[np.abs(lags)]
+    g = float((flat_top * np.abs(lags) * acv_l).sum())
+    spectrum0 = float((flat_top * acv_l).sum())
+    if spectrum0 <= 0:
+        return 1
+    b = (2 * g * g / ((4 / 3) * spectrum0 ** 2)) ** (1 / 3) * n ** (1 / 3)
+    return int(min(max(math.ceil(b), 1), b_max))
+
+
+MIN_INDEPENDENT_DAYS = 250
+
+
+def independent_days(x: np.ndarray) -> float:
+    """Roughly how many independent observations a daily series holds: n (1 - rho) / (1 + rho), with
+    rho its lag-1 autocorrelation. Returns that drift for weeks at a time carry far less evidence than
+    their day count, and no bootstrap recovers it."""
+    x = np.asarray(x, dtype=float)
+    if len(x) < 3 or x.std() == 0:
+        return float(len(x))
+    rho = float(np.corrcoef(x[:-1], x[1:])[0, 1])
+    rho = min(max(rho, 0.0), 0.99)
+    return len(x) * (1 - rho) / (1 + rho)
+
+
+def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials: int, *, block: int | None = None,
                              n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
     """How sure we can be that the strategy's Sharpe truly beats the benchmark's, out of sample, once
     the variants tried are allowed for. Returns (probability, hurdle), Sharpes annualised.
 
-    The two daily return series are resampled together in blocks of `block` days (keeping volatility
-    clusters and the pairing between them), 2,000 times. Each resample gives a Sharpe difference; the
+    The two daily return series are resampled together in blocks (keeping volatility clusters, trend
+    persistence and the pairing between them), 2,000 times. The block is at least 10 days and long
+    enough for the more persistent of the two series and their difference (block_length). Each resample gives a Sharpe difference; the
     hurdle is the difference the best of `n_trials` skill-less variants would show by luck alone
     (expected_max_sharpe, with the resamples' spread as the no-skill error). The probability is the
-    share of resamples above it. Fixed seed, so a tear sheet reads the same every time."""
+    share of resamples above it. Fixed seed, so a tear sheet reads the same every time. Under 60 days,
+    or under MIN_INDEPENDENT_DAYS independent observations, it returns NaN: not enough to judge."""
     pair = pd.concat([strategy, benchmark], axis=1, join="inner").dropna()
     n = len(pair)
-    if n < max(60, 3 * block):
+    if n < 60:
         return float("nan"), float("nan")
     x = pair.to_numpy(dtype=float)
+    if min(independent_days(x[:, 0]), independent_days(x[:, 0] - x[:, 1])) < MIN_INDEPENDENT_DAYS:
+        return float("nan"), float("nan")  # too little independent evidence to judge
+    if block is None:
+        block = max(10, *(block_length(c) for c in (x[:, 0], x[:, 1], x[:, 0] - x[:, 1])))
+    if n < 3 * block:
+        return float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     starts = rng.integers(0, n, size=(n_boot, -(-n // block)))
     idx = ((starts[:, :, None] + np.arange(block)) % n).reshape(n_boot, -1)[:, :n]  # circular blocks

@@ -10,7 +10,7 @@
   <p class="lede">{{ summary }}</p>
 </div>
 <section class="panel" style="margin-bottom:14px">{{ stepper(r.stage, stages, r.observation) }}
-  {% if r.observation %}<p class="warn" style="margin:10px 0 0">Running on paper without a G1 pass on real data. Treat its results as observation, not evidence.</p>{% endif %}</section>
+  {% if r.observation %}<p class="warn" style="margin:10px 0 0">Observation, no G1 pass for {% for o in r.observing %}<a href="/sleeves/{{ o.name }}">{{ o.name }}</a> ({{ o.where }}){{ ', ' if not loop.last }}{% endfor %}.</p>{% endif %}</section>
 <div class="grid">
   <section class="panel span-7">
     <div class="panel-head"><h2>How it works</h2><span class="hint">{{ r.spec.family }}</span></div>
