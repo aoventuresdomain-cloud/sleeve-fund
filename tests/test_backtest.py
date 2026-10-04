@@ -271,3 +271,15 @@ def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
 def test_bad_stop_and_target_combinations_are_refused(prices, instrument, bad, why):
     with pytest.raises(ValueError, match=why):
         run_backtest("buy_and_hold", prices.iloc[:20], instrument, bad)
+
+
+def test_a_target_that_comes_out_below_costs_is_left_off_that_entry(prices, instrument):
+    """2 x a stop of 0.5% (a quiet market's ATR) is a 1% target: under the round trip, so a hit would
+    lose. The entry keeps its stop and goes without a target."""
+    df = _ranged(prices, [100.0] * 30, 0.125)  # ATR 0.25, so 2 ATRs is 0.5%
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0})
+    buys = res.fills[res.fills["side"] == "BUY"]
+    entry = res.decisions[buys.index[0]]["signal"]
+    assert entry["stop_frac"] == pytest.approx(0.005) and "tp_frac" not in entry
+    resting = [d for d in res.decisions.values() if d["intent"] in ("stop_loss", "take_profit")]
+    assert [d["intent"] for d in resting] == ["stop_loss"]

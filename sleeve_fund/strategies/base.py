@@ -566,6 +566,16 @@ class LongFlatStrategy(Strategy):
                     return
                 self._noted.discard("stop_not_ready")
                 self._stop_frac, self._tp_frac, self._stop_basis = plan
+                leg = self._round_trip_cost()
+                if self._tp_frac and self._tp_frac <= leg + (1 + self._tp_frac) * leg:
+                    # A target in multiples of a stop set from the market can come out too close to
+                    # pay the round trip; a hit would lose money, so this trade goes without one.
+                    self._note("target_below_costs", f"No take-profit on this entry: {self._cfg.take_profit_r:g} times "
+                               f"a {self._stop_frac:.2%} stop is {self._tp_frac:.2%}, which doesn't cover the round "
+                               f"trip's fees and spread")
+                    self._tp_frac = None
+                else:
+                    self._noted.discard("target_below_costs")
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
