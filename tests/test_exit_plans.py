@@ -11,8 +11,8 @@ from sleeve_fund.dashboard import trading
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.strategies.base import r_target
 
-from tests.test_sleeve_runtime import _sleeve
-from tests.test_sleeve_runtime import store as _store_fixture
+from test_sleeve_runtime import _sleeve
+from test_sleeve_runtime import store as _store_fixture
 
 store = _store_fixture  # the same journal, on Postgres when TEST_DATABASE_URL is set
 
