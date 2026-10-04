@@ -28,7 +28,6 @@ from nautilus_trader.model import (
     OmsType,
     StrategyId,
     TraderId,
-    Venue,
 )
 
 from sleeve_fund import spreads

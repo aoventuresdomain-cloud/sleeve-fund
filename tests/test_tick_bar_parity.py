@@ -7,7 +7,7 @@ at market on the trade that crosses the level; a backtest only sees whole bars, 
 the venue and fill at the level. Each exit lands in the same minute, at a price a few basis points
 apart, and sizes follow equity, so they drift by as much."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -15,45 +15,54 @@ import pytest
 
 from sleeve_fund.paper.recorder import Recorder
 from sleeve_fund.research.replay import replay
-from sleeve_fund.research.runner import BOOK_SHARE, run_backtest
+from sleeve_fund.instruments import BOOK_SHARE
+from sleeve_fund.research.runner import run_backtest
+from sleeve_fund.store import Store
 from sleeve_fund.venues import venue
 
 START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, in nanoseconds
 SPREAD = 12.0  # $12 wide around each trade: a 1 bp half spread, big enough that dropping it shows
 
 
-def _both(tmp_path, prices, strategy, params, profile):
-    """Record a paper session trading one price a second, replay it tick by tick, and backtest the
-    same trades as one-minute bars. Returns each path's fills as (side, intent, minute, qty, price)."""
+INST = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
+
+
+def _record(path, prices, strategy, params, profile, minutes=1, size=0.01):
+    """A paper session trading one price a second, `size` each, with the quote following each trade."""
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
-    inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
-    path = tmp_path / "s.jsonl.gz"
     rec = Recorder(path)
     rec.meta = {"balances": ["10000.00 USD"],
                 "sleeve": {"name": "parity", "strategy": strategy, "instrument": "BTC/USD",
-                           "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": profile,
-                           "params": params, "max_notional": None, "maker_fee": "0.004", "taker_fee": "0.008",
-                           "tick_seconds": 30}}
-    rec.start(inst)
+                           "bar_spec": f"{minutes}-MINUTE-LAST-INTERNAL", "starting_balance": 10_000,
+                           "risk_profile": profile, "params": params, "max_notional": None, "maker_fee": "0.004",
+                           "taker_fee": "0.008", "tick_seconds": 30}}
+    rec.start(INST)
     stamps = []
     for s, px in enumerate(np.round(prices, 1)):
         t = START + s * 1_000_000_000
-        rec.trade(TradeTick(inst.id, Price(px, 1), Quantity(0.01, 8), AggressorSide.BUY if s % 2 else AggressorSide.SELL,
+        rec.trade(TradeTick(INST.id, Price(px, 1), Quantity(size, 8), AggressorSide.BUY if s % 2 else AggressorSide.SELL,
                             TradeId(str(s)), t, t + 1000))
         # The venue's quote follows each trade, as a live feed's does within milliseconds. (The simulated
         # book sits at the last trade's price until the next quote, so a market order then pays no spread.)
-        rec.quote(QuoteTick(inst.id, Price(px - SPREAD / 2, 1), Price(px + SPREAD / 2, 1), Quantity(1, 8),
+        rec.quote(QuoteTick(INST.id, Price(px - SPREAD / 2, 1), Price(px + SPREAD / 2, 1), Quantity(1, 8),
                             Quantity(1, 8), t + 2000, t + 3000))
         stamps.append(t)
     rec.close()
+    return pd.Series(np.round(prices, 1), index=pd.to_datetime(stamps, utc=True))
 
+
+def _both(tmp_path, prices, strategy, params, profile):
+    """Record a paper session trading one price a second, replay it tick by tick, and backtest the
+    same trades as one-minute bars. Returns each path's fills as (side, intent, minute, qty, price)."""
+    inst = INST
+    path = tmp_path / "s.jsonl.gz"
+    trades = _record(path, prices, strategy, params, profile)
     orders, fills = replay(path, with_fills=True)
     ticks = _by_order(fills, {o["order_id"]: o["intent"] for o in orders})
 
-    trades = pd.Series(np.round(prices, 1), index=pd.to_datetime(stamps, utc=True))
     bars = trades.resample("1min", closed="left", label="right").ohlc()  # stamped at the close, as the engine's
-    # The backtest shows the venue a share of each bar's volume (runner.BOOK_SHARE); paper's simulated
+    # The backtest shows the venue a share of each bar's volume (BOOK_SHARE); paper's simulated
     # venue fills against each whole trade. Scaled so both see the same trades as liquidity.
     bars["volume"] = 0.6 / BOOK_SHARE
     res = run_backtest(strategy, bars, inst, params=params, starting_capital=10_000, risk_profile=profile,
@@ -133,3 +142,59 @@ def test_the_risk_guard_acts_in_the_same_minute_on_ticks_and_bars(tmp_path):
     assert [f[1] for f in ticks] == ["entry", "risk_pause"]
     # Paper values the book every 30 s and the backtest at each minute's close: a minute's move apart.
     _same_trades(ticks, bar, {"risk_pause": (-100.0, 100.0)})
+
+
+def _maker_both(tmp_path, size):
+    """A maker strategy (post-only entries and exits, a 5-minute wait, 15-minute decisions) on both
+    paths: paper replayed tick by tick, and the backtest on the same trades as minute bars with their
+    true volume. Returns (paper orders, paper fills, paper events, backtest journal)."""
+    s = _seconds(16 * 60)
+    prices = 60_000 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.0004, len(s))))
+    params = {"fast": 3, "slow": 8, "maker_wait_minutes": 5}
+    path = tmp_path / "m.jsonl.gz"
+    trades = _record(path, prices, "trend_filter", params, "aggressive", minutes=15, size=size)
+    store = Store.in_memory()
+    orders, fills = replay(path, with_fills=True, store=store)
+    bars = trades.resample("1min", closed="left", label="right").ohlc()
+    bars["volume"] = 60 * size
+    decisions = bars.resample("15min", label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    res = run_backtest("trend_filter", decisions, INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+                       bar_minutes=15, exec_prices=bars, exec_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
+    return orders, fills, store.events("parity", limit=1000, min_level="warning"), res.journal
+
+
+def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_path):
+    """Deep trades (a whole unit a second against orders of 0.08): both paths fill every post-only
+    order whole, at the maker fee, in the same minute or the next. Paper joins the best bid or ask,
+    and the backtest (which has no quotes) one tick inside the last trade, so the backtest's price is
+    up to the half spread (1 bp) worse, never better."""
+    orders, fills, events, j = _maker_both(tmp_path, size=1.0)
+    ticks = _by_order(fills, {o["order_id"]: o["intent"] for o in orders})
+    bar = _by_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
+    kinds = {o["order_id"]: o["order_type"] for o in orders} | {k: o["order_type"] for k, o in j.orders_.items()}
+    assert len(ticks) >= 6 and {kinds[f["order_id"]] for f in [*fills, *j.fills_]} == {"POST-ONLY LIMIT"}
+    for f in [*fills, *j.fills_]:  # the maker fee, on both paths
+        assert f["fee"] / (f["qty"] * f["price"]) == pytest.approx(0.004, abs=1e-5), f
+    assert [f[:2] for f in ticks] == [f[:2] for f in bar]
+    for t, b in zip(ticks, bar):
+        assert timedelta(0) <= b[2] - t[2] <= timedelta(minutes=1), (t, b)
+        assert b[3] == pytest.approx(t[3], rel=2e-3), (t, b)
+        worse = (b[4] / t[4] - 1) * 1e4 * (1 if t[0] == "BUY" else -1)  # bp the backtest's price is worse
+        assert 0 <= worse <= 1.5, (t, b)
+
+
+def test_where_little_trades_paper_fills_more_maker_orders_and_says_so(tmp_path):
+    """Thin trades (0.0005 a second): the backtest gives each post-only order at most BOOK_SHARE of
+    what trades through its price, so most of each entry goes at market after the wait. Paper's
+    simulated venue fills them whole once the price is through, which is the known gap: each such
+    fill is reported in paper's events with what the backtest would have allowed."""
+    orders, fills, events, j = _maker_both(tmp_path, size=0.0005)
+    paper_maker = {o["order_id"] for o in orders if o["order_type"] == "POST-ONLY LIMIT"}
+    bt_entries = [f for f in j.fills_ if j.orders_[f["order_id"]]["intent"] == "entry"]
+    bt_maker = sum(f["qty"] for f in bt_entries if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT")
+    assert bt_maker < 0.25 * sum(f["qty"] for f in bt_entries)
+    assert all(f["order_id"] in paper_maker for f in fills)  # paper: every fill a maker fill
+    flagged = [e for e in events if e["kind"] == "maker_fill_above_tape"]
+    assert len(flagged) >= len(paper_maker) - 1
+    assert "a backtest would fill at most" in flagged[0]["message"] and f"({BOOK_SHARE:.0%})" in flagged[0]["message"]
