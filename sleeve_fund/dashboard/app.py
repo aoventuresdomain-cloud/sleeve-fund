@@ -454,6 +454,16 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # weeks later; it lapses instead, and the decision log says so.
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
+            elif command == "flatten" and st().sleeve(name).desired_state != "running":
+                # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
+                # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
+                # as the kill switch does; flat, there is nothing to sell.
+                s = st().sleeve(name)
+                if abs(st().journal_book(name, s.starting_balance)["qty"]) <= 1e-12:
+                    raise ValueError("it is stopped and holds no position, so there is nothing to flatten")
+                st().command(name, command, reason, actor=actor)
+                st().set_desired_state(name, "running")
+                st().decide(actor, "start", f"Started to sell its position: {reason.strip()}", name)
             else:
                 st().command(name, command, reason, actor=actor)
         except KeyError:
@@ -821,10 +831,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund import accounts as acc
 
         rows = st().accounts()
-        running = {s.name for s in st().sleeves() if s.desired_state == "running"}
+        sleeves = st().sleeves()
+        running = {s.name for s in sleeves if s.desired_state == "running"}
+        held = {s.name for s in sleeves if s.desired_state != "running"
+                and abs(st().journal_book(s.name, s.starting_balance)["qty"]) > 1e-12}
         for r in rows:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
             r["running"] = [n for n in r["sleeves"] if n in running]
+            r["held"] = [n for n in r["sleeves"] if n in held]  # stopped, still holding a position
         return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
 
     @app.post("/accounts/new")

@@ -1281,6 +1281,35 @@ def test_loosening_the_stop_on_an_open_position_is_checked_against_its_size(clie
     assert "saved=settings" in _settings(c, stop_loss_pct="2").headers["location"]  # tighter: no question
 
 
+def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
+    """Review round 8, M8-2: the journal's position decides, not the desired state. An account a stopped
+    strategy still holds a position on can't be retired, and a flatten for a stopped strategy starts it to
+    sell rather than waiting for a start that may never come."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    c, store = client
+    store.create_account("desk-b", "paper")
+    _new(c, account="desk-b")
+    rt = SleeveRuntime(store, "btc-test")
+    rt.on_order(order_id="E-1", side="BUY", qty=0.01, intent="entry", reason="Signal to be long", signal={})
+    rt.on_fill(side="BUY", qty=0.01, price=50_000.0, fee=4.0, order_id="E-1", trade_id="T-1")
+    store.set_desired_state("btc-test", "stopped")
+    page = c.get("/accounts", auth=AUTH).text
+    assert "btc-test is stopped but still holds a position on it" in page
+    r = c.post("/accounts/desk-b/retire", data={"action": "retire", "reason": "tidy"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "still+holds+a+position" in r.headers["location"]
+    assert not next(a for a in store.accounts() if a["name"] == "desk-b")["retired_at"]
+    r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "de-risk"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and store.sleeve("btc-test").desired_state == "running"
+    assert [x["command"] for x in store.pending_commands("btc-test")] == ["flatten"]
+    _new(c, name="eth-flat", instrument="ETH/USD")
+    store.set_desired_state("eth-flat", "stopped")
+    r = c.post("/sleeves/eth-flat/command", data={"command": "flatten", "reason": "x"}, auth=AUTH, headers=SAME)
+    assert r.status_code == 400 and "nothing to flatten" in r.text
+
+
 def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
     c, store = client
     _new(c)

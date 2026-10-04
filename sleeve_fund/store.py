@@ -562,6 +562,13 @@ class Store:
         if running:
             raise ValueError(f"{', '.join(running)} still run{'s' if len(running) == 1 else ''} on {name}; "
                              "stop or move them first")
+        # A stopped strategy can still hold a position, and on a retired account it could never start to
+        # sell it (review round 8, M8-2). The journal's position decides, not the desired state.
+        held = [s.name for s in self.sleeves() if s.name in a["sleeves"]
+                and abs(self.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
+        if held:
+            raise ValueError(f"{', '.join(held)} still hold{'s' if len(held) == 1 else ''} a position on {name}; "
+                             "flatten first")
         with self.engine.begin() as c:
             c.execute(insert(account_retired_t).values(account=name, retired_at=utcnow()))
 
