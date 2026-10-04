@@ -10,6 +10,7 @@ or simply in or out (want_long).
 from __future__ import annotations
 
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
@@ -25,6 +26,7 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType,
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
+from sleeve_fund.instruments import BOOK_SHARE
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -177,6 +179,11 @@ class LongFlatConfig(StrategyConfig):
         self.maker_wait_minutes = maker_wait_minutes
 
 
+# Handlers whose exceptions the engine would swallow without a trace (on_bar and timers it logs).
+REPORTED_HANDLERS = ("on_trade", "on_quote", "on_order_accepted", "on_order_rejected", "on_order_denied",
+                     "on_order_canceled", "on_order_expired", "on_order_filled")
+
+
 class LongFlatStrategy(Strategy):
     """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
     want_long() for all-or-nothing, or target_weight() for anything in between."""
@@ -205,6 +212,10 @@ class LongFlatStrategy(Strategy):
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
+        # Paper: volume traded through each working post-only order's price, to measure its fills by.
+        self._through: dict[str, float] = {}
+        self._tape_last = None  # the latest trade counted into _through (time, trade id)
+        self._overfilled: set[str] = set()  # post-only orders already reported as filled past the tape
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -215,6 +226,30 @@ class LongFlatStrategy(Strategy):
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
+        # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
+        self.handler_errors: list[tuple[str, str]] = []
+        for name in REPORTED_HANDLERS:
+            setattr(self, name, self._reporting(name, getattr(self, name)))
+
+    def _reporting(self, name: str, handler):
+        """The engine swallows an exception raised in an order or market data handler without a log
+        line, so a broken fill handler would quietly stop exits, journaling or the risk guard. Catch
+        it here instead: log it as an error, keep it in handler_errors, and put it in the strategy's
+        events (paper). Wrapped per instance, so a subclass's own handler is covered too."""
+        def run(*args, **kwargs):
+            try:
+                return handler(*args, **kwargs)
+            except Exception as exc:
+                self.handler_errors.append((name, repr(exc)))
+                self.log.error(f"strategy handler {name} failed: {exc!r}\n{traceback.format_exc()}")
+                if self.runtime is not None:
+                    try:
+                        self.runtime.store.event(self.runtime.name, "error", "handler_failed",
+                                                 f"{name} failed: {exc!r}", ts=self.runtime.now())
+                    except Exception:  # the journal itself failing must not hide the first error
+                        pass
+        run.__name__ = name
+        return run
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
@@ -280,6 +315,8 @@ class LongFlatStrategy(Strategy):
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
+        if self._maker and not self._backtest:
+            self._tape(tick)
         self._check_exits(self._last_close)
         self._maybe_tick()
 
@@ -680,6 +717,46 @@ class LongFlatStrategy(Strategy):
         signal = {**{k: v for k, v in info["signal"].items() if k != "price"}, "maker_order": coid}
         self._submit(order.side, qty, info["intent"], reason, signal, market=True)
 
+    def _tape(self, tick) -> None:
+        """Paper: count a trade towards each working post-only order whose price it traded through."""
+        key = (tick.ts_event, str(tick.trade_id))
+        if key == self._tape_last:
+            return
+        self._tape_last = key
+        px, size = tick.price.as_double(), tick.size.as_double()
+        for coid in self._maker:
+            order = self.cache.order(ClientOrderId(coid))
+            if order is None:
+                continue
+            limit = order.price.as_double()
+            if (px < limit) if order.is_buy else (px > limit):
+                self._through[coid] = self._through.get(coid, 0.0) + size
+
+    def _check_maker_fill(self, coid: str, order) -> None:
+        """Paper's simulated venue fills a post-only order in full once the price trades through it,
+        however little traded; a backtest gives it at most BOOK_SHARE of the volume that trades
+        through. Say so, once per order, when a paper fill goes past what the backtest would allow, so
+        a maker strategy's paper results on a thin market aren't read as the backtest's."""
+        last = self.cache.trade(self._cfg.instrument_id)
+        if last is not None:
+            self._tape(last)  # the venue may have filled on a trade this strategy hasn't heard yet
+        through = self._through.get(coid, 0.0)
+        filled, allowed = order.filled_qty.as_double(), BOOK_SHARE * through
+        step = self.instrument.size_increment.as_double()
+        if filled <= allowed + step or coid in self._overfilled:
+            return
+        self._overfilled.add(coid)
+        msg = (f"Post-only order {coid} has filled {filled:.8g} while {through:.8g} traded through its price; a "
+               f"backtest would fill at most {allowed:.8g} ({BOOK_SHARE:.0%}). Paper's maker fills run ahead of "
+               "the backtest's where little trades")
+        self.log.warning(msg)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "maker_fill_above_tape", msg, ts=self.runtime.now())
+
+    def _forget_tape(self, coid: str) -> None:
+        self._through.pop(coid, None)
+        self._overfilled.discard(coid)
+
     def _min_qty(self) -> Decimal:
         step = self.instrument.size_increment.as_decimal()
         return self.instrument.min_quantity.as_decimal() if self.instrument.min_quantity else step
@@ -868,12 +945,36 @@ class LongFlatStrategy(Strategy):
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
         coid = str(event.client_order_id)
+        order = self.cache.order(event.client_order_id)
+        if (order is not None and order.order_type == OrderType.STOP_MARKET and self._backtest
+                and self._pending_exit is None):
+            self._stop_rejected(coid, str(getattr(event, "reason", "") or ""))
         info = self._maker.pop(coid, None)
         if info is not None:  # e.g. the price moved and a post-only order would have taken liquidity
             self._cancel_alert(coid)
             if self._pending_exit is None:
                 self._finish_at_market(coid, info, f"was rejected ({getattr(event, 'reason', '') or 'no reason given'})")
         self._resume_exit(coid)
+
+    def _stop_rejected(self, coid: str, why: str) -> None:
+        """Backtests: the venue refused the resting stop, most often because the price was already
+        through it when the entry filled (a gap). Its linked target goes with it, so nothing would
+        protect the position until the next decision. Sell at market instead, as paper does on the
+        first trade past the stop."""
+        if not self._is_long():
+            return
+        signal = self.decisions[coid]["signal"]
+        price = self._price()
+        trigger = f"{signal.get('trigger', 0):,.6g}"
+        reason = (f"Stop-loss: the price was already through the {trigger} stop when the entry filled, so the venue "
+                  "refused the resting stop and the position was sold at market" if "in the market" in why else
+                  f"Stop-loss: the venue refused the resting stop at {trigger} ({why or 'no reason given'}), so the "
+                  "position was sold at market")
+        self.log.info(reason)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "stop_rejected", reason, ts=self.runtime.now())
+        self._exit_lock = True
+        self._sell_all("stop_loss", reason, {**signal, "price": price})
 
     def on_order_denied(self, event) -> None:
         self._order_status(event, "denied")
@@ -884,6 +985,7 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         info = self._maker.pop(coid, None)
         self._cancel_alert(coid)
+        self._forget_tape(coid)
         timed_out = coid in self._fallback
         self._fallback.discard(coid)
         # Only an order this strategy cancelled for time goes on at market: a cancel from a halt, a
@@ -901,9 +1003,12 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed
+        if coid in self._maker and order is not None and not self._backtest:
+            self._check_maker_fill(coid, order)
         if coid in self._maker and done:
             self._maker.pop(coid)
             self._cancel_alert(coid)
+            self._forget_tape(coid)
         qty, px = event.last_qty.as_double(), event.last_px.as_double()
         if event.is_buy:
             cost = (self._entry_px or 0.0) * self._entry_qty + qty * px

@@ -15,7 +15,7 @@ from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
-from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
+from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY
 
@@ -38,6 +38,8 @@ class BacktestResult:
     half_spread: float = 0.0
     # With a risk profile: the runtime's journal (orders, fills, marks, events), for Store.save_backtest.
     journal: object = None
+    # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
+    handler_errors: list = field(default_factory=list)
 
 
 CHUNK_BARS = 100_000  # bars handed to the engine at a time
@@ -49,7 +51,7 @@ CHUNK_BARS = 100_000  # bars handed to the engine at a time
 # the edge (minute to hourly bars). At a fifth, a resting order takes at most 5% of a bar's volume per
 # print it trades through, so about a tenth of the bar, and the rest waits for the next bar. A market
 # order takes the first print's share at the price and the rest one tick worse.
-BOOK_SHARE = 0.2
+# BOOK_SHARE (sleeve_fund.instruments) is the share; paper measures its maker fills against the same.
 
 
 def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
@@ -190,6 +192,7 @@ def run_backtest(
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
+            handler_errors=list(strategy.handler_errors),
         )
     finally:
         if runtime is not None:
