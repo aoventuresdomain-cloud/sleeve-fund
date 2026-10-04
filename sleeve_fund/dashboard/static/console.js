@@ -523,7 +523,7 @@ window.Console = (() => {
       }
       box.querySelector("[data-needs-stop]").hidden = !!kind.stop.value;
       const rOpt = kind.tp.querySelector("option[value=r]");
-      rOpt.disabled = !kind.stop.value;  // a multiple of the stop's distance needs a stop
+      rOpt.disabled = !kind.stop.value;  // a target in R needs a stop
       if (rOpt.disabled && kind.tp.value === "r") { kind.tp.value = ""; sync(); return; }
       if (!line || !costs) return;
       const pair = ((form.elements.instrument && form.elements.instrument.value) || "").toUpperCase();
@@ -531,7 +531,9 @@ window.Console = (() => {
       const leg = costs.taker + half;  // each way: the taker fee and half the spread
       const s = num("stop_loss_pct") !== null ? num("stop_loss_pct") / 100 : null;
       const r = num("take_profit_r");
-      const t = num("take_profit_pct") !== null ? num("take_profit_pct") / 100 : (r !== null && s !== null ? r * s : null);
+      // A target in R pays R times the stop-out's loss, both after costs (strategies/base.py r_target).
+      const rTarget = (k, stop) => (k * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg);
+      const t = num("take_profit_pct") !== null ? num("take_profit_pct") / 100 : null;
       const parts = [];
       let warn = false;
       const loss = s !== null ? s + leg + (1 - s) * leg : null;  // 1R: what a stop-out loses, costs included
@@ -546,8 +548,9 @@ window.Console = (() => {
           if (R < 0.25) { warn = true; parts.push(`That is almost nothing for the risk: costs alone take ${p2(trip)}.`); }
         } else parts.push(`The target makes ${p2(gain)} after a ${p2(trip)} round trip.`);
       } else if (r !== null) {
-        const eg = 0.03, egLoss = eg + leg + (1 - eg) * leg, egT = r * eg;
-        parts.push(`The target is ${r}:1 before costs. On a 3% stop, for example, it makes ${rr((egT - leg - (1 + egT) * leg) / egLoss)} after costs.`);
+        if (s !== null) parts.push(`The target makes ${rr(r)} after costs: ${p2(rTarget(r, s))} above the entry.`);
+        else parts.push(`The target makes ${rr(r)} after costs, so it sits further out than ${r} stop distances: on a 3% stop, ${p2(rTarget(r, 0.03))} above the entry.`);
+        if (r < 0.25) { warn = true; parts.push("That is almost nothing for the risk."); }
       }
       line.hidden = !parts.length;
       line.classList.toggle("warn", warn);
@@ -563,7 +566,7 @@ window.Console = (() => {
         : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) below entry`
         : swing !== null ? `just under the lowest low of the last ${swing} bars` : null;
       const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% above entry`
-        : r !== null ? `${r} times the stop's distance above entry` : null;
+        : r !== null ? `a target that makes ${r}R after costs` : null;
       if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);
       if (line && !line.hidden) out.push(line.textContent);
       const rpt = num("risk_per_trade_pct");

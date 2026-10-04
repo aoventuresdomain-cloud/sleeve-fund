@@ -228,7 +228,7 @@ def _ranged(prices, closes, half_range):
 
 def test_an_atr_stop_is_set_from_the_market_at_entry(prices, instrument):
     """Review round 7: the PM asked for a volatility stop. 2 ATRs on bars spanning 100 +/- 1 is 4 below
-    the entry, and a 2:1 target is 8 above it; the entry waits until the ATR has its 14 bars."""
+    the entry; the entry waits until the ATR has its 14 bars. A 2R target pays 2R after costs (round 8)."""
     df = _ranged(prices, [100.0] * 30 + [93.0] * 5, 1.0)
     df.iloc[30, df.columns.get_loc("open")] = df.iloc[30, df.columns.get_loc("high")] = 100.0  # falls inside bar 30
     res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0}, half_spread=0)
@@ -238,17 +238,24 @@ def test_an_atr_stop_is_set_from_the_market_at_entry(prices, instrument):
     d = res.decisions[sells.index[0]]
     assert d["intent"] == "stop_loss" and "2 x the 14-bar average true range" in d["reason"]
     entry = res.decisions[buys.index[0]]["signal"]
-    assert entry["stop_frac"] == pytest.approx(0.04) and entry["tp_frac"] == pytest.approx(0.08)
-    assert 1.1 < entry["planned_r"] < 1.2  # 2:1 before costs; the 0.8% taker each way takes it to 1.14R
+    # 1R = 4% + 0.8% in + 0.8% of 96% out = 5.568%; 2R after costs needs (2 x 5.568% + 1.6%) / 0.992 = 12.84%.
+    assert entry["stop_frac"] == pytest.approx(0.04) and entry["tp_frac"] == pytest.approx(0.128387, abs=1e-5)
+    assert entry["planned_r"] == pytest.approx(2.0)
 
 
-def test_a_target_in_multiples_of_the_stop_fills_at_that_level(prices, instrument):
+def test_a_target_in_r_pays_that_r_after_costs(prices, instrument):
+    """Review round 8 (R8-M1): "2R" realised about +0.7R because it was 2 stop distances before costs.
+    Now the target sits where a hit nets twice what a stop-out loses, fees included."""
     df = _path(prices, [100.0] * 10 + [104.0] * 5)
-    df.iloc[10, df.columns.get_loc("high")] = 115.0
+    df.iloc[10, df.columns.get_loc("high")] = 116.0
     res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit_r": 2.0}, half_spread=0)
-    sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
-    assert "2 times the stop's distance" in res.decisions[sells.index[0]]["reason"]
+    buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(114.839, abs=0.01)
+    assert "2R after costs" in res.decisions[sells.index[0]]["reason"]
+    entry, out = float(buys["avg_px"].iloc[0]), float(sells["avg_px"].iloc[0])
+    net = out * (1 - 0.008) - entry * (1 + 0.008)
+    loss = entry * (1 + 0.008) - entry * 0.95 * (1 - 0.008)
+    assert net / loss == pytest.approx(2.0, abs=0.01)
 
 
 def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
@@ -266,20 +273,21 @@ def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
     ({"take_profit_r": 2.0}, "needs a stop-loss"),
     ({"stop_loss": 0.05, "take_profit": 0.1, "take_profit_r": 2.0}, "not both"),
     ({"stop_swing_bars": 1}, "whole number of bars"),
-    ({"stop_loss": 0.004, "take_profit_r": 2.0}, "round trip"),  # an 0.8% target can't cover the costs
+    ({"stop_loss": 0.05, "take_profit": 0.01}, "round trip"),  # a 1% target can't cover the costs
 ])
 def test_bad_stop_and_target_combinations_are_refused(prices, instrument, bad, why):
     with pytest.raises(ValueError, match=why):
         run_backtest("buy_and_hold", prices.iloc[:20], instrument, bad)
 
 
-def test_a_target_that_comes_out_below_costs_is_left_off_that_entry(prices, instrument):
-    """2 x a stop of 0.5% (a quiet market's ATR) is a 1% target: under the round trip, so a hit would
-    lose. The entry keeps its stop and goes without a target."""
+def test_a_target_in_r_clears_costs_even_on_a_tight_stop(prices, instrument):
+    """A 0.5% stop (a quiet market's ATR) at 2R before costs would have been a 1% target that loses on
+    every hit (review round 8, R8-M2). After costs, 2R sits far enough out to pay 2R."""
     df = _ranged(prices, [100.0] * 30, 0.125)  # ATR 0.25, so 2 ATRs is 0.5%
-    res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0})
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0}, half_spread=0)
     buys = res.fills[res.fills["side"] == "BUY"]
     entry = res.decisions[buys.index[0]]["signal"]
-    assert entry["stop_frac"] == pytest.approx(0.005) and "tp_frac" not in entry
+    assert entry["stop_frac"] == pytest.approx(0.005) and entry["tp_frac"] > 0.05
+    assert entry["planned_r"] == pytest.approx(2.0)
     resting = [d for d in res.decisions.values() if d["intent"] in ("stop_loss", "take_profit")]
-    assert [d["intent"] for d in resting] == ["stop_loss"]
+    assert [d["intent"] for d in resting] == ["stop_loss", "take_profit"]

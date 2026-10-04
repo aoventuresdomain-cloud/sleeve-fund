@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -19,14 +20,17 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
 TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheets"))
 
-# Bar lengths a study can decide on. Shorter bars take hours a study and more memory than a job has
-# (review round 7: a 2-year 1-minute study ran past 90 minutes and 1.9 GB), and every result is
-# judged on daily returns anyway.
-STUDY_MINUTES = (1440, 240, 60, 15)
+# Bar lengths a study can decide on. 5-minute bars take about three times as long as 15-minute ones
+# (a 1,000-day study: 149 s and 0.46 GB against 47 s and 0.38 GB). 1-minute bars take hours and more
+# memory than a job has (review round 7: a 2-year study ran past 90 minutes and 1.9 GB), so 1-minute
+# settings are tried on the backtest page; a study still matches resting orders on shorter bars.
+STUDY_MINUTES = (1440, 240, 60, 15, 5)
 # The most execution bars one backtest in a study replays: resting orders and the risk guard are
 # matched on the shortest bars that keep each run within this (as the backtest page does).
 EXEC_BAR_BUDGET = 150_000
 EXEC_STEPS = (1, 5, 15, 60)
+# Stored history ending longer ago than this is still being backfilled; a study says so.
+STALE_HISTORY = pd.Timedelta(days=1)
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,7 @@ class StudyRequest:
     def validate(self) -> None:
         if self.minutes not in STUDY_MINUTES:
             raise ValueError(f"studies decide on {', '.join(_bars(m) for m in STUDY_MINUTES)} bars; "
-                             f"{_bars(self.minutes)} bars would take hours")
+                             f"{_bars(self.minutes)} bars would take hours, so try them on the backtest page")
         for name in ("train_days", "test_days"):
             if getattr(self, name) < 30:
                 raise ValueError(f"{name.replace('_', ' ')} must be at least 30")
@@ -111,8 +115,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     try:
         prices = history.read(profile.name, req.pair, req.minutes)
     except KeyError:
-        raise ValueError(f"no stored {profile.label} history for {req.pair}; the history collector fills the store "
-                         "for each instrument a strategy trades") from None
+        raise ValueError(f"no stored {profile.label} history for {req.pair}; ask for it under Stored history on "
+                         "the Research page") from None
     if prices.empty:
         raise ValueError(f"the {profile.label} history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
@@ -131,8 +135,19 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress)
     result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
-    out = (out_dir or TEARSHEETS) / f"{spec.name}_{dataset}.md"
+    cov = history.coverage(profile.name, req.pair)
+    if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last > STALE_HISTORY:
+        result.notes.append(f"The stored history ends {cov.last:%d %b %Y %H:%M} UTC: the collector is still catching "
+                            "up on this instrument, so the study ends there.")
+    # Every run keeps its own sheet: a re-run with other exits, profile or windows is new evidence, not a
+    # replacement for the old (review round 8, R8-M3). The newest sheet per instrument and bars decides G1.
+    stem = f"{spec.name}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    out = (out_dir or TEARSHEETS) / f"{stem}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while out.exists():  # two runs in the same second
+        n += 1
+        out = out.with_name(f"{stem}-{n}.md")
     out.write_text(render(result, ledger), encoding="utf-8")
     return out
 

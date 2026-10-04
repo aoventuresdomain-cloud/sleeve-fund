@@ -213,6 +213,16 @@ spreads_t = Table(
     Column("samples", Integer, nullable=False),
     Column("measured_at", TS, nullable=False),
 )
+# Instruments the PM asked the history collector to store, from the Research page, so a study can run
+# on an instrument no strategy trades yet. A new table: CREATE TABLE.
+history_requests_t = Table(
+    "history_requests",
+    metadata,
+    Column("venue", String(16), primary_key=True),
+    Column("instrument", String(32), primary_key=True),
+    Column("since", TS, nullable=False),  # where the backfill starts
+    Column("requested_at", TS, nullable=False),
+)
 # Accounts the PM has retired: no strategy can be moved onto one or started on one. A separate table,
 # so it arrives as a plain CREATE TABLE; reinstating deletes the row.
 account_retired_t = Table(
@@ -616,6 +626,22 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(spreads_t).values(venue=venue.upper(), instrument=instrument, half_spread=float(half_spread),
                                                samples=int(samples), measured_at=ts or utcnow()))
+
+    def request_history(self, venue: str, instrument: str, since: datetime) -> bool:
+        """Ask the history collector to store `instrument` from `since`. False if it was already asked."""
+        with self.engine.begin() as c:
+            key = (history_requests_t.c.venue == venue.upper()) & (history_requests_t.c.instrument == instrument)
+            if c.execute(select(history_requests_t.c.venue).where(key)).first() is not None:
+                return False
+            c.execute(insert(history_requests_t).values(venue=venue.upper(), instrument=instrument, since=since,
+                                                        requested_at=utcnow()))
+        return True
+
+    def history_requests(self, venue: str) -> list[dict]:
+        q = (select(history_requests_t).where(history_requests_t.c.venue == venue.upper())
+             .order_by(history_requests_t.c.requested_at))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     def latest_spread(self, venue: str, instrument: str) -> dict | None:
         q = (select(spreads_t).where(spreads_t.c.venue == venue.upper(), spreads_t.c.instrument == instrument)

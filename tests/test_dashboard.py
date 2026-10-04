@@ -1,7 +1,10 @@
+import re
+
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from sleeve_fund.store import Store
+from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import KRAKEN
 
 AUTH = ("pm", "test-pw")
@@ -1096,17 +1099,68 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
             break
         time.sleep(0.05)
     assert j["status"] == "done", j
-    assert j["run_id"] == "buy_and_hold_kraken-ethusd-store-240m"
-    assert "conservative risk profile" in c.get(f"/research/{j['run_id']}", auth=AUTH).text
-    assert (tmp_path / "idea_ledger.jsonl").exists()  # counted in the server's ledger, not the repository's
-    # Missing history is an error on the page, not a crash.
-    r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert re.fullmatch(r"buy_and_hold_kraken-ethusd-store-240m_\d{8}-\d{6}", j["run_id"])
+    first = j["run_id"]
+    assert "conservative risk profile" in c.get(f"/research/{first}", auth=AUTH).text
+    # A re-run with other exits is new evidence beside the old, not a replacement (review round 8, R8-M3).
+    r = c.post("/research/run", data={**form, "stop_loss_pct": "5"}, auth=AUTH, headers=SAME, follow_redirects=False)
     for _ in range(200):
         j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
         if j["status"] not in ("queued", "running"):
             break
         time.sleep(0.05)
-    assert j["status"] == "error" and "no stored Kraken spot history for SOL/USD" in j["error"]
+    assert j["status"] == "done" and j["run_id"] != first
+    listing = c.get("/research", auth=AUTH).text
+    assert f'/research/{first}"' in listing and f'/research/{j["run_id"]}"' in listing
+    assert "exits: the signal only" in listing and "exits: stop-loss 5.0% below entry" in listing
+    assert (tmp_path / "idea_ledger.jsonl").exists()  # counted in the server's ledger, not the repository's
+    # Missing history is said on the page at once, with the way to get it, and starts no job (R8-M6).
+    r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 200 and "there is no stored Kraken spot history for SOL/USD yet" in r.text
+    assert 'name="instrument" value="SOL/USD"><button>Collect SOL/USD history</button>' in r.text
+
+
+def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypatch):
+    """Review round 8, R8-M6: a study on anything but BTC/USD failed for want of stored history, and
+    the only way to get it was to start a paper strategy on the instrument."""
+    from sleeve_fund import history
+    from test_research import _stored_minutes
+
+    c, store = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(3), cursor="x")
+    old = _stored_minutes(3)
+    history.HistoryStore().append("KRAKEN", "BTC/USD", old.set_axis(old.index - pd.Timedelta(days=30)), cursor="y")
+    listed = {"SOL/USD"}
+
+    def check(pair):
+        if pair not in listed:
+            raise ValueError(f"Kraken does not list {pair}")
+
+    monkeypatch.setattr(KRAKEN, "check_listed", check)
+    page = c.get("/research", auth=AUTH).text
+    assert 'id="history"' in page and "Collect another instrument" in page
+    assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Catching up", page, re.S)
+    assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
+    assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
+    # Another site can't ask, an unlisted instrument is refused, and a listed one is queued once.
+    assert c.post("/research/history", data={"instrument": "SOL/USD"}, auth=AUTH,
+                  headers={"Origin": "https://evil.example"}).status_code == 403
+    bad = c.post("/research/history", data={"instrument": "FOO/USD"}, auth=AUTH, headers=SAME)
+    assert "Kraken does not list FOO/USD" in bad.text and not store.history_requests("KRAKEN")
+    ok = c.post("/research/history", data={"instrument": "sol/usd"}, auth=AUTH, headers=SAME)
+    assert "Asked the collector for SOL/USD: it backfills from" in ok.text
+    assert re.search(r"SOL/USD</td>.*?Asked for", ok.text, re.S)
+    (req,) = store.history_requests("KRAKEN")
+    assert req["instrument"] == "SOL/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
+    again = c.post("/research/history", data={"instrument": "SOL/USD"}, auth=AUTH, headers=SAME)
+    assert "SOL/USD was already asked for" in again.text and len(store.history_requests("KRAKEN")) == 1
+    # A study on it before anything is stored says so, without offering to ask again.
+    form = {"strategy": "buy_and_hold", "instrument": "SOL/USD", "minutes": "240", "train_days": "60",
+            "test_days": "30", "holdout_days": "0"}
+    r = c.post("/research/run", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 200 and "SOL/USD&#39;s history was asked for on" in r.text
+    assert "Collect SOL/USD history</button>" not in r.text
 
 
 def test_the_form_and_the_backtest_refuse_a_thin_target_at_the_same_round_trip(client, monkeypatch):
@@ -1134,7 +1188,7 @@ def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
     assert params["stop_atr"] == 2.5 and params["atr_bars"] == 20 and params["take_profit_r"] == 3.0
     assert store.sleeve("btc-test").warmup_bars >= 21  # the ATR's bars load at start, like the model's
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert "2.5 ATR (20 bars) below entry" in page and "3.0x the stop's distance" in page
+    assert "2.5 ATR (20 bars) below entry" in page and "3.0R after costs" in page
     clone = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "stop_atr=2.5" in clone and "take_profit_r=3" in clone  # Clone with changes keeps them
     form = c.get("/sleeves/new?stop_atr=2.5&take_profit_r=3", auth=AUTH).text

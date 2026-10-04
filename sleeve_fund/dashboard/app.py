@@ -32,6 +32,7 @@ from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
+from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research import run as study_run
@@ -543,14 +544,18 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
-    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None):
+    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None, collect: str = "",
+                      notice: str = ""):
         from sleeve_fund.dashboard import pipeline
 
         sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                          reverse=True)]
+        stored = _stored_history(st())
         return page(request, "research.html", sheets=sheets, counts=IdeaLedger(LEDGER).counts(),
                     rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
-                    error=error, pre=pre or {}, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
+                    error=error, pre=pre or {}, strategies=_strategy_choices(),
+                    instruments=[h["pair"] for h in stored] or INSTRUMENT_HINTS, stored=stored, collect=collect,
+                    notice=notice, request_years=REQUEST_YEARS, history_venue=_research_venue().label,
                     profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs())
 
     @app.get("/research", response_class=HTMLResponse)
@@ -570,12 +575,47 @@ def create_app(store: Store | None = None) -> FastAPI:
             req.validate()
         except (ValueError, KeyError) as exc:
             return research_page(request, error=str(exc), pre=form)
+        # No history yet: say so now, with the way to get it, rather than from a failed job (R8-M6).
+        held = next((h for h in _stored_history(st()) if h["pair"] == req.pair), None)
+        if held is None or held["first"] is None:
+            label = _research_venue().label
+            why = (f"{req.pair}'s history was asked for on {held['requested']:%d %b %Y}; the collector hasn't stored "
+                   "any yet." if held else f"there is no stored {label} history for {req.pair} yet.")
+            return research_page(request, error=why, pre=form, collect="" if held else req.pair)
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
         title = f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair}, {study_run._bars(req.minutes)} bars"
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
         return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
+
+    @app.post("/research/history")
+    async def research_history(request: Request, _: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Ask the history collector to store an instrument, so a study can run on it before any strategy
+        trades it (review round 8, R8-M6)."""
+        form = dict((await request.form()).items())
+        pair = str(form.get("instrument", "")).strip().upper()
+        profile = _research_venue()
+        try:
+            if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
+                raise ValueError(f"instrument {pair!r} should look like BTC/USD")
+            if profile.minute_loader is None:
+                raise ValueError(f"{profile.label} has no history loader")
+            if profile.check_listed is not None:
+                try:
+                    profile.check_listed(pair)
+                except ValueError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - venue unreachable: ask anyway; the collector retries
+                    logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
+        except ValueError as exc:
+            return research_page(request, error=str(exc), pre={"instrument": pair}, collect=pair)
+        since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
+        new = st().request_history(profile.name, pair, since)
+        notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
+                  "A study can run once some is stored; this list shows how far it has got."
+                  if new else f"{pair} was already asked for; this list shows how far the collector has got.")
+        return research_page(request, pre={"instrument": pair}, notice=notice)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -910,6 +950,35 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
 
+def _research_venue():
+    from sleeve_fund.venues import venue
+
+    return venue(None)
+
+
+def _stored_history(store: Store) -> list[dict]:
+    """Each instrument research can use or has asked for, on the research venue: what is stored, and
+    whether the collector is current or still catching up."""
+    from sleeve_fund.history import HistoryStore
+
+    profile = _research_venue()
+    hist = HistoryStore()
+    now = utcnow()
+    asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
+    out = []
+    for v, pair in hist.series():
+        if v != profile.name:
+            continue
+        cov = hist.coverage(v, pair)
+        behind = now - cov.last.to_pydatetime() > study_run.STALE_HISTORY
+        out.append({"pair": pair, "first": cov.first, "last": cov.last, "requested": asked.get(pair, {}).get("requested_at"),
+                    "state": "catching up" if behind else "current"})
+    held = {h["pair"] for h in out}
+    out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for"}
+            for p, r in asked.items() if p not in held]
+    return sorted(out, key=lambda h: h["pair"])
+
+
 def _study_request(form: dict) -> "study_run.StudyRequest":
     def num(name: str, default=None, cast=float):
         v = str(form.get(name, "")).strip()
@@ -1092,7 +1161,7 @@ def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
 
 
 # Exit settings the form takes as stored (the % ones are converted above): an ATR or swing-low stop,
-# and a target as a multiple of the stop's distance.
+# and a target in R after costs.
 EXIT_SETTINGS = {"stop_atr": float, "atr_bars": int, "stop_swing_bars": int, "take_profit_r": float}
 
 
@@ -1126,7 +1195,7 @@ def _risk_words(profile: str, params: dict) -> dict[str, str]:
         stop = f"{p['stop_loss'] * 100:g}% below the entry"
     else:
         stop = "none"
-    target = (f"{p['take_profit_r']:g} times the stop's distance" if p.get("take_profit_r")
+    target = (f"{p['take_profit_r']:g}R after costs" if p.get("take_profit_r")
               else f"{p['take_profit'] * 100:g}% above the entry" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
             "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",

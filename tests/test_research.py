@@ -270,3 +270,65 @@ def test_a_halt_in_research_leaves_the_strategy_flat_as_paper_would(tmp_path, in
     eq = r.full_period.equity
     assert eq.iloc[-1] == pytest.approx(eq.iloc[-30], rel=1e-9)  # flat since the halt, though the price rose
     assert r.full_period_benchmark.equity.iloc[-1] > r.full_period_benchmark.equity.iloc[-30]
+
+
+def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_path, instrument, monkeypatch):
+    """Review round 8, R8-M4: a 15-minute study read +0.0% and Sharpe 0.00 in every test fold without
+    saying the balanced halt had stopped it, passed "Enough trades" on in-sample trades, and printed
+    "Deflated Sharpe: n/a probability"."""
+    import numpy as np
+
+    from sleeve_fund.research.tearsheet import g1_checks, oos_gaps
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    idx = pd.date_range("2022-01-01", periods=200, freq="1D", tz="UTC")
+    c = np.r_[np.linspace(100, 110, 60), np.linspace(110, 30, 40), np.linspace(30, 60, 100)]
+    daily = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1e6}, index=idx)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(HOLD, daily, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=0,
+                  train_days=60, test_days=60, risk_profile="conservative")
+    first, second = r.folds
+    assert "in the test window" in first.halted and first.test_trades == 1  # the halt closed the trade
+    assert "in the training stretch" in second.halted and second.test_trades == 0
+    assert r.oos_trades == 1
+    gaps = oos_gaps(r)
+    assert "No trades out-of-sample in 1 of 2 test windows" in gaps
+    assert "The conservative risk profile halted the strategy in 2 of 2 folds" in gaps
+    enough = next(c for c in g1_checks(r, ledger) if c[0] == "Enough out-of-sample trades to judge")
+    assert enough[1] == "FAIL" and enough[2].startswith("1 closed in the 2 walk-forward test windows")
+    sheet = render(r, ledger)
+    assert "> **No trades out-of-sample in 1 of 2 test windows.**" in sheet
+    assert "| 0 (halted) |" in sheet and "| 1 (halted) |" in sheet
+    assert "kept in the repository" not in sheet
+    import sleeve_fund.research.tearsheet as tearsheet
+
+    monkeypatch.setattr(tearsheet, "deflated_sharpe_probability", lambda *a: float("nan"))
+    sheet = render(r, ledger)
+    assert "n/a probability" not in sheet
+    assert "Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns vary" in sheet
+
+
+def test_a_sheet_whose_test_windows_all_traded_has_no_gap_note():
+    from types import SimpleNamespace
+
+    from sleeve_fund.research.tearsheet import oos_gaps
+
+    fold = SimpleNamespace(test_trades=3, halted="", test_end=pd.Timestamp("2024-01-01"))
+    quiet = SimpleNamespace(test_trades=0, halted="", test_end=pd.Timestamp("2024-07-01"))
+    assert oos_gaps(SimpleNamespace(folds=[fold, fold], risk_profile="balanced")) == ""
+    words = oos_gaps(SimpleNamespace(folds=[fold, quiet], risk_profile=None))
+    assert "No trades out-of-sample in 1 of 2" in words and "signal never closed a trade" in words
+    assert "halted" not in words
+
+
+def test_a_study_on_history_still_being_collected_says_where_it_ends(tmp_path):
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+
+    hist = HistoryStore(tmp_path / "hist")
+    m = _stored_minutes(130)
+    hist.append("KRAKEN", "ETH/USD", m.set_axis(m.index - pd.Timedelta(days=10)), cursor="x")
+    req = StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=240, train_days=60, test_days=30,
+                       holdout_days=0)
+    sheet = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts", history=hist).read_text()
+    assert "The stored history ends" in sheet and "the collector is still catching up" in sheet

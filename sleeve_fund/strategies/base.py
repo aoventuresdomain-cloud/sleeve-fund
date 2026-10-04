@@ -80,6 +80,14 @@ _BASE_FIELDS = {
 }
 
 
+def r_target(r: float, stop: float, leg: float) -> float:
+    """The target, as a share of the entry price, that makes r times what the stop loses, both after
+    costs: each leg pays `leg` (the taker fee and half the spread) on its notional. A stop-out loses
+    stop + leg + (1 - stop) * leg; a target hit makes tp - leg - (1 + tp) * leg. So "2R" pays 2R, not
+    2R before costs, which on a 2.3% stop at 0.85% a leg nets about +0.7R (review round 8, R8-M1)."""
+    return (r * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg)
+
+
 def exit_warmup(params: dict) -> int:
     """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop."""
     if params.get("stop_atr"):
@@ -168,13 +176,12 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        fixed_tp = take_profit if take_profit is not None else (
-            take_profit_r * stop_loss if take_profit_r is not None and stop_loss is not None else None)
-        if fixed_tp is not None:
+        # A target in R is after costs by construction (r_target); a fixed one must clear them itself.
+        if take_profit is not None:
             leg = assumed_taker_fee + assumed_half_spread
-            cost = leg + (1 + fixed_tp) * leg  # the fee and half spread in, then out on the larger value
-            if fixed_tp <= cost:
-                raise ValueError(f"Take-profit {fixed_tp:.2%} doesn't cover the round trip's fees and spread "
+            cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
+            if take_profit <= cost:
+                raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
                                  f"({cost:.2%}), so every target hit would lose money")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
@@ -199,7 +206,7 @@ class LongFlatConfig(StrategyConfig):
         self.stop_atr = stop_atr
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)
-        # Or a take-profit this many times the stop's distance above the entry (2 = a 2:1 target).
+        # Or a take-profit that makes this many times what the stop loses, both after costs (r_target).
         self.take_profit_r = take_profit_r
         # Backtest only: the risk profile's position cap (a share of equity), so a backtest sizes
         # exactly as paper does. Paper and live take the cap from the sleeve's runtime instead.
@@ -437,7 +444,8 @@ class LongFlatStrategy(Strategy):
             if clamped != stop:
                 basis += f", held to {clamped:.1%}"
             stop = clamped
-        tp = c.take_profit if c.take_profit else (c.take_profit_r * stop if c.take_profit_r and stop else None)
+        tp = c.take_profit if c.take_profit else (
+            r_target(c.take_profit_r, stop, self._round_trip_cost()) if c.take_profit_r and stop else None)
         return stop, tp, basis
 
     def _restore_plan(self) -> None:
@@ -572,11 +580,10 @@ class LongFlatStrategy(Strategy):
                 self._stop_frac, self._tp_frac, self._stop_basis = plan
                 leg = self._round_trip_cost()
                 if self._tp_frac and self._tp_frac <= leg + (1 + self._tp_frac) * leg:
-                    # A target in multiples of a stop set from the market can come out too close to
-                    # pay the round trip; a hit would lose money, so this trade goes without one.
-                    self._note("target_below_costs", f"No take-profit on this entry: {self._cfg.take_profit_r:g} times "
-                               f"a {self._stop_frac:.2%} stop is {self._tp_frac:.2%}, which doesn't cover the round "
-                               f"trip's fees and spread")
+                    # A fixed target checked against the assumed spread can still fall short when the
+                    # venue's spread is wider now; a hit would lose money, so this trade goes without one.
+                    self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
+                               "doesn't cover the round trip's fees and spread at the venue's spread now")
                     self._tp_frac = None
                 else:
                     self._noted.discard("target_below_costs")
@@ -1220,7 +1227,7 @@ class LongFlatStrategy(Strategy):
                 Price(level, self.instrument.price_precision), TimeInForce.GTC, False, False, False,
                 UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
                 f"Take-profit: resting sell at {level:,.6g}, {tp:.1%} above the {self._entry_px:,.6g} entry"
-                + (f" ({cfg.take_profit_r:g} times the stop's distance)" if cfg.take_profit_r else "")
+                + (f" ({cfg.take_profit_r:g}R after costs)" if cfg.take_profit_r else "")
                 + "; fills at that level",
                 {"entry_px": round(self._entry_px, 8), "take_profit": round(tp, 6), "limit_px": round(level, 8)}))
         for order, intent, kind, reason, signal in orders:

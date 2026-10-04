@@ -40,6 +40,10 @@ class Fold:
     train_sharpe: float
     test: dict
     benchmark_test: dict
+    test_trades: int = 0  # round trips closed inside the test window: what out-of-sample was judged on
+    # When the risk guard halted the run before the test window ended: the day, why, and whether
+    # it was in the training stretch the run traded through first. A halted fold is flat from then on.
+    halted: str = ""
 
 
 @dataclass
@@ -65,10 +69,17 @@ class StudyResult:
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
     bar_minutes: int = 1440
     venue: str = ""
+    risk_profile: str | None = None
+    settings: str = ""  # the risk profile, exits and windows the study ran with, so two sheets can be told apart
 
     @property
     def round_trips(self) -> list[float]:
         return round_trips(self.full_period.fills)
+
+    @property
+    def oos_trades(self) -> int:
+        """Round trips closed inside the walk-forward test windows: the trades out-of-sample stands on."""
+        return sum(f.test_trades for f in self.folds)
 
     @property
     def trade_stats(self) -> dict:
@@ -235,6 +246,9 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=summary(b_ret),
+                test_trades=sum(1 for t in trades(fills_to_rows(run.fills))
+                                if t["closed"] is not None and _utc(t["closed"]) >= _utc(test_idx[0])),
+                halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
             )
         )
         oos_parts.append(test_ret)
@@ -258,6 +272,10 @@ def run_study(
         instrument=str(instrument.id.symbol),
         bar_minutes=minutes,
         venue=str(instrument.id.venue),
+        risk_profile=risk_profile,
+        settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
+                  f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
+                  f"walk-forward {train_days} days training, {test_days} days testing"),
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
@@ -307,6 +325,25 @@ def run_study(
     return result
 
 
+def _utc(ts) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    return t.tz_localize("UTC") if t.tzinfo is None else t
+
+
+def _halt_words(events: list[dict], test_start: pd.Timestamp, test_end: pd.Timestamp) -> str:
+    """'12 Mar 2026 (drawdown 20.3% hit the 20% limit), in the training stretch' for the first halt
+    at or before the test window's end, else ''."""
+    for e in events:
+        if e["kind"] != "risk_halt":
+            continue
+        ts = _utc(e["ts"])
+        if ts > _utc(test_end):
+            return ""
+        where = "in the training stretch the run traded through first" if ts < _utc(test_start) else "in the test window"
+        return f"{ts:%d %b %Y} ({e['message'].split(';')[0]}), {where}"
+    return ""
+
+
 def _exit_words(exits: dict) -> str:
     words = []
     if "stop_loss" in exits:
@@ -319,7 +356,7 @@ def _exit_words(exits: dict) -> str:
     if "take_profit" in exits:
         words.append(f"take-profit {exits['take_profit']:.1%} above entry")
     if "take_profit_r" in exits:
-        words.append(f"take-profit {exits['take_profit_r']:g} times the stop's distance above entry")
+        words.append(f"take-profit making {exits['take_profit_r']:g}R after costs")
     if "risk_per_trade" in exits:
         words.append(f"each trade sized to lose {exits['risk_per_trade']:.1%} of equity at the stop")
     return ", ".join(words)

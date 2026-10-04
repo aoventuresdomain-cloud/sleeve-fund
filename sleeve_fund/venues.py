@@ -40,6 +40,10 @@ class VenueProfile:
     # (pair, cursor) -> (1-minute bars by open time, next cursor, caught_up), for the history store
     minute_loader: Callable[[str, str], tuple] | None = None
     merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
+    # time -> the loader's cursor for history starting then, so a backfill need not start at listing
+    minute_cursor_at: Callable[[pd.Timestamp], str] | None = None
+    # pair -> None, raising ValueError when the venue doesn't list it (public data, no key)
+    check_listed: Callable[[str], None] | None = None
     request_interval: float = 1.0  # seconds between loader requests, within the venue's rate limit
     calendar: str = "24/7"
     # Half the bid-ask spread a backtest charges on orders that take liquidity, until a paper sleeve
@@ -171,6 +175,12 @@ def kraken_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame,
     return trades_to_minutes(trades), nxt, len(rows) < 1000
 
 
+def _kraken_listed(pair: str) -> None:
+    from sleeve_fund.data import kraken_pair_key
+
+    kraken_pair_key(pair)
+
+
 def kraken_asset_codes(pair: str, fetch=None) -> tuple[str, str]:
     """(base, quote) as Kraken's instrument data names them, e.g. SUI/USD -> (SUI, ZUSD).
 
@@ -221,4 +231,7 @@ KRAKEN = register(VenueProfile(
     fetch_fees=kraken_account_fees,
     minute_loader=kraken_minutes,
     merge_minutes=True,
+    # Kraken's Trades `since` takes Unix seconds (its `last` cursor comes back in nanoseconds).
+    minute_cursor_at=lambda ts: str(int(ts.timestamp())),
+    check_listed=_kraken_listed,
 ))

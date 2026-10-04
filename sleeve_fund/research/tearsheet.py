@@ -56,7 +56,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     bench = summary(r.oos_benchmark_returns)
     bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
-    trips = len(r.round_trips)
+    trips = r.oos_trades
     counts = ledger.counts()
     beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
     unjudged = math.isnan(beats)
@@ -93,13 +93,39 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"{counts['variants']} variants across {counts['ideas']} ideas so far",
         ),
         (
-            # A Sharpe built on a handful of trades is luck, not evidence, so this one fails G1.
-            "Enough trades to judge",
+            # A Sharpe built on a handful of trades is luck, not evidence, so this one fails G1. It counts
+            # the trades the out-of-sample Sharpe stands on, not the in-sample ones.
+            "Enough out-of-sample trades to judge",
             "PASS" if trips >= MIN_ROUND_TRIPS else "FAIL",
-            f"{trips} closed trades over the research period (bar: {MIN_ROUND_TRIPS}); turnover {r.turnover:.1f}x a year",
+            f"{trips} closed in the {len(r.folds)} walk-forward test windows (bar: {MIN_ROUND_TRIPS}); "
+            f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
     ]
     return checks
+
+
+def oos_gaps(r: StudyResult) -> str:
+    """Why out-of-sample has test windows without a trade, in words, or '' when every window traded.
+    A halted fold reads +0.0% with a Sharpe of 0.00, which looks like a result and isn't one."""
+    idle = [f for f in r.folds if f.test_trades == 0]
+    halted = [f for f in r.folds if f.halted]
+    if not idle and not halted:
+        return ""
+    words = []
+    if idle:
+        words.append(f"**No trades out-of-sample in {len(idle)} of {len(r.folds)} test windows.**")
+    if halted:
+        who = f"the {r.risk_profile} risk profile" if r.risk_profile else "the risk guard"
+        words.append(
+            f"{who[0].upper()}{who[1:]} halted the strategy in {len(halted)} of {len(r.folds)} folds: "
+            + "; ".join(f"the fold testing to {f.test_end:%b %Y} on {f.halted}" for f in halted)
+            + ". A halted run stays flat, as paper does until you resume it, so its test window shows +0.0%. "
+            "Each fold's run trades through its training stretch first, so the position carried into the test "
+            "is realistic; a halt there leaves the whole test window flat.")
+    quiet = [f for f in idle if not f.halted]
+    if quiet:
+        words.append(f"In {len(quiet)} of them the signal never closed a trade inside the test window.")
+    return " ".join(words)
 
 
 def _n(count: int, noun: str) -> str:
@@ -134,6 +160,9 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
         f"Tested on `{r.instrument}` at {r.bar_minutes}-minute bars" + (f" on `{r.venue}`" if r.venue else "")
     )
     out.append("")
+    if r.settings:
+        out.append(f"Settings: {r.settings}")
+        out.append("")
     out.append(
         f"Dataset `{r.dataset}` · research period {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y} · "
         f"holdout: last {r.holdout_days} days {'(opened)' if r.holdout else '(untouched)'} · "
@@ -166,11 +195,15 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     for name, result, evidence in checks:
         out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
+    gaps = oos_gaps(r)
+    if gaps:
+        out.append(f"> {gaps}")
+        out.append("")
     out.append("The PM's G1 rule (3 Oct 2026) is a higher out-of-sample Sharpe than buy-and-hold after fees. The build "
                f"applies it strictly: by more than luck across every variant tried, at {G1_CONFIDENCE:.0%} confidence "
                "(paired block bootstrap, blocks as long as the returns' persistence), with enough trades, an unused "
                "holdout and robustness to parameter moves. The confidence bar is the build's, pending the PM's choice. "
-               f"Variants are counted from `{ledger.path.name}`, which is kept in the repository.")
+               f"Variants are counted from `{ledger.path.name}`, the idea ledger kept with the research data.")
     out.append("")
     out.append("## Results after fees")
     out.append("")
@@ -202,13 +235,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## Walk-forward folds")
     out.append("")
-    out.append("| Train | Test to | Chosen params | Train Sharpe | Test CAGR | Benchmark CAGR | Test Sharpe | Benchmark Sharpe |")
-    out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    out.append("| Train | Test to | Chosen params | Train Sharpe | Test trades | Test CAGR | Benchmark CAGR | Test Sharpe | Benchmark Sharpe |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for f in r.folds:
         out.append(
             f"| {f.train_start:%b %Y} to {f.train_end:%b %Y} | {f.test_end:%b %Y} | {json.dumps(f.chosen)} "
-            f"| {_num(f.train_sharpe)} | {_pct(f.test['cagr'])} | {_pct(f.benchmark_test['cagr'])} "
-            f"| {_num(f.test['sharpe'])} | {_num(f.benchmark_test['sharpe'])} |"
+            f"| {_num(f.train_sharpe)} | {f.test_trades}{' (halted)' if f.halted else ''} | {_pct(f.test['cagr'])} "
+            f"| {_pct(f.benchmark_test['cagr'])} | {_num(f.test['sharpe'])} | {_num(f.benchmark_test['sharpe'])} |"
         )
     out.append("")
     out.append("## Parameter sensitivity (full research period, in-sample)")
@@ -228,8 +261,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append(f"- {_n(counts['ideas'], 'idea')} and {_n(counts['variants'], 'distinct variant')} tested so far "
                f"({counts['evaluations']} evaluations including walk-forward refits). By family: "
                + ", ".join(f"{k} {v}" for k, v in counts["ideas_by_family"].items()))
-    out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
-               "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
+    if math.isnan(dsr):
+        out.append("- Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns "
+                   "vary, and " + ("these test windows never traded." if r.oos_trades == 0 else
+                                   f"this one has {oos['days']} days."))
+    else:
+        out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
+                   "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
     out.append("")
     out.append("## Caveats")
     out.append("")
