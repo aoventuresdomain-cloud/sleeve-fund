@@ -1077,3 +1077,38 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
             break
         time.sleep(0.05)
     assert j["status"] == "error" and "no stored Kraken spot history for SOL/USD" in j["error"]
+
+
+def test_the_form_and_the_backtest_refuse_a_thin_target_at_the_same_round_trip(client, monkeypatch):
+    """Review round 7: the form refused a 1.5% target against a 1.61% round trip and the backtest
+    against 1.71%, because only the backtest charged the spread."""
+    import re
+    from urllib.parse import parse_qs, urlparse
+
+    from sleeve_fund.data import synthetic_ohlcv
+
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=2, start_price=150))
+    c, _ = client
+    r = _new(c, stop_loss_pct="1", take_profit_pct="1.5", risk_per_trade_pct="1")
+    form_cost = re.search(r"\(([\d.]+%)\)", parse_qs(urlparse(r.headers["location"]).query)["error"][0]).group(1)
+    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&stop_loss_pct=1&take_profit_pct=1.5",
+                 auth=AUTH).text
+    assert f"doesn&#39;t cover the round trip&#39;s fees and spread ({form_cost})" in page
+
+
+def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
+    c, store = client
+    r = _new(c, stop_atr="2.5", atr_bars="20", take_profit_r="3", risk_per_trade_pct="1", warmup_bars="")
+    assert r.status_code == 303 and r.headers["location"] == "/sleeves/btc-test", r.headers["location"]
+    params = store.sleeve("btc-test").params
+    assert params["stop_atr"] == 2.5 and params["atr_bars"] == 20 and params["take_profit_r"] == 3.0
+    assert store.sleeve("btc-test").warmup_bars >= 21  # the ATR's bars load at start, like the model's
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "2.5 ATR (20 bars) below entry" in page and "3.0x the stop's distance" in page
+    clone = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "stop_atr=2.5" in clone and "take_profit_r=3" in clone  # Clone with changes keeps them
+    form = c.get("/sleeves/new?stop_atr=2.5&take_profit_r=3", auth=AUTH).text
+    assert '<option value="atr" selected>' in form and '<option value="r" selected>' in form
+    assert "data-costs=" in form
+    r = _new(c, name="btc-two", stop_loss_pct="5", stop_atr="2")
+    assert "one kind of stop" in r.headers["location"].replace("+", " ")

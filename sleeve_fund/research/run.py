@@ -43,6 +43,18 @@ class StudyRequest:
     stop_loss: float | None = None
     take_profit: float | None = None
     risk_per_trade: float | None = None
+    stop_atr: float | None = None
+    stop_swing_bars: int | None = None
+    atr_bars: int | None = None
+    take_profit_r: float | None = None
+
+    def exits(self) -> dict:
+        """The exits every run of the study trades with, as the strategy takes them."""
+        keys = ("stop_loss", "take_profit", "risk_per_trade", "stop_atr", "stop_swing_bars", "take_profit_r")
+        out = {k: getattr(self, k) for k in keys if getattr(self, k) is not None}
+        if self.stop_atr is not None and self.atr_bars is not None:
+            out["atr_bars"] = self.atr_bars
+        return out
 
     def validate(self) -> None:
         if self.minutes not in STUDY_MINUTES:
@@ -116,7 +128,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     result = run_study(
         spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
         train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
-        exits={"stop_loss": req.stop_loss, "take_profit": req.take_profit, "risk_per_trade": req.risk_per_trade},
+        exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress)
     result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
     out = (out_dir or TEARSHEETS) / f"{spec.name}_{dataset}.md"
