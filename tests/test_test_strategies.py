@@ -4,7 +4,7 @@ import pytest
 
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.strategies.rsi_bands import RsiBands, RsiBandsConfig
-from tests.test_backtest import _path
+from test_backtest import _path
 
 
 def test_ping_pong_buys_first_sells_after_the_rise_and_rebuys_after_the_dip(prices, instrument):
@@ -67,7 +67,7 @@ def test_ping_pong_in_the_paper_runtime_trades_the_same_cycle(tmp_path):
     from sleeve_fund.paper.recorder import Recorder
     from sleeve_fund.research.replay import replay
     from sleeve_fund.venues import venue
-    from tests.test_replay import START
+    from test_replay import START
 
     inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
     path = tmp_path / "pp.jsonl.gz"
