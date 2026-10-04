@@ -276,3 +276,30 @@ def test_max_drawdown_counts_every_mark_not_just_the_latest(store):
         store.record_equity("s1", equity=eq, cash=eq, qty=0, price=1, benchmark=10_000, ts=t0 + timedelta(days=i))
     assert store.max_drawdown("s1") == pytest.approx(0.25) and store.max_drawdown("nobody") == 0.0
     assert sleeve_summary(store, store.sleeve("s1"))["max_drawdown"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("journaled", [True, False])
+def test_a_restart_keeps_the_stop_its_entry_set(store, instrument, journaled):
+    """An ATR stop is set from the market at entry, so a restart reads it back from the entry's journal
+    rather than setting a different one from the bars since. An entry journaled before stops were
+    recorded gets its stop set again once there are bars enough, and says so."""
+    from sqlalchemy import update
+
+    from sleeve_fund.store import orders_t
+
+    _sleeve(store)
+    prices = synthetic_ohlcv(days=60, seed=3)
+    exits = {"stop_atr": 10.0}  # wide: these runs are about the restart, not a stop-out
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    run_backtest("buy_and_hold", prices.iloc[:25], instrument, exits, runtime=rt)
+    (entry,) = [o for o in store.orders("s1") if o["intent"] == "entry"]
+    assert entry["signal"]["stop_frac"] > 0 and "average true range" in entry["signal"]["stop_basis"]
+    if not journaled:
+        sig = {k: v for k, v in entry["signal"].items() if k not in ("stop_frac", "stop_basis")}
+        with store.engine.begin() as c:
+            c.execute(update(orders_t).where(orders_t.c.order_id == entry["order_id"]).values(signal=sig))
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    run_backtest("buy_and_hold", prices.iloc[25:], instrument, exits, runtime=rt)
+    resets = [e for e in store.events("s1", limit=500) if e["kind"] == "stop_reset"]
+    assert len(resets) == (0 if journaled else 1)
+    assert [f["side"] for f in store.fills("s1")] == ["BUY"]

@@ -30,7 +30,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
             "cap_used": min(x["exposure"] / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
             "headroom": max(p.max_drawdown - x["drawdown"], 0.0) * x["equity"],
-            "has_stop": bool(s.params.get("stop_loss")),
+            "has_stop": bool(s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
             "shocks": shocks,
         })
     equity = book["equity"] or 1.0

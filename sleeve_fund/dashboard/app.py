@@ -38,6 +38,7 @@ from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.strategies.base import exit_warmup
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -269,7 +270,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                                bar_spec=bar_spec, starting_balance=float(form.get("starting_balance", 0) or 0),
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
-            needed = REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec))
+            needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
+                         exit_warmup(params))
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -319,11 +321,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         trips = trading.trips(fills, st().events(name, limit=5000), orders)
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        position = trading.open_position(x, fills, orders)
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     account=st().account_of(name),
-                    position=trading.open_position(x, fills, orders),
+                    position=position,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
-                    pending=st().pending_commands(name), risk=_risk_view(x), reasons=COMMON_REASONS,
+                    pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec)),
@@ -440,7 +443,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "research.html", sheets=sheets, counts=IdeaLedger(LEDGER).counts(),
                     rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
                     error=error, pre=pre or {}, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
-                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES)
+                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs())
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -788,7 +791,9 @@ def _study_request(form: dict) -> "study_run.StudyRequest":
         minutes=num("minutes", 1440, int), risk_profile=None if profile == "none" else profile,
         train_days=num("train_days", 3 * 365, int), test_days=num("test_days", 365, int),
         holdout_days=num("holdout_days", 365, int), use_holdout=form.get("use_holdout") == "on",
-        stop_loss=pct("stop_loss_pct"), take_profit=pct("take_profit_pct"), risk_per_trade=pct("risk_per_trade_pct"))
+        stop_loss=pct("stop_loss_pct"), take_profit=pct("take_profit_pct"), risk_per_trade=pct("risk_per_trade_pct"),
+        stop_atr=num("stop_atr"), stop_swing_bars=num("stop_swing_bars", cast=int), atr_bars=num("atr_bars", cast=int),
+        take_profit_r=num("take_profit_r"))
 
 
 def run_study_job(progress, job_id: str, store: Store | str, req, ledger: str, tearsheets: str) -> str:
@@ -852,14 +857,13 @@ def _feed(events: list[dict], kind: str) -> list[dict]:
     return [e for e in events if keep(e)][:120]
 
 
-def _risk_view(x: dict) -> dict:
-    p, params = x["profile"], x["sleeve"].params
-    entry = x["entry_px"]
-    sl, tp = params.get("stop_loss"), params.get("take_profit")
+def _risk_view(x: dict, position: dict | None = None) -> dict:
+    p = x["profile"]
+    stop_px = position["stop_px"] if position else None
     return {
-        "stop_px": entry * (1 - sl) if entry and sl else None,
-        "target_px": entry * (1 + tp) if entry and tp else None,
-        "to_stop": (x["price"] / (entry * (1 - sl)) - 1) if entry and sl and x["price"] else None,
+        "stop_px": stop_px,
+        "target_px": position["target_px"] if position else None,
+        "to_stop": (x["price"] / stop_px - 1) if stop_px and x["price"] else None,
         "cap_used": min(x["exposure"] / p.max_position_pct, 1.0) if p.max_position_pct else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
     }
@@ -1003,7 +1007,7 @@ def _warmup_for(strategy: str, q, bar_spec: str = BACKTEST_BAR_SPEC) -> int:
     except ValueError:
         pass
     cap = MAX_STORED_WARMUP_BARS if bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
-    return min(cap, REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)))
+    return min(cap, max(REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)), exit_warmup(params)))
 
 
 def _form_params(form, strategy: str) -> dict:

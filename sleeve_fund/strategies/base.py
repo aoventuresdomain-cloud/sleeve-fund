@@ -80,6 +80,13 @@ _BASE_FIELDS = {
 }
 
 
+def exit_warmup(params: dict) -> int:
+    """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop."""
+    if params.get("stop_atr"):
+        return int(params.get("atr_bars") or 14) + 1
+    return int(params.get("stop_swing_bars") or 0)
+
+
 class LongFlatConfig(StrategyConfig):
     def __init__(
         self,

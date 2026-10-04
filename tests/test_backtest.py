@@ -216,3 +216,58 @@ def test_any_bar_length_backtests(instrument):
     four_hourly.index = pd.date_range("2024-01-01 04:00", periods=len(four_hourly), freq="4h", tz="UTC")
     res = run_backtest("trend_filter", four_hourly, instrument, {"fast": 6, "slow": 30}, bar_minutes=240)
     assert len(res.fills) > 2 and res.equity.index.equals(four_hourly.index)
+
+
+def _ranged(prices, closes, half_range):
+    """A path whose every bar spans close +/- half_range, so its average true range is 2 x half_range."""
+    df = _path(prices, closes)
+    df["open"] = df["close"]
+    df["high"], df["low"] = df["close"] + half_range, df["close"] - half_range
+    return df
+
+
+def test_an_atr_stop_is_set_from_the_market_at_entry(prices, instrument):
+    """Review round 7: the PM asked for a volatility stop. 2 ATRs on bars spanning 100 +/- 1 is 4 below
+    the entry, and a 2:1 target is 8 above it; the entry waits until the ATR has its 14 bars."""
+    df = _ranged(prices, [100.0] * 30 + [93.0] * 5, 1.0)
+    df.iloc[30, df.columns.get_loc("open")] = df.iloc[30, df.columns.get_loc("high")] = 100.0  # falls inside bar 30
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0}, half_spread=0)
+    buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
+    assert len(buys) == 1 and buys["ts_last"].iloc[0] >= df.index[13]  # not before 14 bars of range
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(96.0)
+    d = res.decisions[sells.index[0]]
+    assert d["intent"] == "stop_loss" and "2 x the 14-bar average true range" in d["reason"]
+    entry = res.decisions[buys.index[0]]["signal"]
+    assert entry["stop_frac"] == pytest.approx(0.04) and entry["tp_frac"] == pytest.approx(0.08)
+    assert 1.1 < entry["planned_r"] < 1.2  # 2:1 before costs; the 0.8% taker each way takes it to 1.14R
+
+
+def test_a_target_in_multiples_of_the_stop_fills_at_that_level(prices, instrument):
+    df = _path(prices, [100.0] * 10 + [104.0] * 5)
+    df.iloc[10, df.columns.get_loc("high")] = 115.0
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit_r": 2.0}, half_spread=0)
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+    assert "2 times the stop's distance" in res.decisions[sells.index[0]]["reason"]
+
+
+def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
+    df = _ranged(prices, [100.0] * 20 + [90.0] * 5, 1.0)
+    df.iloc[5, df.columns.get_loc("low")] = 97.0  # the lowest low of the first 10 bars
+    df.iloc[20, df.columns.get_loc("open")] = df.iloc[20, df.columns.get_loc("high")] = 100.0
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_swing_bars": 10}, half_spread=0)
+    sells = res.fills[res.fills["side"] == "SELL"]
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(97.0)
+    assert "lowest low of the last 10 bars (97)" in res.decisions[sells.index[0]]["reason"]
+
+
+@pytest.mark.parametrize("bad, why", [
+    ({"stop_loss": 0.05, "stop_atr": 2.0}, "one kind of stop"),
+    ({"take_profit_r": 2.0}, "needs a stop-loss"),
+    ({"stop_loss": 0.05, "take_profit": 0.1, "take_profit_r": 2.0}, "not both"),
+    ({"stop_swing_bars": 1}, "whole number of bars"),
+    ({"stop_loss": 0.004, "take_profit_r": 2.0}, "round trip"),  # an 0.8% target can't cover the costs
+])
+def test_bad_stop_and_target_combinations_are_refused(prices, instrument, bad, why):
+    with pytest.raises(ValueError, match=why):
+        run_backtest("buy_and_hold", prices.iloc[:20], instrument, bad)
