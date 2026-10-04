@@ -1,0 +1,54 @@
+name: record-session
+# Records live paper sessions on Kraken's public feed for the replay test (tests/test_replay.py).
+# Paper only; no secrets are configured or used. On a pull request from this repository the
+# recordings are committed to the PR branch under tests/data/replay, then replayed; they are also
+# uploaded as an artifact.
+on:
+  pull_request:
+    paths:
+      - "scripts/record_session.sh"
+      - ".github/workflows/record-session.yml"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to record"
+        default: "45"
+permissions:
+  contents: write  # to commit the recordings to the PR branch
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: scripts/record_session.sh "${{ github.event.inputs.minutes || '45' }}" recordings
+      - name: Paper logs
+        if: always()
+        run: tail -n 40 recordings/*.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: replay-recordings
+          path: recordings/
+          retention-days: 14
+      - name: Commit the recordings to the PR branch
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          mkdir -p tests/data/replay
+          cp recordings/*.jsonl.gz recordings/*.orders.json tests/data/replay/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/data/replay
+          git commit -m "Add live paper recordings for the replay test"
+          git push
+      - name: Replay them through the backtest engine
+        run: |
+          mkdir -p tests/data/replay
+          cp -n recordings/*.jsonl.gz recordings/*.orders.json tests/data/replay/ || true
+          python -m pytest -q tests/test_replay.py

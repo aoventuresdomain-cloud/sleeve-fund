@@ -89,7 +89,7 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
 
 
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
-               asset_fetch=None, history=None) -> LiveNode:
+               asset_fetch=None, recorder=None, history=None) -> LiveNode:
     assert_keyless()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
@@ -124,6 +124,16 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         .build()
     )
     strategy_cls, config_cls = REGISTRY[sleeve.strategy]
+    if recorder is not None:  # what a replay needs to rebuild this run exactly (sleeve_fund.research.replay)
+        recorder.meta = {
+            "balances": [str(b) for b in balances],
+            "sleeve": {"name": sleeve.name, "strategy": sleeve.strategy, "instrument": sleeve.instrument,
+                       "bar_spec": sleeve.bar_spec, "starting_balance": sleeve.starting_balance,
+                       "risk_profile": sleeve.risk_profile, "params": sleeve.params,
+                       "max_notional": sleeve.max_notional, "maker_fee": str(sleeve.fees.maker),
+                       "taker_fee": str(sleeve.fees.taker),
+                       "tick_seconds": runtime.tick_seconds if runtime is not None else None},
+        }
     node.add_strategy(
         strategy_cls(
             config_cls(
@@ -135,7 +145,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
                 **sleeve.params,
             )
-        ).attach_runtime(runtime).attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
+        ).attach_runtime(runtime).attach_recorder(recorder)
+        .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
     )
     return node
 
@@ -147,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--db-sleeve", help="run the named sleeve from the database (journal, controls, risk guard)")
     ap.add_argument("--minutes", type=float, default=0, help="stop after N minutes (0 = run until Ctrl+C)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ap.add_argument("--record", type=Path, help="save every quote and trade received to this .jsonl.gz, for replay")
     args = ap.parse_args(argv)
 
     runtime = None
@@ -163,13 +175,24 @@ def main(argv: list[str] | None = None) -> int:
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}")
     else:
         sleeve = load_sleeve(args.sleeve)
-    node = build_node(sleeve, log_level=args.log_level, runtime=runtime)
+    recorder = None
+    if args.record:
+        if runtime is None:
+            ap.error("--record needs --db-sleeve: only a sleeve with its runtime receives quotes and trades")
+        from sleeve_fund.paper.recorder import Recorder
+
+        recorder = Recorder(args.record)
+    node = build_node(sleeve, log_level=args.log_level, runtime=runtime, recorder=recorder)
     if args.minutes > 0:
         handle = node.handle()
         timer = threading.Timer(args.minutes * 60, handle.stop)
         timer.daemon = True
         timer.start()
-    node.run()
+    try:
+        node.run()
+    finally:
+        if recorder is not None:
+            recorder.close()
     return 0
 
 
