@@ -290,13 +290,13 @@ SPREAD = 12.0  # $12 wide around each BTC trade
 TICK_INST = K.instrument("BTC", "USD", price_precision=1)
 
 
-def _record(path, prices, params, profile="aggressive", size=1.0):
+def _record(path, prices, params, profile="aggressive", size=1.0, strategy="probe"):
     """A paper session with one trade a second, the quote following each trade."""
     from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
     rec = Recorder(path)
     rec.meta = {"balances": ["10000.00 USD"],
-                "sleeve": {"name": "sanity", "strategy": "probe", "instrument": "BTC/USD",
+                "sleeve": {"name": "sanity", "strategy": strategy, "instrument": "BTC/USD",
                            "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000,
                            "risk_profile": profile, "params": params, "max_notional": None,
                            "maker_fee": str(K.fees.maker), "taker_fee": str(K.fees.taker), "tick_seconds": 30}}
@@ -328,13 +328,13 @@ def _per_order(fills, intents):
     return rows
 
 
-def _paper_and_backtest(tmp_path, prices, params):
-    trades = _record(tmp_path / "s.jsonl.gz", prices, params)
+def _paper_and_backtest(tmp_path, prices, params, strategy="probe", profile="aggressive"):
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile=profile, strategy=strategy)
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
     paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders})
     bars = trades.resample("1min", closed="left", label="right").ohlc()
     bars["volume"] = 60 / BOOK_SHARE  # the same trades as liquidity on both paths
-    res = run_backtest("probe", bars, TICK_INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+    res = run_backtest(strategy, bars, TICK_INST, params=params, starting_capital=10_000, risk_profile=profile,
                        bar_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
     j = res.journal
     return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
@@ -376,3 +376,55 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
         # stop sits off its fill at the ask, the backtest's off the bar's trade price: half a spread apart).
         late = (b[2] - p[2]).total_seconds()
         assert late == 0 if p[1] in ("entry", "exit") else 0 <= late <= 60, (p, b)
+
+
+# --- the shipped test strategies as probes -----------------------------------------------------------
+
+# Prices that swing about 3% over an hour or so with small wiggles, drifting up so ping-pong's buy near a
+# top still sees its 1% rise: enough for ping-pong's 1% rise and 0.5% dip, and for RSI(14) on minute bars to reach its bands both ways.
+TEST_STRATEGIES = {
+    "ping_pong": ({"rise": 0.01, "dip": 0.005},
+                  lambda s: 60_000 * (1 + 0.015 * np.sin(s / 600) + 0.001 * np.sin(s / 17) + 2e-6 * s)),
+    "rsi_bands": ({},
+                  lambda s: 60_000 * (1 + 0.004 * np.sin(s / 240) + 0.0008 * np.sin(s / 29))),
+}
+
+
+@pytest.mark.parametrize("strategy", list(TEST_STRATEGIES))
+def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
+    """The two test strategies (the PM's probes) on the same trades: paper replayed tick by tick and
+    the backtest on minute bars send the same orders in the same minute, at the same size and all-in
+    price to within 0.3 bp, and pay the same fees."""
+    params, path = TEST_STRATEGIES[strategy]
+    prices = path(np.arange(240 * 60))
+    paper, bt = _paper_and_backtest(tmp_path, prices, params, strategy=strategy, profile="balanced")
+    assert len(paper) >= 6, paper
+    assert [r[:3] for r in paper] == [r[:3] for r in bt]
+    for p, b in zip(paper, bt):
+        assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
+        assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
+    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
+    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    for side, intent, _, qty, px, fee in paper:  # paper's fee is the venue's taker fee alone
+        assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * TAKER, abs=CENT)
+
+
+@pytest.mark.parametrize("strategy", list(TEST_STRATEGIES))
+def test_test_strategies_book_every_fee_and_end_flat_after_each_exit(strategy):
+    params, path = TEST_STRATEGIES[strategy]
+    s = np.arange(0, 600 * 60, 60)
+    c = path(s)
+    o = np.r_[c[0], c[:-1]]
+    idx = pd.date_range("2025-01-01", periods=len(c), freq="1min", tz="UTC") + pd.Timedelta(minutes=1)
+    prices = pd.DataFrame({"open": o, "high": np.maximum(o, c) * 1.0002, "low": np.minimum(o, c) * 0.9998,
+                           "close": c, "volume": 1e9 / 60_000}, index=idx)
+    j = run_backtest(strategy, prices, TICK_INST, params, starting_capital=10_000, risk_profile="balanced",
+                     bar_minutes=1, half_spread=HALF).journal
+    assert len(j.fills_) >= 6
+    _assert_every_fee(j)
+    held = 0.0
+    for i, f in enumerate(j.fills_):
+        held += f["qty"] if f["side"] == "BUY" else -f["qty"]
+        after = j.fills_[i + 1] if i + 1 < len(j.fills_) else None
+        if f["side"] == "SELL" and (after is None or after["side"] == "BUY"):
+            assert abs(held) < float(TICK_INST.size_increment) / 2, (f, held)
