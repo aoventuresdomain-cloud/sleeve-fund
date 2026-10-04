@@ -143,6 +143,7 @@ main > .panel { margin-bottom: 16px; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
 th { color: var(--faint); font-weight: 500; font-size: 11.5px; background: none; padding-top: 10px; padding-bottom: 8px; }
+table.tight th, table.tight td { padding-left: 7px; padding-right: 7px; }
 th:first-child, td:first-child { padding-left: 18px; } th:last-child, td:last-child { padding-right: 18px; }
 tr:last-child td, tr:last-child th { border-bottom: 0; }
 tbody tr { transition: background-color .12s; }
@@ -356,6 +357,8 @@ nav.tabs .n { display: inline-block; min-width: 18px; padding: 0 5px; margin-lef
 /* Tables name the columns to drop on narrower desks (data-hide-lg ≤1280px, data-hide-md ≤1100px), so the
    key figures stay in view without a sideways scroll. Phones use the card layout instead. */
 @media (min-width: 901px) and (max-width: 1440px) {
+  table[data-hide-xl~="3"] tr > :nth-child(3),
+  table[data-hide-xl~="4"] tr > :nth-child(4),
   table[data-hide-xl~="9"] tr > :nth-child(9) { display: none; }
 }
 @media (min-width: 901px) and (max-width: 1100px) {
@@ -508,3 +511,8 @@ nav.tabs a[aria-current] { border-bottom-color: var(--accent); }
 .chart-legend b { font-weight: 550; color: var(--text); margin-left: 4px; }
 .chart-legend i { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: 3px; margin-right: 6px; background: var(--accent); }
 .chart-legend i.bench { background: none; border-top: 2px dotted var(--muted); height: 0; }
+
+/* A backtest running in the background. */
+.progress { height: 6px; border-radius: 3px; background: var(--neutral-bg); overflow: hidden; margin: 4px 0 10px; }
+.progress > div { height: 100%; background: var(--accent); transition: width .4s ease; }
+.bt-links { font-size: 12.5px; color: var(--muted); }

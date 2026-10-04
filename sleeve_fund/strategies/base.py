@@ -9,6 +9,7 @@ or simply in or out (want_long).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -16,8 +17,8 @@ from typing import Any
 from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
-from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, Price, PriceType, Quantity,
-                                   TimeInForce)
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, OrderSide, OrderStatus, Price, PriceType,
+                                   Quantity, TimeInForce)
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
@@ -160,6 +161,8 @@ class LongFlatStrategy(Strategy):
         self._entry_qty = 0.0
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # backtest: a sell waiting for the resting stop's cancel to confirm
+        self._last_order = None  # client order id of the last order sent, until the venue has it
+        self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -212,7 +215,12 @@ class LongFlatStrategy(Strategy):
             if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
                 self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
             if self.runtime.backtest:
-                return  # a backtest marks and guards once a bar, from on_bar
+                # A backtest marks and guards from its bars: every execution bar when it is fed shorter
+                # bars than it decides on (paper does every 30 s), otherwise every decision bar.
+                if self._cfg.bar_type.is_composite():
+                    self._exec_type = self._cfg.bar_type.composite()
+                    self.subscribe_bars(self._exec_type)
+                return
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
             # Quotes put the venue's bid and ask in the simulated book (each trade updates it too), so
@@ -245,6 +253,13 @@ class LongFlatStrategy(Strategy):
         self._bid, self._ask = bid, ask
         if self.runtime is not None:
             self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+
+    def _on_exec_bar(self, bar: Bar) -> None:
+        """Backtest: value the book and run the risk guard on every execution bar, so a halt or a
+        daily-loss pause fires within the decision bar, as paper's 30-second ticks would."""
+        self._last_close = bar.close.as_double()
+        if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
+            self._on_tick()
 
     def _maybe_tick(self) -> None:
         if self.runtime is None:
@@ -280,14 +295,23 @@ class LongFlatStrategy(Strategy):
             bars, why = [], str(exc)
         else:
             why = "the history store has none"
+        level = "info" if bars else "warning"
         if bars:
             self.on_historical_bars(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from the history store"
+            # Bars between the last one loaded and the first live one are a hole the indicators skip.
+            step = bar_minutes(self._cfg.bar_type) * 60_000_000_000
+            missing = int((time.time_ns() - bars[-1].ts_event) // step)
+            if missing > 0:
+                level = "warning"
+                msg += (f"; the latest closed {missing * bar_minutes(self._cfg.bar_type)} minutes before now, so "
+                        f"{missing} bar{'s' if missing != 1 else ''} before the first live bar "
+                        f"{'are' if missing != 1 else 'is'} missing")
         else:
             msg = f"No warm-up bars loaded ({why}); the model waits for {want} live bars"
         self.log.info(msg)
         if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "info" if bars else "warning", "warmup", msg)
+            self.runtime.store.event(self.runtime.name, level, "warmup", msg)
 
     def want_long(self, bar: Bar) -> bool | None:
         """True = be long, False = be flat, None = not enough data yet (do nothing)."""
@@ -313,6 +337,9 @@ class LongFlatStrategy(Strategy):
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
     def on_bar(self, bar: Bar) -> None:
+        if self._exec_type is not None and bar.bar_type == self._exec_type:
+            self._on_exec_bar(bar)
+            return
         if not self._accept(bar):
             return
         self.log.info(f"bar {bar}")
@@ -329,7 +356,7 @@ class LongFlatStrategy(Strategy):
         w = min(max(float(raw), 0.0), 1.0, self._cap_pct())
         if w == 0:
             self._exit_lock = False
-        if self.cache.orders_inflight(strategy_id=self.strategy_id) or self._maker_working():
+        if self._busy() or self._maker_working():
             return  # the last decision is still being carried out
         is_long = self._is_long()
         close = bar.close.as_double()
@@ -398,7 +425,7 @@ class LongFlatStrategy(Strategy):
         cfg = self._cfg
         if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
             return False
-        if self.cache.orders_inflight(strategy_id=self.strategy_id):
+        if self._busy():
             return False
         move = price / self._entry_px - 1
         if self._backtest:
@@ -490,6 +517,7 @@ class LongFlatStrategy(Strategy):
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
+        self._last_order = order.client_order_id
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self.runtime is not None:
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
@@ -570,6 +598,21 @@ class LongFlatStrategy(Strategy):
                 total += (b.free if free else b).as_decimal()
         return total
 
+    def _unsent(self, side=None):
+        """The last order, if it is still on its way to the venue (INITIALIZED): a backtest's market order
+        sent from inside a bar or tick fills only after that handler returns, so until then neither
+        the account nor orders_inflight shows it. A risk halt's flatten and the bar's own exit used
+        to both sell the whole position that way."""
+        if self._last_order is None:
+            return None
+        order = self.cache.order(self._last_order)
+        if order is None or order.status != OrderStatus.INITIALIZED or (side is not None and order.side != side):
+            return None
+        return order
+
+    def _busy(self) -> bool:
+        return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or self._unsent() is not None
+
     def _is_long(self) -> bool:
         return self._position_qty() >= self._min_qty()
 
@@ -580,6 +623,8 @@ class LongFlatStrategy(Strategy):
             self._pending_exit = (intent, reason, values)
             self.cancel_all_orders(self._cfg.instrument_id)
             return
+        if self._unsent(OrderSide.SELL) is not None:
+            return  # already selling everything; the account just doesn't show it yet
         step = self.instrument.size_increment.as_decimal()
         qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():

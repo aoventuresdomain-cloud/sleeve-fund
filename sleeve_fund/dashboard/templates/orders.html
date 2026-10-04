@@ -8,16 +8,17 @@
     <form class="inline" method="get" action="/orders">
       <input type="hidden" name="status" value="{{ tab }}">
       <label class="sr-only" for="o-sleeve">Strategy</label>
-      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% if backtest %}<option value="{{ sleeve }}" selected>Backtest {{ backtest.run_id }}</option>{% endif %}{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
       <noscript><button>Show</button></noscript>
     </form>
-    <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve if sleeve }}">Download CSV</a>
+    <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
   </div>
   <p class="lede">Every order the strategies have sent, newest first, with what it was for and the reason recorded when it was sent.</p>
 </div>
+{% if backtest %}<div class="banner" role="status">Showing a saved backtest: the paper runtime replayed over history. <a href="/backtest/{{ backtest.run_id }}">Back to the result</a></div>{% endif %}
 
 <nav class="tabs" aria-label="Order status" data-live="order-tabs">
-  {% for k, label, n in tabs %}<a href="?status={{ k }}{{ '&sleeve=' ~ sleeve if sleeve }}" {{ 'aria-current=page' if tab == k }}>{{ label }} <span class="n">{{ n }}</span></a>{% endfor %}
+  {% for k, label, n in tabs %}<a href="?status={{ k }}{{ '&sleeve=' ~ sleeve|urlencode if sleeve }}" {{ 'aria-current=page' if tab == k }}>{{ label }} <span class="n">{{ n }}</span></a>{% endfor %}
 </nav>
 
 <section class="panel flush" data-live="orders">

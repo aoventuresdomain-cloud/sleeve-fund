@@ -57,11 +57,13 @@ def _secs(ts) -> int:
 
 
 def payload(df: pd.DataFrame, minutes: int, fills: list[dict], orders: dict[str, dict], lines: list[dict],
-            source: str, shift_bars: int = 0) -> dict:
+            source: str, shift_bars: int = 0, limit: int | None = 720) -> dict:
     """Everything the chart draws. fills are oldest first. shift_bars moves a marker filled exactly at a
     bar's close back that many bars, since that fill belongs to the candle that just ended; a fill inside
-    a bar (a maker order or a stop matched minute by minute) stays on the candle it happened in."""
-    df = df.iloc[-720:]
+    a bar (a maker order or a stop matched minute by minute) stays on the candle it happened in. limit:
+    the most recent candles kept (a live screen); None keeps them all (a backtest's whole period)."""
+    if limit is not None:
+        df = df.iloc[-limit:]
     out_candles = [{"time": _secs(t), "open": r.open, "high": r.high, "low": r.low, "close": r.close}
                    for t, r in df.iterrows()]
     volume = [{"time": _secs(t), "value": float(r.volume)} for t, r in df.iterrows()] if "volume" in df else []

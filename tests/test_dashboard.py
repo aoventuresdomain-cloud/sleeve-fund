@@ -695,6 +695,31 @@ def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, mon
     assert "0 of 1 as maker" in page and "assumed to miss and is charged the taker fee" in page
 
 
+def test_backtest_guard_checks_stored_minutes_and_says_how_often(client, monkeypatch, tmp_path):
+    """R3-M1: with stored minutes the backtest's risk guard values the book every minute, as paper's
+    30-second ticks do, so a daily-loss pause fires near its limit rather than at the day's close."""
+    import numpy as np
+
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+
+    c, _ = client
+    m = _wavy_minutes(70)
+    crash = np.ones(len(m))
+    crash[60 * 1440:61 * 1440] = np.linspace(1.0, 0.6, 1440)  # day 61 falls 40% minute by minute
+    crash[61 * 1440:] = 0.6
+    for col in ("open", "high", "low", "close"):
+        m[col] = m[col] * crash
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", m, cursor="x")
+    preview._history.clear()
+    d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive", detail=True)
+    assert d["risk"]["checked_minutes"] == 1 and d["risk"]["pauses"] >= 1
+    assert "checked the book every minute." in d["risk"]["note"]
+    sell = next(f for f in d["fills"] if f["side"] == "SELL")
+    assert sell["price"] > 0.8 * 2_000  # out near an 8% loss on a 50% position, not after the whole 40% fall
+
+
 def test_backtest_page_says_when_the_risk_guard_halted(client, monkeypatch):
     from sleeve_fund.dashboard import preview
     from sleeve_fund.data import synthetic_ohlcv
@@ -747,7 +772,7 @@ def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, 
     d = preview.run("trend_filter", "ETH/USD", {"fast": 5, "slow": 20}, minutes=1, detail=True)
     assert d["minutes"] == 1 and d["bars"] > 20 * 1400 and d["trades"]["trades"] > 0
     assert len(d["t"]) <= 21  # equity judged day by day, so Sharpe is annualised as daily
-    assert d["chart_minutes"] == 60 and len(d["price"]["candles"]) <= 720
+    assert d["chart_minutes"] == 15 and len(d["price"]["candles"]) <= preview.CHART_CANDLES  # 20 days fit at 15 min
 
     form = c.get("/sleeves/new?from=backtest&bar_spec=1-HOUR-LAST-INTERNAL&tested_bar_spec=1-HOUR-LAST-INTERNAL",
                  auth=AUTH).text
@@ -769,7 +794,35 @@ def test_minute_backtests_need_the_history_store(client, monkeypatch, tmp_path):
     preview._history.clear()
     page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
                  auth=AUTH).text
-    assert "finished loading here yet, so only daily bars can be backtested" in page
+    assert "has no stored minute history here, so it can only be backtested on daily bars" in page
+    assert "Instruments with stored minutes: none yet" in page
+
+
+def test_intervals_say_what_is_stored_and_how_far_back_they_go(client, monkeypatch, tmp_path):
+    """R3-M2 and R3-M3: the Look-back tests the form's own interval (or says it fell back to daily),
+    the backtest form lists the instruments with stored minutes, and a capped run says it was capped."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(70), cursor="x")
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=3))
+    preview._history.clear()
+    form = c.get("/backtest", auth=AUTH).text
+    assert "Shorter than a day needs stored minute history: ETH/USD (since" in form
+    assert "At most the last year at 1 minute, 3 years at 5 minutes." in form
+
+    q = {"instrument": "ETH/USD", "strategy": "buy_and_hold", "bar_spec": "1-HOUR-LAST-INTERNAL"}
+    d = c.get("/api/preview", params=q, auth=AUTH).json()
+    assert d["minutes"] == 60 and d["every"] == "hour" and d["fallback"] == ""
+    d = c.get("/api/preview", params={**q, "instrument": "SOL/USD"}, auth=AUTH).json()
+    assert d["minutes"] == 1440 and "looked back on daily decisions" in d["fallback"]
+
+    page = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&bar_spec=1-MINUTE-LAST-INTERNAL",
+                 auth=AUTH).text
+    assert "covers at most the last 1 year, so this one didn&#39;t run all the history" in page
 
 
 def test_trade_built_intervals_get_a_warm_up_from_the_store():
@@ -797,3 +850,45 @@ def test_backtest_says_when_its_history_has_long_quiet_stretches(client, monkeyp
                  auth=AUTH).text
     assert "1 stretch of an hour or more with no trades" in page and "3 hours" in page
     assert "ETH/USD 1-hour candles" in page
+
+
+def test_backtest_price_chart_marks_every_trade_over_years(monkeypatch):
+    """R3-M4: the chart used to stop at the last 720 candles, dropping older trades off it."""
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=1800, seed=3, vol=0.03))
+    d = preview.run("trend_filter", "ETH/USD", {"fast": 5, "slow": 20}, detail=True, risk_profile="aggressive")
+    assert d["chart_label"] == "daily candles" and len(d["price"]["candles"]) == d["bars"] > 720
+    assert len(d["price"]["markers"]) == len(d["fills"]) > 0
+    first = d["price"]["candles"][0]["time"]
+    assert all(m["time"] >= first for m in d["price"]["markers"])
+
+
+def test_settings_states_fees_as_they_are_charged(client):
+    """R3-M5: maker-first orders pay the maker rate, the spread is charged apart, and the published
+    rates say which tier and when they were read."""
+    c, _ = client
+    page = c.get("/settings", auth=AUTH).text
+    assert "Every order is charged the taker fee" not in page
+    assert "a maker-first order pays the maker rate" in page and "half the bid-ask spread" in page
+    assert "0.100% assumed" in page and "Tier 1, from the account&#39;s fee page, 3 Oct 2026" in page
+
+
+def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
+    """R3-M7: a strategy started from scratch used to default to no warm-up. Blank now means enough
+    for the model's longest look-back; past the most that loads, the strategy says so."""
+    c, store = client
+    assert _new(c, name="auto-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="20").status_code == 303
+    assert store.sleeve("auto-warm").warmup_bars == 20  # the slow average's length
+    assert not [e for e in store.events("auto-warm") if e["kind"] == "warmup_short"]
+    _new(c, name="short-warm", warmup_bars="10", p_trend_filter__fast="5", p_trend_filter__slow="20")
+    assert store.sleeve("short-warm").warmup_bars == 10
+    (e,) = [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
+    assert e["level"] == "info" and "needs 20 bars of history but 10 load at start" in e["message"]
+    # Past the most the history store loads, the shortfall is an alert.
+    _new(c, name="long-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="60000")
+    assert store.sleeve("long-warm").warmup_bars == 50_000
+    (e,) = [e for e in store.events("long-warm") if e["kind"] == "warmup_short"]
+    assert e["level"] == "warning" and "needs 60,000 bars" in e["message"]
