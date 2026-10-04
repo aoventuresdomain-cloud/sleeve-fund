@@ -487,6 +487,14 @@ window.Console = (() => {
       badge.textContent = config.length; badge.hidden = !config.length;
       if (data) fill();
     };
+    // Drawn while its tab was hidden, the chart fitted the candles to a zero-width box and kept that bar
+    // spacing once shown, crammed into the left edge. Fit again when it first gets a real width.
+    let wasHidden = $(".pc-canvas").clientWidth < 50;
+    new ResizeObserver(([e]) => {
+      const hidden = e.contentRect.width < 50;
+      if (wasHidden && !hidden && data) chart.timeScale().fitContent();
+      wasHidden = hidden;
+    }).observe($(".pc-canvas"));
     chart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
       if (!r || syncing) return;
       syncing = true; strips().forEach((b) => b.chart.timeScale().setVisibleLogicalRange(r)); syncing = false;

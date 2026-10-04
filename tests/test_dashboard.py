@@ -1545,6 +1545,39 @@ def test_a_run_whose_strategy_raised_is_flagged_and_not_offered_for_paper(client
     assert "raised an error" not in c.get("/sleeves/btc-test", auth=AUTH).text
 
 
+def test_round_10_ui_minors(client):
+    """Round 10: a halted run says so in Saved runs (m7); a lost job says so (m9); a stopped strategy whose
+    process hasn't stopped yet reads Stopping, and a waiting flatten can't be queued twice (m5)."""
+    from sleeve_fund.paper.journal import MemoryJournal
+
+    c, store = client
+    j = MemoryJournal()
+    j.create_sleeve(name="bt", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                    starting_balance=10_000)
+    name = store.save_backtest(j, run_id="h1", key="k", title="Halted run", query="", result={"pair": "BTC/USD"})
+    store.set_status(name, "halted", "drawdown 21% past the 20% limit")
+    assert {r["id"]: r for r in store.backtests()}["h1"]["halted"]
+    assert '<span class="chip halted">Halted</span>' in c.get("/backtest", auth=AUTH).text
+    for url in ("/backtest?job=gone", "/research?job=gone"):
+        assert "that run is no longer known" in c.get(url, auth=AUTH).text
+    assert "no longer known" not in c.get("/backtest", auth=AUTH).text
+
+    _new(c)
+    store.set_status("btc-test", "running")
+    store.set_desired_state("btc-test", "stopped")
+    head = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert '<span class="chip stopping">Stopping</span>' in head
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    rt = SleeveRuntime(store, "btc-test")  # a stopped strategy still holding: Flatten is offered once
+    rt.on_order(order_id="E-1", side="BUY", qty=0.01, intent="entry", reason="Signal to be long", signal={})
+    rt.on_fill(side="BUY", qty=0.01, price=50_000.0, fee=4.0, order_id="E-1", trade_id="T-1")
+    assert 'data-open="dlg-flatten">Flatten' in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.command("btc-test", "flatten", "cash out")
+    head = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'data-open="dlg-flatten" disabled title="A flatten is already waiting' in head
+
+
 STOP_KINDS = {"pct": {"stop_loss": 0.03, "take_profit": 0.06},
               "atr": {"stop_atr": 2.0, "atr_bars": 14, "take_profit_r": 2.0},
               "swing": {"stop_swing_bars": 10, "take_profit_r": 1.5}}
