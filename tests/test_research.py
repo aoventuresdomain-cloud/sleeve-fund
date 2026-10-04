@@ -319,3 +319,16 @@ def test_a_sheet_whose_test_windows_all_traded_has_no_gap_note():
     words = oos_gaps(SimpleNamespace(folds=[fold, quiet], risk_profile=None))
     assert "No trades out-of-sample in 1 of 2" in words and "signal never closed a trade" in words
     assert "halted" not in words
+
+
+def test_a_study_on_history_still_being_collected_says_where_it_ends(tmp_path):
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+
+    hist = HistoryStore(tmp_path / "hist")
+    m = _stored_minutes(130)
+    hist.append("KRAKEN", "ETH/USD", m.set_axis(m.index - pd.Timedelta(days=10)), cursor="x")
+    req = StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=240, train_days=60, test_days=30,
+                       holdout_days=0)
+    sheet = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts", history=hist).read_text()
+    assert "The stored history ends" in sheet and "the collector is still catching up" in sheet

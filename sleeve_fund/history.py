@@ -222,16 +222,19 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
-def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000, sleep=None, log=print) -> dict:
+def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000, sleep=None, log=print,
+            since: pd.Timestamp | None = None) -> dict:
     """Bring one instrument's stored history up to date from its venue, resuming from the cursor.
-    The venue profile's minute_loader returns (1-minute bars, next cursor, caught_up)."""
+    The venue profile's minute_loader returns (1-minute bars, next cursor, caught_up). since: where a
+    first backfill starts, when the venue can start mid-history (else at the instrument's listing)."""
     import time
 
     if profile.minute_loader is None:
         raise ValueError(f"{profile.label} has no history loader")
     pages = 0
     cov = store.coverage(profile.name, pair)
-    cursor = cov.cursor if cov else ""
+    cursor = cov.cursor if cov else (
+        profile.minute_cursor_at(pd.Timestamp(since)) if since is not None and profile.minute_cursor_at else "")
     while pages < max_pages:
         bars, cursor_next, caught_up = profile.minute_loader(pair, cursor)
         pages += 1
@@ -250,19 +253,29 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
 CORE_PAIRS = ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD")
 
 
-def _pairs_in_use(venue: str) -> list[str]:
-    pairs = list(CORE_PAIRS)
+# Where the backfill starts for an instrument the PM asks Research for: enough for the default study
+# (holdout, training and test windows) without fetching every trade since the instrument listed.
+REQUEST_YEARS = 5
+
+
+def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None]]:
+    """(instrument, where a first backfill starts) for the core list, every strategy's instrument and
+    every instrument the PM asked Research for."""
+    pairs: dict[str, pd.Timestamp | None] = {p: None for p in CORE_PAIRS}
     try:
         from sleeve_fund.paper.config import from_store
         from sleeve_fund.store import Store
 
-        for s in Store().sleeves():
+        store = store or Store()
+        for s in store.sleeves():
             cfg = from_store(s)
-            if cfg.venue == venue and cfg.instrument not in pairs:
-                pairs.append(cfg.instrument)
+            if cfg.venue == venue:
+                pairs.setdefault(cfg.instrument, None)
+        for r in store.history_requests(venue):
+            pairs.setdefault(r["instrument"], pd.Timestamp(r["since"]))
     except Exception as exc:  # noqa: BLE001 - no database (e.g. locally): the core list still loads
-        print(f"could not read sleeves: {exc!r}")
-    return pairs
+        print(f"could not read sleeves or history requests: {exc!r}")
+    return list(pairs.items())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -293,14 +306,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(store.report(v, pair))
         return 0
     if args.cmd == "refresh":
-        for pair in args.pairs or _pairs_in_use(profile.name):
-            print(refresh(store, profile, pair))
+        for pair, since in [(p, None) for p in args.pairs] or _pairs_in_use(profile.name):
+            print(refresh(store, profile, pair, since=since))
         return 0
     while True:  # run: round-robin so a long backfill on one instrument doesn't starve the others
         behind = False
-        for pair in _pairs_in_use(profile.name):
+        for pair, since in _pairs_in_use(profile.name):
             try:
-                out = refresh(store, profile, pair, max_pages=args.pages)
+                out = refresh(store, profile, pair, max_pages=args.pages, since=since)
                 behind |= out["pages"] >= args.pages
             except Exception as exc:  # noqa: BLE001 - one bad pair or a venue hiccup must not stop the rest
                 print(f"{profile.name} {pair}: refresh failed: {exc!r}")

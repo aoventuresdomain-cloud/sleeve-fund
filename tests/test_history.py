@@ -141,3 +141,34 @@ def test_long_stretches_without_trades_are_reported_not_hidden(tmp_path):
     hours = store.read("X", "ABC/USD", 60)
     assert quiet_runs(hours, 60)["longest_minutes"] == 180
     assert quiet_runs(hours, 60, at_least=240)["count"] == 0
+
+
+def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path):
+    """Review round 8, R8-M6: an instrument asked for on the Research page is collected like a
+    strategy's, starting where the request says rather than at the instrument's listing."""
+    from dataclasses import replace
+
+    from sleeve_fund.history import CORE_PAIRS, _pairs_in_use, refresh
+    from sleeve_fund.store import Store
+    from sleeve_fund.venues import KRAKEN
+
+    store = Store(f"sqlite:///{tmp_path / 'j.db'}")
+    since = pd.Timestamp("2021-10-04", tz="UTC")
+    assert store.request_history("KRAKEN", "ADA/EUR", since.to_pydatetime())
+    assert not store.request_history("kraken", "ADA/EUR", since.to_pydatetime())  # asked once
+    pairs = dict(_pairs_in_use("KRAKEN", store))
+    assert all(pairs[p] is None for p in CORE_PAIRS) and pairs["ADA/EUR"] == since
+    assert "ADA/EUR" not in dict(_pairs_in_use("OTHER", store))
+
+    asked = []
+
+    def loader(pair, cursor):
+        asked.append(cursor)
+        idx = pd.date_range(since, periods=3, freq="1min", tz="UTC")
+        return pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=idx), "c2", True
+
+    hist = HistoryStore(tmp_path / "h")
+    refresh(hist, replace(KRAKEN, minute_loader=loader), "ADA/EUR", since=since)
+    assert asked == [str(int(since.timestamp()))]  # Kraken's `since` in seconds
+    refresh(hist, replace(KRAKEN, minute_loader=loader), "ADA/EUR", since=since)
+    assert asked[-1] == "c2"  # then it resumes from its own cursor
