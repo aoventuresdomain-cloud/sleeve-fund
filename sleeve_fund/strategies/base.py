@@ -89,6 +89,12 @@ def r_target(r: float, stop: float, leg: float) -> float:
     return (r * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg)
 
 
+def _from_entry(stop: float) -> str:
+    """A stop's distance in words: "2.0% below the entry", or above it for a stop set from the market on
+    a position already in profit."""
+    return f"{stop:.1%} below the entry" if stop >= 0 else f"{-stop:.1%} above the entry"
+
+
 def exit_warmup(params: dict) -> int:
     """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop."""
     if params.get("stop_atr"):
@@ -203,7 +209,7 @@ class LongFlatConfig(StrategyConfig):
         # Optional sizing: lose at most this fraction of equity if the stop is hit.
         self.risk_per_trade = risk_per_trade
         # Or a stop set from the market at each entry: this many average true ranges (over atr_bars
-        # bars) below the close, or just under the lowest low of the last stop_swing_bars bars.
+        # bars) below the close, or at the lowest low of the last stop_swing_bars bars.
         self.stop_atr = stop_atr
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)
@@ -227,13 +233,18 @@ class LongFlatConfig(StrategyConfig):
         self.maker_wait_minutes = maker_wait_minutes
 
 
-# Handlers whose exceptions the engine would swallow without a trace (on_bar and timers it logs).
+# Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar
+# that decides, the risk check's tick and the maker order's timer (review round 8, M8-3).
 REPORTED_HANDLERS = ("on_trade", "on_quote", "on_order_accepted", "on_order_rejected", "on_order_denied",
-                     "on_order_canceled", "on_order_expired", "on_order_filled")
+                     "on_order_canceled", "on_order_expired", "on_order_filled", "on_bar", "_on_tick",
+                     "_maker_timeout")
 _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_accepted": "an order accepted",
                   "on_order_rejected": "an order rejected", "on_order_denied": "an order denied",
                   "on_order_canceled": "an order cancelled", "on_order_expired": "an order expired",
-                  "on_order_filled": "an order filled"}
+                  "on_order_filled": "an order filled", "on_bar": "a bar", "_on_tick": "the risk check",
+                  "_maker_timeout": "a post-only order's wait running out",
+                  "_settle_maker": "a post-only order's fees"}
+MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -269,6 +280,10 @@ class LongFlatStrategy(Strategy):
         self._stop_frac: float | None = None
         self._tp_frac: float | None = None
         self._stop_basis = ""  # how the stop was set, in words, for the journal
+        # After a restart: a new ATR or swing-low stop to set from the market on the next bar, with the old
+        # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
+        self._replan_pending: tuple[str, int] | None = None
+        self._plan_entry: dict | None = None  # the open position's entry order, after a restart
         self._atr = Atr(config.atr_bars) if config.stop_atr else None
         self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
@@ -286,7 +301,17 @@ class LongFlatStrategy(Strategy):
         # Paper: volume traded through each working post-only order's price, to measure its fills by.
         self._through: dict[str, float] = {}
         self._tape_last = None  # the latest trade counted into _through (time, trade id)
-        self._overfilled: set[str] = set()  # post-only orders already reported as filled past the tape
+        self._maker_filled: dict[str, float] = {}  # paper: of each post-only order, how much was charged as maker
+        self._capped: dict[str, float] = {}  # paper: of each post-only order, how much was charged as taker
+        # Paper: post-only orders filled before their wait ran out, still counting what trades through their
+        # price until it does (_settle_maker), and the fee model to credit what a backtest would have
+        # filled at the maker fee by then (set by the paper node with ScheduleFeeModel.maker_cap).
+        self._settling: dict[str, object] = {}
+        self._fill_half_spread: dict[str, float] = {}
+        self.fee_model = None
+        # Replay only: the trade the simulated venue is filling on. Live, the data engine caches each trade
+        # before the venue and this strategy hear it; a replay's venue hears it first (maker_allowance).
+        self.venue_trade = None
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -299,6 +324,8 @@ class LongFlatStrategy(Strategy):
         self.decisions: dict[str, dict] = {}
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
+        self.handler_error_count = 0
+        self._failed_handlers: set[str] = set()  # handlers already journaled as failed (see _report)
         for name in REPORTED_HANDLERS:
             setattr(self, name, self._reporting(name, getattr(self, name)))
 
@@ -311,17 +338,28 @@ class LongFlatStrategy(Strategy):
             try:
                 return handler(*args, **kwargs)
             except Exception as exc:
-                self.handler_errors.append((name, repr(exc)))
-                self.log.error(f"strategy handler {name} failed: {exc!r}\n{traceback.format_exc()}")
-                if self.runtime is not None:
-                    try:
-                        self.runtime.store.event(self.runtime.name, "error", "handler_failed",
-                                                 f"The strategy failed {handler_error_words(name, exc)}. Its "
-                                                 "orders after this may be wrong.", ts=self.runtime.now())
-                    except Exception:  # the journal itself failing must not hide the first error
-                        pass
+                self._report(name, exc)
         run.__name__ = name
         return run
+
+    def _report(self, name: str, exc: Exception) -> None:
+        """Keep a handler's exception: count it, keep the first MAX_KEPT_ERRORS in handler_errors, log it,
+        and journal it as an error event (paper) the first time each handler fails, so a handler failing
+        on every tick raises one alert, not one every 30 seconds."""
+        self.handler_error_count += 1
+        if len(self.handler_errors) < MAX_KEPT_ERRORS:
+            self.handler_errors.append((name, repr(exc)))
+        self.log.error(f"strategy handler {name} failed: {exc!r}\n{traceback.format_exc()}")
+        if self.runtime is not None and name not in self._failed_handlers:
+            self._failed_handlers.add(name)
+            try:
+                # The tick's failure is the risk check's: it lists with the breaches on the Risk page.
+                self.runtime.store.event(self.runtime.name, "error",
+                                         "tick_failed" if name == "_on_tick" else "handler_failed",
+                                         f"The strategy failed {handler_error_words(name, exc)}. Its "
+                                         "orders after this may be wrong.", ts=self.runtime.now())
+            except Exception:  # the journal itself failing must not hide the first error
+                pass
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
@@ -388,7 +426,7 @@ class LongFlatStrategy(Strategy):
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
-        if self._maker and not self._backtest:
+        if (self._maker or self._settling) and not self._backtest:
             self._tape(tick)
         self._check_exits(self._last_close)
         self._maybe_tick()
@@ -456,49 +494,137 @@ class LongFlatStrategy(Strategy):
             if len(self._lows) < c.stop_swing_bars or close <= 0:
                 return None
             low = min(self._lows)
-            stop, basis = 1 - low / close, f"under the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
+            stop, basis = 1 - low / close, f"at the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
         if stop is not None and (c.stop_atr or c.stop_swing_bars):
             clamped = min(max(stop, MIN_STOP), MAX_STOP)
             if clamped != stop:
                 basis += f", held to {clamped:.1%}"
             stop = clamped
-        tp = c.take_profit if c.take_profit else (
-            r_target(c.take_profit_r, stop, self._round_trip_cost()) if c.take_profit_r and stop else None)
-        return stop, tp, basis
+        return stop, self._target_for(stop), basis
+
+    def _target_for(self, stop: float | None) -> float | None:
+        """The target as a share of the entry price: the fixed % one, or r_target around this stop."""
+        c = self._cfg
+        if c.take_profit:
+            return c.take_profit
+        if c.take_profit_r and stop is not None and stop > 0:
+            return r_target(c.take_profit_r, stop, self._round_trip_cost())
+        return None
+
+    def _stop_cfg(self) -> dict:
+        """The stop settings, journaled with each entry, so a later edit can tell whether it changed the stop."""
+        c = self._cfg
+        if c.stop_atr:
+            return {"stop_atr": c.stop_atr, "atr_bars": c.atr_bars}
+        if c.stop_swing_bars:
+            return {"stop_swing_bars": c.stop_swing_bars}
+        return {"stop_loss": c.stop_loss} if c.stop_loss else {}
 
     def _restore_plan(self) -> None:
-        """After a restart with a position open: the stop and target its entry journaled. Fixed %
-        exits need no journal; an ATR or swing-low stop set at entry is read back, or, for an entry
-        journaled before stops were recorded, set again from the market on the next bar (_replan).
-        When the PM has changed the settings since the entry, the new ones are set the same way."""
-        c = self._cfg
-        if not self._has_exits:
-            return
-        entry = next((o for o in self.runtime.store.orders(self.runtime.name, limit=200)
+        """After a restart with a position open, the stop and target it works to: the plan its entry
+        journaled, or the latest one set since (Store.exit_plan). When the PM has changed the stop or
+        target since, the new settings apply to it (review round 8, B8-1):
+        - a target-only edit keeps the stop to the tick and sets the target again around it;
+        - a new % stop applies at once;
+        - a new ATR or swing-low stop is set from the market on the next bar with bars enough (_replan),
+          and the old stop keeps working until then.
+        An entry journaled before stops were recorded gets the fixed % plan, or an ATR or swing-low stop
+        set from the market once there are bars enough."""
+        c, store, name = self._cfg, self.runtime.store, self.runtime.name
+        entry = next((o for o in store.orders(name, limit=200)
                       if o.get("intent") == "entry" and o.get("side") == "BUY"), None)
-        sig = (entry or {}).get("signal") or {}
-        changed = self.runtime.store.last_event(self.runtime.name, ("exits_change",))
-        if entry and changed and changed["ts"] > entry["ts"]:
-            sig = {}  # the PM changed the stop or target since this entry: the new ones apply to it too
-        if "stop_frac" in sig or "tp_frac" in sig:
-            self._stop_frac, self._tp_frac = sig.get("stop_frac"), sig.get("tp_frac")
-            self._stop_basis = sig.get("stop_basis", "")
+        self._plan_entry, self._replan_pending = entry, None
+        if entry is None:
+            if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
+                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            return
+        sig = entry.get("signal") or {}
+        plan = store.exit_plan(name, entry["order_id"])
+        if plan is not None:
+            base = (plan["stop_frac"], plan["tp_frac"], plan["basis"] or "", plan["stop_cfg"])
+        elif "stop_frac" in sig or "tp_frac" in sig:
+            base = (sig.get("stop_frac"), sig.get("tp_frac"), sig.get("stop_basis", ""), sig.get("stop_cfg"))
+        else:
+            base = None
+        after = (plan or {}).get("event_id") or 0
+        edits = [e for e in store.sleeve_events_since(name, ("exits_change",), after) if e["ts"] > entry["ts"]]
+        if not edits:
+            if base is not None:
+                self._stop_frac, self._tp_frac, self._stop_basis = base[0], base[1], base[2]
+            elif c.stop_atr or c.stop_swing_bars:
+                last = store.last_event(name, ("exits_change",))
+                self._replan_pending = ("restart", last["id"] if last else 0)
+            elif self._has_exits:
+                self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            return
+        event_id = edits[-1]["id"]
+        old_stop, old_tp, old_basis, old_cfg = base or (None, None, "", None)
+        if old_cfg is not None:
+            same_stop = old_cfg == self._stop_cfg()
+        else:  # an entry journaled before its stop settings were: the change messages say what changed
+            same_stop = base is not None and not any("Stop-loss " in e["message"] for e in edits)
+        if same_stop:
+            self._set_plan(old_stop, self._target_for(old_stop), old_basis, "edit", event_id)
         elif not (c.stop_atr or c.stop_swing_bars):
-            self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+            stop = c.stop_loss
+            self._set_plan(stop, self._target_for(stop), _from_entry(stop) if stop else "", "edit", event_id)
+        else:
+            self._stop_frac, self._stop_basis = old_stop, old_basis
+            self._tp_frac = c.take_profit or old_tp
+            self._replan_pending = ("edit", event_id)
 
     def _replan(self, close: float) -> None:
+        """Set an ATR or swing-low stop from the market for a position already open: as a price level
+        (the close less so many ATRs, or the swing low itself), then as a share of the entry price, so
+        the stop sits where its words say. It only ever tightens the stop working until now."""
         plan = self._plan_exits(close)
         if plan is None:
-            self._note("stop_not_ready", "The open position has no stop yet: it is set from the last "
-                       f"{self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} bars, "
-                       "and there aren't that many since the restart")
+            self._note("stop_not_ready", ("The open position keeps its old stop until the new one can be set: "
+                                          if self._stop_frac is not None else "The open position has no stop yet: ")
+                       + f"it is set from the last {self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} "
+                       "bars, and there aren't that many since the restart")
             return
         self._noted.discard("stop_not_ready")
-        self._stop_frac, self._tp_frac, self._stop_basis = plan
-        if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "warning", "stop_reset",
-                                     f"Stop for the open position set again from the market after a restart: "
-                                     f"{self._stop_frac:.1%} below the entry ({self._stop_basis})", ts=self.runtime.now())
+        kind, event_id = self._replan_pending
+        self._replan_pending = None
+        distance, _, basis = plan
+        level = close * (1 - distance)
+        stop = 1 - level / self._entry_px
+        if self._stop_frac is not None and self._stop_frac < stop:
+            basis = (f"kept: the new setting ({basis}) would put it lower, at {level:,.6g}, and a stop set "
+                     f"from the market only ever tightens; {self._stop_basis or _from_entry(self._stop_frac)}")
+            stop = self._stop_frac
+        self._set_plan(stop, self._target_for(stop) if (stop > 0 or not self._cfg.take_profit_r) else self._tp_frac,
+                       basis, kind, event_id)
+
+    def _set_plan(self, stop: float | None, tp: float | None, basis: str, kind: str, event_id: int) -> None:
+        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so."""
+        self._stop_frac, self._tp_frac, self._stop_basis = stop, tp, basis
+        if self.runtime is None or self._plan_entry is None:
+            return
+        sig = self._plan_entry.get("signal") or {}
+        notional = self._entry_px * self._entry_qty
+        cost = self._round_trip_cost()
+        # A looser stop risks more than the entry did, and R is measured on the larger of the two, so
+        # widening a stop can't flatter the trade's R multiple (review round 8, M8-1).
+        risk = max(float(sig.get("risk_amount") or 0.0),
+                   notional * (stop + cost + (1 - stop) * cost) if stop is not None else 0.0) or None
+        planned = round((tp - cost - (1 + tp) * cost) * notional / risk, 2) if tp and risk else None
+        store, name, now = self.runtime.store, self.runtime.name, self.runtime.now()
+        store.set_exit_plan(name, self._plan_entry["order_id"], kind=kind, ts=now, event_id=event_id,
+                            stop_frac=None if stop is None else round(stop, 6), tp_frac=None if tp is None else round(tp, 6),
+                            basis=basis, stop_cfg=self._stop_cfg(), risk_amount=None if risk is None else round(risk, 2),
+                            planned_r=planned)
+        parts = [f"stop at {self._entry_px * (1 - stop):,.6g}, {_from_entry(stop)}" + (f" ({basis})" if basis and
+                 not basis.endswith("below the entry") else "") if stop is not None else "no stop",
+                 f"target at {self._entry_px * (1 + tp):,.6g}, {tp:.1%} above it" if tp else "no target"]
+        if kind == "edit":
+            store.event(name, "info", "exits_applied", "The open position now works to the new settings: "
+                        f"{'; '.join(parts)} (entry {self._entry_px:,.6g})"
+                        + (f"; 1R is now {risk:,.2f}" if risk else "") + ".", ts=now)
+        else:
+            store.event(name, "warning", "stop_reset", "Stop for the open position set again from the market after "
+                        f"a restart: {'; '.join(parts)} (entry {self._entry_px:,.6g}).", ts=now)
 
     def on_historical_bars(self, bars) -> None:
         for bar in sorted(bars, key=lambda b: b.ts_event):
@@ -567,7 +693,7 @@ class LongFlatStrategy(Strategy):
         self._maybe_tick()
         if self._pending_exit is not None:
             return
-        if self._entry_px is not None and self._has_exits and self._stop_frac is None and self._tp_frac is None:
+        if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
         if self._check_exits(self._last_close):
             return
@@ -694,14 +820,14 @@ class LongFlatStrategy(Strategy):
         Paper and live call this on every trade, so both levels are watched tick by tick. A
         backtest only sees whole bars, so both exits rest at the venue instead (_rest_exits)."""
         stop, tp = self._stop_frac, self._tp_frac
-        if self._entry_px is None or not (stop or tp) or price <= 0:
+        if self._entry_px is None or (stop is None and not tp) or price <= 0:
             return False
         if self._busy():
             return False
         if self._backtest:
             return False  # both exits rest at the venue (_rest_exits) and fill at their levels
         move = price / self._entry_px - 1
-        hit = ("stop_loss" if stop and move <= -stop else "take_profit" if tp and move >= tp else None)
+        hit = ("stop_loss" if stop is not None and move <= -stop else "take_profit" if tp and move >= tp else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
@@ -710,7 +836,8 @@ class LongFlatStrategy(Strategy):
                                      ts=self.runtime.now())
         level = stop if hit == "stop_loss" else tp
         reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
-                  f"the {self._entry_px:,.6g} entry, past the {level:.1%} {'stop' if hit == 'stop_loss' else 'target'}")
+                  f"the {self._entry_px:,.6g} entry, past the "
+                  + (f"stop {_from_entry(level)}" if hit == "stop_loss" else f"{level:.1%} target"))
         values = {"entry_px": self._entry_px, "move": move, hit: level}
         self._exit_lock = True
         self._entry_px = None  # don't fire again while the sell is in flight
@@ -774,6 +901,8 @@ class LongFlatStrategy(Strategy):
                 signal["planned_r"] = round((tp - cost - (1 + tp) * cost) / loss, 2)
         elif self._tp_frac:
             signal["tp_frac"] = round(self._tp_frac, 6)
+        if self._has_exits:
+            signal["stop_cfg"] = self._stop_cfg()
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
     def _loss_at_stop(self) -> float:
@@ -835,6 +964,10 @@ class LongFlatStrategy(Strategy):
         sends the rest at market (on_order_canceled), so nothing is sold or bought twice."""
         coid = event.name.removeprefix("maker-")
         order = self.cache.order(ClientOrderId(coid))
+        if coid in self._settling:  # filled before its wait ran out: settle its fees now
+            self._settle_maker(coid, order)
+            self._forget_tape(coid)
+            return
         if coid in self._maker and order is not None and not order.is_closed and self._pending_exit is None:
             self._fallback.add(coid)
             self.cancel_order(order.client_order_id)
@@ -889,7 +1022,7 @@ class LongFlatStrategy(Strategy):
             return
         self._tape_last = key
         px, size = tick.price.as_double(), tick.size.as_double()
-        for coid in self._maker:
+        for coid in (*self._maker, *self._settling):
             order = self.cache.order(ClientOrderId(coid))
             if order is None:
                 continue
@@ -897,30 +1030,73 @@ class LongFlatStrategy(Strategy):
             if (px < limit) if order.is_buy else (px > limit):
                 self._through[coid] = self._through.get(coid, 0.0) + size
 
-    def _check_maker_fill(self, coid: str, order) -> None:
-        """Paper's simulated venue fills a post-only order in full once the price trades through it,
-        however little traded; a backtest gives it at most BOOK_SHARE of the volume that trades
-        through. Say so, once per order, when a paper fill goes past what the backtest would allow, so
-        a maker strategy's paper results on a thin market aren't read as the backtest's."""
-        last = self.cache.trade(self._cfg.instrument_id)
+    def maker_allowance(self, order, fill_qty: float) -> tuple[float, float]:
+        """Paper, asked by the fee model on each post-only fill: how much of it a backtest would fill at
+        the maker fee (BOOK_SHARE of the volume that traded through its price, less what was already
+        charged as maker), and half the spread now, which the rest pays with the taker fee. Paper's
+        simulated venue fills a post-only order whole once the price trades through, however little
+        traded; charging the rest as the market order it would have been keeps paper's maker fills to
+        the backtest's (review round 8, M8-5)."""
+        coid = str(order.client_order_id)
+        if self._backtest:
+            return fill_qty, 0.0  # the backtest's venue already fills only its share
+        last = (self.venue_trade() if self.venue_trade is not None else None) or self.cache.trade(self._cfg.instrument_id)
         if last is not None:
-            self._tape(last)  # the venue may have filled on a trade this strategy hasn't heard yet
-        through = self._through.get(coid, 0.0)
-        filled, allowed = order.filled_qty.as_double(), BOOK_SHARE * through
-        step = self.instrument.size_increment.as_double()
-        if filled <= allowed + step or coid in self._overfilled:
+            self._tape(last)  # the trade that crossed it may not have reached this strategy yet
+        limit = order.price.as_double()
+        if last is None or ((last.price.as_double() >= limit) if order.is_buy else (last.price.as_double() <= limit)):
+            # The trade that filled it isn't in view: what traded through can't be counted, so the whole
+            # fill is charged as the market order it would have been, the cautious way, and it is said once.
+            self._note("crossing_trade_unseen", f"Post-only order {coid} filled on a trade this strategy couldn't "
+                       "see, so the whole fill was charged the taker fee and half the spread")
+        done = self._maker_filled.get(coid, 0.0)
+        maker = min(max(BOOK_SHARE * self._through.get(coid, 0.0) - done, 0.0), fill_qty)
+        self._maker_filled[coid] = done + maker
+        if fill_qty - maker > 1e-12:
+            self._capped[coid] = self._capped.get(coid, 0.0) + fill_qty - maker
+        self._fill_half_spread[coid] = self._half_spread()
+        return maker, self._fill_half_spread[coid]
+
+    def _settle_maker(self, coid: str, order) -> None:
+        """Paper, when a post-only order's wait runs out. A backtest fills it at the maker fee from the
+        volume that trades through its price over the whole wait, BOOK_SHARE of it, and sends the rest at
+        market when the wait runs out. Paper's venue fills it whole on the first trade through, and
+        maker_allowance charged the maker fee only on what had traded through by then, the rest the
+        taker fee and half the spread. Here paper settles to what the backtest would have done:
+        - what traded through since counts at the maker fee too, and its fees come back;
+        - the rest is priced as the backtest's market order, at the price now rather than this order's.
+        The difference goes on the next fill's fee (ScheduleFeeModel.pending_credit), so the paper
+        account and the journal stay one book; a restart before that fill drops it (review round 8, M8-5)."""
+        charged = self._maker_filled.get(coid)
+        if charged is None or order is None or self.fee_model is None:
             return
-        self._overfilled.add(coid)
-        msg = (f"Post-only order {coid} has filled {filled:.8g} while {through:.8g} traded through its price; a "
-               f"backtest would fill at most {allowed:.8g} ({BOOK_SHARE:.0%}). Paper's maker fills run ahead of "
-               "the backtest's where little trades")
-        self.log.warning(msg)
+        filled = order.filled_qty.as_double()
+        through = self._through.get(coid, 0.0)
+        final = min(filled, BOOK_SHARE * through)
+        extra, taker = max(final - charged, 0.0), filled - final
+        if taker <= 1e-12 and extra <= 1e-12:
+            return
+        fm, px, last = self.fee_model, float(order.avg_px or order.price.as_double()), self._price()
+        gap = float(fm.fees.taker) + self._fill_half_spread.get(coid, 0.0) - float(fm.fees.maker)
+        fees_back = extra * px * gap
+        # A buy at market now pays more than this order did when the price has risen since; a sell gets less.
+        repriced = taker * (last - px) * (1 if order.is_buy else -1) if last > 0 else 0.0
+        fm.pending_credit += fees_back - repriced
+        msg = (f"Post-only order {coid} filled {filled:.8g} on the first trade through its price, and {through:.8g} "
+               f"traded through it before its wait ran out. Settled as a backtest fills it: {final:.8g} "
+               f"({BOOK_SHARE:.0%} of what traded through) at the maker fee, and {taker:.8g} as the market order sent "
+               f"when the wait ran out, at {last:,.6g} rather than {px:,.6g}. "
+               f"{abs(fees_back - repriced):,.2f} {'comes off' if fees_back >= repriced else 'goes on'} the next fill's fee")
+        self.log.info(msg)
         if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "warning", "maker_fill_above_tape", msg, ts=self.runtime.now())
+            self.runtime.store.event(self.runtime.name, "info", "maker_fill_settled", msg, ts=self.runtime.now())
 
     def _forget_tape(self, coid: str) -> None:
         self._through.pop(coid, None)
-        self._overfilled.discard(coid)
+        self._maker_filled.pop(coid, None)
+        self._capped.pop(coid, None)
+        self._fill_half_spread.pop(coid, None)
+        self._settling.pop(coid, None)
 
     def _min_qty(self) -> Decimal:
         step = self.instrument.size_increment.as_decimal()
@@ -1081,9 +1257,8 @@ class LongFlatStrategy(Strategy):
                 self.cancel_all_orders(self._cfg.instrument_id)
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
-        except Exception as exc:  # never let bookkeeping kill the sleeve silently
-            self.log.error(f"sleeve tick failed: {exc!r}")
-            self.runtime.store.event(self.runtime.name, "error", "tick_failed", repr(exc))
+        except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
+            self._report("_on_tick", exc)
 
     # Order lifecycle into the journal; fills are journaled in on_order_filled.
     def _order_status(self, event, status: str) -> None:
@@ -1150,6 +1325,11 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         info = self._maker.pop(coid, None)
         self._cancel_alert(coid)
+        if not self._backtest:
+            try:  # a report failing must not stop the rest going at market below
+                self._settle_maker(coid, self.cache.order(event.client_order_id))
+            except Exception as exc:
+                self._report("_settle_maker", exc)
         self._forget_tape(coid)
         timed_out = coid in self._fallback
         self._fallback.discard(coid)
@@ -1168,12 +1348,14 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed
-        if coid in self._maker and order is not None and not self._backtest:
-            self._check_maker_fill(coid, order)
         if coid in self._maker and done:
             self._maker.pop(coid)
-            self._cancel_alert(coid)
-            self._forget_tape(coid)
+            if (not self._backtest and self._maker_filled.get(coid, 0.0) < order.filled_qty.as_double() - 1e-12
+                    and f"maker-{coid}" in self.clock.timer_names()):
+                self._settling[coid] = order  # keeps its timer: settled when the wait runs out
+            else:
+                self._cancel_alert(coid)
+                self._forget_tape(coid)
         qty, px = event.last_qty.as_double(), event.last_px.as_double()
         if event.is_buy:
             cost = (self._entry_px or 0.0) * self._entry_qty + qty * px
@@ -1184,6 +1366,7 @@ class LongFlatStrategy(Strategy):
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
                 self._stop_frac = self._tp_frac = None
+                self._replan_pending = self._plan_entry = None
         if self._backtest:
             if event.is_buy and done and self._pending_exit is None:
                 self._rest_exits()

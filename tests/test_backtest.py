@@ -258,6 +258,19 @@ def test_a_target_in_r_pays_that_r_after_costs(prices, instrument):
     assert net / loss == pytest.approx(2.0, abs=0.01)
 
 
+def test_a_swing_low_counts_the_bar_the_entry_decides_on(prices, instrument):
+    """Review round 8, m8-T: the bar the entry decides on has closed, so its low is one of the last 10
+    (no look-ahead in using it); leaving it out set the stop under an older, higher low."""
+    df = _ranged(prices, [100.0] * 20 + [90.0] * 5, 1.0)
+    df.iloc[5, df.columns.get_loc("low")] = 97.0
+    df.iloc[9, df.columns.get_loc("low")] = 96.0  # the tenth bar: the entry decides on its close
+    df.iloc[20, df.columns.get_loc("open")] = df.iloc[20, df.columns.get_loc("high")] = 100.0
+    res = run_backtest("buy_and_hold", df, instrument, {"stop_swing_bars": 10}, half_spread=0)
+    buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
+    assert res.decisions[buys.index[0]]["signal"]["stop_basis"].startswith("at the lowest low of the last 10 bars (96)")
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(96.0)
+
+
 def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
     df = _ranged(prices, [100.0] * 20 + [90.0] * 5, 1.0)
     df.iloc[5, df.columns.get_loc("low")] = 97.0  # the lowest low of the first 10 bars

@@ -260,3 +260,39 @@ def test_a_halt_on_the_bar_an_entry_fills_cancels_its_stop_and_target(instrument
         pos += f["qty"] if f["side"] == "BUY" else -f["qty"]
         assert pos > -1e-9, f"sold more than was held at {f['ts']}"
     assert abs(pos) < 1e-9 and res.equity.index[-1] > halt
+
+
+@pytest.mark.strategy_errors
+def test_a_failing_risk_check_or_bar_reaches_the_result_and_raises_one_alert(prices, instrument, monkeypatch):
+    """Review round 8, M8-3: a failing tick or bar showed no banner on the backtest page; with the tick
+    failing, a -50% crash ran with no halt and read as a result. Every failure is counted into the
+    result, the page refuses to stand behind it, and the journal says so once per handler."""
+    from sleeve_fund.dashboard.preview import _errors
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.strategies.buy_and_hold import BuyAndHold
+
+    def down(self, **kw):
+        raise RuntimeError("journal down")
+
+    monkeypatch.setattr(SleeveRuntime, "tick", down)
+    res = run_backtest("buy_and_hold", prices.iloc[:60], instrument, risk_profile="balanced")
+    assert res.handler_error_count >= 59 and res.handler_errors[0] == ("_on_tick", "RuntimeError('journal down')")
+    assert [e["kind"] for e in res.journal.events_ if e["level"] == "error"] == ["tick_failed"]
+    banner = _errors(res.handler_errors, res.handler_error_count)
+    assert f"hit {res.handler_error_count} errors" in banner and "the first handling the risk check: journal down" in banner
+    monkeypatch.undo()
+
+    def broken(self, bar):
+        raise ZeroDivisionError("float division by zero")
+
+    monkeypatch.setattr(BuyAndHold, "want_long", broken)
+    res = run_backtest("buy_and_hold", prices.iloc[:30], instrument)
+    assert res.handler_error_count == 30 and res.handler_errors[0][0] == "on_bar" and res.fills.empty
+
+
+def test_the_alert_send_bound_holds_whatever_the_far_end_does():
+    """Review round 8, m8-T: the whole-send bound could be lifted and every test still passed (the
+    trickle test sets its own)."""
+    from sleeve_fund import alerts
+
+    assert 0 < alerts.TOTAL <= 3 * alerts.TIMEOUT

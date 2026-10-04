@@ -564,7 +564,7 @@ window.Console = (() => {
       const out = [], r = num("take_profit_r"), atr = num("stop_atr"), swing = num("stop_swing_bars");
       const stop = num("stop_loss_pct") !== null ? `${num("stop_loss_pct")}% below entry`
         : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) below entry`
-        : swing !== null ? `just under the lowest low of the last ${swing} bars` : null;
+        : swing !== null ? `at the lowest low of the last ${swing} bars` : null;
       const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% above entry`
         : r !== null ? `a target that makes ${r}R after costs` : null;
       if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);

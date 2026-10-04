@@ -44,6 +44,7 @@ class Fold:
     # When the risk guard halted the run before the test window ended: the day, why, and whether
     # it was in the training stretch the run traded through first. A halted fold is flat from then on.
     halted: str = ""
+    halted_before_test: bool = False  # halted in the training stretch: the whole test window sat flat
 
 
 @dataclass
@@ -71,6 +72,32 @@ class StudyResult:
     venue: str = ""
     risk_profile: str | None = None
     settings: str = ""  # the risk profile, exits and windows the study ran with, so two sheets can be told apart
+    # Exceptions the strategy raised in its runs, as (run, handler, repr) for each run that raised, and
+    # how many in all: results built on a broken handler can't be judged (review round 8, M8-3).
+    errors: list = field(default_factory=list)
+    error_count: int = 0
+    holdout_withheld: str = ""  # why the holdout asked for was left closed
+
+    @property
+    def not_judged(self) -> str:
+        """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
+        - the strategy raised errors, so its orders after them may be wrong;
+        - the risk guard halted every fold before its test window, or halts before the test left
+          out-of-sample without a single trade: a test window that sat flat is no information, and
+          failing on it would spend the idea. A halt inside a test window is a result, and is judged."""
+        if self.error_count:
+            from sleeve_fund.strategies.base import handler_error_words
+
+            run, handler, what = self.errors[0]
+            return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
+                    f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
+                    "orders after that may be wrong")
+        flat = [f for f in self.folds if f.halted_before_test]
+        if flat and (len(flat) == len(self.folds) or self.oos_trades == 0):
+            return (f"the risk guard halted {len(flat)} of {len(self.folds)} folds before their test windows began "
+                    f"and out-of-sample closed {self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so the "
+                    "test windows sat flat rather than testing the idea")
+        return ""
 
     @property
     def round_trips(self) -> list[float]:
@@ -175,6 +202,8 @@ def run_study(
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
         raise ValueError(f"{exec_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
 
+    errors: list = []
+    error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
     total = 1 + len(combos) + 1 + folds_n * (len(combos) + 1) + (2 if use_holdout and holdout_days else 0)
     done = [0]
@@ -191,9 +220,13 @@ def run_study(
         fine = None
         if exec_minutes is not None and not benchmark:  # nothing rests, nothing to guard
             fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
-        return run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
-                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                            exec_minutes=exec_minutes or 1, half_spread=half_spread)
+        res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
+                           risk_profile=risk_profile if guarded else None, exec_prices=fine,
+                           exec_minutes=exec_minutes or 1, half_spread=half_spread)
+        if res.handler_errors:
+            errors.append((f"{name} {df.index[0]:%d %b %Y} to {df.index[-1]:%d %b %Y}", *res.handler_errors[0]))
+            error_count[0] += res.handler_error_count or len(res.handler_errors)
+        return res
 
     def log(params: dict, stage: str, sharpe: float) -> None:
         # Exit settings make it a different variant, so they count towards the idea counter.
@@ -249,6 +282,7 @@ def run_study(
                 test_trades=sum(1 for t in trades(fills_to_rows(run.fills))
                                 if t["closed"] is not None and _utc(t["closed"]) >= _utc(test_idx[0])),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
+                halted_before_test=_halted_before(run.risk_events, test_idx[0]),
             )
         )
         oos_parts.append(test_ret)
@@ -276,6 +310,8 @@ def run_study(
         settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
                   f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
                   f"walk-forward {train_days} days training, {test_days} days testing"),
+        errors=errors,
+        error_count=error_count[0],
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
@@ -310,8 +346,11 @@ def run_study(
             "Paper watches both on every trade."
         )
 
-    # 3. Holdout, only on request, using the most recent fold's choice.
-    if use_holdout and holdout_days:
+    # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
+    # closed: opening it would spend it on no information (review round 8, M8-4).
+    if use_holdout and holdout_days and result.not_judged:
+        result.holdout_withheld = f"left closed, though asked for: G1 can't judge this study ({result.not_judged})"
+    elif use_holdout and holdout_days:
         result.holdout_reused = ledger.holdout_used(spec.name, dataset)
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)
@@ -328,6 +367,10 @@ def run_study(
 def _utc(ts) -> pd.Timestamp:
     t = pd.Timestamp(ts)
     return t.tz_localize("UTC") if t.tzinfo is None else t
+
+
+def _halted_before(events: list[dict], test_start: pd.Timestamp) -> bool:
+    return any(e["kind"] == "risk_halt" and _utc(e["ts"]) < _utc(test_start) for e in events)
 
 
 def _halt_words(events: list[dict], test_start: pd.Timestamp, test_end: pd.Timestamp) -> str:
@@ -352,7 +395,7 @@ def _exit_words(exits: dict) -> str:
         words.append(f"stop-loss {exits['stop_atr']:g} average true ranges (over {exits.get('atr_bars', 14)} bars) "
                      "below entry, set at each entry")
     if "stop_swing_bars" in exits:
-        words.append(f"stop-loss under the lowest low of the last {exits['stop_swing_bars']} bars, set at each entry")
+        words.append(f"stop-loss at the lowest low of the last {exits['stop_swing_bars']} bars, set at each entry")
     if "take_profit" in exits:
         words.append(f"take-profit {exits['take_profit']:.1%} above entry")
     if "take_profit_r" in exits:

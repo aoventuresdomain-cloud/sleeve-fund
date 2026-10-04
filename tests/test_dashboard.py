@@ -1256,6 +1256,60 @@ def test_bad_settings_changes_are_refused_and_keep_what_was_typed(client, over, 
         assert "Not saved" in c.get(loc.split("#")[0], auth=AUTH).text
 
 
+def test_loosening_the_stop_on_an_open_position_is_checked_against_its_size(client):
+    """Review round 8, M8-1: a 3% to 50% edit on an open position saved, about 17R at risk. A looser stop
+    now needs the PM's confirmation, with the risk in money and R; one past the drawdown halt is refused."""
+    from urllib.parse import unquote_plus
+
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    c, store = client
+    _new(c, stop_loss_pct="3")
+    rt = SleeveRuntime(store, "btc-test")
+    rt.on_order(order_id="E-1", side="BUY", qty=0.06, intent="entry", reason="Signal to be long",
+                signal={"stop_frac": 0.03, "risk_amount": 137.28, "stop_cfg": {"stop_loss": 0.03}})
+    rt.on_fill(side="BUY", qty=0.06, price=50_000.0, fee=24.0, order_id="E-1", trade_id="T-1")
+    store.record_equity("btc-test", equity=4_976.0, cash=1_976.0, qty=0.06, price=50_000.0, benchmark=5_000)
+    assert "Accept a looser stop on the open position" in c.get("/sleeves/btc-test", auth=AUTH).text
+    loc = unquote_plus(_settings(c, stop_loss_pct="5").headers["location"])
+    assert "looser than the 3.0%" in loc and "(1.5R of the entry" in loc
+    assert store.sleeve("btc-test").params["stop_loss"] == 0.03
+    loc = unquote_plus(_settings(c, stop_loss_pct="50", confirm_looser="1").headers["location"])
+    assert "drawdown halt" in loc and store.sleeve("btc-test").params["stop_loss"] == 0.03
+    assert "saved=settings" in _settings(c, stop_loss_pct="5", confirm_looser="1").headers["location"]
+    assert store.sleeve("btc-test").params["stop_loss"] == 0.05
+    assert "saved=settings" in _settings(c, stop_loss_pct="2").headers["location"]  # tighter: no question
+
+
+def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
+    """Review round 8, M8-2: the journal's position decides, not the desired state. An account a stopped
+    strategy still holds a position on can't be retired, and a flatten for a stopped strategy starts it to
+    sell rather than waiting for a start that may never come."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    c, store = client
+    store.create_account("desk-b", "paper")
+    _new(c, account="desk-b")
+    rt = SleeveRuntime(store, "btc-test")
+    rt.on_order(order_id="E-1", side="BUY", qty=0.01, intent="entry", reason="Signal to be long", signal={})
+    rt.on_fill(side="BUY", qty=0.01, price=50_000.0, fee=4.0, order_id="E-1", trade_id="T-1")
+    store.set_desired_state("btc-test", "stopped")
+    page = c.get("/accounts", auth=AUTH).text
+    assert "btc-test is stopped but still holds a position on it" in page
+    r = c.post("/accounts/desk-b/retire", data={"action": "retire", "reason": "tidy"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "still+holds+a+position" in r.headers["location"]
+    assert not next(a for a in store.accounts() if a["name"] == "desk-b")["retired_at"]
+    r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "de-risk"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and store.sleeve("btc-test").desired_state == "running"
+    assert [x["command"] for x in store.pending_commands("btc-test")] == ["flatten"]
+    _new(c, name="eth-flat", instrument="ETH/USD")
+    store.set_desired_state("eth-flat", "stopped")
+    r = c.post("/sleeves/eth-flat/command", data={"command": "flatten", "reason": "x"}, auth=AUTH, headers=SAME)
+    assert r.status_code == 400 and "nothing to flatten" in r.text
+
+
 def test_a_stopped_strategy_takes_new_settings_at_its_next_start(client):
     c, store = client
     _new(c)
@@ -1386,3 +1440,67 @@ def test_a_run_whose_strategy_raised_is_flagged_and_not_offered_for_paper(client
     screen = c.get(f"/sleeves/{name}", auth=AUTH).text
     assert "The strategy's code raised an error 1 time during this run" in screen
     assert "raised an error" not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+STOP_KINDS = {"pct": {"stop_loss": 0.03, "take_profit": 0.06},
+              "atr": {"stop_atr": 2.0, "atr_bars": 14, "take_profit_r": 2.0},
+              "swing": {"stop_swing_bars": 10, "take_profit_r": 1.5}}
+STATES = ("running", "paused", "halted", "stopped", "holding")  # holding: stopped with a position
+
+
+def test_every_page_renders_for_every_stop_type_and_strategy_state(client, monkeypatch):
+    """Review round 8, m8-T: the Risk page crashed for any strategy with an ATR or swing-low stop, and
+    the kill switch lives there. Every page renders with each kind of stop in each state, with and
+    without an open position, its stop edited or not."""
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard import charts
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import utcnow
+
+    monkeypatch.setattr(charts, "candles", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    c, store = client
+    names = []
+    for kind, exits in STOP_KINDS.items():
+        for state in STATES:
+            name = f"{kind}-{state}"
+            names.append(name)
+            store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                                starting_balance=5_000, params={"fast": 10, "slow": 30, **exits},
+                                risk_profile="balanced")
+            if state in ("running", "paused", "halted", "holding"):
+                rt = SleeveRuntime(store, name)
+                basis = {"atr": "2 x the 14-bar average true range (1,000)",
+                         "swing": "at the lowest low of the last 10 bars (48,500)"}.get(kind)
+                sig = {"stop_frac": 0.03, "tp_frac": 0.07, "risk_amount": 70.0, "planned_r": 2.0,
+                       "stop_cfg": {k: v for k, v in exits.items() if k.startswith(("stop", "atr"))},
+                       **({"stop_basis": basis} if basis else {})}
+                rt.on_order(order_id=f"{name}-E", side="BUY", qty=0.03, intent="entry", reason="Signal to be long",
+                            signal=sig)
+                rt.on_fill(side="BUY", qty=0.03, price=50_000.0, fee=12.0, order_id=f"{name}-E", trade_id=f"{name}-T")
+                store.record_equity(name, equity=4_950.0, cash=3_488.0, qty=0.03, price=48_700.0, benchmark=4_990.0)
+                if kind == "atr":  # this one had its stop edited while open
+                    store.set_exit_plan(name, f"{name}-E", kind="edit", stop_frac=0.02, tp_frac=0.07,
+                                        risk_amount=70.0, planned_r=2.4)
+            if state == "paused":
+                store.set_status(name, "paused", "daily loss 5.1% hit the 5% limit", paused_until=utcnow() + timedelta(hours=8))
+            elif state == "halted":
+                store.set_status(name, "halted", "drawdown 20.4% hit the 20% limit")
+            elif state in ("stopped", "holding"):
+                store.set_desired_state(name, "stopped")
+                store.set_status(name, "stopped", "process stopped")
+            else:
+                store.set_status(name, "running")
+    pages = ["/", "/trades", "/orders", "/alerts", "/risk", "/reports", "/settings", "/ops", "/accounts", "/decisions",
+             "/research", "/sleeves/new"]
+    for n in names:
+        pages += [f"/sleeves/{n}", f"/api/sleeves/{n}/equity", f"/api/sleeves/{n}/candles", f"/trades?sleeve={n}"]
+    for path in pages:
+        r = c.get(path, auth=AUTH)
+        assert r.status_code == 200, (path, r.text[:300])
+    risk = c.get("/risk", auth=AUTH).text
+    assert "Flatten everything" in risk
+    swing = c.get("/sleeves/swing-holding", auth=AUTH).text
+    assert "48,500" in swing and "Accept a looser stop on the open position" in swing
+    edited = c.get("/sleeves/atr-running", auth=AUTH).text
+    assert "49,000.00" in edited and "edited by the PM" in edited  # the edited plan: 2% under the 50,000 entry

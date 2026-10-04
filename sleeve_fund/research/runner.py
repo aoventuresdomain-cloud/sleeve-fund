@@ -40,6 +40,7 @@ class BacktestResult:
     journal: object = None
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
+    handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
 
 
 CHUNK_BARS = 100_000  # bars handed to the engine at a time
@@ -193,6 +194,7 @@ def run_backtest(
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
             handler_errors=list(strategy.handler_errors),
+            handler_error_count=strategy.handler_error_count,
         )
     finally:
         if runtime is not None:

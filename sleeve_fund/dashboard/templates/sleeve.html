@@ -111,11 +111,11 @@
   <div class="panel-head"><h2 id="trips-h">Closed trades</h2><a class="right" href="/trades?sleeve={{ s.name }}">All trades</a></div>
   {% if trips %}
   <table class="responsive" data-hide-md="3 4 8 10">
-    <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
+    <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
     <tbody>{% for tr in trips[:50] %}{% set rid = 'tr-' ~ loop.index %}
     <tr><td data-m="hide">{{ tr.opened|ts }}</td><td>{{ tr.closed|ts }}</td><td class="num" data-m="hide">{{ tr.held|held }}</td><td class="num" data-m="hide">{{ '%.4g'|format(tr.qty) }} {{ base }}</td>
       <td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td>
-      <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
+      <td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-label="Return">{{ signed(tr.ret) }}</td><td class="num" data-m="hide">{{ tr.r|rmult }}{% if tr.exits_edited %}<div class="sub" title="The PM changed this trade&#39;s stop or target while it was open. R is measured on the larger of the risk at entry and the risk after the change.">exits edited</div>{% endif %}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">
       {{ why('Entry · ' ~ tr.opened|ts ~ ' at ' ~ tr.entry_px|px, tr.entry_why, tr.entry_items) }}
@@ -180,7 +180,7 @@
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}
-      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, average true ranges below entry', 'atr_bars': 'Average true range over, bars', 'stop_swing_bars': 'Stop under the lowest low of, bars', 'take_profit_r': 'Target in R, after costs'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
+      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, average true ranges below entry', 'atr_bars': 'Average true range over, bars', 'stop_swing_bars': 'Stop at the lowest low of, bars', 'take_profit_r': 'Target in R, after costs'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
         <td>{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ (v * 100)|round(2) }}%{% elif k == 'max_notional' %}{{ v|money }} {{ quote }}{% elif k == 'maker_wait_minutes' %}Maker first, the rest at market after {{ v }} min{% else %}{{ v }}{% endif %}</td></tr>
       {% endfor %}
     </table>
@@ -203,7 +203,8 @@
     <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
     <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
     {{ exit_fields(settings_pre, costs) }}
-    <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty > 0 %} The open position takes the new stop and target too{% if s.params.get('stop_atr') or s.params.get('stop_swing_bars') or settings_pre.get('stop_atr') or settings_pre.get('stop_swing_bars') %}; one set from the market is set again on the first bar after the restart{% endif %}.{% endif %}</p>
+    <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty > 0 %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
+    {% if x.qty > 0 %}<div class="field"><label class="check" style="margin-top:10px"><input type="checkbox" name="confirm_looser" value="1"> Accept a looser stop on the open position</label></div>{% endif %}
     <div class="field" style="margin-top:12px"><label for="r-settings">Reason for the decision log</label><input id="r-settings" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason"></div>
     <button>Save settings</button>
     {% endif %}

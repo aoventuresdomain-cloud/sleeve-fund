@@ -21,13 +21,15 @@ def prices():
 
 
 @pytest.fixture(autouse=True)
-def _no_swallowed_strategy_errors(capfd):
+def _no_swallowed_strategy_errors(capfd, request):
     """The engine catches exceptions raised in strategy callbacks: on_bar and timers it only logs,
     and order and market data handlers it drops without a word, so the strategy reports those itself
     (LongFlatStrategy._reporting). Either way a broken handler could pass a test that checks
     something else, so fail any test that logs one."""
     yield
     out, err = capfd.readouterr()
+    if request.node.get_closest_marker("strategy_errors"):  # raised on purpose, and checked by the test
+        return
     for line in (out + err).splitlines():
         if ("Python " in line and ("failed" in line or "raised exception" in line)) or "strategy handler " in line or "sleeve tick failed" in line:
             pytest.fail(f"a strategy callback raised inside the engine: {line}")

@@ -26,6 +26,7 @@ class MemoryJournal:
         self.fills_: list[dict] = []
         self.orders_: dict[str, dict] = {}
         self.events_: list[dict] = []
+        self.exit_plans_: dict[str, list[dict]] = {}
         self._ids = itertools.count(1)
         self._peak: float | None = None
         # The deepest drawdown over every mark, as (peak mark, trough mark): kept through thinning so the
@@ -145,6 +146,20 @@ class MemoryJournal:
     def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
         return next((e for e in reversed(self.events_) if e["kind"] in kinds), None)
 
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
+        return [e for e in self.events_ if e["kind"] in kinds and e["id"] > after_id]
+
+    # Exit plans set after entry (see Store.set_exit_plan). A backtest starts flat and its settings don't
+    # change mid-run, so it rarely has any; they are kept for the same calls.
+    def set_exit_plan(self, sleeve: str, entry_order: str, **plan) -> None:
+        self.exit_plans_.setdefault(entry_order, []).append({"entry_order": entry_order, **plan})
+
+    def exit_plan(self, sleeve: str, entry_order: str) -> dict | None:
+        return (self.exit_plans_.get(entry_order) or [None])[-1]
+
+    def exit_plans(self, sleeve: str) -> dict[str, dict]:
+        return {k: v[-1] for k, v in self.exit_plans_.items() if v}
+
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
         rows = sorted(self.orders_.values(), key=lambda o: (o["ts"], o["id"]), reverse=True)
         return [o for o in rows if not statuses or o["status"] in statuses][:limit]
@@ -157,6 +172,12 @@ class MemoryJournal:
 
     def first_equity(self, sleeve: str) -> dict | None:
         return self.equity[0] if self.equity else None
+
+    def day_open_equity(self, sleeve: str, day_start) -> float | None:
+        before = [m for m in self.equity if m["ts"] < day_start]
+        if before:
+            return float(before[-1]["equity"])
+        return next((float(m["equity"]) for m in self.equity if m["ts"] >= day_start), None)
 
     def last_equity(self, sleeve: str) -> dict | None:
         return self.equity[-1] if self.equity else None

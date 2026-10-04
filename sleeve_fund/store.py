@@ -164,6 +164,26 @@ orders_t = Table(
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
 )
+# The stop and target an open position works to after the PM edited them, or after a restart set them
+# again from the market, as shares of its entry price (the entry order's signal holds the plan it was
+# entered with). The latest row per entry order is in force. A new table: CREATE TABLE.
+exit_plans_t = Table(
+    "exit_plans",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("entry_order", String(64), nullable=False),  # the entry's client order id
+    Column("ts", TS, nullable=False),
+    Column("kind", String(16), nullable=False),  # "edit": the PM changed the settings; "restart": set again
+    Column("stop_frac", Float),
+    Column("tp_frac", Float),
+    Column("basis", Text, nullable=False, default=""),  # how the stop was set, in words
+    Column("stop_cfg", JSON),  # the stop settings it was set from
+    Column("risk_amount", Float),  # the trade's 1R from now on: the larger of the entry's and this plan's
+    Column("planned_r", Float),
+    Column("event_id", Integer),  # the newest settings-change event it applies
+    Index("exit_plans_entry", "sleeve", "entry_order", "id"),
+)
 # Venue accounts (see sleeve_fund/accounts.py), which sleeve trades on which, and whether the
 # supervisor can see a key for each live account. New tables, so they arrive as CREATE TABLE.
 accounts_t = Table(
@@ -255,6 +275,9 @@ backtests_t = Table(
     Column("result", Text, nullable=False),
     Index("backtests_key", "key", "created_at"),
 )
+# Events that say the strategy's own code raised: a handler, or the risk check's tick (see
+# LongFlatStrategy._report).
+ERROR_KINDS = ("handler_failed", "tick_failed")
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
@@ -542,6 +565,13 @@ class Store:
         if running:
             raise ValueError(f"{', '.join(running)} still run{'s' if len(running) == 1 else ''} on {name}; "
                              "stop or move them first")
+        # A stopped strategy can still hold a position, and on a retired account it could never start to
+        # sell it (review round 8, M8-2). The journal's position decides, not the desired state.
+        held = [s.name for s in self.sleeves() if s.name in a["sleeves"]
+                and abs(self.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
+        if held:
+            raise ValueError(f"{', '.join(held)} still hold{'s' if len(held) == 1 else ''} a position on {name}; "
+                             "flatten first")
         with self.engine.begin() as c:
             c.execute(insert(account_retired_t).values(account=name, retired_at=utcnow()))
 
@@ -702,6 +732,19 @@ class Store:
         with self.engine.connect() as c:
             return float(c.execute(q).scalar() or 0.0)
 
+    def day_open_equity(self, sleeve: str, day_start: datetime) -> float | None:
+        """The equity the day opened at: the last mark before `day_start` (00:00 UTC), else the day's
+        first mark. A restart reads it so the daily-loss guard keeps the day's real baseline."""
+        before = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts < day_start)
+                  .order_by(equity_t.c.ts.desc(), equity_t.c.id.desc()).limit(1))
+        first = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts >= day_start)
+                 .order_by(equity_t.c.ts, equity_t.c.id).limit(1))
+        with self.engine.connect() as c:
+            v = c.execute(before).scalar()
+            if v is None:
+                v = c.execute(first).scalar()
+        return float(v) if v is not None else None
+
     def equity_at_or_before(self, sleeve: str, ts: datetime) -> dict | None:
         q = (select(equity_t).where(equity_t.c.sleeve == sleeve, equity_t.c.ts <= ts)
              .order_by(equity_t.c.ts.desc(), equity_t.c.id.desc()).limit(1))
@@ -757,6 +800,37 @@ class Store:
     def last_event_id(self) -> int:
         with self.engine.connect() as c:
             return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
+
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
+        """One sleeve's events of these kinds newer than an id, oldest first."""
+        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds), events_t.c.id > after_id)
+             .order_by(events_t.c.id))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def set_exit_plan(self, sleeve: str, entry_order: str, *, kind: str, stop_frac: float | None,
+                      tp_frac: float | None, basis: str = "", stop_cfg: dict | None = None,
+                      risk_amount: float | None = None, planned_r: float | None = None, event_id: int | None = None,
+                      ts: datetime | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(insert(exit_plans_t).values(
+                sleeve=sleeve, entry_order=entry_order, ts=ts or utcnow(), kind=kind, stop_frac=stop_frac,
+                tp_frac=tp_frac, basis=basis, stop_cfg=stop_cfg, risk_amount=risk_amount, planned_r=planned_r,
+                event_id=event_id))
+
+    def exit_plan(self, sleeve: str, entry_order: str) -> dict | None:
+        """The plan in force for this entry since it was entered, or None if it still has its entry's."""
+        q = (select(exit_plans_t).where(exit_plans_t.c.sleeve == sleeve, exit_plans_t.c.entry_order == entry_order)
+             .order_by(exit_plans_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
+    def exit_plans(self, sleeve: str) -> dict[str, dict]:
+        """The plan in force for each of a sleeve's entries that has one, by entry order id."""
+        q = select(exit_plans_t).where(exit_plans_t.c.sleeve == sleeve).order_by(exit_plans_t.c.id)
+        with self.engine.connect() as c:
+            return {r["entry_order"]: r for r in _rows(c.execute(q))}
 
     def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
@@ -864,7 +938,7 @@ class Store:
                                              for e in journal.events_])
             # A run whose strategy raised must say so wherever it is opened (review round 8, R8-9). A run
             # without a runtime journals no event of its own, so the result's words stand in for it.
-            if result.get("errors") and not any(e.get("kind") == "handler_failed" for e in journal.events_):
+            if result.get("errors") and not any(e.get("kind") in ERROR_KINDS for e in journal.events_):
                 c.execute(insert(events_t).values(sleeve=name, ts=now, level="error", kind="handler_failed",
                                                   message=result["errors"]))
             # To the microsecond, so runs saved in the same second still sort (and prune) in order.
@@ -876,7 +950,7 @@ class Store:
         """How many times the strategy's own code raised, as journaled (handler_failed events); with
         since_start, only since its process last started, so a fixed and restarted strategy reads clean."""
         q = select(func.count()).select_from(events_t).where(events_t.c.sleeve == sleeve,
-                                                            events_t.c.kind == "handler_failed")
+                                                            events_t.c.kind.in_(ERROR_KINDS))
         start = self.last_event(sleeve, ("process_start",)) if since_start else None
         if start is not None:
             q = q.where(events_t.c.id > start["id"])
@@ -900,7 +974,7 @@ class Store:
 
     def backtests(self, limit: int = 50) -> list[dict]:
         errored = (select(events_t.c.id).where(events_t.c.sleeve == backtests_t.c.sleeve,
-                                               events_t.c.kind == "handler_failed").exists())
+                                               events_t.c.kind.in_(ERROR_KINDS)).exists())
         q = (select(backtests_t.c.id, backtests_t.c.sleeve, backtests_t.c.title, backtests_t.c.query,
                     backtests_t.c.created_at, errored.label("errored"))
              .order_by(backtests_t.c.created_at.desc()).limit(limit))
@@ -918,7 +992,7 @@ class Store:
             # otherwise block deleting its event (a foreign key) and with it every later prune.
             c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
                                                                   .where(events_t.c.sleeve.in_(old)))))
-            for t in (equity_t, fills_t, orders_t, events_t):
+            for t in (equity_t, fills_t, orders_t, events_t, exit_plans_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
             c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))
