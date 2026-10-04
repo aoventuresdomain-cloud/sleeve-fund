@@ -34,7 +34,7 @@ def _instrument(h: dict, fees):
 
 def _money(text: str):
     """A recorded balance. Money.from_str only knows registered currencies, and a venue's own codes
-    (Kraken's ZUSD, XXBT) are made on the fly by Currency.from_str, as the live adapter does."""
+    (e.g. a "Z"-prefixed cash code) are made on the fly by Currency.from_str, as the live adapter does."""
     from nautilus_trader.model import Currency, Money
 
     amount, code = text.split()
