@@ -246,15 +246,19 @@ def test_a_halt_on_the_bar_an_entry_fills_cancels_its_stop_and_target(instrument
                       "volume": 50.0}, index=idx)
     daily = m.resample("1D", label="right", closed="right").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    # No spread: the post-only entry rests a tick under the last trade, where the reviewer's run had it.
     res = run_backtest("trend_filter", daily, eth, starting_capital=10_000, exec_prices=m, exec_minutes=1,
-                       risk_profile="conservative", bar_minutes=1440,
+                       risk_profile="conservative", bar_minutes=1440, half_spread=0.0,
                        params={"fast": 2, "slow": 3, "stop_loss": 0.04, "take_profit": 0.05, "maker_wait_minutes": 60})
     j = res.journal
     assert [e["kind"] for e in res.risk_events] == ["risk_halt"]
     halt = pd.Timestamp(res.risk_events[0]["ts"])
     orders = {o["intent"]: o for o in j.orders_.values() if pd.Timestamp(o["ts"]) == halt}
     assert orders["risk_halt"]["status"] == "filled"
-    assert orders["stop_loss"]["status"] == orders["take_profit"]["status"] == "canceled"
+    # The entry's stop and target (resting since its first slice filled) were cancelled, not left to sell.
+    exits = [o for o in j.orders_.values() if o["intent"] in ("stop_loss", "take_profit")
+             and pd.Timestamp(o["ts"]) <= halt and o["status"] not in ("filled", "rejected")]
+    assert exits and all(o["status"] == "canceled" for o in exits)
     pos = 0.0
     for f in j.fills_:
         pos += f["qty"] if f["side"] == "BUY" else -f["qty"]

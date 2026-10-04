@@ -9,6 +9,7 @@ or simply in or out (want_long).
 
 from __future__ import annotations
 
+import math
 import re
 import time
 import traceback
@@ -308,8 +309,10 @@ class LongFlatStrategy(Strategy):
         # price until it does (_settle_maker), and the fee model to credit what a backtest would have
         # filled at the maker fee by then (set by the paper node with ScheduleFeeModel.maker_cap).
         self._settling: dict[str, object] = {}
+        self._fees_journaled: dict[str, float] = {}  # paper: each post-only order's fees as journaled
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
+        self._resized_ns = None  # when the exits were last resized (_rest_exits)
         self._fill_half_spread: dict[str, float] = {}
         self.fee_model = None
         # Replay only: the trade the simulated venue is filling on. Live, the data engine caches each trade
@@ -691,6 +694,7 @@ class LongFlatStrategy(Strategy):
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
     def on_bar(self, bar: Bar) -> None:
+        self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
             return
@@ -939,13 +943,7 @@ class LongFlatStrategy(Strategy):
         signal.setdefault("price", last)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
         if maker:
-            # Join the best bid (to buy) or ask (to sell), so the order adds liquidity rather than taking
-            # it. Without quotes (a backtest on bars), one tick inside the last trade.
-            if self._bid is not None and self._ask is not None:
-                raw = self._bid if side == OrderSide.BUY else self._ask
-            else:
-                raw = last - tick if side == OrderSide.BUY else last + tick
-            px = Price(raw, self.instrument.price_precision)
+            px = Price(self._maker_price(side, last, tick), self.instrument.price_precision)
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
                                              price=px, time_in_force=TimeInForce.GTC, post_only=True)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
@@ -966,6 +964,18 @@ class LongFlatStrategy(Strategy):
             self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
+
+    def _maker_price(self, side, last: float, tick: float) -> float:
+        """Where a post-only order rests: at the best bid (to buy) or ask (to sell), so it adds liquidity
+        rather than taking it. Without quotes (a backtest on bars, or paper before its first quote) the bid
+        and ask are estimated as the last trade less or plus the half spread the run assumes, and at least
+        a tick away. One rule for paper and backtests: the backtest used to rest a tick inside the last
+        trade, nearer than paper's bid, and filled up to 34 points more often (review round 9, M9-3)."""
+        if self._bid is not None and self._ask is not None:
+            return self._bid if side == OrderSide.BUY else self._ask
+        away = max(tick, last * self._cfg.assumed_half_spread)
+        steps = math.ceil(away / tick - 1e-9)  # whole ticks, never nearer than the half spread
+        return last - steps * tick if side == OrderSide.BUY else last + steps * tick
 
     def _maker_timeout(self, event) -> None:
         """The post-only order has waited long enough: cancel what is left; the cancel's confirmation
@@ -1070,11 +1080,15 @@ class LongFlatStrategy(Strategy):
         volume that trades through its price over the whole wait, BOOK_SHARE of it, and sends the rest at
         market when the wait runs out. Paper's venue fills it whole on the first trade through, and
         maker_allowance charged the maker fee only on what had traded through by then, the rest the
-        taker fee and half the spread. Here paper settles to what the backtest would have done:
-        - what traded through since counts at the maker fee too, and its fees come back;
-        - the rest is priced as the backtest's market order, at the price now rather than this order's.
-        The difference goes on the next fill's fee (ScheduleFeeModel.pending_credit), so the paper
-        account and the journal stay one book; a restart before that fill drops it (review round 8, M8-5)."""
+        taker fee and half the spread. Here paper settles the order to what the backtest would have done:
+        - what traded through since counts at the maker fee too;
+        - the rest is the backtest's market order, at the price now rather than this order's, with the
+          taker fee and half the spread on that.
+        The journal rewrites this order's own fills to that price and fee, so the trade they belong to
+        carries the settlement (review round 9, M9-3: it used to land on the next fill's fee, which went
+        negative and moved P&L and R to the next trade). The paper account can't be changed in place, so
+        the difference waits in ScheduleFeeModel.pending_credit until the next fill; marks and
+        reconcile count it meanwhile (_mark), and a restart rebuilds from the journal, which has it."""
         charged = self._maker_filled.get(coid)
         if charged is None or order is None or self.fee_model is None:
             return
@@ -1082,19 +1096,24 @@ class LongFlatStrategy(Strategy):
         through = self._through.get(coid, 0.0)
         final = min(filled, BOOK_SHARE * through)
         extra, taker = max(final - charged, 0.0), filled - final
-        if taker <= 1e-12 and extra <= 1e-12:
+        if (taker <= 1e-12 and extra <= 1e-12) or filled <= 0:
             return
         fm, px, last = self.fee_model, float(order.avg_px or order.price.as_double()), self._price()
-        gap = float(fm.fees.taker) + self._fill_half_spread.get(coid, 0.0) - float(fm.fees.maker)
-        fees_back = extra * px * gap
-        # A buy at market now pays more than this order did when the price has risen since; a sell gets less.
-        repriced = taker * (last - px) * (1 if order.is_buy else -1) if last > 0 else 0.0
-        fm.pending_credit += fees_back - repriced
+        market = last if last > 0 else px
+        half = self._fill_half_spread.get(coid, 0.0)
+        fee = final * px * float(fm.fees.maker) + taker * market * (float(fm.fees.taker) + half)
+        shift = taker * (market - px)  # a buy at market now costs this much more; a sell brings this much more
+        was = self._fees_journaled.get(coid, 0.0)
+        credit = was - fee - (shift if order.is_buy else -shift)
+        fm.pending_credit += credit
+        settled_px = px + shift / filled
+        if self.runtime is not None:
+            self.runtime.store.settle_order(coid, price=settled_px, fee=fee)
         msg = (f"Post-only order {coid} filled {filled:.8g} on the first trade through its price, and {through:.8g} "
                f"traded through it before its wait ran out. Settled as a backtest fills it: {final:.8g} "
                f"({BOOK_SHARE:.0%} of what traded through) at the maker fee, and {taker:.8g} as the market order sent "
-               f"when the wait ran out, at {last:,.6g} rather than {px:,.6g}. "
-               f"{abs(fees_back - repriced):,.2f} {'comes off' if fees_back >= repriced else 'goes on'} the next fill's fee")
+               f"when the wait ran out, at {market:,.6g} rather than {px:,.6g}. Its fills now read {settled_px:,.6g} "
+               f"with {fee:,.2f} in fees (were {px:,.6g} and {was:,.2f})")
         self.log.info(msg)
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "info", "maker_fill_settled", msg, ts=self.runtime.now())
@@ -1105,6 +1124,7 @@ class LongFlatStrategy(Strategy):
         self._capped.pop(coid, None)
         self._fill_half_spread.pop(coid, None)
         self._settling.pop(coid, None)
+        self._fees_journaled.pop(coid, None)
 
     def _lot(self) -> Decimal:
         """The smallest size an order carries: the instrument's step, never finer than the account can hold
@@ -1217,6 +1237,8 @@ class LongFlatStrategy(Strategy):
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
         cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
+        if self.fee_model is not None and not self._backtest:
+            cash += getattr(self.fee_model, "pending_credit", 0.0)  # settled in the journal, not yet in the account
         qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
         return cash + qty * price, cash, qty, price
 
@@ -1390,15 +1412,30 @@ class LongFlatStrategy(Strategy):
                 self._rest_exits()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 self._exit_lock = True  # as in paper: no re-entry until the signal has gone flat
-                # Paper's stop cancels an entry still working before it sells (_sell_all); so does this.
-                for order in self._working():
-                    if order.side == OrderSide.BUY and order.status not in (OrderStatus.PENDING_CANCEL,):
-                        if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
-                            self._cancel_on_accept.add(str(order.client_order_id))
-                        else:
-                            self.cancel_order(order.client_order_id)
+                # Paper's stop sells the whole position and cancels an entry still working (_sell_all); so does
+                # this. A slice that filled after the stop last grew is sold at market with what is left.
+                intent = self.decisions[str(event.client_order_id)]["intent"]
+                if done and self._entry_qty > 1e-12 and self._is_long():
+                    what = "Stop-loss" if intent == "stop_loss" else "Take-profit"
+                    self._sell_all(intent, f"{what}: the rest of the position, which filled after the resting "
+                                           "order was last sized", {"price": px})
+                else:
+                    for order in self._working():
+                        if order.side == OrderSide.BUY and order.status not in (OrderStatus.PENDING_CANCEL,):
+                            if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
+                                self._cancel_on_accept.add(str(order.client_order_id))
+                            else:
+                                self.cancel_order(order.client_order_id)
         if self.runtime is not None:
             fee = event.commission.as_double() if event.commission is not None else 0.0
+            if self.fee_model is not None and not self._backtest:
+                # The paper account took an earlier order's settlement off this fill's commission; the journal
+                # already has it on that order (_settle_maker), so this fill keeps its own fee.
+                fee += getattr(self.fee_model, "credit_applied", {}).pop(coid, 0.0)
+                if coid in self._settling or not done:
+                    self._fees_journaled[coid] = self._fees_journaled.get(coid, 0.0) + fee
+                else:
+                    self._fees_journaled.pop(coid, None)
             self.runtime.on_fill(
                 side="BUY" if event.is_buy else "SELL",
                 qty=event.last_qty.as_double(),
@@ -1423,6 +1460,15 @@ class LongFlatStrategy(Strategy):
             return
         resting = self._resting_exits()
         if resting:
+            # At most one resize per moment of the run. The simulated venue matches its resting orders against
+            # the current bar again on every command, without using up what they took, so a resize there
+            # fills the post-only entry once more, whose fill would ask for another resize: a chain that
+            # took the whole entry from one bar. A later slice at the same moment waits for the next event.
+            now = self.clock.timestamp_ns()
+            if now == self._resized_ns:
+                self._resize_due = True
+                return
+            self._resized_ns = now
             self._resize_exits(resting, plan)
             return
         qty = self._position_qty(free=True).quantize(self._lot(), rounding=ROUND_DOWN)

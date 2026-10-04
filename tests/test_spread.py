@@ -29,13 +29,13 @@ def test_a_sell_takes_the_bid(prices, instrument):
 
 def test_a_maker_fill_pays_no_spread(instrument):
     day = [10_000.0] * 1440
-    dip = [10_000.0 - (i % 3) for i in range(1440)]  # trades through one tick under the last price
+    dip = [10_000.0 - (i % 12) for i in range(1440)]  # trades through the estimated bid, $10 under the last
     m = _minutes(day + dip)
     res = run_backtest("buy_and_hold", _daily(m), instrument, {"maker_wait_minutes": 15}, exec_prices=m,
                        half_spread=0.001)
     fill = res.fills.iloc[0]
     assert fill["liquidity_side"] == "MAKER" and res.spread_paid == 0
-    assert float(fill["avg_px"]) == pytest.approx(9_999.99)
+    assert float(fill["avg_px"]) == pytest.approx(9_990.00)  # the bid: the last trade less the half spread
 
 
 def test_without_a_measurement_the_venue_assumption_is_used(prices, instrument):

@@ -95,9 +95,12 @@ class ScheduleFeeModel(FeeModel):
         # charged as the market order it would have been: the taker fee and half the spread (review
         # round 8, M8-5). Set by the paper node to the strategy's LongFlatStrategy.maker_allowance.
         self.maker_cap = None
-        # Paper only: fees to give back on the next fill, from post-only orders that a backtest would have
-        # filled at the maker fee by the end of their wait (LongFlatStrategy._settle_maker).
+        # Paper only: what the account owes back (or is owed) from post-only orders settled to the backtest's
+        # fills when their wait ran out (LongFlatStrategy._settle_maker), paid on the next fill.
         self.pending_credit = 0.0
+        # Paper only: how much of it each order's commission took off, by client order id, so the journal
+        # can record that fill's own fee (the settlement is already on the order it came from).
+        self.credit_applied: dict[str, float] = {}
 
     def rate_for(self, order) -> Decimal:
         return self.fees.maker if getattr(order, "is_post_only", False) else self.fees.taker
@@ -105,6 +108,9 @@ class ScheduleFeeModel(FeeModel):
     def get_commission(self, order, fill_quantity, fill_px, instrument) -> Money:
         notional = fill_quantity.as_decimal() * fill_px.as_decimal()
         credit, self.pending_credit = Decimal(str(self.pending_credit)), 0.0
+        if credit:
+            coid = str(order.client_order_id)
+            self.credit_applied[coid] = self.credit_applied.get(coid, 0.0) + float(credit)
         if self.maker_cap is not None and getattr(order, "is_post_only", False):
             maker_qty, half = self.maker_cap(order, fill_quantity.as_double())
             maker = min(Decimal(str(maker_qty)), fill_quantity.as_decimal())

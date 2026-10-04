@@ -167,9 +167,9 @@ def _maker_both(tmp_path, size, min_level="warning"):
 
 def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_path):
     """Deep trades (a whole unit a second against orders of 0.08): both paths fill every post-only
-    order whole, at the maker fee, in the same minute or the next. Paper joins the best bid or ask,
-    and the backtest (which has no quotes) one tick inside the last trade, so the backtest's price is
-    up to the half spread (1 bp) worse, never better."""
+    order whole, at the maker fee, in the same minute or the next. Paper joins the best bid or ask, and
+    the backtest (which has no quotes) the bid or ask it estimates from the last trade and the half
+    spread, so both rest at the same price to within rounding (review round 9, M9-3)."""
     orders, fills, events, j = _maker_both(tmp_path, size=1.0)
     ticks = _by_order(fills, {o["order_id"]: o["intent"] for o in orders})
     bar = _by_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
@@ -182,10 +182,10 @@ def test_maker_orders_trade_the_same_on_ticks_and_bars_where_plenty_trades(tmp_p
         assert timedelta(0) <= b[2] - t[2] <= timedelta(minutes=1), (t, b)
         assert b[3] == pytest.approx(t[3], rel=2e-3), (t, b)
         worse = (b[4] / t[4] - 1) * 1e4 * (1 if t[0] == "BUY" else -1)  # bp the backtest's price is worse
-        assert 0 <= worse <= 1.5, (t, b)
+        assert abs(worse) <= 0.5, (t, b)
 
 
-_SETTLED = re.compile(r"filled ([\d.e-]+) on the first.*?it: ([\d.e-]+) \(.*?([\d,.]+) (comes off|goes on)")
+_SETTLED = re.compile(r"filled ([\d.e-]+) on the first.*?it: ([\d.e-]+) \(")
 
 
 @pytest.mark.parametrize("size", [0.0005, 0.002])
@@ -193,11 +193,13 @@ def test_where_little_trades_paper_settles_maker_fills_to_the_backtests(tmp_path
     """Thin trades: the backtest gives each post-only order at most BOOK_SHARE of what trades through
     its price over its wait, then sends the rest at market. Paper's simulated venue fills the order
     whole on the first trade through, so paper charges the maker fee on that share only and settles the
-    rest as the backtest's market order when the wait runs out (review round 8, M8-5). Paper's maker
-    share is then within 10 points of the backtest's, and its P&L within 0.1% of capital."""
+    rest as the backtest's market order when the wait runs out (review round 8, M8-5). The settlement
+    rewrites that order's own fills, so no fee row goes negative or lands on another trade (review
+    round 9, M9-3). Paper's maker share is then within 10 points of the backtest's, and its P&L within
+    0.1% of capital."""
     orders, fills, all_events, j = _maker_both(tmp_path, size=size, min_level="info")
     events = [e for e in all_events if e["kind"] == "maker_fill_settled"]  # newest first
-    assert events and not [e for e in all_events if e["kind"] == "maker_fill_above_tape"]
+    assert events and not [e for e in all_events if e["kind"] in ("maker_fill_above_tape", "reconcile_mismatch")]
     settled_qty = sum(float(_SETTLED.search(e["message"]).group(1)) for e in events)
     maker = sum(float(_SETTLED.search(e["message"]).group(2)) for e in events)
     paper_qty = sum(f["qty"] for f in fills)
@@ -205,13 +207,12 @@ def test_where_little_trades_paper_settles_maker_fills_to_the_backtests(tmp_path
     bt_qty = sum(f["qty"] for f in j.fills_)
     bt_share = sum(f["qty"] for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT") / bt_qty
     assert bt_share < 0.7 and abs(paper_share - bt_share) <= 0.10, (paper_share, bt_share)
-    # The settlement of the last order lands on the next fill's fee; there is none here, so count it in.
-    newest = _SETTLED.search(events[0]["message"])
-    pending = 0.0
-    if events[0]["ts"] >= fills[-1]["ts"]:
-        pending = float(newest.group(3).replace(",", "")) * (1 if newest.group(4) == "comes off" else -1)
+    # Every fee row is a fee: between the maker rate and the taker rate plus half the spread.
+    half = SPREAD / 2 / 60_000
+    for f in fills:
+        assert 0.004 - 1e-6 <= f["fee"] / (f["qty"] * f["price"]) <= 0.008 + 2 * half + 1e-6, f
     last = j.equity[-1]["price"]
-    paper, bt = _pnl(fills, last) + pending, _pnl(j.fills_, last)
+    paper, bt = _pnl(fills, last), _pnl(j.fills_, last)
     assert abs(paper - bt) <= 0.001 * 10_000, (paper, bt)
 
 
