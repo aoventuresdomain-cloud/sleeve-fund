@@ -3,11 +3,11 @@ exit on an ATR trailing stop. Shows how a plain-English idea maps onto the templ
 
 from __future__ import annotations
 
-from nautilus_trader.indicators import ExponentialMovingAverage, RelativeStrengthIndex
+from nautilus_trader.indicators import ExponentialMovingAverage
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Atr, Sma
+from sleeve_fund.strategies.indicators import Atr, Rsi, Sma
 
 SPEC = IdeaSpec(
     summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
@@ -49,7 +49,7 @@ class RsiPullback(LongFlatStrategy):
     def __init__(self, config: RsiPullbackConfig) -> None:
         super().__init__(config)
         self.c = config
-        self.rsi = RelativeStrengthIndex(config.rsi_period)
+        self.rsi = Rsi(config.rsi_period)  # the standard RSI, as the chart draws it
         self.ema = ExponentialMovingAverage(config.ema_period)
         self.vol = Sma(config.vol_period)
         self.atr = Atr(config.atr_period)
@@ -73,7 +73,7 @@ class RsiPullback(LongFlatStrategy):
             return close >= self._peak - self.c.atr_mult * self.atr.value  # False = trailing stop hit
         self._peak = None
         entry = (
-            self.rsi.value * 100 < self.c.rsi_entry  # Nautilus RSI runs 0 to 1
+            self.rsi.value < self.c.rsi_entry
             and close > self.ema.value
             and bar.volume.as_double() > self.c.vol_mult * self._prev_vol_avg
         )
@@ -83,7 +83,7 @@ class RsiPullback(LongFlatStrategy):
 
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         c, close = self.c, bar.close.as_double()
-        rsi, vol, avg = self.rsi.value * 100, bar.volume.as_double(), self._prev_vol_avg or 0.0
+        rsi, vol, avg = self.rsi.value, bar.volume.as_double(), self._prev_vol_avg or 0.0
         values = {"rsi": rsi, f"ema_{c.ema_period}": self.ema.value, "volume_x": vol / avg if avg else None,
                   "atr": self.atr.value}
         if target:

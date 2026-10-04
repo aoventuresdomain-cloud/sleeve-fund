@@ -393,8 +393,10 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
 TEST_STRATEGIES = {
     "ping_pong": ({"rise": 0.01, "dip": 0.005},
                   lambda s: 60_000 * (1 + 0.015 * np.sin(s / 600) + 0.001 * np.sin(s / 17) + 2e-6 * s)),
+    # Wilder's RSI(14), the standard one, is smoother than the engine's exponential RSI it once traded on
+    # (review round 11, M11-1): a 1.2% swing over about 40 minutes takes it past both bands.
     "rsi_bands": ({},
-                  lambda s: 60_000 * (1 + 0.004 * np.sin(s / 240) + 0.0008 * np.sin(s / 29))),
+                  lambda s: 60_000 * (1 + 0.006 * np.sin(s / 400) + 0.0008 * np.sin(s / 29))),
 }
 
 
@@ -580,7 +582,7 @@ def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(st
 
 PERP = {"market": "perp", "allow_short": True}
 PERP_FEES = markets.LOW_FEE_PERP
-RISK_EXITS = {"risk_pause", "risk_halt", "liquidation", "liquidation_guard"}
+RISK_EXITS = {"risk_pause", "risk_halt", "liquidation", "liquidation_cut"}
 
 
 class ProbeLS(Probe):
@@ -799,10 +801,10 @@ def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_w
     j = res.journal
     orders = sorted(j.orders_.values(), key=lambda o: o["id"])
     fills = {f["order_id"]: f for f in j.fills_}
-    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_guard" in {o["intent"] for o in orders}
+    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_cut" in {o["intent"] for o in orders}
     for opened, closed in zip(orders[::2], orders[1::2]):  # each short, then what bought it back
         assert (opened["side"], opened["intent"]) == ("SELL", "entry"), opened
-        assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_guard")
+        assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_cut")
         assert closed["filled_qty"] == pytest.approx(opened["filled_qty"])  # the whole short
         assert fills[closed["order_id"]]["price"] < opened["signal"]["liquidation_px"], (opened, closed)
     assert "liquidation" not in {o["intent"] for o in orders}  # the venue never took it

@@ -1,4 +1,4 @@
-"""Moving averages with no period limit.
+"""Moving averages with no period limit, and the standard RSI.
 
 The engine's own SimpleMovingAverage, and AverageTrueRange which averages through it, abort the
 whole process (a Rust panic, not an exception) once the period passes 1,024. A 2,000-bar average is
@@ -71,3 +71,53 @@ class Atr:
     @property
     def initialized(self) -> bool:
         return self._avg.initialized
+
+
+class Rsi:
+    """Wilder's RSI(period) on the usual 0 to 100 scale, updated with each bar's close: the first average
+    gain and loss are the mean of the first `period` changes, each later one (previous x (period - 1) + this
+    change) / period. The engine's RelativeStrengthIndex smooths exponentially (alpha 2 / (period + 1))
+    instead, which reads about 5 points off the standard RSI on minute bars and touches 30/70 about twice
+    as often, so the strategy traded a different RSI from the one the chart draws (review round 11, M11-1).
+    dashboard/static/console.js draws these same values (tests/test_indicators.py)."""
+
+    def __init__(self, period: int = 14) -> None:
+        if int(period) != period or period < 2:
+            raise ValueError("an RSI period is a whole number of bars, at least 2")
+        self.period = int(period)
+        self.reset()
+
+    def reset(self) -> None:
+        self._prev: float | None = None
+        self._gains: list[float] = []
+        self._losses: list[float] = []
+        self._avg_gain = self._avg_loss = 0.0
+        self.value = 0.0
+        self.initialized = False
+
+    def update_raw(self, close: float) -> None:
+        close = float(close)
+        if self._prev is None:
+            self._prev = close
+            return
+        change, self._prev = close - self._prev, close
+        gain, loss = max(change, 0.0), max(-change, 0.0)
+        n = self.period
+        if not self.initialized:
+            self._gains.append(gain)
+            self._losses.append(loss)
+            if len(self._gains) < n:
+                return
+            self._avg_gain, self._avg_loss = sum(self._gains) / n, sum(self._losses) / n
+            self._gains = self._losses = []
+            self.initialized = True
+        else:
+            self._avg_gain = (self._avg_gain * (n - 1) + gain) / n
+            self._avg_loss = (self._avg_loss * (n - 1) + loss) / n
+        if self._avg_loss == 0:
+            self.value = 100.0 if self._avg_gain > 0 else 50.0
+        else:
+            self.value = 100.0 - 100.0 / (1.0 + self._avg_gain / self._avg_loss)
+
+    def handle_bar(self, bar) -> None:
+        self.update_raw(bar.close.as_double())

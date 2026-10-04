@@ -357,7 +357,7 @@ window.Console = (() => {
   const rsi = (c, n) => {
     const d = c.map((x, i) => (i ? x - c[i - 1] : 0)).slice(1);
     const up = wilder(d.map((x) => Math.max(x, 0)), n), dn = wilder(d.map((x) => Math.max(-x, 0)), n);
-    return [null].concat(up.map((u, i) => (u == null ? null : dn[i] === 0 ? 100 : 100 - 100 / (1 + u / dn[i]))));
+    return [null].concat(up.map((u, i) => (u == null ? null : dn[i] === 0 ? (u > 0 ? 100 : 50) : 100 - 100 / (1 + u / dn[i]))));  // as sleeve_fund/strategies/indicators.py Rsi
   };
   const trueRange = (k) => k.close.map((_, i) => (i ? Math.max(k.high[i] - k.low[i], Math.abs(k.high[i] - k.close[i - 1]), Math.abs(k.low[i] - k.close[i - 1])) : k.high[i] - k.low[i]));
   const lo = (xs) => Math.min(...xs), hi = (xs) => Math.max(...xs);

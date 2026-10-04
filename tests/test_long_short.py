@@ -2,6 +2,7 @@
 funding, the liquidation price and guard, trade pairing, and a paper restart that carries a short."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -162,7 +163,7 @@ def test_long_only_perp_holds_the_short_leg_flat(prices, instrument):
 
 def test_rsi_bands_shorts_a_rally_on_a_perp(prices, instrument):
     # A slide pushes RSI under 30 (long), a rebound past 55 sells; the rally past 70 now opens a short.
-    # (A chop to start, not a flat line: RSI of a flat line reads as overbought.)
+    # (A chop to start, so RSI begins near 50.)
     closes = ([100.0 + (0.3 if i % 2 else -0.3) for i in range(20)] + [100 - i for i in range(1, 12)]
               + [89 + 1.5 * i for i in range(1, 15)] + [110.0] * 5)
     res = run_backtest("rsi_bands", _path(prices, closes), instrument, {"rsi_period": 5, **PERP}, half_spread=0)
@@ -216,8 +217,9 @@ def _record(path, meta, legs, px=60_000.0):
     rec.start(inst)
     s = 0
     for minutes, move in legs:
-        step = (1 + move) ** (1 / (minutes * 60))
-        for _ in range(minutes * 60):
+        # A leg of 0 minutes is a gap: one trade at the new price, nothing between.
+        step = (1 + move) ** (1 / (minutes * 60)) if minutes else 1 + move
+        for _ in range(minutes * 60 or 1):
             px *= step
             t = START + s * 1_000_000_000
             rec.quote(QuoteTick(inst.id, Price(px - 0.5, 1), Price(px + 0.5, 1), Quantity(1, 8), Quantity(1, 8),
@@ -331,3 +333,89 @@ def test_a_perp_is_sized_by_the_leverage_cap(prices, instrument):
     assert 1.9 * 10_000 < notional(perp) <= 2 * 10_000
     assert notional(spot) <= 0.33 * 10_000 + 1
     assert perp.decisions[perp.fills.index[0]]["signal"]["sized_by"] in ("2x leverage cap", "balanced risk profile cap")
+
+
+def test_a_perp_position_is_read_exactly_not_from_its_float():
+    """Review round 11, B11-2: Nautilus keeps signed_qty as a float sum of the fills, so a position filled in
+    two slices of 0.01978348 and 0.08312022 reads 0.10290369999999999. Rounded down to the lot, the exit left
+    1e-8 behind and the next entry on the other side rested no stop. The venue's quantity is exact."""
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import Quantity
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    def pos(slices, sign):
+        exact = sum(Decimal(x) for x in slices)
+        return SimpleNamespace(quantity=Quantity.from_str(str(exact)), signed_qty=sign * sum(float(x) for x in slices))
+
+    slices = ["0.01978348", "0.08312022"]
+    assert Decimal(repr(sum(float(x) for x in slices))) < Decimal("0.1029037")  # the float read is short
+    for sign in (1, -1):
+        fake = SimpleNamespace(_margin=True, _cfg=SimpleNamespace(instrument_id=None),
+                               cache=SimpleNamespace(positions_open=lambda instrument_id, ps=[pos(slices, sign)]: ps))
+        assert LongFlatStrategy._signed_qty(fake) == sign * Decimal("0.1029037")
+
+
+def test_every_perp_exit_leaves_the_book_flat_and_every_entry_rests_its_stop(prices, instrument):
+    """Review round 11, B11-2: the position was read from Nautilus' float signed_qty (0.08838354999999999
+    for 0.08838355) and the exit rounded it down, leaving one lot. The next entry on the other side then
+    counted as a reduction: no stop, no target. Every exit must close the whole position, and every entry
+    from flat must rest its stop."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    closes = list(60_000 * np.exp(np.cumsum(rng.normal(0, 0.004, 400))))
+    feed = _path(prices, closes)
+    feed["volume"] = 1.0  # the venue shows about 0.1 a bar, so each order fills in slices that float sums blur
+    params = {"rsi_period": 5, "stop_loss": 0.01, "take_profit": 0.02, **PERP}
+    res = run_backtest("rsi_bands", feed, instrument, params, half_spread=0, risk_profile="aggressive")
+    intent = {o: d["intent"] for o, d in res.decisions.items()}
+    net, opened, closed = Decimal(0), 0, {}
+    for f in res.journal.fills_:  # in fill order, slice by slice
+        before = net
+        net += Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] == "entry":
+            opened += before == 0
+        else:
+            closed[f["order_id"]] = net
+    assert opened >= 6 and closed
+    # An exit order, once wholly filled, leaves nothing behind.
+    assert all(net_after == 0 for oid, net_after in closed.items()
+               if oid != res.journal.fills_[-1]["order_id"]), closed
+    # Every entry from flat rested a stop: as many stop orders sent as entries opened from flat (the run may
+    # end with one still resting), and no round trip was closed by the next entry.
+    stops = sum(1 for d in res.decisions.values() if d["intent"] == "stop_loss")
+    assert stops >= opened - 1, (stops, opened)
+
+
+def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(prices, instrument):
+    """Review round 11, M11-3: the liquidation close never traded (its intent wasn't journaled), so the
+    short stayed open past liquidation. Shorted at 101.5, a gap to 160 is through any capped leverage."""
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 160.0, 160.0, 160.0]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    assert not res.handler_errors, res.handler_errors
+    fills = res.fills.sort_values("ts_last", kind="stable")
+    intents = [res.decisions[o]["intent"] for o in fills.index]
+    assert "liquidation" in intents, intents
+    liq = fills.index[intents.index("liquidation")]
+    assert fills.loc[liq, "side"] == "BUY"
+    assert "Liquidated" in res.decisions[liq]["reason"]
+    assert res.exposure.iloc[-1] == pytest.approx(0, abs=1e-9)  # closed, and halted: nothing reopened
+    assert "liquidation" in {e["kind"] for e in res.risk_events}
+
+
+def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path):
+    """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
+    as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
+    from sleeve_fund.research.replay import replay
+
+    path = tmp_path / "gap.jsonl.gz"
+    _record(path, _meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP}), [(5, 0.0), (20, 0.015), (2, 0.0), (0, 0.7), (3, 0.0)])
+    orders, fills = replay(path, with_fills=True)
+    kinds = [(o["side"], o["intent"]) for o in orders]
+    assert ("SELL", "entry") in kinds and ("BUY", "liquidation") in kinds, kinds
+    liq = next(o for o in orders if o["intent"] == "liquidation")
+    assert liq["filled_qty"] > 0 and liq["status"] == "filled"
+    # Nothing after it: the strategy is halted with the book closed.
+    assert orders[-1] is liq
