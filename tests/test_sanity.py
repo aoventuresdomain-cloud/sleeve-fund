@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 from nautilus_trader.model import Bar
 
-from sleeve_fund import markets
+from sleeve_fund import markets, risk
 from sleeve_fund.instruments import BOOK_SHARE
 from sleeve_fund.paper.recorder import Recorder
 from sleeve_fund.research.replay import replay
@@ -599,10 +599,18 @@ class ProbeShort(Probe):
         return -1
 
 
+class ProbeLong(Probe):
+    """Long from the first bar, and stays long."""
+
+    def want_side(self, bar):
+        return 1
+
+
 @pytest.fixture(autouse=True)
 def _probe_ls(monkeypatch):
     monkeypatch.setitem(REGISTRY, "probe_ls", (ProbeLS, ProbeConfig))
     monkeypatch.setitem(REGISTRY, "probe_short", (ProbeShort, ProbeConfig))
+    monkeypatch.setitem(REGISTRY, "probe_long", (ProbeLong, ProbeConfig))
 
 
 def _ls_bars(closes, minutes=60, start="2025-10-03"):
@@ -698,6 +706,8 @@ def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
     res = run_backtest("probe_ls", bars, TICK_INST, {"period": 24, **PERP}, starting_capital=10_000,
                        risk_profile="balanced", bar_minutes=60, half_spread=HALF)
     j = res.journal
+    entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
+    assert entries and all(o["signal"]["sized_by"] == "2x leverage cap" for o in entries)  # funding on 2x
     held, cash = 0.0, 10_000.0
     for f in j.fills_:
         sign = 1 if f["side"] == "BUY" else -1
@@ -722,6 +732,64 @@ def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
     assert res.equity.iloc[-1] == pytest.approx(cash + total + held * c[-1], abs=0.05)
 
 
+def _swing(n=400):
+    s = np.arange(0, n * 60, 60)
+    return _ls_bars(60_000 * (1 + 0.03 * np.sin(s / 9_000) + 0.004 * np.sin(s / 700)), minutes=60)
+
+
+@pytest.mark.parametrize("profile", ["conservative", "balanced", "aggressive"])
+def test_a_perp_entry_takes_the_leverage_cap_and_its_liquidation_price_is_where_the_margin_runs_out(profile):
+    """Sizing on a perp (PM decision, 4 Oct): every entry, long or short, is the profile's leverage cap of
+    equity (less the cash buffer and fee, never over it), and the liquidation price it reports is where
+    equity falls to the maintenance margin: below the entry for a long, above it for a short, at the
+    textbook (1 -/+ 1/leverage) / (1 -/+ maintenance) of the entry, and outside the profile's minimum
+    distance. A long at 1x is fully paid for and has none."""
+    prof = risk.PROFILES[profile]
+    j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
+                     risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
+    entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
+    assert {o["side"] for o in entries} == {"BUY", "SELL"}
+    m = float(PERP_FEES.maintenance_margin)
+    for o in entries:
+        sig = o["signal"]
+        assert sig["sized_by"] == f"{prof.max_leverage:g}x leverage cap", sig
+        if o["side"] == "BUY" and prof.max_leverage <= 1:
+            assert "liquidation_px" not in sig, sig
+            continue
+        lev, liq, close = sig["leverage"], sig["liquidation_px"], sig["close"]
+        assert prof.max_leverage * 0.97 <= lev <= prof.max_leverage, sig
+        side = 1 if o["side"] == "BUY" else -1
+        assert (liq < close) if side > 0 else (liq > close), sig
+        assert liq / close == pytest.approx((1 - side / lev) / (1 - side * m), rel=2e-3), sig
+        assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
+
+
+@pytest.mark.parametrize(("profile", "stop", "refused"), [
+    ("balanced", 0.20, False), ("balanced", 0.30, True),  # 2x: liquidation ~50% away, stop at most half
+    ("aggressive", 0.10, False), ("aggressive", 0.20, True),  # 3x: ~33% away
+])
+def test_an_entry_whose_stop_sits_past_the_profiles_share_of_the_way_to_liquidation_is_refused(profile, stop,
+                                                                                                refused):
+    """With leverage binding, the stop-to-liquidation rule decides: a stop further than the profile's share
+    of the distance to liquidation refuses the entry; one inside it enters, and its stop then sits between
+    the entry and the liquidation price, at most that share of the way."""
+    prof = risk.PROFILES[profile]
+    j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, "stop_loss": stop, **PERP},
+                     starting_capital=10_000, risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
+    entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
+    if refused:
+        assert not entries and not j.fills_
+        return
+    assert entries
+    for o in entries:
+        sig = o["signal"]
+        close, liq = sig["close"], sig["liquidation_px"]
+        side = 1 if o["side"] == "BUY" else -1
+        stop_px = close * (1 - side * sig["stop_frac"])
+        assert (liq < stop_px < close) if side > 0 else (close < stop_px < liq), sig
+        assert abs(stop_px - close) <= prof.stop_to_liquidation * abs(liq - close) + 1e-6, sig
+
+
 @pytest.mark.parametrize("profile", ["conservative", "balanced", "aggressive"])
 def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_would_liquidate(profile):
     """A short caught in a steady rally to three times its price: the daily-loss pause and the drawdown halt
@@ -732,11 +800,34 @@ def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_w
                        half_spread=HALF)
     j = res.journal
     orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    fills = {f["order_id"]: f for f in j.fills_}
     assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_cut" in {o["intent"] for o in orders}
     for opened, closed in zip(orders[::2], orders[1::2]):  # each short, then what bought it back
         assert (opened["side"], opened["intent"]) == ("SELL", "entry"), opened
         assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_cut")
         assert closed["filled_qty"] == pytest.approx(opened["filled_qty"])  # the whole short
+        assert fills[closed["order_id"]]["price"] < opened["signal"]["liquidation_px"], (opened, closed)
+    assert "liquidation" not in {o["intent"] for o in orders}  # the venue never took it
+    assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
+    assert res.equity.iloc[-1] > 0
+
+
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
+def test_a_crash_under_a_leveraged_long_is_sold_by_the_guards_before_the_venue_would_liquidate(profile):
+    """The mirror of the rally: a long at 2x or 3x in a steady fall to a third of its price is sold in
+    full by the guards at a price above its liquidation price, the book ends flat with equity left."""
+    c = np.r_[np.full(10, 60_000.0), np.linspace(60_000, 20_000, 200)]
+    res = run_backtest("probe_long", _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000,
+                       risk_profile=profile, bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    fills = {f["order_id"]: f for f in j.fills_}
+    assert orders
+    for opened, closed in zip(orders[::2], orders[1::2]):
+        assert (opened["side"], opened["intent"]) == ("BUY", "entry"), opened
+        assert closed["side"] == "SELL" and closed["intent"] in RISK_EXITS - {"liquidation"}, closed
+        assert closed["filled_qty"] == pytest.approx(opened["filled_qty"])
+        assert fills[closed["order_id"]]["price"] > opened["signal"]["liquidation_px"], (opened, closed)
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
     assert res.equity.iloc[-1] > 0
 
