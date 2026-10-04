@@ -199,37 +199,23 @@ def test_without_quotes_a_post_only_order_rests_at_the_estimated_bid(instrument)
     assert fill["type"] == "LIMIT" and float(fill["avg_px"]) == pytest.approx(9_995.00)
 
 
-def test_a_settled_order_keeps_its_settlement_on_its_own_fills(tmp_path):
-    """Review round 9, M9-3: a paper post-only order settled to the backtest's fills rewrites its own fill
-    rows (price and fee), so the journal's cash and the trade it belongs to carry it; nothing lands on
-    the next fill. The fee model says how much of an earlier settlement each commission took off."""
+def test_a_paper_maker_slice_is_charged_as_filled_at_its_limit():
+    """Review round 9, M9-3: paper sends a kept post-only order's slices at market; the fee model charges
+    each as filled at the order's limit with the maker fee, so the account matches the backtest's fill."""
     from decimal import Decimal
 
-    from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
-    from sleeve_fund.store import Store
-
-    st = Store(f"sqlite:///{tmp_path}/j.db")
-    st.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
-                     starting_balance=10_000, risk_profile="balanced")
-    st.record_order("s", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="r", order_type="POST-ONLY LIMIT")
-    for i, q in enumerate((0.04, 0.06)):
-        st.record_fill("s", side="BUY", qty=q, price=10_000.0, fee=q * 10_000 * 0.004, order_id="O-1", trade_id=f"t{i}")
-        st.update_order("O-1", fill_qty=q, fill_px=10_000.0, fee=q * 10_000 * 0.004)
-    st.settle_order("O-1", price=10_010.0, fee=6.0)
-    rows = st.fills("s")
-    assert {r["price"] for r in rows} == {10_010.0}
-    assert sorted(r["fee"] for r in rows) == pytest.approx([2.4, 3.6])
-    assert st.journal_book("s", 10_000)["cash"] == pytest.approx(10_000 - 1_001 - 6.0)
-    order = st.orders("s")[0]
-    assert order["avg_px"] == 10_010.0 and order["fee"] == 6.0
-
-    fm = ScheduleFeeModel(FeeSchedule(Decimal("0.004"), Decimal("0.008")))
-    fm.pending_credit = 3.0
     from nautilus_trader.model import Price, Quantity
+
+    from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
     from sleeve_fund.venues import venue
 
+    fm = ScheduleFeeModel(FeeSchedule(Decimal("0.004"), Decimal("0.008")))
     inst = venue("KRAKEN").instrument("BTC", "USD")
-    order = type("O", (), {"client_order_id": "O-2", "is_post_only": False})()
-    fee = fm.get_commission(order, Quantity(0.1, 8), Price(10_000, 2), inst)
-    assert fee.as_double() == pytest.approx(0.1 * 10_000 * 0.008 - 3.0)
-    assert fm.credit_applied == {"O-2": 3.0} and fm.pending_credit == 0.0
+    fm.maker_slices = {"B": (Decimal("10000"), True), "S": (Decimal("10000"), False)}
+    slice_ = lambda coid: type("O", (), {"client_order_id": coid, "is_post_only": False})()  # noqa: E731
+    # A buy filled at 9,990 pays 10 more a unit; a sell filled at 10,010 gives 10 back: both at 10,000 net.
+    buy = fm.get_commission(slice_("B"), Quantity(0.1, 8), Price(9_990, 2), inst).as_double()
+    sell = fm.get_commission(slice_("S"), Quantity(0.1, 8), Price(10_010, 2), inst).as_double()
+    assert buy == pytest.approx(0.1 * 10_000 * 0.004 + 1.0) and sell == pytest.approx(0.1 * 10_000 * 0.004 + 1.0)
+    assert 0.1 * 9_990 + buy == pytest.approx(0.1 * 10_000 * 1.004)
+    assert 0.1 * 10_010 - sell == pytest.approx(0.1 * 10_000 * 0.996)

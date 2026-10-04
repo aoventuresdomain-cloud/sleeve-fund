@@ -9,6 +9,8 @@ import pytest
 from sleeve_fund.paper.recorder import Recorder
 from sleeve_fund.research.replay import comparable, replay
 
+# Live paper sessions and the orders paper sent. The maker sessions' orders were re-recorded when paper began
+# filling post-only orders in slices, as backtests do (review round 9, M9-3): the venue used to fill them whole.
 RECORDINGS = Path(__file__).parent / "data" / "replay"
 START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, in nanoseconds
 
