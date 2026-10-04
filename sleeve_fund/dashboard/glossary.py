@@ -10,7 +10,7 @@ GLOSSARY = {
     "cash": "Uninvested money. Open P&L is the unrealised gain or loss on open positions.",
     "drawdown": "How far equity is below its highest point so far. Each risk profile halts a strategy at a set drawdown.",
     "sharpe": "Return per unit of risk: annual return divided by annual volatility. Above 1 is good; buy-and-hold is the bar to beat. Needs at least 30 days to mean much.",
-    "fees": "Venue trading fees paid (Kraken). Every order is charged the taker fee, the higher of the two.",
+    "fees": "Venue trading fees paid. Market orders and protective exits pay the taker rate; maker-first orders pay the maker rate on what fills while they rest. The bid-ask spread is shown apart.",
     "volatility": "How much daily returns swing, scaled to a year. Higher means a bumpier ride.",
     "cagr": "Compound annual growth rate: the steady yearly return that would give the same end result.",
     "win_rate": "Share of closed trades that made money after both fees. A low win rate can still be profitable if wins are much bigger than losses.",

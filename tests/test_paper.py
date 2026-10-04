@@ -157,6 +157,42 @@ def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     assert events == [("s1", "info", "warmup", "Loaded 3 of 3 warm-up bars from the history store")]
 
 
+def test_warm_up_runs_up_to_now_and_says_any_hole_left(tmp_path):
+    """R3-M7: the store can be up to 6 h behind. The venue's own recent candles fill the gap up to the
+    first live bar; without them the warm-up event says how many bars are missing."""
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.venues import venue
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    store = _store_with_minutes(tmp_path, now - pd.Timedelta(hours=3) + pd.Timedelta(minutes=1), 10 * 60)
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+
+    def recent(pair, minutes):  # the venue's last 12 hourly candles by open time, the newest forming
+        assert (pair, minutes) == ("BTC/USD", 60)
+        idx = pd.date_range(end=now, periods=12, freq="1h", tz="UTC")
+        c = np.full(12, 500.0)
+        return pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx)
+
+    bars = history_loader("KRAKEN", "BTC/USD", store, recent=recent)(instrument, bt, 6)
+    closes = [pd.Timestamp(b.ts_event, tz="UTC") for b in bars]
+    assert closes == [now - pd.Timedelta(hours=h) for h in range(5, -1, -1)]  # no hole, nothing forming
+    assert [b.close.as_double() for b in bars][-3:] == [500.0] * 3  # the venue's candles after the store's
+
+    events = []
+    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
+                            warmup_bars=6)
+    s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))  # no venue candles
+    s.instrument, s.runtime = instrument, runtime
+    s._warm_from_history()
+    (_, level, kind, msg), = events
+    assert level == "warning" and kind == "warmup" and "3 bars before the first live bar are missing" in msg
+
+
 def test_a_stale_history_store_is_not_used_for_warm_up(tmp_path):
     import pandas as pd
 

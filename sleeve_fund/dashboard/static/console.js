@@ -404,7 +404,8 @@ window.Console = (() => {
           <tr><td>Worst drawdown</td><td class="num">${f(d.strategy.max_drawdown)}</td><td class="num">${f(d.hold.max_drawdown)}</td></tr>
           <tr><td>Closed trades</td><td class="num">${d.trades.trades}${d.trades.trades ? ` · ${f(d.trades.win_rate, 0).replace("+", "")} won` : ""}</td><td class="num">1</td></tr>
           <tr><td>Fees paid</td><td class="num">${money.format(d.fees)}</td><td class="num"></td></tr></tbody></table>
-          <p class="muted" style="margin:8px 0 0;font-size:12px">${d.pair}, ${d.from} to ${d.to} (${d.days} days), daily decisions. In-sample: a sense check, not a G1 test.</p>`;
+          <p class="muted" style="margin:8px 0 0;font-size:12px">${d.pair}, ${d.from} to ${d.to} (${d.days} days), deciding every ${d.every || "day"}. In-sample: a sense check, not a G1 test.</p>`;
+        if (d.fallback) box.appendChild(Object.assign(document.createElement("p"), {className: "banner warn", style: "margin:6px 0 0;font-size:12px", textContent: d.fallback}));
         if (d.risk && d.risk.note) box.appendChild(Object.assign(document.createElement("p"), {className: d.risk.halted ? "banner warn" : "muted", style: "margin:6px 0 0;font-size:12px", textContent: d.risk.note}));
         if (d.execution && d.execution.note) box.appendChild(Object.assign(document.createElement("p"), {className: "muted", style: "margin:6px 0 0;font-size:12px", textContent: `${d.execution.maker_orders} of ${d.execution.orders} orders filled as maker. ${d.execution.note}`}));
         if (chart) chart.destroy();

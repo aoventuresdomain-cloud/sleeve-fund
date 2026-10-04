@@ -1,5 +1,6 @@
 """Backtests with a risk profile run the paper runtime, so the guard acts as it would in paper."""
 
+import pandas as pd
 import pytest
 
 from sleeve_fund.research.runner import run_backtest
@@ -122,3 +123,38 @@ def test_a_halt_and_an_exit_on_the_same_bar_sell_once(instrument):
     same_bar = [o for o in orders if o["side"] == "SELL" and o["ts"] == halt[0]["ts"]]
     assert [o["intent"] for o in same_bar] == ["risk_halt"]
     assert rt.store.journal_book("backtest", 10_000)["qty"] >= 0
+
+
+def _minutes_to_daily(m):
+    g = m.resample("1D", closed="right", label="right")
+    return pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+                         "close": g["close"].last(), "volume": g["volume"].sum()}).dropna()
+
+
+def test_the_guard_checks_every_execution_bar_like_paper(instrument):
+    """Review round 3, R3-M1: paper values the book every 30 s, so a daily-loss pause fires near its
+    limit. A backtest fed minute bars now does the same instead of waiting for the day's close."""
+    import numpy as np
+
+    days = 12
+    idx = pd.date_range("2024-01-01 00:01", periods=days * 1440, freq="1min", tz="UTC")
+    close = np.full(len(idx), 100.0)
+    crash = slice(10 * 1440, 11 * 1440)  # day 11 falls 40% minute by minute, then stays there
+    close[crash] = np.linspace(100.0, 60.0, 1440)
+    close[11 * 1440:] = 60.0
+    m = pd.DataFrame({"open": np.concatenate([[100.0], close[:-1]]), "close": close, "volume": 5.0}, index=idx)
+    m["high"], m["low"] = m[["open", "close"]].max(axis=1), m[["open", "close"]].min(axis=1)
+    daily = _minutes_to_daily(m)
+
+    def pause_sell(**kw):
+        res = run_backtest("buy_and_hold", daily, instrument, starting_capital=10_000, risk_profile="aggressive",
+                           half_spread=0.0, **kw)
+        assert [e["kind"] for e in res.risk_events][:1] == ["risk_pause"]
+        sells = res.fills[res.fills["side"] == "SELL"]
+        return float(sells.iloc[0]["avg_px"])
+
+    # Once a day: the 8% daily-loss limit is noticed at the close, after a 40% fall at a 50% position.
+    assert pause_sell() == pytest.approx(60.0, abs=0.5)
+    # Every minute: noticed as the loss passes 8%, about a 16% fall at a 50% position.
+    px = pause_sell(exec_prices=m, exec_minutes=1)
+    assert 82.0 < px < 85.0
