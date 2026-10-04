@@ -7,20 +7,31 @@ Both are set on the server only, never in code:
                           ?chat_id=... on the end. An ntfy.sh topic URL gets the plain text.
     HEALTHCHECK_PING_URL  pinged every minute (e.g. a healthchecks.io check); the monitor alerts when
                           the pings stop, which nothing on this server can do for itself.
-The supervisor runs both: sleeve processes never wait on the network to journal an event.
+The supervisor runs both, on a thread of their own, so neither the sleeves nor the supervisor's
+loop ever waits on the network. It also raises an alert when the nightly database backup is late or
+failed (BACKUP_DIR, read only).
+
+A send that times out after the far end got it is sent again next minute: a duplicate is the safer
+way to be wrong.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
+from datetime import timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 
-from sleeve_fund.store import Store
+from sleeve_fund import backups
+from sleeve_fund.store import Store, utcnow
 
 MAX_LINES = 10  # alerts listed in one message; the rest are counted
-TIMEOUT = 10
+TIMEOUT = 8
+BACKUP_CHECK = timedelta(hours=1)
+_THROUGH = re.compile(r"through event #(\d+)")
 
 
 def post(url: str, text: str) -> None:
@@ -53,15 +64,25 @@ def message(events: list[dict]) -> str:
 
 
 class Forwarder:
-    """Sends warnings and errors journaled since the last send, in one message. Starts from the
-    newest event, so a restart doesn't resend history; a failed send is retried next time."""
+    """Sends warnings and errors journaled since the last send, in one message. Picks up where the
+    last send stopped (each send journals how far it got), so alerts raised while the supervisor was
+    down still go out after a restart; a failed send is retried next time."""
 
-    def __init__(self, store: Store, environ=None, send=post, pinger=ping) -> None:
+    def __init__(self, store: Store, environ=None, send=post, pinger=ping, now=utcnow) -> None:
         env = os.environ if environ is None else environ
-        self.store, self.send, self.pinger = store, send, pinger
+        self.store, self.send, self.pinger, self.now = store, send, pinger, now
         self.url, self.ping_url = env.get("ALERT_WEBHOOK_URL") or None, env.get("HEALTHCHECK_PING_URL") or None
-        self.cursor = store.last_event_id()
+        self.backup_dir = Path(env["BACKUP_DIR"]) if env.get("BACKUP_DIR") else None
+        self.cursor = self._resume()
         self._failing = False
+        self._backup_checked = None
+        self._backup_said = None
+
+    def _resume(self) -> int:
+        last = self.store.last_event(None, ("alerts_sent",)) if self.url else None
+        m = _THROUGH.search(last["message"]) if last else None
+        newest = self.store.last_event_id()
+        return min(int(m.group(1)), newest) if m else newest
 
     def describe(self) -> str:
         alerts = f"Alerts go to {where(self.url)}" if self.url else "Alerts are not set up (ALERT_WEBHOOK_URL)"
@@ -69,7 +90,19 @@ class Forwarder:
               else "no uptime ping (HEALTHCHECK_PING_URL)")
         return f"{alerts}; {up}."
 
+    def check_backup(self) -> None:
+        """Hourly: a late or failed backup becomes a warning, said again only when the problem changes."""
+        now = self.now()
+        if self.backup_dir is None or (self._backup_checked and now - self._backup_checked < BACKUP_CHECK):
+            return
+        self._backup_checked = now
+        issue = backups.problem(self.backup_dir, now)
+        if issue and issue.split(":")[0] != self._backup_said:
+            self.store.event(None, "warning", "backup_problem", issue)
+        self._backup_said = issue.split(":")[0] if issue else None
+
     def step(self) -> None:
+        self.check_backup()
         if self.ping_url:
             try:
                 self.pinger(self.ping_url)
@@ -91,3 +124,4 @@ class Forwarder:
             return
         self._failing = False
         self.cursor = events[-1]["id"]
+        self.store.event(None, "info", "alerts_sent", f"{len(events)} sent to {where(self.url)}, through event #{self.cursor}")

@@ -7,8 +7,9 @@ name: deploy
 # Optional: SITE_ADDRESS (defaults to <DEPLOY_HOST>.sslip.io for free HTTPS without a domain).
 # Optional: ALERT_WEBHOOK_URL and HEALTHCHECK_PING_URL (see sleeve_fund/alerts.py).
 # No exchange credentials are involved: this stack is paper only.
-# Deploys only a commit whose tests passed: it runs when the tests workflow finishes green on main,
-# and a manual run checks that the tests passed on the commit it ships.
+# Deploys only main, and only a commit whose tests passed: it runs when the tests workflow finishes
+# green on a push to main, and a manual run (from main only) checks that the push run passed on the
+# commit it ships. The repository variable DEPLOY_ENABLED=true gates both.
 on:
   workflow_run:
     workflows: [tests]
@@ -23,9 +24,10 @@ jobs:
     env:
       USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' ||
-          (vars.DEPLOY_ENABLED == 'true' && github.event.workflow_run.conclusion == 'success' &&
-           github.event.workflow_run.event == 'push') }}
+      ${{ vars.DEPLOY_ENABLED == 'true' &&
+          ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+           (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' &&
+            github.event.workflow_run.head_branch == 'main')) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,8 +37,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
-          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on $GITHUB_SHA; wait for the tests workflow"; exit 1; }
+          # The push run on main, not a pull request's run, so nothing unmerged can ship.
+          ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success \
+               --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}

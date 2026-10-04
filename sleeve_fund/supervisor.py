@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -138,17 +139,25 @@ class Supervisor:
                 msg = str(exc).replace(creds[0], "***").replace(creds[1], "***")
                 self.store.event(None, "warning", "fee_fetch_failed", f"{a['name']}: {msg}")
 
+    def _send_alerts(self, alerts: Forwarder) -> None:
+        try:
+            alerts.step()
+        except Exception as exc:  # noqa: BLE001 - the dashboard shows it; the next minute tries again
+            self.store.event(None, "error", "supervisor_error", f"alerts: {exc!r}")
+
     def run(self) -> None:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "_stopping", True))
         alerts = Forwarder(self.store)
         self.store.event(None, "info", "supervisor_start", "supervisor started")
         self.store.event(None, "info", "alerts_config", alerts.describe())
-        loops = 0
+        loops, sender = 0, None
         while not self._stopping:
             try:
-                if loops % ALERT_EVERY == 0:
-                    alerts.step()
+                if loops % ALERT_EVERY == 0 and (sender is None or not sender.is_alive()):
+                    # Its own thread: a slow webhook or monitor never holds up supervising the sleeves.
+                    sender = threading.Thread(target=self._send_alerts, args=(alerts,), name="alerts", daemon=True)
+                    sender.start()
                 if loops % KEY_CHECK_EVERY == 0:
                     self.check_keys()
                 if loops % FEE_CHECK_EVERY == 0:

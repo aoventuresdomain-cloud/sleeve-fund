@@ -826,6 +826,14 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
+    def drop_pending(self, sleeve: str, why: str) -> int:
+        """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
+        pending = self.pending_commands(sleeve)
+        for cmd in pending:
+            self.mark_applied(cmd["id"])
+            self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", sleeve)
+        return len(pending)
+
     def mark_applied(self, command_id: int) -> None:
         with self.engine.begin() as c:
             c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))

@@ -221,6 +221,13 @@ def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch)
                 Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/T/secret"}).describe())
     page = c.get("/ops", auth=AUTH).text
     assert "2 kept" in page and '<span class="">Last' in page
+    assert "Copies on this server only" in page and "Lightsail snapshots cover" not in page
+    (folder / "status.json").write_text('{"ok": true, "message": "x", "restored": {"sleeves": 3, "orders": 40, '
+                                        '"fills": 41, "events": 900}}')
+    assert "Restored into a scratch database and read back (3 strategies, 40 orders, 900 events)" in c.get(
+        "/ops", auth=AUTH).text
+    (folder / "status.json").write_text('{"ok": false, "message": "pg_dump failed: disk full"}')
+    assert "Last run failed: pg_dump failed: disk full." in c.get("/ops", auth=AUTH).text
     assert "Alerts go to hooks.example.com" in page and "secret" not in page
 
 
@@ -948,25 +955,37 @@ def test_a_backtest_chart_covers_its_whole_period(client):
 
 
 def test_the_book_kill_switch_flattens_every_running_strategy(client):
-    """Review rounds 1 to 5: no book kill switch. One button on Risk sells every running strategy to
-    cash and pauses it, each with the PM's reason; a stopped one is named, since it can't sell."""
+    """Review rounds 1 to 6: one button on Risk sells every strategy still trading or holding a position
+    to cash and pauses it, each with the PM's reason. A stopped one holding a position is started just
+    to sell; a halted, flat one is left alone; a blank reason sells nothing and says why."""
     c, store = client
     _new(c)
     _new(c, name="eth-test", instrument="ETH/USD")
+    _new(c, name="sol-test", instrument="SOL/USD")
     store.record_equity("btc-test", equity=5100, cash=3000, qty=0.02, price=105000, benchmark=5050)
     store.record_equity("eth-test", equity=5000, cash=4000, qty=0.3, price=3300, benchmark=5000)
+    store.record_equity("sol-test", equity=4000, cash=4000, qty=0.0, price=150, benchmark=5000)
     store.set_desired_state("eth-test", "stopped")
+    store.set_status("sol-test", "halted", "drawdown 10.1% hit the 10% limit")
     page = c.get("/risk", auth=AUTH).text
-    assert "Flatten everything" in page and "eth-test still hold" in page
-    assert c.post("/book/flatten", data={"reason": " "}, auth=AUTH, headers=SAME).status_code == 400
+    assert "Flatten everything" in page and "All 2 strategies still trading or holding a position sell" in page
+    assert "eth-test is stopped, so it starts just to sell" in page
+    r = c.post("/book/flatten", data={"reason": " "}, auth=AUTH, headers=SAME)
+    assert "Nothing was sold: the kill switch needs a reason" in r.text and store.pending_commands("btc-test") == []
     r = c.post("/book/flatten", data={"reason": "Market event; standing aside"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert r.status_code == 303
-    (cmd,) = store.pending_commands("btc-test")
-    assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
-    assert store.pending_commands("eth-test") == []
-    assert store.decisions()[0]["action"] == "flatten everything"
+    for name in ("btc-test", "eth-test"):
+        (cmd,) = store.pending_commands(name)
+        assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
+    assert store.sleeve("eth-test").desired_state == "running"
+    assert store.pending_commands("sol-test") == []
+    assert store.decisions()[0]["action"] == "flatten everything" and "(2 strategies)" in store.decisions()[0]["reason"]
     assert c.post("/book/flatten", data={"reason": "x"}, auth=AUTH).status_code in (400, 403)  # same origin only
+    # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
+    c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
+    assert store.pending_commands("btc-test") == []
+    assert any(d["action"] == "drop flatten" and "lapsed" in d["reason"] for d in store.decisions("btc-test"))
 
 
 def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatch, tmp_path):
