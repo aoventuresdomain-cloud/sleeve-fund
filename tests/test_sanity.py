@@ -105,6 +105,10 @@ def _assert_every_fee(j):
     for f in j.fills_:
         expected = f["qty"] * f["price"] * _rate(j.orders_[f["order_id"]])
         assert f["fee"] == pytest.approx(expected, abs=CENT), (f, expected)
+    # The rounding is carried from fee to fee, so however many fills, the total stays within a cent: a
+    # one-cent tolerance per fee must not hide a bias that builds up.
+    exact = sum(f["qty"] * f["price"] * _rate(j.orders_[f["order_id"]]) for f in j.fills_)
+    assert sum(f["fee"] for f in j.fills_) == pytest.approx(exact, abs=0.0100001), (len(j.fills_), exact)
 
 
 @pytest.mark.parametrize("capital", [100.0, 10_000.0, 1_000_000.0])
@@ -425,3 +429,99 @@ def test_test_strategies_book_every_fee_and_end_flat_after_each_exit(strategy):
         after = j.fills_[i + 1] if i + 1 < len(j.fills_) else None
         if f["side"] == "SELL" and (after is None or after["side"] == "BUY"):
             assert abs(held) < float(TICK_INST.size_increment) / 2, (f, held)
+
+
+# --- market orders by default ------------------------------------------------------------------------
+
+
+def test_maker_first_orders_are_refused_while_switched_off(monkeypatch):
+    """Maker-first is behind an off switch (SLEEVE_MAKER_ORDERS): asking for it is an error, not a
+    silent post-only order at a fee the PM didn't choose."""
+    monkeypatch.delenv("SLEEVE_MAKER_ORDERS", raising=False)
+    inst, px = INSTRUMENTS["BTC"]
+    with pytest.raises(ValueError, match="switched off"):
+        _run(_bars(px, n=60, minutes=1, vol=1.0), inst, {"maker_wait_minutes": 5}, minutes=1)
+
+
+@pytest.mark.parametrize("strategy", ["probe", *TEST_STRATEGIES])
+def test_every_order_goes_at_market_and_pays_the_taker_fee_by_default(tmp_path, monkeypatch, strategy):
+    """With the switch off, every order on both paths (entries, exits, stops and targets) takes
+    liquidity: nothing post-only or limit, and every fill pays the taker fee."""
+    monkeypatch.delenv("SLEEVE_MAKER_ORDERS", raising=False)
+    params, path = TEST_STRATEGIES.get(strategy, ({"period": 7, "stop_loss": 0.004, "take_profit": 0.02},
+                                                  lambda s: 60_000 * (1 + 0.01 * np.sin(s / 700) + 0.001 * np.sin(s / 11))))
+    trades = _record(tmp_path / "s.jsonl.gz", path(np.arange(180 * 60)), params, profile="balanced", strategy=strategy)
+    orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
+    bars = trades.resample("1min", closed="left", label="right").ohlc()
+    bars["volume"] = 60 / BOOK_SHARE
+    j = run_backtest(strategy, bars, TICK_INST, params=params, starting_capital=10_000, risk_profile="balanced",
+                     bar_minutes=1, half_spread=HALF).journal
+    for name, os_ in (("paper", orders), ("backtest", list(j.orders_.values()))):
+        filled = [o for o in os_ if float(o["filled_qty"]) > 0]
+        assert len(filled) >= 4, (name, os_)
+        # A backtest's stop rests at the venue as a stop-market order: it still takes liquidity at the taker fee.
+        kinds = {(o["intent"], o["order_type"]) for o in filled}
+        assert all(t == "MARKET" or (i == "stop_loss" and t == "STOP") for i, t in kinds), (name, kinds)
+    for f in fills:
+        assert f["fee"] == pytest.approx(f["qty"] * f["price"] * TAKER, abs=CENT), f
+    _assert_every_fee(j)
+
+
+# --- restarts ----------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path):
+    from sleeve_fund.store import Store
+
+    s = Store(f"sqlite:///{tmp_path}/t.db")
+    s.create_sleeve(name="s1", strategy="probe", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                    starting_balance=10_000, risk_profile="balanced")
+    return s
+
+
+def _restarted(store, t):
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(TAKER)
+    return rt
+
+
+@pytest.mark.parametrize("command,reason", [("pause", "PM pause"), ("flatten", "PM flatten"),
+                                            ("flatten", "Book kill switch: stop everything")])
+def test_a_pm_stop_survives_any_number_of_restarts_until_resumed(store, command, reason):
+    """Pause, flatten and the book kill switch (a flatten per strategy) have no end time: restarts (a
+    settings reload, a stale feed, a crash) never lift them; only a resume does (round 10, B10-3)."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    store.command("s1", command, reason)
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+    for _ in range(3):
+        t[0] += timedelta(days=2)  # long enough that a daily-loss pause would have ended
+        rt = _restarted(store, t)
+        rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+        assert store.sleeve("s1").status == "paused" and not rt.can_open()
+    store.command("s1", "resume", "carry on")
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+    assert store.sleeve("s1").status == "running" and rt.can_open()
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "NEW (sanity S-3): a flatten is marked done when it is sent, not when the position is sold, so a process "
+    "that stops before the sell fills restarts paused and still holding, and nothing sells it"))
+@pytest.mark.parametrize("reason", ["PM flatten", "Book kill switch: stop everything"])
+def test_a_flatten_cut_short_by_a_restart_still_sells_the_position(store, reason):
+    """The kill switch promises cash. If the process stops between sending the sell and its fill (the
+    moments a kill switch is pressed are the ones processes fall over in), the restart must sell again."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    store.command("s1", "flatten", reason)
+    assert rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000) == "flatten"
+    t[0] += timedelta(minutes=1)
+    rt = _restarted(store, t)  # the sell never filled
+    assert rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000) == "flatten"
