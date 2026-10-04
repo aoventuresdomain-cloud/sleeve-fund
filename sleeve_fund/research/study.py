@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
-from sleeve_fund.research.ledger import IdeaLedger
+from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.metrics import (
     daily_returns,
     fills_to_rows,
@@ -64,7 +64,6 @@ class StudyResult:
     oos_benchmark_returns: pd.Series
     holdout: dict | None = None
     holdout_benchmark: dict | None = None
-    holdout_reused: bool = False
     fee_note: str = ""
     notes: list[str] = field(default_factory=list)
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
@@ -82,7 +81,7 @@ class StudyResult:
     def not_judged(self) -> str:
         """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
         - the strategy raised errors, so its orders after them may be wrong;
-        - the risk guard left most test windows blind, or out-of-sample without a single trade. A window
+        - the risk guard left half or more of the test windows blind, or out-of-sample without a trade. A window
           is blind when a halt before it began kept it flat, or a halt left it without a trade: no
           information, and failing on it would spend the idea (review round 9, N7). A halt inside a
           test window that still traded is a result, and so is a window the signal never traded in."""
@@ -94,12 +93,14 @@ class StudyResult:
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
         blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.test_trades == 0)]
-        if blind and (2 * len(blind) > len(self.folds) or self.oos_trades == 0):
+        # Half blind is not judged either: the other half then holds the halted windows' stubs too, so the
+        # verdict would rest on a window or two (review round 10, M10-1).
+        if blind and (2 * len(blind) >= len(self.folds) or self.oos_trades == 0):
             halted = sum(1 for f in self.folds if f.halted)
             return (f"the risk guard halted the strategy in {halted} of {len(self.folds)} folds, leaving {len(blind)} "
                     f"of {len(self.folds)} test windows flat or without a trade, and out-of-sample closed "
-                    f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so most of it sat flat rather "
-                    "than testing the idea")
+                    f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so at least half of it sat flat "
+                    "rather than testing the idea")
         return ""
 
     @property
@@ -351,10 +352,14 @@ def run_study(
 
     # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
     # closed: opening it would spend it on no information (review round 8, M8-4).
+    # Nor is it opened twice: the first look was its one use, at any bar length (review round 10, M10-1).
+    opened = ledger.holdout_opened(spec.name, dataset) if use_holdout and holdout_days else None
     if use_holdout and holdout_days and result.not_judged:
         result.holdout_withheld = f"left closed, though asked for: G1 can't judge this study ({result.not_judged})"
+    elif opened is not None:
+        result.holdout_withheld = (f"left closed, though asked for: this model's holdout on {result.instrument} was "
+                                   f"opened {opened_words(opened)}, and a second look can't be fresh")
     elif use_holdout and holdout_days:
-        result.holdout_reused = ledger.holdout_used(spec.name, dataset)
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)
         b_all = bt("buy_and_hold", prices, {}, benchmark=True)

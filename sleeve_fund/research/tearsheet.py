@@ -95,9 +95,8 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
         ),
         (
             "Holdout not used for tuning",
-            "FAIL" if r.holdout_reused else "PASS",
-            "holdout opened more than once" if r.holdout_reused else
-            ("opened once, for this read-out" if r.holdout else r.holdout_withheld or "untouched"),
+            "PASS",
+            "opened once, for this read-out" if r.holdout else r.holdout_withheld or "untouched",
         ),
         (
             "Variants tried disclosed",

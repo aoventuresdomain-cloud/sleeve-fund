@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -33,10 +34,11 @@ from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
+from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
 from sleeve_fund.research import run as study_run
-from sleeve_fund.research.ledger import IdeaLedger
+from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY
@@ -103,7 +105,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["ago"] = _ago
     templates.env.filters["held"] = _held
     templates.env.filters["bytes"] = _bytes
-    templates.env.filters["px"] = lambda x: "n/a" if x is None or x != x else (f"{x:,.2f}" if x >= 100 else f"{x:,.4f}")
+    templates.env.filters["px"] = lambda x: "n/a" if x is None or x != x else f"{x:,.{price_decimals(x)}f}"
+    templates.env.filters["qty"] = _qty
     templates.env.globals["bar_label"] = _bar_label
     templates.env.globals["bar_short"] = _bar_short
     from sleeve_fund.dashboard.glossary import GLOSSARY
@@ -461,6 +464,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # weeks later; it lapses instead, and the decision log says so.
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
+            elif command == "flatten" and any(c["command"] == "flatten" for c in st().pending_commands(name)):
+                # A second would sell again whatever the first left (review round 10, m5).
+                raise ValueError("a flatten is already waiting for the strategy to act on it")
             elif command == "flatten" and st().sleeve(name).desired_state != "running":
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
@@ -581,11 +587,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                          reverse=True)]
         stored = _stored_history(st())
-        return page(request, "research.html", sheets=sheets, counts=IdeaLedger(LEDGER).counts(),
+        ledger = IdeaLedger(LEDGER)
+        spent = {f"{idea}|{base}": opened_words(e) for (idea, base), e in ledger.holdouts().items()}
+        return page(request, "research.html", sheets=sheets, counts=ledger.counts(),
                     rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
                     error=error, pre=pre or {}, strategies=_strategy_choices(),
                     instruments=[h["pair"] for h in stored] or INSTRUMENT_HINTS, stored=stored, collect=collect,
                     notice=notice, request_years=REQUEST_YEARS, history_venue=_research_venue().label,
+                    research_venue=_research_venue().name.lower(), spent_holdouts=spent,
                     profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs())
 
     @app.get("/research", response_class=HTMLResponse)
@@ -998,6 +1007,15 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                         bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
+
+def _qty(x: float) -> str:
+    """A quantity to six significant figures, without exponents: 23,350.1 and 0.0765 rather than 2.335e+04
+    (review round 10, m3)."""
+    if not x:
+        return "0"
+    d = min(8, max(0, 5 - math.floor(math.log10(abs(x)))))
+    return f"{x:,.{d}f}".rstrip("0").rstrip(".") if d else f"{x:,.0f}"
+
 
 def _research_venue():
     from sleeve_fund.venues import venue

@@ -35,7 +35,7 @@
       <div class="field"><label for="train_days">Train window, days</label><input id="train_days" name="train_days" type="number" min="30" step="1" value="{{ pre.get('train_days', 365) }}"></div>
       <div class="field"><label for="test_days">Test window, days</label><input id="test_days" name="test_days" type="number" min="30" step="1" value="{{ pre.get('test_days', 180) }}"></div>
       <div class="field"><label for="holdout_days">Holdout, most recent days</label><input id="holdout_days" name="holdout_days" type="number" min="0" step="1" value="{{ pre.get('holdout_days', 365) }}"></div>
-      <div class="field"><label class="check"><input type="checkbox" name="use_holdout" {{ 'checked' if pre.get('use_holdout') == 'on' }}> Open the holdout</label><p class="hint">Once per model and instrument; a second opening fails G1.</p></div>
+      <div class="field"><label class="check"><input type="checkbox" id="use_holdout" name="use_holdout" {{ 'checked' if pre.get('use_holdout') == 'on' }} data-venue="{{ research_venue }}" data-spent="{{ spent_holdouts|tojson|forceescape }}"> Open the holdout</label><p class="hint" id="holdout-hint">Once per model and instrument, at any bar length.</p></div>
     </div>
     <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('stop_atr') or pre.get('stop_swing_bars') or pre.get('take_profit_pct') or pre.get('take_profit_r') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre, costs) }}</details>
     <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
@@ -93,7 +93,22 @@
 {% endblock %}
 {% block scripts %}
 <script src="/static/console.js"></script>
-<script>Console.orderFields("study-form");</script>
+<script>Console.orderFields("study-form");
+(() => {
+  // A holdout already opened for this model and instrument stays closed, so the box is too (review round 10, M10-1).
+  const form = document.getElementById("study-form"), box = document.getElementById("use_holdout");
+  const hint = document.getElementById("holdout-hint"), spent = JSON.parse(box.dataset.spent), plain = hint.textContent;
+  const sync = () => {
+    const pair = form.elements.instrument.value.trim().replace("/", "").toLowerCase();
+    const when = spent[`${form.elements.strategy.value}|${box.dataset.venue}-${pair}-store`];
+    if (when) box.checked = false;
+    box.disabled = !!when;
+    hint.textContent = when ? `Already opened for this model and instrument ${when}, so it stays closed.` : plain;
+  };
+  form.elements.strategy.addEventListener("change", sync);
+  form.elements.instrument.addEventListener("input", sync);
+  sync();
+})();</script>
 {% if job and job.status in ('queued', 'running') %}<script>
 (function () {
   const box = document.getElementById("study-job"), bar = box.querySelector(".progress"), text = document.getElementById("study-job-text");

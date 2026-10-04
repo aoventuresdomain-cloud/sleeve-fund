@@ -1330,7 +1330,7 @@ def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
     store.set_desired_state("btc-test", "stopped")
     store.record_equity("btc-test", equity=10_000, cash=10_000, qty=0.0, price=50_000, benchmark=10_000)  # a stale mark
     page = c.get("/accounts", auth=AUTH).text
-    assert "btc-test is stopped but still holds a position on it" in page
+    assert '<a href="/sleeves/btc-test">btc-test</a> is stopped but still holds a position on it' in page
     # Round 9, R9-M1: the page told the PM to flatten it first but offered no Flatten. The journal decides.
     head = c.get("/sleeves/btc-test", auth=AUTH).text
     assert 'data-open="dlg-start">Start' in head and 'data-open="dlg-flatten">Flatten' in head
@@ -1343,6 +1343,11 @@ def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
                follow_redirects=False)
     assert r.status_code == 303 and store.sleeve("btc-test").desired_state == "running"
     assert [x["command"] for x in store.pending_commands("btc-test")] == ["flatten"]
+    # Round 10, m5: while it waits, Flatten is off, and a stale page's second one is refused in words.
+    assert 'disabled title="A flatten is already waiting' in c.get("/sleeves/btc-test", auth=AUTH).text
+    r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "again"}, auth=AUTH, headers=SAME)
+    assert "Not done: a flatten is already waiting for the strategy to act on it." in r.text
+    assert len(store.pending_commands("btc-test")) == 1
     _new(c, name="eth-flat", instrument="ETH/USD")
     store.set_desired_state("eth-flat", "stopped")
     assert 'data-open="dlg-flatten"' not in c.get("/sleeves/eth-flat", auth=AUTH).text
@@ -1559,3 +1564,35 @@ def test_the_stop_distance_is_the_drop_from_the_last_price():
          "profile": SimpleNamespace(max_position_pct=1.0, daily_loss=0.05)}
     view = _risk_view(x, {"stop_px": 3746.20, "target_px": None})
     assert round(view["to_stop"], 3) == 0.447
+
+
+def test_the_research_form_knows_which_holdouts_are_spent(client, tmp_path):
+    """Review round 10, M10-1: a holdout opened on daily bars was offered again for a 60-minute study."""
+    import html
+    import json
+
+    from sleeve_fund.research.ledger import IdeaLedger
+
+    c, _ = client
+    IdeaLedger(tmp_path / "idea_ledger.jsonl").record(idea="trend_filter", family="trend", params={},
+                                                       dataset="kraken-btcusd-store", stage="holdout", sharpe=0.4)
+    page = c.get("/research", auth=AUTH).text
+    spent = json.loads(html.unescape(re.search(r'data-spent="([^"]*)"', page).group(1)))
+    assert list(spent) == ["trend_filter|kraken-btcusd-store"]
+    assert spent["trend_filter|kraken-btcusd-store"].endswith(", on daily bars")
+    assert 'data-venue="kraken"' in page
+
+
+def test_sub_dollar_numbers_read_in_full(client):
+    """Review round 10, m3: DOGE read "0.0674" and "2.335e+04 DOGE", and a filled order looked partial."""
+    from sleeve_fund.dashboard.app import _qty
+
+    c, store = client
+    assert [_qty(x) for x in (23350.12345, 0.0765165, 9926.15, 5.0, 0.0)] == ["23,350.1", "0.0765165", "9,926.15", "5", "0"]
+    _new(c)
+    store.record_order("btc-test", order_id="O-1", side="BUY", qty=9926.15, intent="entry", reason="Signal", signal={})
+    store.record_fill("btc-test", side="BUY", qty=9926.149999999998, price=0.0765, fee=0.6, order_id="O-1", trade_id="T-1")
+    store.update_order("O-1", fill_qty=9926.149999999998, fill_px=0.0765, fee=0.6)
+    page = c.get("/orders", auth=AUTH).text
+    assert "9,926.15" in page and "filled</div>" not in page
+    assert "0.076500" in page  # the average price at the decimals the Why text uses
