@@ -8,6 +8,10 @@ import pytest
 
 from sleeve_fund.research.runner import run_backtest
 
+# Maker-first orders are switched off by default; this file tests the post-only path, so it switches them on.
+pytestmark = pytest.mark.usefixtures("maker_on")
+
+
 MAKER, TAKER = 0.004, 0.008
 
 

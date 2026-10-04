@@ -53,6 +53,7 @@ def test_a_replay_trades_with_the_paper_runtime_and_is_deterministic(tmp_path):
     assert all(o["filled_qty"] * o["avg_px"] <= 1000 * 1.001 for o in buys)  # max_notional holds
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_a_maker_order_joins_the_best_bid(tmp_path):
     path = _synthetic(tmp_path / "m.jsonl.gz", minutes=120, maker_wait=2, bar_spec="5-MINUTE-LAST-INTERNAL")
     orders = replay(path)
@@ -64,6 +65,7 @@ def test_a_maker_order_joins_the_best_bid(tmp_path):
         assert (limit < price) if o["side"] == "BUY" else (limit > price)  # resting on its own side of the book
 
 
+@pytest.mark.usefixtures("maker_on")
 @pytest.mark.parametrize("recording", sorted(RECORDINGS.glob("*.jsonl.gz")), ids=lambda p: p.name)
 def test_recorded_paper_session_replays_to_the_same_orders(recording):
     from datetime import datetime

@@ -712,6 +712,7 @@ def test_sleeve_page_marks_its_status_banners_and_dialogs_live(client):
     assert "Not updating since" in js and "visibilitychange" in js
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_maker_first_orders_round_trip_through_the_form_and_clone(client):
     from urllib.parse import parse_qs, urlparse
 
@@ -744,6 +745,7 @@ def _wavy_minutes(days):
     return pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": 1.0}, index=idx)
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, monkeypatch, tmp_path):
     from sleeve_fund import history
     from sleeve_fund.dashboard import preview
@@ -1233,6 +1235,7 @@ def _settings(c, name="btc-test", **over):
     return c.post(f"/sleeves/{name}/settings", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_risk_settings_change_in_place_with_a_reason_and_restart(client):
     c, store = client
     _new(c, stop_loss_pct="8", maker_wait_minutes="20", execution="maker")
@@ -1619,3 +1622,17 @@ def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, 
     assert c.get("/sleeves/old-one", auth=AUTH).status_code == 200
     store.unarchive("old-one")  # brought back: it rejoins the book
     assert store.previous_book() == {}
+
+
+def test_maker_first_orders_are_switched_off_by_default(client, prices, instrument):
+    """PM, 4 Oct 2026: market orders only until a strategy proves it needs maker fills. The form offers no
+    order type, a hand-made maker request is refused in words, and so is a backtest asking for one."""
+    from sleeve_fund.research.runner import run_backtest
+
+    c, store = client
+    form = c.get("/sleeves/new?strategy=trend_filter", auth=AUTH).text
+    assert 'name="execution" value="market"' in form and "Maker first" not in form
+    r = _new(c, execution="maker", maker_wait_minutes="20")
+    assert r.status_code in (200, 303, 400) and "btc-test" not in [s.name for s in store.sleeves()]
+    with pytest.raises(ValueError, match="switched off"):
+        run_backtest("trend_filter", prices.iloc[:50], instrument, {"fast": 5, "slow": 20, "maker_wait_minutes": 10})

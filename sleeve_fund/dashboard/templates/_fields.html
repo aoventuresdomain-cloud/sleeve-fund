@@ -49,6 +49,10 @@
 {% endmacro %}
 
 {% macro order_fields(pre) %}
+{% if not maker_enabled() %}
+<input type="hidden" id="execution" name="execution" value="market">
+<p class="hint">Every order goes at market and pays the taker fee. Maker-first orders are switched off for now.</p>
+{% else %}
 {% set maker = pre.get('execution') == 'maker' %}
 <div class="grid2 order-fields">
   <div class="field"><label for="execution">Order type</label><select id="execution" name="execution">
@@ -57,4 +61,5 @@
   </select></div>
   <div class="field" data-when-maker {{ 'hidden' if not maker }}><label for="maker_wait_minutes">Go to market after, minutes</label><input id="maker_wait_minutes" name="maker_wait_minutes" type="number" min="1" max="1439" step="1" value="{{ pre.get('maker_wait_minutes', 15) }}"></div>
 </div>
+{% endif %}
 {% endmacro %}

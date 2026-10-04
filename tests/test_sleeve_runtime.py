@@ -236,6 +236,7 @@ def test_order_status_moves_forward_only(store):
         store.record_order("s1", order_id="O-3", side="BUY", qty=1, intent="yolo", reason="x")
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_maker_first_orders_are_journaled_with_the_market_fallback(store, instrument):
     from test_maker import _daily, _minutes
 

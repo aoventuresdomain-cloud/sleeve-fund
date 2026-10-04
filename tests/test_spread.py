@@ -27,6 +27,7 @@ def test_a_sell_takes_the_bid(prices, instrument):
     assert float(res.fills["avg_px"].iloc[1]) == pytest.approx(95.0 * 0.999, rel=1e-4)
 
 
+@pytest.mark.usefixtures("maker_on")
 def test_a_maker_fill_pays_no_spread(instrument):
     day = [10_000.0] * 1440
     dip = [10_000.0 - (i % 12) for i in range(1440)]  # trades through the estimated bid, $10 under the last
