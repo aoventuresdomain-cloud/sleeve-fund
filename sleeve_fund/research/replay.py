@@ -56,8 +56,9 @@ def _data(instrument, rows: list[dict]) -> list:
     return out
 
 
-def replay(path: Path | str) -> list[dict]:
-    """The orders the recorded sleeve sends when replayed, oldest first, as the journal stores them."""
+def replay(path: Path | str, with_fills: bool = False) -> list[dict] | tuple[list[dict], list[dict]]:
+    """The orders the recorded sleeve sends when replayed, oldest first, as the journal stores them;
+    with_fills, the fills too, oldest first."""
     from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
     from nautilus_trader.common import LoggerConfig, LogLevel
     from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
@@ -89,7 +90,8 @@ def replay(path: Path | str) -> list[dict]:
                             **s["params"])
         engine.add_strategy(strategy_cls(config).attach_runtime(runtime))
         engine.run()
-        return list(reversed(store.orders(s["name"], limit=100_000)))
+        orders = list(reversed(store.orders(s["name"], limit=100_000)))
+        return (orders, list(reversed(store.fills(s["name"], limit=100_000)))) if with_fills else orders
     finally:
         runtime.now = utcnow  # break the runtime <-> strategy cycle on this thread
         engine.dispose()
