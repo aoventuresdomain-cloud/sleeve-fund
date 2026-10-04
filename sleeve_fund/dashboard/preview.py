@@ -226,7 +226,7 @@ def _data_note(prices: pd.DataFrame, minutes: int) -> dict:
         note = (f"The price history has {q['count']} stretch{'es' if q['count'] != 1 else ''} of an hour or more "
                 f"with no trades (the longest, {hours:.0f} hour{'s' if round(hours) != 1 else ''}, ended "
                 f"{q['longest_end']:%d %b %Y %H:%M} UTC). They are held flat at the last price, as the venue "
-                "reported no trades; a long one may be a venue outage.")
+                "reported no trades; a long one may be a venue outage. No order fills on a bar with no trades.")
     return {**q, "longest_end": q["longest_end"].isoformat() if q["longest_end"] is not None else None, "note": note}
 
 
