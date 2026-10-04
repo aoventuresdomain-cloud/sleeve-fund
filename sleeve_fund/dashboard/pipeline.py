@@ -23,8 +23,12 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
     sharpe = next((r for r in rows if r[0].startswith("G1 test")), None)
     if sharpe is None:
         return None, "", []
-    failed = [label for label, verdict, _ in rows if verdict not in ("PASS", "INFO")]
-    return ("FAIL" if failed else "PASS"), sharpe[2].strip(), failed
+    failed = [(label, ev.strip()) for label, verdict, ev in rows if verdict not in ("PASS", "INFO")]
+    evidence = sharpe[2].strip()
+    if failed:
+        # Lead with what failed: a strong Sharpe beside "Fail" otherwise reads like a pass.
+        evidence = "Failed: " + "; ".join(f"{label} ({ev})" if ev else label for label, ev in failed) + ". " + evidence
+    return ("FAIL" if failed else "PASS"), evidence, [label for label, _ in failed]
 
 
 def sheet_facts(path: Path) -> dict:
