@@ -580,7 +580,7 @@ def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(st
 
 PERP = {"market": "perp", "allow_short": True}
 PERP_FEES = markets.LOW_FEE_PERP
-RISK_EXITS = {"risk_pause", "risk_halt", "liquidation", "liquidation_guard"}
+RISK_EXITS = {"risk_pause", "risk_halt", "liquidation", "liquidation_cut"}
 
 
 class ProbeLS(Probe):
@@ -730,10 +730,10 @@ def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_w
                        half_spread=HALF)
     j = res.journal
     orders = sorted(j.orders_.values(), key=lambda o: o["id"])
-    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_guard" in {o["intent"] for o in orders}
+    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_cut" in {o["intent"] for o in orders}
     for opened, closed in zip(orders[::2], orders[1::2]):  # each short, then what bought it back
         assert (opened["side"], opened["intent"]) == ("SELL", "entry"), opened
-        assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_guard")
+        assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_cut")
         assert closed["filled_qty"] == pytest.approx(opened["filled_qty"])  # the whole short
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
     assert res.equity.iloc[-1] > 0

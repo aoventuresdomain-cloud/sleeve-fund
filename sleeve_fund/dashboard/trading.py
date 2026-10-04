@@ -9,9 +9,10 @@ from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
-           "rebalance": "Rebalance"}
+           "rebalance": "Rebalance", "liquidation": "Liquidated", "liquidation_cut": "Cut before liquidation"}
 # Exit events, for trades closed before orders were journaled with a reason.
-EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten")}
+EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten",
+                                       "liquidation", "liquidation_cut")}
 
 STATUS_TABS = {
     "open": ("Open", OPEN_ORDER_STATUSES),

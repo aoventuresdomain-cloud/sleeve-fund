@@ -317,7 +317,8 @@ ERROR_KINDS = ("handler_failed", "tick_failed")
 BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
-INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
+INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
+           "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
 
 
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8

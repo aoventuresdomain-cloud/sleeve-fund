@@ -13,7 +13,8 @@ from sleeve_fund.venues import venue as venue_profile
 
 # Every candle length the venue's OHLC endpoint serves, 1 minute to 1 week.
 INTERVALS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
-FORCED = {"stop_loss": "Stop", "take_profit": "Target", "risk_halt": "Halt", "risk_pause": "Pause", "pm_flatten": "Flatten"}
+FORCED = {"stop_loss": "Stop", "take_profit": "Target", "risk_halt": "Halt", "risk_pause": "Pause", "pm_flatten": "Flatten",
+          "liquidation": "Liquidated", "liquidation_cut": "Liq. cut"}
 _cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
 _lock = threading.Lock()
 

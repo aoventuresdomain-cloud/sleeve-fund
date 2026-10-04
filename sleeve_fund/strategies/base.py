@@ -17,7 +17,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from nautilus_trader.config import StrategyConfig
@@ -1415,9 +1415,16 @@ class LongFlatStrategy(Strategy):
         return net, (notional / net if net else 0.0)
 
     def _signed_qty(self) -> Decimal:
-        """The position: positive long, negative short."""
+        """The position: positive long, negative short. On a perp, summed from the venue's own quantities:
+        the float signed_qty reads 0.08838354999999999 for 0.08838355, and an exit rounded down from that
+        left one lot behind, so the next entry on the other side counted as a reduction and rested no stop
+        (review round 11, B11-2)."""
         if self._margin:
-            return Decimal(repr(self._net_position()[0]))
+            net = Decimal(0)
+            for p in self.cache.positions_open(instrument_id=self._cfg.instrument_id):
+                q = p.quantity.as_decimal()
+                net += q if p.signed_qty > 0 else -q
+            return net
         return self._position_qty()
 
     def _pos_side(self) -> int:
@@ -1492,7 +1499,8 @@ class LongFlatStrategy(Strategy):
                     self.cancel_order(order.client_order_id)
             return
         step = self._lot()
-        qty = self._position_qty(free=True).quantize(step, rounding=ROUND_DOWN)
+        # Spot can't sell more than the free balance, so round down; a perp's position is already whole lots.
+        qty = self._position_qty(free=True).quantize(step, rounding=ROUND_HALF_EVEN if self._margin else ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
         # A short is closed by buying it back.
@@ -1508,7 +1516,7 @@ class LongFlatStrategy(Strategy):
         r = self._restore
         if r is None or self._restore_id is not None or self.instrument is None:
             return
-        qty = Decimal(repr(abs(r["qty"]))).quantize(self._lot(), rounding=ROUND_DOWN)
+        qty = Decimal(repr(abs(r["qty"]))).quantize(self._lot(), rounding=ROUND_HALF_EVEN)  # a float sum, not floored
         if qty < self._min_qty():
             self._restore = None
             return
@@ -1568,7 +1576,7 @@ class LongFlatStrategy(Strategy):
         floor = self.runtime.profile.min_liquidation_distance if self.runtime is not None else 0.0
         if not crossed and distance >= floor:
             return
-        intent = "liquidation" if crossed else "liquidation_guard"
+        intent = "liquidation" if crossed else "liquidation_cut"
         reason = (f"Liquidated: the price {price:,.6g} reached the liquidation price {liq:,.6g}" if crossed else
                   f"Cut to avoid liquidation: the price {price:,.6g} is {distance:.1%} from the liquidation price "
                   f"{liq:,.6g}, inside the {floor:.0%} the risk profile keeps")
@@ -1691,7 +1699,10 @@ class LongFlatStrategy(Strategy):
             if self._margin:
                 self._apply_funding(self._price())
             equity, cash, qty, price = self._mark()
-            if price <= 0 or equity <= 0:
+            # A perp position valued at or below zero equity is past its liquidation price (a gap the guards
+            # couldn't trade inside), not a book that can't be valued: liquidate it, and the risk check halts.
+            underwater = self._margin and qty != 0 and price > 0 and equity <= 0
+            if price <= 0 or (equity <= 0 and not underwater):
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
                 self.runtime.store.heartbeat(self.runtime.name)
                 if not self._mark_warned:
@@ -1710,6 +1721,13 @@ class LongFlatStrategy(Strategy):
                     self.cancel_all_orders(self._cfg.instrument_id)
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
+            if self._margin and qty != 0:
+                # Through the liquidation price: the venue takes the position whatever our own risk check says,
+                # so the liquidation goes first and is journaled as one (review round 11, M11-3).
+                probe = price if underwater or worst is None else worst
+                liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+                if underwater or (liq is not None and (probe <= liq if qty > 0 else probe >= liq)):
+                    self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
                                  busy=bool(self._working())) == "flatten":
@@ -1874,7 +1892,7 @@ class LongFlatStrategy(Strategy):
             self._entry_side = sign
         else:
             self._entry_qty = max(self._entry_qty - qty, 0.0)
-            if self._entry_qty <= 1e-12:
+            if self._entry_qty < float(self._lot()) / 2:  # less than half a lot is flat: no order can trade it
                 self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
                 self._stop_frac = self._tp_frac = None
                 self._replan_pending = self._plan_entry = None

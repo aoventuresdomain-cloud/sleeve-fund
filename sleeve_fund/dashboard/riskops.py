@@ -10,7 +10,8 @@ from sleeve_fund import backups
 from sleeve_fund.store import Store, utcnow
 
 SHOCKS = (-0.10, -0.20, -0.35, -0.50)
-BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not_found", "tick_failed")
+BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not_found", "tick_failed", "liquidation",
+                "liquidation_cut")
 
 
 def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:

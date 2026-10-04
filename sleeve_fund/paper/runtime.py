@@ -46,7 +46,7 @@ class SleeveRuntime:
 
     def risk_events(self) -> list[dict]:
         """Halts and pauses, oldest first, for a backtest to show."""
-        kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch", "liquidation", "liquidation_guard")
+        kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch", "liquidation", "liquidation_cut")
         return [e for e in reversed(self.store.events(self.name, limit=10_000)) if e["kind"] in kinds]
 
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:

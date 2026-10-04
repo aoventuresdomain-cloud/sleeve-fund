@@ -1208,6 +1208,7 @@ ACTION_WORDS = {"change_settings": "Changed settings", "move_account": "Moved ac
 KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Maker fill ahead of the tape",
               "maker_fill_settled": "Maker fill settled", "crossing_trade_unseen": "Fill on an unseen trade",
               "risk_halt": "Risk halt", "risk_pause": "Risk pause", "reconcile_mismatch": "Reconcile mismatch",
+              "liquidation": "Liquidated", "liquidation_cut": "Cut before liquidation",
               "instrument_not_found": "Instrument not found", "tick_failed": "Risk check failed",
               "mark_unavailable": "No price to value the book", "price_feed_back": "Price feed back",
               "heartbeat_stale": "Heartbeat late", "process_crash": "Process crashed", "process_start": "Process started",

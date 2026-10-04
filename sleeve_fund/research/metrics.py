@@ -104,7 +104,7 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
     """Backtest fills report -> the same shape the live journal stores (side, qty, price, fee)."""
     if fills is None or fills.empty:
         return []
-    f = fills.sort_values("ts_last")
+    f = fills.sort_values("ts_last", kind="stable")  # an exit and the flip's entry can share a timestamp
     fees = f["commissions"] if "commissions" in f else [0.0] * len(f)
     return [
         {"side": "BUY" if str(side).endswith("BUY") else "SELL", "qty": float(q), "price": float(px), "fee": _money(c),
