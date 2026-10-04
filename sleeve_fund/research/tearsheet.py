@@ -9,12 +9,12 @@ import pandas as pd
 
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
-    PERIODS_PER_YEAR,
+    daily_returns,
     deflated_sharpe_probability,
     expected_max_sharpe,
-    returns_from_equity,
     sharpe_beats_probability,
     summary,
+    years_covered,
 )
 from sleeve_fund.research.study import StudyResult
 
@@ -56,7 +56,7 @@ def _row(label: str, s: dict, b: dict) -> str:
 def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     oos = summary(r.oos_returns)
     bench = summary(r.oos_benchmark_returns)
-    bench_sharpe_full = summary(returns_from_equity(r.full_period_benchmark.equity))["sharpe"]
+    bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = len(r.round_trips)
     counts = ledger.counts()
@@ -108,14 +108,14 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = summary(r.oos_benchmark_returns)
-    full = summary(returns_from_equity(r.full_period.equity))
-    full_b = summary(returns_from_equity(r.full_period_benchmark.equity))
+    full = summary(daily_returns(r.full_period.equity))
+    full_b = summary(daily_returns(r.full_period_benchmark.equity))
     counts = ledger.counts()
     trial_sharpes = ledger.sharpes()
     sharpe_std = float(pd.Series(trial_sharpes).std(ddof=1)) if len(trial_sharpes) > 1 else 0.0
     hurdle = expected_max_sharpe(counts["variants"], sharpe_std)
     dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
-    years_full = len(r.full_period.equity) / PERIODS_PER_YEAR
+    years_full = years_covered(r.full_period.equity)
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
     ts = r.trade_stats
 

@@ -18,8 +18,8 @@ from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
+    daily_returns,
     fills_to_rows,
-    returns_from_equity,
     round_trips,
     summary,
     trade_stats,
@@ -110,16 +110,24 @@ def run_study(
     exits: dict | None = None,
     position_cap: float | None = None,
 ) -> StudyResult:
-    """exits: optional stop_loss / take_profit / risk_per_trade applied to every strategy run.
+    """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
+    train and test windows are in days whatever the bar, and every statistic is on daily returns.
+    exits: optional stop_loss / take_profit / risk_per_trade applied to every strategy run.
     position_cap: the largest share of capital in the position, as the paper risk profile allows. It
     applies to the benchmark too, so G1 compares the strategy with buy and hold at the same exposure."""
     if position_cap is not None and not 0 < position_cap <= 1:
         raise ValueError(f"position_cap {position_cap} outside (0, 1]")
-    if len(prices) < holdout_days + train_days + test_days:
+    minutes = bar_minutes_of(prices)
+    if 1440 % minutes:
+        raise ValueError(f"{minutes}-minute bars don't divide a day; use 1, 5, 15, 30, 60, 240 or 1440")
+    per_day = 1440 // minutes
+    holdout_bars, train_bars, test_bars = holdout_days * per_day, train_days * per_day, test_days * per_day
+    if len(prices) < holdout_bars + train_bars + test_bars:
         raise ValueError(
-            f"{len(prices)} bars is too short for holdout {holdout_days} + train {train_days} + test {test_days}"
+            f"{len(prices) / per_day:,.0f} days of bars is too short for holdout {holdout_days} + train "
+            f"{train_days} + test {test_days} days"
         )
-    research = prices.iloc[:-holdout_days] if holdout_days else prices
+    research = prices.iloc[:-holdout_bars] if holdout_bars else prices
     combos = grid(spec.param_grid)
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
 
@@ -130,7 +138,7 @@ def run_study(
             params = {**params, **exits}
         if position_cap is not None:
             params = {**params, "position_cap_pct": position_cap}
-        return run_backtest(name, df, instrument, params, starting_capital=starting_capital)
+        return run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes)
 
     def log(params: dict, stage: str, sharpe: float) -> None:
         # Exit settings make it a different variant, so they count towards the idea counter.
@@ -139,14 +147,14 @@ def run_study(
 
     # Benchmark over the research period; sliced for every comparison below.
     bench = bt("buy_and_hold", research, {})
-    bench_ret = returns_from_equity(bench.equity)
+    bench_ret = daily_returns(bench.equity)
 
     # 1. Sensitivity over the full research period.
     rows = []
     full_default = None
     for params in combos:
         res = bt(spec.name, research, params)
-        m = summary(returns_from_equity(res.equity))
+        m = summary(daily_returns(res.equity))
         log(params, "sensitivity", m["sharpe"])
         rows.append({**params, **m, "round_trips": len(round_trips(res.fills)), "fees": res.fees_paid})
         if params == default_params:
@@ -159,20 +167,21 @@ def run_study(
     folds: list[Fold] = []
     oos_parts, bench_parts = [], []
     start = 0
-    while start + train_days + test_days <= len(research):
-        train = research.iloc[start : start + train_days]
-        through_test = research.iloc[start : start + train_days + test_days]
-        test_idx = through_test.index[train_days:]
+    while start + train_bars + test_bars <= len(research):
+        train = research.iloc[start : start + train_bars]
+        through_test = research.iloc[start : start + train_bars + test_bars]
+        test_idx = through_test.index[train_bars:]
         best, best_sharpe = None, float("-inf")
         for params in combos:
-            m = summary(returns_from_equity(bt(spec.name, train, params).equity))
+            m = summary(daily_returns(bt(spec.name, train, params).equity))
             log(params, "wf_train", m["sharpe"])
             if m["sharpe"] > best_sharpe:
                 best, best_sharpe = params, m["sharpe"]
         # Trade the chosen params continuously through the test window so the
         # position carried in from training is realistic, then score only the test days.
         run = bt(spec.name, through_test, best)
-        test_ret = returns_from_equity(run.equity).loc[test_idx[1:]]
+        test_ret = daily_returns(run.equity)
+        test_ret = test_ret[test_ret.index > test_idx[0]]  # the test window's days, not the train's
         b_ret = bench_ret.reindex(test_ret.index).dropna()
         folds.append(
             Fold(
@@ -187,7 +196,7 @@ def run_study(
         )
         oos_parts.append(test_ret)
         bench_parts.append(b_ret)
-        start += test_days
+        start += test_bars
 
     result = StudyResult(
         spec=spec,
@@ -204,7 +213,7 @@ def run_study(
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
         instrument=str(instrument.id.symbol),
-        bar_minutes=bar_minutes_of(prices),
+        bar_minutes=minutes,
         venue=str(instrument.id.venue),
         fee_note=(f"{instrument.id.venue}: {float(instrument.maker_fee):.2%} maker / {float(instrument.taker_fee):.2%} "
                   "taker, taker charged on every order"),
@@ -213,6 +222,10 @@ def run_study(
         f"Positions are capped at {position_cap:.0%} of capital, as the paper risk profile allows, and the "
         "buy-and-hold benchmark is held at the same exposure." if position_cap is not None else
         "Positions are uncapped (all of the capital), and so is the benchmark; paper trades at its risk profile's cap.")
+    if minutes < 1440:
+        result.notes.append(
+            f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
+            "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + ", ".join(f"{k.replace('_', ' ')} {v:.1%}" for k, v in exits.items())
@@ -226,9 +239,11 @@ def run_study(
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)
         b_all = bt("buy_and_hold", prices, {})
-        h_idx = prices.index[-holdout_days:]
-        h_ret = returns_from_equity(run.equity).reindex(h_idx).dropna()
-        hb_ret = returns_from_equity(b_all.equity).reindex(h_idx).dropna()
+        h_start = prices.index[-holdout_bars]
+        h_ret = daily_returns(run.equity)
+        h_ret = h_ret[h_ret.index >= h_start]
+        hb_ret = daily_returns(b_all.equity)
+        hb_ret = hb_ret[hb_ret.index >= h_start]
         result.holdout = summary(h_ret)
         result.holdout_benchmark = summary(hb_ret)
         log(chosen, "holdout", result.holdout["sharpe"])

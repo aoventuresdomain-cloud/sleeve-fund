@@ -122,3 +122,73 @@ def test_cli_reads_the_history_store(tmp_path, monkeypatch):
     assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "buy_and_hold", "--store", "--holdout-days", "100",
                  "--out", str(out)]) == 0
     assert "capped at 33%" in out.read_text()
+
+
+def test_an_hourly_study_is_judged_on_daily_returns(tmp_path, instrument):
+    """Review rounds 2 to 6: research was daily only, so hourly and minute strategies had no G1; and
+    intraday returns annualised with sqrt(365) and bootstrapped in blocks of bars would mislead. The
+    study now takes any bar that divides a day, with its windows in days, and judges daily returns."""
+    import numpy as np
+
+    from sleeve_fund.research.tearsheet import g1_checks
+
+    idx = pd.date_range("2022-01-01 01:00", periods=420 * 24, freq="60min", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(4).normal(0, 0.006, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    hourly = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c,
+                           "volume": 1e6}, index=idx)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, hourly, instrument, dataset="syn-60m", ledger=ledger, synthetic=True, holdout_days=60,
+                  train_days=180, test_days=60, default_params={"fast": 20, "slow": 100})
+    assert r.bar_minutes == 60
+    assert r.research_end == hourly.index[-60 * 24 - 1]  # the holdout is 60 days of hours
+    assert len(r.folds) == 3  # 360 research days: train 180, then three 60-day tests
+    days = pd.Series(r.oos_returns.index).diff().dropna()
+    assert (days == pd.Timedelta("1D")).all() and len(r.oos_returns) == 3 * 60  # each test day, once
+    assert r.oos_returns.index.max() <= r.research_end.ceil("1D")
+    sheet = render(r, ledger)
+    assert "Tested on `BTC/USD` at 60-minute bars" in sheet
+    # 180 daily observations are too few to judge: not a pass, however the Sharpe reads.
+    sharpe = next(c for c in g1_checks(r, ledger) if c[0].startswith("G1 test"))
+    assert sharpe[1] == "FAIL" and "too few independent out-of-sample days" in sharpe[2]
+    with pytest.raises(ValueError, match="don't divide a day"):
+        run_study(SPEC, hourly.iloc[::7], instrument, dataset="x", ledger=ledger)
+
+
+def test_slow_regimes_count_as_few_independent_days():
+    """Review round 6: the independence check looked one day back, so 60-day regimes with a lag-1
+    autocorrelation of 0.3 passed G1 by luck 10.7% of the time. It now sums every autocorrelation
+    that matters."""
+    import math
+
+    import numpy as np
+
+    from sleeve_fund.research.metrics import independent_days
+
+    rng = np.random.default_rng(0)
+    n = 1095
+    iid = rng.normal(size=n)
+    regimes = math.sqrt(0.3) * np.repeat(rng.choice([-1, 1], size=n // 60 + 1), 60)[:n] + math.sqrt(0.7) * rng.normal(size=n)
+    assert independent_days(iid) > 0.9 * n
+    assert independent_days(regimes) < 250  # below MIN_INDEPENDENT_DAYS: not judged
+    ar = np.zeros(n)
+    for i in range(1, n):
+        ar[i] = 0.3 * ar[i - 1] + rng.normal()
+    assert 0.35 * n < independent_days(ar) < 0.75 * n  # about (1 - 0.3) / (1 + 0.3) of the days
+
+
+def test_cli_studies_hourly_bars_from_the_store(tmp_path, monkeypatch):
+    import numpy as np
+
+    from sleeve_fund import history
+    from sleeve_fund.__main__ import main
+
+    idx = pd.date_range("2024-01-01", periods=500 * 24, freq="60min", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(2).normal(0, 0.004, len(idx))))
+    minutes = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx).resample("1min").ffill()
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "BTC/USD", minutes, cursor="x")
+    assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "buy_and_hold", "--store", "--minutes", "60",
+                 "--holdout-days", "60", "--train-days", "180", "--test-days", "90", "--out", str(tmp_path / "s.md")]) == 0
+    sheet = (tmp_path / "s.md").read_text()
+    assert "at 60-minute bars" in sheet and "kraken-btcusd-store-60m" in sheet
