@@ -372,21 +372,32 @@ def _utc(ts) -> pd.Timestamp:
     return t.tz_localize("UTC") if t.tzinfo is None else t
 
 
+# What stops a run trading until a person steps in: the risk guard's halt, and a reconcile mismatch
+# (the engine's book disagreeing with the journal halts it too; review round 9, B9-1 and M9-1).
+HALT_KINDS = ("risk_halt", "reconcile_mismatch")
+
+
+def _halt_reason(e: dict) -> str:
+    if e["kind"] == "reconcile_mismatch":
+        return "reconcile mismatch: the engine's book disagreed with the journal"
+    return e["message"].split(";")[0]
+
+
 def _halted_before(events: list[dict], test_start: pd.Timestamp) -> bool:
-    return any(e["kind"] == "risk_halt" and _utc(e["ts"]) < _utc(test_start) for e in events)
+    return any(e["kind"] in HALT_KINDS and _utc(e["ts"]) < _utc(test_start) for e in events)
 
 
 def _halt_words(events: list[dict], test_start: pd.Timestamp, test_end: pd.Timestamp) -> str:
     """'12 Mar 2026 (drawdown 20.3% hit the 20% limit), in the training stretch' for the first halt
     at or before the test window's end, else ''."""
     for e in events:
-        if e["kind"] != "risk_halt":
+        if e["kind"] not in HALT_KINDS:
             continue
         ts = _utc(e["ts"])
         if ts > _utc(test_end):
             return ""
         where = "in the training stretch the run traded through first" if ts < _utc(test_start) else "in the test window"
-        return f"{ts:%d %b %Y} ({e['message'].split(';')[0]}), {where}"
+        return f"{ts:%d %b %Y} ({_halt_reason(e)}), {where}"
     return ""
 
 

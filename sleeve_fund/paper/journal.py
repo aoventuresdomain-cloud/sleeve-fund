@@ -112,12 +112,15 @@ class MemoryJournal:
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
-                     fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0) -> None:
+                     fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
+                     qty: float | None = None) -> None:
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
         row = self.orders_.get(order_id)
         if row is None:
             return
+        if qty is not None:
+            row["qty"] = qty
         if fill_qty:
             filled = row["filled_qty"] + fill_qty
             row["avg_px"] = ((row["avg_px"] or 0.0) * row["filled_qty"] + fill_qty * fill_px) / filled
@@ -167,8 +170,13 @@ class MemoryJournal:
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         return list(reversed(self.fills_))[:limit]
 
-    def peak_equity(self, sleeve: str) -> float | None:
-        return self._peak
+    def peak_equity(self, sleeve: str, since: datetime | None = None) -> float | None:
+        if since is None:
+            return self._peak
+        return max((float(m["equity"]) for m in self.equity if m["ts"] >= since), default=None)
+
+    def equity_at_or_before(self, sleeve: str, ts: datetime) -> dict | None:
+        return next((m for m in reversed(self.equity) if m["ts"] <= ts), None)
 
     def first_equity(self, sleeve: str) -> dict | None:
         return self.equity[0] if self.equity else None

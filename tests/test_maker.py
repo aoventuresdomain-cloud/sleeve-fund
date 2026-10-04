@@ -127,3 +127,27 @@ def test_a_stop_the_price_is_already_through_sells_at_market(instrument):
     assert "already through the 9,599.99 stop" in sell["reason"]
     assert sum(f["qty"] * (1 if f["side"] == "BUY" else -1) for f in res.journal.fills_) == 0
     assert any(e["kind"] == "stop_rejected" for e in res.journal.events_)
+
+
+def test_a_partly_filled_maker_entry_is_guarded_by_its_stop_through_the_wait(instrument):
+    """Review round 9, M9-4: the backtest rested the stop only once the entry had filled whole, so a
+    post-only entry filling in slices had no stop through its wait. Paper guards from the first slice; a
+    25% fall inside the wait cost the backtest 3.5% of capital against 1.2% in paper. The stop now rests
+    on the first slice and grows with each, and its fill cancels what is left of the entry, as paper's does."""
+    day = [10_000.0] * 1440
+    fall = [10_000.0 * (1 - 0.025 * k) for k in range(1, 11)]
+    m = _minutes(day + [10_000.0] * 4 + fall + [7_500.0] * (2 * 1440), wiggle=1.0, volume=1.0)
+    res = _run(m, {"maker_wait_minutes": 15, "stop_loss": 0.02}, instrument=instrument, risk_profile="aggressive",
+               bar_minutes=1440, exec_minutes=1)
+    j = res.journal
+    entry = [f for f in j.fills_ if j.orders_[f["order_id"]]["intent"] == "entry"]
+    stops = [f for f in j.fills_ if j.orders_[f["order_id"]]["intent"] == "stop_loss"]
+    assert len(entry) >= 2 and stops  # the entry filled in slices, and the stop sold
+    wait_ends = pd.Timestamp("2024-01-02 00:15", tz="UTC")
+    assert all(pd.Timestamp(f["ts"]) < wait_ends for f in stops)
+    held = sum(f["qty"] for f in entry)
+    assert sum(f["qty"] for f in stops) == pytest.approx(held)
+    assert min(f["price"] for f in stops) > 9_700  # out near the 2% stop, not after the 25% fall
+    assert pd.Timestamp(stops[-1]["ts"]) >= max(pd.Timestamp(f["ts"]) for f in entry)  # nothing bought after
+    stop_order = j.orders_[stops[0]["order_id"]]
+    assert stop_order["qty"] > entry[0]["qty"] and "resized" in stop_order["message"]  # grew with the entry

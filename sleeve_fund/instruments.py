@@ -23,6 +23,20 @@ class FeeSchedule:
                 raise ValueError(f"{name} fee {value} outside sane range [0, 5%)")
 
 
+def lot_decimals(instrument) -> int:
+    """Decimals an order size can carry: the instrument's, but no more than the account holds the base
+    currency in. Nautilus keeps XRP and ADA at 6 decimals while venues list 8 lot decimals, so an
+    8-decimal buy is held as 6 and a full exit leaves the difference in the journal (review round 9, B9-1)."""
+    return min(instrument.size_precision, instrument.base_currency.precision)
+
+
+def price_decimals(price: float) -> int:
+    """Price decimals for an instrument built from stored history, where the venue's own increment isn't
+    to hand: 2 at 100 or more, 4 from 1, else 6. Studies and the backtest page share it, so a study never
+    rounds a sub-dollar instrument to the cent (review round 9, B9-2)."""
+    return 2 if price >= 100 else 4 if price >= 1 else 6
+
+
 def spot_pair(
     base: str,
     quote: str,
@@ -31,9 +45,12 @@ def spot_pair(
     price_precision: int = 2,
     size_precision: int = 8,
 ) -> CurrencyPair:
-    """Build a spot CurrencyPair. Use VenueProfile.instrument() so the venue's fees come with it."""
+    """Build a spot CurrencyPair. Use VenueProfile.instrument() so the venue's fees come with it.
+
+    Sizes never carry more decimals than the engine keeps the base currency in (see lot_decimals)."""
     base_ccy = Currency.from_str(base)
     quote_ccy = Currency.from_str(quote)
+    size_precision = min(size_precision, base_ccy.precision)
     symbol = Symbol(f"{base}/{quote}")
     return CurrencyPair(
         instrument_id=InstrumentId(symbol=symbol, venue=venue),

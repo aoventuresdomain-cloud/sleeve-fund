@@ -57,7 +57,7 @@ class SleeveRuntime:
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
-        self.peak = store.peak_equity(sleeve_name) or sleeve.starting_balance
+        self.peak = self._restored_peak(sleeve.starting_balance)
         first = store.first_equity(sleeve_name)
         self.bench_base_price = first["price"] if first else None
         self.taker_fee = 0.008
@@ -71,6 +71,30 @@ class SleeveRuntime:
         self._spread_since = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
         self.flatten_why: tuple[str, str] | None = None
+
+    def _restored_peak(self, starting_balance: float) -> float:
+        """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
+        halt, which reset it, else the highest mark ever. Without the reset a settings edit after such a
+        resume re-halted and flattened at once (review round 9, M9-2)."""
+        reset = self.store.last_event(self.name, ("drawdown_reset",))
+        if reset is None:
+            return self.store.peak_equity(self.name) or starting_balance
+        # The reset's own mark was taken a moment before its event, on the tick that applied the resume.
+        at = self.store.equity_at_or_before(self.name, reset["ts"])
+        marks = [self.store.peak_equity(self.name, since=reset["ts"]), at["equity"] if at else None]
+        return max((float(m) for m in marks if m is not None), default=starting_balance)
+
+    def _restored_day_open(self, now: datetime, equity: float) -> float:
+        """The daily-loss baseline after a (re)start: the equity at the PM's last resume today, which reset
+        it (review round 9, M9-2), else the day's open (review round 8, B8-2), else this mark."""
+        midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+        resumed = self.store.last_event(self.name, ("pm_resume",))
+        if resumed is not None and resumed["ts"] >= midnight:
+            mark = self.store.equity_at_or_before(self.name, resumed["ts"])
+            if mark is not None:
+                return float(mark["equity"])
+        restored = self.store.day_open_equity(self.name, midnight)
+        return restored if restored is not None else equity
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -137,9 +161,7 @@ class SleeveRuntime:
             # (re)start reads it from the journal, so a restart mid-day, such as the reload a settings
             # edit makes, can't lift the daily-loss pause by resetting the baseline (review round 8, B8-2).
             if self._day is None and self._last_equity is None:
-                midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
-                restored = self.store.day_open_equity(self.name, midnight)
-                self._day_open = restored if restored is not None else equity
+                self._day_open = self._restored_day_open(now, equity)
             else:
                 self._day_open = self._last_equity if self._last_equity is not None else equity
             self._day = now.date()
@@ -171,8 +193,12 @@ class SleeveRuntime:
                 if self.status != "halted":
                     self._set("paused", f"paused by PM: {cmd['reason']}")
             elif cmd["command"] == "resume":
+                # Both resets are journaled (this tick's mark, and the events below) so a restart keeps them.
                 if self.status == "halted":
                     self.peak = equity  # a resume after a halt resets the drawdown reference
+                    self.store.event(self.name, "info", "drawdown_reset",
+                                     f"drawdown measured from {equity:,.2f}, the equity when the PM resumed "
+                                     "after the halt", ts=self.now())
                 self._day_open = equity
                 self._set("running", "")
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())

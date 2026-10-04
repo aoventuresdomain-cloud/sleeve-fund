@@ -103,6 +103,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     from sleeve_fund import spreads
     from sleeve_fund.fees import resolve as resolve_fees
     from sleeve_fund.history import HistoryStore
+    from sleeve_fund.instruments import price_decimals
     from sleeve_fund.research.ledger import IdeaLedger
     from sleeve_fund.research.study import run_study
     from sleeve_fund.research.tearsheet import render
@@ -122,7 +123,10 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     fees = resolve_fees(profile.name, store)
     spread = spreads.resolve(profile.name, req.pair, store)
     base, quote = req.pair.split("/")
-    instrument = profile.instrument(base, quote, fees=fees.fees)
+    # Price decimals from the stored prices, as the backtest page does: the default 2 rounded every
+    # sub-$10 instrument to the cent (review round 9, B9-2).
+    instrument = profile.instrument(base, quote, fees=fees.fees,
+                                    price_precision=price_decimals(float(prices["close"].median())))
     exec_prices = None
     step = exec_step(prices.index[-1] - prices.index[0], req.minutes)
     if step is not None:
