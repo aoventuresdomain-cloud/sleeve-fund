@@ -101,6 +101,8 @@
   sheet.querySelector("[data-close]").addEventListener("click", () => sheet.close());
   sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });  // tap outside closes
   if (sheet.querySelector("[aria-current]")) btn.setAttribute("aria-current", "page");
+  // A one-off notice (kill switch fired, a refused form) is said once: a reload doesn't bring it back.
+  if (document.querySelector("[data-once]") && location.search) history.replaceState(null, "", location.pathname + location.hash);
 })();
 </script>
 <script src="/static/live.js" defer></script>

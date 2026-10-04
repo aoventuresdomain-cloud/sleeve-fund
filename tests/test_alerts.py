@@ -113,3 +113,77 @@ def test_a_late_or_failed_backup_raises_an_alert_once(tmp_path):
     clock[0] += timedelta(hours=1)
     fwd.step()
     assert store.events(limit=1)[0]["message"].endswith("hours old")  # 30 hours plus the clock moved on
+
+
+def test_a_stale_backup_warns_once_however_old_it_grows(tmp_path):
+    """Review round 7: the stale warning's text changed every hour (its age), so it was said hourly."""
+    import json
+    import os
+    import time
+    from datetime import timedelta
+
+    from sleeve_fund.store import utcnow
+
+    (tmp_path / "sleeve_fund-a.dump").write_bytes(b"x")
+    (tmp_path / "status.json").write_text(json.dumps({"ok": True, "message": "ok"}))
+    os.utime(tmp_path / "sleeve_fund-a.dump", (time.time() - 30 * 3600,) * 2)
+    store, clock = _store(), [utcnow()]
+    fwd = Forwarder(store, environ={"BACKUP_DIR": str(tmp_path)}, now=lambda: clock[0])
+    for _ in range(5):
+        fwd.step()
+        clock[0] += timedelta(hours=1)
+    assert len([e for e in store.events(limit=50) if e["kind"] == "backup_problem"]) == 1
+
+
+def test_an_unreadable_backup_status_is_a_failure_not_a_pass(tmp_path):
+    """Review round 7, R7-B: a status file the backup wrote badly read as no news, so Ops showed the
+    backup as fine and nothing alerted."""
+    from sleeve_fund import backups
+    from sleeve_fund.store import utcnow
+
+    (tmp_path / "sleeve_fund-a.dump").write_bytes(b"x")
+    (tmp_path / "status.json").write_bytes(b'{"ok": false, "message": "pg_dump failed: \tbad\xff"')
+    kind, text = backups.problem(tmp_path, utcnow())
+    assert kind == "failed" and "isn't valid" in text
+    assert backups.latest(tmp_path, utcnow())["check"]["ok"] is False
+
+
+def test_a_send_that_trickles_is_cut_off_and_reported(monkeypatch):
+    """Review round 7: the 8 s timeout is per socket read, so a far end sending a byte every few
+    seconds held one send for 115 s, with no failure said."""
+    import socket
+    import threading
+    import time
+
+    from sleeve_fund import alerts
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    stop = threading.Event()
+
+    def trickle():
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+        while not stop.is_set():
+            try:
+                conn.sendall(b"x")
+            except OSError:
+                break
+            time.sleep(0.2)
+        conn.close()
+
+    threading.Thread(target=trickle, daemon=True).start()
+    monkeypatch.setattr(alerts, "TOTAL", 1.0)
+    store = _store()
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": f"http://127.0.0.1:{srv.getsockname()[1]}/hook"})
+    store.event(None, "error", "supervisor_error", "boom")
+    t0 = time.monotonic()
+    fwd.step()
+    took = time.monotonic() - t0
+    stop.set()
+    srv.close()
+    assert took < 3
+    (failed,) = [e for e in store.events(limit=10) if e["kind"] == "alert_send_failed"]
+    assert "TimeoutError" in failed["message"]

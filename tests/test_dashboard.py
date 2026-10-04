@@ -222,7 +222,7 @@ def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch)
                 Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/T/secret"}).describe())
     page = c.get("/ops", auth=AUTH).text
     assert "2 kept" in page and '<span class="">Last' in page
-    assert "Copies on this server only" in page and "Lightsail snapshots cover" not in page
+    assert "automatic daily snapshot of the whole server" in page
     (folder / "status.json").write_text('{"ok": true, "message": "x", "restored": {"sleeves": 3, "orders": 40, '
                                         '"fills": 41, "events": 900}}')
     assert "Restored into a scratch database and read back (3 strategies, 40 orders, 900 events)" in c.get(
@@ -969,13 +969,15 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     store.set_desired_state("eth-test", "stopped")
     store.set_status("sol-test", "halted", "drawdown 10.1% hit the 10% limit")
     page = c.get("/risk", auth=AUTH).text
-    assert "Flatten everything" in page and "All 2 strategies still trading or holding a position sell" in page
+    assert "Flatten everything" in page and "Both strategies still trading or holding a position sell" in page
     assert "eth-test is stopped, so it starts just to sell" in page
     r = c.post("/book/flatten", data={"reason": " "}, auth=AUTH, headers=SAME)
     assert "Nothing was sold: the kill switch needs a reason" in r.text and store.pending_commands("btc-test") == []
     r = c.post("/book/flatten", data={"reason": "Market event; standing aside"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
-    assert r.status_code == 303
+    assert r.status_code == 303 and r.headers["location"] == "/risk?killed=2"
+    fired = c.get(r.headers["location"], auth=AUTH).text
+    assert "Kill switch fired: 2 strategies are selling to cash" in fired and "data-once" in fired
     for name in ("btc-test", "eth-test"):
         (cmd,) = store.pending_commands(name)
         assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
@@ -987,6 +989,18 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
     assert any(d["action"] == "drop flatten" and "lapsed" in d["reason"] for d in store.decisions("btc-test"))
+    # With one strategy left to act on, the dialog names it.
+    store.set_desired_state("eth-test", "stopped")
+    store.record_equity("eth-test", equity=5000, cash=5000, qty=0.0, price=3300, benchmark=5000)
+    store.set_desired_state("btc-test", "running")
+    store.record_equity("btc-test", equity=5100, cash=5100, qty=0.0, price=105000, benchmark=5050)
+    assert "btc-test, the one strategy still trading or holding a position, sells" in c.get("/risk", auth=AUTH).text
+    from datetime import timedelta
+
+    from sleeve_fund.store import utcnow
+
+    store.set_status("btc-test", "paused", "daily loss 5.2%", utcnow() + timedelta(hours=20))
+    assert "btc-test is on a daily-loss pause, which then lasts until you resume too" in c.get("/risk", auth=AUTH).text
 
 
 def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatch, tmp_path):
@@ -1014,6 +1028,14 @@ def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatc
     daily = summary(returns_from_equity(pd.Series(d["equity"], index=pd.to_datetime(d["t"]))))["max_drawdown"]
     assert shown > 0.05 > -daily  # the dip is in, where daily closes saw almost none
     assert -d["hold"]["max_drawdown"] > 0.05  # the benchmark is measured on every bar too
+
+
+def test_an_age_never_reads_minus_zero():
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard.app import _held
+
+    assert _held(timedelta(seconds=-2)) == "0 min" and _held(timedelta(minutes=5)) == "5 min"
 
 
 def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):

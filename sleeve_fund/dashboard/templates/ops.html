@@ -53,7 +53,7 @@
     <tr><th scope="row">Outside alerts</th><td>{% if ops.alerts and 'not set up' not in ops.alerts.message %}{{ ops.alerts.message }}{% elif ops.alerts %}<span class="warn">{{ ops.alerts.message }}</span>{% else %}<span class="warn">Not reported yet: the supervisor says at start.</span>{% endif %}</td></tr>
     <tr><th scope="row">Database backup</th><td>{% set b = ops.backup %}{% if b and b.name %}<span class="{{ 'warn' if b.stale }}">Last {{ b.age|held }} ago</span>, {{ b.bytes|bytes }}; {{ b.count }} kept.{% elif b %}<span class="warn">No dump on disk.</span>{% else %}<span class="warn">None yet.</span> The backup service writes one a night.{% endif %}
       {% if b and b.check %}{% if b.check.ok %}Restored into a scratch database and read back{% if b.check.restored %} ({{ b.check.restored.sleeves }} strategies, {{ b.check.restored.orders }} orders, {{ b.check.restored.events }} events){% endif %}.{% else %}<span class="warn">Last run failed: {{ b.check.message }}.</span> It tries again within the hour.{% endif %}{% endif %}
-      <br><span class="muted">Copies on this server only, so losing the server loses them too. An off-site copy (S3 or Lightsail snapshots) is your call.</span></td></tr>
+      <br><span class="muted">Dumps sit on this server. The off-site copy is Lightsail's automatic daily snapshot of the whole server, which you turned on in the Lightsail console; this page can't see it, so check it there.</span></td></tr>
     <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>
   </table>
 </section>
