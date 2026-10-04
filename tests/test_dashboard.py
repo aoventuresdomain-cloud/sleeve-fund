@@ -988,7 +988,6 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     assert any(d["action"] == "drop flatten" and "lapsed" in d["reason"] for d in store.decisions("btc-test"))
 
 
-
 def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatch, tmp_path):
     """Review round 6, R6-M2: the result page measured drawdown on daily closes, so a fall that
     recovered by the close vanished, and a run read "drawdown 19.3%" beside "halted at 20.0%"."""
