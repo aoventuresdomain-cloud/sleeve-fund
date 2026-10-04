@@ -166,6 +166,7 @@ class LongFlatConfig(StrategyConfig):
         volume_scale: float = 1.0,
         market: str = markets.SPOT,
         allow_short: bool = False,
+        demo_mirror: bool = False,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -291,6 +292,8 @@ class LongFlatConfig(StrategyConfig):
         self.market = market
         self.allow_short = bool(allow_short)
         self.perp = markets.terms({"market": market})
+        # Read by the Deribit testnet demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
+        self.demo_mirror = bool(demo_mirror)
 
 
 # Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar

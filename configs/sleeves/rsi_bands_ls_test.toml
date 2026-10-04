@@ -1,7 +1,8 @@
 # Test strategy 2, long and short (PM, 4 Oct 2026): long when RSI(14) closes at or below 30 until it
 # reaches 55; short at or above 70 until it falls back to 50. Simulated on a low-fee perpetual (0.02%
 # maker, 0.05% taker, funding every 8 hours) on Kraken's live prices.
-# Added stopped: the PM (or the QA hand-over) starts it from the dashboard.
+# Added stopped: the PM (or the QA hand-over) starts it from the dashboard. Its fills are copied to the
+# Deribit testnet demo account when the demo mirror is on; the paper book stays the record.
 
 [sleeve]
 name = "rsi-bands-ls-test"
@@ -21,3 +22,4 @@ short_entry = 70.0
 short_exit = 50.0
 market = "perp"
 allow_short = true
+demo_mirror = true                    # copied to the Deribit testnet when the mirror is on (sleeve_fund/mirror.py)
