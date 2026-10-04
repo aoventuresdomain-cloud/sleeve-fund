@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv
-from sleeve_fund.instruments import price_decimals
+from sleeve_fund.instruments import history_price_decimals
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.run import LEDGER, STUDY_MINUTES, TEARSHEETS, StudyRequest, run_store_study, spec_of
 from sleeve_fund.research.study import run_study
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     quote = resolve(args.venue, _journal())
     print(f"fees: {quote.text}")
     instrument = venue(args.venue).instrument(args.base, args.quote, fees=quote.fees,
-                                              price_precision=price_decimals(float(prices["close"].median())))
+                                              price_precision=history_price_decimals(prices["close"]))
     result = run_study(
         spec,
         prices,

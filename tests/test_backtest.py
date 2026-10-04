@@ -304,3 +304,25 @@ def test_a_target_in_r_clears_costs_even_on_a_tight_stop(prices, instrument):
     assert entry["planned_r"] == pytest.approx(2.0)
     resting = [d for d in res.decisions.values() if d["intent"] in ("stop_loss", "take_profit")]
     assert [d["intent"] for d in resting] == ["stop_loss", "take_profit"]
+
+
+def test_sub_cent_prices_get_a_fine_enough_price_step(prices):
+    """At SHIB-like prices the old 2/4/6 rule gave a step of 5% of the price: 31 distinct closes a year and
+    stops filling from -0.36R to -1.61R (review round 10, B10-2). Now the step stays near 0.01% of the price."""
+    from sleeve_fund.instruments import history_price_decimals, price_decimals
+    from sleeve_fund.venues import venue
+
+    assert [price_decimals(p) for p in (60_000, 2.0, 0.48, 0.0765, 0.005, 0.00002)] == [2, 4, 6, 6, 7, 9]
+    shib = prices.copy()
+    scale = 2e-5 / prices["close"].median()
+    shib[["open", "high", "low", "close"]] = shib[["open", "high", "low", "close"]] * scale
+    shib["volume"] = shib["volume"] / scale  # the same dollar volume
+    d = history_price_decimals(shib["close"])
+    inst = venue("KRAKEN").instrument("SHIB", "USD", price_precision=d)
+    res = run_backtest("trend_filter", shib, inst, {"fast": 10, "slow": 30, "stop_loss": 0.03}, half_spread=0)
+    rounded = shib["close"].round(d)
+    assert rounded.nunique() > 0.9 * shib["close"].nunique()
+    assert not res.fills.empty
+    with pytest.raises(ValueError, match="can't be tested"):
+        history_price_decimals(shib["close"] / 1000)
+

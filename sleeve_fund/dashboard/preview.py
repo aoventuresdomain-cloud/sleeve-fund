@@ -13,7 +13,7 @@ import time
 
 import pandas as pd
 
-from sleeve_fund.instruments import price_decimals
+from sleeve_fund.instruments import history_price_decimals
 from sleeve_fund.research.metrics import (fills_to_rows, max_drawdown, returns_from_equity, summary, trade_stats,
                                           trades)
 from sleeve_fund.research.runner import BOOK_SHARE, run_backtest
@@ -273,7 +273,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         raise ValueError(f"only {len(prices)} bars of {profile.label} history for {pair}; need at least 60")
     spread = spread_quote or spreads.resolve(profile.name, pair)
     base, quote = pair.split("/")
-    inst = profile.instrument(base, quote, price_precision=price_decimals(float(prices["close"].median())),
+    inst = profile.instrument(base, quote, price_precision=history_price_decimals(prices["close"]),
                               fees=quote_fees.fees)
     if risk_profile is not None:
         from sleeve_fund.risk import profile as risk_profile_of

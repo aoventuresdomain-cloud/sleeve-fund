@@ -33,7 +33,7 @@ pytestmark = pytest.mark.sanity
 K = venue("KRAKEN")
 MAKER, TAKER = float(K.fees.maker), float(K.fees.taker)
 HALF = 0.0005  # a 5 bp half spread on orders that take liquidity
-CENT = 0.005  # fees are kept to the cent, so any one fee may be half a cent out
+CENT = 0.0100001  # fees are kept to the cent with the rounding carried to the next (S-1): one fee may be a cent out
 
 # Three price scales: a large price, a sub-dollar one and a sub-cent one.
 INSTRUMENTS = {
@@ -172,14 +172,8 @@ def test_post_only_fills_pay_the_maker_fee_and_market_fills_the_taker_fee(name):
     assert sum(f["fee"] for f in maker) / _notional(maker) == pytest.approx(MAKER, rel=1e-3)
 
 
-CENT_ROUNDING = pytest.mark.xfail(strict=True, reason=(
-    "NEW (sanity S-1): every fee is rounded to the cent (Nautilus keeps USD to 2 dp), so equal small slices "
-    "all round the same way: $2.44 slices pay 0.41%, not 0.40%, and $1.20 slices pay nothing"))
-
-
 @pytest.mark.usefixtures("maker_on")
-@pytest.mark.parametrize("capital", [pytest.param(96.0, marks=CENT_ROUNDING), pytest.param(200.0, marks=CENT_ROUNDING),
-                                     20_000.0, 1_000_000.0])
+@pytest.mark.parametrize("capital", [96.0, 200.0, 20_000.0, 1_000_000.0])
 def test_post_only_orders_filled_in_slices_still_pay_the_maker_rate_overall(capital):
     """Thin minutes: each post-only order fills a slice at a time (BOOK_SHARE of what trades), so small
     accounts get many small fills. Rounding each to the cent must not move the total off the rate."""
