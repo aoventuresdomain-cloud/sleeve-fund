@@ -27,6 +27,7 @@ from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE
+from sleeve_fund.strategies.indicators import Atr
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -55,6 +56,9 @@ class IdeaSpec:
 # StrategyConfig is a native type: Python passes the same keyword arguments to its
 # __new__, which reads the base fields (strategy_id etc.) from them. So __init__ must
 # not forward them, and we reject anything unrecognised so a typo in a sleeve file fails.
+# A stop set from the market is kept between these shares of the price: a swing low at the close would
+# otherwise give no room at all, and a stop half the price away protects nothing.
+MIN_STOP, MAX_STOP = 0.002, 0.5
 # The most of a bar's traded volume one buy may take (see LongFlatConfig.max_participation).
 MAX_PARTICIPATION = 0.25
 # Paper's price watchdog: minutes without a trade or a quote before it warns, and before it treats the
@@ -90,6 +94,10 @@ class LongFlatConfig(StrategyConfig):
         stop_loss: float | None = None,
         take_profit: float | None = None,
         risk_per_trade: float | None = None,
+        stop_atr: float | None = None,
+        stop_swing_bars: int | None = None,
+        atr_bars: int = 14,
+        take_profit_r: float | None = None,
         position_cap_pct: float | None = None,
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
@@ -117,11 +125,27 @@ class LongFlatConfig(StrategyConfig):
                              ("risk_per_trade", risk_per_trade, 0.2)):
             if v is not None and not 0 < v <= hi:
                 raise ValueError(f"{label} {v} outside (0, {hi}]; use a fraction, e.g. 0.05 for 5%")
+        stops = [k for k, v in (("stop_loss", stop_loss), ("stop_atr", stop_atr), ("stop_swing_bars", stop_swing_bars))
+                 if v is not None]
+        if len(stops) > 1:
+            raise ValueError(f"choose one kind of stop-loss, not {' and '.join(stops)}")
+        if stop_atr is not None and not 0 < stop_atr <= 20:
+            raise ValueError(f"stop_atr {stop_atr} outside (0, 20]; a multiple of the average true range, e.g. 2")
+        for label, v in (("stop_swing_bars", stop_swing_bars), ("atr_bars", atr_bars)):
+            if v is not None and (int(v) != v or not 2 <= v <= 500):
+                raise ValueError(f"{label} {v} must be a whole number of bars from 2 to 500")
+        if take_profit_r is not None:
+            if not 0 < take_profit_r <= 50:
+                raise ValueError(f"take_profit_r {take_profit_r} outside (0, 50]; a multiple of the stop distance")
+            if take_profit is not None:
+                raise ValueError("set the take-profit as a % or as a multiple of the stop distance, not both")
+            if not stops:
+                raise ValueError("a take-profit in multiples of the stop distance needs a stop-loss")
         if position_cap_pct is not None and not 0 < position_cap_pct <= 1:
             raise ValueError(f"position_cap_pct {position_cap_pct} outside (0, 1]")
         if rebalance_band is not None and not 0 <= rebalance_band < 1:
             raise ValueError(f"rebalance_band {rebalance_band} outside [0, 1)")
-        if rebalance_band is not None and (stop_loss or take_profit or risk_per_trade):
+        if rebalance_band is not None and (stops or take_profit or take_profit_r or risk_per_trade):
             raise ValueError("stop-loss, take-profit and risk per trade work on all-or-nothing positions; "
                              "they can't be combined with rebalancing to a target weight yet")
         if maker_wait_minutes is not None:
@@ -135,13 +159,15 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"max_participation {max_participation} outside (0, 1]")
         if not 0 < volume_scale <= 1:
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
-        if risk_per_trade is not None and stop_loss is None:
+        if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        if take_profit is not None:
+        fixed_tp = take_profit if take_profit is not None else (
+            take_profit_r * stop_loss if take_profit_r is not None and stop_loss is not None else None)
+        if fixed_tp is not None:
             leg = assumed_taker_fee + assumed_half_spread
-            cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
-            if take_profit <= cost:
-                raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
+            cost = leg + (1 + fixed_tp) * leg  # the fee and half spread in, then out on the larger value
+            if fixed_tp <= cost:
+                raise ValueError(f"Take-profit {fixed_tp:.2%} doesn't cover the round trip's fees and spread "
                                  f"({cost:.2%}), so every target hit would lose money")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
@@ -161,6 +187,13 @@ class LongFlatConfig(StrategyConfig):
         self.take_profit = take_profit
         # Optional sizing: lose at most this fraction of equity if the stop is hit.
         self.risk_per_trade = risk_per_trade
+        # Or a stop set from the market at each entry: this many average true ranges (over atr_bars
+        # bars) below the close, or just under the lowest low of the last stop_swing_bars bars.
+        self.stop_atr = stop_atr
+        self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
+        self.atr_bars = int(atr_bars)
+        # Or a take-profit this many times the stop's distance above the entry (2 = a 2:1 target).
+        self.take_profit_r = take_profit_r
         # Backtest only: the risk profile's position cap (a share of equity), so a backtest sizes
         # exactly as paper does. Paper and live take the cap from the sleeve's runtime instead.
         self.position_cap_pct = position_cap_pct
@@ -200,6 +233,13 @@ class LongFlatStrategy(Strategy):
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
         self._entry_qty = 0.0
+        # This position's stop and target as shares of the entry price, fixed when it was entered
+        # (from the % settings, or from the market for an ATR or swing-low stop); None when flat.
+        self._stop_frac: float | None = None
+        self._tp_frac: float | None = None
+        self._stop_basis = ""  # how the stop was set, in words, for the journal
+        self._atr = Atr(config.atr_bars) if config.stop_atr else None
+        self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
@@ -289,6 +329,7 @@ class LongFlatStrategy(Strategy):
             book = self.runtime.book
             if book["qty"] > 0 and book["entry_px"]:  # carried over from before a restart
                 self._entry_px, self._entry_qty = book["entry_px"], book["qty"]
+                self._restore_plan()
             if self.runtime.backtest:
                 # A backtest marks and guards from its bars: every execution bar when it is fed shorter
                 # bars than it decides on (paper does every 30 s), otherwise every decision bar.
@@ -357,8 +398,70 @@ class LongFlatStrategy(Strategy):
             return False
         self._last_bar_ts = bar.ts_event
         self._volumes.append(bar.volume.as_double() / self._cfg.volume_scale)
+        if self._atr is not None:
+            self._atr.update_raw(bar.high.as_double(), bar.low.as_double(), bar.close.as_double())
+        if self._lows is not None:
+            self._lows.append(bar.low.as_double())
         self.update_indicators(bar)
         return True
+
+    @property
+    def _has_exits(self) -> bool:
+        c = self._cfg
+        return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars or c.take_profit)
+
+    def _plan_exits(self, close: float) -> tuple[float | None, float | None, str] | None:
+        """This entry's stop and target as shares of the price, and how the stop was set; None while
+        an ATR or swing-low stop hasn't seen enough bars to be set."""
+        c = self._cfg
+        stop, basis = c.stop_loss, f"{c.stop_loss:.1%} below the entry" if c.stop_loss else ""
+        if c.stop_atr:
+            if not self._atr.initialized or close <= 0:
+                return None
+            stop, basis = c.stop_atr * self._atr.value / close, (
+                f"{c.stop_atr:g} x the {c.atr_bars}-bar average true range ({self._atr.value:,.6g})")
+        elif c.stop_swing_bars:
+            if len(self._lows) < c.stop_swing_bars or close <= 0:
+                return None
+            low = min(self._lows)
+            stop, basis = 1 - low / close, f"under the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
+        if stop is not None and (c.stop_atr or c.stop_swing_bars):
+            clamped = min(max(stop, MIN_STOP), MAX_STOP)
+            if clamped != stop:
+                basis += f", held to {clamped:.1%}"
+            stop = clamped
+        tp = c.take_profit if c.take_profit else (c.take_profit_r * stop if c.take_profit_r and stop else None)
+        return stop, tp, basis
+
+    def _restore_plan(self) -> None:
+        """After a restart with a position open: the stop and target its entry journaled. Fixed %
+        exits need no journal; an ATR or swing-low stop set at entry is read back, or, for an entry
+        journaled before stops were recorded, set again from the market on the next bar (_replan)."""
+        c = self._cfg
+        if not self._has_exits:
+            return
+        entry = next((o for o in self.runtime.store.orders(self.runtime.name, limit=200)
+                      if o.get("intent") == "entry" and o.get("side") == "BUY"), None)
+        sig = (entry or {}).get("signal") or {}
+        if "stop_frac" in sig or "tp_frac" in sig:
+            self._stop_frac, self._tp_frac = sig.get("stop_frac"), sig.get("tp_frac")
+            self._stop_basis = sig.get("stop_basis", "")
+        elif not (c.stop_atr or c.stop_swing_bars):
+            self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(self._entry_px) or (None, None, "")
+
+    def _replan(self, close: float) -> None:
+        plan = self._plan_exits(close)
+        if plan is None:
+            self._note("stop_not_ready", "The open position has no stop yet: it is set from the last "
+                       f"{self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} bars, "
+                       "and there aren't that many since the restart")
+            return
+        self._noted.discard("stop_not_ready")
+        self._stop_frac, self._tp_frac, self._stop_basis = plan
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "stop_reset",
+                                     f"Stop for the open position set again from the market after a restart: "
+                                     f"{self._stop_frac:.1%} below the entry ({self._stop_basis})", ts=self.runtime.now())
 
     def on_historical_bars(self, bars) -> None:
         for bar in sorted(bars, key=lambda b: b.ts_event):
@@ -427,6 +530,8 @@ class LongFlatStrategy(Strategy):
         self._maybe_tick()
         if self._pending_exit is not None:
             return
+        if self._entry_px is not None and self._has_exits and self._stop_frac is None and self._tp_frac is None:
+            self._replan(self._last_close)
         if self._check_exits(self._last_close):
             return
         raw = self.target_weight(bar)
@@ -445,6 +550,15 @@ class LongFlatStrategy(Strategy):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
+            if self._has_exits:
+                plan = self._plan_exits(close)
+                if plan is None:
+                    self._note("stop_not_ready", "Entry held back: the stop is set from the last "
+                               f"{self._cfg.atr_bars if self._cfg.stop_atr else self._cfg.stop_swing_bars} bars, "
+                               "and there aren't that many yet", level="info")
+                    return
+                self._noted.discard("stop_not_ready")
+                self._stop_frac, self._tp_frac, self._stop_basis = plan
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
@@ -533,23 +647,22 @@ class LongFlatStrategy(Strategy):
 
         Paper and live call this on every trade, so both levels are watched tick by tick. A
         backtest only sees whole bars, so both exits rest at the venue instead (_rest_exits)."""
-        cfg = self._cfg
-        if self._entry_px is None or not (cfg.stop_loss or cfg.take_profit) or price <= 0:
+        stop, tp = self._stop_frac, self._tp_frac
+        if self._entry_px is None or not (stop or tp) or price <= 0:
             return False
         if self._busy():
             return False
         if self._backtest:
             return False  # both exits rest at the venue (_rest_exits) and fill at their levels
         move = price / self._entry_px - 1
-        hit = ("stop_loss" if cfg.stop_loss and move <= -cfg.stop_loss
-               else "take_profit" if cfg.take_profit and move >= cfg.take_profit else None)
+        hit = ("stop_loss" if stop and move <= -stop else "take_profit" if tp and move >= tp else None)
         if hit is None:
             return False
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry",
                                      ts=self.runtime.now())
-        level = cfg.stop_loss if hit == "stop_loss" else cfg.take_profit
+        level = stop if hit == "stop_loss" else tp
         reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'}: price {price:,.6g} is {move:+.2%} from "
                   f"the {self._entry_px:,.6g} entry, past the {level:.1%} {'stop' if hit == 'stop_loss' else 'target'}")
         values = {"entry_px": self._entry_px, "move": move, hit: level}
@@ -602,20 +715,26 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
                   "budget": round(float(budget), 2)}
-        if self._cfg.stop_loss:
+        if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
             signal["risk_amount"] = round(float(qty * bar.close.as_decimal()) * loss, 2)
-            if self._cfg.take_profit:  # what the target makes, after the same costs, in R
-                tp, cost = self._cfg.take_profit, self._round_trip_cost()
+            signal["stop_frac"] = round(self._stop_frac, 6)
+            if self._cfg.stop_atr or self._cfg.stop_swing_bars:
+                signal["stop_basis"] = self._stop_basis
+            if self._tp_frac:  # what the target makes, after the same costs, in R
+                tp, cost = self._tp_frac, self._round_trip_cost()
+                signal["tp_frac"] = round(tp, 6)
                 signal["planned_r"] = round((tp - cost - (1 + tp) * cost) / loss, 2)
+        elif self._tp_frac:
+            signal["tp_frac"] = round(self._tp_frac, 6)
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
     def _loss_at_stop(self) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
         and half the spread to buy, plus the same on what is left to sell. A 6% stop at 0.8% taker and a
         0.05% half spread loses 7.65%, not 6%."""
-        cost, stop = self._round_trip_cost(), self._cfg.stop_loss
+        cost, stop = self._round_trip_cost(), self._stop_frac if self._stop_frac is not None else self._cfg.stop_loss
         return stop + cost + (1 - stop) * cost
 
     def _round_trip_cost(self) -> float:
@@ -1018,6 +1137,7 @@ class LongFlatStrategy(Strategy):
             self._entry_qty = max(self._entry_qty - qty, 0.0)
             if self._entry_qty <= 1e-12:
                 self._entry_px, self._entry_qty = None, 0.0
+                self._stop_frac = self._tp_frac = None
         if self._backtest:
             if event.is_buy and done and self._pending_exit is None:
                 self._rest_exits()
@@ -1044,14 +1164,14 @@ class LongFlatStrategy(Strategy):
         extreme nearer the open trades first. A stop fills at its level, or at the open when the price
         gaps through it; a target fills at its level, never better, never worse."""
         cfg = self._cfg
-        if not (cfg.stop_loss or cfg.take_profit) or self._entry_px is None:
+        plan = {"stop_loss": self._stop_frac, "take_profit": self._tp_frac}
+        if not any(plan.values()) or self._entry_px is None:
             return
         qty = self._position_qty(free=True).quantize(self.instrument.size_increment.as_decimal(), rounding=ROUND_DOWN)
         if qty < self._min_qty():
             return
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
-        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit")
-               if getattr(cfg, k)}
+        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit") if plan[k]}
         both = len(ids) == 2
 
         def link(kind: str) -> dict:
@@ -1060,24 +1180,28 @@ class LongFlatStrategy(Strategy):
 
         orders = []
         now = self.clock.timestamp_ns()
-        if cfg.stop_loss:
-            level = self._entry_px * (1 - cfg.stop_loss)
+        if plan["stop_loss"]:
+            stop = plan["stop_loss"]
+            level = self._entry_px * (1 - stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], OrderSide.SELL, quantity,
                 Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, False, False,
                 UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
-                f"Stop-loss: resting sell at {level:,.6g}, {cfg.stop_loss:.1%} below the {self._entry_px:,.6g} entry; "
-                "fills at that level, or the open if the price gaps through",
-                {"entry_px": round(self._entry_px, 8), "stop_loss": cfg.stop_loss, "trigger": round(level, 8)}))
-        if cfg.take_profit:
-            level = self._entry_px * (1 + cfg.take_profit)
+                f"Stop-loss: resting sell at {level:,.6g}, {stop:.1%} below the {self._entry_px:,.6g} entry"
+                + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
+                + "; fills at that level, or the open if the price gaps through",
+                {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
+        if plan["take_profit"]:
+            tp = plan["take_profit"]
+            level = self._entry_px * (1 + tp)
             orders.append((LimitOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], OrderSide.SELL, quantity,
                 Price(level, self.instrument.price_precision), TimeInForce.GTC, False, False, False,
                 UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
-                f"Take-profit: resting sell at {level:,.6g}, {cfg.take_profit:.1%} above the {self._entry_px:,.6g} "
-                "entry; fills at that level",
-                {"entry_px": round(self._entry_px, 8), "take_profit": cfg.take_profit, "limit_px": round(level, 8)}))
+                f"Take-profit: resting sell at {level:,.6g}, {tp:.1%} above the {self._entry_px:,.6g} entry"
+                + (f" ({cfg.take_profit_r:g} times the stop's distance)" if cfg.take_profit_r else "")
+                + "; fills at that level",
+                {"entry_px": round(self._entry_px, 8), "take_profit": round(tp, 6), "limit_px": round(level, 8)}))
         for order, intent, kind, reason, signal in orders:
             self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
             if self.runtime is not None:

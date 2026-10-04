@@ -237,7 +237,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         chosen = strategy if strategy in REGISTRY else "trend_filter"
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
                     bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
-                    pre=dict(request.query_params), accounts=st().accounts())
+                    pre=dict(request.query_params), accounts=st().accounts(), costs=exit_costs())
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -262,7 +262,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=bar_spec, starting_balance=float(form.get("starting_balance", 0) or 0),
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")))
-            _check_strategy_params(cfg)
+            _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
             needed = REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec))
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
@@ -506,6 +506,14 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "unknown export")
         return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
 
+    def exit_costs() -> dict:
+        """What each leg of a trade costs, for the plan line under the exit fields: the taker fee and
+        each instrument's half spread (measured, else the venue's assumption), exactly as the backtest
+        and paper charge them, so the form and the backtest quote the same round trip."""
+        default = resolve_spread(None, "?/?", None).half_spread
+        return {"taker": float(resolve_fees(None, st()).fees.taker), "default_spread": default,
+                "spreads": {p: resolve_spread(None, p, st()).half_spread for p in INSTRUMENT_HINTS}}
+
     def backtest_form(request: Request, q, *, result=None, error="", job=None, saved=None):
         """The backtest page: the settings form, plus a result, an error, or a run in progress."""
         from sleeve_fund.dashboard import pipeline
@@ -529,7 +537,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
-                    runs=st().backtests(limit=BACKTEST_KEEP))
+                    runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs())
 
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_page(request: Request, _: str = Depends(require_pm)):
@@ -875,6 +883,11 @@ def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
     return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes)
 
 
+# Exit settings the form takes as stored (the % ones are converted above): an ATR or swing-low stop,
+# and a target as a multiple of the stop's distance.
+EXIT_SETTINGS = {"stop_atr": float, "atr_bars": int, "stop_swing_bars": int, "take_profit_r": float}
+
+
 def _clone_qs(s) -> str:
     """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
     params = dict(s.params)
@@ -886,6 +899,9 @@ def _clone_qs(s) -> str:
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # stored as fractions, entered as %
         if key in params:
             q[f"{key}_pct"] = f"{params.pop(key) * 100:g}"
+    for key in EXIT_SETTINGS:
+        if key in params:
+            q[key] = f"{params.pop(key):g}"
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
@@ -937,6 +953,15 @@ def _form_params(form, strategy: str) -> dict:
         raw = str(form.get(f"{key}_pct", "")).strip()
         if raw:
             params[key] = round(float(raw) / 100, 6)
+    for key, cast in EXIT_SETTINGS.items():  # entered as they are stored
+        raw = str(form.get(key, "")).strip()
+        if raw:
+            try:
+                params[key] = cast(raw)
+            except ValueError:
+                raise ValueError(f"{key.replace('_', ' ')}: a number") from None
+    if "atr_bars" in params and "stop_atr" not in params:
+        params.pop("atr_bars")  # only means something with an ATR stop
     execution = str(form.get("execution", "") or "market")
     if execution not in ("market", "maker"):
         raise ValueError("order type: market or maker first")
@@ -963,13 +988,15 @@ def _coerce_params(raw: dict) -> dict:
     return out
 
 
-def _check_strategy_params(cfg: SleeveConfig) -> None:
-    """Build the strategy config once so bad parameters fail here, not in the sleeve process."""
+def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
+    """Build the strategy config once so bad parameters fail here, not in the sleeve process. With the
+    spread paper will charge, so a target that can't cover its costs is refused here at the same round
+    trip the backtest quotes (review round 7: 1.61% here against 1.71% there)."""
     from nautilus_trader.model import BarType, InstrumentId
 
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)
     config_cls(instrument_id=InstrumentId.from_str(cfg.instrument_id), bar_type=BarType.from_str(cfg.bar_type),
-               assumed_taker_fee=float(cfg.fees.taker), **params)
+               assumed_taker_fee=float(cfg.fees.taker), assumed_half_spread=half_spread, **params)
 
