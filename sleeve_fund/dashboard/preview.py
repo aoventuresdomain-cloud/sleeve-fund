@@ -13,8 +13,9 @@ import time
 
 import pandas as pd
 
-from sleeve_fund.research.metrics import fills_to_rows, returns_from_equity, summary, trade_stats, trades
-from sleeve_fund.research.runner import run_backtest
+from sleeve_fund.research.metrics import (fills_to_rows, max_drawdown, returns_from_equity, summary, trade_stats,
+                                          trades)
+from sleeve_fund.research.runner import BOOK_SHARE, run_backtest
 from sleeve_fund.venues import venue as venue_profile
 
 CACHE_SECONDS = 6 * 3600  # daily candles: refetching more often adds nothing
@@ -94,7 +95,7 @@ CHART_CANDLES = 2500  # the most candles a backtest's price chart draws; coarser
 
 
 def _daily(series: pd.Series) -> pd.Series:
-    """Daily closes of an intraday series, so returns, Sharpe and drawdowns are annualised as daily."""
+    """Daily closes of an intraday series, so returns and Sharpe are annualised as daily (drawdowns use every mark)."""
     return series.resample("1D", closed="right", label="right").last().dropna()
 
 
@@ -160,7 +161,9 @@ def _execution(res, wait, matched_on) -> dict:
     if wait and matched_on is None:
         out["note"] = "No minute history here: maker orders assumed to miss, charged the taker fee."
     elif wait:
-        out["note"] = f"Maker fills matched on {matched_on} bars, trade-through only."
+        out["note"] = (f"Maker fills matched on {matched_on} bars: only on trades through the limit, and at most "
+                       f"{BOOK_SHARE / 4:.0%} of a bar's volume per price it trades through, so a large order "
+                       "fills over several bars.")
     return out
 
 
@@ -284,11 +287,25 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     if keep is not None:
         keep["journal"] = res.journal
     bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
+    # The worst drawdown over every mark, before the daily closes below hide the intraday low: the
+    # journal marks each execution bar (as paper marks every tick), the curve each decision bar.
+    worst = max_drawdown(res.equity)
+    if res.journal is not None:
+        worst = min(worst, -res.journal.max_drawdown())
+    bench_worst = max_drawdown(bench)
+    if exec_prices is not None:  # hold the benchmark to the same standard, on the same execution bars
+        fine = exec_prices[exec_prices.index >= prices.index[0]]
+        c = cap if cap is not None else 1.0
+        held = starting * (1 - c) + starting * c * (1 - float(inst.taker_fee)) * fine["close"] / prices["close"].iloc[0]
+        bench_worst = max_drawdown(pd.concat([bench, held]).sort_index())
     if minutes < 1440:  # judge returns day by day, whatever the bar length, so Sharpe is annualised right
         equity, bench = _daily(res.equity), _daily(bench)
     else:
         equity = res.equity
     s, b = summary(returns_from_equity(equity)), summary(returns_from_equity(bench))
+    for m, w in ((s, worst), (b, bench_worst)):
+        m["max_drawdown"] = min(m["max_drawdown"], w)
+        m["calmar"] = m["cagr"] / abs(m["max_drawdown"]) if m["max_drawdown"] < 0 else 0.0
     rows = fills_to_rows(res.fills)
     trips = trades(rows)
     stats = trade_stats(trips)

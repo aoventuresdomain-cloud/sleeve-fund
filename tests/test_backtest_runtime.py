@@ -193,14 +193,14 @@ def test_the_participation_cap_can_be_set_or_turned_off(instrument):
         TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.008, max_participation=2)
 
 
-def _volume_run(prices, instrument, volume):
+def _volume_run(prices, instrument, volume, params=None):
     from sleeve_fund.paper.runtime import SleeveRuntime
 
     bars = prices.iloc[:30].copy()
     bars["volume"] = volume
     rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
                                     starting_balance=1_000_000, risk_profile="aggressive")
-    run_backtest("buy_and_hold", bars, instrument, runtime=rt)
+    run_backtest("buy_and_hold", bars, instrument, params=params, runtime=rt)
     buys = [o for o in rt.store.orders(limit=100) if o["side"] == "BUY"]
     return buys, rt.store.events(rt.name, limit=100)
 
@@ -217,7 +217,46 @@ def test_bars_with_no_volume_do_not_silence_the_strategy(prices, instrument):
 
 
 def test_a_buy_the_volume_cap_blocks_says_so(prices, instrument):
-    buys, events = _volume_run(prices, instrument, 1e-8)  # a quarter of it rounds to nothing
+    # A tenth of it rounds to nothing (the venue is shown at least the smallest size where anything traded).
+    buys, events = _volume_run(prices, instrument, 1e-8, {"max_participation": 0.1})
     assert buys == []
     (note,) = [e for e in events if e["kind"] == "buy_skipped"]  # said once, not every bar
     assert "share of the bar's volume" in note["message"] and "smallest order" in note["message"]
+
+
+def test_a_halt_on_the_bar_an_entry_fills_cancels_its_stop_and_target(instrument):
+    """A maker entry filled and the drawdown halt fired on the same minute, while the entry's stop and
+    target were not yet at the venue. The halt sold the position, and the target, still resting, sold it
+    again hours later: a short in a cash account and a phantom exit (review round 6, N6-1). This path is
+    the reviewer's seed 5 that found it."""
+    import numpy as np
+
+    from sleeve_fund.venues import venue
+
+    eth = venue("kraken").instrument("ETH", "USD")
+    n = 87 * 1440
+    rng = np.random.default_rng(5)
+    r = rng.normal(0, 0.06 / np.sqrt(1440), 90 * 1440)
+    jumps = rng.random(90 * 1440) < 2 / 1440
+    r[jumps] += rng.normal(0, 0.06, jumps.sum())
+    c = 1000 * np.exp(np.cumsum(r))[:n]
+    o = np.r_[c[0], c[:-1]]
+    idx = pd.date_range("2024-01-01 00:01", periods=n, freq="1min", tz="UTC")
+    m = pd.DataFrame({"open": o, "high": np.maximum(o, c) * 1.0005, "low": np.minimum(o, c) * 0.9995, "close": c,
+                      "volume": 50.0}, index=idx)
+    daily = m.resample("1D", label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    res = run_backtest("trend_filter", daily, eth, starting_capital=10_000, exec_prices=m, exec_minutes=1,
+                       risk_profile="conservative", bar_minutes=1440,
+                       params={"fast": 2, "slow": 3, "stop_loss": 0.04, "take_profit": 0.05, "maker_wait_minutes": 60})
+    j = res.journal
+    assert [e["kind"] for e in res.risk_events] == ["risk_halt"]
+    halt = pd.Timestamp(res.risk_events[0]["ts"])
+    orders = {o["intent"]: o for o in j.orders_.values() if pd.Timestamp(o["ts"]) == halt}
+    assert orders["risk_halt"]["status"] == "filled"
+    assert orders["stop_loss"]["status"] == orders["take_profit"]["status"] == "canceled"
+    pos = 0.0
+    for f in j.fills_:
+        pos += f["qty"] if f["side"] == "BUY" else -f["qty"]
+        assert pos > -1e-9, f"sold more than was held at {f['ts']}"
+    assert abs(pos) < 1e-9 and res.equity.index[-1] > halt

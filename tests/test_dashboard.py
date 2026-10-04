@@ -714,11 +714,13 @@ def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, mon
 
     c, _ = client
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
-    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", _wavy_minutes(90), cursor="x")
+    deep = _wavy_minutes(90).assign(volume=1_000.0)  # the whole order fits in what one minute shows
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", deep, cursor="x")
     preview._history.clear()
     q = "/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold&execution=maker&maker_wait_minutes=15"
     page = c.get(q, auth=AUTH).text
     assert "1 of 1 as maker" in page and "Maker fills matched on 1-minute bars" in page
+    assert "at most 5% of a bar&#39;s volume per price it trades through" in page
     assert "maker_wait_minutes=15" in page and "execution=maker" in page  # carried to the paper strategy
 
     preview._history.clear()  # no stored minutes for this one: the page says every maker order paid taker
@@ -984,3 +986,31 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
     assert any(d["action"] == "drop flatten" and "lapsed" in d["reason"] for d in store.decisions("btc-test"))
+
+
+
+def test_the_backtest_result_page_shows_the_intraday_drawdown(client, monkeypatch, tmp_path):
+    """Review round 6, R6-M2: the result page measured drawdown on daily closes, so a fall that
+    recovered by the close vanished, and a run read "drawdown 19.3%" beside "halted at 20.0%"."""
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.research.metrics import returns_from_equity, summary
+
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    m = _wavy_minutes(120)
+    dip = np.ones(len(m))
+    dip[100 * 1440 + 600:100 * 1440 + 700] = 0.85  # 15% down for 100 minutes, back by the close
+    for col in ("open", "high", "low", "close"):
+        m[col] = m[col] * dip
+    history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", m, cursor="x")
+    preview._history.clear()
+    keep = {}
+    d = preview.run("buy_and_hold", "ETH/USD", {}, risk_profile="aggressive", keep=keep)
+    shown = -d["strategy"]["max_drawdown"]
+    assert shown == pytest.approx(keep["journal"].max_drawdown(), abs=1e-9)
+    daily = summary(returns_from_equity(pd.Series(d["equity"], index=pd.to_datetime(d["t"]))))["max_drawdown"]
+    assert shown > 0.05 > -daily  # the dip is in, where daily closes saw almost none
+    assert -d["hold"]["max_drawdown"] > 0.05  # the benchmark is measured on every bar too

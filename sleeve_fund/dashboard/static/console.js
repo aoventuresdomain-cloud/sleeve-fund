@@ -161,7 +161,7 @@ window.Console = (() => {
         };
         item("", labels[0], signed(view.ret[at]), view.ret[at] >= 0 ? "gain" : "loss");
         item("bench", labels[1], signed(view.bench[at]));
-        item(null, i === null || i === undefined ? "Worst drawdown" : "Drawdown", signed(i === null || i === undefined ? Math.min(...view.dd) : view.dd[at]));
+        item(null, i === null || i === undefined ? "Worst drawdown" : "Drawdown", signed(i === null || i === undefined ? view.worst : view.dd[at]));
         legend.append(Object.assign(document.createElement("span"), {textContent: when, className: "faint"}));
       };
       const hover = (_e, els) => readout(els.length ? els[0].index : null);
@@ -203,6 +203,9 @@ window.Console = (() => {
         const lab = times.slice(from).map((t) => new Date(t).toLocaleString("en-GB", {...opts, timeZone: "UTC"}));
         const ret = rebase(d.equity, from), bench = rebase(d.benchmark, from);
         view = {lab, ret, bench, dd: d.drawdown.slice(from).map((x) => -x * 100)};
+        // The whole run's worst comes from every mark, as the tables show it; the curve is daily or
+        // thinned and can miss a fall that recovered between its points. A shorter range reads the curve.
+        view.worst = from === 0 && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
         eq.data.labels = lab; eq.data.datasets[0].data = ret; eq.data.datasets[1].data = bench;
         eq.data.datasets[2].data = ret.map((v, i) => (buys.has(i + from) ? v : null));
         eq.data.datasets[3].data = ret.map((v, i) => (sells.has(i + from) ? v : null));

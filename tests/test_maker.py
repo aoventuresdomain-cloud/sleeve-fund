@@ -9,13 +9,14 @@ from sleeve_fund.research.runner import run_backtest
 MAKER, TAKER = 0.004, 0.008
 
 
-def _minutes(closes, start="2024-01-01", wiggle=0.0):
-    """1-minute bars stamped at their close, as the history store returns them."""
+def _minutes(closes, start="2024-01-01", wiggle=0.0, volume=1_000.0):
+    """1-minute bars stamped at their close, as the history store returns them. Deep by default, so an
+    order fills whole inside the share of a bar the venue shows (runner.BOOK_SHARE)."""
     c = np.asarray(closes, dtype=float)
     o = np.concatenate([[c[0]], c[:-1]])
     idx = pd.date_range(start, periods=len(c), freq="1min", tz="UTC") + pd.Timedelta("1min")
     return pd.DataFrame({"open": o, "high": np.maximum(o, c) + wiggle, "low": np.minimum(o, c) - wiggle,
-                         "close": c, "volume": 1.0}, index=pd.DatetimeIndex(idx, name="timestamp"))
+                         "close": c, "volume": volume}, index=pd.DatetimeIndex(idx, name="timestamp"))
 
 
 def _daily(m):
@@ -41,6 +42,23 @@ def test_a_post_only_entry_fills_at_its_limit_and_pays_the_maker_fee(instrument)
     assert float(fill["avg_px"]) == pytest.approx(9_999.99)  # one tick (a cent) under the last price
     assert _fee(res.fills) == pytest.approx(float(fill["filled_qty"]) * 9_999.99 * MAKER, abs=0.01)
     assert fill["ts_last"] < pd.Timestamp("2024-01-02 00:15", tz="UTC")  # well inside the wait
+
+
+def test_a_post_only_order_takes_only_a_share_of_what_trades(instrument):
+    """Review R2-M3: a post-only order joins the back of the queue, so it can't take all of a thin bar's
+    volume just because the price traded through it. Each minute fills at most BOOK_SHARE / 4 of the
+    minute's volume per print through the limit; what is left after the wait goes at market."""
+    from sleeve_fund.research.runner import BOOK_SHARE
+
+    m = _minutes([10_000.0] * (3 * 1440), wiggle=1.0, volume=1.0)  # 1 a minute; the order is about 1
+    res = _run(m, {"maker_wait_minutes": 15}, instrument=instrument)
+    maker, market = res.fills.iloc[0], res.fills.iloc[1]
+    assert maker["type"] == "LIMIT" and market["type"] == "MARKET"
+    per_print = BOOK_SHARE / 4
+    # 15 minutes of at most two prints through the limit each; the whole order was nearly a minute's volume.
+    assert 0 < float(maker["filled_qty"]) <= 15 * 2 * per_print + 1e-9
+    assert float(market["filled_qty"]) > 0.2 * float(maker["filled_qty"])
+    assert "not filled within 15 minutes" in list(res.decisions.values())[1]["reason"]
 
 
 def test_an_unfilled_post_only_order_goes_at_market_after_the_wait(instrument):
