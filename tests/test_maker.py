@@ -151,3 +151,32 @@ def test_a_partly_filled_maker_entry_is_guarded_by_its_stop_through_the_wait(ins
     assert pd.Timestamp(stops[-1]["ts"]) >= max(pd.Timestamp(f["ts"]) for f in entry)  # nothing bought after
     stop_order = j.orders_[stops[0]["order_id"]]
     assert stop_order["qty"] > entry[0]["qty"] and "resized" in stop_order["message"]  # grew with the entry
+
+
+def test_a_stop_and_target_resized_mid_flight_still_cover_the_whole_position(instrument):
+    """An entry slice can fill while its stop and target are still being sent or resized. Those were
+    skipped, so the stop sold a few slices and left most of the position with none; and resizing both
+    linked orders made each undo the other's size. Every stop or target exit now leaves the book flat."""
+    s = np.arange(16 * 3600)
+    px = np.round(60_000 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.0004, len(s)))), 1)
+    trades = pd.Series(px, index=pd.date_range("2025-10-03", periods=len(s), freq="1s", tz="UTC"))
+    bars = trades.resample("1min", closed="left", label="right").ohlc()
+    bars["volume"] = 60 * 0.0005  # thin: a post-only entry fills in slices
+    dec = bars.resample("15min", label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    res = run_backtest("trend_filter", dec, instrument,
+                       params={"fast": 3, "slow": 8, "maker_wait_minutes": 10, "stop_loss": 0.004, "take_profit": 0.02},
+                       starting_capital=10_000, risk_profile="aggressive", bar_minutes=15, exec_prices=bars,
+                       exec_minutes=1, half_spread=1e-4)
+    j = res.journal
+    held, exits = 0.0, 0
+    fills = sorted(j.fills_, key=lambda f: f["id"])
+    for i, f in enumerate(fills):
+        held += f["qty"] if f["side"] == "BUY" else -f["qty"]
+        assert held > -1e-9
+        last_of_exit = j.orders_[f["order_id"]]["intent"] in ("stop_loss", "take_profit") and (
+            i + 1 == len(fills) or fills[i + 1]["side"] == "BUY")
+        if last_of_exit:
+            exits += 1
+            assert held == pytest.approx(0, abs=1e-9), f
+    assert exits >= 3 and res.handler_error_count == 0
