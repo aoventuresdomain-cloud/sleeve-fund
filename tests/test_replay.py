@@ -94,3 +94,58 @@ def test_a_silent_feed_is_flagged_then_restarted(tmp_path):
     back = next(e for e in events if e["kind"] == "price_feed_back")
     marks = [m["ts"] for m in store.equity_series("replay-test", limit=100_000)]
     assert not [t for t in marks if dead["ts"] < t < back["ts"]]  # no marks, no heartbeat: the supervisor restarts it
+
+
+@pytest.mark.usefixtures("maker_on")
+def test_fills_at_8_lot_decimals_are_journaled_as_the_account_holds_them(tmp_path):
+    """A venue lists XRP at 8 lot decimals while the account keeps 6. Post-only entries fill in slices sized
+    by 8-decimal prints; the account rounds each slice to 6, so the journal must too, or the two drift apart
+    until reconcile halts the strategy (review round 10, B10-1)."""
+    from decimal import Decimal
+
+    import numpy as np
+    from nautilus_trader.model import (AggressorSide, Currency, CurrencyPair, InstrumentId, Price, Quantity,
+                                       QuoteTick, Symbol, TradeId, TradeTick)
+
+    import sleeve_fund.paper.runtime as rtmod
+    from sleeve_fund.store import Store
+    from sleeve_fund.venues import venue
+
+    v = venue("KRAKEN").instrument("XRP", "USD", price_precision=5)
+    inst = CurrencyPair(instrument_id=InstrumentId.from_str("XRP/USD.KRAKEN"), raw_symbol=Symbol("XRP/USD"),
+                        base_currency=Currency.from_str("XRP"), quote_currency=Currency.from_str("USD"),
+                        price_precision=5, size_precision=8, price_increment=Price(1e-5, 5),
+                        size_increment=Quantity(1e-8, 8), lot_size=None, min_quantity=None, min_notional=None,
+                        margin_init=Decimal(0), margin_maint=Decimal(0), maker_fee=v.maker_fee, taker_fee=v.taker_fee,
+                        ts_event=0, ts_init=0)
+    rng, rng2 = np.random.default_rng(7), np.random.default_rng(11)
+    s = np.arange(4 * 3600)
+    p = 0.5 * (1 + 0.02 * np.sin(s / 900) + 0.006 * np.sin(s / 300)) * (1 + 0.0004 * rng.standard_normal(len(s)).cumsum() / 30)
+    path = tmp_path / "xrp8.jsonl.gz"
+    rec = Recorder(path)
+    rec.meta = {"balances": ["10000.00 USD"],
+                "sleeve": {"name": "x", "strategy": "trend_filter", "instrument": "XRP/USD",
+                           "bar_spec": "15-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": "aggressive",
+                           "params": {"fast": 3, "slow": 8, "stop_loss": 0.02, "maker_wait_minutes": 10},
+                           "max_notional": None, "maker_fee": "0.004", "taker_fee": "0.008", "tick_seconds": 30}}
+    rec.start(inst)
+    for j, px in enumerate(np.round(p, 5)):
+        t = START + j * 1_000_000_000
+        size = round(150.00617284 * (0.2 + 1.6 * rng2.random()), 8)
+        rec.trade(TradeTick(inst.id, Price(px, 5), Quantity(size, 8), AggressorSide.BUY if j % 2 else AggressorSide.SELL,
+                            TradeId(str(j)), t, t + 1000))
+        rec.quote(QuoteTick(inst.id, Price(px - 3e-5, 5), Price(px + 3e-5, 5), Quantity(10 ** 6, 8),
+                            Quantity(10 ** 6, 8), t + 2000, t + 3000))
+    rec.close()
+    store = Store(f"sqlite:///{tmp_path}/j.db")
+    old = rtmod.RECONCILE_EVERY
+    rtmod.RECONCILE_EVERY = old / (24 * 12)  # every 5 minutes
+    try:
+        replay(path, store=store)
+    finally:
+        rtmod.RECONCILE_EVERY = old
+    fills = store.fills("x", limit=10_000)
+    assert len(fills) > len({f["order_id"] for f in fills})  # some orders filled in slices
+    assert all(Decimal(repr(f["qty"])) == Decimal(repr(f["qty"])).quantize(Decimal("1e-6")) for f in fills)
+    kinds = [e["kind"] for e in store.events("x", limit=10_000)]
+    assert "reconcile" in kinds and "reconcile_mismatch" not in kinds

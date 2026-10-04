@@ -437,3 +437,55 @@ def test_a_restart_closes_the_orders_the_last_process_left_working(store):
     SleeveRuntime(store, "s1").on_start(0.008)
     (o,) = store.orders("s1")
     assert o["status"] == "canceled" and "restarted" in o["message"]
+
+
+@pytest.mark.parametrize("command", ["pause", "flatten"])
+def test_a_pm_pause_or_flatten_survives_a_restart(store, command):
+    """The PM's pause, flatten (which pauses) and the book kill switch (a flatten per strategy) have no end
+    time: only a resume lifts them, not a settings reload, a stale-heartbeat or a crash restart (round 10, B10-3)."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2024, 3, 1, 12, 0, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    mark = {"cash": 10_000.0, "qty": 0.0}
+    store.command("s1", command, "PM wants it stopped")
+    rt.tick(equity=10_000, price=100, **mark)
+    assert store.sleeve("s1").status == "paused"
+    t[0] += timedelta(minutes=5)
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])  # the restart
+    rt.on_start(0.008)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()
+    store.command("s1", "resume", "carry on")
+    rt.tick(equity=10_000, price=100, **mark)
+    assert store.sleeve("s1").status == "running" and rt.can_open()
+
+
+def test_a_crash_keeps_a_pause_and_its_end_time(store):
+    """A crash used to overwrite any status with "error", losing a daily-loss pause's end time, so the
+    restart traded again hours early. Now the status stays and the crash is an event (round 10, B10-3)."""
+    from datetime import timedelta
+
+    from sleeve_fund.store import utcnow
+    from sleeve_fund.supervisor import Proc, Supervisor
+
+    class Dead:
+        pid, returncode = 1, 1
+
+        def poll(self):
+            return 1
+
+    _sleeve(store)
+    store.set_desired_state("s1", "running")
+    until = utcnow() + timedelta(hours=20)
+    store.set_status("s1", "paused", "daily loss", until)
+    sup = Supervisor(store)
+    sup.procs["s1"] = Proc(popen=Dead(), started_at=utcnow())
+    sup.step()
+    s = store.sleeve("s1")
+    assert s.status == "paused" and abs((s.paused_until - until).total_seconds()) < 1
+    assert any(e["kind"] == "process_crash" and "still paused" in e["message"] for e in store.events("s1"))
+    rt = SleeveRuntime(store, "s1")
+    rt.on_start(0.008)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()

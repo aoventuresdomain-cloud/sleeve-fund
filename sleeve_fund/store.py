@@ -8,6 +8,8 @@ runs. Tables are plain and typed so reports and BI tools can query them directly
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import json
 import os
 from dataclasses import dataclass
@@ -283,6 +285,9 @@ BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance")
+
+
+DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
 def is_backtest(name: str | None) -> bool:
@@ -788,21 +793,24 @@ class Store:
         q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
         with self.engine.connect() as c:
             fills = _rows(c.execute(q))
-        cash, qty, entry = float(starting_balance), 0.0, None
+        # The position is summed in Decimal from each fill as written: a float sum of many XRP-sized fills
+        # carries noise of a few 1e-12 that could tip a one-lot difference over reconcile's tolerance.
+        cash, qty, entry = float(starting_balance), Decimal(0), None
         for f in fills:
             notional = f["qty"] * f["price"]
+            q = Decimal(repr(float(f["qty"])))
             if f["side"] == "BUY":
-                entry = ((entry or 0.0) * qty + notional) / (qty + f["qty"])
+                entry = ((entry or 0.0) * float(qty) + notional) / float(qty + q)
                 cash -= notional + f["fee"]
-                qty += f["qty"]
+                qty += q
             else:
                 cash += notional - f["fee"]
-                qty -= f["qty"]
-                if abs(qty) <= 1e-12:
-                    qty = 0.0
+                qty -= q
+                if abs(qty) < DUST:  # float residue from a fill's own arithmetic, far below any lot
+                    qty = Decimal(0)
                 if qty <= 0:  # a negative qty is left visible so reconciliation catches it
                     entry = None
-        return {"cash": cash, "qty": qty, "entry_px": entry, "fills": len(fills)}
+        return {"cash": cash, "qty": float(qty), "entry_px": entry, "fills": len(fills)}
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         q = select(events_t).where(events_t.c.level.in_(LEVELS[LEVELS.index(min_level):]))

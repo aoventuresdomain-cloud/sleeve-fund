@@ -6,8 +6,10 @@ venue is assumed. Each venue's rates live in its profile (sleeve_fund.venues).
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from nautilus_trader.execution import FeeModel
 from nautilus_trader.model import Currency, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol, Venue
@@ -30,11 +32,34 @@ def lot_decimals(instrument) -> int:
     return min(instrument.size_precision, instrument.base_currency.precision)
 
 
+MAX_PRICE_DECIMALS = 9
+MAX_TICK_SHARE = 0.0005  # a price step coarser than 0.05% of the price distorts stops and fills
+
+
 def price_decimals(price: float) -> int:
     """Price decimals for an instrument built from stored history, where the venue's own increment isn't
-    to hand: 2 at 100 or more, 4 from 1, else 6. Studies and the backtest page share it, so a study never
-    rounds a sub-dollar instrument to the cent (review round 9, B9-2)."""
-    return 2 if price >= 100 else 4 if price >= 1 else 6
+    to hand: 2 at 100 or more, 4 from 1, else at least 6, and enough that a step is at most about 0.01% of
+    the price (7 at $0.005, 9 at $0.00002). The 2/4/6 rule alone left sub-cent instruments on a step of 5% of
+    the price (review rounds 9 and 10, B9-2, B10-2). Studies, the backtest page and the tables share it."""
+    if price >= 100:
+        return 2
+    if price >= 1:
+        return 4
+    if price <= 0 or price != price:
+        return 6
+    return min(MAX_PRICE_DECIMALS, max(6, 4 - math.floor(math.log10(price))))
+
+
+def history_price_decimals(closes) -> int:
+    """Decimals for an instrument built from these closes: set by the lowest, so the cheapest stretch is
+    still priced finely. Refuses prices so low that even the finest step the engine keeps is coarser than
+    MAX_TICK_SHARE of the price, since stops and fills there would be noise (review round 10, B10-2)."""
+    low = float(closes[closes > 0].min())
+    d = price_decimals(low)
+    if 10 ** -d / low > MAX_TICK_SHARE:
+        raise ValueError(f"prices as low as {low:.3g} can't be tested: the finest price step kept "
+                         f"({10 ** -d:g}) is {10 ** -d / low:.2%} of the price")
+    return d
 
 
 def spot_pair(
@@ -96,6 +121,17 @@ class ScheduleFeeModel(FeeModel):
         # at market as it earns it, and this charges the slice as filled at the limit with the maker fee:
         # the commission carries the difference from the price the venue filled at (review round 9, M9-3).
         self.maker_slices: dict[str, tuple[Decimal, bool]] = {}
+        # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
+        # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
+        # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
+        # the total charged stays within a cent of the schedule however small the fills.
+        self._carry = Decimal(0)
+
+    def _charge(self, exact: Decimal, currency) -> Money:
+        total = exact + self._carry
+        charged = total.quantize(Decimal(10) ** -currency.precision, rounding=ROUND_HALF_EVEN)
+        self._carry = total - charged
+        return Money(charged, currency)
 
     def rate_for(self, order) -> Decimal:
         return self.fees.maker if getattr(order, "is_post_only", False) else self.fees.taker
@@ -108,14 +144,14 @@ class ScheduleFeeModel(FeeModel):
             qty = fill_quantity.as_decimal()
             # A buy that filled below its limit pays the difference here, a sell above it gives it back.
             shift = qty * (limit - fill_px.as_decimal()) * (1 if buy else -1)
-            return Money(float(qty * limit * self.fees.maker + shift), instrument.quote_currency)
+            return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         charge = notional * self.rate_for(order)
         if self.half_spread and not getattr(order, "is_post_only", False):
             spread = notional * self.half_spread
             coid = str(order.client_order_id)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
-        return Money(float(charge), instrument.quote_currency)
+        return self._charge(charge, instrument.quote_currency)
 
 
 def fill_model():

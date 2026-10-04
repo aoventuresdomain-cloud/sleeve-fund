@@ -24,7 +24,8 @@ def test_paper_code_cannot_build_a_real_execution_client():
         assert "api_key=" not in src and "api_secret=" not in src, path
 
 
-@pytest.mark.parametrize("var", ["KRAKEN_SPOT_API_KEY", "KRAKEN_SPOT_API_SECRET", "binance_api_key"])
+@pytest.mark.parametrize("var", ["KRAKEN_SPOT_API_KEY", "KRAKEN_SPOT_API_SECRET", "binance_api_key",
+                                 "DERIBIT_TESTNET_API_KEY", "DERIBIT_TESTNET_API_SECRET"])
 def test_refuses_to_start_with_credentials(var):
     with pytest.raises(PaperSafetyError):
         assert_keyless({var: "x"})

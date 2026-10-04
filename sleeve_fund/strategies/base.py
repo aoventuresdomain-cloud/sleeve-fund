@@ -23,7 +23,7 @@ from nautilus_trader.config import StrategyConfig
 from datetime import timedelta
 
 from nautilus_trader.core import UUID4
-from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, OrderSide,
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, Money, OrderSide,
                                    OrderStatus, OrderType, Price, PriceType, Quantity, StopMarketOrder, TimeInForce,
                                    TriggerType)
 from nautilus_trader.trading import Strategy
@@ -1163,6 +1163,15 @@ class LongFlatStrategy(Strategy):
         an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1)."""
         return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
 
+    def _held_qty(self, qty: float) -> float:
+        """A fill's quantity as the account holds it. A venue can print and fill at 8 lot decimals in a
+        currency the engine keeps at 6 (XRP, ADA): the account rounds each fill to 6, so the journal must
+        too, or the two drift apart a fraction of a lot per fill until reconcile halts (round 10, B10-1)."""
+        base = getattr(self.instrument, "base_currency", None)
+        if base is None or self.instrument.size_precision <= base.precision:
+            return qty
+        return float(Money(qty, base).as_decimal())  # rounded exactly as the account rounds it
+
     def _min_qty(self) -> Decimal:
         step = self._lot()
         return max(self.instrument.min_quantity.as_decimal(), step) if self.instrument.min_quantity else step
@@ -1316,7 +1325,7 @@ class LongFlatStrategy(Strategy):
                     self.runtime.store.event(self.runtime.name, "warning", "mark_unavailable", why)
                 return
             if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
-                tol = float(self._lot())  # one unit of the base currency (review round 9, B9-1)
+                tol = 2 * float(self._lot())  # two units of the base currency (review rounds 9 and 10, B9-1, B10-1)
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
                     self._drop_kept()  # halted: no trading, no flattening
                     self.cancel_all_orders(self._cfg.instrument_id)
@@ -1442,7 +1451,7 @@ class LongFlatStrategy(Strategy):
         if coid in self._maker and done:
             self._maker.pop(coid)
             self._cancel_alert(coid)
-        qty, px = event.last_qty.as_double(), event.last_px.as_double()
+        qty, px = self._held_qty(event.last_qty.as_double()), event.last_px.as_double()
         # Paper: a slice of a kept post-only order is the order's own fill, at its limit and the maker fee
         # (the fee model charged it so; ScheduleFeeModel.maker_slices).
         journal_id, fee = coid, (event.commission.as_double() if event.commission is not None else 0.0)
