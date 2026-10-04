@@ -805,6 +805,8 @@ class LongFlatStrategy(Strategy):
         behind it. Called straight after want_long() on the same bar, so it sees the same state.
         It is journaled with the order, so the reason is the one the strategy acted on. A strategy that
         decides with want_side gets the side (+1, 0 or -1) as `target`."""
+        if target is not True and target is not False and target < 0:
+            return "Signal to be short", {}
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
     def _on_bar_sided(self, bar: Bar) -> None:

@@ -301,8 +301,20 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert page.status_code == 200
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
+    assert "over the cap" not in html  # 3,007 of 10,050 is 30%, inside balanced's 33%
+    # A losing short grows: at 92,000 it is 46% of equity, past the 33% it was sized to.
+    store.record_equity("pp-ls", equity=10_000.0, cash=14_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
+    assert "over the cap" in c.get("/sleeves/pp-ls", auth=AUTH).text
     # The 2% stop sits above the entry; the open short gains as the price falls.
     assert "61,812" in html
     trades_page = c.get("/trades", auth=AUTH).text
     assert "short" in trades_page
     assert c.get("/", auth=AUTH).status_code == 200
+
+
+def test_default_explain_names_a_short():
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    assert LongFlatStrategy.explain(None, None, -1)[0] == "Signal to be short"
+    assert LongFlatStrategy.explain(None, None, 1)[0] == "Signal to be long"
+    assert LongFlatStrategy.explain(None, None, False)[0] == "Signal to be flat"
