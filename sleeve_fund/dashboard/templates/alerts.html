@@ -7,7 +7,7 @@
     <a class="button {{ '' if show == 'open' else 'secondary' }}" href="/alerts">Open</a>
     <a class="button {{ '' if show == 'all' else 'secondary' }}" href="/alerts?show=all">All, including acknowledged</a>
   </div>
-  <p class="lede">Warnings and errors from every strategy. Acknowledging records that you have seen it; it does not change the strategy.</p>
+  <p class="lede">Ack does not change the strategy.</p>
 </div>
 <section class="panel" data-live="alerts" data-live-forms>
 {% if alerts %}

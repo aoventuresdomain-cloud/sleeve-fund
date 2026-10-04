@@ -12,7 +12,7 @@
 {% macro icon(d) %}<svg viewBox="0 0 24 24" aria-hidden="true">{{ d|safe }}</svg>{% endmacro %}
 <div class="app">
   <aside class="rail" aria-label="Main">
-    <a class="brand" href="/"><svg class="mark" viewBox="0 0 26 26" aria-hidden="true"><defs><linearGradient id="bm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8592FF"/><stop offset="1" stop-color="#2EBD85"/></linearGradient></defs><rect width="26" height="26" rx="7" fill="url(#bm)"/><path d="M6 17l4.5-4.5 3 3L20 9" stroke="#0B0D12" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Multi-Strategy Fund<small>Systematic trading</small></span></a>
+    <a class="brand" href="/"><svg class="mark" viewBox="0 0 26 26" aria-hidden="true"><defs><linearGradient id="bm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8592FF"/><stop offset="1" stop-color="#2EBD85"/></linearGradient></defs><rect width="26" height="26" rx="7" fill="url(#bm)"/><path d="M6 17l4.5-4.5 3 3L20 9" stroke="#0B0D12" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Multi-Strategy Fund</span></a>
     {% set here = request.url.path %}
     {% set is_sleeve = here.startswith('/sleeves/') and here != '/sleeves/new' %}
     <a class="button rail-new" href="/sleeves/new">+ New strategy</a>

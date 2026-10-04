@@ -4,12 +4,12 @@
 {% block content %}
 <div class="page-head">
   <h1>New strategy</h1>
-  <p class="lede">One model on one instrument, with its own capital and limits. It starts within seconds of saving, in paper mode: live prices and Kraken's fees, simulated money. Live mode unlocks after G2.</p>
+  <p class="lede">Paper: live prices, simulated money.</p>
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>{% endif %}
-{% if pre.get('from') == 'clone' %}<div class="banner">Settings copied from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>. Change what you want to test, give it a reason, and start it on paper. {{ pre.get('source') }} keeps running unchanged.</div>{% endif %}
+{% if pre.get('from') == 'clone' %}<div class="banner">Cloned from <a href="/sleeves/{{ pre.get('source') }}">{{ pre.get('source') }}</a>.</div>{% endif %}
 {% set from_bt = pre.get('from') == 'backtest' %}
-{% if from_bt %}<div class="banner">Settings carried over from your backtest, including its decision interval and enough history to start with indicators ready. Give it a name and a reason, then start it on paper.</div>{% endif %}
+{% if from_bt %}<div class="banner">From backtest.</div>{% endif %}
 <form method="post" action="/sleeves/new" id="sleeve-form" class="grid">
   {% if from_bt %}<input type="hidden" name="from" value="backtest"><input type="hidden" name="bar_spec" value="{{ pre.get('bar_spec') }}"><input type="hidden" name="tested_bar_spec" value="{{ pre.get('tested_bar_spec') or pre.get('bar_spec') }}">{% endif %}
   <div class="span-7">
@@ -17,7 +17,7 @@
       <legend>1. Market</legend>
       <div class="grid2">
         {{ pair_field(instruments, pre) }}
-        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select><p class="hint">{{ 'Fixed to the interval the backtest used. To trade another interval, backtest it first.' if from_bt else 'How often the model looks at the market and may trade.' }}</p></div>
+        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select>{% if from_bt %}<p class="hint">As backtested.</p>{% endif %}</div>
       </div>
     </fieldset>
     <fieldset class="panel step">
@@ -28,10 +28,10 @@
       <legend>3. Capital and risk</legend>
       <div class="grid2">
         <div class="field"><label for="starting_balance">Capital, in the instrument's quote currency</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
-        <div class="field"><label for="account">Account</label><select id="account" name="account">{% for a in accounts %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' }} {{ 'selected' if a.name == pre.get('account', 'paper') }}>{{ a.name }} ({{ 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select><p class="hint">Which money it trades. <a href="/accounts">Manage accounts</a></p></div>
+        <div class="field"><label for="account">Account</label><select id="account" name="account">{% for a in accounts %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' }} {{ 'selected' if a.name == pre.get('account', 'paper') }}>{{ a.name }} ({{ 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select></div>
         <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }} data-dd="{{ p.max_drawdown }}" data-day="{{ p.daily_loss }}" data-cap="{{ p.max_position_pct }}">{{ p.name|capitalize }}: halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
         <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
-        <div class="field"><label for="warmup_bars">History to load at start (bars)</label><input id="warmup_bars" name="warmup_bars" type="number" min="0" max="50000" value="{{ pre.get('warmup_bars', '') }}" placeholder="Automatic"><p class="hint">Lets indicators start ready. Leave blank for enough to cover the model's longest look-back. Venue candles load up to 720 bars; bars built from live trades load from the history store, up to 50,000.</p></div>
+        <div class="field"><label for="warmup_bars">History to load at start (bars)</label><input id="warmup_bars" name="warmup_bars" type="number" min="0" max="50000" value="{{ pre.get('warmup_bars', '') }}" placeholder="Automatic"></div>
       </div>
     </fieldset>
     <fieldset class="panel step">
@@ -43,7 +43,7 @@
     <fieldset class="panel step">
       <legend>5. Name and reason</legend>
       <div class="grid2">
-        <div class="field"><label for="name">Strategy name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}><p class="hint">Lower-case letters, digits and dashes.</p></div>
+        <div class="field"><label for="name">Strategy name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}></div>
         <div class="field"><label for="reason">Why start it?</label><input id="reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
       </div>
     </fieldset>
@@ -53,7 +53,7 @@
     <div class="panel sticky" aria-live="polite">
       <div class="panel-head"><h2>This strategy will</h2></div>
       <ul class="summary" id="summary"></ul>
-      <div id="g1-note" class="banner warn" hidden>This model has not passed G1 on real data for this instrument and interval. It can run on paper as an observation; its results are not evidence.</div>
+      <div id="g1-note" class="banner warn" hidden>Not G1-passed: observation only.</div>
       <p style="margin:14px 0 0"><a class="button secondary" id="bt-these" href="/backtest" target="_blank" rel="noopener">Backtest these settings</a></p>
       <p style="margin:16px 0 0"><button>Start strategy in paper mode</button></p>
     </div>

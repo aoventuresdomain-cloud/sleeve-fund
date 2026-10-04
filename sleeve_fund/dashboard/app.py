@@ -602,8 +602,11 @@ def create_app(store: Store | None = None) -> FastAPI:
     def settings_page(request: Request, _: str = Depends(require_pm)):
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "text": q.text, "source": q.source,
-                       "assumed_spread": f"{2 * v.assumed_half_spread:.3%}"}
+        fee_quotes = [{"venue_label": q.venue_label, "source": q.source,
+                       "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
+                       "basis": q.basis if q.source == "published" else
+                       f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
+                       "assumed_spread": f"{2 * v.assumed_half_spread:.2%}"}
                       for v in VENUES.values() for q in [resolve_fees(v.name, st())]]
 
         return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,

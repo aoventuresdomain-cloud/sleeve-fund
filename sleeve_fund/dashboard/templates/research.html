@@ -4,13 +4,13 @@
 {% block content %}
 <div class="page-head">
   <h1>Research</h1>
-  <p class="lede">Every model moves through the same gates: tested on real history, passes G1 (out-of-sample Sharpe beats buy-and-hold after fees), runs on paper, passes G2, then goes live with small money.</p>
+  <p class="lede">Idea → G1 → paper → G2 → live.</p>
 </div>
 <section class="ledger" aria-label="Research counters">
   <div><div class="k">Models</div><div class="v lead">{{ rows|length }}</div><div class="s">in the library</div></div>
   <div><div class="k">Passed G1</div><div class="v lead">{{ rows|selectattr('g1', 'equalto', 'PASS')|list|length }}</div><div class="s">on real data</div></div>
-  <div><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div><div class="s">rethink after 15 to 20 with no pass</div></div>
-  <div><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div><div class="s">each one raises the bar</div></div>
+  <div><div class="k">Ideas tested</div><div class="v">{{ counts.ideas }}</div></div>
+  <div><div class="k">Variants tried</div><div class="v">{{ counts.variants }}</div></div>
 </section>
 
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="pipe-h">
@@ -39,5 +39,4 @@
       <td data-m="hide" class="muted">{{ s.evidence }}</td></tr>{% endfor %}</tbody></table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
 </section>
-<p class="muted" style="font-size:12.5px;margin-top:12px">New ideas: describe them in plain English in the project chat, including entry, exit and the market, and they are built as models here.</p>
 {% endblock %}

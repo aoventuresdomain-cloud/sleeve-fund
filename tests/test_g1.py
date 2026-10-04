@@ -86,8 +86,8 @@ def test_the_backtest_page_warns_unless_g1_passed_here(tmp_path, monkeypatch):
     c = TestClient(app_mod.create_app(Store(f"sqlite:///{tmp_path}/t.db")))
     eth = c.get("/backtest?run=1&instrument=ETH/USD&strategy=buy_and_hold", auth=("pm", "test-pw")).text
     sol = c.get("/backtest?run=1&instrument=SOL/USD&strategy=buy_and_hold", auth=("pm", "test-pw")).text
-    assert "passed G1" not in eth, eth[eth.find("passed G1") - 200:][:300]
-    assert "passed G1 on real data for SOL/USD" in sol, sol[sol.find("banner"):][:300]
+    assert "Not G1 evidence" not in eth and "G1 comes from the research tests" in eth
+    assert "Not G1 evidence for SOL/USD" in sol, sol[sol.find("banner"):][:300]
     form = c.get("/sleeves/new?strategy=buy_and_hold", auth=("pm", "test-pw")).text
     assert 'data-g1="ETH/USD@1440"' in form
 
