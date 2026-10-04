@@ -64,17 +64,6 @@ def stored(venue: str | None = None) -> list[dict]:
     return sorted(out, key=lambda r: (r["since"], r["pair"]))
 
 
-def cap_note(minutes: int, days: int | None) -> str:
-    """Said on the page when a short interval runs less than the period asked for."""
-    most = MAX_DAYS.get(minutes)
-    if most is None or (days is not None and days <= most):
-        return ""
-    span = "1 year" if most == 365 else f"{most // 365} years"
-    every = "minute" if minutes == 1 else f"{minutes} minutes"
-    asked = "all the history" if days is None else f"{days} days"
-    return f"A backtest deciding every {every} covers at most the last {span}, so this one didn't run {asked}."
-
-
 def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFrame:
     from sleeve_fund.history import HistoryStore
 
@@ -84,7 +73,6 @@ def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFram
         have = ", ".join(r["pair"] for r in stored(profile.name)) or "none yet"
         raise ValueError(f"interval: {profile.label}'s minute-by-minute history for {pair} isn't stored here, so it "
                          f"can only be backtested on daily bars. Instruments with stored minutes: {have}.")
-    days = min(days or MAX_DAYS[minutes], MAX_DAYS[minutes]) if minutes in MAX_DAYS else days
     start = cov.last - pd.Timedelta(days=days) if days else None
     key = (profile.name, pair, minutes, days)
     with _lock:
@@ -97,11 +85,9 @@ def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFram
     return df
 
 
-# Short bars mean a lot of rows: a year of 1-minute bars is 525,600, and the engine holds every bar
-# in memory. A year at 1 minute takes about 20 s and 0.7 GB (measured 4 Oct 2026, with the backtest
-# journal in memory); the server has 4 GB shared with paper trading, so longer runs wait for the
-# engine to be fed in chunks.
-MAX_DAYS = {1: 365, 5: 365 * 3}
+# No cap on the period at any interval: the engine is fed in slices and the run's journal keeps an
+# hour's marks at most, so five years of 1-minute bars took 82 s and peaked at 0.54 GB (4 Oct 2026),
+# in a process of its own.
 INTRADAY_CACHE_SECONDS = 15 * 60
 CHART_CANDLES = 2500  # the most candles a backtest's price chart draws; coarser candles past that
 
@@ -320,7 +306,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "fees": round(res.fees_paid, 2),
         "exposure": round(float(res.exposure.mean()), 4),
         "cap": cap,
-        "data": {**_data_note(prices, minutes), "capped": cap_note(minutes, days)},
+        "data": _data_note(prices, minutes),
         "execution": _execution(res, wait, matched_on),
         "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,

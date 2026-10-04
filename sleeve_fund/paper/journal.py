@@ -14,6 +14,7 @@ from datetime import datetime
 from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, utcnow
 
 _FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
+KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
 
 
 class MemoryJournal:
@@ -27,6 +28,9 @@ class MemoryJournal:
         self.events_: list[dict] = []
         self._ids = itertools.count(1)
         self._peak: float | None = None
+        self._hour: tuple | None = None  # the hour of the latest mark, and where its marks start
+        self._hour_start = 0
+        self._thinned = False
 
     # --- the sleeve -----------------------------------------------------------------
 
@@ -68,7 +72,19 @@ class MemoryJournal:
 
     def record_equity(self, sleeve: str, *, equity: float, cash: float, qty: float, price: float,
                       benchmark: float, ts: datetime | None = None) -> None:
-        self.equity.append({"ts": ts or utcnow(), "equity": equity, "cash": cash, "qty": qty, "price": price,
+        ts = ts or utcnow()
+        hour = (ts.year, ts.month, ts.day, ts.hour)
+        if hour != self._hour:
+            # Past KEEP_ALL_MARKS only the last mark of each hour is ever saved (marks_to_keep), so a
+            # finished hour shrinks to that one now: five years of minutes would otherwise hold 2.6
+            # million marks in memory. The first mark of the run always stays.
+            if len(self.equity) > KEEP_ALL_MARKS:
+                start = max(self._hour_start, 1)
+                if len(self.equity) - start > 1:
+                    del self.equity[start:-1]
+                    self._thinned = True
+            self._hour, self._hour_start = hour, len(self.equity)
+        self.equity.append({"ts": ts, "equity": equity, "cash": cash, "qty": qty, "price": price,
                             "benchmark": benchmark})
         self._peak = equity if self._peak is None else max(self._peak, equity)
 
@@ -162,7 +178,7 @@ class MemoryJournal:
         90 days, of each day) of a long one, which is what the screens chart anyway. The first and
         last marks are always kept, so the run's start and end values are exact."""
         marks = self.equity
-        if len(marks) <= 5000:
+        if len(marks) <= KEEP_ALL_MARKS and not self._thinned:
             return list(marks)
         span = marks[-1]["ts"] - marks[0]["ts"]
         fmt = "%Y%m%d%H" if span.days <= 90 else "%Y%m%d"

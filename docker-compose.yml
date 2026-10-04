@@ -43,6 +43,9 @@ services:
   dashboard:
     build: .
     restart: unless-stopped
+    # The pages plus one backtest at a time, each in its own process (5 years of 1-minute bars
+    # peaked at 0.54 GB). A run past this is stopped and says so; the pages carry on.
+    mem_limit: 1536m
     depends_on: { db: { condition: service_healthy } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund

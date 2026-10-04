@@ -40,6 +40,9 @@ class BacktestResult:
     journal: object = None
 
 
+CHUNK_BARS = 100_000  # bars handed to the engine at a time
+
+
 def run_backtest(
     strategy_name: str,
     prices: pd.DataFrame,
@@ -126,10 +129,10 @@ def run_backtest(
         engine.add_instrument(instrument)
         if exec_prices is not None and not exec_prices.empty:
             bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
-            engine.add_data(to_bars(exec_prices, instrument, bar_type_for(instrument, exec_minutes)))
+            feed, feed_type = exec_prices, bar_type_for(instrument, exec_minutes)
         else:
             bar_type = bar_type_for(instrument, bar_minutes)
-            engine.add_data(to_bars(prices, instrument, bar_type))
+            feed, feed_type = prices, bar_type
         config = config_cls(
             instrument_id=instrument.id,
             bar_type=bar_type,
@@ -138,7 +141,13 @@ def run_backtest(
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
         engine.add_strategy(strategy)
-        engine.run()
+        # Fed in slices so memory stays at one slice of engine bars however long the run: five years
+        # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
+        for i in range(0, len(feed), CHUNK_BARS):
+            engine.add_data(to_bars(feed.iloc[i:i + CHUNK_BARS], instrument, feed_type))
+            engine.run(streaming=True)
+            engine.clear_data()
+        engine.end()
 
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
         account = engine.generate_account_report(instrument.id.venue)

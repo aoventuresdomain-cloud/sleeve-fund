@@ -17,7 +17,7 @@
     <div class="grid2">
       <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
       <div class="field"><label for="bt_bar_spec">Decision interval</label><select id="bt_bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == bar_spec }}>{{ bar_label(b).split(' (')[0] }}{{ ' (from live trades in paper)' if b.endswith('INTERNAL') else '' }}</option>{% endfor %}</select>
-        <p class="hint">Shorter than a day needs stored minute history: {% if stored %}{% for r in stored %}{{ r.pair }} (since {{ r.since.strftime('%b %Y') }}){{ ', ' if not loop.last }}{% endfor %}{% else %}none stored yet{% endif %}. At most the last year at 1 minute, 3 years at 5 minutes.</p></div>
+        <p class="hint">Shorter than a day needs stored minute history: {% if stored %}{% for r in stored %}{{ r.pair }} (since {{ r.since.strftime('%b %Y') }}){{ ', ' if not loop.last }}{% endfor %}{% else %}none stored yet{% endif %}.</p></div>
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
     <div class="grid2">
@@ -48,7 +48,6 @@
       {% if g1.get(chosen) != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">This model hasn't passed G1 on real data. Treat this as a sense check: a single in-sample run is not evidence.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">One in-sample run. G1 is decided by the research loop's out-of-sample tests, not this page.</p>{% endif %}
       {% if result.risk.note %}<p class="banner {{ 'warn' if result.risk.halted else '' }}" style="margin:0 0 10px">{{ result.risk.note }}</p>{% endif %}
-      {% if result.data.capped %}<p class="banner" style="margin:0 0 10px">{{ result.data.capped }}</p>{% endif %}
       {% if result.data.note %}<p class="banner warn" style="margin:0 0 10px">{{ result.data.note }}</p>{% endif %}
       {% if result.execution.note %}<p class="{{ 'banner warn' if result.execution.matched_on is none else 'muted' }}" style="margin:0 0 10px;font-size:12.5px">{{ result.execution.note }}</p>{% endif %}
       <table class="compare">

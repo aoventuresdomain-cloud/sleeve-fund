@@ -505,7 +505,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         hit = st().fresh_backtest(key, utcnow() - BACKTEST_FRESH)
         if hit:
             return RedirectResponse(f"/backtest/{hit['id']}", status_code=303)
-        job = app.state.jobs.submit(key, args["title"], lambda job: _run_backtest(st(), job, args, key, q))
+        query = urlencode([(k, v) for k, v in q.items() if k != "run" and v != ""])
+        jobs = app.state.jobs
+        # A process of its own opens the journal by its address; in-process it shares this one.
+        target = st().url if jobs.isolate and st().url else st()
+        job = jobs.submit(key, args["title"], run_backtest_job, target, args, key, query)
         job.done_event.wait(BACKTEST_WAIT)
         if job.status == "done":
             return RedirectResponse(f"/backtest/{job.run_id}", status_code=303)
@@ -660,25 +664,23 @@ def _backtest_key(q, *costs: str) -> str:
     return hashlib.sha256("|".join([urlencode(items), *costs]).encode()).hexdigest()[:32]
 
 
-def _run_backtest(store: Store, job, args: dict, key: str, q) -> str:
-    """Run one backtest on the paper runtime and save it, with its journal. Returns its id."""
+def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key: str, query: str) -> str:
+    """Run one backtest on the paper runtime and save it, with its journal, as `run_id`. Runs in a
+    process of its own (see jobs.py), where `store` is the journal's database address."""
     from sleeve_fund.dashboard import preview
 
+    if isinstance(store, str):
+        store = Store(store)
     keep: dict = {}
-
-    def progress(f: float) -> None:
-        job.progress = f
-
     result = preview.run(args["strategy"], args["pair"], args["params"], starting=args["starting"],
                          days=args["days"], detail=True, minutes=args["minutes"], risk_profile=args["risk_profile"],
                          fee_quote=resolve_fees(None, store), spread_quote=resolve_spread(None, args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
-    query = urlencode([(k, v) for k, v in q.items() if k != "run" and v != ""])
-    store.save_backtest(keep["journal"], run_id=job.id, key=key, title=args["title"], query=query, result=result,
+    store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
                         bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
-    return job.id
+    return run_id
 
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
