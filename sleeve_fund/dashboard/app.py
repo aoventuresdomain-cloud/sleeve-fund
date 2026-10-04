@@ -1092,7 +1092,7 @@ def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
 
 
 # Exit settings the form takes as stored (the % ones are converted above): an ATR or swing-low stop,
-# and a target as a multiple of the stop's distance.
+# and a target in R after costs.
 EXIT_SETTINGS = {"stop_atr": float, "atr_bars": int, "stop_swing_bars": int, "take_profit_r": float}
 
 
@@ -1126,7 +1126,7 @@ def _risk_words(profile: str, params: dict) -> dict[str, str]:
         stop = f"{p['stop_loss'] * 100:g}% below the entry"
     else:
         stop = "none"
-    target = (f"{p['take_profit_r']:g} times the stop's distance" if p.get("take_profit_r")
+    target = (f"{p['take_profit_r']:g}R after costs" if p.get("take_profit_r")
               else f"{p['take_profit'] * 100:g}% above the entry" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
             "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",

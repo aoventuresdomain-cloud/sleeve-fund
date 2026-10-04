@@ -92,7 +92,7 @@
       <tr><th scope="row">Average entry</th><td class="num">{{ x.entry_px|px }}</td></tr>
       <tr><th scope="row">Last price</th><td class="num">{{ x.price|px }}</td></tr>
       <tr><th scope="row">Stop-loss</th><td class="num">{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="muted">({{ risk.to_stop|pct1 }} away)</span>{% elif stop_words(s.params)|trim %}{{ stop_words(s.params) }}{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
-      <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% elif s.params.take_profit_r %}{{ s.params.take_profit_r }}x the stop's distance{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
+      <tr><th scope="row">Take-profit</th><td class="num">{% if risk.target_px %}{{ risk.target_px|px }}{% elif s.params.take_profit %}{{ (s.params.take_profit * 100)|round(1) }}% above entry{% elif s.params.take_profit_r %}{{ s.params.take_profit_r }}R after costs{% else %}<span class="muted">Not set</span>{% endif %}</td></tr>
       <tr><th scope="row">Position cap</th><td class="num">{{ usage(risk.cap_used) }} <span class="muted">{{ x.exposure|pct0 }} of {{ x.profile.max_position_pct|pct0 }}</span></td></tr>
       <tr><th scope="row">Drawdown</th><td class="num">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td></tr>
       {% if not backtest_id %}<tr><th scope="row">Today's loss</th><td class="num">{{ usage(risk.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td></tr>
@@ -179,7 +179,7 @@
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
       <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, max {{ x.profile.max_position_pct|pct0 }} in the market</td></tr>
       {% for k, v in s.params.items() %}
-      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, average true ranges below entry', 'atr_bars': 'Average true range over, bars', 'stop_swing_bars': 'Stop under the lowest low of, bars', 'take_profit_r': 'Target, times the stop distance'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
+      <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, average true ranges below entry', 'atr_bars': 'Average true range over, bars', 'stop_swing_bars': 'Stop under the lowest low of, bars', 'take_profit_r': 'Target in R, after costs'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
         <td>{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ (v * 100)|round(2) }}%{% elif k == 'max_notional' %}{{ v|money }} {{ quote }}{% elif k == 'maker_wait_minutes' %}Maker first, the rest at market after {{ v }} min{% else %}{{ v }}{% endif %}</td></tr>
       {% endfor %}
     </table>

@@ -1134,7 +1134,7 @@ def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
     assert params["stop_atr"] == 2.5 and params["atr_bars"] == 20 and params["take_profit_r"] == 3.0
     assert store.sleeve("btc-test").warmup_bars >= 21  # the ATR's bars load at start, like the model's
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert "2.5 ATR (20 bars) below entry" in page and "3.0x the stop's distance" in page
+    assert "2.5 ATR (20 bars) below entry" in page and "3.0R after costs" in page
     clone = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "stop_atr=2.5" in clone and "take_profit_r=3" in clone  # Clone with changes keeps them
     form = c.get("/sleeves/new?stop_atr=2.5&take_profit_r=3", auth=AUTH).text

@@ -319,7 +319,7 @@ def _exit_words(exits: dict) -> str:
     if "take_profit" in exits:
         words.append(f"take-profit {exits['take_profit']:.1%} above entry")
     if "take_profit_r" in exits:
-        words.append(f"take-profit {exits['take_profit_r']:g} times the stop's distance above entry")
+        words.append(f"take-profit making {exits['take_profit_r']:g}R after costs")
     if "risk_per_trade" in exits:
         words.append(f"each trade sized to lose {exits['risk_per_trade']:.1%} of equity at the stop")
     return ", ".join(words)

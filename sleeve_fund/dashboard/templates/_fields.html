@@ -38,10 +38,10 @@
     <div class="field"><label for="tp_kind">Take-profit</label><select id="tp_kind" data-kind="tp">
       <option value="" {{ 'selected' if not tp_kind }}>None</option>
       <option value="pct" {{ 'selected' if tp_kind == 'pct' }}>A % above the entry</option>
-      <option value="r" {{ 'selected' if tp_kind == 'r' }}>A multiple of the stop's distance</option>
+      <option value="r" {{ 'selected' if tp_kind == 'r' }}>A multiple of the risk (R), after costs</option>
     </select></div>
     <div class="field" data-tp="pct"><label for="take_profit_pct">Target, % above entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.01" placeholder="e.g. 15" value="{{ pre.get('take_profit_pct', '') }}"></div>
-    <div class="field" data-tp="r"><label for="take_profit_r">Target, times the stop's distance</label><input id="take_profit_r" name="take_profit_r" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 2" value="{{ pre.get('take_profit_r', '') }}"></div>
+    <div class="field" data-tp="r"><label for="take_profit_r">Target in R, after costs</label><input id="take_profit_r" name="take_profit_r" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 2" value="{{ pre.get('take_profit_r', '') }}"></div>
     <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
   </div>
   <p class="exit-plan" aria-live="polite" hidden></p>
