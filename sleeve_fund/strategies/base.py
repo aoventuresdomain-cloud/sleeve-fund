@@ -1701,7 +1701,9 @@ class LongFlatStrategy(Strategy):
                     self.cancel_all_orders(self._cfg.instrument_id)
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
-            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard) == "flatten":
+            self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
+            if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
+                                 busy=bool(self._working())) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")

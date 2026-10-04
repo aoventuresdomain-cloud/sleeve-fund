@@ -518,10 +518,48 @@ def test_a_flatten_cut_short_by_a_restart_sells_again(store, command, reason, se
         assert rt.flatten_why[0] == "pm_flatten" and reason in rt.flatten_why[1]
         assert store.last_event("s1", ("flatten_retry",)) is not None
     t[0] += timedelta(seconds=5)
-    assert rt.tick(**held) is None  # once per start: the strategy's own sell is in flight
+    assert rt.tick(**held, busy=True) is None  # the strategy's own sell is in flight: wait for it
     assert store.sleeve("s1").status == "paused"
     rt = _restart(store, t)
     assert rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000) is None  # sold: nothing owed
+
+
+def test_a_flatten_that_does_not_close_is_sent_again_then_handed_to_the_pm(store):
+    """Sanity, 4 Oct: a flatten whose order is rejected (or cut short) is owed until the position closes:
+    sent again while no order is working, up to FLATTEN_RETRIES times, then an error asks the PM."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.paper.runtime import FLATTEN_RETRIES
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restart(store, t)
+    store.command("s1", "flatten", "PM flatten")
+    short = {"equity": 10_000, "cash": 13_000, "qty": -0.05, "price": 60_000}  # a short closes by buying
+    assert rt.tick(**short) == "flatten"
+    assert rt.tick(**short, busy=True) is None
+    for _ in range(FLATTEN_RETRIES):
+        t[0] += timedelta(seconds=30)
+        assert rt.tick(**short) == "flatten" and rt.flatten_why[0] == "pm_flatten"
+    t[0] += timedelta(seconds=30)
+    assert rt.tick(**short) is None
+    assert store.last_event("s1", ("flatten_failed",))["level"] == "error"
+    assert rt.tick(**short) is None and len([e for e in store.events("s1") if e["kind"] == "flatten_failed"]) == 1
+
+
+def test_dust_owes_no_flatten(store):
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restart(store, t)
+    store.command("s1", "flatten", "PM flatten")
+    assert rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000) == "flatten"
+    t[0] += timedelta(minutes=1)
+    rt = _restart(store, t)
+    rt.close_floor = 1e-8
+    assert rt.tick(equity=10_000, cash=10_000, qty=3e-9, price=60_000) is None  # below one lot: can't be sold
+    assert store.last_event("s1", ("flatten_retry",)) is None
 
 
 def test_a_risk_halt_cut_short_sells_again_but_a_resume_or_a_reconcile_halt_does_not(store):
