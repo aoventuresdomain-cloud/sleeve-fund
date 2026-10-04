@@ -134,6 +134,16 @@ class MemoryJournal:
         if self.equity:
             row["updated_at"] = self.equity[-1]["ts"]
 
+    def settle_order(self, order_id: str, *, price: float, fee: float) -> None:
+        rows = [f for f in self.fills_ if f["order_id"] == order_id]
+        total = sum(f["qty"] for f in rows)
+        if total <= 0:
+            return
+        for f in rows:
+            f["price"], f["fee"] = price, fee * f["qty"] / total
+        if order_id in self.orders_:
+            self.orders_[order_id].update(avg_px=price, fee=fee)
+
     def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None) -> None:
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")

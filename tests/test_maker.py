@@ -1,5 +1,7 @@
 """Maker-first orders: post-only limits that pay the maker fee when filled, finished at market."""
 
+import collections
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -169,14 +171,65 @@ def test_a_stop_and_target_resized_mid_flight_still_cover_the_whole_position(ins
                        starting_capital=10_000, risk_profile="aggressive", bar_minutes=15, exec_prices=bars,
                        exec_minutes=1, half_spread=1e-4)
     j = res.journal
-    held, exits = 0.0, 0
-    fills = sorted(j.fills_, key=lambda f: f["id"])
-    for i, f in enumerate(fills):
+    held, after, exit_moments = 0.0, {}, set()
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
         held += f["qty"] if f["side"] == "BUY" else -f["qty"]
         assert held > -1e-9
-        last_of_exit = j.orders_[f["order_id"]]["intent"] in ("stop_loss", "take_profit") and (
-            i + 1 == len(fills) or fills[i + 1]["side"] == "BUY")
-        if last_of_exit:
-            exits += 1
-            assert held == pytest.approx(0, abs=1e-9), f
-    assert exits >= 3 and res.handler_error_count == 0
+        after[f["ts"]] = held  # the position once everything at that moment has filled
+        if j.orders_[f["order_id"]]["intent"] in ("stop_loss", "take_profit"):
+            exit_moments.add(f["ts"])
+    # A slice that fills at the moment the stop does (its cancel still in flight) is sold with the rest.
+    assert len(exit_moments) >= 3 and all(after[t] == pytest.approx(0, abs=1e-9) for t in exit_moments)
+    assert res.handler_error_count == 0
+    # Each resize is a command, and the venue matches its resting orders against the bar again on every one:
+    # resizing on each slice once took a whole entry from one bar, 50 slices in a minute. At most the four
+    # prints of a bar plus one re-match now.
+    entry_slices = collections.Counter((f["order_id"], f["ts"]) for f in j.fills_
+                                       if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT")
+    assert entry_slices and max(entry_slices.values()) <= 5, entry_slices.most_common(3)
+
+
+def test_without_quotes_a_post_only_order_rests_at_the_estimated_bid(instrument):
+    """Review round 9, M9-3: paper joins the best bid, while the backtest rested a tick inside the last
+    trade, nearer the market, and filled up to 34 points more often. Without quotes the backtest now
+    estimates the bid as the last trade less the half spread it charges, in whole ticks."""
+    m = _minutes([10_000.0] * (3 * 1440), wiggle=10.0)
+    res = _run(m, {"maker_wait_minutes": 15}, instrument=instrument, half_spread=0.0005)
+    fill = res.fills.iloc[0]
+    assert fill["type"] == "LIMIT" and float(fill["avg_px"]) == pytest.approx(9_995.00)
+
+
+def test_a_settled_order_keeps_its_settlement_on_its_own_fills(tmp_path):
+    """Review round 9, M9-3: a paper post-only order settled to the backtest's fills rewrites its own fill
+    rows (price and fee), so the journal's cash and the trade it belongs to carry it; nothing lands on
+    the next fill. The fee model says how much of an earlier settlement each commission took off."""
+    from decimal import Decimal
+
+    from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel
+    from sleeve_fund.store import Store
+
+    st = Store(f"sqlite:///{tmp_path}/j.db")
+    st.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                     starting_balance=10_000, risk_profile="balanced")
+    st.record_order("s", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="r", order_type="POST-ONLY LIMIT")
+    for i, q in enumerate((0.04, 0.06)):
+        st.record_fill("s", side="BUY", qty=q, price=10_000.0, fee=q * 10_000 * 0.004, order_id="O-1", trade_id=f"t{i}")
+        st.update_order("O-1", fill_qty=q, fill_px=10_000.0, fee=q * 10_000 * 0.004)
+    st.settle_order("O-1", price=10_010.0, fee=6.0)
+    rows = st.fills("s")
+    assert {r["price"] for r in rows} == {10_010.0}
+    assert sorted(r["fee"] for r in rows) == pytest.approx([2.4, 3.6])
+    assert st.journal_book("s", 10_000)["cash"] == pytest.approx(10_000 - 1_001 - 6.0)
+    order = st.orders("s")[0]
+    assert order["avg_px"] == 10_010.0 and order["fee"] == 6.0
+
+    fm = ScheduleFeeModel(FeeSchedule(Decimal("0.004"), Decimal("0.008")))
+    fm.pending_credit = 3.0
+    from nautilus_trader.model import Price, Quantity
+    from sleeve_fund.venues import venue
+
+    inst = venue("KRAKEN").instrument("BTC", "USD")
+    order = type("O", (), {"client_order_id": "O-2", "is_post_only": False})()
+    fee = fm.get_commission(order, Quantity(0.1, 8), Price(10_000, 2), inst)
+    assert fee.as_double() == pytest.approx(0.1 * 10_000 * 0.008 - 3.0)
+    assert fm.credit_applied == {"O-2": 3.0} and fm.pending_credit == 0.0
