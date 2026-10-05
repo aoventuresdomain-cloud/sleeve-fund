@@ -5,3 +5,8 @@
 [[clear]]
 id = "2026-10-04"
 reason = "PM asked to remove every existing strategy and start again with two test strategies"
+
+[[clear]]
+id = "2026-10-05"
+reason = "PM asked to archive every strategy not in use, keeping the two Binance long/short test strategies"
+keep = ["ping-pong-ls-binance", "rsi-bands-ls-binance"]

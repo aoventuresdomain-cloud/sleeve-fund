@@ -101,25 +101,89 @@ def test_clear_puts_every_strategy_away_once_and_keeps_its_journal(store, sleeve
 
 
 
-def test_clear_never_archives_a_strategy_still_holding_a_position(store, sleeve, tmp_path):
+def test_clear_flattens_a_strategy_still_holding_a_position_before_archiving_it(store, sleeve, tmp_path):
     """Archiving takes a strategy off the book: one still holding a position would drop it from every
-    total with nothing watching it. It is stopped, not archived, and the entry finishes on a later start
-    once it is flat (review round 11)."""
-    store.set_desired_state("s", "running")
+    total with nothing watching it (review round 11). It is flattened instead (a PM flatten, which pauses it
+    too), started if it was stopped so the flatten can trade, and archived on a later start once flat."""
+    store.set_desired_state("s", "stopped")
     store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
     path = tmp_path / "clear.toml"
     path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "clean slate"\n')
     assert clear(store, str(path)) == []
-    assert store.sleeve("s").desired_state == "stopped" and "s" not in store.archived()
+    assert store.sleeve("s").desired_state == "running" and "s" not in store.archived()
+    assert [c["command"] for c in store.pending_commands("s")] == ["flatten"]
     assert any(e["kind"] == "clear_held" and "0.01" in e["message"] for e in store.events("s"))
     assert store.decisions(action="clear") == []
+    assert clear(store, str(path)) == [] and len(store.pending_commands("s")) == 1  # not asked twice
     store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
     assert clear(store, str(path)) == ["s"]  # flat now: the next start finishes the entry
+    assert store.sleeve("s").desired_state == "stopped"
     assert clear(store, str(path)) == []
+
+
+def test_a_clean_slate_waiting_on_a_flatten_finishes_without_a_restart_and_touches_nothing_added_since(
+        store, sleeve, tmp_path, monkeypatch):
+    """PM, 5 Oct 2026: a fresh book once the clean slate deploys. One still holding is flattened first; the
+    supervisor retries the slate about every minute, so the book clears once it is flat rather than on the
+    next deploy, and a strategy the PM added in between is left alone."""
+    from sleeve_fund import supervisor
+    from sleeve_fund.supervisor import Supervisor
+
+    monkeypatch.setattr(supervisor, "POLL_SECONDS", 0)
+    store.set_desired_state("s", "stopped")
+    store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "fresh book"\n')
+    assert clear(store, str(path)) == []
+    store.create_sleeve(name="added-since", strategy="buy_and_hold", instrument="ETH/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=500)
+    store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
+    sup = Supervisor(store, clear_path=str(path))
+    sup.step = lambda: setattr(sup, "_stopping", True)  # one pass of the loop
+    sup.run()
+    assert "s" in store.archived() and "added-since" not in store.archived()
+    assert store.sleeve("added-since").desired_state == "running"
+    assert set(store.previous_book()) == {"s"}
+
+
+def test_the_deploy_log_says_what_the_book_holds(store, sleeve):
+    from sleeve_fund.supervisor import book_line
+
+    store.create_sleeve(name="fresh", strategy="buy_and_hold", instrument="ETH/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10000, desired_state="stopped")
+    store.record_equity("s", equity=990, cash=990, qty=0, price=1, benchmark=1000)
+    assert book_line(store) == "s 1,000 (running, has history); fresh 10,000 (stopped, no history)"
+
+
+def test_clear_leaves_the_strategies_it_keeps(store, sleeve, tmp_path):
+    store.set_desired_state("s", "running")
+    store.create_sleeve(name="kept", strategy="buy_and_hold", instrument="ETH/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=500)
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "k"\nreason = "tidy"\nkeep = ["kept"]\n')
+    assert clear(store, str(path)) == ["s"]
+    assert "kept" not in store.archived() and store.sleeve("kept").desired_state == "running"
+
 
 def test_the_shipped_clear_file_reads(store):
     assert clear(store, "configs/clear.toml") == []
-    assert store.decisions(action="clear")[0]["reason"].startswith("2026-10-04: ")
+    assert sorted(d["reason"][:10] for d in store.decisions(action="clear")) == ["2026-10-04", "2026-10-05"]
+
+
+def test_the_shipped_clear_keeps_only_the_binance_strategies(store, tmp_path):
+    """PM, 5 Oct 2026: archive every strategy not in use; the two Binance long/short test strategies stay,
+    for the PM to start once the Bybit demo mirror is deployed."""
+    import glob
+
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "first slate"\n')
+    clear(store, str(path))  # the book as it stood: the 4 Oct slate applied, then everything seeded
+    seed(store, sorted(glob.glob("configs/sleeves/*.toml")))
+    put_away = clear(store, "configs/clear.toml")
+    assert sorted(put_away) == ["ping-pong-ls-test", "ping-pong-test", "rsi-bands-15m-ls-test", "rsi-bands-15m-test",
+                                "rsi-bands-ls-test", "rsi-bands-test"]
+    assert sorted(s.name for s in store.sleeves() if s.name not in store.archived()) == [
+        "ping-pong-ls-binance", "rsi-bands-ls-binance"]
 
 
 def test_changed_settings_restart_a_running_strategy_once(store, sleeve, monkeypatch):
