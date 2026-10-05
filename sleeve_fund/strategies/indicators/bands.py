@@ -87,3 +87,61 @@ class Bollinger(Block):
 
     def peek_values(self, close: float) -> dict:
         return peek_values(self, close)
+
+
+class Donchian(Block):
+    """Donchian channel: the highest high (upper) and lowest low (lower) of the `period` bars before this one,
+    and their midpoint. It leaves out the bar just closed so that "close above upper" is a breakout, as the
+    donchian model trades it. source="close" builds it from closes instead of highs and lows. `value` is mid."""
+
+    SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX),
+                Setting("source", str, "high_low", choices=("high_low", "close")))
+    OUTPUTS = ("upper", "lower", "mid")
+
+    def __init__(self, period: int = 20, source: str = "high_low") -> None:
+        self.period = whole("period", period, 1)
+        if source not in ("high_low", "close"):
+            raise ValueError(f"a Donchian channel is built from 'high_low' or 'close', got {source!r}")
+        self.source = source
+        self.reset()
+
+    def reset(self) -> None:
+        # Monotonic queues of (bar number, price): the front is the window's max (or min), O(1) a bar on average.
+        self._highs: deque[tuple[int, float]] = deque()
+        self._lows: deque[tuple[int, float]] = deque()
+        self.count = 0
+        self._value = 0.0
+        self._vals = dict.fromkeys(self.OUTPUTS, 0.0)
+
+    def update_raw(self, high: float, low: float, close: float) -> None:
+        hi, lo = (float(close), float(close)) if self.source == "close" else (float(high), float(low))
+        if self.count >= self.period:  # the channel of the bars before this one
+            oldest = self.count - self.period
+            while self._highs[0][0] < oldest:
+                self._highs.popleft()
+            while self._lows[0][0] < oldest:
+                self._lows.popleft()
+            upper, lower = self._highs[0][1], self._lows[0][1]
+            self._value = (upper + lower) / 2
+            self._vals = {"upper": upper, "lower": lower, "mid": self._value}
+        while self._highs and self._highs[-1][1] <= hi:
+            self._highs.pop()
+        self._highs.append((self.count, hi))
+        while self._lows and self._lows[-1][1] >= lo:
+            self._lows.pop()
+        self._lows.append((self.count, lo))
+        self.count += 1
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(high, low, close)
+
+    @property
+    def initialized(self) -> bool:
+        return self.count > self.period
+
+    def _outputs(self) -> dict:
+        return dict(self._vals)
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return s["period"] + 1

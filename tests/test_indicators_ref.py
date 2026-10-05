@@ -13,7 +13,7 @@ import pytest
 from nautilus_trader.indicators import ExponentialMovingAverage
 
 from sleeve_fund.strategies.indicators import (
-    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, Bollinger, EfficiencyRatio, Ema, RelativeVolume, Rsi, Sma, Vwap,
+    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, Bollinger, Donchian, EfficiencyRatio, Ema, RelativeVolume, Rsi, RsiDivergence, Sma, Vwap,
     Wma, make_block, settle_bars, warmup_for,
 )
 
@@ -220,20 +220,82 @@ def test_rsi(bars, n):
     _check(*_stream(Rsi(n), bars, _close), ref)
 
 
+@pytest.mark.parametrize("n", [1, 20, 55])
+@pytest.mark.parametrize("source", ["high_low", "close"])
+def test_donchian(bars, n, source):
+    hi, lo = (bars["close"], bars["close"]) if source == "close" else (bars["high"], bars["low"])
+    upper, lower = hi.shift(1).rolling(n).max(), lo.shift(1).rolling(n).min()
+    for key, ref in {"upper": upper, "lower": lower, "mid": (upper + lower) / 2}.items():
+        _check(*_stream(Donchian(n, source), bars, _hlc, key), ref)
+
+
+def _rsi_ref(close: pd.Series, n: int) -> pd.Series:
+    change = close.diff().iloc[1:]
+    gain, loss = _wilder(change.clip(lower=0), n), _wilder((-change).clip(lower=0), n)
+    return (100 - 100 / (1 + gain / loss)).where(loss > 0, np.where(gain > 0, 100.0, 50.0)).reindex(close.index)
+
+
+def _divergence_ref(bars: pd.DataFrame, rsi_period: int, left: int, right: int, max_gap: int) -> pd.DataFrame:
+    """Swings found over the whole series with rolling windows, then compared pairwise: an independent route to
+    the same definition. Each signal is placed on the bar that confirms its swing (swing bar + right)."""
+    rsi = _rsi_ref(bars["close"], rsi_period)
+    low, high = bars["low"], bars["high"]
+    later_min = low[::-1].rolling(right).min()[::-1].shift(-1)  # min of the `right` bars after
+    later_max = high[::-1].rolling(right).max()[::-1].shift(-1)
+    swing_low = (low <= low.shift(1).rolling(left).min()) & (low < later_min) & rsi.notna()
+    swing_high = (high >= high.shift(1).rolling(left).max()) & (high > later_max) & rsi.notna()
+    out = pd.DataFrame({"bullish": 0, "bearish": 0}, index=bars.index)
+    for flags, price, key, beyond in ((swing_low, low, "bullish", np.less), (swing_high, high, "bearish", np.greater)):
+        idx = list(np.flatnonzero(flags.to_numpy()))
+        for a, b in zip(idx, idx[1:]):
+            rsi_moved = rsi.iloc[b] > rsi.iloc[a] if key == "bullish" else rsi.iloc[b] < rsi.iloc[a]
+            if b - a <= max_gap and beyond(price.iloc[b], price.iloc[a]) and rsi_moved:
+                out.iloc[b + right, out.columns.get_loc(key)] = 1
+    return out
+
+
+@pytest.mark.parametrize("left,right,max_gap", [(3, 3, 50), (5, 2, 30), (1, 1, 10)])
+def test_rsi_divergence(bars, left, right, max_gap):
+    ref = _divergence_ref(bars, 14, left, right, max_gap)
+    got = {"bullish": [], "bearish": []}
+    block = RsiDivergence(14, left, right, max_gap)
+    for row in bars.itertuples(index=False):
+        block.update_raw(row.high, row.low, row.close)
+        for k in got:
+            got[k].append(block.values[k] or 0)  # None before it is initialized, where the reference has 0
+    for k in got:
+        np.testing.assert_array_equal(got[k], ref[k].to_numpy(), err_msg=k)
+    if len(bars) > 1000:
+        assert ref["bullish"].sum() > 5 and ref["bearish"].sum() > 5, "the test series should hold divergences"
+
+
+def test_rsi_divergence_signals_only_once_the_swing_is_confirmed():
+    d = RsiDivergence(rsi_period=2, left=1, right=2, max_gap=20)
+    # Falling, a first low at 90, a bounce, a lower low at 88 on a gentler fall (RSI higher), then a bounce.
+    closes = [100, 98, 96, 94, 92, 90, 95, 97, 96, 93, 91, 89.5, 88.8, 88, 93, 95, 96]
+    flags = []
+    for c in closes:
+        d.update_raw(c + 0.5, c - 0.5, c)
+        flags.append(d.values["bullish"] or 0)
+    swing = closes.index(88)
+    assert flags.index(1) == swing + d.confirm_lag and sum(flags) == 1
+
+
 # ---- the interface every block keeps -----------------------------------------------------------------------
 
 def _all_blocks():
     """One of each block, with the feed its update_raw takes."""
     return [(Sma(20), _close), (Ema(20), _close), (Wma(20), _close), (Vwap("day"), _ohlcv),
             (Vwap("rolling", 30), _ohlcv), (Rsi(14), _close), (Bollinger(20), _close), (Atr(14), _hlc),
-            (RelativeVolume(20), _vol), (EfficiencyRatio(10), _close)]
+            (RelativeVolume(20), _vol), (EfficiencyRatio(10), _close), (Donchian(20), _hlc),
+            (RsiDivergence(), _hlc)]
 
 
 def test_every_named_block_is_tested_here():
     assert {type(b) for b, _ in _all_blocks()} == set(BLOCKS.values())
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_no_look_ahead(i):
     """A value at a bar is the same whether or not later bars exist: each prefix reads as the full run did."""
     block, feed = _all_blocks()[i]
@@ -244,7 +306,7 @@ def test_no_look_ahead(i):
         np.testing.assert_array_equal(part, full[:cut])
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_reset_gives_a_fresh_block(i):
     block, feed = _all_blocks()[i]
     fresh = copy.deepcopy(block)
@@ -257,7 +319,7 @@ def test_reset_gives_a_fresh_block(i):
     assert block.values == fresh.values and block.initialized == fresh.initialized
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_settled_after_its_warmup(i):
     """Fed warmup_bars bars, every block is initialized: warm-up from warmup_bars is always enough."""
     block, feed = _all_blocks()[i]
@@ -278,6 +340,8 @@ def test_warmup_bars_from_settings():
     assert Vwap("rolling", 30).warmup_bars == 30
     assert Vwap("day").warmup_bars == DAY_OF_MINUTE_BARS + 1
     assert warmup_for([Sma(50), Ema(20), RelativeVolume(20)]) == settle_bars(20)
+    assert Donchian(20).warmup_bars == 21
+    assert RsiDivergence(14, 3, 3, 50).warmup_bars == settle_bars(14) + 56
     assert warmup_for([]) == 0
 
 
@@ -304,14 +368,15 @@ def test_make_block_by_name():
 @pytest.mark.parametrize("kind,settings", [
     ("ema", {"period": 0}), ("wma", {"period": 2.5}), ("bollinger", {"period": 1}), ("bollinger", {"k": 0}),
     ("vwap", {"anchor": "week"}), ("ema", {"lookback": 5}), ("bollinger", {"k": 50}), ("sma", {"period": 10**6}), ("vwap", {"anchor": "rolling"}), ("vwap", {"anchor": "day", "period": 5}),
-    ("relative_volume", {"period": True}), ("efficiency_ratio", {"period": -1}),
+    ("relative_volume", {"period": True}), ("efficiency_ratio", {"period": -1}), ("donchian", {"source": "open"}),
+    ("rsi_divergence", {"right": 0}), ("rsi_divergence", {"rsi_period": 1}), ("rsi_divergence", {"left": 51}),
 ])
 def test_bad_settings_are_refused(kind, settings):
     with pytest.raises(ValueError):
         make_block(kind, **settings)
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_update_ohlcv_and_handle_bar_match_update_raw(i):
     """Any block can be fed whole bars, ignoring what it doesn't use, and reads as update_raw fed it."""
     block, feed = _all_blocks()[i]
@@ -339,7 +404,7 @@ def test_update_ohlcv_and_handle_bar_match_update_raw(i):
         assert from_bar.values == raw.values
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_values_are_none_until_initialized_and_never_nan(i):
     block, feed = _all_blocks()[i]
     assert set(block.values) == set(type(block).OUTPUTS) and all(v is None for v in block.values.values())
@@ -354,7 +419,7 @@ def test_values_are_none_until_initialized_and_never_nan(i):
                 assert block.value is None
 
 
-@pytest.mark.parametrize("i", range(10))
+@pytest.mark.parametrize("i", range(12))
 def test_warmup_from_the_class_matches_the_block(i):
     block, _ = _all_blocks()[i]
     assert type(block).warmup_bars(**block.settings) == block.warmup_bars
@@ -369,7 +434,8 @@ def test_every_block_lists_settings_with_defaults_inside_their_limits():
             if s.default is not None:
                 assert s.check(s.default) == s.default
         assert make_block(kind, **({"anchor": "rolling", "period": 5} if kind == "vwap" else {})).initialized is False
-        assert cls.confirm_lag == 0
+        block = make_block(kind, **({"anchor": "rolling", "period": 5} if kind == "vwap" else {}))
+        assert block.confirm_lag == (block.right if kind == "rsi_divergence" else 0)
 
 
 def test_day_vwap_needs_close_times():
