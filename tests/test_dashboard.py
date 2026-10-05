@@ -1727,6 +1727,29 @@ def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, 
     assert store.previous_book() == {}
 
 
+def test_the_5_oct_clean_slate_leaves_a_fresh_book_of_the_two_binance_strategies(client, tmp_path):
+    """PM, 5 Oct 2026: the book's equity, P&L and drawdown carried the old test strategies' history and read as
+    made up. After the 5 Oct slate the book starts from the two Binance strategies' capital alone."""
+    import glob
+
+    from sleeve_fund.supervisor import clear, seed
+
+    c, store = client
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "first slate"\n')
+    clear(store, str(path))
+    seed(store, sorted(glob.glob("configs/sleeves/*.toml")))
+    store.record_equity("rsi-bands-ls-test", equity=8123.45, cash=8123.45, qty=0, price=1, benchmark=10000)
+    store.record_fill("ping-pong-ls-test", side="BUY", qty=0.01, price=60_000, fee=0.5, order_id="O-1", trade_id="T-1")
+    store.record_fill("ping-pong-ls-test", side="SELL", qty=0.01, price=59_000, fee=0.5, order_id="O-2", trade_id="T-2")
+    clear(store, "configs/clear.toml")
+    book = c.get("/", auth=AUTH).text
+    assert "20,000.00" in book and "8,123.45" not in book
+    assert 'href="/sleeves/ping-pong-ls-binance"' in book and 'href="/sleeves/rsi-bands-ls-binance"' in book
+    curve = c.get("/api/book/equity", auth=AUTH).json()
+    assert all(v == 20_000 for v in curve.get("equity", [])) and not any(curve.get("drawdown", []))
+
+
 def test_a_strategy_a_clean_slate_put_away_still_holding_stays_in_the_book_until_flat(client, tmp_path):
     """5 Oct 2026: the 4 Oct clean slate archived btc-trend-smoke and btc-trend-daily while they were still
     long, and the book then left them out, so their positions sat in no exposure, risk page or kill switch.
