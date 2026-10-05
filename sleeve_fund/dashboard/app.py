@@ -235,8 +235,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         live = [x for x in summaries if x["sleeve"].name not in flattening]
         trading = [x for x in live if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
         held = [x for x in live if x["qty"] and x not in trading]
+        # What the switch trades: every open position, longs and shorts, by its size (round 12, M12-U4: shorts
+        # were left out, so the dialog showed a seventh of the notional it would trade).
+        holding = [x for x in trading + held if x["qty"]]
         return {"trading": trading, "held": held, "all": trading + held, "flattening": flattening,
-                "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"]}
+                "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"],
+                "holding": holding, "gross": sum(abs(x["position_value"]) for x in holding),
+                "shorts": sum(1 for x in holding if x["qty"] < 0)}
 
     @app.post("/book/flatten")
     def book_flatten(reason: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
