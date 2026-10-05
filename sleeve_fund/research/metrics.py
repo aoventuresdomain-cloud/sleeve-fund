@@ -113,7 +113,7 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
     ]
 
 
-def trades(rows: list[dict], shorts: bool = False) -> list[dict]:
+def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = None) -> list[dict]:
     """Closed round trips (flat -> long -> flat, or flat -> short -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial fills are fine: a trip
@@ -125,6 +125,9 @@ def trades(rows: list[dict], shorts: bool = False) -> list[dict]:
 
     A spot journal never sells short, so on spot a sell with nothing open can only be a journal read from
     mid-trip; such rows are skipped unless shorts is set (a perpetual's journal).
+
+    funding: a perpetual's funding payments (ts, amount: + received, - paid). Each is booked to the trip
+    open at its time, so a trip's P&L is after fees and funding; `funding` carries its share.
     """
     out, pos = [], ZERO
     trip: dict | None = None
@@ -155,7 +158,27 @@ def trades(rows: list[dict], shorts: bool = False) -> list[dict]:
             if pos == ZERO:
                 out.append(_trip(trip, r))
                 trip = None
+    if funding:
+        _book_funding(out, funding)
     return out
+
+
+def _book_funding(trips: list[dict], funding: list[dict]) -> None:
+    """Add each funding payment to the trip open at its time (oldest-first trips; each payment once)."""
+    pays = sorted((f["ts"], f["amount"]) for f in funding if f.get("ts") is not None)
+    i = 0
+    for t in trips:
+        if t["opened"] is None or t["closed"] is None:
+            continue
+        while i < len(pays) and pays[i][0] < t["opened"]:
+            i += 1  # paid while no closed trip was open (journal read from mid-trip)
+        total = 0.0
+        while i < len(pays) and pays[i][0] <= t["closed"]:
+            total += pays[i][1]
+            i += 1
+        t["funding"] = total
+        t["pnl"] += total
+        t["ret"] = t["pnl"] / t["cost"] if t["cost"] else 0.0
 
 
 def _trip(t: dict, closing: dict) -> dict:
@@ -164,6 +187,7 @@ def _trip(t: dict, closing: dict) -> dict:
     out_qty = t["sold"] if side > 0 else t["bought"]
     pnl = side * (t["exit"] - t["entry"]) - t["fees"]
     return {"pnl": pnl, "ret": pnl / t["entry"] if t["entry"] else 0.0, "cost": t["entry"], "fees": t["fees"],
+            "funding": 0.0,
             "qty": qty, "side": side, "entry_px": t["entry"] / qty if qty else float("nan"),
             "exit_px": t["exit"] / out_qty if out_qty else float("nan"),
             "opened": t["opened"], "closed": closing.get("ts"),

@@ -87,14 +87,31 @@ def order_view(o: dict) -> dict:
     return o
 
 
-def plan_items(plan: dict) -> list[tuple[str, str]]:
-    """An exit plan set after entry (see Store.set_exit_plan), as (label, text) pairs for display."""
+def exit_ways(params: dict | None, side: int | None = None) -> dict[str, str]:
+    """Which way a stop and a target sit from the entry, in words: for the side held, or, with no
+    position, for every side the strategy can take (a long/short perpetual: both)."""
+    if side and side < 0:
+        return {"stop": "above", "tp": "below", "swing": "highest high", "swing_short": "high"}
+    try:
+        perp = markets.is_perp(params)
+    except ValueError:  # an unknown market typed into a form: the form refuses it on submit
+        perp = False
+    if not side and perp and (params or {}).get("allow_short"):
+        return {"stop": "below (a short: above)", "tp": "above (a short: below)",
+                "swing": "lowest low (a short: highest high)", "swing_short": "low (a short: high)"}
+    return {"stop": "below", "tp": "above", "swing": "lowest low", "swing_short": "low"}
+
+
+def plan_items(plan: dict, side: int = 1) -> list[tuple[str, str]]:
+    """An exit plan set after entry (see Store.set_exit_plan), as (label, text) pairs for display.
+    side: the position's, so a short's stop reads above its entry."""
     out = [("Exits", "edited by the PM" if plan["kind"] == "edit" else "set again after a restart")]
+    away, toward = ("below", "above") if side > 0 else ("above", "below")
     if plan.get("stop_frac") is not None:
         s = plan["stop_frac"]
-        out.append(("Stop now", f"{s:.1%} below the entry" if s >= 0 else f"{-s:.1%} above the entry"))
+        out.append(("Stop now", f"{s:.1%} {away} the entry" if s >= 0 else f"{-s:.1%} {toward} the entry"))
     if plan.get("tp_frac"):
-        out.append(("Target now", f"{plan['tp_frac']:.1%} above the entry"))
+        out.append(("Target now", f"{plan['tp_frac']:.1%} {toward} the entry"))
     if plan.get("risk_amount"):
         out.append(("1R now", f"{plan['risk_amount']:,.2f}"))
     if plan.get("planned_r") is not None:
@@ -103,14 +120,14 @@ def plan_items(plan: dict) -> list[tuple[str, str]]:
 
 
 def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
-          plans: dict[str, dict] | None = None, shorts: bool = False) -> list[dict]:
+          plans: dict[str, dict] | None = None, shorts: bool = False, funding: list[dict] | None = None) -> list[dict]:
     """Closed round trips, newest first, with holding time and the journaled reason at each end.
     fills: newest first, as the store returns them. orders: journal rows keyed by order id. plans: exit
     plans set after entry (Store.exit_plans), by entry order id. shorts: a perpetual's journal, where a
-    sell from flat opens a short (metrics.trades)."""
+    sell from flat opens a short (metrics.trades). funding: a perpetual's payments, booked to each trip."""
     exits = [e for e in events if e["kind"] in EXIT_EVENTS]
     out = []
-    for t in reversed(trades(list(reversed(fills)), shorts)):
+    for t in reversed(trades(list(reversed(fills)), shorts, funding)):
         entry, exit_ = orders.get(t["entry_order"] or ""), orders.get(t["exit_order"] or "")
         if exit_:
             kind = exit_["intent"]
@@ -137,7 +154,7 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
         t["planned_r"] = plan["planned_r"] if plan else sig.get("planned_r")
         t["exits_edited"] = bool(plan and plan["kind"] == "edit")
         if plan:
-            t["entry_items"] = t["entry_items"] + plan_items(plan)
+            t["entry_items"] = t["entry_items"] + plan_items(plan, t["side"])
         out.append(t)
     return out
 
@@ -196,9 +213,35 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "stop_px": x["entry_px"] * (1 - side * sl) if sl is not None else None,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "why": entry["reason"] if entry else None,
-        "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan) if plan else []),
+        "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
         "weight": x["position_value"] / x["equity"] if x["equity"] else 0.0,
+    }
+
+
+def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | None:
+    """What a perpetual position adds to a spot one: leverage, isolated margin, how far it is from
+    liquidation, and the funding it has paid or received. funding: newest first, as the store returns it."""
+    t = markets.terms(x["sleeve"].params)
+    if t is None:
+        return None
+    qty, price, equity, cash = x["qty"], x["price"], x["equity"], x["cash"]
+    notional = abs(qty * price)
+    liq = markets.liquidation_price(cash, qty, t.maintenance_margin) if qty else None
+    opened = position["opened"] if position else None
+    held = [f for f in funding if opened is not None and f["ts"] >= opened]
+    return {
+        "leverage": notional / equity if equity > 0 else None,
+        "margin": max(equity, 0.0),  # isolated: the strategy's whole equity backs its one position
+        "maintenance": notional * t.maintenance_margin,
+        "maintenance_rate": t.maintenance_margin,
+        "liq_px": liq,
+        "to_liq": abs(liq / price - 1) if liq and price else None,
+        "funding_rate": t.funding_rate,
+        "funding_last": held[0] if held else None,
+        "funding_open": sum(f["amount"] for f in held),
+        "funding_total": sum(f["amount"] for f in funding),
+        "label": t.label,
     }
 
 
@@ -218,7 +261,9 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         pos = open_position(x, fills, orders, plans)
         if pos:
             positions.append(pos)
-        for t in trips(fills, store.events(name, limit=5000), orders, plans, markets.is_perp(x["sleeve"].params)):
+        perp = markets.is_perp(x["sleeve"].params)
+        for t in trips(fills, store.events(name, limit=5000), orders, plans, perp,
+                       store.funding(name, limit=1_000_000) if perp else None):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)

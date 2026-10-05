@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from sleeve_fund import markets
 from sleeve_fund.research.metrics import trade_stats, trades
 from sleeve_fund.risk import position_cap
 from sleeve_fund.risk import profile as risk_profile
@@ -32,7 +33,10 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         "fills": len(fills),
         "fees": sum(f["fee"] for f in fills),
         "pnl": 0.0,
-        "trades": trade_stats(trades(list(reversed(fills)))),  # closed trips, after fees
+        # Closed trips after fees (and a perpetual's funding), paired as the Trades tab pairs them: on a perpetual a sell from flat opens a
+        # short, so the header, the Trades tab and the G2 checklist count the same trips (round 11, M11-4).
+        "trades": trade_stats(trades(list(reversed(fills)), markets.is_perp(s.params),
+                                     store.funding(s.name, limit=100_000) if markets.is_perp(s.params) else None)),
         "healthy": bool(s.heartbeat_at and utcnow() - s.heartbeat_at < STALE),
     }
     if series:

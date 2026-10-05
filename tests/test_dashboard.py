@@ -1277,7 +1277,7 @@ def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
     clone = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "stop_atr=2.5" in clone and "take_profit_r=3" in clone  # Clone with changes keeps them
     form = c.get("/sleeves/new?stop_atr=2.5&take_profit_r=3", auth=AUTH).text
-    assert '<option value="atr" selected>' in form and '<option value="r" selected>' in form
+    assert '<option value="atr" selected' in form and '<option value="r" selected>' in form
     assert "data-costs=" in form
     r = _new(c, name="btc-two", stop_loss_pct="5", stop_atr="2")
     assert "one kind of stop" in r.headers["location"].replace("+", " ")

@@ -97,7 +97,9 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
                     if len(brets) >= MIN_DAYS_FOR_RATIOS and brets.std() > 0 else float("nan"))
     peak = curve["equity"].cummax() if len(curve) else pd.Series(dtype=float)
     dd = (1 - curve["equity"] / peak) if len(curve) else pd.Series(dtype=float)
-    exposure = sum(x["position_value"] for x in active)
+    # Gross counts a short as exposure too; net lets a short offset a long. Signed values: + long, - short.
+    exposure = sum(abs(x["position_value"]) for x in active)
+    net = sum(x["position_value"] for x in active)
     return {
         "sleeves": len(summaries),
         "running": sum(1 for x in summaries if x["sleeve"].status == "running"),
@@ -112,6 +114,8 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "mtd_pnl": sum(x["mtd_pnl"] for x in active),
         "exposure": exposure,
         "exposure_pct": exposure / equity if equity else 0.0,
+        "net_exposure": net,
+        "net_pct": net / equity if equity else 0.0,
         "cash": sum(x["cash"] for x in active),
         "unrealised": sum(x["unrealised"] for x in active),
         "fees": sum(x["fees"] for x in active),

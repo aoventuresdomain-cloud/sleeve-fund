@@ -93,6 +93,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
+    templates.env.globals["market_choices"] = market_choices
+    templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -364,10 +366,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         events = st().events(name, limit=400)
         orders = trading.orders_by_id(st(), name)
         plans = st().exit_plans(name)
-        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, markets.is_perp(s.params))
+        perp = markets.is_perp(s.params)
+        funding = st().funding(name, limit=100_000) if perp else []
+        trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
         position = trading.open_position(x, fills, orders, plans)
+        perp_x = trading.perp_view(x, position, funding) if perp else None
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -380,7 +385,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # last mark may be older than its last fill.
                     held=0.0 if bt_id else st().journal_book(name, s.starting_balance)["qty"],
                     costs=exit_costs(), reload=st().pending_reload(name),
-                    position=position,
+                    position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
@@ -555,7 +560,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             _check_strategy_params(cfg, half_spread)
             _check_open_stop(st(), s, params, PROFILES[profile], float(cfg.fees.taker) + half_spread,
                              bool(form.get("confirm_looser")))
-            changes = _risk_changes(s.risk_profile, s.params, profile, params)
+            held = st().journal_book(name, s.starting_balance)["qty"]
+            changes = _risk_changes(s.risk_profile, s.params, profile, params, (held > 0) - (held < 0))
             if not changes:
                 raise ValueError("nothing changed")
             cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
@@ -629,7 +635,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     instruments=[h["pair"] for h in stored] or INSTRUMENT_HINTS, stored=stored, collect=collect,
                     notice=notice, request_years=REQUEST_YEARS, history_venue=_research_venue().label,
                     research_venue=_research_venue().name.lower(), spent_holdouts=spent,
-                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs())
+                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True))
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -762,10 +768,12 @@ def create_app(store: Store | None = None) -> FastAPI:
             for n in chosen:
                 orders = trading.orders_by_id(st(), n)
                 for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders,
-                                       st().exit_plans(n), _shorts(st(), n)):
+                                       st().exit_plans(n), _shorts(st(), n),
+                                       st().funding(n, limit=1_000_000) if _shorts(st(), n) else None):
                     rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
                                  if t["held"] else None})
-            cols = ["sleeve", "opened", "closed", "held_hours", "qty", "entry_px", "exit_px", "cost", "fees", "pnl",
+            cols = ["sleeve", "opened", "closed", "held_hours", "side", "qty", "entry_px", "exit_px", "cost", "fees",
+                    "funding", "pnl",
                     "ret", "r", "planned_r", "exits_edited", "exit_kind", "entry_why", "exit_why", "entry_order",
                     "exit_order"]
         elif kind == "orders":
@@ -777,12 +785,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "unknown export")
         return _csv(f"{kind}-{sleeve or 'all'}", reports.to_csv(rows, cols))
 
-    def exit_costs() -> dict:
+    def exit_costs(backtest: bool = False) -> dict:
         """What each leg of a trade costs, for the plan line under the exit fields: the taker fee and
         each instrument's half spread (measured, else the venue's assumption), exactly as the backtest
-        and paper charge them, so the form and the backtest quote the same round trip."""
+        and paper charge them, so the form and the backtest quote the same round trip. `markets`: a
+        perpetual's own taker fee, and in a backtest its assumed half spread (paper pays the live one)."""
         default = resolve_spread(None, "?/?", None).half_spread
-        return {"taker": float(resolve_fees(None, st()).fees.taker), "default_spread": default,
+        venue_fees = resolve_fees(None, st()).fees
+        per_market = {}
+        for m in markets.MARKETS:
+            t = markets.terms({"market": m})
+            if t is None:
+                continue
+            per_market[m] = {"taker": float(markets.fees_for({"market": m}, venue_fees).taker)}
+            if backtest and t.half_spread is not None:
+                per_market[m]["half_spread"] = t.half_spread
+        return {"taker": float(venue_fees.taker), "default_spread": default, "markets": per_market,
                 "spreads": {p: resolve_spread(None, p, st()).half_spread for p in INSTRUMENT_HINTS}}
 
     def backtest_form(request: Request, q, *, result=None, error="", job=None, saved=None):
@@ -803,12 +821,17 @@ def create_app(store: Store | None = None) -> FastAPI:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
                      "drawdown": result["drawdown"], "fills": result["fills"], "res": "daily",  # equity is daily
                      "worst": round(-result["strategy"]["max_drawdown"], 5)}  # over every mark, as the table
+        market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
+        shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
+        market_words = ("Spot, long only" if market == markets.SPOT else
+                        f"{markets.terms({'market': market}).label}, {'long and short' if shorts else 'long only'}")
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
+                    market_words=market_words,
                     chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, g1_here=g1_here,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
-                    runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs())
+                    runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs(backtest=True))
 
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_page(request: Request, _: str = Depends(require_pm)):
@@ -858,7 +881,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = dict(parse_qsl(row["query"]))
         result, name = row["result"], row["sleeve"]
         result["trips"] = trading.trips(st().fills(name, limit=1_000_000), st().events(name, limit=10_000),
-                                        trading.orders_by_id(st(), name), shorts=_shorts(st(), name))
+                                        trading.orders_by_id(st(), name), shorts=_shorts(st(), name),
+                                        funding=st().funding(name, limit=1_000_000) if _shorts(st(), name) else None)
         result["orders"] = sum(st().order_counts(name).values())
         rs = [t["r"] for t in result["trips"] if t["r"] is not None]
         result["expectancy_r"] = sum(rs) / len(rs) if rs else None
@@ -1324,35 +1348,60 @@ def _risk_form(params: dict) -> dict:
     return q
 
 
-def _risk_words(profile: str, params: dict) -> dict[str, str]:
-    """Each risk setting in words, for the decision log's before and after."""
+def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
+    """Each risk setting in words, for the decision log's before and after, in the terms of the position
+    held (side: 1 long, -1 short, 0 flat): a short's stop is above its entry (review round 11, M11-7)."""
     p = params
+    w = trading.exit_ways(params, side)
+    held = " (short)" if side < 0 else ""
     if p.get("stop_atr"):
-        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) below the entry"
+        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
     elif p.get("stop_swing_bars"):
-        stop = f"at the lowest low of {p['stop_swing_bars']} bars"
+        stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):
-        stop = f"{p['stop_loss'] * 100:g}% below the entry"
+        stop = f"{p['stop_loss'] * 100:g}% {w['stop']} the entry{held}"
     else:
         stop = "none"
     target = (f"{p['take_profit_r']:g}R after costs" if p.get("take_profit_r")
-              else f"{p['take_profit'] * 100:g}% above the entry" if p.get("take_profit") else "none")
+              else f"{p['take_profit'] * 100:g}% {w['tp']} the entry{held}" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
             "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",
             "Largest order": f"{p['max_notional']:,.2f}" if p.get("max_notional") else "no cap"}
 
 
-def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict) -> list[str]:
-    before, after = _risk_words(old_profile, old), _risk_words(new_profile, new)
+def _risk_changes(old_profile: str, old: dict, new_profile: str, new: dict, side: int = 0) -> list[str]:
+    before, after = _risk_words(old_profile, old, side), _risk_words(new_profile, new, side)
     return [f"{k} {before[k]} to {after[k]}" for k in before if before[k] != after[k]]
+
+
+MARKET_KEYS = ("market", "allow_short", "demo_mirror")  # form fields of their own, not model parameters
+
+
+def market_choices() -> list[tuple[str, str]]:
+    return [(markets.SPOT, "Spot: long only, the venue's fees"),
+            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {markets.LOW_FEE_PERP.fees.maker:.2%} maker, "
+                           f"{markets.LOW_FEE_PERP.fees.taker:.2%} taker, funding"),
+            (markets.PERP_VENUE_FEES, f"{markets.VENUE_FEE_PERP.label}: funding")]
+
+
+def _market_form(params: dict) -> dict:
+    """A strategy's market settings as the form's own fields."""
+    out = {}
+    if params.get("market"):
+        out["market"] = params["market"]
+    for key in ("allow_short", "demo_mirror"):
+        if params.get(key):
+            out[key] = "1"
+    return out
 
 
 def _clone_qs(s) -> str:
     """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
-    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS}
+    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS and k not in MARKET_KEYS}
     q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
          "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
-         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params)}
+         "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params),
+         **_market_form(s.params)}
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
@@ -1398,6 +1447,24 @@ def _form_params(form, strategy: str) -> dict:
     # Each strategy's parameter inputs are named p_<strategy>__<param>; only the chosen one counts.
     prefix = f"p_{strategy}__"
     params = _coerce_params({k[len(prefix):]: v for k, v in form.items() if k.startswith(prefix) and v != ""})
+    # A setting the form can't honour is refused, never dropped: a long/short strategy's market came
+    # through "Clone with changes" as a model parameter the form had no field for, and the backtest quietly
+    # ran it as long-only spot (review round 11, B11-1).
+    known = set(_defaults(strategy)) | _config_keys(strategy) if strategy in REGISTRY else set()
+    unknown = sorted(set(params) - known)
+    if unknown:
+        raise ValueError(f"{', '.join(unknown)}: unknown setting for the {strategy.replace('_', ' ')} model; it "
+                         "can't be honoured here, so nothing was run")
+    market = str(form.get("market", "") or markets.SPOT)
+    if market not in markets.MARKETS:
+        raise ValueError(f"market: one of {', '.join(markets.MARKETS)}")
+    if market != markets.SPOT:
+        params["market"] = market
+    for key in ("allow_short", "demo_mirror"):
+        if str(form.get(key, "")).strip().lower() in ("1", "true", "on", "yes"):
+            if market == markets.SPOT:
+                raise ValueError(f"{key.replace('_', ' ')}: only on a perpetual; spot is long only")
+            params[key] = True
     if str(form.get("max_notional", "")).strip():
         params["max_notional"] = float(form["max_notional"])
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
@@ -1424,6 +1491,14 @@ def _form_params(form, strategy: str) -> dict:
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
     return params
+
+
+def _config_keys(strategy: str) -> set[str]:
+    """The keyword settings a model's config takes beyond the common ones."""
+    import inspect
+
+    sig = inspect.signature(REGISTRY[strategy][1].__init__)
+    return {n for n, p in sig.parameters.items() if p.kind == p.KEYWORD_ONLY}
 
 
 def _coerce_params(raw: dict) -> dict:

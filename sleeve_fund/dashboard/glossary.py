@@ -6,7 +6,7 @@ GLOSSARY = {
     "mtd": "Change in equity since the 1st of this month, after fees.",
     "since_start": "Return since the money was first allocated, after fees. The benchmark is what simply buying the instrument on day one and holding it would have returned.",
     "vs_hold": "The strategy's return minus buy-and-hold over the same period. Positive means the model added value over simply holding the instrument.",
-    "in_market": "Gross exposure: the value of open positions as a share of equity. 0% means flat, all cash. In a backtest, the share of time a position was held.",
+    "in_market": "Gross exposure: the value of open positions, longs and shorts alike, as a share of equity. Net lets a short offset a long. 0% means flat, all cash. In a backtest, the share of time a position was held.",
     "cash": "Uninvested money. Open P&L is the unrealised gain or loss on open positions.",
     "drawdown": "How far equity is below its highest point so far. Measured on every mark, as the risk guard sees it; each risk profile halts a strategy at a set drawdown.",
     "sharpe": "Return per unit of risk: annual return divided by annual volatility. Above 1 is good; buy-and-hold is the bar to beat. Measured on daily closes at every interval, and needs at least 30 days to mean much.",

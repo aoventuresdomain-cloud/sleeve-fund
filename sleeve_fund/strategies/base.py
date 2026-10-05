@@ -237,9 +237,6 @@ class LongFlatConfig(StrategyConfig):
                 raise ValueError("maker-first orders aren't available on a perpetual yet: every order goes at market")
             if rebalance_band is not None:
                 raise ValueError("rebalancing to a target weight isn't available on a perpetual yet")
-            if stop_swing_bars is not None:
-                raise ValueError("a stop at a recent low isn't available on a perpetual yet (a short needs the "
-                                 "recent high); use a % or an average-true-range stop")
         # A target in R is after costs by construction (r_target); a fixed one must clear them itself.
         if take_profit is not None:
             leg = assumed_taker_fee + assumed_half_spread
@@ -367,6 +364,8 @@ class LongFlatStrategy(Strategy):
         self._plan_entry: dict | None = None  # the open position's entry order, after a restart
         self._atr = Atr(config.atr_bars) if config.stop_atr else None
         self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
+        # A short's swing stop sits at the highest high (review round 11, M11-7).
+        self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
@@ -582,6 +581,7 @@ class LongFlatStrategy(Strategy):
             self._atr.update_raw(bar.high.as_double(), bar.low.as_double(), bar.close.as_double())
         if self._lows is not None:
             self._lows.append(bar.low.as_double())
+            self._highs.append(bar.high.as_double())
         self.update_indicators(bar)
         return True
 
@@ -603,8 +603,12 @@ class LongFlatStrategy(Strategy):
         elif c.stop_swing_bars:
             if len(self._lows) < c.stop_swing_bars or close <= 0:
                 return None
-            low = min(self._lows)
-            stop, basis = 1 - low / close, f"at the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
+            if side < 0:
+                high = max(self._highs)
+                stop, basis = high / close - 1, f"at the highest high of the last {c.stop_swing_bars} bars ({high:,.6g})"
+            else:
+                low = min(self._lows)
+                stop, basis = 1 - low / close, f"at the lowest low of the last {c.stop_swing_bars} bars ({low:,.6g})"
         if stop is not None and (c.stop_atr or c.stop_swing_bars):
             clamped = min(max(stop, MIN_STOP), MAX_STOP)
             if clamped != stop:
@@ -706,8 +710,8 @@ class LongFlatStrategy(Strategy):
         level = close * (1 - side * distance)
         stop = side * (1 - level / self._entry_px)
         if self._stop_frac is not None and self._stop_frac < stop:
-            basis = (f"kept: the new setting ({basis}) would put it lower, at {level:,.6g}, and a stop set "
-                     f"from the market only ever tightens; {self._stop_basis or _from_entry(self._stop_frac)}")
+            basis = (f"kept: the new setting ({basis}) would loosen it, to {level:,.6g}, and a stop set "
+                     f"from the market only ever tightens; {self._stop_basis or _from_entry(self._stop_frac, self._entry_side or 1)}")
             stop = self._stop_frac
         self._set_plan(stop, self._target_for(stop) if (stop > 0 or not self._cfg.take_profit_r) else self._tp_frac,
                        basis, kind, event_id)

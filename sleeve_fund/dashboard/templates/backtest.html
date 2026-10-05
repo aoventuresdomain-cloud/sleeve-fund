@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
-{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields %}
+{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
 {% block title %}Backtest · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -24,6 +24,7 @@
       <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: positions up to {{ p.max_position_pct|pct0 }}</option>{% endfor %}</select></div>
       <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
     </div>
+    {{ market_fields(pre) }}
     {{ order_fields(pre) }}
     <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('stop_atr') or pre.get('stop_swing_bars') or pre.get('take_profit_pct') or pre.get('take_profit_r') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre, costs) }}</details>
     <p style="margin:14px 0 0"><button>Run backtest</button></p>
@@ -41,7 +42,7 @@
   {% if result %}
     {% set s, h, ts = result.strategy, result.hold, result.stats %}{% set dfmt = '%d %b %Y %H:%M' if result.minutes < 1440 else '%d %b %Y' %}
     <section class="panel bt-head">
-      <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days · {{ result.fee_schedule.short or result.fee_schedule.text }} · {{ result.spread.short or result.spread.text }}</span>
+      <div class="panel-head"><h2>{{ chosen|replace('_', ' ')|capitalize }} on {{ result.pair }}</h2><span class="hint">{{ result['from'] }} to {{ result['to'] }}, {{ result.days }} days · <strong>{{ market_words }}</strong> · {{ result.fee_schedule.text }} · {{ result.spread.short or result.spread.text }}</span>
         <a class="m-jump" href="#bt-form">Change the settings</a>
         {% if saved %}<span class="bt-links">Saved run: <a href="/orders?sleeve={{ saved.sleeve|urlencode }}">{{ result.orders }} orders</a> · <a href="/trades?sleeve={{ saved.sleeve|urlencode }}">trades</a> · <a href="/sleeves/{{ saved.sleeve|urlencode }}">strategy screen</a></span>{% endif %}
         {% if result.errors %}<span class="right muted">Fix the strategy's error before starting it on paper.</span>{% else %}<a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a>{% endif %}</div>
@@ -89,7 +90,7 @@
         <tr><td data-m="hide">{{ t.opened.strftime(dfmt) }}</td><td>{{ t.closed.strftime(dfmt) }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
           <td class="num" data-m="hide">{{ '%g'|format(t.qty) }}{% if t.side == -1 %}<div class="sub">short</div>{% endif %}</td>
           <td class="num" data-m="hide">{{ t.entry_px|px }}</td><td class="num" data-m="hide">{{ t.exit_px|px }}</td>
-          <td class="num" data-m="hide">{{ t.fees|money }}</td>
+          <td class="num" data-m="hide">{{ t.fees|money }}{% if t.funding|abs >= 0.005 %}<div class="sub" title="Funding over the trade: + received, − paid. P&amp;L is after fees and funding.">funding {{ t.funding|smoney }}</div>{% endif %}</td>
           <td class="num" data-m="right">{{ money_signed(t.pnl) }}</td><td class="num" data-label="Return">{{ signed(t.ret) }}</td><td class="num" data-m="hide">{{ t.r|rmult }}</td>
           <td data-m="hide">{{ tag(t.reason, t.exit_kind) }}</td><td data-m="right">{{ why_toggle(rid) }}</td></tr>
         <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">

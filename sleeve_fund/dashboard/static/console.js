@@ -795,7 +795,12 @@ window.Console = (() => {
       const items = [
         `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${document.getElementById("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
-        `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}.`,
+        (() => {
+          const mk = form.elements.market ? form.elements.market.value : "spot";
+          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}, long only.`;
+          const shorts = form.elements.allow_short && form.elements.allow_short.checked;
+          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
+        })(),
         `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
       items.push(...exitFields(form)());
@@ -816,11 +821,20 @@ window.Console = (() => {
     const bt = document.getElementById("bt-these");
     bt.addEventListener("click", () => {
       const q = new URLSearchParams(new FormData(form));
-      ["name", "reason", "warmup_bars", "tested_bar_spec", "from", "account"].forEach((k) => q.delete(k));
+      ["name", "reason", "warmup_bars", "tested_bar_spec", "from", "account", "demo_mirror"].forEach((k) => q.delete(k));
       q.set("run", "1");
       bt.href = `/backtest?${q}`;
     });
   }
+
+  // A trade's exits priced after costs, as the strategy prices them (strategies/base.py loss_at_stop,
+  // gain_at_target, r_target): each leg pays `leg` on its own notional, and a short (side -1) buys back
+  // above its entry at the stop and below it at the target.
+  const exitMath = {
+    loss: (stop, leg, side) => stop + leg + (1 - side * stop) * leg,
+    gain: (tp, leg, side) => tp - leg - (1 + side * tp) * leg,
+    rTarget: (r, stop, leg, side) => (r * exitMath.loss(stop, leg, side) + 2 * leg) / (1 - side * leg),
+  };
 
   // Exits: one kind of stop and one kind of target, with only the chosen one's inputs live, and a plan
   // line pricing it in R with the costs the backtest and paper charge (the form's data-costs).
@@ -831,6 +845,17 @@ window.Console = (() => {
     if (box.exitDescribe) return box.exitDescribe;
     const costs = box.dataset.costs ? JSON.parse(box.dataset.costs) : null;
     const line = box.querySelector(".exit-plan");
+    // The side the exits are for: the position held, else every side the strategy can take.
+    const market = () => (form.elements.market ? form.elements.market.value : box.dataset.market) || "spot";
+    const shorts = () => market() !== "spot" && (form.elements.allow_short ? form.elements.allow_short.checked : !!box.dataset.shorts);
+    const heldSide = () => Number(box.dataset.side || 0);
+    const ways = () => {
+      const side = heldSide();
+      if (side < 0) return {stop: "above", tp: "below", swing: "highest high", swing_short: "high"};
+      if (!side && shorts()) return {stop: "below (a short: above)", tp: "above (a short: below)",
+        swing: "lowest low (a short: highest high)", swing_short: "low (a short: high)"};
+      return {stop: "below", tp: "above", swing: "lowest low", swing_short: "low"};
+    };
     const kind = {stop: box.querySelector("[data-kind=stop]"), tp: box.querySelector("[data-kind=tp]")};
     const num = (n) => { const i = form.elements[n]; return i && !i.disabled && i.value !== "" ? Number(i.value) : null; };
     const p2 = (x) => `${(x * 100).toFixed(2)}%`;
@@ -847,22 +872,29 @@ window.Console = (() => {
       const rOpt = kind.tp.querySelector("option[value=r]");
       rOpt.disabled = !kind.stop.value;  // a target in R needs a stop
       if (rOpt.disabled && kind.tp.value === "r") { kind.tp.value = ""; sync(); return; }
+      const w = ways();
+      box.querySelectorAll("[data-exit-tpl]").forEach((el) => {
+        el.textContent = el.dataset.exitTpl.replace(/\{(\w+)\}/g, (_, k) => w[k]);
+      });
       if (!line || !costs) return;
       const pair = ((form.elements.instrument && form.elements.instrument.value) || "").toUpperCase();
-      const half = pair in costs.spreads ? costs.spreads[pair] : costs.default_spread;
-      const leg = costs.taker + half;  // each way: the taker fee and half the spread
+      const mk = (costs.markets || {})[market()] || {};
+      const half = "half_spread" in mk ? mk.half_spread : pair in costs.spreads ? costs.spreads[pair] : costs.default_spread;
+      const leg = ("taker" in mk ? mk.taker : costs.taker) + half;  // each way: the taker fee and half the spread
+      // Priced for the side held; with none, for a long (a short's differs by a fraction of the leg cost).
+      const side = heldSide() < 0 ? -1 : 1, who = heldSide() < 0 ? "the short" : "the position";
       const s = num("stop_loss_pct") !== null ? num("stop_loss_pct") / 100 : null;
       const r = num("take_profit_r");
       // A target in R pays R times the stop-out's loss, both after costs (strategies/base.py r_target).
-      const rTarget = (k, stop) => (k * (stop * (1 - leg) + 2 * leg) + 2 * leg) / (1 - leg);
+      const rTarget = (k, stop) => exitMath.rTarget(k, stop, leg, side);
       const t = num("take_profit_pct") !== null ? num("take_profit_pct") / 100 : null;
       const parts = [];
       let warn = false;
-      const loss = s !== null ? s + leg + (1 - s) * leg : null;  // 1R: what a stop-out loses, costs included
-      if (loss !== null) parts.push(`A stop-out loses 1R = ${p2(loss)} of the position: the ${p2(s)} stop plus ${p2(loss - s)} in fees and spread.`);
+      const loss = s !== null ? exitMath.loss(s, leg, side) : null;  // 1R: what a stop-out loses, costs included
+      if (loss !== null) parts.push(`A stop-out loses 1R = ${p2(loss)} of ${who}: the ${p2(s)} stop ${w.stop} the entry plus ${p2(loss - s)} in fees and spread.`);
       else if (kind.stop.value === "atr" || kind.stop.value === "swing") parts.push("The stop is set from the market at each entry, so 1R differs from trade to trade; each trade's R shows in the backtest.");
       if (t !== null) {
-        const trip = leg + (1 + t) * leg, gain = t - trip;
+        const gain = exitMath.gain(t, leg, side), trip = t - gain;
         if (gain <= 0) { warn = true; parts.push(`The ${p2(t)} target doesn't cover the ${p2(trip)} round trip, so every target hit would lose money. It can't be saved.`); }
         else if (loss !== null) {
           const R = gain / loss;
@@ -870,8 +902,8 @@ window.Console = (() => {
           if (R < 0.25) { warn = true; parts.push(`That is almost nothing for the risk: costs alone take ${p2(trip)}.`); }
         } else parts.push(`The target makes ${p2(gain)} after a ${p2(trip)} round trip.`);
       } else if (r !== null) {
-        if (s !== null) parts.push(`The target makes ${rr(r)} after costs: ${p2(rTarget(r, s))} above the entry.`);
-        else parts.push(`The target makes ${rr(r)} after costs, so it sits further out than ${r} stop distances: on a 3% stop, ${p2(rTarget(r, 0.03))} above the entry.`);
+        if (s !== null) parts.push(`The target makes ${rr(r)} after costs: ${p2(rTarget(r, s))} ${w.tp} the entry.`);
+        else parts.push(`The target makes ${rr(r)} after costs, so it sits further out than ${r} stop distances: on a 3% stop, ${p2(rTarget(r, 0.03))} ${w.tp} the entry.`);
         if (r < 0.25) { warn = true; parts.push("That is almost nothing for the risk."); }
       }
       line.hidden = !parts.length;
@@ -879,15 +911,15 @@ window.Console = (() => {
       line.textContent = parts.join(" ");
     };
     kind.stop.addEventListener("change", sync); kind.tp.addEventListener("change", sync);
-    form.addEventListener("input", sync);
+    form.addEventListener("input", sync); form.addEventListener("change", sync); form.addEventListener("market-change", sync);
     sync();
     box.exitDescribe = () => {
       sync();  // the summary may be asked before this form's own input listener has run
-      const out = [], r = num("take_profit_r"), atr = num("stop_atr"), swing = num("stop_swing_bars");
-      const stop = num("stop_loss_pct") !== null ? `${num("stop_loss_pct")}% below entry`
-        : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) below entry`
-        : swing !== null ? `at the lowest low of the last ${swing} bars` : null;
-      const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% above entry`
+      const out = [], r = num("take_profit_r"), atr = num("stop_atr"), swing = num("stop_swing_bars"), w = ways();
+      const stop = num("stop_loss_pct") !== null ? `${num("stop_loss_pct")}% ${w.stop} entry`
+        : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) ${w.stop} entry`
+        : swing !== null ? `at the ${w.swing} of the last ${swing} bars` : null;
+      const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% ${w.tp} entry`
         : r !== null ? `a target that makes ${r}R after costs` : null;
       if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);
       if (line && !line.hidden) out.push(line.textContent);
@@ -902,6 +934,15 @@ window.Console = (() => {
   function orderFields(formId) {
     const form = document.getElementById(formId);
     exitFields(form);
+    if (form && form.elements.market) {  // shorts and the testnet mirror only on a perpetual
+      const perp = [...form.querySelectorAll("[data-when-perp]")];
+      const syncMarket = () => {
+        const spot = form.elements.market.value === "spot";
+        perp.forEach((el) => { el.hidden = spot; if (spot) el.querySelectorAll("input[type=checkbox]").forEach((c) => { c.checked = false; }); });
+        form.dispatchEvent(new Event("market-change"));
+      };
+      form.elements.market.addEventListener("change", syncMarket); syncMarket();
+    }
     if (!form || !form.elements.execution) return;
     const wait = form.querySelector("[data-when-maker]");
     if (!wait) return;  // maker-first orders switched off: market only
