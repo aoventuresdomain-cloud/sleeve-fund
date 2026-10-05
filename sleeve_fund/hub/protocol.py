@@ -1,6 +1,6 @@
 """The market data hub's stream (v2 P1-1): one JSON object per line over TCP.
 
-A client opens with {"v": 1, "sub": ["BTCUSDT-PERP.BINANCE", ...]} and the hub answers {"t": "hello", "v": 1,
+A client opens with {"v": 1, "sub": ["<instrument id>", ...]} and the hub answers {"t": "hello", "v": 1,
 "pending": [ids not relayed yet], "instruments": [each relayed one's definition, Instrument.to_dict()]}, or
 {"t": "error", ...} and closes. Then, for the instruments subscribed:
 - {"t": "trade", "id", "px", "qty", "side", "tid", "ts", "recv"}: a trade print;

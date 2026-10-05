@@ -917,7 +917,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if held is not None:
             return (f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now.")
-        if pair in (profile.core_pairs or CORE_PAIRS):
+        if pair in profile.core_pairs:
             # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
             # a request would change nothing, and its "from five years back" would misstate where it starts.
             return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
@@ -1493,7 +1493,7 @@ def _check_listed(store: Store, venue: str | None, pair: str) -> None:
     if not PAIR_RE.fullmatch(pair):
         raise ValueError(f"instrument: write it as BASE/QUOTE, for example {_hints(profile.name)[0]}")
     listed = charts._listed.get(profile.name, (0, []))[1]
-    if pair in {*_hints(profile.name), *INSTRUMENT_HINTS, *listed} or profile.check_listed is None:
+    if pair in {*_hints(profile.name), *listed} or profile.check_listed is None:
         return
     if any(h["pair"] == pair for h in _stored_history(store, profile)):
         return

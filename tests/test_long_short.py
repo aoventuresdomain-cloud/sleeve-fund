@@ -652,7 +652,7 @@ def test_a_perps_stress_loss_stops_at_its_isolated_margin_and_the_liquidation_fe
     s, aggressive = store.sleeve("pp-3x"), profile("aggressive")
     x = {"sleeve": s, "profile": aggressive, "equity": 10_000.0, "qty": -0.1, "price": 60_000.0, "entry_px": 60_000.0,
          "cash": 16_000.0, "unrealised": 0.0, "position_value": -6_000.0, "dd_used": 0.0, "day_ret": 0.0,
-         "exposure": -0.6, "room": 1_000.0}
+         "exposure": -0.6, "room": 1_000.0, "pnl": 0.0, "fees": 0.0}
     mm = markets.terms(s.params, s.venue).maintenance_margin
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
     assert aggressive.max_leverage == 3.0
