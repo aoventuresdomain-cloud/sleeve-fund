@@ -104,8 +104,10 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     from sleeve_fund.fees import resolve as resolve_fees
     from sleeve_fund.history import HistoryStore
     from sleeve_fund.instruments import history_price_decimals
+    from sleeve_fund.research.holdout import HoldoutLocks
     from sleeve_fund.research.ledger import IdeaLedger
     from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.trials import TrialsRegister
     from sleeve_fund.research.tearsheet import render
     from sleeve_fund.venues import venue as venue_profile
 
@@ -137,7 +139,9 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
         train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
         exits=req.exits(),
-        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress)
+        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress,
+        register=TrialsRegister(store) if store is not None else None,
+        locks=HoldoutLocks(store) if store is not None else None)
     result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
     cov = history.coverage(profile.name, req.pair)
     if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last > STALE_HISTORY:

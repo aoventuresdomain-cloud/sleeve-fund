@@ -17,7 +17,8 @@ class IdeaLedger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def record(self, *, idea: str, family: str, params: dict, dataset: str, stage: str, sharpe: float) -> None:
+    def record(self, *, idea: str, family: str, params: dict, dataset: str, stage: str, sharpe: float) -> str:
+        """Append one evaluation; returns the line written, which the trials register hashes for its id."""
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "idea": idea,
@@ -27,8 +28,10 @@ class IdeaLedger:
             "stage": stage,
             "sharpe": round(float(sharpe), 4),
         }
+        line = json.dumps(entry, sort_keys=True)
         with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+            fh.write(line + "\n")
+        return line
 
     def entries(self) -> list[dict]:
         if not self.path.exists():

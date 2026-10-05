@@ -49,14 +49,16 @@ class TrialsRegister:
 
     def record(self, *, definition_hash: str, idea_hash: str, name: str, family: str, settings: dict, dataset: str,
                stage: str, source: str, sharpe: float | None, trades: int | None = None,
-               oos_trades: int | None = None, backtest_id: str | None = None) -> str:
-        """Add one evaluation. Returns its id."""
-        row_id = secrets.token_hex(8)
+               oos_trades: int | None = None, backtest_id: str | None = None, row_id: str | None = None,
+               data_start=None, data_end=None) -> str:
+        """Add one evaluation, over the bars from data_start to data_end. Returns its id. row_id, when given, is
+        kept, so a row recorded twice (a study that also writes the idea counter) counts once."""
+        row_id = row_id or secrets.token_hex(8)
         self.store.add_trials([{
             "id": row_id, "definition_hash": definition_hash, "idea_hash": idea_hash, "code_version": code_version(),
             "definition_name": name, "family": family, "settings": json.dumps(settings, sort_keys=True),
             "dataset": dataset, "stage": stage, "source": source, "sharpe": _finite(sharpe), "trades": trades,
-            "oos_trades": oos_trades, "backtest_id": backtest_id,
+            "oos_trades": oos_trades, "backtest_id": backtest_id, "data_start": data_start, "data_end": data_end,
         }])
         return row_id
 
@@ -94,9 +96,9 @@ class TrialsRegister:
                 continue
             e = json.loads(line)
             rows.append({
-                "id": hashlib.sha256(line.encode("utf-8")).hexdigest()[:16],
-                "definition_hash": content_hash({"idea": e["idea"], "params": e["params"]}),
-                "idea_hash": content_hash({"idea": e["idea"]}),
+                "id": line_id(line),
+                "definition_hash": legacy_definition_hash(e["idea"], e["params"]),
+                "idea_hash": legacy_idea_hash(e["idea"]),
                 "code_version": LEGACY_CODE,
                 "definition_name": e["idea"], "family": e["family"],
                 "settings": json.dumps(e["params"], sort_keys=True),
@@ -105,6 +107,20 @@ class TrialsRegister:
                 "created_at": datetime.fromisoformat(e["ts"]),
             })
         return self.store.add_trials(rows)
+
+
+def line_id(line: str) -> str:
+    """A trial id from an idea-counter line, so the same evaluation is one row however it arrives."""
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def legacy_idea_hash(idea: str) -> str:
+    """The idea hash of a hand-coded model, known by its name until it becomes a definition (P1-5)."""
+    return content_hash({"idea": idea})
+
+
+def legacy_definition_hash(idea: str, params: dict) -> str:
+    return content_hash({"idea": idea, "params": params})
 
 
 def _finite(x) -> float | None:

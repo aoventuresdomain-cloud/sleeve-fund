@@ -28,6 +28,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     create_engine,
     delete,
     event,
@@ -38,6 +39,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
@@ -412,9 +414,30 @@ trials_t = Table(
     # Not a foreign key: saved backtests are pruned to the latest 50, and a trial outlives its run.
     Column("backtest_id", String(16)),
     Column("created_at", TS, nullable=False),
+    # The bars the evaluation read. NULL is unknown (the old idea counter), which a holdout check counts as
+    # overlapping: the safe side.
+    Column("data_start", TS),
+    Column("data_end", TS),
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
+# venue, for ever. Append-only, and no strategy column, so a reset never touches it.
+holdout_locks_t = Table(
+    "holdout_locks",
+    metadata,
+    Column("id", String(16), primary_key=True),
+    Column("idea_hash", String(64), nullable=False),
+    Column("underlying", String(16), nullable=False),  # the base asset, upper-case: BTC covers every BTC pair
+    Column("period_start", TS),  # NULL when imported from the idea counter, which kept no dates
+    Column("period_end", TS),
+    Column("opened_at", TS, nullable=False),
+    # Not a foreign key, as trials.backtest_id: the opening is kept even when its trial row is not there.
+    Column("trial_id", String(16)),
+    Column("source", String(16), nullable=False),
+    UniqueConstraint("idea_hash", "underlying", name="holdout_locks_idea_underlying"),
+)
+HOLDOUT_SOURCES = ("study", "ledger_import")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
 TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
@@ -1431,7 +1454,8 @@ class Store:
                 raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
         with self.engine.begin() as c:
             have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
-            new = [dict(r, created_at=r.get("created_at") or utcnow()) for r in rows if r["id"] not in have]
+            new = [{**r, "created_at": r.get("created_at") or utcnow(), "data_start": r.get("data_start"),
+                    "data_end": r.get("data_end")} for r in rows if r["id"] not in have]
             new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
             if new:
                 c.execute(insert(trials_t), new)
@@ -1440,6 +1464,24 @@ class Store:
     def trials(self) -> list[dict]:
         with self.engine.connect() as c:
             return _rows(c.execute(select(trials_t).order_by(trials_t.c.created_at, trials_t.c.id)))
+
+    def add_holdout_lock(self, row: dict) -> bool:
+        """Record a holdout opening. False, and nothing written, when this idea already holds a lock on this
+        underlying: the first opening is the only one."""
+        if row["source"] not in HOLDOUT_SOURCES:
+            raise ValueError(f"a holdout lock's source is one of {HOLDOUT_SOURCES}, got {row['source']!r}")
+        row = {"period_start": None, "period_end": None, "trial_id": None, **row,
+               "underlying": row["underlying"].upper(), "opened_at": row.get("opened_at") or utcnow()}
+        try:
+            with self.engine.begin() as c:
+                c.execute(insert(holdout_locks_t), [row])
+        except IntegrityError:
+            return False
+        return True
+
+    def holdout_locks(self) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(holdout_locks_t).order_by(holdout_locks_t.c.opened_at)))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""
