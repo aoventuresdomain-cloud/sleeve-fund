@@ -392,7 +392,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec)),
+                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
                                                                st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
@@ -817,7 +817,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         pair = q.get("instrument", "").strip().upper()
-        g1_here = pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec)) if pair else None
+        g1_here = (pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec),
+                                   {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
+                                    "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")})
+                   if pair else None)
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
@@ -1322,10 +1325,10 @@ def _strategy_choices() -> list[dict]:
     return out
 
 
-def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
+def _g1_of(strategy: str, instrument: str, minutes: int, params: dict | None = None) -> str | None:
     from sleeve_fund.dashboard import pipeline
 
-    return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes)
+    return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes, params)
 
 
 # Exit settings the form takes as stored (the % ones are converted above): an ATR or swing-low stop,

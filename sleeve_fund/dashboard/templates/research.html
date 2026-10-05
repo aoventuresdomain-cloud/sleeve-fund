@@ -16,6 +16,7 @@
 
 <section class="panel" style="margin-bottom:14px" aria-labelledby="study-h" id="study">
   <div class="panel-head"><h2 id="study-h">Run a G1 study</h2><span class="hint">walk-forward on the stored history, under paper's rules</span></div>
+  <p class="muted" style="margin:0 0 10px;font-size:12.5px">Studies run spot, long only. A pass is not G1 for a strategy on a perpetual or one that shorts: those wait for perpetual studies.</p>
   {% if job %}
   <div class="bt-job" id="study-job" data-job="{{ job.id }}" aria-live="polite">
     <p style="margin:0 0 6px"><b>{{ job.title }}</b></p>

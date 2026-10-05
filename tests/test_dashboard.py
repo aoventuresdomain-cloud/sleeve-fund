@@ -1722,3 +1722,17 @@ def test_maker_first_orders_are_switched_off_by_default(client, prices, instrume
     assert r.status_code in (200, 303, 400) and "btc-test" not in [s.name for s in store.sleeves()]
     with pytest.raises(ValueError, match="switched off"):
         run_backtest("trend_filter", prices.iloc[:50], instrument, {"fast": 5, "slow": 20, "maker_wait_minutes": 10})
+
+
+def test_the_g2_checklist_says_a_long_short_strategy_has_no_g1_yet(client):
+    """Round 12, M12-U3: the G1 row explains why a perp or long/short strategy can't pass yet."""
+    from sleeve_fund.dashboard import gates
+    from sleeve_fund.dashboard.book import sleeve_extras
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+
+    c, store = client
+    store.create_sleeve(name="rsi-ls", strategy="rsi_bands", instrument="BTC/USD", bar_spec="1-HOUR-LAST-EXTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    x = sleeve_extras(store, sleeve_summary(store, store.sleeve("rsi-ls")), pd.DataFrame())
+    row = next(r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow()) if "G1" in r["label"])
+    assert not row["ok"] and "perpetual or long/short" in row["detail"]
