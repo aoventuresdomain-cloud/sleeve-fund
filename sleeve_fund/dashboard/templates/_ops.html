@@ -1,11 +1,5 @@
-{% extends "base.html" %}
+{# Operations: the System tab of Risk & health (formerly its own page, /ops). Needs ops and shell. #}
 {% from "_macros.html" import chip, usage %}
-{% block title %}Operations · Multi-Strategy Fund{% endblock %}
-{% block content %}
-<div class="page-head">
-  <h1>Operations</h1>
-</div>
-
 <section class="panel flush" style="margin-bottom:14px" aria-labelledby="proc-h">
   <div class="panel-head"><h2 id="proc-h">Strategy processes</h2></div>
   <table class="responsive" data-hide-md="2 6 7">
@@ -57,4 +51,3 @@
     <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>
   </table>
 </section>
-{% endblock %}

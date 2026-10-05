@@ -79,6 +79,7 @@
       }
       if (changed) document.dispatchEvent(new CustomEvent("live:swap"));
       last = Date.now();
+      document.dispatchEvent(new CustomEvent("live:pulled"));  // e.g. Risk & health's "Live · 4s ago"
       delay = EVERY;
     } catch {
       delay = Math.min(delay * 2, MAX_BACKOFF);
