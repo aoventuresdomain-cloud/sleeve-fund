@@ -1068,7 +1068,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/risk?killed=2"
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash" in fired and "data-once" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash" in fired and "data-once" in fired
     for name in ("btc-test", "eth-test"):
         (cmd,) = store.pending_commands(name)
         assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
@@ -1087,7 +1087,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     # Round 9, N1: a second fire logged "0 strategies" and its banner said "0 strategies are selling".
     assert second.headers["location"] == "/risk?killed=0" and len(store.decisions()) == logged
     said = c.get(second.headers["location"], auth=AUTH).text
-    assert "Nothing more to sell: btc-test, eth-test are already selling to cash. Nothing was logged." in said
+    assert "Nothing more to sell: btc-test, eth-test are already closing out to cash. Nothing was logged." in said
     # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
@@ -1368,7 +1368,7 @@ def test_the_kill_banner_counts_the_strategies_it_names(client):
     r = c.post("/book/flatten", data={"reason": "Market event"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.headers["location"] == "/risk?killed=1"  # only eth-test was new
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash at market (btc-test, eth-test)" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash at market (btc-test, eth-test)" in fired
 
 
 def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):

@@ -1725,12 +1725,18 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "strategy's equity", ts=self.runtime.now())
 
-    def _wiped_out_why(self) -> str:
+    def _wiped_out_why(self, shortfall: float = 0.0) -> str:
+        """shortfall: an open position's equity below zero, which the insurance fund will cover once it closes, so
+        the halt says how much before the close journals it (fix re-check, mF-1)."""
         covered = sum(a for _, a in self.insurance_log)
         if not covered and self.runtime is not None:  # since a restart: the journal has it
             covered = self.runtime.store.insurance_total(self.runtime.name)
         why = "wiped out: a gap took the price past the bankruptcy price, so equity is zero"
-        return why + (f" and the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
+        if covered > 0:
+            return why + f" and the venue's insurance fund covered the {covered:,.2f} shortfall"
+        if shortfall > 0:
+            return why + f"; the venue's insurance fund covers the shortfall, about {shortfall:,.2f} at this price"
+        return why
 
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
@@ -1912,7 +1918,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
-                wiped = self._wiped_out_why()
+                wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
                 equity = 0.0
                 cash = 0.0 if ruined else cash
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,

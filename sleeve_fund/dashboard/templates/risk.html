@@ -9,8 +9,8 @@
 {% if kill_error %}<p class="banner warn" data-once>Nothing was sold: the kill switch needs a reason for the decision log.</p>{% endif %}
 {# The count and the names are the same list: every strategy waiting to sell now (review round 9, N1). #}
 {% set selling = kill.flattening|length if kill.flattening else (killed|int) %}
-{% if killed == '0' %}<p class="banner" data-once role="status">Nothing more to sell: {% if kill.flattening %}{{ kill.flattening|join(', ') }} {{ 'is' if selling == 1 else 'are' }} already selling to cash{% else %}no strategy is trading or holding a position{% endif %}. Nothing was logged.</p>
-{% elif killed %}<p class="banner" data-once role="status">Kill switch fired: {{ 'the strategy is' if selling == 1 else selling ~ ' strategies are' }} selling to cash at market{% if kill.flattening %} ({{ kill.flattening|join(', ') }}){% endif %} and will stay paused until you resume {{ 'it' if selling == 1 else 'each one' }}. Each order shows on Orders as it fills.</p>
+{% if killed == '0' %}<p class="banner" data-once role="status">Nothing more to sell: {% if kill.flattening %}{{ kill.flattening|join(', ') }} {{ 'is' if selling == 1 else 'are' }} already closing out to cash{% else %}no strategy is trading or holding a position{% endif %}. Nothing was logged.</p>
+{% elif killed %}<p class="banner" data-once role="status">Kill switch fired: {{ 'the strategy is' if selling == 1 else selling ~ ' strategies are' }} closing out to cash at market{% if kill.flattening %} ({{ kill.flattening|join(', ') }}){% endif %} and will stay paused until you resume {{ 'it' if selling == 1 else 'each one' }}. Each order shows on Orders as it fills.</p>
 {% elif kill.flattening %}<p class="banner warn" role="status">Waiting to sell: {{ kill.flattening|join(', ') }}. {{ 'Its' if kill.flattening|length == 1 else 'Their' }} process{{ 'es' if kill.flattening|length != 1 }} will sell at market and pause.</p>{% endif %}
 
 <section class="ledger" aria-label="Book risk">
@@ -69,7 +69,7 @@
       {% if kill.stopped %}{{ kill.stopped|join(', ') }} {{ 'is' if kill.stopped|length == 1 else 'are' }} stopped, so {{ 'it starts' if kill.stopped|length == 1 else 'they start' }} just to sell.{% endif %}</p>
     <label for="r-kill">Reason for the decision log</label>
     <input id="r-kill" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger">Sell everything and pause</button></div>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger">{{ 'Close' if kill.shorts else 'Sell' }} everything and pause</button></div>
   </form>
 </dialog>
 {% endif %}

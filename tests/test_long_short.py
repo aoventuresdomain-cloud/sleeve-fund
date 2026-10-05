@@ -807,6 +807,7 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     assert covered > 0
     s = store.sleeve(name)
     assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
+    assert "insurance fund covers the shortfall, about" in s.status_reason  # halted while open: an estimate (mF-1)
     last = store.equity_series(name)[-1]
     assert (last["equity"], last["qty"]) == (0.0, 0.0)  # the book counts it at zero, not its last mark
     book = store.journal_book(name, 10_000)
@@ -979,6 +980,7 @@ def test_the_kill_switch_dialog_counts_shorts_by_their_size(client):  # noqa: F8
     # 18,000 short and 3,000 long: 21,000 to trade, not the 3,000 of longs alone (nor the -15,000 net).
     assert "worth about 21,000" in dialog, dialog
     assert "close to cash at market (longs sell, shorts buy back)" in dialog
+    assert "Close everything and pause" in dialog  # not "Sell everything" with a short to buy back
 
 
 @pytest.mark.sanity
@@ -1009,6 +1011,22 @@ def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(
     one = c.get("/api/sleeves/late/equity", auth=AUTH).json()
     assert one["drawdown"] == [pytest.approx(0.1)] and one["worst"] == pytest.approx(0.1)
     assert store.max_drawdown("late") == 0.0 and store.max_drawdown("late", 10_000) == pytest.approx(0.1)
+
+
+def test_a_wiped_out_strategy_says_it_cannot_trade_and_is_no_stress_breach(client):  # noqa: F811
+    """Round 12 fix re-check, mF-2 and mF-3: Resume on a wiped-out strategy promised it would trade again on its
+    next signal, and /risk listed it as a strategy that would halt at every market move."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    store.create_sleeve(name="gone", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+    store.record_equity("gone", equity=0.0, cash=0.0, qty=0.0, price=60_000.0, benchmark=10_000)
+    store.set_status("gone", "halted", "wiped out: a gap took the price past the bankruptcy price, so equity is zero")
+    page = c.get("/sleeves/gone", auth=AUTH).text
+    assert "cannot open a trade: resuming only halts it again" in page and "trades again on its next signal" not in page
+    stress = c.get("/risk", auth=AUTH).text.split("Strategies that would halt")[1].split("</table>")[0]
+    assert "gone" not in stress, stress
 
 
 def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F811

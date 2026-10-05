@@ -28,7 +28,8 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             loss = min(x["position_value"] * -shock, max(x["equity"], 0.0))
             after = x["equity"] - loss
             dd_after = 1 - after / max(peak, x["equity"]) if peak else 0.0
-            shocks.append({"loss": loss, "breach": dd_after >= p.max_drawdown})
+            # A strategy with nothing left (wiped out) can't breach again: it is already halted (m12 fix re-check, mF-3).
+            shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown})
         rows.append({
             "x": x,
             "dd_used": x["dd_used"],
