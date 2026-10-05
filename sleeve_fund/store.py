@@ -11,6 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -421,6 +422,7 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
     goes negative; if it does, the negative stays visible so reconciliation catches it."""
     cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
         price = float(f["price"])
@@ -428,9 +430,14 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
         sign = 1 if f["side"] == "BUY" else -1
         cash -= sign * float(f["qty"]) * price + float(f["fee"])
         new = qty + sign * q
-        if abs(new) < DUST:  # float residue from a fill's own arithmetic, far below any lot
+        big, legs = max(big, abs(float(f["qty"]))), legs + 1
+        # Float residue from the fills' own arithmetic: below DUST, or for fills too large for a float to hold
+        # every lot (1.6e8 units: one float step is 3e-8, wider than a 1e-8 lot) within a few float steps per
+        # fill since flat. Left in, an exit back to flat read as 3e-8 held (review round 13, E13-2).
+        if abs(new) < DUST or abs(new) <= (legs + 2) * Decimal(math.ulp(big)):
             new = Decimal(0)
         if new == 0:
+            legs = 0
             entry = None
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
