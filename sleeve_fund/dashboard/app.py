@@ -379,6 +379,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
+            for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
+                _check_slower_history(cfg.venue, cfg.instrument, minutes, candles)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -1464,6 +1466,19 @@ def _research_venue(name: str | None = None):
     from sleeve_fund.venues import venue
 
     return venue(name or None)
+
+
+def _check_slower_history(venue: str, pair: str, minutes: int, candles: int) -> None:
+    """A model reading slower candles warms them up from the history store at their own size (v2 P1-4): refused
+    when the store holds fewer than its look-back, rather than run on a filter that isn't settled."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.strategies.timeframes import span
+
+    cov = HistoryStore().coverage(venue, pair)
+    have = 0 if cov is None else int((cov.last - cov.first).total_seconds() // (minutes * 60))
+    if have < candles:
+        raise ValueError(f"history: the model's {span(minutes)} candles need {candles:,} closed ones of stored "
+                         f"history and the store holds {have:,} for {pair}; load more history first")
 
 
 def _venue_name(value) -> str:

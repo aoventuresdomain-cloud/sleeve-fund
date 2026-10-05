@@ -32,7 +32,8 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
-from sleeve_fund.strategies.indicators import Atr
+from sleeve_fund.strategies.indicators import Atr, warmup_for
+from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -425,6 +426,8 @@ class LongFlatStrategy(Strategy):
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
+        self._slower: list[SlowerCandles] = []  # slower candles the model reads (slower(), v2 P1-4)
+        self._short_history: str | None = None  # why the slower candles' warm-up couldn't be met: no decisions
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
@@ -552,6 +555,8 @@ class LongFlatStrategy(Strategy):
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
         self._plan_resume()
+        if self._slower and self.history_loader is not None:
+            self._warm_slower()  # before the decision bars, which then complete the slower candle forming now
         if self._cfg.warmup_bars:
             if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
                 self._warm_from_history()
@@ -651,6 +656,14 @@ class LongFlatStrategy(Strategy):
     def update_indicators(self, bar: Bar) -> None:
         """Override to feed indicators. Called once per bar, historical or live, in time order."""
 
+    def slower(self, minutes: int, *blocks) -> SlowerCandles:
+        """Slower candles of this instrument for the model to read, e.g. self.slower(240, Sma(50)) for a 4-hour
+        trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
+        decision on the bar that closed it. Warm-up loads them from the history store at their own size."""
+        s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks)
+        self._slower.append(s)
+        return s
+
     def _accept(self, bar: Bar) -> bool:
         # Indicators are fed by hand rather than registered, so warm-up bars and live
         # bars can't double-count. Anything at or before the last bar seen is ignored.
@@ -663,6 +676,8 @@ class LongFlatStrategy(Strategy):
         if self._lows is not None:
             self._lows.append(bar.low.as_double())
             self._highs.append(bar.high.as_double())
+        for s in self._slower:
+            s.handle_bar(bar)
         self.update_indicators(bar)
         return True
 
@@ -976,6 +991,33 @@ class LongFlatStrategy(Strategy):
                 upcoming = self.clock.timestamp_ns() // step * step + step
                 self.resume_leg(r["side"], max(int((upcoming - r["bar"]) // step) - 1, 0))
 
+    def _warm_slower(self) -> None:
+        """Each slower timeframe's warm-up (v2 P1-4): its blocks' look-back in candles of its own size from the
+        history store, up to the last closed one; the decision bars loaded after this carry on from there. When
+        the store can't cover it the model makes no decisions (_short_history), rather than run on a filter that
+        isn't settled, and says why."""
+        short = []
+        for s in self._slower:
+            need = warmup_for(s.blocks)
+            if not need:
+                continue
+            bar_type = BarType.from_str(f"{self._cfg.instrument_id}-{bar_spec(s.minutes)}")
+            try:
+                bars, why = self.history_loader(self.instrument, bar_type, need), "the history store has fewer"
+            except Exception as exc:  # noqa: BLE001 - said below, with what is missing
+                bars, why = [], str(exc)
+            s.seed(Candle(b.open.as_double(), b.high.as_double(), b.low.as_double(), b.close.as_double(),
+                          b.volume.as_double(), b.ts_event) for b in sorted(bars, key=lambda b: b.ts_event))
+            if len(bars) < need:
+                short.append(f"its {span(s.minutes)} candles need {need} closed ones of history and {len(bars)} "
+                             f"loaded ({why})")
+        if short:
+            self._short_history = "; ".join(short)
+            msg = f"Not trading: {self._short_history}. It trades after a restart once the history store covers them."
+            self.log.error(msg)
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "error", "warmup_short", msg)
+
     def _warm_from_history(self) -> None:
         """Feed the indicators the latest stored bars, so a model on bars built from live trades
         is ready on its first live bar instead of waiting out its longest look-back."""
@@ -1014,6 +1056,12 @@ class LongFlatStrategy(Strategy):
         is twice the longest whole-number setting; strategies that know better override it."""
         longest = max((v for v in params.values() if isinstance(v, int) and not isinstance(v, bool)), default=0)
         return 2 * longest
+
+    @classmethod
+    def slower_needs(cls, params: dict) -> dict[int, int]:
+        """The slower candles the model reads with these settings (slower()), as {minutes: closed candles its
+        warm-up needs}, so a strategy the history store can't warm up is refused when it is created (P1-4)."""
+        return {}
 
     def target_weight(self, bar: Bar) -> float | None:
         """Share of the sleeve to hold from this bar's close, 0 to 1; None = not enough data yet.
@@ -1239,6 +1287,8 @@ class LongFlatStrategy(Strategy):
         if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
         if self._check_exits(self._last_close):
+            return
+        if self._short_history is not None:  # its slower candles' warm-up isn't met: stops work, the model doesn't
             return
         if self._margin:
             if self._restore is None:
