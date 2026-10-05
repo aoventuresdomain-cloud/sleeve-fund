@@ -123,7 +123,7 @@ def test_ema_matches_the_engines_ema_that_rsi_pullback_trades(n):
         ours.update_raw(c)
         theirs.update_raw(c)
         assert ours.initialized == theirs.initialized
-        assert ours.value == pytest.approx(theirs.value, rel=1e-12)
+        assert ours._value == pytest.approx(theirs.value, rel=1e-12)  # before it is initialized too
 
 
 @pytest.mark.parametrize("n", [1, 5, 30])
@@ -159,7 +159,7 @@ def test_day_vwap_counts_the_bar_closing_at_midnight_in_the_old_day():
     midnight = 20_000 * NS_PER_DAY
     v.update_raw(10, 10, 10, 1, midnight - NS_PER_MIN)
     v.update_raw(20, 20, 20, 1, midnight)  # the 23:59 to 00:00 bar
-    assert v.value == 15 and not v.initialized
+    assert v._value == 15 and v.value is None and not v.initialized
     v.update_raw(40, 40, 40, 1, midnight + NS_PER_MIN)  # first bar of the new day
     assert v.value == 40 and v.initialized
 
@@ -303,12 +303,73 @@ def test_make_block_by_name():
 
 @pytest.mark.parametrize("kind,settings", [
     ("ema", {"period": 0}), ("wma", {"period": 2.5}), ("bollinger", {"period": 1}), ("bollinger", {"k": 0}),
-    ("vwap", {"anchor": "week"}), ("vwap", {"anchor": "rolling"}), ("vwap", {"anchor": "day", "period": 5}),
+    ("vwap", {"anchor": "week"}), ("ema", {"lookback": 5}), ("bollinger", {"k": 50}), ("sma", {"period": 10**6}), ("vwap", {"anchor": "rolling"}), ("vwap", {"anchor": "day", "period": 5}),
     ("relative_volume", {"period": True}), ("efficiency_ratio", {"period": -1}),
 ])
 def test_bad_settings_are_refused(kind, settings):
     with pytest.raises(ValueError):
         make_block(kind, **settings)
+
+
+@pytest.mark.parametrize("i", range(10))
+def test_update_ohlcv_and_handle_bar_match_update_raw(i):
+    """Any block can be fed whole bars, ignoring what it doesn't use, and reads as update_raw fed it."""
+    block, feed = _all_blocks()[i]
+    raw, whole_bar, from_bar = block, copy.deepcopy(block), copy.deepcopy(block)
+
+    class _P:
+        def __init__(self, x):
+            self.x = x
+
+        def as_double(self):
+            return self.x
+
+    class _Bar:
+        def __init__(self, r):
+            self.open, self.high, self.low = _P(r.close), _P(r.high), _P(r.low)
+            self.close, self.volume, self.ts_event = _P(r.close), _P(r.volume), int(r.ts)
+
+    for row in DATA["synthetic"].iloc[:2000].itertuples(index=False):
+        feed(raw, row)
+        whole_bar.update_ohlcv(row.close, row.high, row.low, row.close, row.volume, ts_ns=int(row.ts))
+        if type(block) not in (Sma, Atr, Rsi):  # their handle_bar predates update_ohlcv and reads a real Bar
+            from_bar.handle_bar(_Bar(row))
+        assert whole_bar.values == raw.values
+    if type(block) not in (Sma, Atr, Rsi):
+        assert from_bar.values == raw.values
+
+
+@pytest.mark.parametrize("i", range(10))
+def test_values_are_none_until_initialized_and_never_nan(i):
+    block, feed = _all_blocks()[i]
+    assert set(block.values) == set(type(block).OUTPUTS) and all(v is None for v in block.values.values())
+    for row in DATA["synthetic"].itertuples(index=False):
+        feed(block, row)
+        vals = block.values
+        if block.initialized:
+            assert all(v is not None and np.isfinite(v) for v in vals.values())
+        else:
+            assert all(v is None for v in vals.values())
+            if type(block) not in (Sma, Atr, Rsi):  # their `value` is the one the hand-coded models trade
+                assert block.value is None
+
+
+@pytest.mark.parametrize("i", range(10))
+def test_warmup_from_the_class_matches_the_block(i):
+    block, _ = _all_blocks()[i]
+    assert type(block).warmup_bars(**block.settings) == block.warmup_bars
+    assert warmup_for([(k, s) for k, s in [(name, block.settings) for name, cls in BLOCKS.items()
+                                            if cls is type(block)]]) == block.warmup_bars
+
+
+def test_every_block_lists_settings_with_defaults_inside_their_limits():
+    for kind, cls in BLOCKS.items():
+        assert cls.SETTINGS, kind
+        for s in cls.SETTINGS:
+            if s.default is not None:
+                assert s.check(s.default) == s.default
+        assert make_block(kind, **({"anchor": "rolling", "period": 5} if kind == "vwap" else {})).initialized is False
+        assert cls.confirm_lag == 0
 
 
 def test_day_vwap_needs_close_times():
