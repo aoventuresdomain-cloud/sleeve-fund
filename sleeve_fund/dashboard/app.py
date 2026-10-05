@@ -29,7 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import gates, reports, riskops, trading
+from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -118,6 +118,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
+    templates.env.globals["action_reasons"] = reasons.ACTION_REASONS  # templates/_reasons.html
+    templates.env.globals["reason_note_min"] = reasons.NOTE_MIN
     templates.env.filters["action_words"] = action_words
     templates.env.filters["kind_words"] = kind_words
     templates.env.filters["rmult"] = lambda r: "–" if r is None else f"{r:+.2f}R"
@@ -196,7 +198,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves),
                     positions=trading.book_positions(st(), summaries), working=working,
                     book_fills=trading.book_fills(st(), sleeves), funding=trading.book_funding(st(), summaries),
-                    fill_count=sum(x["fills"] for x in summaries), reasons=COMMON_REASONS)
+                    fill_count=sum(x["fills"] for x in summaries))
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -267,11 +269,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                 "shorts": sum(1 for x in holding if x["qty"] < 0)}
 
     @app.post("/book/flatten")
-    def book_flatten(reason: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def book_flatten(reason: str = Form(""), reason_pick: str | None = Form(None), reason_note: str = Form(""),
+                     actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """The book's kill switch: every strategy still trading or holding a position sells to cash at
         market and pauses, each with the PM's reason in its decision log. A stopped strategy holding a
         position is started so its process can sell; it pauses once flat, as the others do."""
-        why = reason.strip()
+        try:
+            why = _reason("book_flatten", reason, reason_pick, reason_note)
+        except ValueError:
+            why = ""
         if not why:
             return RedirectResponse("/risk?kill_error=reason", status_code=303)
         _, _, summaries = book_data()
@@ -412,6 +418,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
+        path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
+                                                                     s.params), st().accounts(), utcnow())
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -423,12 +431,16 @@ def create_app(store: Store | None = None) -> FastAPI:
                     costs=exit_costs(), reload=st().pending_reload(name),
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
-                    pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
+                    pending=st().pending_commands(name), risk=_risk_view(x, position),
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    signals=None if bt_id else _signals_view(s, st().signal_state(name)),
+                    timeline=_timeline(events, st().decisions(name, limit=50)),
+                    pos_history=_position_history(events, funding, position),
+                    then_stop=q.get("then_stop", ""), done=q.get("done", ""),
+                    flatten_waits=any(c["command"] == "flatten" for c in st().pending_commands(name)),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
-                                                               st().accounts(), utcnow()))
+                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
@@ -524,9 +536,25 @@ def create_app(store: Store | None = None) -> FastAPI:
         })
 
     @app.post("/sleeves/{name}/command")
-    def sleeve_command(name: str, command: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_command(name: str, command: str = Form(...), reason: str = Form(""),
+                       reason_pick: str | None = Form(None), reason_note: str = Form(""), reason_for: str = Form(""),
+                       then: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """A PM command, with its reason: picked from the action's own list (reasons.py) or typed. Flatten with
+        then=stop is the Stop dialog's "Flatten and stop": the flatten goes now, and the page asks to stop once
+        the strategy is flat, as a stop sent now would drop the waiting flatten."""
+        then_stop = ""
+        if command == "flatten-stop":  # the Stop dialog's other button, with the Stop dialog's reasons
+            command, then, reason_for = "flatten", "stop", "stop"
         try:
+            action = reason_for if reason_for in ("stop", "close") and command == "flatten" else command
+            reason = _reason(action, reason, reason_pick, reason_note)
+            if not reason:
+                raise ValueError("every command needs a reason")
+            if command == "stop" and _flatten_waits(name):
+                raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
+                                 "drop it; stop it once it is flat")
+            if command == "flatten" and then == "stop":
+                then_stop = reason
             if command in ("start", "stop"):
                 if not reason.strip():
                     raise ValueError("a reason is required")
@@ -563,7 +591,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/sleeves/{name}", status_code=303)
+        done = {"pause": "Pause sent", "resume": "Resume sent", "stop": "Stopped", "start": "Started",
+                "flatten": "Close sent: it sells at market, then pauses" if reason_for == "close" else
+                "Flatten sent: it closes at market, then pauses"}.get(command, "Sent")
+        # Flatten and stop keeps then_stop in the address (the page asks to stop once flat), so no one-off toast.
+        q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
+        return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
+
+    def _flatten_waits(name: str) -> bool:
+        """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
+        drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
+        if not any(c["command"] == "flatten" for c in st().pending_commands(name)):
+            return False
+        hb = st().sleeve(name).heartbeat_at
+        return bool(hb and utcnow() - hb < STALE)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -582,7 +623,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         try:
-            reason = str(form.get("reason", "")).strip()
+            reason = reasons.from_form("save", form)
             if not reason:
                 raise ValueError("a reason is required")
             if is_backtest(name):
@@ -621,14 +662,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/sleeves/{name}?saved=settings#settings", status_code=303)
 
     @app.post("/sleeves/{name}/account")
-    def sleeve_account(name: str, account: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_account(name: str, account: str = Form(...), reason: str = Form(""), reason_pick: str | None = Form(None),
+                       reason_note: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         try:
             s = st().sleeve(name)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         try:
-            if not reason.strip():
+            reason = _reason("move", reason, reason_pick, reason_note)
+            if not reason:
                 raise ValueError("a reason is required")
             # Paper processes don't use the account yet (fees come from the venue's schedule), so a running,
             # flat strategy moves without a restart.
@@ -640,10 +682,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/sleeves/{name}?saved=account#settings", status_code=303)
 
     @app.post("/sleeves/{name}/archive")
-    def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(""), reason_pick: str | None = Form(None),
+                       reason_note: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         try:
-            if not reason.strip():
+            reason = _reason(action if action in ("archive", "restore") else "archive", reason, reason_pick, reason_note)
+            if not reason:
                 raise ValueError("a reason is required")
             if is_backtest(name):
                 raise ValueError("a saved backtest can't be archived")
@@ -1399,6 +1442,14 @@ def run_study_job(progress, job_id: str, store: Store | str, req, ledger: str, t
     return path.stem
 
 
+def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
+    """The PM's reason for an action: composed from the dialog's pick and note (reasons.compose, which says in
+    words what is missing), or the plain reason field older forms send."""
+    return reasons.compose(action, pick, note) if pick is not None else (reason or "").strip()
+
+
+# Only the kill switch on Risk & health still offers these; it moves to reasons.ACTION_REASONS["book_flatten"]
+# (templates/_reasons.html) when that page is rebuilt, and this list can go then.
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
     "Market event; standing aside",
@@ -1841,6 +1892,174 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
         raise ValueError(f"a {new:.1%} stop is looser than the {working:.1%} the open position works to now: it "
                          f"risks {loss:,.2f} from here{in_r}. Tick \"Accept a looser stop on the open position\" "
                          "to save it")
+
+
+# The strategy page's Activity chips (combined build F2): every event and decision, each under one kind.
+_RISK_KINDS = {"risk_halt", "risk_pause", "reconcile_mismatch", "liquidation", "liquidation_cut", "stop_loss",
+               "take_profit", "flatten_retry", "flatten_failed", "drawdown_reset"}
+_TRADE_KINDS = {"fill", "order_rejected", "order_denied"}
+
+
+def _timeline(events: list[dict], decisions: list[dict]) -> list[dict]:
+    """Events and PM decisions in one list, newest first, each with a kind for the filter chips: decisions
+    (yours, and the strategy acting on them), risk (halts, pauses, stops, warnings and errors), trades (fills
+    and refused orders) and system (starts, warm-up, the feed and the rest). Routine reconcile passes stay out,
+    as before."""
+    rows = []
+    for e in events:
+        k = e["kind"]
+        if k == "reconcile":
+            continue
+        kind = ("decisions" if k.startswith("pm_") else "trades" if k in _TRADE_KINDS
+                else "risk" if k in _RISK_KINDS or e["level"] in ("warning", "error") else "system")
+        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": kind_words(k), "text": e["message"]})
+    for d in decisions:
+        rows.append({"ts": d["ts"], "kind": "decisions", "level": "info", "title": action_words(d["action"]),
+                     "text": f"by {d['actor']}: {d['reason']}"})
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:150]
+
+
+_HISTORY_KINDS = {"fill": "Fill", "exits_applied": "Stop and target changed", "stop_reset": "Stop set again",
+                  "stop_loss": "Stop-loss", "take_profit": "Take-profit", "liquidation_cut": "Cut back"}
+
+
+def _position_history(events: list[dict], funding: list[dict], position: dict | None) -> list[dict]:
+    """The open position's story, newest first: its fills (the entry and any adds), stop moves and funding."""
+    if not position or not position.get("opened"):
+        return []
+    since = position["opened"]
+    rows = [{"ts": e["ts"], "what": _HISTORY_KINDS[e["kind"]], "text": e["message"]}
+            for e in events if e["kind"] in _HISTORY_KINDS and e["ts"] >= since]
+    rows += [{"ts": f["ts"], "what": "Funding", "text": f"{f['amount']:+,.2f} at {f['rate'] * 100:.4f}%"}
+             for f in funding if f["ts"] >= since]
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:60]
+
+
+def _journey(s, x: dict, path: list[dict] | None, mirror: list[dict]) -> list[dict]:
+    """The strategy's road to live as five steps, from what the checklist and the mirror already show: Research
+    (passed G1), Paper (six weeks, ten trades, clean), Demo check (fills copied to a demo account), G2 approval
+    (yours) and Live. The first step not done is where it is now. Read-only: nothing here approves anything."""
+    if not path:
+        return []
+    ok = {r["label"]: r for r in path}
+    rows = list(ok.values())
+    g1, weeks, trades = rows[0], rows[1], rows[2]
+    clean = all(r["ok"] for r in rows[3:5])
+    filled = [m for m in mirror if m["status"] == "filled"]
+    errors = [m for m in mirror[:20] if m["status"] == "error"]
+    mirrored = bool(s.params.get("demo_mirror"))
+    steps = [
+        {"label": "Research", "done": bool(g1["ok"]), "detail": "passed G1" if g1["ok"] else "not passed G1"},
+        {"label": "Paper", "done": bool(weeks["ok"] and trades["ok"] and clean),
+         "detail": f"{weeks['detail']} · {trades['detail']}"},
+        {"label": "Demo check", "done": bool(filled) and not errors,
+         "detail": (f"{len(filled)} fill{'s' if len(filled) != 1 else ''} copied" + (", with errors" if errors else ""))
+         if filled else "mirror on, no fills yet" if mirrored else "not mirrored to a demo account"},
+        {"label": "G2 approval", "done": False, "detail": "your decision"},
+        {"label": "Live", "done": x.get("mode") == "live", "detail": "live" if x.get("mode") == "live" else "keys and the switch"},
+    ]
+    here = next((i for i, st_ in enumerate(steps) if not st_["done"]), None)
+    for i, st_ in enumerate(steps):
+        st_["state"] = "done" if st_["done"] else "here" if i == here else "todo"
+    return steps
+
+
+SIGNALS_FRESH_SECONDS = 60  # older than this, the Signals tab waits for the model rather than show old lights
+_OP_WORDS = {"<=": "≤", ">=": "≥", "<": "<", ">": ">"}
+
+
+def _signal_row(c: dict, guard: bool = False) -> dict:
+    """One condition as the Signals tab draws it: value, threshold, distance and the gauge's positions (%).
+    guard: a stop or target, which reads as how far away it is, or hit."""
+    unit, v, t = c.get("unit", "pts"), c.get("value"), c.get("threshold") or 0.0
+    fmt = (lambda n: f"{n:+.2f}%") if unit == "%" else (lambda n: f"{n:.1f}")
+    row = {"name": c["name"], "note": c.get("note", ""), "met": bool(c.get("met")),
+           "threshold": f"{_OP_WORDS.get(c.get('op'), c.get('op'))} {fmt(t)}", "value": "–", "distance": "", "gauge": None}
+    if v is None:
+        row["distance"] = "met" if row["met"] else "not yet"
+        return row
+    row["value"] = fmt(v)
+    gap = abs(v - t)
+    gap_words = f"{gap:.2f}%" if unit == "%" else f"{gap:.1f} pts"
+    if guard:
+        row["distance"] = "hit · exits at once" if row["met"] else f"{gap_words} away"
+    else:
+        row["distance"] = f"met · {gap_words} inside" if row["met"] else f"{gap_words} to go"
+    lo, hi = c.get("gauge_min"), c.get("gauge_max")
+    if lo is not None and hi is not None and hi > lo:
+        at = lambda n: round(min(max((n - lo) / (hi - lo), 0.0), 1.0) * 100, 2)  # noqa: E731
+        tick = at(t)
+        below = c.get("op") in ("<=", "<")
+        row["gauge"] = {"tick": tick, "dot": at(v), "zone_left": 0.0 if below else tick,
+                        "zone_width": tick if below else round(100 - tick, 2)}
+    return row
+
+
+def _signal_card(side: int, rows: list[dict] | None, guards: list[dict], held: int, flat_why: str) -> dict:
+    """One side's card: its rules (entry, or exit while the model is on that side), the count, and the
+    stop and target while a position on that side is open."""
+    card = {"label": "Long" if side > 0 else "Short", "key": "long" if side > 0 else "short", "flat": flat_why,
+            "rows": [], "exit": False, "met": 0, "total": 0, "all": False, "guards": []}
+    if flat_why:
+        return card
+    card["rows"] = [_signal_row(r) for r in rows or []]
+    card["exit"] = bool(rows) and all(r.get("exit") for r in rows)
+    card["met"] = sum(r["met"] for r in card["rows"])
+    card["total"] = len(card["rows"])
+    card["all"] = card["total"] > 0 and card["met"] == card["total"]
+    if held == side:
+        card["guards"] = [_signal_row(g, guard=True) for g in guards]
+    return card
+
+
+def _signals_view(s, row: dict | None) -> dict:
+    """The strategy page's Signals tab, from the latest conditions its paper process wrote
+    (LongFlatStrategy.signal_state): the long and short cards, the lights for the tab label, and when the
+    model next acts. Display only."""
+    cls = REGISTRY.get(s.strategy, (None,))[0]
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
+    if not view["supported"]:
+        return view
+    if s.desired_state != "running":
+        view["state"] = "stopped"
+        return view
+    if row is None:
+        return view
+    now = utcnow()
+    secs = max(0, int((now - row["ts"]).total_seconds()))
+    view["age"] = f"{secs} s ago" if secs < 60 else f"{secs // 60} min ago" if secs < 3600 else _ago(row["ts"])
+    if secs > SIGNALS_FRESH_SECONDS:
+        view["state"] = "stale"
+        return view
+    p = row["payload"]
+    held = int(p.get("held") or 0)
+    if not markets.is_perp(s.params):
+        short_flat = "held flat on spot"
+    elif not s.params.get("allow_short"):
+        short_flat = "held flat: shorts are off in its settings"
+    else:
+        short_flat = ""
+    view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
+                     _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
+    view["warming"] = not view["cards"][0]["rows"]
+    view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
+    view["state"] = "live"
+    # The model acts at its bar's close: the next one after the last bar it decided on.
+    minutes = int(p.get("bar_minutes") or 1)
+    step = minutes * 60
+    last = (p.get("bar_ts") or 0) / 1e9
+    t = now.timestamp()
+    nxt = last + step * max(1, math.ceil((t - last) / step)) if last else (t // step + 1) * step
+    left = max(0, int(nxt - t))
+    view["close_at"] = int(nxt * 1000)
+    view["close_in"] = f"{left // 3600}:{left // 60 % 60:02d}:{left % 60:02d}" if left >= 3600 else f"{left // 60:02d}:{left % 60:02d}"
+    view["every"] = ("daily" if minutes == 1440 else f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-minute")
+    return view
 
 
 def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:

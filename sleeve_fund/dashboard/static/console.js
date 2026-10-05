@@ -1067,5 +1067,114 @@ window.Console = (() => {
     show();
   }
 
-  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  // --- Action reasons and the strategy page's switches (combined build F2, F4) ---------------------------------
+  // Reason pickers (templates/_reasons.html): a dialog's buttons marked data-needs-reason wait for a pick, and
+  // Other for a note of data-min characters. data-blocked keeps a button off whatever the pick.
+  function reasons() {
+    const check = (fs) => {
+      const form = fs.closest("form");
+      if (!form) return;
+      const min = Number(fs.dataset.min || 10);
+      const pick = fs.querySelector("input[name=reason_pick]:checked")?.value || "";
+      const note = (fs.querySelector("textarea[name=reason_note]")?.value || "").trim().replace(/\s+/g, " ");
+      const ok = Boolean(pick) && (pick !== "Other" || note.length >= min);
+      form.querySelectorAll("[data-needs-reason]").forEach((b) => { b.disabled = !ok || b.hasAttribute("data-blocked"); });
+      fs.querySelectorAll("label.opt").forEach((l) => l.classList.toggle("sel", Boolean(l.querySelector("input")?.checked)));
+      const hint = fs.querySelector("[data-note-hint]");
+      if (hint) hint.textContent = pick === "Other" ? `(needed, at least ${min} characters)` : "(optional)";
+      const line = fs.querySelector("[data-logline]");
+      if (line) line.textContent = "Logged as: " + (pick ? pick + (note ? ": " + note : "") : "no reason yet");
+    };
+    const all = () => document.querySelectorAll("[data-reasons]").forEach(check);
+    once("reasonsBound", () => {
+      const on = (e) => { const fs = e.target.closest && e.target.closest("[data-reasons]"); if (fs) check(fs); };
+      document.addEventListener("change", on);
+      document.addEventListener("input", on);
+      document.addEventListener("live:swap", all);
+    });
+    all();
+  }
+
+  // Filter chips over a list (data-chips names the list's id): rows carry data-kind, one or more kinds. The
+  // choice is kept through live updates.
+  function chips() {
+    const chosen = {};
+    const apply = (group, k) => {
+      const list = document.getElementById(group.dataset.chips);
+      group.querySelectorAll("[data-chip]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.chip === k)));
+      list?.querySelectorAll("[data-kind]").forEach((r) => { r.hidden = k !== "all" && !r.dataset.kind.split(" ").includes(k); });
+      const none = list?.querySelector("[data-none]");
+      if (none) none.hidden = k === "all" || [...list.querySelectorAll("[data-kind]")].some((r) => !r.hidden);
+    };
+    once("chipsBound", () => {
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-chip]");
+        if (!b) return;
+        const group = b.closest("[data-chips]");
+        chosen[group.dataset.chips] = b.dataset.chip;
+        apply(group, b.dataset.chip);
+      });
+      document.addEventListener("live:swap", () => document.querySelectorAll("[data-chips]").forEach((g) => {
+        if (chosen[g.dataset.chips]) apply(g, chosen[g.dataset.chips]);
+      }));
+    });
+  }
+
+  // A two-way switch (Price / Equity on the overview chart): the box's data-mode picks what shows.
+  function modes() {
+    once("modesBound", () => document.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-mode-to]");
+      if (!b) return;
+      const box = b.closest("[data-mode]");
+      box.dataset.mode = b.dataset.modeTo;
+      box.querySelectorAll("[data-mode-to]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      window.dispatchEvent(new Event("resize"));  // a chart drawn while hidden sizes itself now
+    }));
+  }
+
+  // Settings: Save first lists every change, before and after, in its confirm dialog, with a warning when the
+  // risk profile changes (its option carries the new limits in data-limits).
+  function settingsDiff(formId) {
+    const form = document.getElementById(formId);
+    const dlg = form && form.querySelector("dialog[data-diff]");
+    const open = form && form.querySelector("[data-diff-open]");
+    if (!dlg || !open) return;
+    const words = (t) => (t || "").replace(/\s+/g, " ").trim();
+    const label = (f) => words(form.querySelector(`label[for="${CSS.escape(f.id)}"]`)?.textContent || f.name);
+    open.addEventListener("click", () => {
+      const rows = [];
+      let profile = null;
+      form.querySelectorAll("input[name], select[name], textarea[name]").forEach((f) => {
+        if (f.closest("dialog") || f.type === "hidden" || f.name.startsWith("reason")) return;
+        if (f.type === "checkbox") {
+          if (f.checked !== f.defaultChecked) rows.push([words(f.closest("label")?.textContent || f.name), f.defaultChecked ? "yes" : "no", f.checked ? "yes" : "no"]);
+        } else if (f.tagName === "SELECT") {
+          const was = [...f.options].find((o) => o.defaultSelected) || f.options[0];
+          if (was && f.value !== was.value) {
+            rows.push([label(f), words(was.textContent).split(":")[0], words(f.selectedOptions[0].textContent).split(":")[0]]);
+            if (f.name === "risk_profile") profile = f.selectedOptions[0];
+          }
+        } else if (f.value !== f.defaultValue) {
+          rows.push([label(f), f.defaultValue || "none", f.value || "none"]);
+        }
+      });
+      const box = dlg.querySelector("[data-diff-rows]");
+      box.replaceChildren(...(rows.length ? rows.map(([k, a, b]) => {
+        const d = document.createElement("div");
+        d.append(Object.assign(document.createElement("span"), {textContent: k}),
+                 Object.assign(document.createElement("span"), {textContent: `${a} → ${b}`}));
+        return d;
+      }) : [Object.assign(document.createElement("div"), {textContent: "Nothing has changed yet.", className: "muted"})]));
+      const warn = dlg.querySelector("[data-diff-warn]");
+      if (warn) {
+        warn.hidden = !profile;
+        if (profile) warn.querySelector("span").textContent = profile.dataset.limits || "";
+      }
+      dlg.querySelectorAll("[data-needs-change]").forEach((b) => { b.toggleAttribute("data-blocked", !rows.length); });
+      document.querySelectorAll("[data-reasons]").forEach((fs) => fs.dispatchEvent(new Event("change", {bubbles: true})));
+      dlg.showModal();
+    });
+  }
+
+  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, chips, modes, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

@@ -2054,7 +2054,8 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
-    assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it
+    # The header's line: model · instrument · venue · candle · profile (combined build F2).
+    assert "BTC/USDT · Binance USD-M perpetuals ·" in shown and "venue=binance" in shown  # clone keeps it
 
 
 def test_risk_and_health_reads_a_feed_as_fresh_from_its_venues_latest_trade():
