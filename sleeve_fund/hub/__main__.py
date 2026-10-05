@@ -48,7 +48,8 @@ def build(profile, port: int, sink=None):
         raise SystemExit(f"{profile.label} has no live market data client")
     pairs = instruments(profile)
     relay = HubRelay(HubRelayConfig(instrument_ids=tuple(sorted(pairs))))
-    fanout = Fanout(profile.name, known=relay.known, want=relay.want, venue_up=relay.venue_up)
+    fanout = Fanout(profile.name, known=relay.known, want=relay.want, venue_up=relay.venue_up,
+                    instruments=relay.instruments)
     if sink is None:
         from sleeve_fund.history import HistoryStore
 

@@ -59,7 +59,8 @@ def _until(f, kind):
 @pytest.fixture
 def fanout():
     wanted = []
-    fo = Fanout("BINANCE", known=lambda: {BTC}, want=wanted.extend, heartbeat=0.2, log=lambda *_: None)
+    fo = Fanout("BINANCE", known=lambda: {BTC}, want=wanted.extend, heartbeat=0.2, log=lambda *_: None,
+                instruments=lambda ids: [{"type": "CryptoPerpetual", "id": i} for i in sorted(ids & {BTC})])
     fo.wanted = wanted
     fo.start(host="127.0.0.1")
     yield fo
@@ -69,7 +70,9 @@ def fanout():
 def test_each_client_gets_only_its_instruments_and_every_heartbeat(fanout):
     a, fa = _connect(fanout.port, [BTC])
     b, fb = _connect(fanout.port, [ETH])
-    assert _until(fa, "hello")["pending"] == [] and _until(fb, "hello")["pending"] == [ETH]
+    ha, hb = _until(fa, "hello"), _until(fb, "hello")
+    assert ha["pending"] == [] and hb["pending"] == [ETH]
+    assert [i["id"] for i in ha["instruments"]] == [BTC] and hb["instruments"] == []  # what each can be sent
     assert fanout.wanted == [ETH]  # not relayed yet: the relay is asked to add it
     deadline = time.time() + 5
     while len(fanout.clients) < 2 and time.time() < deadline:
@@ -210,3 +213,13 @@ def test_an_instrument_added_while_the_hub_runs_is_picked_up_on_the_next_pass():
     r.relayed = {BTC}
     r._refresh()
     assert relayed == [ETH] and r.pairs[ETH] == "ETH/USDT"
+
+
+def test_a_bar_with_no_volume_is_checked_against_the_venues_candle():
+    r, stored = _relay()
+    r.on_bar(_bar(BTC, T0))
+    flat = Bar(BarType.from_str(f"{BTC}-1-MINUTE-LAST-INTERNAL"), *(Price.from_str("60000.10"),) * 4,
+               Quantity.from_str("0.000"), T0 + MINUTE_NS, T0 + MINUTE_NS)
+    r.on_bar(flat)  # no trades reached the hub that minute: a dropped feed or a quiet market
+    assert stored[-1]["ts"] == T0 + MINUTE_NS and stored[-1]["refilled"] is True
+    assert not any(m["t"] == "bar" and m["ts"] == T0 + MINUTE_NS and not m["refilled"] for m in r.fanout.sent)

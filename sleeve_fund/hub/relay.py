@@ -94,6 +94,7 @@ class HubRelay(DataActor):
         self.pairs: dict[str, str] = {}  # instrument id -> pair, for the REST refill and the store
         self.recent = self.discover = None
         self.relayed: set[str] = set()
+        self.definitions: dict[str, dict] = {}  # instrument id -> the instrument, as Instrument.to_dict()
         self.gaps = Gaps()
         self._wanted: set[str] = set()
         self._lock = threading.Lock()
@@ -120,6 +121,10 @@ class HubRelay(DataActor):
     def known(self) -> set[str]:
         with self._lock:
             return set(self.relayed)
+
+    def instruments(self, ids: set[str]) -> list[dict]:
+        with self._lock:
+            return [self.definitions[i] for i in sorted(ids) if i in self.definitions]
 
     def want(self, ids: set[str]) -> None:
         with self._lock:
@@ -159,8 +164,11 @@ class HubRelay(DataActor):
         self.subscribe_quotes(inst)
         self.subscribe_bars(bar_type_for(iid))
         self._since[iid] = time.time_ns()
+        inst = self.cache.instrument(inst)
         with self._lock:
             self.relayed.add(iid)
+            if inst is not None:  # sent to each client on connecting, so paper needs no venue connection of its own
+                self.definitions[iid] = inst.to_dict()
 
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
@@ -174,14 +182,15 @@ class HubRelay(DataActor):
         msg = protocol.bar_from_nautilus(bar, time.time_ns())
         iid, close = msg["id"], msg["ts"]
         missing = self.gaps.see(iid, close)
-        # The first bar after subscribing opened before the hub saw any of its trades: a part bar, so the
-        # venue's own candle stands in for it.
-        partial = close - MINUTE_NS < self._since.get(iid, 0)
-        if missing is not None or partial:
-            since, until = missing[0] if missing else close, close if partial else missing[1]
+        # The first bar after subscribing opened before the hub saw any of its trades: a part bar. A bar with no
+        # volume was built while no trades arrived (Nautilus builds one at the last price), a dropped connection
+        # as like as a quiet minute. Either way the venue's own candle stands in for it.
+        stand_in = close - MINUTE_NS < self._since.get(iid, 0) or float(msg["v"]) == 0
+        if missing is not None or stand_in:
+            since, until = missing[0] if missing else close, close if stand_in else missing[1]
             self.fanout.publish({"t": "gap", "id": iid, "since": since, "until": until})
             self._refill.submit(self._fill, iid, since, until)
-        if not partial:
+        if not stand_in:
             self.fanout.publish(msg)
             self._store.submit(self._keep, msg)
 

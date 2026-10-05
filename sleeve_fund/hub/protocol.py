@@ -1,7 +1,8 @@
 """The market data hub's stream (v2 P1-1): one JSON object per line over TCP.
 
-A client opens with {"v": 1, "sub": ["BTCUSDT-PERP.BINANCE", ...]} and the hub answers {"t": "hello", "v": 1, ...}
-or {"t": "error", ...} and closes. Then, for the instruments subscribed:
+A client opens with {"v": 1, "sub": ["BTCUSDT-PERP.BINANCE", ...]} and the hub answers {"t": "hello", "v": 1,
+"pending": [ids not relayed yet], "instruments": [each relayed one's definition, Instrument.to_dict()]}, or
+{"t": "error", ...} and closes. Then, for the instruments subscribed:
 - {"t": "trade", "id", "px", "qty", "side", "tid", "ts", "recv"}: a trade print;
 - {"t": "quote", "id", "bid", "ask", "bid_qty", "ask_qty", "ts", "recv"}: the best bid and ask;
 - {"t": "bar", "id", "o", "h", "l", "c", "v", "ts", "recv", "refilled"}: a closed 1-minute bar stamped at its
@@ -23,7 +24,7 @@ MAX_LINE = 64 * 1024  # a subscription line longer than this is refused
 
 
 def encode(msg: dict) -> bytes:
-    return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+    return (json.dumps(msg, separators=(",", ":"), default=str) + "\n").encode()
 
 
 def decode(line: bytes) -> dict:

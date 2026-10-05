@@ -29,12 +29,14 @@ class _Client:
 
 class Fanout:
     """known: the instrument ids this hub relays (a callable, so instruments added while it runs count).
-    want: called with ids a client asked for that aren't relayed yet, so the relay can add them."""
+    want: called with ids a client asked for that aren't relayed yet, so the relay can add them.
+    instruments: the definitions (Instrument.to_dict) of the ids asked for, sent in the hello."""
 
     def __init__(self, venue: str, known: Callable[[], set[str]], want: Callable[[set[str]], None] | None = None,
                  venue_up: Callable[[], bool] = lambda: True, heartbeat: float = protocol.HEARTBEAT_SECONDS,
-                 log=print) -> None:
+                 instruments: Callable[[set[str]], list[dict]] = lambda ids: [], log=print) -> None:
         self.venue, self.known, self.want, self.venue_up = venue, known, want, venue_up
+        self.instruments = instruments
         self.heartbeat, self.log = heartbeat, log
         self.clients: set[_Client] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -124,7 +126,7 @@ class Fanout:
         c.task = asyncio.current_task()
         self.clients.add(c)
         writer.write(protocol.encode({"t": "hello", "v": protocol.VERSION, "venue": self.venue,
-                                      "pending": sorted(missing)}))
+                                      "pending": sorted(missing), "instruments": self.instruments(ids)}))
         try:
             while not c.dropped:
                 line = await c.queue.get()
