@@ -6,6 +6,12 @@ a record, not a cache: snapshots are only ever added. One JSON file per venue an
 directory, topped up from the last snapshot kept. A snapshot already kept is never replaced: a later copy with
 different numbers is written to the instrument's provenance.jsonl, as the hub's bars are. A missed period stays a
 hole, and gaps() reports it. No strategy reads this yet; it is collected so the history exists when one does.
+
+Point in time (Independent Quant Advisor, 19:06): a snapshot is stamped at the end of its period, but the venue
+publishes it some minutes later and the collector fetches it later still. Each snapshot therefore also keeps
+`first_seen` (when this collector first held it). A backtest may read a snapshot only once stamp + lag() has passed,
+where lag() is the 95th percentile of (first_seen - stamp) over snapshots collected as they were published, so
+research never sees open interest that live would not yet have had.
 """
 
 from __future__ import annotations
@@ -18,7 +24,8 @@ import pandas as pd
 
 from sleeve_fund.history import DEFAULT_ROOT
 
-COLUMNS = ("contracts", "notional")
+COLUMNS = ("contracts", "notional", "first_seen", "backfill")  # notional is contracts x price: derived, not independent
+AT_RISK = pd.Timedelta(days=7)  # the venue keeps 30 days: say so loudly long before anything is lost
 _lock = threading.Lock()
 
 
@@ -34,7 +41,20 @@ def snapshots(venue: str, pair: str, root: str | Path | None = None) -> pd.DataF
     """Every snapshot kept, indexed by its time (UTC, the end of its period), oldest first."""
     rows = _kept(_path(venue, pair, root))
     index = pd.DatetimeIndex(pd.to_datetime([r[0] for r in rows], unit="ms", utc=True), name="timestamp")
-    return pd.DataFrame([r[1:] for r in rows], index=index, columns=list(COLUMNS), dtype=float)
+    df = pd.DataFrame([r[1:3] for r in rows], index=index, columns=list(COLUMNS[:2]), dtype=float)
+    df["first_seen"] = pd.to_datetime([r[3] for r in rows], unit="ms", utc=True)
+    df["backfill"] = [bool(r[4]) for r in rows]
+    return df
+
+
+def lag(venue: str, pair: str, root: str | Path | None = None, q: float = 0.95) -> pd.Timedelta | None:
+    """How long after its stamp a snapshot reaches us: the q-quantile of (first_seen - stamp) over snapshots
+    collected as the venue published them (not the first backfill). None until there are any."""
+    df = snapshots(venue, pair, root)
+    live = df[~df["backfill"]]
+    if live.empty:
+        return None
+    return pd.Timedelta((live["first_seen"] - live.index).quantile(q))
 
 
 def latest(venue: str, pair: str, root: str | Path | None = None) -> pd.Timestamp | None:
@@ -56,24 +76,26 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
     conflicts: list[dict] = []
     with _lock:
         kept = _kept(path)
+        backfill = not kept  # the first fetch reaches back over the venue's whole window
         by_time = {r[0]: r for r in kept}
         start = kept[-1][0] + 1 if kept else 0
         for _ in range(max_pages):
             page = loader(pair, start)
+            seen = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
             for t, *values in page:
                 have = by_time.get(int(t))
                 if have is None:
-                    row = [int(t), *map(float, values)]
+                    row = [int(t), *map(float, values), seen, int(backfill)]
                     kept.append(row)
                     by_time[int(t)] = row
                     written += 1
-                elif have[1:] == [float(v) for v in values]:
+                elif have[1:3] == [float(v) for v in values]:
                     unchanged += 1
                 else:
                     conflicts.append({"kind": "conflict", "series": "open_interest",
                                       "at": pd.Timestamp.now(tz="UTC").isoformat(), "source": "venue_rest",
                                       "snapshot": pd.Timestamp(int(t), unit="ms", tz="UTC").isoformat(),
-                                      "stored": have[1:], "offered": [float(v) for v in values]})
+                                      "stored": have[1:3], "offered": [float(v) for v in values]})
             if not page or len(page) < 500 or page[-1][0] + 1 <= start:
                 break
             start = page[-1][0] + 1
@@ -104,3 +126,15 @@ def gaps(venue: str, pair: str, root: str | Path | None = None,
         if b - a > step:
             out.append((pd.Timestamp(a + step, unit="ms", tz="UTC"), pd.Timestamp(b - step, unit="ms", tz="UTC")))
     return out
+
+
+def at_risk(venue: str, pair: str, root: str | Path | None = None, now: pd.Timestamp | None = None) -> str | None:
+    """Why this instrument's open interest is close to being lost for good, or None. The venue keeps 30 days, so
+    once the newest snapshot kept is a week old the collector is failing and must be fixed while it can catch up."""
+    newest = latest(venue, pair, root)
+    now = now or pd.Timestamp.now(tz="UTC")
+    if newest is not None and now - newest > AT_RISK:
+        lost = newest + pd.Timedelta(days=30)
+        return (f"{venue.upper()} {pair}: open interest last kept {newest:%Y-%m-%d %H:%M} UTC; the venue drops "
+                f"snapshots after 30 days, so they start being lost for good from {lost:%Y-%m-%d %H:%M} UTC")
+    return None

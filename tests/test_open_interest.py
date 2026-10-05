@@ -103,3 +103,38 @@ def test_a_funding_failure_does_not_stop_open_interest(tmp_path, capfd, monkeypa
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     out = capfd.readouterr().out
     assert "funding refresh failed" in out and "open interest to 2026-10-01 00:00 UTC (+1), funding to none yet" in out
+
+
+def test_each_snapshot_keeps_when_it_was_first_seen_and_the_lag_ignores_the_backfill(tmp_path, monkeypatch):
+    stamps = [T0 + i * STEP for i in range(4)]
+    clock = iter([pd.Timestamp(T0 + 10 * 86_400_000, unit="ms", tz="UTC"),  # the backfill, days later
+                  pd.Timestamp(stamps[2] + 7 * 60_000, unit="ms", tz="UTC"),  # then each one 7, then 9 minutes late
+                  pd.Timestamp(stamps[3] + 9 * 60_000, unit="ms", tz="UTC")])
+    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: next(clock)))
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:2]))
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:3]))
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps))
+    kept = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)
+    assert list(kept["backfill"]) == [True, True, False, False]
+    assert kept["first_seen"].iloc[2] - kept.index[2] == pd.Timedelta(minutes=7)
+    assert pd.Timedelta(minutes=7) < open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) <= pd.Timedelta(minutes=9)
+
+
+def test_a_week_without_new_snapshots_is_raised_once_a_day_before_any_are_lost(tmp_path):
+    from sleeve_fund import history
+
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with([T0]))
+    day6, day8 = (pd.Timestamp(T0, unit="ms", tz="UTC") + pd.Timedelta(days=d) for d in (6, 8))
+    assert open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=day6) is None
+    problem = open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=day8)
+    assert "lost for good from 2026-10-31 00:00 UTC" in problem
+
+    class Inbox:
+        events = []
+
+        def event(self, sleeve, level, kind, message):
+            self.events.append((level, kind))
+    history._warned.clear()
+    history._warn_at_risk(problem, store=Inbox())
+    history._warn_at_risk(problem, store=Inbox())
+    assert Inbox.events == [("error", "open_interest_at_risk")]

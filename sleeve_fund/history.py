@@ -585,11 +585,35 @@ def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
         out = open_interest.refresh(profile.name, pair, root=root)
     except Exception as exc:  # noqa: BLE001 - snapshots the venue still keeps are fetched on the next pass
         print(f"{profile.name} {pair}: open interest refresh failed: {exc!r}")
+        _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root))
         return
+    _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root))
     oi = f"{out['latest']:%Y-%m-%d %H:%M}" if out["latest"] is not None else "none yet"
     fr = f"{funding_to:%Y-%m-%d %H:%M}" if funding_to is not None else "none yet"
     extra = f", {out['conflicts']} differing (provenance.jsonl)" if out["conflicts"] else ""
     print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
+
+
+_warned: dict[str, float] = {}  # message prefix -> when it last went to the alerts inbox
+
+
+def _warn_at_risk(problem: str | None, store=None) -> None:
+    """Open interest about to be lost for good goes to the alerts inbox, at most once a day per instrument."""
+    import time
+
+    if problem is None:
+        return
+    print(f"OPEN INTEREST AT RISK: {problem}")
+    key = problem.split(":")[0]
+    if time.time() - _warned.get(key, 0) < 86_400:
+        return
+    try:
+        from sleeve_fund.store import Store
+
+        (store or Store()).event(None, "error", "open_interest_at_risk", problem)
+        _warned[key] = time.time()
+    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line above still says it
+        print(f"could not raise the open interest alert: {exc!r}")
 
 
 def unwritable(path: Path) -> str | None:
