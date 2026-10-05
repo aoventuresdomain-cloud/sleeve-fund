@@ -99,3 +99,39 @@ def test_bad_bars_are_refused_and_nothing_is_written(tmp_path, bad, why):
 def test_source_must_be_live_or_refill(tmp_path):
     with pytest.raises(ValueError, match="source"):
         HistoryStore(tmp_path).append_bars(V, P, _rows("2026-10-05 12:00", 1), "rest")
+
+
+def test_a_stamp_a_few_ns_off_the_minute_is_refused(tmp_path):
+    t = pd.Timestamp("2026-10-05 12:00", tz="UTC").value + 100  # rounds onto the minute through a float64
+    with pytest.raises(ValueError, match="whole minutes"):
+        HistoryStore(tmp_path).append_bars(V, P, [(t, 1.0, 1.0, 1.0, 1.0, 1.0)], "live")
+
+
+def _loader_page(start, n, price):
+    idx = pd.date_range(start, periods=n, freq="1min", tz="UTC")
+    return pd.DataFrame({"open": price, "high": price + 1, "low": price - 1, "close": price, "volume": 3.0}, index=idx)
+
+
+def test_the_rest_loader_fills_holes_but_never_overwrites_a_hub_bar(tmp_path):
+    # The hub runs the REST backfill in the same process: a loader page overlapping the hub's bars.
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
+    store.append_bars(V, P, _rows("2026-10-05 12:04", 2, price=104.0), "live")  # 12:02-12:03 missed
+    cov = store.append(V, P, _loader_page("2026-10-05 12:00", 7, price=500.0), cursor="next")
+    one = store.read(V, P, 1)
+    stamped = lambda m: pd.Timestamp(m, tz="UTC") + pd.Timedelta("1min")
+    assert one.loc[stamped("2026-10-05 12:00"), "close"] == 100.0  # the hub's bar is kept
+    assert one.loc[stamped("2026-10-05 12:02"), "close"] == 500.0  # the hole is filled from the loader
+    assert store.gaps(V, P) == [] and cov.cursor == "next"
+    kinds = [(r["kind"], r["source"]) for r in store.provenance(V, P)]
+    assert kinds.count(("conflict", "loader")) == 4 and ("refill", "loader") in kinds
+    # 12:06, beyond the hub's newest closed minute, is the loader's newest and may still be forming.
+    assert cov.closed == pd.Timestamp("2026-10-05 12:05", tz="UTC") and cov.last == pd.Timestamp("2026-10-05 12:06", tz="UTC")
+
+
+def test_the_loader_does_not_fill_a_hub_hole_flat(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
+    store.append(V, P, _loader_page("2026-10-05 12:10", 2, price=110.0), cursor="c")  # loader ahead of the hub
+    hole = (pd.Timestamp("2026-10-05 12:02", tz="UTC"), pd.Timestamp("2026-10-05 12:09", tz="UTC"))
+    assert store.gaps(V, P) == [hole]
