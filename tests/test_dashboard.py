@@ -425,7 +425,7 @@ def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
     c, _ = client
     page = c.get(path, auth=AUTH).text
     assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
-    for href in ("/", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
+    for href in ("/", "/alerts", "/research", "/backtest", "/risk", "/records", "/setup"):
         assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
     assert 'id="strats"' in page  # every strategy is listed under Portfolio (a sheet on phones)
     if path in ("/", "/trades", "/orders"):  # the book-wide blotters are tabs of the portfolio
