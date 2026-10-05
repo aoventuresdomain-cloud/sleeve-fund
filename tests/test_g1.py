@@ -159,3 +159,23 @@ def test_the_block_grows_with_persistence_and_drifting_returns_are_not_judged():
     bench = pd.Series(rng.normal(0.0005, 0.03, len(noise)), idx)
     p, _ = sharpe_beats_probability(pd.Series(0.01 + 0.001 * drifting, idx), bench, 1)
     assert np.isnan(p)  # about 58 independent days: nothing to judge, however good it looks
+
+
+_SLEEVE = dict(id=1, starting_balance=1000, risk_profile="balanced", warmup_bars=0, desired_state="running",
+               status="running", status_reason="", paused_until=None, heartbeat_at=None, created_at=None,
+               updated_at=None)
+
+
+def test_a_spot_long_only_pass_never_counts_for_a_perp_or_long_short_strategy(tmp_path):
+    """Round 12, M12-U3: studies run spot, long only, and G1 was looked up by model, instrument and bars
+    alone, so a spot pass ticked "Strategy passed G1" on the long/short version of the model."""
+    _sheet(tmp_path / "rsi_bands_btc.md", "rsi_bands", "PASS", minutes=60)
+    assert pipeline.g1_for(tmp_path, "rsi_bands", "BTC/USD", 60, {}) == "PASS"
+    assert pipeline.g1_for(tmp_path, "rsi_bands", "BTC/USD", 60, {"market": "perp"}) is None
+    assert pipeline.g1_for(tmp_path, "rsi_bands", "BTC/USD", 60, {"market": "perp", "allow_short": True}) is None
+    perp = Sleeve(name="rsi-ls", strategy="rsi_bands", instrument="BTC/USD", bar_spec="1-HOUR-LAST-EXTERNAL",
+                  params={"market": "perp", "allow_short": True}, **_SLEEVE)
+    spot = Sleeve(name="rsi-spot", strategy="rsi_bands", instrument="BTC/USD", bar_spec="1-HOUR-LAST-EXTERNAL",
+                  params={}, **_SLEEVE)
+    row = next(r for r in pipeline.strategies(tmp_path, [perp, spot]) if r["name"] == "rsi_bands")
+    assert [o["name"] for o in row["observing"]] == ["rsi-ls"]  # the spot one is backed by the pass
