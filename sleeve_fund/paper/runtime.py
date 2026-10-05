@@ -97,7 +97,7 @@ class SleeveRuntime:
     def _restored_day_open(self, now: datetime, equity: float) -> float:
         """The daily-loss baseline after a (re)start: the equity at the PM's last resume today, which reset
         it (review round 9, M9-2), else the day's open (review round 8, B8-2), else this mark."""
-        midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+        midnight = datetime.combine(risk.trading_day(now), datetime.min.time(), tzinfo=timezone.utc)
         resumed = self.store.last_event(self.name, ("pm_resume",))
         if resumed is not None and resumed["ts"] >= midnight:
             mark = self.store.equity_at_or_before(self.name, resumed["ts"])
@@ -191,8 +191,8 @@ class SleeveRuntime:
         self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
                                  ts=now)
         self.peak = max(self.peak, equity)
-        if self._day != now.date():
-            # The day opens at the equity last marked before midnight: the same thing in paper, which
+        if self._day != risk.trading_day(now):
+            # The day opens at the equity last marked at or before midnight: the same thing in paper, which
             # marks every few seconds, and in a backtest, which marks once a bar. The first tick after a
             # (re)start reads it from the journal, so a restart mid-day, such as the reload a settings
             # edit makes, can't lift the daily-loss pause by resetting the baseline (review round 8, B8-2).
@@ -200,7 +200,7 @@ class SleeveRuntime:
                 self._day_open = self._restored_day_open(now, equity)
             else:
                 self._day_open = self._last_equity if self._last_equity is not None else equity
-            self._day = now.date()
+            self._day = risk.trading_day(now)
         self._last_equity = equity
 
         flatten = False

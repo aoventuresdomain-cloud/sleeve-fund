@@ -579,6 +579,60 @@ def test_a_daily_loss_pause_cut_short_sells_again_but_not_once_it_has_expired(st
     assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) is None and rt.can_open()
 
 
+
+def test_a_reconcile_halt_after_an_expired_pause_never_replays_the_pauses_flatten(store):
+    """A daily-loss pause that has run its 24 hours is over: if a reconcile mismatch halts the strategy
+    later, a restart must not send the old pause's flatten again, since a reconcile halt never trades
+    (review round 11, M11-9)."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000)
+    t[0] += timedelta(minutes=1)
+    assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) == "flatten"  # a 10% day: paused
+    t[0] += timedelta(hours=25)
+    assert rt.can_open()  # the pause has expired
+    assert not rt.reconcile(cash=7_000, qty=0.05)  # the journal holds nothing: halted
+    rt = _restarted(store, t)
+    assert store.sleeve("s1").status == "halted"
+    assert rt.tick(equity=9_000, cash=7_000, qty=0.05, price=40_000) is None
+
+
+def test_the_guard_judges_the_worst_price_since_the_last_tick_not_only_the_mark(store):
+    """A backtest passes the equity at the bar's worst price for the position: a wick through the drawdown
+    limit halts even when the bar closes back above it (long/short verdict, L3)."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    rt.tick(equity=10_000, cash=7_000, qty=0.05, price=60_000)
+    t[0] += timedelta(minutes=1)
+    assert rt.tick(equity=9_990, cash=7_000, qty=0.05, price=59_800, guard_equity=7_500) == "flatten"
+    assert store.sleeve("s1").status == "halted"
+
+
+
+def test_the_day_opens_at_the_midnight_mark_not_the_bar_before(store):
+    """An hourly backtest marks at each bar's close, so the bar that ends at 00:00 carries the midnight
+    equity. The day opened at the 23:00 mark instead, an hour early, and paused at a 4.25% day loss under a
+    5% limit (coordinator, 5 Oct). The new day opens at the midnight mark, after a restart too."""
+    from datetime import datetime, timedelta
+
+    t = [datetime(2025, 10, 4, 22, tzinfo=timezone.utc)]
+    rt = _restarted(store, t)
+    for equity in (10_000, 10_000, 9_700):  # 22:00, 23:00, 00:00: 3% down on the 4th, no pause
+        assert rt.tick(equity=equity, cash=equity, qty=0.0, price=60_000) is None
+        t[0] += timedelta(hours=1)
+    # 01:00: 4.1% under the midnight 9,700 (7% under the 23:00 mark) is inside balanced's 5% daily loss.
+    assert rt.tick(equity=9_300, cash=9_300, qty=0.0, price=60_000) is None
+    assert store.sleeve("s1").status == "running"
+    rt = _restarted(store, t)
+    assert rt.tick(equity=9_300, cash=9_300, qty=0.0, price=60_000) is None
+    assert store.sleeve("s1").status == "running"
+    assert rt._day_open == 9_700
+
+
 # --- long and short on a perpetual ----------------------------------------------------------------
 
 PERP = {"market": "perp", "allow_short": True}

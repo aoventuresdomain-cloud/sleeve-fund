@@ -739,3 +739,135 @@ def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(pr
     loss = buy["qty"] * (buy["price"] - sell["price"]) + buy["fee"] + sell["fee"]
     # The 5% daily loss, plus the exit's fee and a day's funding: not the 20% the wick reached.
     assert res.starting_capital * 0.05 <= loss <= res.starting_capital * 0.053
+
+
+# --- review round 11, M11-9: tests for the mutations that survived the suite ------------------------
+
+
+def test_a_shorts_1r_and_r_target_carry_its_side():
+    """A short buys back above the entry at its stop, so the exit leg costs more than a long's, and its
+    target sits below the entry, so the target's exit leg costs less. "2R" pays two of that 1R after costs."""
+    from sleeve_fund.strategies.base import gain_at_target, loss_at_stop, r_target
+
+    stop, leg = 0.02, 0.001
+    assert loss_at_stop(stop, leg, 1) == pytest.approx(stop + leg + 0.98 * leg)
+    assert loss_at_stop(stop, leg, -1) == pytest.approx(stop + leg + 1.02 * leg)
+    for side in (1, -1):
+        tp = r_target(2, stop, leg, side)
+        assert gain_at_target(tp, leg, side) == pytest.approx(2 * loss_at_stop(stop, leg, side))
+    assert r_target(2, stop, leg, -1) != pytest.approx(r_target(2, stop, leg, 1), abs=1e-9)
+
+
+def test_an_entry_whose_stop_sits_past_half_way_to_liquidation_is_refused(prices, instrument):
+    """Aggressive sizes a perp at 3x, liquidated about 33% away: a 25% stop is past half of that, so the
+    entry is refused and says why; a 10% stop is inside it and enters."""
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 101.0, 100.0]
+    feed = _path(prices, closes)
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "stop_loss": 0.25}, half_spread=0,
+                       risk_profile="aggressive")
+    assert res.fills.empty
+    assert "entry_refused_liquidation" in {e["kind"] for e in res.journal.events_}
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "stop_loss": 0.10}, half_spread=0,
+                       risk_profile="aggressive")
+    assert not res.fills.empty
+    assert "entry_refused_liquidation" not in {e["kind"] for e in res.journal.events_}
+
+
+def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
+    # Short at 101.5, then a fall: the 2% target buys back at 101.5 x 0.98, not above the entry.
+    closes = [100.0, 100.5, 100.8, 101.5, 101.0, 100.0, 99.0, 98.0, 98.0]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument,
+                       {**PERP, "take_profit": 0.02, "dip": 0.05}, half_spread=0)
+    fills = res.fills.sort_values("ts_last")
+    got = [(res.decisions[o]["intent"], fills.loc[o, "side"]) for o in fills.index]
+    assert got == [("entry", "BUY"), ("exit", "SELL"), ("entry", "SELL"), ("take_profit", "BUY")], got
+    assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
+
+
+def test_a_restart_holding_a_perp_settles_the_funding_it_was_down_for(tmp_path):
+    """Funding owed while the process was down is settled on the first tick: from the last fill or funding
+    payment, not from the restart. A short opened at 15:00 and restarted at midnight owes 16:00 and 00:00."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from test_replay import START
+
+    store = Store.in_memory()
+    create = store.create_sleeve
+    opened = datetime.fromtimestamp(START / 1e9 - 9 * 3600, tz=timezone.utc)
+
+    def create_with_a_short(**kw):
+        s = create(**kw)
+        store.record_fill(kw["name"], side="SELL", qty=0.05, price=61_000.0, fee=1.5, order_id="carried",
+                          trade_id="carried", ts=opened)
+        return s
+
+    store.create_sleeve = create_with_a_short
+    path = tmp_path / "funding.jsonl.gz"
+    book = replay_book([_fill("SELL", 0.05, 61_000.0, 1.5)], 10_000.0)
+    _record(path, _meta(book["cash"] + book["qty"] * book["entry_px"], {"rise": 0.01, "dip": 0.005, **PERP}),
+            [(10, 0.0)])
+    replay(path, with_fills=True, store=store)
+    paid = sorted(f["ts"].replace(tzinfo=timezone.utc) for f in store.funding("ping-pong-test", limit=10))
+    assert paid == [datetime(2025, 10, 2, 16, tzinfo=timezone.utc), datetime(2025, 10, 3, tzinfo=timezone.utc)]
+
+
+def test_paper_reconciles_the_position_to_two_lots(tmp_path, monkeypatch):
+    """The reconcile tolerance on the position is two lots of the base currency (review rounds 9 and 10,
+    B9-1, B10-1): wider would let a real gap pass, narrower halts on rounding."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.research.replay import replay
+
+    seen = []
+    real = SleeveRuntime.reconcile
+
+    def spy(self, **kw):
+        seen.append(kw["qty_tolerance"])
+        return real(self, **kw)
+
+    monkeypatch.setattr(SleeveRuntime, "reconcile", spy)
+    path = tmp_path / "tol.jsonl.gz"
+    _record(path, _meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP}), [(5, 0.0)])
+    replay(path)
+    assert seen and all(t == pytest.approx(2e-8) for t in seen)  # BTC trades in lots of 0.00000001
+
+
+def test_without_a_resting_risk_stop_the_guard_still_judges_the_wick(prices, instrument, monkeypatch):
+    """The risk stop can't rest while an exit or a flip is in flight. The guard is the backstop then: it
+    judges each bar at its worst price for the position (the low for a long), so a wick through the
+    daily-loss level that recovers by the close still pauses the strategy (long/short verdict, L3)."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    monkeypatch.setattr(LongFlatStrategy, "_rest_risk_stop", lambda self: None)
+    closes = [100.0, 100.0, 100.0, 100.0]
+    feed = _path(prices, closes)
+    feed.iloc[2, feed.columns.get_loc("low")] = 90.0  # a wick 10% down, back to 100 by the close
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "rise": 0.4, "dip": 0.4}, half_spread=0,
+                       risk_profile="balanced")
+    assert "risk_pause" in {e["kind"] for e in res.risk_events}, res.risk_events
+
+
+@pytest.mark.parametrize("volume", [1e6, 5.0])
+def test_a_flip_opens_the_new_side_only_once_the_old_one_is_closed(prices, instrument, volume):
+    """Turning from long to short (or back) closes the position first and opens the new side only once
+    it is flat: no entry fill ever adds to the other side's position or crosses zero (review round 11). On
+    a thin book (volume 5) the orders fill in slices across bars. It keeps trading, too: the risk stop's
+    re-pricing each bar once read as an order in flight, and the strategy never decided again after its
+    first entry."""
+    import numpy as np
+
+    feed = _path(prices, list(60_000 * (1 + 0.02 * np.sin(np.arange(120) / 4))))  # a cycle every 25 bars
+    feed["volume"] = volume
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "rise": 0.01, "dip": 0.005}, half_spread=0,
+                       risk_profile="balanced")
+    intent = {o: d["intent"] for o, d in res.decisions.items()}
+    net, entries, sides = Decimal(0), set(), set()
+    for f in res.journal.fills_:
+        before = net
+        step = Decimal(repr(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        net += step
+        if intent[f["order_id"]] == "entry":
+            entries.add(f["order_id"])
+            sides.add(f["side"])
+            # From flat, or adding to its own side: never against an open position of the other side.
+            assert before == 0 or (before > 0) == (step > 0), (f, before)
+    assert len(entries) >= 4 and sides == {"BUY", "SELL"}, (len(entries), res.risk_events)
