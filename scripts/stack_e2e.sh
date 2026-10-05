@@ -61,8 +61,10 @@ echo "dashboard: with password $CODE, without $NOAUTH"
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
 # The history stores can write their venue folders (they refuse to start, in one line, when they can't).
-for svc in history history-binance; do
-  docker compose exec -T "$svc" python -c "
+# The hub is run once rather than exec'd: it restarts while the runner can't reach its venue.
+for svc in history hub-binance; do
+  if [ "$svc" = history ]; then run="exec -T"; else run="run --rm -T --no-deps"; fi
+  docker compose $run "$svc" python -c "
 import sys
 from pathlib import Path
 from sleeve_fund.history import unwritable

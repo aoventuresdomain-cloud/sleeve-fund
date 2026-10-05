@@ -10,7 +10,7 @@
   // A region is a panel the server renders: an explicit data-live, or a labelled section.
   const keyOf = (el) => el.dataset.live || el.getAttribute("aria-labelledby") || el.getAttribute("aria-label");
   const SELECTOR = "[data-live], main section[aria-labelledby], main section[aria-label]";
-  const swappable = (el) => el.dataset.live !== "off" && !el.querySelector("canvas, .pc-canvas")
+  const swappable = (el) => el.dataset.live !== "off" && !el.querySelector(".lw, .pc-canvas")
     && (el.hasAttribute("data-live-forms") || !el.querySelector("input:not([type=hidden]), select, textarea"))
     && !el.parentElement.closest(SELECTOR);
   const regions = (root) => [...root.querySelectorAll(SELECTOR)].filter(swappable);

@@ -81,7 +81,11 @@ services:
     command: python -m sleeve_fund.history run
 
   # The same store for Binance USD-M perpetuals (public data, no key): prices and settled funding.
-  history-binance:
+  # The Binance market data hub (v2 P1-1, sleeve_fund/hub): one public websocket relaying trades, quotes and
+  # 1-minute bars to every client on port 7700 of this network, and handing closed bars to the history store.
+  # The venue's one history writer: it also runs the store's REST backfill and funding refresh (it replaces
+  # history-binance). Public data only: it refuses to start with any venue credential.
+  hub-binance:
     build: .
     restart: unless-stopped
     depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
@@ -90,7 +94,7 @@ services:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
     volumes: [history:/data/history]
-    command: python -m sleeve_fund.history run --venue binance
+    command: python -m sleeve_fund.hub run --venue binance --port 7700
 
   # Copies the fills of strategies with demo_mirror = true to a demo account (sleeve_fund/mirror.py): Bybit
   # Demo Trading for strategies on Binance's USDT perpetuals, the Deribit TESTNET for the rest. The only

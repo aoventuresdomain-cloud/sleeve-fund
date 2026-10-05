@@ -61,7 +61,7 @@ def test_create_sleeve_and_control_it(client):
     page = c.get("/sleeves/btc-test", auth=AUTH)
     assert page.status_code == 200 and "Flatten" in page.text
     # Listed under Portfolio in the rail, marked as the page you're on, with trades and orders as its tabs.
-    assert 'href="/sleeves/btc-test" aria-current=page' in page.text and 'data-tab="orders"' in page.text
+    assert 'href="/sleeves/btc-test" aria-current=page' in page.text and 'data-sub="history"' in page.text
     assert c.get("/api/sleeves/btc-test/equity", auth=AUTH).json()["equity"] == [5100.0]
 
     r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "testing"}, auth=AUTH,
@@ -156,14 +156,15 @@ def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
     store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
     store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
     page = c.get("/", auth=AUTH).text
-    for text in ("Book equity", "Month to date", "Gross exposure", "Allocation", "price feed quiet"):
+    for text in ("Book value", "Month to date", "Allocation and top", "Needs you", "price feed quiet"):
         assert text in page
     alert = store.alerts()[0]
     r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/"
     assert store.open_alert_count() == 0 and store.alerts(include_acked=True)[0]["ack_note"] == "seen"
-    assert "price feed quiet" not in c.get("/", auth=AUTH).text
+    after = c.get("/", auth=AUTH).text
+    assert "price feed quiet" not in after and 'class="needs-you"' not in after  # the bar goes once nothing waits
     assert "seen" in c.get("/alerts?show=all", auth=AUTH).text
 
 
@@ -703,7 +704,7 @@ def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, mo
     assert [m["text"] for m in d["markers"]] == ["", "Stop", ""]  # only the forced exit is labelled
     notes = list(d["notes"].values())
     assert notes[1]["reason"].startswith("Stop-loss: price 92") and notes[2]["reason"] == "RSI 25.1 below 30"
-    assert {ln["title"] for ln in d["lines"]} == {"Entry", "Stop"} and d["lines"][0]["price"] == 90
+    assert {ln["title"] for ln in d["lines"]} == {"Entry", "SL"} and d["lines"][0]["price"] == 90
 
     now = pd.Timestamp.now(tz="UTC").floor("h")
     kraken = pd.DataFrame({"open": [1.0, 2.0], "high": [2.0, 3.0], "low": [0.5, 1.5], "close": [2.0, 2.5],
@@ -762,7 +763,7 @@ def test_position_tab_is_compact_with_reason_folded(client):
     store.record_fill("sol-x", side="BUY", qty=10, price=90, fee=0.72, order_id="O-1", trade_id="t1")
     store.record_equity("sol-x", equity=10_049.28, cash=9_099.28, qty=10, price=95, benchmark=10_000)
     page = c.get("/sleeves/sol-x", auth=AUTH).text
-    tab = page[page.index('id="tab-positions"'):page.index('id="tab-trades"')]
+    tab = page[page.index('id="tab-positions"'):page.index('id="tab-activity"')]
     for label in ("Size", "Quantity", "Notional", "Share of equity", "Entry", "Stop-loss", "Take-profit", "Unrealised", "Realised", "Total"):
         assert f">{label}<" in tab or f">{label} " in tab, label
     assert "10 SOL" in tab and "950.00 USD" in tab  # quantity in the instrument and notional in the quote
@@ -794,14 +795,14 @@ def test_fetch_kraken_ohlc_keeps_the_forming_candle_and_uses_open_times():
 
 
 def test_every_headline_figure_explains_itself(client):
-    from sleeve_fund.dashboard.glossary import GLOSSARY
-
     c, store = client
     _new(c)
-    for path in ("/", "/sleeves/btc-test", "/trades"):
+    for path in ("/sleeves/btc-test", "/trades"):
         page = c.get(path, auth=AUTH).text
         assert 'class="help"' in page and 'aria-label="What does this mean?"' in page
-    assert GLOSSARY["drawdown"] in c.get("/", auth=AUTH).text
+    # Portfolio's tiles are a label and a number; the detail is each tile's hover title (UI v2, PM 5 Oct).
+    kpis = c.get("/", auth=AUTH).text.split('aria-label="Book figures">')[1].split("</section>")[0]
+    assert kpis.count('<div class="kpi') == kpis.count('title="') == 8 and 'class="s"' not in kpis
 
 
 def test_clone_with_changes_prefills_the_new_sleeve_form(client):
