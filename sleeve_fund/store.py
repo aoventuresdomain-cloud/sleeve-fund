@@ -250,6 +250,14 @@ sleeve_accounts_t = Table(
     Column("account", String(41), ForeignKey("accounts.name"), nullable=False),
     Column("assigned_at", TS, nullable=False),
 )
+# The venue a strategy trades on, where it isn't the default (sleeve_fund.venues). A table of its own, so
+# it arrives as CREATE TABLE: a strategy with no row here trades on the default venue, as every one did.
+sleeve_venues_t = Table(
+    "sleeve_venues",
+    metadata,
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
+    Column("venue", String(16), nullable=False),
+)
 account_keys_t = Table(
     "account_keys",
     metadata,
@@ -413,14 +421,15 @@ class Sleeve:
     heartbeat_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    venue: str | None = None  # None: the default venue (sleeve_fund.venues.DEFAULT_VENUE)
 
     @classmethod
-    def from_row(cls, row) -> "Sleeve":
+    def from_row(cls, row, venue: str | None = None) -> "Sleeve":
         d = dict(row._mapping)
         for k in ("paused_until", "heartbeat_at", "created_at", "updated_at"):
             d[k] = _aware(d[k])
         d["params"] = dict(d["params"] or {})
-        return cls(**d)
+        return cls(**d, venue=venue)
 
 
 def _rows(result) -> list[dict]:
@@ -483,6 +492,7 @@ class Store:
         risk_profile: str = "balanced",
         warmup_bars: int = 0,
         desired_state: str = "running",
+        venue: str | None = None,
     ) -> Sleeve:
         ts = utcnow()
         with self.engine.begin() as c:
@@ -492,14 +502,17 @@ class Store:
                 desired_state=desired_state, status="starting" if desired_state == "running" else "stopped",
                 status_reason="", created_at=ts, updated_at=ts,
             ))
+            if venue:
+                c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
         return self.sleeve(name)
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
             row = c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()
+            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == name)).scalar()
         if row is None:
             raise KeyError(f"no strategy {name!r}")
-        return Sleeve.from_row(row)
+        return Sleeve.from_row(row, venue)
 
     def sleeves(self, include_backtests: bool = False) -> list[Sleeve]:
         """Paper and live strategies. Saved backtests are left out unless asked for: they never run,
@@ -509,7 +522,8 @@ class Store:
             q = q.where(_not_backtest(sleeves_t.c.name))
         with self.engine.connect() as c:
             rows = c.execute(q).all()
-        return [Sleeve.from_row(r) for r in rows]
+            venues = dict(c.execute(select(sleeve_venues_t.c.sleeve, sleeve_venues_t.c.venue)).all())
+        return [Sleeve.from_row(r, venues.get(r.name)) for r in rows]
 
     def _update_sleeve(self, name: str, **values) -> None:
         with self.engine.begin() as c:
@@ -1173,7 +1187,7 @@ class Store:
             # otherwise block deleting its event (a foreign key) and with it every later prune.
             c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
                                                                   .where(events_t.c.sleeve.in_(old)))))
-            for t in (equity_t, fills_t, funding_t, insurance_t, orders_t, events_t, exit_plans_t):
+            for t in (equity_t, fills_t, funding_t, insurance_t, orders_t, events_t, exit_plans_t, sleeve_venues_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
             c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))

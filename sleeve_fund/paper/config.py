@@ -157,5 +157,5 @@ def to_store_kwargs(cfg: SleeveConfig) -> dict:
     return dict(
         name=cfg.name, strategy=cfg.strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
         starting_balance=cfg.starting_balance, params=params, risk_profile=cfg.risk_profile,
-        warmup_bars=cfg.warmup_bars,
+        warmup_bars=cfg.warmup_bars, venue=None if cfg.venue == DEFAULT_VENUE else cfg.venue,
     )

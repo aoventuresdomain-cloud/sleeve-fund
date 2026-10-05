@@ -1,0 +1,25 @@
+# Test strategy 2, long and short, on Binance (PM, 5 Oct 2026): rsi-bands-ls-test's rules on Binance's own
+# BTCUSDT perpetual, at its published fees (0.02% maker, 0.05% taker) and the funding it settles every
+# 8 hours. Long when RSI(14) closes at or below 30 until it reaches 55; short at or above 70 until it
+# falls back to 50.
+# Added stopped: the PM starts it from the dashboard. Paper only; the paper book is the record.
+
+[sleeve]
+name = "rsi-bands-ls-binance"
+strategy = "rsi_bands"
+instrument = "BTC/USDT"
+venue = "binance"
+bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Binance trades
+starting_balance = 10000
+warmup_bars = 140                     # ten RSI periods, from the stored history: Wilder's RSI settles slowly
+risk_profile = "balanced"
+start = false
+
+[params]
+rsi_period = 14
+long_entry = 30.0
+long_exit = 55.0
+short_entry = 70.0
+short_exit = 50.0
+market = "perp"
+allow_short = true
