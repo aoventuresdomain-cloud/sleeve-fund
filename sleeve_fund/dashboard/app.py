@@ -198,7 +198,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves),
                     positions=trading.book_positions(st(), summaries), working=working,
                     book_fills=trading.book_fills(st(), sleeves), funding=trading.book_funding(st(), summaries),
-                    fill_count=sum(x["fills"] for x in summaries), reasons=COMMON_REASONS)
+                    fill_count=sum(x["fills"] for x in summaries))
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -421,7 +421,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     costs=exit_costs(), reload=st().pending_reload(name),
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
-                    pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
+                    pending=st().pending_commands(name), risk=_risk_view(x, position),
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     timeline=_timeline(events, st().decisions(name, limit=50)),
@@ -1315,6 +1315,8 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
     return reasons.compose(action, pick, note) if pick is not None else (reason or "").strip()
 
 
+# Only the kill switch on Risk & health still offers these; it moves to reasons.ACTION_REASONS["book_flatten"]
+# (templates/_reasons.html) when that page is rebuilt, and this list can go then.
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
     "Market event; standing aside",

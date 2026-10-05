@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, signed, money_signed, usage, spark, help, pts, tag %}
+{% from "_reasons.html" import reason_picker %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
@@ -277,15 +278,14 @@
 
 {# Close sends the strategy's own flatten, as Flatten on its page does: at market, then the strategy pauses. #}
 <div data-live="close-dialogs" data-live-forms>
-<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 {% for p in positions.rows %}{% set s = p.x.sleeve %}{% set base = p.pair.split('/')[0] %}{% set quote = p.pair.split('/')[1] %}
 <dialog id="dlg-close-{{ p.sleeve }}" aria-labelledby="dlg-close-{{ p.sleeve }}-h">
   <form method="post" action="/sleeves/{{ p.sleeve }}/command">
     <h2 id="dlg-close-{{ p.sleeve }}-h">Close {{ p.sleeve }}'s {{ 'short' if p.side < 0 else 'position' }}</h2>
     <p>{% if s.desired_state != 'running' %}It is stopped, so it starts only to {{ 'buy back' if p.side < 0 else 'sell' }}{% else %}{{ 'Buys back' if p.side < 0 else 'Sells' }}{% endif %} {{ p.qty|abs|qty }} {{ base }} (about {{ p.value|abs|money }} {{ quote }}) at market, paying the taker fee, then pauses the strategy.</p>
-    <label for="r-close-{{ p.sleeve }}">Reason for the decision log</label>
-    <input id="r-close-{{ p.sleeve }}" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="flatten" class="danger">{{ 'Close to cash and pause' if p.side < 0 else 'Sell to cash and pause' }}</button></div>
+    <input type="hidden" name="reason_for" value="close">
+    {{ reason_picker('close', 'r-close-' ~ p.sleeve) }}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="flatten" class="danger" data-needs-reason disabled>{{ 'Close to cash and pause' if p.side < 0 else 'Sell to cash and pause' }}</button></div>
   </form>
 </dialog>
 {% endfor %}
@@ -306,7 +306,7 @@
 {% block scripts %}
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.sortable(); Console.tabs(); Console.dialogs(); Console.bookCharts("/api/book/equity");
+<script>Console.sortable(); Console.tabs(); Console.dialogs(); Console.reasons(); Console.bookCharts("/api/book/equity");
 // The tab bar's counts update live; this keeps the open tab marked after they do.
 document.addEventListener("live:swap", () => window.dispatchEvent(new HashChangeEvent("hashchange")));</script>
 {% endblock %}

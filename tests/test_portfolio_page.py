@@ -5,6 +5,8 @@ import re
 
 from test_dashboard import AUTH, SAME, client  # noqa: F401 - the fixture
 
+from sleeve_fund.dashboard import reasons
+
 PERP = {"market": "perp", "allow_short": True}
 
 
@@ -72,11 +74,18 @@ def test_close_reuses_the_strategy_flatten_with_a_reason(client):  # noqa: F811
     page = c.get("/", auth=AUTH).text
     dlg = page.split('<dialog id="dlg-close-pp-short"')[1].split("</dialog>")[0]
     assert 'action="/sleeves/pp-short/command"' in dlg and 'name="command" value="flatten"' in dlg
-    assert 'name="reason"' in dlg and "required" in dlg and "then pauses the strategy" in dlg
+    assert "then pauses the strategy" in dlg
+    # The Flatten / Close position reason list plus Other, as on the strategy page; confirm waits for a pick.
+    for r, _ in reasons.ACTION_REASONS["close"]:
+        assert f'name="reason_pick" value="{r}"' in dlg
+    assert 'value="Other"' in dlg and 'name="reason_for" value="close"' in dlg
+    assert "data-needs-reason disabled" in dlg
     assert 'data-open="dlg-close-pp-short"' in page
-    r = c.post("/sleeves/pp-short/command", data={"command": "flatten", "reason": "Reducing exposure"}, auth=AUTH,
-               headers=SAME, follow_redirects=False)
+    r = c.post("/sleeves/pp-short/command", data={"command": "flatten", "reason_for": "close",
+                                                  "reason_pick": "Reducing exposure", "reason_note": ""},
+               auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and store.pending_commands("pp-short")[0]["command"] == "flatten"
+    assert store.decisions("pp-short", limit=1)[0]["reason"] == "Reducing exposure"
     # A flatten already waiting: Close is disabled rather than queueing a second one.
     again = c.get("/", auth=AUTH).text
     button = again.split('data-open="dlg-close-pp-short"')[1].split(">")[0]

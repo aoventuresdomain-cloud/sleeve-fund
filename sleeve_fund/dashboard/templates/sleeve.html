@@ -49,15 +49,15 @@
 {% if command_error %}<div class="banner loss" role="alert" data-once>Not done: {{ command_error }}.</div>{% endif %}
 {% if done %}<div class="toast" role="status" data-once>{{ done }}</div>{% elif then_stop and not (held or flatten_waits) and s.desired_state == 'running' %}{% elif then_stop %}<div class="toast" role="status">Flatten sent first. Reason: {{ then_stop }}.</div>{% endif %}
 
-<section class="ledger kpi7" aria-label="Strategy figures">
-  <div class="lead-box"><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">started with {{ s.starting_balance|money }} {{ quote }}</div></div>
-  {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
-  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">vs buy and hold {{ x.bench_ret|pct1s }}</div></div>
-  {% if perp %}<div><div class="k" title="The margin the position takes at the risk profile's {{ '%g'|format(x.profile.max_leverage) }}x leverage cap: its notional over the cap, as a share of equity">Margin used</div><div class="v">{{ ((x.position_value|abs) / x.profile.max_leverage / x.equity if x.equity > 0 else 0)|pct0 }}</div><div class="s">{% if x.qty %}notional {{ x.exposure|abs|pct0 }} · {{ "short" if x.qty < 0 else "long" }}{% if perp.leverage %} {{ '%.2f'|format(perp.leverage) }}×{% endif %}{% else %}flat{% endif %}</div></div>
-  {% else %}<div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% else %}all cash{% endif %} · spot, no margin</div></div>{% endif %}
-  <div><div class="k">Unrealised {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no position{% endif %}</div></div>
-  <div><div class="k">Realised {{ help('realised') }}</div><div class="v">{{ money_signed(realised) }}</div><div class="s">{{ t.trades }} closed trade{{ 's' if t.trades != 1 }}{% if t.trades %} · {{ t.win_rate|pct0 }} won{% endif %}</div></div>
-  <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
+<section class="kpis" aria-label="Strategy figures">
+  <div class="kpi lead"><div class="k">Equity {{ help('equity') }}</div><div class="v">{{ x.equity|money }}</div><div class="s">started with {{ s.starting_balance|money }} {{ quote }}</div></div>
+  {% if not backtest_id %}<div class="kpi"><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
+  <div class="kpi"><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">buy and hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}</div></div>
+  {% if perp %}<div class="kpi"><div class="k" title="The margin the position takes at the risk profile's {{ '%g'|format(x.profile.max_leverage) }}x leverage cap: its notional divided by that cap, as a share of equity">Margin used</div><div class="v">{{ ((x.position_value|abs) / x.profile.max_leverage / x.equity if x.equity > 0 else 0)|pct0 }}</div><div class="s">{% if x.qty %}notional {{ x.exposure|abs|pct0 }} · {{ "short" if x.qty < 0 else "long" }}{% if perp.leverage %} · {{ '%.2f'|format(perp.leverage) }}×{% if perp.liq_px %} · liq {{ perp.liq_px|px }}{% endif %}{% endif %}{% else %}flat{% endif %}</div></div>
+  {% else %}<div class="kpi"><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% else %}all cash{% endif %} · spot, no margin</div></div>{% endif %}
+  <div class="kpi"><div class="k">Unrealised {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no position{% endif %}</div></div>
+  <div class="kpi"><div class="k">Realised {{ help('realised') }}</div><div class="v">{{ money_signed(realised) }}</div><div class="s">{{ t.trades }} closed trade{{ 's' if t.trades != 1 }}{% if t.trades %} · {{ t.win_rate|pct0 }} won{% endif %}</div></div>
+  <div class="kpi"><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
 </section>
 
 {# The strategy's own desk: headline figures stay on top, the detail sits in tabs. Without JavaScript every tab shows, one after another. #}
