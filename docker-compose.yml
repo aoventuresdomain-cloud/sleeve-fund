@@ -43,12 +43,23 @@ services:
     volumes: [backups:/backups, research:/research:ro, ./deploy/backup.sh:/backup.sh:ro]
     entrypoint: ["bash", "/backup.sh"]
 
+  # Runs once per deploy, as root, and hands the writable volumes to the image's user (uid 1000).
+  # Volumes made before the image dropped root (#64), or for a folder the image lacked, are root-owned,
+  # and a folder a root process made in one stays root-owned: the history store couldn't add a venue's
+  # folder, nor the dashboard its tear sheets. Only what isn't 1000 changes.
+  volume-init:
+    build: .
+    user: "0"
+    restart: "no"
+    volumes: [history:/data/history, research:/data/research]
+    command: [find, /data/history, /data/research, "!", -uid, "1000", -exec, chown, "1000:1000", "{}", +]
+
   # Keeps every instrument's minute history current from its venue, into the shared store that
   # research and the backtest page read. Public market data only, no keys.
   history:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
@@ -59,7 +70,7 @@ services:
   history-binance:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
@@ -89,7 +100,7 @@ services:
     # The pages plus one backtest at a time, each in its own process (5 years of 1-minute bars
     # peaked at 0.54 GB). A run past this is stopped and says so; the pages carry on.
     mem_limit: 1536m
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}

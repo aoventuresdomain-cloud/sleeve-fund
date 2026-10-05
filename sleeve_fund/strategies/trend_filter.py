@@ -129,6 +129,10 @@ class TrendFilter(LongFlatStrategy):
             return None
         return self.fast.value > self.slow.value
 
+    @classmethod
+    def weight_sized(cls, params: dict) -> bool:
+        return bool(params.get("vol_target"))  # without a volatility target it is all or nothing
+
     def target_weight(self, bar: Bar) -> float | None:
         on = self.want_long(bar)
         if on is None or not self._cfg.vol_target:

@@ -189,6 +189,42 @@ def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> t
     return params.get("stop_loss"), params.get("take_profit")
 
 
+def position_margin(x: dict) -> tuple[float, float | None]:
+    """The margin x's open position puts up and the price that liquidates it. On a perpetual, isolated at
+    the risk profile's leverage cap, as paper and the demo copy hold it: notional at entry over the cap
+    (markets.isolated_margin, U13-2), liquidated from that margin, not from the strategy's whole equity. On
+    spot, what it cost, with nothing to liquidate. The one place every page takes these from (UI v2, item 7)."""
+    qty, cash = x["qty"], x["cash"]
+    entry = x.get("entry_px") or x["price"]
+    if not qty:
+        return 0.0, None
+    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
+    if t is None:
+        return abs(qty) * entry, None
+    lev = x["profile"].max_leverage
+    return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
+            markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin))
+
+
+def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | None:
+    """What the position loses from the mark if its stop is hit: size x the move to the stop, a fall for a
+    long, a rise for a short (0 once the mark is already past it). None when it has no stop: unbounded."""
+    if stop_px is None:
+        return None
+    side = 1 if qty > 0 else -1
+    return abs(qty) * max(side * (price - stop_px), 0.0)
+
+
+def open_risk(positions: list[dict]) -> dict:
+    """Margin and open risk across positions (open_position's dicts): margin put up, the sum of their Risk to
+    stop, and the strategies whose position has no stop, which leave open risk unbounded."""
+    return {
+        "margin": sum(p["margin"] for p in positions),
+        "open_risk": sum(p["risk_to_stop"] for p in positions if p["risk_to_stop"] is not None),
+        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None],
+    }
+
+
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
                   plans: dict[str, dict] | None = None) -> dict | None:
     """An open position from a sleeve summary (with book extras), or None when flat."""
@@ -200,6 +236,8 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
     plan = (plans or {}).get(lot["order_id"]) if lot else None
     sl, tp = exit_fracs(x["sleeve"].params, entry["signal"] if entry else None, plan)
     cost = abs(x["qty"]) * x["entry_px"]
+    stop_px = x["entry_px"] * (1 - side * sl) if sl is not None else None
+    margin, liq = position_margin(x)
     return {
         "sleeve": x["sleeve"].name,
         "pair": x["sleeve"].instrument,
@@ -212,8 +250,14 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "unrealised_ret": x["unrealised"] / cost if cost else 0.0,
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
-        "stop_px": x["entry_px"] * (1 - side * sl) if sl is not None else None,
+        "stop_px": stop_px,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
+        "notional": abs(x["qty"]) * x["price"],
+        "margin": margin,
+        "leverage": cost / margin if margin else None,
+        "liq_px": liq,
+        "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
+        "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
@@ -227,12 +271,9 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return None
-    qty, price, equity, cash = x["qty"], x["price"], x["equity"], x["cash"]
+    qty, price, equity = x["qty"], x["price"], x["equity"]
     notional = abs(qty * price)
-    # Isolated at the risk profile's leverage cap, as paper and the demo copy hold it (markets.isolated_margin).
-    entry, lev = x.get("entry_px") or price, x["profile"].max_leverage
-    margin = markets.isolated_margin(qty, entry, lev, cash + qty * entry) if qty else 0.0
-    liq = markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin) if qty else None
+    margin, liq = position_margin(x)
     opened = position["opened"] if position else None
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
@@ -281,6 +322,7 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         "stats": stats,
         "unrealised": sum(p["unrealised"] for p in positions),
         "exposure": sum(p["value"] for p in positions),
+        **open_risk(positions),
     }
 
 
@@ -312,6 +354,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
         "notional": sum(abs(r["value"]) for r in rows),
         "realised": sum(r["realised"] for r in rows),
         "fees": sum(r["fees"] for r in rows),
+        **open_risk(rows),
     }
 
 

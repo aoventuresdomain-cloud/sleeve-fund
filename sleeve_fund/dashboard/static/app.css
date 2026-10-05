@@ -1119,6 +1119,13 @@ fieldset.reasons input[type="radio"] { width: auto; margin: 3px 0 0; accent-colo
 fieldset.reasons .note { font-size: 12px; color: var(--muted); margin-top: 4px; }
 fieldset.reasons textarea { width: 100%; min-height: 48px; resize: vertical; }
 fieldset.reasons .logline { margin: 0; font-size: 11.5px; color: var(--faint); }
+/* UI v2 item 9: the reasons as a searchable pick-list, suggested first, then the PM's own. */
+fieldset.reasons .reason-search { width: 100%; }
+fieldset.reasons .reason-list { display: grid; gap: 6px; max-height: 300px; overflow-y: auto; padding-right: 2px; }
+fieldset.reasons .reason-list .grp { margin: 4px 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
+fieldset.reasons .reason-list .none { margin: 0; font-size: 12px; color: var(--muted); }
+fieldset.reasons label.opt.write span { color: var(--accent); }
+fieldset.reasons label[hidden], fieldset.reasons .grp[hidden] { display: none; }
 dialog:has(fieldset.reasons) { max-height: calc(100vh - 24px); overflow-y: auto; }
 .warnbox { background: var(--warn-bg); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); border-radius: var(--r-sm); padding: 9px 11px; font-size: 13px; margin: 0 0 12px; }
 .warnbox b { color: var(--warn); font-weight: 600; }
@@ -1144,3 +1151,57 @@ form.banner.then-stop .then-acts { margin-left: auto; display: flex; gap: 8px; }
 }
 .reset-plan { margin: 0 0 12px; padding-left: 18px; line-height: 1.5; font-size: 13px; }
 .reset-plan li + li { margin-top: 6px; }
+/* --- UI v2 items 8 and 9: Development aligned, pick-lists ------------------------------------------------------- */
+/* The list takes no height of its own, so the study sets the row and both columns end on the same line;
+   the list scrolls inside its box. */
+.dev { align-items: stretch; }
+.plan-col { display: flex; flex-direction: column; gap: 8px; height: 0; min-height: 100%; }
+.plan-col .plan-filters { margin-bottom: 0; }
+.plan-search { width: 100%; }
+.plan-col .plan-list { flex: 1; min-height: 0; overflow-y: auto; gap: 2px; align-content: start; border: 1px solid var(--line); border-radius: 10px; padding: 4px; background: var(--panel); }
+.plan-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "name chip" "meta chip"; column-gap: 8px; align-items: center; padding: 7px 10px; border-radius: 8px; color: var(--text); }
+.plan-row:hover { text-decoration: none; background: var(--neutral-bg); }
+.plan-row[aria-current] { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.plan-row b { grid-area: name; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plan-row .pr-meta { grid-area: meta; font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plan-row .chip { grid-area: chip; }
+.plan-none { padding: 10px; font-size: 12.5px; color: var(--muted); }
+.study .hint.fit { margin: 6px 0 0; }
+@media (max-width: 900px) {
+  .plan-col { height: auto; min-height: 0; }
+  .plan-col .plan-list { overflow: visible; }
+}
+/* The instrument pick-list: a combobox over every venue's listing, with history badges. */
+.picklist { position: relative; min-width: 220px; }
+.picklist .pl-box { position: relative; }
+.picklist .pl-box input { width: 100%; padding-right: 74px; text-transform: uppercase; }
+.picklist .pl-box input::placeholder { text-transform: none; }
+.picklist .pl-kind { position: absolute; right: 9px; top: 50%; transform: translateY(-50%); font-size: 11.5px; color: var(--faint); pointer-events: none; }
+.picklist .pl-menu { position: absolute; z-index: 30; left: 0; right: 0; top: calc(100% + 4px); margin: 0; padding: 4px; list-style: none; max-height: 320px; overflow-y: auto;
+  background: var(--raised); border: 1px solid var(--line-strong); border-radius: var(--r-sm); box-shadow: var(--shadow); }
+.picklist .pl-menu[hidden] { display: none; }
+.picklist .pl-menu .grp { padding: 6px 8px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
+.picklist .pl-menu .opt { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 6px 8px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+.picklist .pl-menu .opt small { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+.picklist .pl-menu .opt small.running { color: var(--gain); }
+.picklist .pl-menu .opt small.paused { color: var(--warn); }
+.picklist .pl-menu .opt[aria-selected="true"] { background: var(--accent-soft); }
+.picklist .pl-menu .opt.own { color: var(--accent); }
+.picklist .pl-menu .none { padding: 8px; font-size: 12.5px; color: var(--muted); }
+.picklist .pl-badge { margin: 4px 0 0; min-height: 1em; }
+.picklist .pl-badge.running { color: var(--gain); }
+.picklist .pl-badge.paused { color: var(--warn); }
+.study .where .picklist { flex: 1 1 260px; max-width: 360px; }
+/* Candle length as chips. */
+.field > .label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.chip-pick { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip-pick label { margin: 0; }
+.chip-pick label { position: relative; }
+.chip-pick input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; pointer-events: none; }
+.chip-pick span { display: block; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: 999px; font-size: 12.5px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.chip-pick span:hover { color: var(--text); }
+.chip-pick input:checked + span { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.chip-pick input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip-pick input:disabled + span { cursor: default; opacity: .6; }
+.chip-pick input:disabled:checked + span { opacity: 1; }
+.study .picklist .pl-badge { display: none; }  /* the study has its own history chip beside it */

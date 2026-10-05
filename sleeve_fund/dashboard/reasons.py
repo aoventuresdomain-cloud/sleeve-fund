@@ -86,6 +86,9 @@ def compose(action: str, picked: str, note: str = "") -> str:
     choices = [r for r, _ in ACTION_REASONS.get(action, [])]
     if not picked:
         raise ValueError("pick a reason")
+    if picked.startswith(OTHER + ":"):  # one of the PM's own reasons, picked again from "You used recently"
+        own = " ".join(picked[len(OTHER) + 1:].split())
+        picked, note = OTHER, f"{own}: {note}" if own and note else own or note
     if picked == OTHER:
         if len(note) < NOTE_MIN:
             raise ValueError(f"Other needs a note of at least {NOTE_MIN} characters")
@@ -93,6 +96,23 @@ def compose(action: str, picked: str, note: str = "") -> str:
     if picked not in choices:
         raise ValueError(f"{picked!r} isn't one of the reasons for this action")
     return f"{picked}: {note}" if note else picked
+
+
+def recent(decisions: list[dict], limit: int = 5) -> list[dict]:
+    """The PM's own reasons ("Other: <text>" in the decision log), newest first and each once, for the
+    picker's "You used recently" group: {"text", "action", "ts"}. `decisions` is newest first."""
+    out, seen = [], set()
+    for d in decisions:
+        reason = str(d.get("reason") or "")
+        if not reason.startswith(OTHER + ": "):
+            continue
+        text = reason[len(OTHER) + 2:].strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            out.append({"text": text, "action": d.get("action") or "", "ts": d.get("ts")})
+        if len(out) == limit:
+            break
+    return out
 
 
 def from_form(action: str, form) -> str:

@@ -1,4 +1,5 @@
-"""Moving averages with no period limit, and the standard RSI.
+"""The averages and RSI the hand-coded models trade: moving averages with no period limit, and the standard RSI.
+Their outputs never change (models depend on them); the block interface is added around them.
 
 The engine's own SimpleMovingAverage, and AverageTrueRange which averages through it, abort the
 whole process (a Rust panic, not an exception) once the period passes 1,024. A 2,000-bar average is
@@ -13,28 +14,23 @@ from collections import deque
 
 from nautilus_trader.model import Bar
 
-# Wilder's averages (RSI, ATR) and exponential ones (EMA) never forget their starting value, only discount it:
-# after k bars it still weighs (1 - 1/n)^k for Wilder, (1 - 2/(n+1))^k for an EMA. Ten lengths take it below
-# 0.01% for RSI(14), so a strategy started on that much history reads what a long-running one would (PM, 5 Oct
-# 2026: "if bare minimum it requires a warm up of 140+ then it requires 140+"). A simple average needs only its
-# own length.
-SETTLE_LENGTHS = 10
+from sleeve_fund.strategies.indicators._common import PERIOD_MAX, BlockBase, Setting, peek, settle_bars, warmup
 
 
-def settle_bars(period: int) -> int:
-    """Bars of history a Wilder or exponential average of `period` needs before it reads as a settled one."""
-    return SETTLE_LENGTHS * int(period)
-
-
-class Sma:
+class Sma(BlockBase):
     """Simple moving average over the last `period` values, O(1) per value. Before `period` values
     have arrived it averages what it has, like the engine's version, but is not yet initialized."""
+
+    SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX),)
 
     def __init__(self, period: int) -> None:
         if period < 1:
             raise ValueError(f"period must be at least 1, got {period}")
         self.period = period
-        self._window: deque[float] = deque(maxlen=period)
+        self.reset()
+
+    def reset(self) -> None:
+        self._window: deque[float] = deque(maxlen=self.period)
         self._sum = 0.0
         self._since_exact = 0
         self.count = 0
@@ -58,14 +54,32 @@ class Sma:
     def initialized(self) -> bool:
         return self.count >= self.period
 
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(close)
 
-class Atr:
+    def _outputs(self) -> dict:
+        return {"value": self.value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return s["period"]
+
+    def peek(self, close: float) -> float | None:
+        return peek(self, close)
+
+
+class Atr(BlockBase):
     """Average true range: the simple average of each bar's range, stretched to the previous close
     when the bar gapped (the engine's default settings)."""
 
+    SETTINGS = (Setting("period", int, 14, 1, PERIOD_MAX),)
+
     def __init__(self, period: int) -> None:
         self.period = period
-        self._avg = Sma(period)
+        self.reset()
+
+    def reset(self) -> None:
+        self._avg = Sma(self.period)
         self._prev_close: float | None = None
 
     def update_raw(self, high: float, low: float, close: float) -> None:
@@ -85,14 +99,26 @@ class Atr:
     def initialized(self) -> bool:
         return self._avg.initialized
 
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(high, low, close)
 
-class Rsi:
+    def _outputs(self) -> dict:
+        return {"value": self.value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return s["period"] + 1  # a simple average of true ranges; the first range needs the bar before
+
+
+class Rsi(BlockBase):
     """Wilder's RSI(period) on the usual 0 to 100 scale, updated with each bar's close: the first average
     gain and loss are the mean of the first `period` changes, each later one (previous x (period - 1) + this
     change) / period. The engine's RelativeStrengthIndex smooths exponentially (alpha 2 / (period + 1))
     instead, which reads about 5 points off the standard RSI on minute bars and touches 30/70 about twice
     as often, so the strategy traded a different RSI from the one the chart draws (review round 11, M11-1).
     dashboard/static/console.js draws these same values (tests/test_indicators.py)."""
+
+    SETTINGS = (Setting("period", int, 14, 2, PERIOD_MAX),)
 
     def __init__(self, period: int = 14) -> None:
         if int(period) != period or period < 2:
@@ -134,6 +160,16 @@ class Rsi:
 
     def handle_bar(self, bar) -> None:
         self.update_raw(bar.close.as_double())
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(close)
+
+    def _outputs(self) -> dict:
+        return {"value": self.value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return settle_bars(s["period"])
 
     def peek(self, close: float) -> float | None:
         """The value this RSI would read if `close` closed the next bar, worked out on a copy so the RSI
