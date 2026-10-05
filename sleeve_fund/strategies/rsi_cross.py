@@ -83,11 +83,8 @@ class RsiCross(LongFlatStrategy):
             need = max(need, sma * int(params.get("trend_minutes", 240)) // max(bar_minutes, 1))
         return need
 
-    def on_start(self) -> None:
-        super().on_start()
-        if self.runtime is not None and self.runtime.book["qty"]:
-            # After a restart while holding: that leg is still on, and its time stop counts from now.
-            self._side = 1 if self.runtime.book["qty"] > 0 else -1
+    def resume_leg(self, side: int, held: int) -> None:
+        self._side, self._held = side, held  # after a restart: the leg, and its time stop, from the journal's entry
 
     def update_indicators(self, bar: Bar) -> None:
         self._prev = self.rsi.value if self.rsi.initialized else None
