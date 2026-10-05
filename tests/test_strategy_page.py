@@ -193,24 +193,45 @@ def test_a_stop_is_not_refused_when_the_process_is_not_there_to_flatten(client):
 
 # --- the page ------------------------------------------------------------------------------------------------
 
-def test_strategy_page_tabs_in_order_with_seven_figures(client):
+def test_strategy_page_tabs_in_order_with_six_figures(client):
     c, store = client
     _sleeve(store, held=0.01)
     page = c.get("/sleeves/btc-x", auth=AUTH).text
     nav = page[page.index("data-tabs>"):page.index("</nav>", page.index("data-tabs>"))]
     tabs = re.findall(r'data-tab="([a-z]+)"', nav)
-    assert tabs == ["overview", "signals", "positions", "trades", "orders", "activity", "path", "settings"]
+    # Trades and Orders leave the top row for the panel under the chart; Signals and Position stay (UI v2).
+    assert tabs == ["overview", "signals", "positions", "activity", "path", "settings"]
     assert ">Path to live<" in nav
     figures = page[page.index('aria-label="Strategy figures"'):page.index("</section>", page.index('aria-label="Strategy figures"'))]
     assert [k.strip() for k in re.findall(r'<div class="k">([^<{]+)', figures)] == [
-        "Equity", "Today", "Since start", "In the market", "Unrealised", "Realised", "Fees paid"]
+        "Equity", "Today", "Since start", "Unrealised", "Realised", "Fees and funding"]
+    assert 'class="s"' not in figures and figures.count(' title="') == 6
     overview = page[page.index('id="tab-overview"'):page.index('id="tab-signals"')]
-    assert 'data-mode-to="price"' in overview and 'data-mode-to="equity"' in overview and 'id="pc"' in overview
-    assert "Why it bought" in overview and "RSI 28 at or below 30" in overview and 'data-open="dlg-close"' in overview
+    # The price chart only, with the signal lamps beside it; no Price / Equity switch.
+    assert "data-mode-to" not in overview and 'id="pc"' in overview and 'class="ov-signals"' in overview
+    assert 'data-live="sig-side"' in overview
+    # Under the chart: Position, Trades, Open orders and Order history, the position's Close on the first.
+    assert re.findall(r'data-sub="(\w+)"', overview) == ["pos", "trades", "open", "history"]
+    assert 'data-open="dlg-close"' in overview and "Room to halt" in overview and "Today's loss" in overview
     path = page[page.index('id="tab-path"'):page.index('id="tab-settings"')]
     assert "Research" in path and "Demo check" in path and "G2 approval" in path and "Your G2 approval" in path
     activity = page[page.index('id="tab-activity"'):page.index('id="tab-path"')]
     assert [k for k in re.findall(r'data-chip="([a-z]+)"', activity)] == ["all", "decisions", "risk", "system"]
+
+
+def test_open_orders_counts_working_orders_only(client):
+    c, store = client
+    _sleeve(store, held=0.01)
+    store.update_order("E-1", status="filled")  # the fixture's entry, still working until now
+    for n in range(18):
+        store.record_order("btc-x", order_id=f"F-{n}", side="BUY", qty=0.001, intent="entry", reason="filled one")
+        store.update_order(f"F-{n}", fill_qty=0.001, fill_px=60_000, fee=0.01)
+    page = c.get("/sleeves/btc-x", auth=AUTH).text
+    bar = page.split('class="sub-tabs"')[1].split("</div>")[0]
+    assert re.search(r'data-sub="open"[^>]*>Open orders<span class="n">0</span>', bar)
+    assert re.search(r'data-sub="history"[^>]*>Order history</button>', bar)  # no count on history
+    history = page.split('data-sub-panel="history"')[1].split("data-sub-panel")[0]
+    assert "filled one" in history
 
 
 def test_settings_save_opens_a_confirm_with_the_changes(client):

@@ -1060,13 +1060,27 @@ nav.tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; 
 
 /* --- Strategy page (combined build F2-F4): figures, overview, filters, path to live, reasons ------------- */
 .page-head .sub-line { color: var(--faint); font-size: 12.5px; }
-.ov-term { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 14px; margin-bottom: 14px; align-items: start; }
-.ov-chart { position: relative; min-width: 0; }
-.ov-chart[data-mode="price"] .ov-equity, .ov-chart[data-mode="equity"] .ov-price { display: none; }
-.ov-chart .price-chart, .ov-chart .ov-equity { margin: 0; }
-.ov-switch { display: inline-flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--neutral-bg); margin-bottom: 8px; }
-.ov-switch button { background: transparent; border: 0; color: var(--muted); padding: 4px 12px; font-size: 12.5px; font-weight: 500; border-radius: 6px; box-shadow: none; }
-.ov-switch button[aria-pressed="true"] { background: var(--raised); color: var(--text); }
+.ov-term { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; margin-bottom: 14px; align-items: start; }
+.ov-term.no-signals { grid-template-columns: minmax(0, 1fr); }
+.ov-price { min-width: 0; }
+.ov-price .price-chart { margin: 0; }
+/* Signals beside the chart: the same lamps as the Signals tab, one card under another. */
+.ov-signals { min-width: 0; max-height: 640px; overflow-y: auto; }
+.ov-signals .sig-board { grid-template-columns: 1fr; gap: 10px; }
+.ov-signals .sig-card { margin: 0; }
+.ov-signals .sig-timing { margin: 8px 2px 0; font-size: 12px; }
+/* Under the chart: Position, Trades, Open orders and Order history in one panel. */
+.ov-lower { margin-bottom: 14px; }
+.ov-lower .panel { border: 0; background: none; margin: 0; box-shadow: none; }
+.sub-tabs { display: flex; gap: 4px; padding: 6px 12px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.sub-tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 8px 10px; font-size: 13px; font-weight: 500; box-shadow: none; white-space: nowrap; }
+.sub-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.sub-tabs .n { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: var(--neutral-bg); font-size: 11.5px; text-align: center; }
+.limit-bars { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 24px; padding: 12px 18px 16px; border-top: 1px solid var(--line); font-size: 12.5px; }
+.limit-bars > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.limit-bars .k { color: var(--muted); white-space: nowrap; }
+.limit-bars b { font-weight: 550; white-space: nowrap; }
+@media (max-width: 900px) { .limit-bars { grid-template-columns: 1fr; } }
 .kv-list { display: grid; gap: 7px; margin: 0; font-size: 12.5px; }
 .kv-list > div { display: flex; justify-content: space-between; gap: 10px; }
 .kv-list dt { color: var(--faint); } .kv-list dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
