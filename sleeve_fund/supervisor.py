@@ -231,9 +231,13 @@ def clear(store: Store, path: str) -> list[str]:
                    if e["message"].startswith(f"{reason}:")}
         holding = []
         for s in store.sleeves():
-            if s.name in keep or s.name in put_away or (waiting and s.name not in waiting):
+            if s.name in keep or (waiting and s.name not in waiting):
                 continue
             qty = store.journal_book(s.name, s.starting_balance)["qty"]
+            if s.name in put_away and abs(qty) <= 1e-12 and s.name not in waiting:
+                continue  # put away flat by an earlier slate
+            # One archived while still holding (the 4 Oct slate, before holders were flattened first) is
+            # flattened like any other holder: until it is flat it stays in the book's figures.
             if abs(qty) > 1e-12:
                 holding.append(s.name)
                 if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
@@ -267,6 +271,9 @@ def book_line(store: Store) -> str:
     parts = []
     for s in store.sleeves():
         if s.name in archived:
+            qty = store.journal_book(s.name, s.starting_balance)["qty"]
+            if abs(qty) > 1e-12:  # still counted in the book until it is flat
+                parts.append(f"{s.name} {s.starting_balance:,.0f} (archived, still holding {qty:.12g}, {s.desired_state})")
             continue
         history = "has history" if store.fills(s.name, limit=1) or store.last_equity(s.name) else "no history"
         parts.append(f"{s.name} {s.starting_balance:,.0f} ({s.desired_state}, {history})")
