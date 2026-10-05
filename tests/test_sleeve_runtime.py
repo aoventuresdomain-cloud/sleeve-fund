@@ -600,3 +600,19 @@ def test_an_expired_daily_loss_pause_owes_nothing_after_a_restart(store):
     t[0] += timedelta(hours=25)
     rt = _restart(store, t)
     assert rt.tick(equity=9_400, cash=0, qty=1.0, price=9_400) is None
+
+
+def test_reconcile_allows_the_float_step_at_a_large_position(store):
+    """Review round 12, M12-E1: at 1.6e8 units (a sub-cent instrument) one float step is 3e-8, wider than two
+    lots of 8 decimals, so a gap no float could avoid halted a backtest. A real gap still halts."""
+    import math
+
+    _sleeve(store)
+    held = 159660965.631
+    store.record_fill("s1", side="BUY", qty=held, price=0.00002, fee=0.0, order_id="x", trade_id="x")
+    rt = SleeveRuntime(store, "s1", now=utcnow_fixed)
+    cash = 10_000 - held * 0.00002
+    drift = held + math.ulp(held)  # one float step: about 3e-8 here
+    assert drift - held > 2e-8  # more than two 8-decimal lots
+    assert rt.reconcile(cash=cash, qty=drift, qty_tolerance=2e-8)
+    assert not rt.reconcile(cash=cash, qty=held + 0.001, qty_tolerance=2e-8)
