@@ -59,7 +59,7 @@ class SleeveRuntime:
         self.name = sleeve_name
         sleeve = store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
-        self.cap = risk.position_cap(self.profile, sleeve.params)  # a perp's is its leverage cap
+        self.cap = risk.position_cap(self.profile, sleeve.params)  # on a perp, the margin cap times the leverage cap
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
@@ -189,8 +189,8 @@ class SleeveRuntime:
         if self.bench_base_price is None:
             self.bench_base_price = price
         # Buy and hold at the exposure this sleeve may take (its position cap), the rest in cash, so the
-        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap is its
-        # leverage cap and a levered hold can't be liquidated. The backtest page's definition, so a saved
+        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap can pass 1x
+        # and a levered hold can't be liquidated. The backtest page's definition, so a saved
         # run's screen and its result agree (round 12, M12-U1).
         cap = min(self.cap, 1.0)
         benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)

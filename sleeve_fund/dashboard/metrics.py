@@ -20,7 +20,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
     out = {
         "sleeve": s,
         "profile": prof,
-        "cap": position_cap(prof, s.params),  # a perpetual's is its leverage cap
+        "cap": position_cap(prof, s.params),  # on a perpetual, the margin cap times the leverage cap
         "equity": s.starting_balance,
         "benchmark": s.starting_balance,
         "ret": 0.0,

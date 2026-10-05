@@ -141,6 +141,11 @@ def test_research_and_tearsheet(client):
     assert md.headers["content-disposition"] == 'attachment; filename="trend_filter_x.md"' and "|" in md.text
     assert c.get("/research/..%2F..%2Fetc%2Fpasswd/download", auth=AUTH).status_code == 404
     assert c.get("/research/nope/download", auth=AUTH).status_code == 404
+    # A refresh or Back onto a form's address (a GET) returns to the research page, not "no such tear sheet".
+    for path, to in (("/research/history?venue=binance", "/research?venue=binance#history"),
+                     ("/research/run", "/research?venue=kraken"), ("/research/history?venue=nope", "/research?venue=kraken#history")):
+        r = c.get(path, auth=AUTH, follow_redirects=False)
+        assert (r.status_code, r.headers["location"]) == (303, to), path
     assert c.get("/decisions", auth=AUTH).status_code == 200
     assert c.get("/sleeves/new", auth=AUTH).status_code == 200
 
@@ -1209,7 +1214,7 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(3), cursor="x")
     old = _stored_minutes(3)
     history.HistoryStore().append("KRAKEN", "BTC/USD", old.set_axis(old.index - pd.Timedelta(days=30)), cursor="y")
-    listed = {"SOL/USD"}
+    listed = {"ADA/USD"}
 
     def check(pair):
         if pair not in listed:
@@ -1222,17 +1227,17 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
     assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
     # Another site can't ask, an unlisted instrument is refused, and a listed one is queued once.
-    assert c.post("/research/history", data={"instrument": "SOL/USD"}, auth=AUTH,
+    assert c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH,
                   headers={"Origin": "https://evil.example"}).status_code == 403
     bad = c.post("/research/history", data={"instrument": "FOO/USD"}, auth=AUTH, headers=SAME)
     assert "Kraken does not list FOO/USD" in bad.text and not store.history_requests("KRAKEN")
-    ok = c.post("/research/history", data={"instrument": "sol/usd"}, auth=AUTH, headers=SAME)
-    assert "Asked the collector for SOL/USD: it backfills from" in ok.text
-    assert re.search(r"SOL/USD</td>.*?Asked for", ok.text, re.S)
+    ok = c.post("/research/history", data={"instrument": "ada/usd"}, auth=AUTH, headers=SAME)
+    assert "Asked the collector for ADA/USD: it backfills from" in ok.text
+    assert re.search(r"ADA/USD</td>.*?Asked for", ok.text, re.S)
     (req,) = store.history_requests("KRAKEN")
-    assert req["instrument"] == "SOL/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
-    again = c.post("/research/history", data={"instrument": "SOL/USD"}, auth=AUTH, headers=SAME)
-    assert "SOL/USD was already asked for" in again.text and len(store.history_requests("KRAKEN")) == 1
+    assert req["instrument"] == "ADA/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
+    again = c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH, headers=SAME)
+    assert "ADA/USD was already asked for" in again.text and len(store.history_requests("KRAKEN")) == 1
     # Review round 9, N5: a stored pair was asked for again, a mistyped one offered a button that failed the
     # same way, and with the venue unreachable any pair was asked for, to sit "Asked for" for good.
     stored = c.post("/research/history", data={"instrument": "eth/usd"}, auth=AUTH, headers=SAME)
@@ -1248,12 +1253,16 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     down = c.post("/research/history", data={"instrument": "ZZZQ/USD"}, auth=AUTH, headers=SAME)
     assert "couldn&#39;t reach Kraken spot to check it lists ZZZQ/USD, so nothing was asked for" in down.text
     assert len(store.history_requests("KRAKEN")) == 1
+    # A core instrument is always stored from its listing: no request, and no "five years back" to mislead.
+    core = c.post("/research/history", data={"instrument": "sol/usd"}, auth=AUTH, headers=SAME)
+    assert "SOL/USD is on the collector&#39;s core list for Kraken spot: it is stored from its listing" in core.text
+    assert len(store.history_requests("KRAKEN")) == 1
     # A study on it before anything is stored says so, without offering to ask again.
-    form = {"strategy": "buy_and_hold", "instrument": "SOL/USD", "minutes": "240", "train_days": "60",
+    form = {"strategy": "buy_and_hold", "instrument": "ADA/USD", "minutes": "240", "train_days": "60",
             "test_days": "30", "holdout_days": "0"}
     r = c.post("/research/run", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
-    assert r.status_code == 200 and "SOL/USD&#39;s history was asked for on" in r.text
-    assert "Collect SOL/USD history</button>" not in r.text
+    assert r.status_code == 200 and "ADA/USD&#39;s history was asked for on" in r.text
+    assert "Collect ADA/USD history</button>" not in r.text
 
 
 def test_the_form_and_the_backtest_refuse_a_thin_target_at_the_same_round_trip(client, monkeypatch):
@@ -1847,9 +1856,9 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert '<td data-label="Instrument">SOL/USDT</td>' in page and '<td data-label="Instrument">ETH/USD</td>' not in page
     assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
     assert '<td data-label="Instrument">ETH/USD</td>' in c.get("/research", auth=AUTH).text
-    asked = c.post("/research/history", data={"instrument": "xrp/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
-    assert "Asked the collector for XRP/USDT" in asked.text and not store.history_requests("KRAKEN")
-    assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["XRP/USDT"]
+    asked = c.post("/research/history", data={"instrument": "doge/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
+    assert "Asked the collector for DOGE/USDT" in asked.text and not store.history_requests("KRAKEN")
+    assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["DOGE/USDT"]
     none = c.post("/research/run", data={"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance",
                                          "minutes": "1440", "risk_profile": "balanced"}, auth=AUTH, headers=SAME)
     assert "no stored Binance USD-M perpetuals history for BTC/USDT" in none.text

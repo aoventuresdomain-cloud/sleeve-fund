@@ -765,7 +765,7 @@ def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
                        risk_profile="balanced", bar_minutes=60, half_spread=HALF)
     j = res.journal
     entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
-    assert entries and all(o["signal"]["sized_by"] == "2x leverage cap" for o in entries)  # funding on 2x
+    assert entries and all(o["signal"]["sized_by"] == "balanced risk profile cap" for o in entries)  # 0.66x
     held, cash = 0.0, 10_000.0
     for f in j.fills_:
         sign = 1 if f["side"] == "BUY" else -1
@@ -796,13 +796,16 @@ def _swing(n=400):
 
 
 @pytest.mark.parametrize("profile", ["conservative", "balanced", "aggressive"])
-def test_a_perp_entry_takes_the_leverage_cap_and_its_liquidation_price_is_where_the_margin_runs_out(profile):
-    """Sizing on a perp (PM decision, 4 Oct): every entry, long or short, is the profile's leverage cap of
-    equity (less the cash buffer and fee, never over it), and the liquidation price it reports is where
-    equity falls to the maintenance margin: below the entry for a long, above it for a short, at the
-    textbook (1 -/+ 1/leverage) / (1 -/+ maintenance) of the entry, and outside the profile's minimum
-    distance. A long at 1x is fully paid for and has none."""
+def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_price_is_where_the_margin_runs_out(
+        profile):
+    """Sizing on a perp (PM decision, 5 Oct): every entry, long or short, puts up the profile's position cap
+    of equity as margin (20%, 33%, 50%) at its leverage cap (1x, 2x, 3x), so a notional of the two multiplied,
+    never over it; and the liquidation price it reports is where equity falls to the maintenance margin:
+    below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage) / (1 -/+ maintenance)
+    of the entry, and outside the profile's minimum distance. A long at 1x or less is fully paid for and has
+    none."""
     prof = risk.PROFILES[profile]
+    cap = prof.max_position_pct * prof.max_leverage
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
                      risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
     entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
@@ -810,12 +813,13 @@ def test_a_perp_entry_takes_the_leverage_cap_and_its_liquidation_price_is_where_
     m = float(PERP_FEES.maintenance_margin)
     for o in entries:
         sig = o["signal"]
-        assert sig["sized_by"] == f"{prof.max_leverage:g}x leverage cap", sig
-        if o["side"] == "BUY" and prof.max_leverage <= 1:
+        assert sig["sized_by"] == f"{profile} risk profile cap", sig
+        if o["side"] == "BUY" and cap <= 1:
             assert "liquidation_px" not in sig, sig
             continue
         lev, liq, close = sig["leverage"], sig["liquidation_px"], sig["close"]
-        assert prof.max_leverage * 0.97 <= lev <= prof.max_leverage, sig
+        # The margin, notional over the leverage cap, is the position cap of the equity at entry, never more.
+        assert prof.max_position_pct * 0.94 <= lev / prof.max_leverage <= prof.max_position_pct, sig
         side = 1 if o["side"] == "BUY" else -1
         assert (liq < close) if side > 0 else (liq > close), sig
         assert liq / close == pytest.approx((1 - side / lev) / (1 - side * m), rel=2e-3), sig
@@ -827,7 +831,7 @@ def test_a_perp_entry_takes_the_leverage_cap_and_its_liquidation_price_is_where_
     ("aggressive", 0.10, False), ("aggressive", 0.20, True),  # 3x: ~33% away
 ])
 def test_an_entry_whose_stop_sits_past_the_profiles_share_of_the_way_to_liquidation_is_refused(profile, stop,
-                                                                                                refused):
+                                                                                                refused, full_margin):
     """With leverage binding, the stop-to-liquidation rule decides: a stop further than the profile's share
     of the distance to liquidation refuses the entry; one inside it enters, and its stop then sits between
     the entry and the liquidation price, at most that share of the way."""
@@ -873,7 +877,7 @@ def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_w
 
 
 @pytest.mark.parametrize("profile", ["balanced", "aggressive"])
-def test_a_crash_under_a_leveraged_long_is_sold_by_the_guards_before_the_venue_would_liquidate(profile):
+def test_a_crash_under_a_leveraged_long_is_sold_by_the_guards_before_the_venue_would_liquidate(profile, full_margin):
     """The mirror of the rally: a long at 2x or 3x in a steady fall to a third of its price is sold in
     full by the guards at a price above its liquidation price, the book ends flat with equity left."""
     c = np.r_[np.full(10, 60_000.0), np.linspace(60_000, 20_000, 200)]
@@ -964,7 +968,7 @@ def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_sto
 
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
 @pytest.mark.parametrize("profile", ["balanced", "aggressive"])
-def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no_more(profile, strategy, gap):
+def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no_more(profile, strategy, gap, full_margin):
     """M11-3: a price that jumps past the liquidation price between bars, with no bar near it for the guards
     to act on, is liquidated: one order with the 'liquidation' intent closes the whole position, the book is
     flat after it, and the strategy is halted (no entry after it)."""
