@@ -30,6 +30,8 @@ def daily(store: Store, sleeve: str) -> pd.DataFrame:
 
 def _start_of(now: datetime, unit: str) -> datetime:
     day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if unit == "week":  # Monday 00:00 UTC
+        return day - pd.Timedelta(days=day.weekday())
     return day.replace(day=1) if unit == "month" else day
 
 
@@ -42,6 +44,7 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
     """Adds day/MTD P&L, open position, sparkline and last activity to a sleeve_summary dict."""
     s, now = x["sleeve"], utcnow()
     day_open = _equity_at(store, s, _start_of(now, "day"))
+    week_open = _equity_at(store, s, _start_of(now, "week"))
     month_open = _equity_at(store, s, _start_of(now, "month"))
     book = store.journal_book(s.name, s.starting_balance)
     last = store.last_equity(s.name)
@@ -55,6 +58,7 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
         mode="paper",
         day_pnl=x["equity"] - day_open,
         day_ret=x["equity"] / day_open - 1 if day_open else 0.0,
+        week_pnl=x["equity"] - week_open,
         mtd_pnl=x["equity"] - month_open,
         qty=qty,
         price=price,
@@ -110,6 +114,7 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "ret": equity / start - 1 if start else 0.0,
         "bench_ret": (sum(x["benchmark"] for x in active) / start - 1) if start else 0.0,
         "day_pnl": sum(x["day_pnl"] for x in active),
+        "week_pnl": sum(x["week_pnl"] for x in active),
         "mtd_pnl": sum(x["mtd_pnl"] for x in active),
         "exposure": exposure,
         "exposure_pct": exposure / equity if equity else 0.0,
@@ -212,3 +217,37 @@ def correlation(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
     corr = rets.corr(min_periods=MIN_DAYS_FOR_CORRELATION)
     return {"names": names, "matrix": [[(None if pd.isna(corr.loc[a, b]) else round(float(corr.loc[a, b]), 2))
                                          for b in names] for a in names]}
+
+
+HOLDINGS_SHOWN = 10
+
+
+def holdings(rows: list[dict], equity: float, limit: int = HOLDINGS_SHOWN) -> dict:
+    """The book's open positions netted by instrument across strategies, largest notional first, for the
+    allocation bar and the top holdings table under it. rows are trading.book_positions rows. Notional is
+    the net position's value at the mark; weight is notional over book value; share is the instrument's part
+    of the summed notional (the bar's segment). Margin adds up each position's isolated margin when the rows
+    carry it, else None. crossing: one strategy long and another short the same instrument."""
+    by: dict[tuple[str, bool], dict] = {}
+    for r in rows:
+        perp = r.get("perp") is not None
+        h = by.setdefault((r["pair"], perp), {"instrument": r["pair"], "perp": perp, "qty": 0.0, "value": 0.0,
+                                               "unrealised": 0.0, "margin": 0.0, "held": [], "sides": set()})
+        h["qty"] += r["qty"]
+        h["value"] += r["value"]
+        h["unrealised"] += r["unrealised"]
+        m = r.get("margin")
+        h["margin"] = None if m is None or h["margin"] is None else h["margin"] + m
+        h["held"].append({"sleeve": r["sleeve"], "side": r["side"]})
+        h["sides"].add(r["side"])
+    out = []
+    for h in by.values():
+        sides = h.pop("sides")
+        notional = abs(h["value"])
+        out.append({**h, "notional": notional, "side": (1 if h["value"] > 0 else -1 if h["value"] < 0 else 0),
+                    "weight": notional / equity if equity > 0 else 0.0, "crossing": len(sides) > 1})
+    out.sort(key=lambda h: -h["notional"])
+    total = sum(h["notional"] for h in out)
+    for h in out:
+        h["share"] = h["notional"] / total if total else 0.0
+    return {"rows": out[:limit], "count": len(out), "notional": total}

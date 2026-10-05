@@ -63,6 +63,10 @@ def site(tmp_path_factory):
             "p_trend_filter__fast": "10", "p_trend_filter__slow": "30", "reason": "browser test"}
     r = httpx.post(f"{base}/sleeves/new", data=form, auth=("pm", PASSWORD), headers={"origin": base})
     assert r.status_code in (200, 303), r.text[:300]
+    # Two marks today: a book under two days old, so the book chart must open on 1D with its points showing.
+    marks = Store(f"sqlite:///{tmp}/b.db")
+    marks.record_equity("eth-trend", equity=5_000, cash=5_000, qty=0, price=2_500, benchmark=5_000)
+    marks.record_equity("eth-trend", equity=5_012.5, cash=5_012.5, qty=0, price=2_510, benchmark=5_010)
     yield base
     server.should_exit = True
     thread.join(timeout=5)
@@ -97,6 +101,20 @@ PAGES = ["/", "/trades", "/orders", "/alerts", "/risk", "/ops", "/research", "/s
 def test_page_runs_without_script_errors(site, browser, path):
     page, errors = _open(browser, site + path)
     assert "Couldn't run it" not in page.content()
+    assert errors == []
+    page.context.close()
+
+
+def test_book_chart_opens_young_books_on_1d_and_switches_to_percent(site, browser):
+    page, errors = _open(browser, site + "/")
+    page.wait_for_selector("#curve-h ~ * .chart-legend, .chart-legend", timeout=5000)
+    assert page.get_attribute('[data-days="1"]', "aria-pressed") == "true"
+    assert page.locator("#eq canvas").count() >= 1  # drawn by Lightweight Charts, not Chart.js
+    legend = page.inner_text(".chart-legend")
+    assert "Book" in legend and "5,012.50" in legend
+    page.click('[data-unit="pct"]')
+    assert page.get_attribute('[data-unit="pct"]', "aria-pressed") == "true"
+    assert "%" in page.inner_text(".chart-legend").split("Drawdown")[0]
     assert errors == []
     page.context.close()
 

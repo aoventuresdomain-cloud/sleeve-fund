@@ -1003,8 +1003,11 @@ def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(
     book = c.get("/api/book/equity", auth=AUTH).json()
     assert book["start"] == 50_000 and book["equity"] == [40_000, 30_000]
     assert book["drawdown"] == [pytest.approx(0.2), pytest.approx(0.4)]  # from 50,000, not the 40,000 close
-    tile = c.get("/", auth=AUTH).text.split("Drawdown")[1].split("</div></div>")[0]
-    assert "40.0%" in tile and "worst 40.0%" in tile, tile
+    # The tile shows the drawdown; the worst is in its hover title (UI v2: a label and a number only).
+    page = c.get("/", auth=AUTH).text
+    before, after = page.split('<div class="k">Drawdown</div>', 1)
+    tile = before.rsplit('<div class="kpi"', 1)[1] + after.split("</div>")[0]
+    assert "40.0%" in tile and "Worst 40.0%" in tile, tile
     # One strategy whose first mark is already a loss: its chart and figures count it from its starting balance.
     store.create_sleeve(name="late", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})

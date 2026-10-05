@@ -1130,3 +1130,24 @@ form.banner.then-stop .then-acts { margin-left: auto; display: flex; gap: 8px; }
 }
 .reset-plan { margin: 0 0 12px; padding-left: 18px; line-height: 1.5; font-size: 13px; }
 .reset-plan li + li { margin-top: 6px; }
+
+/* --- Portfolio, UI v2 --------------------------------------------------------- */
+/* Needs you: shown only while an alert waits to be acknowledged. */
+.needs-you { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 9px 12px; margin-bottom: 12px; border-radius: 10px;
+  background: var(--loss-bg); border: 1px solid color-mix(in srgb, var(--loss) 40%, transparent); font-size: 13px; }
+.needs-you .tag { flex: none; font-weight: 600; color: var(--loss); }
+.needs-you .grow { flex: 1 1 240px; min-width: 0; }
+.needs-you .when { color: var(--muted); font-size: 12px; }
+.needs-you form { margin: 0; }
+@media (min-width: 901px) and (max-width: 1399px) { .kpis.ledger8 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.chart.lw { height: 300px; }
+.chart.short.lw { height: 92px; }
+table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px solid var(--line-strong); border-bottom: 0; color: var(--text); font-weight: 550; }
+/* Allocation: the bar's segments and the holdings rows share order and colour. */
+.alloc-bar { display: flex; gap: 2px; height: 14px; border-radius: 4px; overflow: hidden; margin: 2px 18px 10px; background: var(--neutral-bg); }
+.alloc-bar i { display: block; height: 100%; min-width: 2px; }
+.wbar { display: inline-block; position: relative; width: 80px; height: 6px; margin-left: 8px; border-radius: 3px; background: var(--accent-soft); vertical-align: middle; }
+.wbar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); }
+.held-by { color: var(--muted); font-size: 12.5px; }
+.chip.warn { color: var(--warn); background: var(--warn-bg); box-shadow: none; }
+.chip.warn::before { display: none; }
