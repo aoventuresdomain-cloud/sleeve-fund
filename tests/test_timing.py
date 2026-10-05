@@ -3,6 +3,8 @@ microsecond, for close-to-fill times per strategy."""
 
 from datetime import datetime, timezone
 
+import pytest
+
 from sleeve_fund.store import Store
 from tests.test_dashboard import AUTH, client  # noqa: F401
 
@@ -107,3 +109,53 @@ def test_a_bar_that_closed_while_the_strategy_was_down_is_decided_once_if_still_
     assert late_bar(bars, NS + minute, minute, down, None) is None  # a bar old: history, not a signal
     assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS + 1_000_000)) is None  # acted on before
     assert late_bar([], NS, minute, down, None) is None
+
+
+def test_journal_writes_leave_the_decision_path_and_every_read_sees_them():
+    import time
+
+    from sleeve_fund.paper.queued import QueuedStore
+
+    class Slow(Store):
+        def record_order(self, *a, **k):
+            time.sleep(0.2)
+            super().record_order(*a, **k)
+
+    slow = Slow.in_memory()
+    slow.create_sleeve(name="pp", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                       starting_balance=10_000)
+    q = QueuedStore(slow)
+    t0 = time.monotonic()
+    q.record_order("pp", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="test")
+    q.record_timing("pp", "O-1", decided=NS, sent=NS)  # after its order, in order
+    assert time.monotonic() - t0 < 0.05  # the decision didn't wait for the database
+    assert [o["order_id"] for o in q.orders("pp")] == ["O-1"] and len(q.timings("pp")) == 1  # reads wait
+    q.record_order("pp", order_id="O-2", side="BUY", qty=0.1, intent="nonsense", reason="test")
+    with pytest.raises(RuntimeError, match="journal write failed"):
+        q.orders("pp")  # a failed write surfaces on the next read
+    assert [o["order_id"] for o in q.orders("pp")] == ["O-1"]
+
+
+def test_a_run_journals_the_same_through_the_queue():
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.paper.queued import QueuedStore
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.venues import venue
+
+    prices = synthetic_ohlcv(days=300, seed=5, vol=0.03)
+    inst = venue("kraken").instrument("ETH", "USD")
+
+    def journal(wrap):
+        db = Store.in_memory()
+        db.create_sleeve(name="backtest", strategy="trend_filter", instrument="ETH/USD",
+                         bar_spec="1-DAY-LAST-EXTERNAL", starting_balance=10_000, risk_profile="aggressive")
+        rt = SleeveRuntime(wrap(db), "backtest", tick_seconds=86_400)
+        run_backtest("trend_filter", prices, inst, params={"fast": 5, "slow": 20}, runtime=rt)
+        if wrap is QueuedStore:
+            rt.store.flush()
+        return ([(o["side"], o["intent"], round(o["qty"], 8), o["status"], o["ts"]) for o in db.orders("backtest", limit=10_000)],
+                [(f["side"], round(f["qty"], 8), f["price"]) for f in db.fills("backtest", limit=10_000)])
+
+    direct = journal(lambda db: db)
+    assert direct[0] and journal(QueuedStore) == direct
