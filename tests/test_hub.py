@@ -1,0 +1,180 @@
+"""The market data hub's live side (v2 P1-1): the stream, the fan-out, gaps and their refill."""
+
+import json
+import socket
+import time
+
+import pandas as pd
+import pytest
+
+from nautilus_trader.model import AggressorSide, Bar, BarType, InstrumentId, Price, Quantity, QuoteTick, TradeId, TradeTick
+
+from sleeve_fund.hub import protocol
+from sleeve_fund.hub.relay import MINUTE_NS, Gaps, HubRelay, HubRelayConfig, refill_bars
+from sleeve_fund.hub.server import Fanout
+
+BTC, ETH = "BTCUSDT-PERP.BINANCE", "ETHUSDT-PERP.BINANCE"
+T0 = int(pd.Timestamp("2026-10-05 12:00", tz="UTC").value)
+
+
+def _bar(iid, close_ns, c="60000.10"):
+    return Bar(BarType.from_str(f"{iid}-1-MINUTE-LAST-INTERNAL"), Price.from_str("60000.00"), Price.from_str("60010.00"),
+               Price.from_str("59990.00"), Price.from_str(c), Quantity.from_str("1.250"), close_ns, close_ns)
+
+
+def test_ticks_and_bars_travel_as_the_venues_own_decimals():
+    t = TradeTick(InstrumentId.from_str(BTC), Price.from_str("60000.10"), Quantity.from_str("0.005"),
+                  AggressorSide.from_str("BUY"), TradeId("42"), T0, T0)
+    q = QuoteTick(InstrumentId.from_str(BTC), Price.from_str("60000.00"), Price.from_str("60000.10"),
+                  Quantity.from_str("3.1"), Quantity.from_str("0.7"), T0, T0)
+    msgs = [protocol.trade(t, T0 + 5), protocol.quote(q, T0 + 6), protocol.bar_from_nautilus(_bar(BTC, T0), T0 + 7)]
+    back = [protocol.decode(protocol.encode(m)) for m in msgs]
+    assert back == msgs
+    assert back[0] == {"t": "trade", "id": BTC, "px": "60000.10", "qty": "0.005", "side": "BUY", "tid": "42",
+                       "ts": T0, "recv": T0 + 5}
+    assert back[1]["bid"] == "60000.00" and back[1]["ask_qty"] == "0.7"
+    assert back[2]["c"] == "60000.10" and back[2]["ts"] == T0 and back[2]["refilled"] is False
+
+
+@pytest.mark.parametrize("msg", [{"v": 2, "sub": [BTC]}, {"v": 1, "sub": []}, {"v": 1}, {"v": 1, "sub": [3]}])
+def test_a_subscription_in_another_version_or_without_instruments_is_refused(msg):
+    with pytest.raises(ValueError):
+        protocol.check_subscription(msg)
+
+
+def _connect(port, ids):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(protocol.encode(protocol.subscription(ids)))
+    f = s.makefile("rb")
+    return s, f
+
+
+def _until(f, kind):
+    while True:
+        m = json.loads(f.readline())
+        if m["t"] == kind:
+            return m
+
+
+@pytest.fixture
+def fanout():
+    wanted = []
+    fo = Fanout("BINANCE", known=lambda: {BTC}, want=wanted.extend, heartbeat=0.2, log=lambda *_: None)
+    fo.wanted = wanted
+    fo.start(host="127.0.0.1")
+    yield fo
+    fo.stop()
+
+
+def test_each_client_gets_only_its_instruments_and_every_heartbeat(fanout):
+    a, fa = _connect(fanout.port, [BTC])
+    b, fb = _connect(fanout.port, [ETH])
+    assert _until(fa, "hello")["pending"] == [] and _until(fb, "hello")["pending"] == [ETH]
+    assert fanout.wanted == [ETH]  # not relayed yet: the relay is asked to add it
+    deadline = time.time() + 5
+    while len(fanout.clients) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    fanout.publish({"t": "trade", "id": BTC, "px": "1"})
+    fanout.publish({"t": "trade", "id": ETH, "px": "2"})
+    assert _until(fa, "trade")["px"] == "1" and _until(fb, "trade")["px"] == "2"
+    assert "venue_up" in _until(fa, "hb") and "venue_up" in _until(fb, "hb")
+    a.close(), b.close()
+
+
+def test_a_client_speaking_another_version_is_told_and_closed(fanout):
+    s = socket.create_connection(("127.0.0.1", fanout.port), timeout=5)
+    s.sendall(protocol.encode({"v": 9, "sub": [BTC]}))
+    f = s.makefile("rb")
+    m = json.loads(f.readline())
+    assert m["t"] == "error" and "version 9" in m["message"]
+    assert f.readline() == b""  # closed
+    s.close()
+
+
+def test_a_client_that_falls_behind_is_cut_off_and_the_rest_carry_on(fanout, monkeypatch):
+    from sleeve_fund.hub import server
+
+    monkeypatch.setattr(server, "MAX_QUEUE", 5)
+    slow, _ = _connect(fanout.port, [BTC])  # never reads
+    slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    fast, ff = _connect(fanout.port, [BTC])
+    _until(ff, "hello")
+    deadline = time.time() + 5
+    while len(fanout.clients) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    for i in range(20_000):
+        fanout.publish({"t": "trade", "id": BTC, "px": str(i), "pad": "x" * 200})
+    deadline = time.time() + 10
+    while fanout.cut_off == 0 and time.time() < deadline:
+        ff.readline()
+    assert fanout.cut_off >= 1
+    fast.close(), slow.close()
+
+
+def test_a_skipped_minute_is_a_gap_and_a_late_bar_changes_nothing():
+    g = Gaps()
+    assert g.see(BTC, T0) is None and g.see(BTC, T0 + MINUTE_NS) is None
+    assert g.see(BTC, T0 + 4 * MINUTE_NS) == (T0 + 2 * MINUTE_NS, T0 + 3 * MINUTE_NS)
+    assert g.see(BTC, T0 + 2 * MINUTE_NS) is None  # a refilled bar arriving after: no new gap
+    assert g.see(ETH, T0 + 9 * MINUTE_NS) is None  # instruments are tracked apart
+
+
+def _candles(start, n):
+    idx = pd.date_range(start, periods=n, freq="1min", tz="UTC")
+    c = 100.0 + pd.Series(range(n), index=idx, dtype=float)
+    return pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": 2.0}, index=idx)
+
+
+def test_a_gap_is_refilled_from_the_venues_closed_candles_only():
+    recent = lambda pair, minutes: _candles("2026-10-05 11:50", 15)  # noqa: E731 - 11:50 to 12:04, 12:04 forming
+    bars = refill_bars(recent, "BTC/USDT", BTC, T0 + MINUTE_NS, T0 + 10 * MINUTE_NS, T0 + 11 * MINUTE_NS)
+    # Candles opening 12:00 to 12:03 close 12:01 to 12:04; 12:04's is still forming and left out.
+    assert [b["ts"] for b in bars] == [T0 + k * MINUTE_NS for k in (1, 2, 3, 4)]
+    assert all(b["refilled"] and b["id"] == BTC for b in bars) and bars[0]["o"] == "110.0"
+
+
+class _Fan:
+    def __init__(self):
+        self.sent = []
+
+    def publish(self, m):
+        self.sent.append(m)
+
+
+class _Now:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, fn, *a):
+        self.calls.append(a)
+        fn(*a)
+
+
+def _relay(last_close=None, since=None):
+    stored = []
+    r = HubRelay(HubRelayConfig(instrument_ids=(BTC,)))
+    recent = lambda pair, minutes: _candles("2026-10-05 11:50", 30)  # noqa: E731
+    r.attach(_Fan(), sink=stored.append, pairs={BTC: "BTC/USDT"}, recent=recent, last_close=last_close)
+    r._refill = _Now()
+    r._since[BTC] = since if since is not None else T0 - 10 * MINUTE_NS
+    return r, stored
+
+
+def test_bars_go_to_clients_and_the_store_and_a_missed_stretch_is_refilled_and_flagged():
+    r, stored = _relay(last_close={BTC: T0 - 3 * MINUTE_NS})  # the store ends three minutes back: hub was down
+    r.on_bar(_bar(BTC, T0))
+    gap = next(m for m in r.fanout.sent if m["t"] == "gap")
+    assert (gap["since"], gap["until"]) == (T0 - 2 * MINUTE_NS, T0 - MINUTE_NS)
+    refilled = [m for m in stored if m["refilled"]]
+    assert [m["ts"] for m in refilled] == [T0 - 2 * MINUTE_NS, T0 - MINUTE_NS]
+    live = [m for m in stored if not m["refilled"]]
+    assert [m["ts"] for m in live] == [T0] and live[0] in r.fanout.sent
+
+
+def test_the_first_bar_after_subscribing_is_a_part_bar_and_the_venues_candle_stands_in():
+    r, stored = _relay(since=T0 - 30_000_000_000)  # subscribed half way through the minute that closes at T0
+    r.on_bar(_bar(BTC, T0, c="60001.00"))
+    assert all(m.get("c") != "60001.00" for m in r.fanout.sent)  # the part bar is never published
+    assert [(m["ts"], m["refilled"]) for m in stored] == [(T0, True)]
+    r.on_bar(_bar(BTC, T0 + MINUTE_NS, c="60002.00"))  # the next is whole
+    assert stored[-1]["c"] == "60002.00" and stored[-1]["refilled"] is False

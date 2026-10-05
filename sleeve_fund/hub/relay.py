@@ -1,0 +1,168 @@
+"""The hub's venue side (v2 P1-1): one Nautilus node per venue, holding the venue's one public market-data
+connection, relaying every trade and quote and building each 1-minute bar once (Nautilus's own time-bar
+aggregator, stamped at the bar's close, as the paper strategies build theirs today). Everything goes to the
+fan-out (sleeve_fund.hub.server); closed bars also go to `sink`, the storage side's hook (the history store),
+which this module leaves to its owner.
+
+A minute the hub missed (the venue connection dropped, or the hub was down) is announced as a gap and refilled
+from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits."""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+
+import pandas as pd
+
+from nautilus_trader.common import DataActor, DataActorConfig
+from nautilus_trader.model import BarType, InstrumentId
+
+from sleeve_fund.hub import protocol
+
+MINUTE_NS = 60_000_000_000
+REFRESH_SECONDS = 60  # how often the relay picks up instruments asked for since it started
+VENUE_QUIET_SECONDS = 60  # no trade or quote for this long: the heartbeat says the venue is down
+
+
+def bar_type_for(instrument_id: str) -> BarType:
+    return BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-INTERNAL")
+
+
+class Gaps:
+    """Per instrument, the close of the last bar seen; says which minutes a new bar skipped over."""
+
+    def __init__(self) -> None:
+        self.last: dict[str, int] = {}
+
+    def see(self, instrument_id: str, close_ns: int) -> tuple[int, int] | None:
+        """(first, last) close of the minutes missing before this bar, or None. A bar at or before the last
+        one seen (a refill landing late) changes nothing."""
+        prev = self.last.get(instrument_id)
+        if prev is not None and close_ns <= prev:
+            return None
+        self.last[instrument_id] = close_ns
+        if prev is not None and close_ns - prev > MINUTE_NS:
+            return prev + MINUTE_NS, close_ns - MINUTE_NS
+        return None
+
+
+def refill_bars(recent, pair: str, instrument_id: str, since_ns: int, until_ns: int, now_ns: int) -> list[dict]:
+    """The venue's own closed 1-minute candles closing from since_ns to until_ns, as refilled bar messages.
+    recent: the venue profile's ohlc_history ((pair, minutes) -> candles by open time, newest still forming)."""
+    r = recent(pair, 1).iloc[:-1]
+    closes = (r.index + pd.Timedelta(minutes=1)).as_unit("ns").asi8
+    keep = (closes >= since_ns) & (closes <= until_ns)
+    return [protocol.bar(instrument_id, row.open, row.high, row.low, row.close, row.volume, int(close), now_ns,
+                         refilled=True) for row, close in zip(r[keep].itertuples(), closes[keep])]
+
+
+class HubRelayConfig(DataActorConfig):
+    def __init__(self, *, instrument_ids: tuple[str, ...] = (), **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.instrument_ids = tuple(instrument_ids)
+
+
+class HubRelay(DataActor):
+    """Subscribes to every instrument the hub serves and hands what arrives to the fan-out."""
+
+    def __init__(self, config: HubRelayConfig) -> None:
+        super().__init__(config)
+        self.fanout = None  # attach() before the node runs
+        self.sink: Callable[[dict], None] = lambda bar: None
+        self.pairs: dict[str, str] = {}  # instrument id -> pair, for the REST refill
+        self.recent = None
+        self.relayed: set[str] = set()
+        self.gaps = Gaps()
+        self._wanted: set[str] = set()
+        self._lock = threading.Lock()
+        self._last_tick = 0.0
+        self._refill = ThreadPoolExecutor(1, thread_name_prefix="hub-refill")
+        self._initial = tuple(config.instrument_ids)
+        self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
+
+    def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
+               last_close: dict[str, int] | None = None) -> "HubRelay":
+        """last_close: per instrument, the close of the last bar already stored, so the minutes the hub was
+        down are refilled from its first bar."""
+        self.fanout, self.recent = fanout, recent
+        self.sink = sink or self.sink
+        self.pairs = dict(pairs or {})
+        self.gaps.last.update(last_close or {})
+        return self
+
+    # --- the fan-out asks, from its own thread ------------------------------------------
+
+    def known(self) -> set[str]:
+        with self._lock:
+            return set(self.relayed)
+
+    def want(self, ids: set[str]) -> None:
+        with self._lock:
+            self._wanted |= ids
+
+    def venue_up(self) -> bool:
+        return time.time() - self._last_tick < VENUE_QUIET_SECONDS
+
+    # --- the node's thread ------------------------------------------------------------
+
+    def on_start(self) -> None:
+        for iid in self._initial:
+            self._relay(iid)
+        self.clock.set_timer("hub-refresh", pd.Timedelta(seconds=REFRESH_SECONDS).to_pytimedelta(),
+                             callback=self._refresh)
+
+    def _refresh(self, _event=None) -> None:
+        with self._lock:
+            wanted, self._wanted = self._wanted, set()
+        for iid in sorted(wanted - self.relayed):
+            try:
+                self._relay(iid)
+            except Exception as exc:  # noqa: BLE001 - an id the venue doesn't list: the client stays pending
+                self.log.warning(f"hub: can't relay {iid}: {exc}")
+
+    def _relay(self, iid: str) -> None:
+        inst = InstrumentId.from_str(iid)
+        self.subscribe_trades(inst)
+        self.subscribe_quotes(inst)
+        self.subscribe_bars(bar_type_for(iid))
+        self._since[iid] = time.time_ns()
+        with self._lock:
+            self.relayed.add(iid)
+
+    def on_trade(self, tick) -> None:
+        self._last_tick = time.time()
+        self.fanout.publish(protocol.trade(tick, time.time_ns()))
+
+    def on_quote(self, tick) -> None:
+        self._last_tick = time.time()
+        self.fanout.publish(protocol.quote(tick, time.time_ns()))
+
+    def on_bar(self, bar) -> None:
+        msg = protocol.bar_from_nautilus(bar, time.time_ns())
+        iid, close = msg["id"], msg["ts"]
+        missing = self.gaps.see(iid, close)
+        # The first bar after subscribing opened before the hub saw any of its trades: a part bar, so the
+        # venue's own candle stands in for it.
+        partial = close - MINUTE_NS < self._since.get(iid, 0)
+        if missing is not None or partial:
+            since, until = missing[0] if missing else close, close if partial else missing[1]
+            self.fanout.publish({"t": "gap", "id": iid, "since": since, "until": until})
+            self._refill.submit(self._fill, iid, since, until)
+        if not partial:
+            self.fanout.publish(msg)
+            self.sink(msg)
+
+    def _fill(self, iid: str, since_ns: int, until_ns: int) -> None:
+        pair = self.pairs.get(iid)
+        if pair is None or self.recent is None:
+            return
+        try:
+            bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns())
+        except Exception as exc:  # noqa: BLE001 - the venue's REST down too: the gap stays announced
+            print(f"hub: refill of {iid} failed: {exc!r}")
+            return
+        for b in bars:
+            self.fanout.publish(b)
+            self.sink(b)
