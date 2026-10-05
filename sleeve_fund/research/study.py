@@ -225,12 +225,6 @@ def run_study(
     for combo in grid(spec.param_grid) or [{}]:  # refused up front, before any data is read or run
         check_perp_sizing(spec.name, {**(default_params or spec.default_params or {}), **combo,
                                       **({"market": PERP} if perpetual else {})})
-    if risk_profile is not None:
-        from sleeve_fund.risk import profile as risk_profile_of
-
-        position_cap = risk_profile_of(risk_profile).max_position_pct
-    if position_cap is not None and not 0 < position_cap <= 1:
-        raise ValueError(f"position_cap {position_cap} outside (0, 1]")
     minutes = bar_minutes_of(prices)
     if 1440 % minutes:
         raise ValueError(f"{minutes}-minute bars don't divide a day; use 1, 5, 15, 30, 60, 240 or 1440")
@@ -252,6 +246,17 @@ def run_study(
     profile = VENUES.get(str(instrument.id.venue))
     # A venue that lists perpetuals only has no spot: every run, the benchmark too, holds its perpetual.
     market = {"market": PERP} if profile is not None and profile.perpetual else {}
+    strategy_cap = None
+    if risk_profile is not None:
+        from sleeve_fund.risk import position_cap as cap_of
+        from sleeve_fund.risk import profile as risk_profile_of
+
+        # On a perpetual, the margin cap times the leverage cap, as paper and the backtest page size it; the
+        # benchmark holds that exposure up to all of the capital, as the backtest page's does (review round 13, E13-1).
+        strategy_cap = cap_of(risk_profile_of(risk_profile), market)
+        position_cap = min(strategy_cap, 1.0)
+    if position_cap is not None and not 0 < position_cap <= 1:
+        raise ValueError(f"position_cap {position_cap} outside (0, 1]")
     if half_spread is None:
         from sleeve_fund.venues import venue as venue_profile
 
@@ -395,9 +400,9 @@ def run_study(
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "
-            f"{position_cap:.0%} of capital, the drawdown halt (flat for the rest of the run, as paper stays halted "
-            "until you resume it) and the daily-loss pause. The buy-and-hold benchmark is held at the same exposure "
-            "and never halted.")
+            f"{strategy_cap:.0%} of capital{' in notional' if market else ''}, the drawdown halt (flat for the rest of the run, as paper stays halted "
+            "until you resume it) and the daily-loss pause. The buy-and-hold benchmark is held at "
+            f"{'the same exposure' if position_cap == strategy_cap else f'{position_cap:.0%} of capital'} and never halted.")
     else:
         result.notes.append(
             f"Positions are capped at {position_cap:.0%} of capital, as the paper risk profile allows, and the "

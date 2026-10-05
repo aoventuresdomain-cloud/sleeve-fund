@@ -164,3 +164,23 @@ def test_a_strategy_keeps_its_venue_and_a_backtest_prune_takes_it_away():
     assert store.sleeve("bn").venue == "BINANCE" and store.sleeve("kr").venue is None
     assert {s.name: s.venue for s in store.sleeves()} == {"bn": "BINANCE", "kr": None}
     assert from_store(store.sleeve("bn")).venue == "BINANCE" and from_store(store.sleeve("kr")).venue == "KRAKEN"
+
+
+def test_a_perp_study_holds_its_benchmark_at_the_perp_cap_as_the_backtest_page_does(tmp_path, offline_binance):
+    """On a perpetual the balanced profile puts 33% of equity up as margin at 2x, a notional of 66%. The G1
+    benchmark is held at that, as the backtest page's is (min(cap, 1)), not at the 33% margin share (review
+    round 13, E13-1)."""
+    from sleeve_fund import risk
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+
+    cap = min(risk.position_cap(risk.profile("balanced"), {"market": markets.PERP}), 1.0)
+    assert cap == pytest.approx(0.66)
+    r = run_study(HOLD, synthetic_ohlcv(days=200, seed=4), offline_binance.instrument("BTC", "USDT"), dataset="syn",
+                  ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True, holdout_days=0, train_days=60,
+                  test_days=60, risk_profile="balanced")
+    bench = r.full_period_benchmark.exposure
+    assert abs(bench[bench > 0].iloc[0] - cap) < 0.0015  # sized at the cap on entry, within 0.15 points
+    assert any("capped at 66% of capital in notional" in n and "held at the same exposure" in n for n in r.notes)
