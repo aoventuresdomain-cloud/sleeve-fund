@@ -87,7 +87,7 @@
   </select></div>
   <div class="field" data-when-perp {{ 'hidden' if market == 'spot' }}><label class="check"><input type="checkbox" id="allow_short" name="allow_short" value="1" {{ 'checked' if pre.get('allow_short') in ('1', 'True', 'true', 'on') }}> Allow shorts</label>
     <p class="hint">The model's short leg sells short on the perpetual; without it the short leg is held flat.</p></div>
-  {% if mirror %}<div class="field" data-when-perp {{ 'hidden' if market == 'spot' }}><label class="check"><input type="checkbox" id="demo_mirror" name="demo_mirror" value="1" {{ 'checked' if pre.get('demo_mirror') in ('1', 'True', 'true', 'on') }}> Copy fills to the Deribit testnet</label>
-    <p class="hint">Demo money on the venue's test system, for watching the trades there. The paper book stays the record.</p></div>{% endif %}
+  {% if mirror %}<div class="field" data-when-perp {{ 'hidden' if market == 'spot' }}><label class="check"><input type="checkbox" id="demo_mirror" name="demo_mirror" value="1" {{ 'checked' if pre.get('demo_mirror') in ('1', 'True', 'true', 'on') }}> Copy fills to a demo account</label>
+    <p class="hint">Bybit Demo Trading for a strategy on Binance, else the Deribit testnet: demo money, for watching the trades there. The paper book stays the record.</p></div>{% endif %}
 </div>
 {% endmacro %}

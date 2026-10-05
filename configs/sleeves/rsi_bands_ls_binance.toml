@@ -2,7 +2,8 @@
 # BTCUSDT perpetual, at its published fees (0.02% maker, 0.05% taker) and the funding it settles every
 # 8 hours. Long when RSI(14) closes at or below 30 until it reaches 55; short at or above 70 until it
 # falls back to 50.
-# Added stopped: the PM starts it from the dashboard. Paper only; the paper book is the record.
+# Added stopped: the PM starts it from the dashboard. Its fills are copied to the PM's Bybit Demo Trading
+# account when the demo mirror is on; the paper book stays the record.
 
 [sleeve]
 name = "rsi-bands-ls-binance"
@@ -23,3 +24,4 @@ short_entry = 70.0
 short_exit = 50.0
 market = "perp"
 allow_short = true
+demo_mirror = true                    # copied to Bybit Demo Trading when the mirror is on (sleeve_fund/mirror.py)

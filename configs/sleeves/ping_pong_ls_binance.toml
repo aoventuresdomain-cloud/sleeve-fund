@@ -2,7 +2,8 @@
 # BTCUSDT perpetual, at its published fees (0.02% maker, 0.05% taker) and the funding it settles every
 # 8 hours. Long from the start, sold after a 1% rise in the close and shorted on the same close; the short
 # is covered after a 0.5% dip (its take-profit) and the long bought again.
-# Added stopped: the PM starts it from the dashboard. Paper only; the paper book is the record.
+# Added stopped: the PM starts it from the dashboard. Its fills are copied to the PM's Bybit Demo Trading
+# account when the demo mirror is on; the paper book stays the record.
 
 [sleeve]
 name = "ping-pong-ls-binance"
@@ -20,3 +21,4 @@ rise = 0.01
 dip = 0.005
 market = "perp"
 allow_short = true
+demo_mirror = true                    # copied to Bybit Demo Trading when the mirror is on (sleeve_fund/mirror.py)
