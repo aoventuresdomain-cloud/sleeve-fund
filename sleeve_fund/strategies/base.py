@@ -426,6 +426,7 @@ class LongFlatStrategy(Strategy):
         self._noted: set[str] = set()  # warnings already logged; each is said once until it clears
         self._last_market_ns: int | None = None  # the latest trade or quote, for the price watchdog
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
+        self._side_weight: float | None = None  # perp: the share of equity this bar's target_weight asked for
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
         # Paper: the post-only orders this strategy holds itself rather than at the simulated venue, which
@@ -928,6 +929,7 @@ class LongFlatStrategy(Strategy):
         """The side to be on from this bar's close: +1 long, 0 flat, -1 short (taken only with allow_short);
         None = not enough data yet. The default is want_long's long or flat."""
         w = self.target_weight(bar)
+        self._side_weight = None if w is None else min(max(float(w), 0.0), 1.0)  # sizes the entry (_open)
         return None if w is None else (1 if w > 0 else 0)
 
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
@@ -1008,7 +1010,9 @@ class LongFlatStrategy(Strategy):
 
     def _on_bar_sided(self, bar: Bar) -> None:
         """A perpetual's decision: be long, short or flat, all or nothing. Turning from one side to the
-        other closes first, and the new side opens once the close has filled (on_order_filled)."""
+        other closes first, and the new side opens once the close has filled (on_order_filled). A model that
+        sets a target weight opens at that share of equity, as on spot (review round 13, E13-6)."""
+        self._side_weight = None
         side = self.want_side(bar)
         if side is None:
             return
@@ -1026,7 +1030,7 @@ class LongFlatStrategy(Strategy):
         reason, values = self.explain(bar, side)
         values = {**values, "close": close}
         if current != 0:
-            self._flip = (side, bar, reason, values) if side != 0 else None
+            self._flip = (side, bar, reason, values, self._side_weight) if side != 0 else None
             self._sell_all("exit", reason, values)
             return
         self._open(side, bar, reason, values)
@@ -1069,6 +1073,9 @@ class LongFlatStrategy(Strategy):
             limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+        weight = self._side_weight
+        if weight is not None and weight < 1:
+            limits["target weight"] = Decimal(str(equity * weight))
         if self._cfg.risk_per_trade and self._stop_frac:
             limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
         if (cap := self._volume_cap(bar)) is not None:
@@ -1083,6 +1090,8 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
                   "budget": round(float(budget), 2)}
+        if weight is not None and weight < 1:
+            signal["target_weight"] = round(weight, 6)
         notional = float(qty) * close
         liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
@@ -2366,7 +2375,7 @@ class LongFlatStrategy(Strategy):
             self._resume_exit(coid)
             if self._flip is not None and self._pending_exit is None and self._pos_side() == 0:
                 # Turning from one side to the other: the close has filled, so open the new side now.
-                side, bar, reason, values = self._flip
+                side, bar, reason, values, self._side_weight = self._flip
                 self._flip = None
                 self._open(side, bar, reason, values)
 

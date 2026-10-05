@@ -827,6 +827,42 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
 
 
+class ProbeWeighted(Probe):
+    """A quarter of equity on the clock's long periods, through target_weight, as donchian and vol_target do."""
+
+    def target_weight(self, bar):
+        return 0.25 if self.want_long(bar) else 0.0
+
+
+class ProbeShortWeighted(Probe):
+    """Short a quarter of equity on the clock's odd periods: a want_side model that sets its own weight."""
+
+    def want_side(self, bar):
+        short = self.want_long(bar)
+        self._side_weight = 0.25 if short else None
+        return -1 if short else 0
+
+
+@pytest.mark.parametrize("model", ["probe_weighted", "probe_short_weighted"])
+def test_a_perp_entry_takes_the_models_target_weight_not_the_whole_cap(model, monkeypatch):
+    """Review round 13, E13-6: on a perpetual every entry opened at the full profile cap (66% on balanced), so a
+    model asking for a quarter of equity held 2.6 times that while its reason said a quarter. The entry's
+    notional is the weight's share of equity, within a lot, long and short, and the journal says the weight
+    set it."""
+    monkeypatch.setitem(REGISTRY, "probe_weighted", (ProbeWeighted, ProbeConfig))
+    monkeypatch.setitem(REGISTRY, "probe_short_weighted", (ProbeShortWeighted, ProbeConfig))
+    res = run_backtest(model, _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
+                       risk_profile="balanced", bar_minutes=60, half_spread=HALF)
+    entries = [o for o in res.journal.orders_.values() if o["intent"] == "entry"]
+    assert len(entries) >= 3 and {o["side"] for o in entries} == {"BUY" if model == "probe_weighted" else "SELL"}
+    for o in entries:
+        sig = o["signal"]
+        assert sig["sized_by"] == "target weight" and sig["target_weight"] == 0.25, sig
+        lot = float(TICK_INST.size_increment) * sig["close"]
+        assert o["qty"] * sig["close"] == pytest.approx(sig["budget"], abs=lot + 0.01), sig  # within a lot
+        assert sig["leverage"] == pytest.approx(0.25, abs=0.005), sig  # notional / equity, not the 0.66 cap
+
+
 @pytest.mark.parametrize(("profile", "stop", "refused"), [
     ("balanced", 0.20, False), ("balanced", 0.30, True),  # 2x: liquidation ~50% away, stop at most half
     ("aggressive", 0.10, False), ("aggressive", 0.20, True),  # 3x: ~33% away
