@@ -8,6 +8,7 @@ There is deliberately no code path here that adds a venue execution client.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 import threading
@@ -35,12 +36,20 @@ from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless
-from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.venues import venue as venue_profile
 
 
 def _tag(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
+
+
+def strategy_id(cls_name: str, name: str) -> StrategyId:
+    """The strategy's id in its node. Client order ids carry only the last hyphen-separated part of it (and of the
+    trader id), so that part is a hash of the full name: two strategies whose names end alike (ping-pong-test and
+    rsi-bands-test) got the same order ids, and the second to send one in a second lost its journal row."""
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8].upper()
+    return StrategyId.from_str(f"{cls_name}-{_tag(name)[:20]}-{digest}")
 
 
 # Warm-up bars from a store that stopped updating would leave a hole before the first live bar.
@@ -196,7 +205,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 assumed_half_spread=spreads.resolve(profile.name, sleeve.instrument,
                                                     runtime.store if runtime is not None else None).half_spread,
                 warmup_bars=sleeve.warmup_bars,
-                strategy_id=StrategyId.from_str(f"{strategy_cls.__name__}-{tag[:20]}"),
+                strategy_id=strategy_id(strategy_cls.__name__, sleeve.name),
                 **sleeve.params,
             )
         ).attach_runtime(runtime).attach_recorder(recorder)
@@ -238,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                     "live prices; funding every 8 hours from our own ledger")
     else:
         sleeve = load_sleeve(args.sleeve)
+        check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor
     recorder = None
     if args.record:
         if runtime is None:

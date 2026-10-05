@@ -316,3 +316,27 @@ def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):
     assert store.pending_reset() is None and store.sleeve("ping-pong-test").desired_state == "stopped"
     with pytest.raises(ValueError, match="archived"):
         store.request_reset(next(iter(store.reset_runs())), "x")
+
+
+@pytest.mark.sanity
+def test_a_reset_keeps_a_pause_or_halt_and_restarts_a_running_strategy(store):
+    """Round 13, U13-4: Reset all un-paused strategies the kill switch had paused (a pause leaves desired_state
+    running, and the fresh run started with no status). A pause or halt in force when the reset is asked for is
+    still in force after it, so nothing trades until the PM resumes; a running strategy still restarts."""
+    from sleeve_fund.supervisor import Supervisor
+
+    for name in ("bn-paused", "bn-halted", "bn-running"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp", "allow_short": True}, venue="binance")
+    store.set_status("bn-paused", "paused", "kill switch: paused by PM")
+    store.set_status("bn-halted", "halted", "drawdown 21% hit the 20% limit")
+    store.set_status("bn-running", "running")
+    for name in ("bn-paused", "bn-halted", "bn-running"):
+        store.request_reset(name, "Reset all")
+    Supervisor(store, python="true").reset_pending()
+    assert store.pending_reset() is None
+    paused, halted, running = (store.sleeve(n) for n in ("bn-paused", "bn-halted", "bn-running"))
+    assert (paused.status, paused.paused_until) == ("paused", None) and "kill switch" in paused.status_reason
+    assert halted.status == "halted" and "20% limit" in halted.status_reason
+    assert running.status == "stopped" and running.desired_state == "running"  # starts afresh and runs
+    # The fresh paper process reads that status and keeps it until a resume (review round 10, B10-3).

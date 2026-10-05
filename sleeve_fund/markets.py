@@ -116,10 +116,29 @@ def funding_times(after: datetime, until: datetime, hours: tuple[int, ...]) -> l
     return out
 
 
+def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
+    """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
+    opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the
+    strategy's equity is not at risk to the venue's liquidation. The one margin figure for paper,
+    backtest, the dashboard and the demo copy (set to isolated at the same leverage)."""
+    margin = abs(qty) * entry / max(leverage, 1e-9)
+    return min(margin, max(balance, 0.0)) if balance is not None else margin
+
+
+def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:
+    """The liquidation price of a position of qty opened at entry on isolated margin at this leverage.
+    cash is the strategy's spot-style cash (its balance less qty x entry). None when flat, or when no
+    positive price liquidates it (a long at 1x or less is fully paid for)."""
+    if qty == 0 or entry <= 0:
+        return None
+    margin = isolated_margin(qty, entry, leverage, cash + qty * entry)
+    return liquidation_price(margin - qty * entry, qty, maintenance)
+
+
 def liquidation_price(cash: float, qty: float, maintenance: float) -> float | None:
     """The price at which a position's equity (cash + qty x price) falls to the maintenance margin on
-    its value, with the strategy's whole equity as the position's isolated margin. None when flat, or
-    when no positive price liquidates it (a long fully paid for in cash)."""
+    its value, cash being the margin backing it less qty x entry (isolated_liquidation). None when flat,
+    or when no positive price liquidates it (a long fully paid for in cash)."""
     if qty == 0:
         return None
     # cash + qty * p = maintenance * |qty| * p  =>  p = cash / (maintenance * |qty| - qty)

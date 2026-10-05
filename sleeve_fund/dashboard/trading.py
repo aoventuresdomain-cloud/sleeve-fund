@@ -229,12 +229,15 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
         return None
     qty, price, equity, cash = x["qty"], x["price"], x["equity"], x["cash"]
     notional = abs(qty * price)
-    liq = markets.liquidation_price(cash, qty, t.maintenance_margin) if qty else None
+    # Isolated at the risk profile's leverage cap, as paper and the demo copy hold it (markets.isolated_margin).
+    entry, lev = x.get("entry_px") or price, x["profile"].max_leverage
+    margin = markets.isolated_margin(qty, entry, lev, cash + qty * entry) if qty else 0.0
+    liq = markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin) if qty else None
     opened = position["opened"] if position else None
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
         "leverage": notional / equity if equity > 0 else None,
-        "margin": max(equity, 0.0),  # isolated: the strategy's whole equity backs its one position
+        "margin": margin,
         "maintenance": notional * t.maintenance_margin,
         "maintenance_rate": t.maintenance_margin,
         "liq_px": liq,

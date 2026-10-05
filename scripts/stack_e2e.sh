@@ -85,13 +85,20 @@ echo "sleeves receiving live quotes: $QUOTED"
 
 # Restart check: a position in the journal must survive a restart and reconcile with the
 # rebuilt paper engine. Journal a 10 SUI buy, restart the sleeves, and expect them to carry it.
+# SUI trades live data, before the restart and even during it (a bar can close while it restarts), so
+# neither its position nor its fill count is fixed: expect a restore from the journal after the restart,
+# then a reconcile in which the rebuilt engine matches the journal.
 q "insert into fills (sleeve, ts, side, qty, price, fee, order_id, trade_id)
    values ('sui-e2e', now(), 'BUY', 10, 1.0, 0.01, 'e2e-carry', 'e2e-carry')"
+RESTART_AT=$(q "select now()")
 docker compose restart supervisor
 echo "waiting ${WAIT}s after restart..."
 sleep "$WAIT"
 q "select ts, sleeve, level, kind, message from events where kind in ('restore', 'reconcile', 'reconcile_mismatch') order by id"
-RESTORED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'restore' and message like '%position 10%'")
+RESTORED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'restore' and ts > '$RESTART_AT'
+  and message like 'book restored from % journal fills:%'
+  and exists (select 1 from events r where r.sleeve = 'sui-e2e' and r.kind = 'reconcile' and r.ts > '$RESTART_AT'
+              and r.message like 'engine matches journal:%')")
 RECONCILED=$(q "select count(*) from events where sleeve = 'sui-e2e' and kind = 'reconcile'")
 ERRS=$(q "select count(*) from events where level = 'error'")
 HEART=$(q "select count(*) from sleeves where heartbeat_at > now() - interval '2 minutes'")

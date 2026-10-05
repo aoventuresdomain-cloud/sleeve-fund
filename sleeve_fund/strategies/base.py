@@ -39,6 +39,8 @@ from sleeve_fund.strategies.indicators import Atr
 MAKER_INTENTS = ("entry", "exit", "rebalance")
 OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
 EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
+# Exits after which the side they closed isn't entered again until the signal has moved off it (_exit_lock).
+LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 MINUTE_NS = 60_000_000_000
 
 
@@ -158,6 +160,12 @@ def gain_at_target(tp: float, leg: float, side: int = 1) -> float:
     return tp - leg - (1 + side * tp) * leg
 
 
+def _ns(ts: datetime) -> int:
+    """A journal time as clock nanoseconds (a stored time without a zone is UTC)."""
+    ts = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    return int(ts.timestamp()) * 1_000_000_000 + ts.microsecond * 1000
+
+
 def _from_entry(stop: float, side: int = 1) -> str:
     """A stop's distance in words: "2.0% below the entry" for a long ("above" for a short), or the other
     way for a stop set from the market on a position already in profit."""
@@ -165,12 +173,13 @@ def _from_entry(stop: float, side: int = 1) -> str:
     return f"{abs(stop):.1%} {'below' if below else 'above'} the entry"
 
 
-def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float,
-                      maintenance: float) -> tuple[float | None, float]:
-    """The liquidation price of an entry of qty at close once it fills (the fee paid, the strategy's whole
-    equity as its isolated margin), and how far that is from close as a share of it (inf when none)."""
-    notional = qty * close
-    liq = markets.liquidation_price(cash - side * notional * (1 + side * fee), side * qty, maintenance)
+def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: float,
+                      leverage: float) -> tuple[float | None, float]:
+    """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
+    leverage as its isolated margin: markets.isolated_margin), and how far that is from close as a share of
+    it (inf when none)."""
+    notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
+    liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
@@ -416,6 +425,9 @@ class LongFlatStrategy(Strategy):
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
+        # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
+        # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
+        self._resume: dict | None = None
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
@@ -539,11 +551,15 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
+        self._plan_resume()
         if self._cfg.warmup_bars:
             if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
                 self._warm_from_history()
+                self._finish_resume()
             else:
-                self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
+                self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)  # resumed when they arrive
+        else:
+            self._finish_resume()
         self.subscribe_bars(self._cfg.bar_type)
         if self.runtime is not None:
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
@@ -875,8 +891,90 @@ class LongFlatStrategy(Strategy):
 
     def on_historical_bars(self, bars) -> None:
         for bar in sorted(bars, key=lambda b: b.ts_event):
-            self._accept(bar)
+            if self._accept(bar):
+                self._replay(bar)
+        self._finish_resume()
         self.log.info(f"warmed up on {len(bars)} historical bars")
+
+    def resume_leg(self, side: int, held: int) -> None:
+        """After a restart: put the model's rules back on the leg the journal's last entry opened (+1 long, -1
+        short), as they stood `held` decision bars after the entry's own bar. The warm-up bars since are then
+        decided on again, without trading (_replay), so the leg ends, its time stop falls and an exit lock
+        clears where they would have without the restart (review round 13, E13-3/E13-4). Models whose rules
+        keep a leg override this; for any other model a restart rebuilds nothing beyond its indicators."""
+
+    def _plan_resume(self) -> None:
+        """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first
+        exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
+        self._resume = None
+        if (self.runtime is None or self.runtime.backtest
+                or type(self).resume_leg is LongFlatStrategy.resume_leg):
+            return
+        step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
+        orders = self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
+        at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
+        qty = self.runtime.book["qty"]
+        held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False} if qty else None
+        if at is None:  # held with no entry in the journal's recent orders: that leg is on, from now
+            self._resume = held
+            return
+        entry = orders[at]
+        side = 1 if entry["side"] == "BUY" else -1
+        lock = next((o for o in reversed(orders[:at]) if o["intent"] in LOCKING_INTENTS), None)
+        if qty * side <= 0 and lock is None:
+            # Not held on the entry's side, and no stop, target or liquidation closed it: its own signal, a PM
+            # close or a flatten ended the leg, and the exit may be older than the warm-up, so resuming it
+            # would wake the model in a trade the book doesn't hold. Only the book's own position comes back.
+            self._resume = held
+            return
+        # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
+        self._resume = {"side": side, "bar": _ns(entry["ts"]) // step * step,
+                        "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
+
+    def _replay(self, bar: Bar) -> None:
+        """A warm-up bar after a restart, closed since the journal's last entry: decide on it as the run did, for
+        the model's state only. No order, no journal; the exit lock is set and cleared as on_bar would."""
+        r = self._resume
+        if r is None or r["bar"] is None or bar.ts_event <= r["bar"]:
+            return
+        if r["lock_ns"] is not None and bar.ts_event > r["lock_ns"]:
+            self._lock_resumed(r)
+        if not r["on"]:  # until the model's indicators are ready to decide, the leg's bars count on
+            self.resume_leg(r["side"], int((bar.ts_event - r["bar"]) // r["step"]) - 1)
+        if self._margin:
+            side = self.want_side(bar)
+            if side is None:
+                return
+            side = 0 if int(side) < 0 and not self._cfg.allow_short else int(side)
+            if self._exit_lock and self._exit_lock != side:
+                self._exit_lock = False
+        else:
+            raw = self.target_weight(bar)
+            if raw is None:
+                return
+            if min(max(float(raw), 0.0), 1.0, self._cap_pct()) == 0:
+                self._exit_lock = False
+        r["on"] = True
+
+    def _lock_resumed(self, r: dict) -> None:
+        self._exit_lock = r["side"] if self._margin else True
+        r["lock_ns"] = None
+
+    def _finish_resume(self) -> None:
+        """The warm-up is in: a leg no warm-up bar was decided on resumes at the bars counted to the next one,
+        and an exit lock set after the last warm-up bar is set now."""
+        r, self._resume = self._resume, None
+        if r is None:
+            return
+        if r["lock_ns"] is not None:
+            self._lock_resumed(r)
+        if not r["on"]:
+            if r["bar"] is None:
+                self.resume_leg(r["side"], 0)
+            else:
+                step = r["step"]
+                upcoming = self.clock.timestamp_ns() // step * step + step
+                self.resume_leg(r["side"], max(int((upcoming - r["bar"]) // step) - 1, 0))
 
     def _warm_from_history(self) -> None:
         """Feed the indicators the latest stored bars, so a model on bars built from live trades
@@ -922,6 +1020,12 @@ class LongFlatStrategy(Strategy):
         The default maps want_long() to all (1) or nothing (0)."""
         target = self.want_long(bar)
         return None if target is None else (1.0 if target else 0.0)
+
+    @classmethod
+    def weight_sized(cls, params: dict) -> bool:
+        """Whether, with these settings, the model holds a share of the capital below all of it (target_weight)
+        rather than all or nothing. A model that overrides target_weight does, unless it says otherwise."""
+        return cls.target_weight is not LongFlatStrategy.target_weight
 
     def want_side(self, bar: Bar) -> int | None:
         """The side to be on from this bar's close: +1 long, 0 flat, -1 short (taken only with allow_short);
@@ -1084,7 +1188,7 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2)}
         notional = float(qty) * close
         liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
-                                          self._cfg.perp.maintenance_margin)
+                                          self._cfg.perp.maintenance_margin, lev)
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / equity, 4)
@@ -1111,6 +1215,7 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
+        self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
@@ -1607,6 +1712,12 @@ class LongFlatStrategy(Strategy):
         step = self._lot()
         return max(self.instrument.min_quantity.as_decimal(), step) if self.instrument.min_quantity else step
 
+    def _liq(self, cash: float, qty: float) -> float | None:
+        """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
+        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin)."""
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        return markets.isolated_liquidation(cash, qty, self._net_position()[1], lev, self._cfg.perp.maintenance_margin)
+
     def _net_position(self) -> tuple[float, float]:
         """Perp: the signed position at the simulated venue and its average entry there."""
         net = notional = 0.0
@@ -1826,7 +1937,7 @@ class LongFlatStrategy(Strategy):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
                   ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
             levels.append((liq / (1 - d) if side > 0 else liq / (1 + d), "liquidation_cut"))
@@ -1857,7 +1968,7 @@ class LongFlatStrategy(Strategy):
         px = Price(level, self.instrument.price_precision)
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         _, cash, net, _ = self._mark()
-        liq = markets.liquidation_price(cash, net, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, net)
         if order is not None:
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 return  # in flight: re-priced at the next bar
@@ -1965,11 +2076,11 @@ class LongFlatStrategy(Strategy):
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
         take it), or comes within the risk profile's minimum distance of it (cut back before the venue
-        does), with the strategy's equity as the position's isolated margin."""
+        does), on the position's isolated margin (_liq)."""
         terms = self._cfg.perp
         if terms is None or qty == 0 or price <= 0 or self._pending_exit is not None or self._busy():
             return
-        liq = markets.liquidation_price(cash, qty, terms.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is None:
             return
         side = 1 if qty > 0 else -1
@@ -2000,7 +2111,7 @@ class LongFlatStrategy(Strategy):
         day_open = self.runtime._day_open or equity
         if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
             return True
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
 
     def _intrabar_guard(self, bar: Bar) -> None:
@@ -2014,7 +2125,7 @@ class LongFlatStrategy(Strategy):
         worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
         _, cash, _, _ = self._mark()
         self._guard_equity = cash + qty * worst
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is not None and (worst <= liq if qty > 0 else worst >= liq):
             self._guard_price = worst
 
@@ -2139,7 +2250,7 @@ class LongFlatStrategy(Strategy):
                 # Through the liquidation price: the venue takes the position whatever our own risk check says,
                 # so the liquidation goes first and is journaled as one (review round 11, M11-3).
                 probe = price if underwater or worst is None else worst
-                liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+                liq = self._liq(cash, qty)
                 if underwater or (liq is not None and (probe <= liq if qty > 0 else probe >= liq)):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))

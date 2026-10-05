@@ -42,8 +42,9 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -563,6 +564,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if command == "start" and _retired(st().account_of(name)):
                     raise ValueError(f"its account {st().account_of(name)} is retired; move it to another "
                                      "account or reinstate that one first")
+                if command == "start":
+                    s = st().sleeve(name)
+                    check_perp_sizing(s.strategy, s.params)
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
@@ -1215,8 +1219,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = str(form.get("reason", "")).strip()
             if not reason:
                 raise ValueError("a reason is required")
-            st().create_account(name, str(form.get("kind", "")), str(form.get("note", "")).strip()[:200])
-            st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
+            kind = str(form.get("kind", ""))
+            st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
+            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
             return RedirectResponse(f"/setup?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
@@ -1315,6 +1321,7 @@ def _backtest_args(q) -> dict:
     params = _form_params(q, strategy)
     _profile_cap(q)  # validates the profile name
     markets.check_venue(params, venue)  # a perpetual venue has no spot
+    check_perp_sizing(strategy, params)
     if spec_minutes(bar_spec) < 1440:
         have = [r["pair"] for r in _stored(venue)]
         if pair not in have:
@@ -2110,6 +2117,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     trip the backtest quotes (review round 7: 1.61% here against 1.71% there)."""
     from nautilus_trader.model import BarType, InstrumentId
 
+    check_perp_sizing(cfg.strategy, cfg.params)
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)
