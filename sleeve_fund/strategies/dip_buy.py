@@ -114,10 +114,8 @@ class DipBuy(LongFlatStrategy):
                    int(params.get("exit_sma", 6)), per_day)
         return max(days * per_day, bars)
 
-    def on_start(self) -> None:
-        super().on_start()
-        if self.runtime is not None and self.runtime.book["qty"]:
-            self._side = 1 if self.runtime.book["qty"] > 0 else -1  # after a restart while holding
+    def resume_leg(self, side: int, held: int) -> None:
+        self._side, self._held = side, held  # after a restart: the leg, and its time stop, from the journal's entry
 
     def update_indicators(self, bar: Bar) -> None:
         close = bar.close.as_double()
