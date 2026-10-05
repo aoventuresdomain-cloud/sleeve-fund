@@ -452,6 +452,9 @@ class LongFlatStrategy(Strategy):
         # Paper and its replay (set by the node): post-only orders are kept here and sliced. Live, they rest
         # at the venue, whose own queue decides.
         self.simulated_venue = False
+        # Paper fed by its venue's market data hub (v2 P1-1, sleeve_fund.paper.hub_client): the bars are the hub's,
+        # so warm-up comes from the history store the hub feeds, never from the venue (set by the node).
+        self.hub_fed = False
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
@@ -553,7 +556,7 @@ class LongFlatStrategy(Strategy):
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
         self._plan_resume()
         if self._cfg.warmup_bars:
-            if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
+            if self.history_loader is not None and (str(self._cfg.bar_type).endswith("INTERNAL") or self.hub_fed):
                 self._warm_from_history()
                 self._finish_resume()
             else:
