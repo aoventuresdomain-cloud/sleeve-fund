@@ -435,6 +435,8 @@ class _BybitMargin(mirror.BybitDemo):
                                                        "leverage": self.lev, "positionIdx": 0}]}}
         if path == "/v5/order/realtime":
             return {"retCode": 0, "result": {"list": [{"avgPrice": "60000"}]}}
+        if path == "/v5/order/cancel-all":
+            return {"retCode": 0, "result": {"list": []}}
         o = json.loads(body)
         self.orders.append(o)
         self.held = round(self.held + (1 if o["side"] == "Buy" else -1) * float(o["qty"]), 8)
@@ -511,3 +513,46 @@ def test_spot_strategies_and_other_venues_get_no_margin_set_up():
 def test_the_start_check_reports_equity_and_margin():
     out = _BybitMargin().check()
     assert "50,000.00 USD equity" in out and "cross margin, BTCUSDT at 10x" in out
+
+
+@pytest.mark.sanity
+def test_resync_brings_bybit_to_the_paper_position_at_once_on_the_paper_terms():
+    store, demo = _store(), _BybitMargin(refuse_while_holding=True)
+    _binance(store)
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "BUY", 0.076, 1)
+    mirror.mirror_once(store, targets)
+    demo.held = 0.1  # traded by hand on the demo account, and still at Bybit's 10x default
+    store.request_resync("bn-ls", "Demo copy out of line with paper")
+    margin = {}
+    assert mirror.process_resyncs(store, targets, margin) == 1
+    assert (demo.held, demo.mode, demo.lev) == (0.076, "ISOLATED_MARGIN", "2") and margin == {"BTCUSDT": 2.0}
+    assert "/v5/order/cancel-all" in demo.calls
+    assert all(o["orderLinkId"].endswith("resync") for o in demo.orders[1:])
+    req = store.last_resync("bn-ls")
+    assert req["done_at"] and "paper +0.076 at 2x isolated" in req["result"]
+    assert "before +0.1, cross margin, BTCUSDT at 10x" in req["result"] and "after +0.076, isolated margin" in req["result"]
+    assert store.mirror_positions() == {"BTCUSDT": pytest.approx(0.076)}
+    assert all(r["message"].startswith("resync") for r in store.mirror_rows("bn-ls")[:2])
+    assert store.events("bn-ls")[0]["kind"] == "mirror_resync"
+    assert store.journal_book("bn-ls", 10_000)["qty"] == pytest.approx(0.076)  # the paper book is untouched
+    assert mirror.process_resyncs(store, targets, margin) == 0  # done once
+
+
+def test_resync_all_covers_every_bybit_strategy_and_refuses_what_is_not_copied():
+    store, demo = _store(), _BybitMargin()
+    _binance(store, "bn-a")
+    _binance(store, "bn-b")
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-a", "BUY", 0.05, 1)
+    _fill(store, "bn-b", "SELL", 0.02, 2)
+    store.request_resync(None, "After a deploy or restart")
+    mirror.process_resyncs(store, targets, {})
+    assert demo.held == pytest.approx(0.03)
+    with pytest.raises(ValueError, match="isn't copied"):
+        store.request_resync("pp", "x")
+    with pytest.raises(ValueError, match="reason"):
+        store.request_resync("bn-a", " ")
+    assert "Deribit" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced

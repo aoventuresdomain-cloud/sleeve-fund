@@ -322,6 +322,19 @@ feed_seen_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("seen_at", TS, nullable=False),
 )
+# A PM's "resync the demo copy" request, for the mirror container to act on (only it holds the demo keys):
+# sleeve null means every mirrored strategy. done_at and result once it has. A new table: CREATE TABLE.
+mirror_requests_t = Table(
+    "mirror_requests",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=True),
+    Column("reason", Text, nullable=False),
+    Column("actor", String(64), nullable=False),
+    Column("created_at", TS, nullable=False),
+    Column("done_at", TS, nullable=True),
+    Column("result", Text, nullable=False, default=""),
+)
 # A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
 # fills, equity marks and events) in the ordinary tables under a sleeve named BACKTEST_PREFIX + id, so
 # the run opens in the same Orders, Trades and strategy screens as paper. A new table: CREATE TABLE.
@@ -973,6 +986,36 @@ class Store:
         """The last fill the mirror has dealt with for a strategy, or None if it has never run for it."""
         with self.engine.connect() as c:
             return c.execute(select(func.max(mirror_t.c.fill_id)).where(mirror_t.c.sleeve == sleeve)).scalar()
+
+    def request_resync(self, sleeve: str | None, reason: str, actor: str = "PM") -> None:
+        """Ask the mirror to bring the demo account in line with the paper book now (sleeve None: all)."""
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        if sleeve is not None and not self.sleeve(sleeve).params.get("demo_mirror"):
+            raise ValueError("this strategy isn't copied to a demo account, so there is nothing to resync")
+        with self.engine.begin() as c:
+            c.execute(insert(mirror_requests_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor,
+                                                       created_at=utcnow(), result=""))
+        self.decide(actor, "resync", f"Resync the demo copy: {reason.strip()}", sleeve)
+
+    def pending_resyncs(self) -> list[dict]:
+        q = select(mirror_requests_t).where(mirror_requests_t.c.done_at.is_(None)).order_by(mirror_requests_t.c.id)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def finish_resync(self, request_id: int, result: str) -> None:
+        with self.engine.begin() as c:
+            c.execute(update(mirror_requests_t).where(mirror_requests_t.c.id == request_id)
+                      .values(done_at=utcnow(), result=result))
+
+    def last_resync(self, sleeve: str) -> dict | None:
+        """The latest resync request covering this strategy (its own or one for all)."""
+        q = (select(mirror_requests_t).where(or_(mirror_requests_t.c.sleeve == sleeve,
+                                                  mirror_requests_t.c.sleeve.is_(None)))
+             .order_by(mirror_requests_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def mirror_rows(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         q = select(mirror_t)

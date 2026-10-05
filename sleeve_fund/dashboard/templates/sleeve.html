@@ -124,6 +124,18 @@
       <div class="total"><dt>Since start</dt><dd>{{ perp.funding_total|smoney }} <span class="faint">longs pay {{ '%.4f%%'|format(perp.funding_rate * 100) }} every 8h</span></dd></div>
     </dl></div>
   </div>{% endif %}
+  {% if demo %}<div class="pos-grid two" data-live="demo">
+    <div class="pos-card"><h3>Demo copy <span class="faint">{{ demo.label }}, demo money</span></h3><dl>
+      <div><dt>Paper position</dt><dd>{{ '%+g'|format(held) }} {{ base }}</dd></div>
+      <div><dt title="What the mirror has put on the demo account for this strategy">Copied</dt><dd>{{ '%+g'|format(demo.put_on) }} {{ base }}{% if (demo.put_on - held)|abs > 0.0000001 %} <span class="loss">out of line</span>{% else %} <span class="faint">in line</span>{% endif %}</dd></div>
+      <div><dt>Terms</dt><dd>isolated margin, {{ '%g'|format(demo.leverage) }}× <span class="faint">as paper</span></dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>Resync</h3><dl>
+      <div><dt>Last</dt><dd>{% if demo.last %}{% if demo.last.done_at %}{{ demo.last.done_at|ago }}{% else %}<span class="faint">waiting for the mirror</span>{% endif %}{% else %}<span class="muted">Never</span>{% endif %}</dd></div>
+      {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result }}</dd></div>{% endif %}
+    </dl>
+    <button type="button" class="secondary" data-open="dlg-resync">Resync demo copy</button></div>
+  </div>{% endif %}
   {% if position %}<details class="why-fold">
     <summary><span class="k">{{ "Why it was sold short" if position.side < 0 else "Why it was bought" }}</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
     {{ why('Decision at ' ~ (position.opened|ts if position.opened else 'entry'), position.why, position.sig) }}
@@ -284,6 +296,16 @@
   </form>
 </dialog>
 {% endfor %}
+{% if demo %}<dialog id="dlg-resync" aria-labelledby="dlg-resync-h">
+  <form method="post" action="/sleeves/{{ s.name }}/resync-demo">
+    <h2 id="dlg-resync-h">Resync the demo copy</h2>
+    <p>Sets {{ demo.label }} to isolated margin at {{ '%g'|format(demo.leverage) }}×, cancels any resting order, and trades the demo position to match paper now ({{ '%+g'|format(held) }} {{ base }}{% if s.instrument %} {{ s.instrument }}{% endif %}, for every strategy copied on that instrument). Demo money only: the paper book is not touched. Its orders are labelled "resync".</p>
+    <label for="r-resync">Reason for the decision log</label>
+    <input id="r-resync" name="reason" list="resync-reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <datalist id="resync-reasons">{% for r in resync_reasons %}<option value="{{ r }}">{% endfor %}</datalist>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button>Resync now</button></div>
+  </form>
+</dialog>{% endif %}
 <dialog id="dlg-move" aria-labelledby="dlg-move-h">
   <form method="post" action="/sleeves/{{ s.name }}/account">
     <h2 id="dlg-move-h">Move {{ s.name }} to another account</h2>

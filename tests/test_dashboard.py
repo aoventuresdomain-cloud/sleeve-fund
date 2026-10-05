@@ -1931,3 +1931,30 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
     assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it
+
+
+def test_a_strategy_copied_to_bybit_demo_can_be_resynced_from_its_page(client):
+    """PM, 5 Oct 2026: a quick refresh for the demo copy while testing. The page shows paper against what the
+    mirror copied, and Resync asks the mirror (which alone holds the demo key) to bring Bybit Demo in line."""
+    c, store = client
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True, "demo_mirror": True},
+                        venue="binance")
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    page = c.get("/sleeves/bn-ls", auth=AUTH).text
+    assert "Demo copy" in page and "Bybit Demo Trading" in page and "out of line" in page
+    assert 'action="/sleeves/bn-ls/resync-demo"' in page and "isolated margin at 2×" in page
+    r = c.post("/sleeves/bn-ls/resync-demo", data={"reason": "Demo copy out of line with paper"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/sleeves/bn-ls#positions"
+    (req,) = store.pending_resyncs()
+    assert req["sleeve"] == "bn-ls" and store.decisions("bn-ls")[0]["action"] == "resync"
+    assert "waiting for the mirror" in c.get("/sleeves/bn-ls", auth=AUTH).text
+    r = c.post("/mirror/resync", data={"reason": "After a deploy or restart"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and store.pending_resyncs()[-1]["sleeve"] is None
+    # Not copied to Bybit Demo: no panel, and the route refuses in words.
+    _new(c)
+    assert "Demo copy" not in c.get("/sleeves/btc-test", auth=AUTH).text
+    r = c.post("/sleeves/btc-test/resync-demo", data={"reason": "x"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" in r.headers["location"] and len(store.pending_resyncs()) == 2

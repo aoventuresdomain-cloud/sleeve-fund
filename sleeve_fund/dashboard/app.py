@@ -407,8 +407,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
+                    resync_reasons=RESYNC_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
+                    demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
                                                                st().accounts(), utcnow()))
@@ -547,6 +549,33 @@ def create_app(store: Store | None = None) -> FastAPI:
             # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
+
+    @app.post("/sleeves/{name}/resync-demo")
+    def sleeve_resync_demo(name: str, reason: str = Form(...), actor: str = Depends(require_pm),
+                           _o: None = Depends(same_origin)):
+        """Ask the demo mirror to bring Bybit Demo in line with this strategy's paper position now. Demo only:
+        the paper book is never touched."""
+        try:
+            if _demo_copy(st(), st().sleeve(name)) is None:
+                raise ValueError("only a perpetual strategy copied to Bybit Demo can be resynced")
+            st().request_resync(name, reason, actor=actor)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        except ValueError as exc:
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}#positions",
+                                    status_code=303)
+        return RedirectResponse(f"/sleeves/{name}#positions", status_code=303)
+
+    @app.post("/mirror/resync")
+    def resync_all_demo(request: Request, reason: str = Form(...), actor: str = Depends(require_pm),
+                        _o: None = Depends(same_origin)):
+        """Resync every strategy copied to Bybit Demo."""
+        back = request.headers.get("referer") or "/"
+        try:
+            st().request_resync(None, reason, actor=actor)
+        except ValueError as exc:
+            return RedirectResponse(f"/?{urlencode({'command_error': str(exc)})}", status_code=303)
+        return RedirectResponse(back if back.startswith(("/", str(request.base_url))) else "/", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1259,6 +1288,22 @@ def run_study_job(progress, job_id: str, store: Store | str, req, ledger: str, t
     return path.stem
 
 
+def _demo_copy(store, s) -> dict | None:
+    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to Bybit Demo, the
+    one demo account the mirror can trade to an exact quantity."""
+    from sleeve_fund import mirror
+
+    if not s.params.get("demo_mirror") or not markets.is_perp(s.params) or mirror.target_for(s) != "BYBIT":
+        return None
+    put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
+                 if r["status"] == "filled")
+    last = store.last_resync(s.name)
+    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+            "leverage": PROFILES[s.risk_profile].max_leverage}
+
+
+RESYNC_REASONS = ["Demo copy out of line with paper", "Demo account settings changed", "After a deploy or restart",
+                  "Checking the copy during testing"]
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
     "Market event; standing aside",
