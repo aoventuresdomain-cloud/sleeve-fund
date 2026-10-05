@@ -92,6 +92,23 @@ def test_cli_holds_migrations_on_first_stamp_drift_and_raises_an_alert(engine, m
     assert "alembic_version" not in inspect(engine).get_table_names()
 
 
+def test_cli_reports_drift_after_migrating_too(engine, monkeypatch, capfd):
+    schema.migrate(engine, log=lambda _: None)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE stray (x INTEGER)"))  # a hand edit on the server
+    monkeypatch.setattr(schema, "make_engine", lambda: engine)
+    assert schema.main(["migrate"]) == 0
+    assert "the migrated database differs" in capfd.readouterr().err
+    (ev,) = Store(engine=engine).events_of(("schema_drift",))
+    assert "table stray" in ev["message"]
+
+
+def test_a_clean_migrate_raises_no_alert(engine, monkeypatch):
+    monkeypatch.setattr(schema, "make_engine", lambda: engine)
+    assert schema.main(["migrate"]) == 0
+    assert Store(engine=engine).events_of(("schema_drift",)) == []
+
+
 def test_cli_migrate_fails_the_deploy_when_a_migration_fails(engine, monkeypatch):
     schema.migrate(engine, log=lambda _: None)
     monkeypatch.setattr(schema.command, "upgrade", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))

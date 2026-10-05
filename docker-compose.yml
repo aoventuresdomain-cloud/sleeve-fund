@@ -18,7 +18,7 @@ services:
   # Runs once per deploy, before anything that uses the database: applies new schema migrations
   # (python -m sleeve_fund.schema migrate). An existing database without migration history is stamped,
   # never rebuilt, and only if it matches the code; if it doesn't, nothing is changed and an error event
-  # lists the drift. If a migration fails it exits non-zero, the services below don't start on the new
+  # lists the drift (re-checked after every deploy). If a migration fails it exits non-zero, the services below don't start on the new
   # code and the deploy fails. The backup keeps running regardless.
   migrate:
     build: .

@@ -138,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
             # may start as it always has. Nothing is migrated until the drift is fixed, and the alerts inbox
             # (and the status workflow's events) say so on every deploy. A failing migration still exits 1.
             msg = f"migrations held, nothing changed: {exc}"
+        else:
+            # Every deploy re-checks the migrated schema against the code: a hand edit on the server or a
+            # migration that doesn't match store.py shows up here, without stopping the deploy.
+            _, diffs = report(engine)
+            msg = ("the migrated database differs from the code:\n" + "\n".join(f"  - {d}" for d in diffs)
+                   if diffs else None)
+        if msg:
             print(f"SCHEMA DRIFT: {msg}", file=sys.stderr)
             with engine.begin() as conn:
                 conn.execute(insert(events_t).values(sleeve=None, ts=utcnow(), level="error", kind="schema_drift",
