@@ -183,16 +183,25 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
+# m13-E3: a bar that closed while the strategy was down is decided on only this soon after its close, the same
+# limit the hub client puts on a refilled bar; later, its price has moved on and it is warm-up only.
+LATE_DECISION_NS = 90 * 1_000_000_000
+
+
+def _stale(age_ns: int, step_ns: int) -> bool:
+    return age_ns >= step_ns or age_ns > LATE_DECISION_NS
+
+
 def late_bar(bars: list, now_ns: int, step_ns: int, last_alive: datetime | None, last_order_at: datetime | None):
     """m13-E3: the latest warm-up bar, when it closed while the strategy was down and is still the latest
     closed bar, so it is decided on once rather than only warmed up on. last_alive: the previous process's last
     heartbeat. None (warm-up only) for a first start, when that process was still alive at the close (it saw
-    the bar), when an order was journaled at or after the close (it acted on it), or when the bar is a bar or
-    more old (deciding on it now would trade on a stale signal)."""
+    the bar), when an order was journaled at or after the close (it acted on it), or when the bar closed more
+    than LATE_DECISION_NS ago or is a bar or more old (deciding on it now would trade on a stale signal)."""
     if not bars or last_alive is None:
         return None
     last = bars[-1]
-    if now_ns - last.ts_event >= step_ns or _ns(last_alive) >= last.ts_event:
+    if _stale(now_ns - last.ts_event, step_ns) or _ns(last_alive) >= last.ts_event:
         return None
     if last_order_at is not None and _ns(last_order_at) >= last.ts_event:
         return None
@@ -1250,10 +1259,10 @@ class LongFlatStrategy(Strategy):
             self._deciding = None
 
     def _decide_late(self) -> None:
-        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest;
-        a bar since (or an hour of no trades) makes it warm-up only."""
+        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest
+        and closed at most LATE_DECISION_NS ago; a bar since, or no trade in time, makes it warm-up only."""
         late, self._late = self._late, None
-        if self.clock.timestamp_ns() - late.ts_event >= bar_minutes(self._cfg.bar_type) * 60_000_000_000:
+        if _stale(self.clock.timestamp_ns() - late.ts_event, bar_minutes(self._cfg.bar_type) * 60_000_000_000):
             self.on_historical_bars([late])
             return
         when = datetime.fromtimestamp(late.ts_event / 1e9, tz=timezone.utc)
