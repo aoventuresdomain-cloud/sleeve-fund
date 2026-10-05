@@ -1461,9 +1461,12 @@ class Store:
                 c.execute(insert(trials_t), new)
         return len(new)
 
-    def trials(self) -> list[dict]:
+    def trials(self, idea_hash: str | None = None) -> list[dict]:
+        q = select(trials_t)
+        if idea_hash is not None:
+            q = q.where(trials_t.c.idea_hash == idea_hash)
         with self.engine.connect() as c:
-            return _rows(c.execute(select(trials_t).order_by(trials_t.c.created_at, trials_t.c.id)))
+            return _rows(c.execute(q.order_by(trials_t.c.created_at, trials_t.c.id)))
 
     def add_holdout_lock(self, row: dict) -> bool:
         """Record a holdout opening. False, and nothing written, when this idea already holds a lock on this
@@ -1479,9 +1482,19 @@ class Store:
             return False
         return True
 
-    def holdout_locks(self) -> list[dict]:
+    def holdout_locks(self, idea_hash: str | None = None) -> list[dict]:
+        q = select(holdout_locks_t)
+        if idea_hash is not None:
+            q = q.where(holdout_locks_t.c.idea_hash == idea_hash)
         with self.engine.connect() as c:
-            return _rows(c.execute(select(holdout_locks_t).order_by(holdout_locks_t.c.opened_at)))
+            return _rows(c.execute(q.order_by(holdout_locks_t.c.opened_at)))
+
+    def link_holdout_trial(self, lock_id: str, trial_id: str) -> None:
+        """Name the trial a holdout lock's one look produced. The lock is claimed before the look, so the trial
+        is named after; a link already made is never changed."""
+        with self.engine.begin() as c:
+            c.execute(update(holdout_locks_t).where(holdout_locks_t.c.id == lock_id,
+                                                    holdout_locks_t.c.trial_id.is_(None)).values(trial_id=trial_id))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from decimal import Decimal
 from dataclasses import dataclass, field
 
@@ -33,6 +34,9 @@ from sleeve_fund.research.metrics import (
 from sleeve_fund.research.runner import BacktestResult, run_backtest
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import IdeaSpec
+
+
+log_ = logging.getLogger(__name__)
 
 
 @dataclass
@@ -452,7 +456,7 @@ def run_study(
     # while an earlier evaluation of the idea read the held-back days.
     locked = ""
     if use_holdout and holdout_days and locks is not None:
-        from sleeve_fund.research.holdout import underlying_of
+        from sleeve_fund.research.holdout import MIN_UNDATED_HOLDOUT_TRADES, underlying_of
         from sleeve_fund.research.trials import legacy_idea_hash
 
         idea_hash, underlying = legacy_idea_hash(spec.name), underlying_of(pair_of(instrument))
@@ -464,19 +468,45 @@ def run_study(
                                    f"opened {opened_words(opened)}, and a second look can't be fresh")
     elif locked:
         result.holdout_withheld = f"left closed, though asked for: {locked}"
+    elif (use_holdout and holdout_days and locks is not None and locks.undated(idea_hash)
+          and (few := _holdout_trades(bt(spec.name, prices, folds[-1].chosen), prices.index[-holdout_bars]))
+          < MIN_UNDATED_HOLDOUT_TRADES):
+        # Counted before the claim, and only the count is shown: spending the one clean look on too few trades
+        # to judge would waste it (Advisor, C4 option b).
+        result.holdout_withheld = (f"left closed, though asked for: no holdout yet: the held-back days hold {few} "
+                                   f"trades, and {MIN_UNDATED_HOLDOUT_TRADES} are needed: "
+                                   f"{MIN_UNDATED_HOLDOUT_TRADES - few} more")
+    elif use_holdout and holdout_days and locks is not None and not locks.open(
+            idea_hash, underlying, prices.index[-holdout_bars], prices.index[-1]):
+        # Claimed before the look: another study took the lock since the check above, so this one doesn't look.
+        result.holdout_withheld = ("left closed, though asked for: another study opened this idea's holdout on "
+                                   f"{underlying} while this one ran")
     elif use_holdout and holdout_days:
         chosen = folds[-1].chosen
-        run = bt(spec.name, prices, chosen)
-        b_all = bt("buy_and_hold", prices, {}, benchmark=True)
-        h_start = prices.index[-holdout_bars]
-        h_ret = whole_days(daily_returns(run.equity), h_start, bar)
-        hb_ret = whole_days(daily_returns(b_all.equity), h_start, bar)
-        result.holdout = summary(h_ret)
-        result.holdout_benchmark = summary(hb_ret)
+        try:
+            run = bt(spec.name, prices, chosen)
+            b_all = bt("buy_and_hold", prices, {}, benchmark=True)
+            h_start = prices.index[-holdout_bars]
+            h_ret = whole_days(daily_returns(run.equity), h_start, bar)
+            hb_ret = whole_days(daily_returns(b_all.equity), h_start, bar)
+            result.holdout = summary(h_ret)
+            result.holdout_benchmark = summary(hb_ret)
+        except Exception:
+            if locks is not None:
+                # The lock was claimed before the look, so the holdout is spent: say it was a crash, not a result.
+                log_.error("holdout of %s on %s spent by a crash, not a failed result: the lock stays", spec.name,
+                           underlying)
+            raise
         trial = log(chosen, "holdout", result.holdout["sharpe"], prices.iloc[-holdout_bars:])
-        if locks is not None:
-            locks.open(idea_hash, underlying, h_start, prices.index[-1], trial_id=trial)
+        if locks is not None and trial:
+            locks.link_trial(idea_hash, underlying, trial)
     return result
+
+
+def _holdout_trades(run: BacktestResult, start) -> int:
+    """Round trips opened and closed inside the holdout."""
+    return sum(1 for t in trades(fills_to_rows(run.fills), run.shorts)
+               if t["closed"] is not None and _utc(t["opened"]) >= _utc(start))
 
 
 def _utc(ts) -> pd.Timestamp:

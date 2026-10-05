@@ -2,8 +2,11 @@
 
 The lock is keyed by the idea and the underlying asset, not a dataset name, so the same instrument at another
 timeframe or venue can't open a fresh look at the same days. A holdout is also refused while any trial of the
-idea read data inside it: those days are no longer unseen (Independent Quant Advisor, 5 Oct 2026). A trial with
-unknown dates, from the old idea counter, counts as reading them.
+idea read data inside it: those days are no longer unseen (Independent Quant Advisor, 5 Oct 2026).
+
+Trials from the old idea counter kept no dates. Everything before the counter was retired counts as read by
+them, so such an idea's holdout must fall wholly after that, last at least MIN_UNDATED_HOLDOUT_DAYS and hold at
+least MIN_UNDATED_HOLDOUT_TRADES trades before it can be opened (Advisor, 5 Oct 2026, option b).
 """
 
 from __future__ import annotations
@@ -16,6 +19,12 @@ from pathlib import Path
 import pandas as pd
 
 from sleeve_fund.store import Store
+
+# When the file-based idea counter stopped being the record: every study from here on dates its trials. Undated
+# trials count as having read every bar before this (or before their own run, if later).
+COUNTER_RETIRED = pd.Timestamp("2026-10-06", tz="UTC")
+MIN_UNDATED_HOLDOUT_DAYS = 90
+MIN_UNDATED_HOLDOUT_TRADES = 20  # the per-instrument floor of the pooled 100-trade rule
 
 # Quote currencies a dataset name can end in, longest first, to find the underlying of an old counter entry.
 _QUOTES = ("usdt", "usdc", "usd", "eur", "gbp")
@@ -34,6 +43,10 @@ def underlying_of_dataset(dataset: str) -> str | None:
     return m.group(1).upper() if m else None
 
 
+def lock_id(idea_hash: str, underlying: str) -> str:
+    return hashlib.sha256(f"{idea_hash}|{underlying.upper()}".encode()).hexdigest()[:16]
+
+
 def _ts(x) -> pd.Timestamp | None:
     if x is None:
         return None
@@ -47,8 +60,7 @@ class HoldoutLocks:
 
     def lock(self, idea_hash: str, underlying: str) -> dict | None:
         u = underlying.upper()
-        return next((r for r in self.store.holdout_locks() if r["idea_hash"] == idea_hash and r["underlying"] == u),
-                    None)
+        return next((r for r in self.store.holdout_locks(idea_hash) if r["underlying"] == u), None)
 
     def refusal(self, idea_hash: str, underlying: str, start, end) -> str:
         """Why this idea can't open its holdout on this underlying from `start` to `end`, or '' when it can."""
@@ -58,25 +70,44 @@ class HoldoutLocks:
             return (f"this idea's holdout on {underlying.upper()} was opened on {when:%d %b %Y}, and a second look "
                     "can't be fresh")
         start, end = _ts(start), _ts(end)
-        seen = [t for t in self.store.trials() if t["idea_hash"] == idea_hash and t["stage"] != "holdout"]
-        unknown = [t for t in seen if t["data_start"] is None or t["data_end"] is None]
-        if unknown:
-            return (f"{len(unknown)} earlier evaluation{'s' if len(unknown) != 1 else ''} of this idea "
-                    "kept no dates, so they may have read the held-back days")
-        inside = [t for t in seen if _ts(t["data_start"]) <= end and _ts(t["data_end"]) >= start]
+        seen = [t for t in self.store.trials(idea_hash) if t["stage"] != "holdout"]
+        undated = [t for t in seen if t["data_start"] is None or t["data_end"] is None]
+        if undated:
+            after = self.undated_until(undated)
+            wanted = max(after, start) + pd.Timedelta(days=MIN_UNDATED_HOLDOUT_DAYS)
+            if start < after or end < wanted:
+                short = max(1, (wanted - end).days + (1 if (wanted - end) % pd.Timedelta(days=1) else 0))
+                return (f"no holdout yet: {len(undated)} earlier evaluation{'s' if len(undated) != 1 else ''} of "
+                        f"this idea kept no dates, so only days after {after:%d %b %Y} are unseen, and a holdout "
+                        f"there needs {MIN_UNDATED_HOLDOUT_DAYS} days: {short} more days of data")
+        inside = [t for t in seen if t not in undated and _ts(t["data_start"]) <= end and _ts(t["data_end"]) >= start]
         if inside:
             last = max(_ts(t["data_end"]) for t in inside)
             return (f"{len(inside)} earlier evaluation{'s' if len(inside) != 1 else ''} of this idea read data "
                     f"inside the held-back period (up to {last:%d %b %Y})")
         return ""
 
-    def open(self, idea_hash: str, underlying: str, start, end, trial_id: str | None = None) -> bool:
-        """Lock the holdout as opened now. False when it was already locked."""
-        row_id = hashlib.sha256(f"{idea_hash}|{underlying.upper()}".encode()).hexdigest()[:16]
+    def undated(self, idea_hash: str) -> bool:
+        """True when some earlier evaluation of this idea kept no dates: its holdout also needs enough trades."""
+        return any(t["data_start"] is None or t["data_end"] is None
+                   for t in self.store.trials(idea_hash) if t["stage"] != "holdout")
+
+    @staticmethod
+    def undated_until(undated: list[dict]) -> pd.Timestamp:
+        """The last moment undated evaluations may have read: the counter's retirement, or a later run."""
+        return max([COUNTER_RETIRED, *(_ts(t["created_at"]) for t in undated)])
+
+    def open(self, idea_hash: str, underlying: str, start, end) -> bool:
+        """Claim the holdout before looking at it. False when another study already holds the lock: then this
+        one must not look. A look that fails after the claim has still spent the holdout."""
         return self.store.add_holdout_lock({
-            "id": row_id, "idea_hash": idea_hash, "underlying": underlying, "period_start": _ts(start),
-            "period_end": _ts(end), "trial_id": trial_id, "source": "study",
+            "id": lock_id(idea_hash, underlying), "idea_hash": idea_hash, "underlying": underlying,
+            "period_start": _ts(start), "period_end": _ts(end), "source": "study",
         })
+
+    def link_trial(self, idea_hash: str, underlying: str, trial_id: str) -> None:
+        """Name the trial the look produced, once it exists."""
+        self.store.link_holdout_trial(lock_id(idea_hash, underlying), trial_id)
 
     def import_ledger(self, path: str | Path) -> int:
         """Lock every holdout the old idea counter records as opened. Dates were not kept, so the period is
@@ -96,7 +127,7 @@ class HoldoutLocks:
                 continue
             idea_hash = legacy_idea_hash(e["idea"])
             added += self.store.add_holdout_lock({
-                "id": hashlib.sha256(f"{idea_hash}|{underlying}".encode()).hexdigest()[:16],
+                "id": lock_id(idea_hash, underlying),
                 "idea_hash": idea_hash, "underlying": underlying, "opened_at": pd.Timestamp(e["ts"]).to_pydatetime(),
                 "source": "ledger_import",
             })
