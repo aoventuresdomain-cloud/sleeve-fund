@@ -1,11 +1,15 @@
 """Run a venue's market data hub (v2 P1-1): python -m sleeve_fund.hub run --venue binance [--port 7700].
 
-Public market data only: it refuses to start with any venue credential in its environment, as paper does."""
+The hub is its venue's one history-store writer: besides the closed bars it relays, it runs the store's REST
+backfill and funding refresh (python -m sleeve_fund.history run) on a thread of its own, so no second process
+writes the venue's folder. Public market data only: it refuses to start with any venue credential in its
+environment, as paper does."""
 
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 
 import pandas as pd
 
@@ -69,6 +73,23 @@ def build(profile, port: int, sink=None):
     return node, fanout, relay
 
 
+def collector(profile) -> threading.Thread:
+    """The store's REST backfill and funding refresh (sleeve_fund.history's run loop), in this process: the store
+    takes one writer per venue, and its lock is per process, shared by the backfill and the hub's bars."""
+    from sleeve_fund import history
+
+    def run() -> None:
+        try:
+            code = history.main(["run", "--venue", profile.name.lower()])
+            print(f"hub {profile.name}: the history backfill stopped ({code}); live bars are still stored")
+        except Exception as exc:  # noqa: BLE001 - the relay keeps going; the store's gaps show what's missing
+            print(f"hub {profile.name}: the history backfill failed: {exc!r}; live bars are still stored")
+
+    t = threading.Thread(target=run, name="hub-backfill", daemon=True)
+    t.start()
+    return t
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.hub", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -78,7 +99,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     assert_keyless()
     profile = venue_profile(args.venue)
+    from sleeve_fund.history import HistoryStore, unwritable
+
+    if problem := unwritable(HistoryStore().root / profile.name.upper()):
+        print(f"hub {profile.name}: can't start: {problem}")
+        return 2
     node, fanout, _ = build(profile, args.port)
+    collector(profile)
     print(f"hub {profile.name}: serving on port {fanout.port}")
     try:
         node.run()

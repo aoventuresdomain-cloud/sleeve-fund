@@ -226,3 +226,16 @@ def test_a_bar_with_no_volume_is_checked_against_the_venues_candle():
     r.on_bar(flat)  # no trades reached the hub that minute: a dropped feed or a quiet market
     assert stored[-1]["ts"] == T0 + MINUTE_NS and stored[-1]["refilled"] is True
     assert not any(m["t"] == "bar" and m["ts"] == T0 + MINUTE_NS and not m["refilled"] for m in r.fanout.sent)
+
+
+def test_the_hub_runs_the_store_backfill_in_its_own_process(monkeypatch):
+    """The store takes one writer per venue: the REST backfill runs in the hub, not beside it."""
+    from types import SimpleNamespace
+
+    from sleeve_fund import history
+    from sleeve_fund.hub.__main__ import collector
+
+    calls = []
+    monkeypatch.setattr(history, "main", lambda argv: calls.append(argv) or 0)
+    collector(SimpleNamespace(name="BINANCE")).join(5)
+    assert calls == [["run", "--venue", "binance"]]
