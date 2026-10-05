@@ -107,7 +107,7 @@ def test_the_development_tab_lists_every_model_with_its_status(client):
     assert "Pass on BTC/USD, Kraken spot" in page and "not tested yet" in page
     for word, n in (("Ready", 1), ("Passed G1", 1), ("Killed", 1)):
         assert re.search(rf'>{word} <span class="n">{n}</span></button>', page)
-    assert '<button type="button" data-filter="all" aria-pressed="true">All <span class="n">6</span>' in page
+    assert '<button type="button" data-filter="all" aria-pressed="true">All <span class="n">8</span>' in page
     # No page-level venue switch that reloads; the menu and the tab both say Development.
     assert "data-reload" not in page and 'data-tab="development">Development' in page
     assert "<span>Development</span>" in page
