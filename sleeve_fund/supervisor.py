@@ -205,36 +205,43 @@ def seed(store: Store, paths: list[str]) -> list[str]:
 
 
 def clear(store: Store, path: str) -> list[str]:
-    """Put away every strategy on the book, once per [[clear]] entry in the file: each is stopped and
-    archived, and its journal stays as it is (nothing is deleted). An entry already applied is skipped,
-    so this can run on every start; strategies added after it are never touched. A strategy still
-    holding a position is stopped but not archived, since archiving would drop a position nobody then
-    watches from the book (review round 11): the entry stays open and finishes on a later start, once
-    the PM has flattened it."""
+    """Put away the strategies on the book, once per [[clear]] entry in the file: each is stopped and
+    archived, and its journal stays as it is (nothing is deleted). An entry's optional `keep` list names
+    strategies it leaves alone. An entry already applied is skipped, so this can run on every start;
+    strategies added after it are never touched. A strategy still holding a position is not archived, since
+    archiving would drop a position nobody then watches from the book (review round 11): it is flattened
+    instead (a PM flatten, which also pauses it, so it opens nothing new), started if it was stopped so the
+    flatten can trade, and the entry stays open to finish on a later start, once it is flat."""
     with open(path, "rb") as fh:
         entries = tomllib.load(fh).get("clear", [])
     done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
     cleared = []
     for entry in entries:
         key, reason = str(entry["id"]), str(entry["reason"]).strip()
+        keep = set(entry.get("keep", []))
         if key in done:
             continue
         put_away = store.archived()
         holding = []
         for s in store.sleeves():
-            if s.desired_state != "stopped":
-                store.set_desired_state(s.name, "stopped")
-                store.drop_pending(s.name, "lapsed: the strategy was stopped before it acted")
-                store.decide("system", "stop", reason, s.name)
-            if s.name in put_away:
+            if s.name in keep or s.name in put_away:
                 continue
             qty = store.journal_book(s.name, s.starting_balance)["qty"]
             if abs(qty) > 1e-12:
                 holding.append(s.name)
+                if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
+                    store.command(s.name, "flatten", f"{reason}: flattened so it can be archived", actor="system")
+                if s.desired_state != "running":
+                    store.set_desired_state(s.name, "running")
+                    store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)
                 store.event(s.name, "warning", "clear_held",
-                            f"{reason}: not archived, it still holds {qty:.12g}; flatten it and the next start "
-                            "archives it")
+                            f"{reason}: not archived yet, it still holds {qty:.12g}; it is being flattened and "
+                            "paused, and the next start archives it")
                 continue
+            if s.desired_state != "stopped":
+                store.set_desired_state(s.name, "stopped")
+                store.drop_pending(s.name, "lapsed: the strategy was stopped before it acted")
+                store.decide("system", "stop", reason, s.name)
             store.archive(s.name)
             store.decide("system", "archive", reason, s.name)
             cleared.append(s.name)
