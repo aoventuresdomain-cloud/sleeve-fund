@@ -87,7 +87,7 @@ def test_the_collector_keeps_both_and_logs_how_far_each_is_kept(tmp_path, capfd,
     profile = venue("BINANCE")
     times = [T0 + i * STEP for i in range(3)]
     monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in (T0,) if t >= start])
-    monkeypatch.setattr(profile, "open_interest_loader", _venue_with(times))
+    monkeypatch.setattr(profile, "stats_loaders", {"open_interest": _venue_with(times)})
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     line = capfd.readouterr().out.strip().splitlines()[-1]
     assert line == "BINANCE BTC/USDT: open interest to 2026-10-01 00:10 UTC (+3), funding to 2026-10-01 00:00 UTC"
@@ -99,7 +99,7 @@ def test_a_funding_failure_does_not_stop_open_interest(tmp_path, capfd, monkeypa
     def broken(pair, start):
         raise OSError("venue down")
     monkeypatch.setattr(profile, "funding_loader", broken)
-    monkeypatch.setattr(profile, "open_interest_loader", _venue_with([T0]))
+    monkeypatch.setattr(profile, "stats_loaders", {"open_interest": _venue_with([T0])})
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     out = capfd.readouterr().out
     assert "funding refresh failed" in out and "open interest to 2026-10-01 00:00 UTC (+1), funding to none yet" in out
@@ -138,3 +138,45 @@ def test_a_week_without_new_snapshots_is_raised_once_a_day_before_any_are_lost(t
     history._warn_at_risk(problem, store=Inbox())
     history._warn_at_risk(problem, store=Inbox())
     assert Inbox.events == [("error", "open_interest_at_risk")]
+
+
+def test_as_of_hides_a_snapshot_until_its_measured_lag_has_passed(tmp_path, monkeypatch):
+    stamps = [T0 + i * STEP for i in range(3)]
+    clock = iter([pd.Timestamp(stamps[0] + 60_000, unit="ms", tz="UTC"),
+                  pd.Timestamp(stamps[1] + 8 * 60_000, unit="ms", tz="UTC"),
+                  pd.Timestamp(stamps[2] + 8 * 60_000, unit="ms", tz="UTC")])
+    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: next(clock)))
+    for n in (1, 2, 3):
+        open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:n]))
+    assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) == pd.Timedelta(minutes=8)
+    at = pd.Timestamp(stamps[2], unit="ms", tz="UTC") + pd.Timedelta(minutes=7)  # the newest is stored, not yet known
+    assert open_interest.as_of("BINANCE", "BTC/USDT", at, root=tmp_path)["contracts"] == 101.0
+    later = at + pd.Timedelta(minutes=1)
+    assert open_interest.as_of("BINANCE", "BTC/USDT", later, root=tmp_path)["contracts"] == 102.0
+    assert open_interest.as_of("BINANCE", "BTC/USDT", pd.Timestamp(T0, unit="ms", tz="UTC"), root=tmp_path) is None
+
+
+def test_backfilled_snapshots_are_read_with_a_cautious_lag_until_one_is_measured(tmp_path):
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with([T0, T0 + STEP]))
+    assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) is None
+    at = pd.Timestamp(T0 + STEP, unit="ms", tz="UTC") + pd.Timedelta(minutes=19)
+    assert open_interest.as_of("BINANCE", "BTC/USDT", at, root=tmp_path)["contracts"] == 100.0
+
+
+def test_positioning_ratios_are_kept_as_their_own_unused_series(tmp_path, monkeypatch):
+    from sleeve_fund.venues import BINANCE_STATS
+
+    asked = []
+    rows = [{"symbol": "BTCUSDT", "longShortRatio": "1.8", "longAccount": "0.6429", "shortAccount": "0.3571",
+             "timestamp": T0}]
+    out = BINANCE_STATS["long_short_top"]("BTC/USDT", 0, get_json=lambda url: asked.append(url) or rows, now_ms=T0)
+    assert out == [(T0, 1.8, 0.6429, 0.3571)] and "/topLongShortPositionRatio?" in asked[0]
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "stats_loaders", {
+        "open_interest": _venue_with([T0]),
+        "long_short_global": lambda pair, start: [(T0, 1.2, 0.55, 0.45)] if start <= T0 else []})
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    kept = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path, series="long_short_global")
+    assert list(kept.columns[:3]) == ["long_short_ratio", "long_share", "short_share"]
+    assert kept["long_share"].iloc[0] == 0.55
+    assert (tmp_path / "BINANCE" / "BTC-USDT" / "open_interest.json").exists()

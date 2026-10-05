@@ -575,19 +575,22 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
 
 
 def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
-    """The venue's open interest snapshots for the instrument (sleeve_fund.open_interest), then one line saying how
-    far open interest and funding are kept, which the status workflow shows in the hub's log."""
-    if profile.open_interest_loader is None:
+    """The venue's open interest and positioning snapshots for the instrument (sleeve_fund.open_interest), then
+    one line saying how far open interest and funding are kept, which the status workflow shows in the hub's log."""
+    if not profile.stats_loaders:
         return
     from sleeve_fund import open_interest
 
-    try:
-        out = open_interest.refresh(profile.name, pair, root=root)
-    except Exception as exc:  # noqa: BLE001 - snapshots the venue still keeps are fetched on the next pass
-        print(f"{profile.name} {pair}: open interest refresh failed: {exc!r}")
-        _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root))
+    outs = {}
+    for series in profile.stats_loaders:
+        try:
+            outs[series] = open_interest.refresh(profile.name, pair, root=root, series=series)
+        except Exception as exc:  # noqa: BLE001 - snapshots the venue still keeps are fetched on the next pass
+            print(f"{profile.name} {pair}: {series.replace('_', ' ')} refresh failed: {exc!r}")
+        _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root, series=series))
+    out = outs.get("open_interest")
+    if out is None:
         return
-    _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root))
     oi = f"{out['latest']:%Y-%m-%d %H:%M}" if out["latest"] is not None else "none yet"
     fr = f"{funding_to:%Y-%m-%d %H:%M}" if funding_to is not None else "none yet"
     extra = f", {out['conflicts']} differing (provenance.jsonl)" if out["conflicts"] else ""
@@ -604,7 +607,7 @@ def _warn_at_risk(problem: str | None, store=None) -> None:
     if problem is None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
-    key = problem.split(":")[0]
+    key = problem.split(" last kept")[0]  # instrument and series
     if time.time() - _warned.get(key, 0) < 86_400:
         return
     try:
