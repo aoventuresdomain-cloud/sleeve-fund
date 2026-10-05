@@ -1710,6 +1710,29 @@ def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, 
     assert store.previous_book() == {}
 
 
+def test_a_strategy_a_clean_slate_put_away_still_holding_stays_in_the_book_until_flat(client, tmp_path):
+    """5 Oct 2026: the 4 Oct clean slate archived btc-trend-smoke and btc-trend-daily while they were still
+    long, and the book then left them out, so their positions sat in no exposure, risk page or kill switch.
+    One still holding stays in the book, the kill switch reaches it, and it leaves once it is flat."""
+    c, store = client
+    store.create_sleeve(name="old-long", strategy="trend_filter", instrument="BTC/USD",
+                        bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=7000)
+    store.record_fill("old-long", side="BUY", qty=0.05, price=60_000, fee=1.2, order_id="O-1", trade_id="T-1")
+    store.record_equity("old-long", equity=6998.8, cash=3998.8, qty=0.05, price=60_000, benchmark=7000)
+    store.set_desired_state("old-long", "stopped")
+    from sleeve_fund.store import sleeve_archive_t, utcnow
+
+    with store.engine.begin() as conn:  # archived with its position, as the clear did before #86
+        conn.execute(sleeve_archive_t.insert().values(sleeve="old-long", archived_at=utcnow()))
+    store.decide("system", "clear", "2026-10-04: new book (1 put away)")  # as the 4 Oct clear left it
+    assert "old-long" not in store.previous_book()
+    risk = c.get("/risk", auth=AUTH).text
+    assert 'href="/sleeves/old-long"' in risk and "Flatten everything" in risk
+    store.record_fill("old-long", side="SELL", qty=0.05, price=60_000, fee=1.2, order_id="O-2", trade_id="T-2")
+    assert set(store.previous_book()) == {"old-long"}
+    assert 'href="/sleeves/old-long"' not in c.get("/risk", auth=AUTH).text
+
+
 def test_maker_first_orders_are_switched_off_by_default(client, prices, instrument):
     """PM, 4 Oct 2026: market orders only until a strategy proves it needs maker fills. The form offers no
     order type, a hand-made maker request is refused in words, and so is a backtest asking for one."""
