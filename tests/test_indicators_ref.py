@@ -13,7 +13,7 @@ import pytest
 from nautilus_trader.indicators import ExponentialMovingAverage
 
 from sleeve_fund.strategies.indicators import (
-    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, Bollinger, Donchian, EfficiencyRatio, Ema, RelativeVolume, Rsi, RsiDivergence, Sma, Vwap,
+    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, Bollinger, Donchian, EfficiencyRatio, Ema, Keltner, RelativeVolume, Rsi, RsiDivergence, Sma, Stochastic, Vwap,
     Wma, make_block, settle_bars, warmup_for,
 )
 
@@ -229,6 +229,33 @@ def test_donchian(bars, n, source):
         _check(*_stream(Donchian(n, source), bars, _hlc, key), ref)
 
 
+@pytest.mark.parametrize("n,smooth,d", [(1, 1, 1), (14, 3, 3), (30, 5, 4)])
+def test_stochastic(bars, n, smooth, d):
+    top, bottom = bars["high"].rolling(n).max(), bars["low"].rolling(n).min()
+    raw = (100 * (bars["close"] - bottom) / (top - bottom)).where(top > bottom, 50.0).where(top.notna())
+    k = raw.rolling(smooth).mean()
+    for key, ref in {"k": k, "d": k.rolling(d).mean()}.items():
+        _check(*_stream(Stochastic(n, smooth, d), bars, _hlc, key), ref)
+
+
+def test_stochastic_on_a_flat_range_reads_50():
+    s = Stochastic(3, 1, 1)
+    for _ in range(3):
+        s.update_raw(100.0, 100.0, 100.0)
+    assert s.values == {"k": 50.0, "d": 50.0}
+
+
+@pytest.mark.parametrize("n,atr_n,k", [(1, 1, 1.0), (20, 10, 2.0), (50, 14, 1.5)])
+def test_keltner(bars, n, atr_n, k):
+    mid = bars["close"].ewm(alpha=2 / (n + 1), adjust=False).mean()  # the engine EMA: starts at the first close
+    prev = bars["close"].shift(1)
+    tr = np.maximum(bars["high"], prev.fillna(bars["high"])) - np.minimum(bars["low"], prev.fillna(bars["low"]))
+    atr = tr.rolling(atr_n).mean()
+    for key, ref in {"mid": mid, "upper": mid + k * atr, "lower": mid - k * atr}.items():
+        got, ready = _stream(Keltner(n, atr_n, k), bars, _hlc, key)
+        np.testing.assert_allclose(got[ready], ref.to_numpy()[ready], rtol=1e-9, atol=1e-7, err_msg=key)
+
+
 def _rsi_ref(close: pd.Series, n: int) -> pd.Series:
     change = close.diff().iloc[1:]
     gain, loss = _wilder(change.clip(lower=0), n), _wilder((-change).clip(lower=0), n)
@@ -288,14 +315,14 @@ def _all_blocks():
     return [(Sma(20), _close), (Ema(20), _close), (Wma(20), _close), (Vwap("day"), _ohlcv),
             (Vwap("rolling", 30), _ohlcv), (Rsi(14), _close), (Bollinger(20), _close), (Atr(14), _hlc),
             (RelativeVolume(20), _vol), (EfficiencyRatio(10), _close), (Donchian(20), _hlc),
-            (RsiDivergence(), _hlc)]
+            (RsiDivergence(), _hlc), (Stochastic(), _hlc), (Keltner(), _hlc)]
 
 
 def test_every_named_block_is_tested_here():
     assert {type(b) for b, _ in _all_blocks()} == set(BLOCKS.values())
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_no_look_ahead(i):
     """A value at a bar is the same whether or not later bars exist: each prefix reads as the full run did."""
     block, feed = _all_blocks()[i]
@@ -306,7 +333,7 @@ def test_no_look_ahead(i):
         np.testing.assert_array_equal(part, full[:cut])
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_reset_gives_a_fresh_block(i):
     block, feed = _all_blocks()[i]
     fresh = copy.deepcopy(block)
@@ -319,7 +346,7 @@ def test_reset_gives_a_fresh_block(i):
     assert block.values == fresh.values and block.initialized == fresh.initialized
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_settled_after_its_warmup(i):
     """Fed warmup_bars bars, every block is initialized: warm-up from warmup_bars is always enough."""
     block, feed = _all_blocks()[i]
@@ -342,6 +369,8 @@ def test_warmup_bars_from_settings():
     assert warmup_for([Sma(50), Ema(20), RelativeVolume(20)]) == settle_bars(20)
     assert Donchian(20).warmup_bars == 21
     assert RsiDivergence(14, 3, 3, 50).warmup_bars == settle_bars(14) + 56
+    assert Stochastic(14, 3, 3).warmup_bars == 18
+    assert Keltner(20, 10).warmup_bars == settle_bars(20) and Keltner(2, 30).warmup_bars == 31
     assert warmup_for([]) == 0
 
 
@@ -369,6 +398,7 @@ def test_make_block_by_name():
     ("ema", {"period": 0}), ("wma", {"period": 2.5}), ("bollinger", {"period": 1}), ("bollinger", {"k": 0}),
     ("vwap", {"anchor": "week"}), ("ema", {"lookback": 5}), ("bollinger", {"k": 50}), ("sma", {"period": 10**6}), ("vwap", {"anchor": "rolling"}), ("vwap", {"anchor": "day", "period": 5}),
     ("relative_volume", {"period": True}), ("efficiency_ratio", {"period": -1}), ("donchian", {"source": "open"}),
+    ("stochastic", {"smooth": 0}), ("stochastic", {"d_period": 1.5}), ("keltner", {"k": 0}), ("keltner", {"atr_period": 0}),
     ("rsi_divergence", {"right": 0}), ("rsi_divergence", {"rsi_period": 1}), ("rsi_divergence", {"left": 51}),
 ])
 def test_bad_settings_are_refused(kind, settings):
@@ -376,7 +406,7 @@ def test_bad_settings_are_refused(kind, settings):
         make_block(kind, **settings)
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_update_ohlcv_and_handle_bar_match_update_raw(i):
     """Any block can be fed whole bars, ignoring what it doesn't use, and reads as update_raw fed it."""
     block, feed = _all_blocks()[i]
@@ -404,7 +434,7 @@ def test_update_ohlcv_and_handle_bar_match_update_raw(i):
         assert from_bar.values == raw.values
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_values_are_none_until_initialized_and_never_nan(i):
     block, feed = _all_blocks()[i]
     assert set(block.values) == set(type(block).OUTPUTS) and all(v is None for v in block.values.values())
@@ -419,7 +449,7 @@ def test_values_are_none_until_initialized_and_never_nan(i):
                 assert block.value is None
 
 
-@pytest.mark.parametrize("i", range(12))
+@pytest.mark.parametrize("i", range(14))
 def test_warmup_from_the_class_matches_the_block(i):
     block, _ = _all_blocks()[i]
     assert type(block).warmup_bars(**block.settings) == block.warmup_bars
