@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import sys
@@ -380,8 +381,10 @@ def mirror_once(store, targets: dict) -> int:
                             f"Demo mirror didn't copy the {f['side'].lower()} of {f['qty']:.8g} to {venue.label}: "
                             f"{why}. The paper book is unaffected.")
                 continue
+            reset = "Reset strategy" in store.order_reason(f.get("order_id") or "")  # a PM reset's closing fill
             try:
-                order_id, price = venue.market(f["side"], instrument, amount, f"{s.name}:{f['id']}")
+                order_id, price = venue.market(f["side"], instrument, amount,
+                                               f"{s.name[:20]}:reset:{f['id']}" if reset else f"{s.name}:{f['id']}")
             except Exception as e:  # noqa: BLE001 - noted, never retried, so it can't trade twice
                 store.record_mirror(s.name, fill_id=f["id"], status="error", instrument=instrument,
                                     amount=sign * amount, message=str(e)[:500])
@@ -390,7 +393,7 @@ def mirror_once(store, targets: dict) -> int:
                             f"to {venue.label}: {str(e)[:200]}. The paper book is unaffected.")
                 continue
             store.record_mirror(s.name, fill_id=f["id"], status="filled", instrument=instrument, amount=sign * amount,
-                                price=price, order_id=order_id)
+                                price=price, order_id=order_id, message="reset" if reset else "")
             sent += 1
     return sent
 
@@ -515,7 +518,7 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
                 _MARGIN_RESET.add(symbol)
                 side = "SELL" if held > 0 else "BUY"
                 try:
-                    order_id, price = venue.market(side, symbol, abs(held), f"{symbol}:margin-switch")
+                    order_id, price = venue.market(side, symbol, abs(held), _link(symbol, "margin-switch"))
                     put_on = _put_on(store)
                     for s in sleeves:
                         if put_on.get(s.name):
@@ -544,12 +547,14 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
     return out
 
 
-def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float]) -> str:
+def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float], tag: str = "resync") -> str:
     """The PM's resync button: bring Bybit Demo in line with the paper book now, for the strategy's symbol (all
     strategies sharing it) or every mirrored symbol. Cancels resting orders, re-applies isolated margin at the
     paper leverage (closing the demo position first if Bybit won't switch while it is open), then trades the
     demo position straight to the paper total, with no wait for the catch-up. Every order and row it makes is
-    labelled "resync". Returns paper against Bybit, before and after. Never touches the paper book."""
+    labelled with tag ("resync", or "reset" after a PM reset). Its rows take the strategy's latest fill as their
+    watermark: the paper position already counts every fill, so none is copied again afterwards. Returns paper
+    against Bybit, before and after. Never touches the paper book."""
     venue = targets.get("BYBIT")
     groups = bybit_leverage(store)
     if sleeve is not None:
@@ -573,13 +578,13 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float]) -
         except Exception as first:  # noqa: BLE001
             note = f" (margin: {str(first)[:120]})"
             if held:
-                order_id, price = venue.market("SELL" if held > 0 else "BUY", symbol, abs(held), f"{symbol}:resync")
+                order_id, price = venue.market("SELL" if held > 0 else "BUY", symbol, abs(held), _link(symbol, tag))
                 put_on = _put_on(store)
                 for s in sleeves:
                     if put_on.get(s.name):
                         store.record_mirror(s.name, fill_id=store.mirror_watermark(s.name) or 0, status="filled",
                                             instrument=symbol, amount=-put_on[s.name], price=price,
-                                            order_id=order_id, message="resync: closed to switch to isolated margin")
+                                            order_id=order_id, message=f"{tag}: closed to switch to isolated margin")
                 held = 0.0
                 try:
                     venue.margin_setup(symbol, lev)
@@ -589,14 +594,14 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float]) -
         delta = round(round((target - held) / step) * step, 8)
         order_id, price = "", None
         if abs(delta) >= step:
-            order_id, price = venue.market("BUY" if delta > 0 else "SELL", symbol, abs(delta), f"{symbol}:resync")
+            order_id, price = venue.market("BUY" if delta > 0 else "SELL", symbol, abs(delta), _link(symbol, tag))
         put_on = _put_on(store)
         for s in sleeves:  # the mirror's record now says what each strategy holds on paper
             amount = round(paper[s.name] - put_on.get(s.name, 0.0), 8)
-            if abs(amount) > 1e-12:
-                store.record_mirror(s.name, fill_id=store.mirror_watermark(s.name) or 0, status="filled",
-                                    instrument=symbol, amount=amount, price=price, order_id=order_id,
-                                    message="resync to the paper position")
+            last = store.last_fill_id(s.name)
+            if abs(amount) > 1e-12 or last > (store.mirror_watermark(s.name) or 0):
+                store.record_mirror(s.name, fill_id=last, status="filled", instrument=symbol, amount=amount,
+                                    price=price, order_id=order_id, message=f"{tag} to the paper position")
         if not note:
             margin[symbol] = lev
         after = f"{venue.position(symbol):+g}, {venue.margin_state(symbol)}"
@@ -609,7 +614,8 @@ def process_resyncs(store, targets: dict, margin: dict[str, float]) -> int:
     done = 0
     for req in store.pending_resyncs():
         try:
-            result = resync(store, targets, req["sleeve"], margin)
+            tag = "reset" if req["reason"].startswith("Reset strategy") else "resync"
+            result = resync(store, targets, req["sleeve"], margin, tag)
             level = "info"
         except Exception as e:  # noqa: BLE001 - reported on the request and the strategy, not retried
             result, level = f"failed: {str(e)[:300]}", "warning"
@@ -619,6 +625,15 @@ def process_resyncs(store, targets: dict, margin: dict[str, float]) -> int:
             store.event(name, level, "mirror_resync", f"Demo copy resynced ({req['reason']}): {result}")
         done += 1
     return done
+
+
+_LINKS = itertools.count()
+
+
+def _link(symbol: str, tag: str) -> str:
+    """A label for a mirror order that is no fill's copy: unique, since Bybit refuses a repeated order link id,
+    and short enough for its 36 characters."""
+    return f"{symbol}:{tag}:{int(time.time() * 1000):x}{next(_LINKS) % 100:02d}"
 
 
 def _put_on(store) -> dict[str, float]:

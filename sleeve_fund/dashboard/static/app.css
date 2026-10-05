@@ -648,3 +648,5 @@ td.health { line-height: 1.35; }
 .exit-fields .grid2 + .grid2 { margin-top: 12px; }
 .exit-plan { margin: 12px 0 0; padding: 9px 12px; border-radius: var(--r-sm); background: var(--neutral-bg); font-size: 13px; line-height: 1.5; }
 .exit-plan.warn { background: var(--warn-bg); }
+.reset-plan { margin: 0 0 12px; padding-left: 18px; line-height: 1.5; font-size: 13px; }
+.reset-plan li + li { margin-top: 6px; }

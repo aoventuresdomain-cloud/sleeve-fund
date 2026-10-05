@@ -19,6 +19,7 @@
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
+    {% if not backtest_id and not archived %}<button type="button" class="secondary" data-open="dlg-reset" {% if resetting %}disabled title="A reset is under way"{% endif %}>{{ "Resetting…" if resetting else "Reset" }}</button>{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }}{% if s.venue %} on {{ venue_label(s.venue) }}{% endif %}, {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
@@ -130,11 +131,10 @@
       <div><dt title="What the mirror has put on the demo account for this strategy">Copied</dt><dd>{{ '%+g'|format(demo.put_on) }} {{ base }}{% if (demo.put_on - held)|abs > 0.0000001 %} <span class="loss">out of line</span>{% else %} <span class="faint">in line</span>{% endif %}</dd></div>
       <div><dt>Terms</dt><dd>isolated margin, {{ '%g'|format(demo.leverage) }}× <span class="faint">as paper</span></dd></div>
     </dl></div>
-    <div class="pos-card"><h3>Resync</h3><dl>
-      <div><dt>Last</dt><dd>{% if demo.last %}{% if demo.last.done_at %}{{ demo.last.done_at|ago }}{% else %}<span class="faint">waiting for the mirror</span>{% endif %}{% else %}<span class="muted">Never</span>{% endif %}</dd></div>
+    <div class="pos-card"><h3>Last sync</h3><dl>
+      <div><dt>When</dt><dd>{% if demo.last %}{% if demo.last.done_at %}{{ demo.last.done_at|ago }}{% else %}<span class="faint">waiting for the mirror</span>{% endif %}{% else %}<span class="muted">Never</span>{% endif %}</dd></div>
       {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result }}</dd></div>{% endif %}
-    </dl>
-    <button type="button" class="secondary" data-open="dlg-resync">Resync demo copy</button></div>
+    </dl></div>
   </div>{% endif %}
   {% if position %}<details class="why-fold">
     <summary><span class="k">{{ "Why it was sold short" if position.side < 0 else "Why it was bought" }}</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
@@ -296,14 +296,19 @@
   </form>
 </dialog>
 {% endfor %}
-{% if demo %}<dialog id="dlg-resync" aria-labelledby="dlg-resync-h">
-  <form method="post" action="/sleeves/{{ s.name }}/resync-demo">
-    <h2 id="dlg-resync-h">Resync the demo copy</h2>
-    <p>Sets {{ demo.label }} to isolated margin at {{ '%g'|format(demo.leverage) }}×, cancels any resting order, and trades the demo position to match paper now ({{ '%+g'|format(held) }} {{ base }}{% if s.instrument %} {{ s.instrument }}{% endif %}, for every strategy copied on that instrument). Demo money only: the paper book is not touched. Its orders are labelled "resync".</p>
-    <label for="r-resync">Reason for the decision log</label>
-    <input id="r-resync" name="reason" list="resync-reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <datalist id="resync-reasons">{% for r in resync_reasons %}<option value="{{ r }}">{% endfor %}</datalist>
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button>Resync now</button></div>
+{% if not archived %}<dialog id="dlg-reset" aria-labelledby="dlg-reset-h">
+  <form method="post" action="/sleeves/{{ s.name }}/reset">
+    <h2 id="dlg-reset-h">Reset {{ s.name }}</h2>
+    <ul class="reset-plan">
+      <li>{% if held %}Closes the {{ "short" if held < 0 else "long" }} of {{ held|abs|qty }} {{ base }} on paper at market{% if demo %}, and the copy on {{ demo.label }}{% endif %}.{% else %}No position to close{% if demo %}; {{ demo.label }} is set flat too{% endif %}.{% endif %} Open orders are cancelled{% if demo %} on both{% endif %}. Closing fills are marked "reset".</li>
+      <li>Puts this run away under Previous book: since {{ s.created_at|ts }}, equity {{ x.equity|money }}, profit and loss {{ money_signed(x.pnl) }}, fees {{ x.fees|money }}, {{ x.fills }} fills. Kept and still viewable, not counted in the book. Nothing is deleted.</li>
+      <li>Starts {{ s.name }} again at {{ s.starting_balance|money }} {{ quote }}, with profit and loss, drawdown and fees at zero{% if s.desired_state != 'running' %}, stopped as it is now{% endif %}. Its settings stay as they are.</li>
+      {% if demo %}<li>Sets {{ demo.label }} to isolated margin at {{ '%g'|format(demo.leverage) }}×, as paper, before it trades again.</li>{% endif %}
+    </ul>
+    <label for="r-reset">Reason for the decision log</label>
+    <input id="r-reset" name="reason" list="reset-reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <datalist id="reset-reasons">{% for r in reset_reasons %}<option value="{{ r }}">{% endfor %}</datalist>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger">Reset strategy</button></div>
   </form>
 </dialog>{% endif %}
 <dialog id="dlg-move" aria-labelledby="dlg-move-h">

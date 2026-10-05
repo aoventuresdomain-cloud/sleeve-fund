@@ -529,7 +529,8 @@ def test_resync_brings_bybit_to_the_paper_position_at_once_on_the_paper_terms():
     assert mirror.process_resyncs(store, targets, margin) == 1
     assert (demo.held, demo.mode, demo.lev) == (0.076, "ISOLATED_MARGIN", "2") and margin == {"BTCUSDT": 2.0}
     assert "/v5/order/cancel-all" in demo.calls
-    assert all(o["orderLinkId"].endswith("resync") for o in demo.orders[1:])
+    links = [o["orderLinkId"] for o in demo.orders[1:]]
+    assert all("-resync-" in x for x in links) and len(set(links)) == len(links)
     req = store.last_resync("bn-ls")
     assert req["done_at"] and "paper +0.076 at 2x isolated" in req["result"]
     assert "before +0.1, cross margin, BTCUSDT at 10x" in req["result"] and "after +0.076, isolated margin" in req["result"]

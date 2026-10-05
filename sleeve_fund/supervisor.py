@@ -96,7 +96,35 @@ class Supervisor:
         proc.popen = None
         self.store.event(name, "info", "process_stop", why)
 
+    def reset_pending(self) -> None:
+        """Carry each PM reset forward (5 Oct 2026): a strategy still holding is flattened first (a PM flatten,
+        which pauses it; started if stopped so the flatten can trade); once flat its process is stopped, the run
+        so far is put away under its own name (Store.split_run), and the strategy starts again at its starting
+        capital if it was running. A strategy copied to Bybit Demo then has its demo copy resynced (flat, on
+        the paper margin terms) before it trades again."""
+        for req in self.store.pending_resets():
+            name = req["sleeve"]
+            s = self.store.sleeve(name)
+            pending = self.store.pending_commands(name)
+            if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+                if not any(c["command"] == "flatten" for c in pending):
+                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"])
+                    if s.desired_state != "running":
+                        self.store.set_desired_state(name, "running")
+                continue
+            self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
+            self.store.drop_pending(name, "lapsed: the strategy was reset")
+            run = self.store.split_run(req)
+            self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
+            self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
+                              f"kept as {run} under Previous book", name)
+            self.store.event(name, "info", "reset", f"Reset by the PM ({req['reason']}): the run so far is kept as "
+                             f"{run}; starting again at {s.starting_balance:,.0f}")
+            if s.params.get("demo_mirror"):
+                self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
+
     def step(self) -> None:
+        self.reset_pending()
         now = utcnow()
         for sleeve in self.store.sleeves():
             proc = self.procs.setdefault(sleeve.name, Proc())

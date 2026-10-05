@@ -407,7 +407,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
-                    resync_reasons=RESYNC_REASONS,
+                    reset_reasons=RESET_REASONS, resetting=None if bt_id else st().pending_reset(name),
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     demo=None if bt_id else _demo_copy(st(), s),
@@ -550,32 +550,29 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
-    @app.post("/sleeves/{name}/resync-demo")
-    def sleeve_resync_demo(name: str, reason: str = Form(...), actor: str = Depends(require_pm),
-                           _o: None = Depends(same_origin)):
-        """Ask the demo mirror to bring Bybit Demo in line with this strategy's paper position now. Demo only:
-        the paper book is never touched."""
+    @app.post("/sleeves/{name}/reset")
+    def sleeve_reset(name: str, reason: str = Form(...), actor: str = Depends(require_pm),
+                     _o: None = Depends(same_origin)):
+        """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
+        puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
-            if _demo_copy(st(), st().sleeve(name)) is None:
-                raise ValueError("only a perpetual strategy copied to Bybit Demo can be resynced")
-            st().request_resync(name, reason, actor=actor)
+            st().request_reset(name, reason, actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
-            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}#positions",
-                                    status_code=303)
-        return RedirectResponse(f"/sleeves/{name}#positions", status_code=303)
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
-    @app.post("/mirror/resync")
-    def resync_all_demo(request: Request, reason: str = Form(...), actor: str = Depends(require_pm),
-                        _o: None = Depends(same_origin)):
-        """Resync every strategy copied to Bybit Demo."""
-        back = request.headers.get("referer") or "/"
-        try:
-            st().request_resync(None, reason, actor=actor)
-        except ValueError as exc:
-            return RedirectResponse(f"/?{urlencode({'command_error': str(exc)})}", status_code=303)
-        return RedirectResponse(back if back.startswith(("/", str(request.base_url))) else "/", status_code=303)
+    @app.post("/book/reset")
+    def book_reset(reason: str = Form(...), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Reset every strategy on the current book (not archived, not a backtest, none already resetting)."""
+        if not reason.strip():
+            return RedirectResponse(f"/?{urlencode({'command_error': 'a reason is required'})}", status_code=303)
+        gone = set(st().archived())
+        for s in st().sleeves():
+            if s.name not in gone and not st().pending_reset(s.name):
+                st().request_reset(s.name, reason, actor=actor)
+        return RedirectResponse("/", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1302,8 +1299,8 @@ def _demo_copy(store, s) -> dict | None:
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
-RESYNC_REASONS = ["Demo copy out of line with paper", "Demo account settings changed", "After a deploy or restart",
-                  "Checking the copy during testing"]
+RESET_REASONS = ["Test finished; starting a clean run", "Settings changed; a fresh run to compare",
+                 "Demo copy out of line with paper", "After a fix to the engine or the mirror"]
 COMMON_REASONS = [
     "Risk limit close; reducing exposure",
     "Market event; standing aside",
