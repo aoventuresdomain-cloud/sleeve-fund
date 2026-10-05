@@ -559,7 +559,8 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
     assert shorted, "the backtest never went short"
     # M12-U5: the side rides on the entry cell, which no width hides (Size, which says it too, goes at 1440 px).
     table = result.split('id="bt-tr-h"')[1].split("</table>")[0]
-    sides = re.findall(r'<tr><td data-m="hide">[^<]+<div class="sub">(long|short)</div></td>', table)
+    # Not hidden on a phone's card either (data-m="hide"), where Size is gone too.
+    sides = re.findall(r'<tr><td data-label="Entry">[^<]+<div class="sub">(long|short)</div></td>', table)
     assert "short" in sides and len(sides) == table.count('<tr class="detail"'), sides
 
     # Start: the new strategy keeps the market, shorts and mirror.
