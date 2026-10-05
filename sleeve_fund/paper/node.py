@@ -19,7 +19,7 @@ import pandas as pd
 
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig, SandboxExecutionClientFactory
 from nautilus_trader.common import Environment, LoggerConfig, LogLevel
-from nautilus_trader.live import LiveDataEngineConfig, LiveNode
+from nautilus_trader.live import LiveNode
 from nautilus_trader.model import (
     AccountId,
     AccountType,
@@ -55,7 +55,6 @@ def strategy_id(cls_name: str, name: str) -> StrategyId:
 
 # Warm-up bars from a store that stopped updating would leave a hole before the first live bar.
 HISTORY_MAX_LAG = pd.Timedelta(hours=6)
-HUB_BUILD_DELAY_SECONDS = 3  # a hub minute lands within milliseconds of its close; a stand-in candle after one REST call
 
 
 def history_loader(venue: str, pair: str, store=None, recent=None):
@@ -163,14 +162,15 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     venue = profile.venue
     base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
     if hub is not None:
-        # The hub's trades, quotes and 1-minute bars, the same for every strategy on the instrument; anything
-        # longer is built here from those 1-minute bars, as a backtest builds them from the store's.
+        # The hub's trades, quotes and 1-minute bars, the same for every strategy on the instrument; longer bars
+        # are built by the hub client from those minutes, as a backtest builds them from the store's.
         from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, hub_bar_spec
 
-        bar_type = BarType.from_str(f"{sleeve.instrument_id}-{hub_bar_spec(sleeve.bar_spec)}")
+        spec = hub_bar_spec(sleeve.bar_spec)
+        bar_type = BarType.from_str(f"{sleeve.instrument_id}-{spec}")
         data_factory = HubDataClientFactory()
         data_config = HubDataClientConfig(venue=profile.name, instrument_ids=(sleeve.instrument_id,), host=hub[0],
-                                          port=hub[1])
+                                          port=hub[1], bar_spec=spec)
     else:
         bar_type = BarType.from_str(sleeve.bar_type)
         data_factory, data_config = profile.data_client()
@@ -188,16 +188,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             balances = [Money(book["cash"], Currency.from_str(quote_code))]
             if book["qty"] > 0:
                 balances.append(Money(book["qty"], Currency.from_str(base_code)))
-    builder = LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
-    if hub is not None:
-        # A bar built here from the hub's minutes closes on this node's clock, before the minute closing with it
-        # has arrived: waiting HUB_BUILD_DELAY_SECONDS lets that minute (or the venue's candle standing in for
-        # it) land in its own bar rather than the next. The first bar, begun before the node started, would be a
-        # part bar: it's skipped, as the warm-up comes from the store.
-        builder = builder.with_data_engine_config(LiveDataEngineConfig(
-            time_bars_build_delay=HUB_BUILD_DELAY_SECONDS * 1_000_000, time_bars_skip_first_non_full_bar=True))
     node = (
-        builder
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
         # The hub may take a minute to pick up an instrument it doesn't relay yet.

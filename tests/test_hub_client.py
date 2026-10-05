@@ -11,10 +11,9 @@ T0 = 1_791_223_020_000_000_000
 
 
 @pytest.mark.parametrize("spec, fed", [
-    ("1-MINUTE-LAST-INTERNAL", "1-MINUTE-LAST-EXTERNAL"),  # the hub's own bars, as they come
-    ("15-MINUTE-LAST-INTERNAL", "15-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL"),  # built in the node from them
-    ("1-HOUR-LAST-INTERNAL", "1-HOUR-LAST-INTERNAL@1-MINUTE-EXTERNAL"),
-    ("15-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL", "15-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL"),
+    ("1-MINUTE-LAST-INTERNAL", "1-MINUTE-LAST-EXTERNAL"),  # the hub's own minutes, as they come
+    ("15-MINUTE-LAST-INTERNAL", "15-MINUTE-LAST-EXTERNAL"),  # built by the hub client from them
+    ("1-HOUR-LAST-INTERNAL", "1-HOUR-LAST-EXTERNAL"),
 ])
 def test_a_strategys_bars_are_the_hubs_minutes_or_built_from_them(spec, fed):
     assert hub_bar_spec(spec) == fed
@@ -25,9 +24,8 @@ def test_bars_the_venue_builds_itself_cant_come_from_the_hub():
         hub_bar_spec("1-DAY-LAST-EXTERNAL")
 
 
-def _bar(ts, c="60000.10", refilled=False):
-    return {"t": "bar", "id": BTC, "o": "60000.00", "h": "60010.00", "l": "59990.00", "c": c, "v": "1.250",
-            "ts": ts, "recv": ts, "refilled": refilled}
+def _bar(ts, c="60000.10", refilled=False, o="60000.00", h="60010.00", l="59990.00", v="1.250"):  # noqa: E741
+    return {"t": "bar", "id": BTC, "o": o, "h": h, "l": l, "c": c, "v": v, "ts": ts, "recv": ts, "refilled": refilled}
 
 
 def test_messages_become_nautilus_data_and_each_bar_is_delivered_once_in_order():
@@ -53,6 +51,40 @@ def test_a_bar_refilled_long_after_its_close_is_not_traded_on():
     assert d(_bar(T0, refilled=True), T0 + 91 * 1_000_000_000) is None and d.late == 1
     assert d(_bar(T0 + minute, refilled=True), T0 + minute + 2_000_000_000) is not None  # the latest, just refilled
     assert d.late == 1
+
+
+M = 60_000_000_000
+E = 1_791_223_500_000_000_000  # 18:05 on 5 Oct 2026: a 5-minute boundary
+
+
+def test_longer_bars_are_the_minutes_closing_in_them_sent_with_their_last_minute():
+    d = Decoder("5-MINUTE-LAST-EXTERNAL")
+    assert d(_bar(E - M, c="60000.50"), E - M + 5) is None  # 18:04: the bar to 18:05 began before the node did
+    assert d(_bar(E), E + 5) is None  # its last minute: a part bar, not sent
+    for k, (h, lo) in enumerate([("60050.00", "59990.00"), ("60010.00", "59900.00"), ("60010.00", "59990.00"),
+                                 ("60010.00", "59990.00")], 1):
+        assert d(_bar(E + k * M, o=f"6000{k}.00", h=h, l=lo, c=f"6000{k}.50"), E + k * M + 5) is None
+    b = d(_bar(E + 5 * M, c="60005.50", v="2.000"), E + 5 * M + 5)  # 18:10 closes the bar to 18:10
+    assert str(b.bar_type) == f"{BTC}-5-MINUTE-LAST-EXTERNAL" and b.ts_event == E + 5 * M
+    assert (str(b.open), str(b.high), str(b.low), str(b.close), str(b.volume)) == (
+        "60001.00", "60050.00", "59900.00", "60005.50", "7.000")
+
+
+def test_a_bar_whose_last_minute_never_came_is_sent_with_the_next_minute_while_current():
+    d = Decoder("5-MINUTE-LAST-EXTERNAL")
+    for k in range(1, 6):
+        d(_bar(E - 5 * M + k * M), E - 5 * M + k * M + 5)  # a whole bar to 18:05, sent
+    for k in range(1, 5):
+        d(_bar(E + k * M), E + k * M + 5)  # 18:06 to 18:09; 18:10 never comes
+    b = d(_bar(E + 6 * M), E + 6 * M + 5)  # 18:11 arrives a minute after the bar should have closed
+    assert b.ts_event == E + 5 * M and str(b.volume) == "5.000"  # stamped at its close, four minutes in it
+    assert d.building[BTC].end == E + 10 * M
+
+
+def test_one_minute_bars_go_through_as_they_come():
+    d = Decoder()
+    b = d(_bar(E), E + 5)
+    assert str(b.bar_type) == f"{BTC}-1-MINUTE-LAST-EXTERNAL" and b.ts_event == E and str(b.close) == "60000.10"
 
 
 def test_the_instrument_comes_from_its_definition():

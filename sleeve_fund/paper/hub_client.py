@@ -2,17 +2,19 @@
 Nautilus data client that reads the hub's stream (sleeve_fund.hub.protocol) and hands the node the same trades,
 quotes and closed 1-minute bars every other strategy on the instrument gets, and the instrument's definition.
 
-Bars arrive as `<instrument>-1-MINUTE-LAST-EXTERNAL`; a strategy on longer bars subscribes to a composite type
-(`15-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL`) and the node builds them from these, as a backtest builds them
-from the store's 1-minute bars. A bar at or before the last one delivered (a refill landing after the live bars
-moved on) is not delivered again. When the hub goes away the client reconnects; until it does, no trades reach
-the strategy and its stale-feed guard holds new entries."""
+Bars reach the strategy as `<instrument>-<its bar>-LAST-EXTERNAL`. A strategy on longer bars gets them built here
+from the hub's minutes, as a backtest builds them from the store's: a 15-minute bar is the minutes closing in it,
+sent as the one closing at its end arrives and stamped at that close. Building them here rather than on the
+node's clock means a bar never closes before its last minute has arrived. A bar at or before the last one
+delivered (a refill landing after the live bars moved on) is not delivered again. When the hub goes away the
+client reconnects; until it does, nothing arrives, so no bar closes and the strategy decides nothing."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from decimal import Decimal
 
 from nautilus_trader.live import DataClientConfig
 from nautilus_trader.live.clients import DataClientFactory, MarketDataClient
@@ -36,20 +38,14 @@ CONNECT_TIMEOUT = 90  # the hub picks up an instrument it doesn't relay yet with
 LATE_BAR_SECONDS = 90  # a bar refilled this long after its close is history, not a signal
 
 
-def bar_type(instrument_id: str) -> BarType:
-    return BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
+MINUTE_NS = 60_000_000_000
 
 
 def hub_bar_spec(spec: str) -> str:
-    """A strategy's bar spec as fed by the hub: 1-minute bars as they come, anything longer built in the node
-    from them. 15-MINUTE-LAST-INTERNAL -> 15-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL."""
-    if spec == "1-MINUTE-LAST-EXTERNAL" or spec.endswith("@1-MINUTE-EXTERNAL"):
-        return spec
-    if spec == "1-MINUTE-LAST-INTERNAL":
-        return "1-MINUTE-LAST-EXTERNAL"
+    """A strategy's bar spec as fed by the hub: 15-MINUTE-LAST-INTERNAL -> 15-MINUTE-LAST-EXTERNAL."""
     if not spec.endswith("-LAST-INTERNAL"):
         raise ValueError(f"bar spec {spec!r} can't be built from the hub's 1-minute bars")
-    return f"{spec}@1-MINUTE-EXTERNAL"
+    return spec.replace("-INTERNAL", "-EXTERNAL")
 
 
 def instrument_from(defn: dict):
@@ -58,15 +54,32 @@ def instrument_from(defn: dict):
     return getattr(model, defn["type"]).from_dict(defn)
 
 
-class Decoder:
-    """Hub messages -> Nautilus data, delivering each instrument's bars in order only once, and only while
-    current: a bar that closed more than LATE_BAR_SECONDS before it arrived (the hub refilling minutes it missed)
-    is stored by the hub for warm-ups but not traded on here, as a strategy building its own bars never saw
-    the minutes its feed missed either."""
+class _Building:
+    """A longer bar being built from minutes: ends at `end` (ns), whole when its first minute was seen."""
 
-    def __init__(self) -> None:
+    def __init__(self, end: int, whole: bool, m: dict) -> None:
+        self.end, self.whole = end, whole
+        self.o, self.h, self.l, self.c, self.v = (Decimal(m[k]) for k in ("o", "h", "l", "c", "v"))
+
+    def add(self, m: dict) -> None:
+        self.h, self.l = max(self.h, Decimal(m["h"])), min(self.l, Decimal(m["l"]))
+        self.c, self.v = Decimal(m["c"]), self.v + Decimal(m["v"])
+
+
+class Decoder:
+    """Hub messages -> Nautilus data, delivering each instrument's minutes in order only once, and only while
+    current: a minute that closed more than LATE_BAR_SECONDS before it arrived (the hub refilling minutes it
+    missed) is stored by the hub for warm-ups but not traded on here, as a strategy building its own bars never
+    saw the minutes its feed missed either. bar_spec: the strategy's bars, e.g. 15-MINUTE-LAST-EXTERNAL, built
+    from those minutes; the first, begun before the node started, is a part bar and is not sent."""
+
+    def __init__(self, bar_spec: str = "1-MINUTE-LAST-EXTERNAL") -> None:
+        self.bar_spec = bar_spec
+        self.period = int(BarType.from_str(f"X.Y-{bar_spec}").spec.timedelta.total_seconds()) * 1_000_000_000
         self.last_bar: dict[str, int] = {}
         self.types: dict[str, BarType] = {}
+        self.building: dict[str, _Building] = {}
+        self.sent: set[str] = set()  # instruments with a bar sent: a part bar after that is a gap, still sent
         self.late = 0
 
     def __call__(self, m: dict, now_ns: int):
@@ -84,24 +97,48 @@ class Decoder:
                 self.late += 1
                 return None
             self.last_bar[m["id"]] = m["ts"]
-            bt = self.types.get(m["id"]) or self.types.setdefault(m["id"], bar_type(m["id"]))
-            return Bar(bt, Price.from_str(m["o"]), Price.from_str(m["h"]), Price.from_str(m["l"]),
-                       Price.from_str(m["c"]), Quantity.from_str(m["v"]), m["ts"], now_ns)
+            return self._build(m, now_ns)
         return None  # heartbeats, gaps and anything newer: read for their effect, not passed on
+
+    def _build(self, m: dict, now_ns: int):
+        iid, close = m["id"], m["ts"]
+        end = -(-close // self.period) * self.period  # the close of the bar this minute is part of
+        b, out = self.building.get(iid), None
+        if b is not None and b.end != end:  # the last bar's closing minute never came (the hub was away)
+            del self.building[iid]
+            out = self._bar(iid, b, now_ns) if now_ns - b.end <= LATE_BAR_SECONDS * 1_000_000_000 else None
+            b = None
+        if b is None:
+            b = self.building[iid] = _Building(end, close - MINUTE_NS == end - self.period, m)
+        else:
+            b.add(m)
+        if close == end:
+            del self.building[iid]
+            out = self._bar(iid, b, now_ns)
+        return out
+
+    def _bar(self, iid: str, b: _Building, now_ns: int):
+        if not b.whole and iid not in self.sent:
+            return None
+        self.sent.add(iid)
+        bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
+        return Bar(bt, Price.from_str(str(b.o)), Price.from_str(str(b.h)), Price.from_str(str(b.l)),
+                   Price.from_str(str(b.c)), Quantity.from_str(str(b.v)), b.end, now_ns)
 
 
 class HubDataClientConfig(DataClientConfig):
     def __init__(self, *, venue: str, instrument_ids: tuple[str, ...], host: str = "hub", port: int = 7700,
-                 **kwargs) -> None:
+                 bar_spec: str = "1-MINUTE-LAST-EXTERNAL", **kwargs) -> None:
         super().__init__(**kwargs)
         self.venue, self.instrument_ids, self.host, self.port = venue, tuple(instrument_ids), host, port
+        self.bar_spec = bar_spec
 
 
 class HubDataClient(MarketDataClient):
     def __init__(self, *, name: str, config: HubDataClientConfig, cache, clock) -> None:
         super().__init__(name=name, config=config, cache=cache, clock=clock, venue=Venue(config.venue))
         self.cfg = config
-        self.decode = Decoder()
+        self.decode = Decoder(config.bar_spec)
         self.last_heartbeat_ns = 0
         self.venue_up = False
         self.connects = 0
