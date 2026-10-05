@@ -375,6 +375,79 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later
 
 
+def _restarted(strategy, closes, orders, book_qty=0.0, **params):
+    """A model after a deploy restart: the journal holds `orders` (oldest first) and the warm-up is `closes`, one
+    1-minute bar each; what on_start does with them before the first live bar."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.venues import venue
+
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
+    t0 = 1_790_000_000 // 60 * 60
+
+    def at(i, seconds=0):  # bar i closes at t0 + i minutes; an order goes out a few seconds after its bar
+        return datetime.fromtimestamp(t0 + 60 * i + seconds, tz=timezone.utc)
+
+    rows = [{"intent": intent, "side": side, "ts": at(i, sec)} for intent, side, i, sec in orders][::-1]
+    store = type("S", (), {"orders": lambda self, name, limit=500: rows, "event": lambda self, *a, **k: None})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": store,
+                             "book": {"qty": book_qty, "entry_px": 100.0 if book_qty else None}})()
+    cls, cfg = REGISTRY[strategy]
+    s = cls(cfg(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005, market="perp", allow_short=True,
+                **params))
+    s.instrument, s.runtime = instrument, runtime
+    bars = [Bar(bt, Price(c, 1), Price(c, 1), Price(c, 1), Price(c, 1), Quantity(1, 8), int(at(i).timestamp() * 1e9),
+                int(at(i).timestamp() * 1e9)) for i, c in enumerate(closes)]
+    s._plan_resume()
+    s.on_historical_bars(bars)
+    return s
+
+
+FALLING = [100_000.0 - 10 * i for i in range(200)]  # RSI near 0, every close below its recent average
+
+
+@pytest.mark.parametrize("strategy", ["rsi_cross", "dip_buy"])
+def test_a_restart_counts_the_time_stop_from_the_journals_entry_not_from_the_restart(strategy):
+    """Review round 13, E13-3: after a deploy restart rsi_cross and dip_buy put the leg back with its time stop at 0,
+    so it ran on past where the uninterrupted run exited. The leg's bars now count from the entry's own bar."""
+    entry = [("entry", "BUY", 150, 2)]  # decided on bar 150, the leg's rules unmet since (no exit)
+    s = _restarted(strategy, FALLING, entry, book_qty=0.1, time_stop_bars=100)
+    assert (s._side, s._held) == (1, 49)  # bars 151 to 199
+    s = _restarted(strategy, FALLING, entry, book_qty=0.1, time_stop_bars=40)
+    assert s._side == 0  # the time stop fell on bar 190, during the warm-up: the first live bar exits
+
+
+@pytest.mark.parametrize("strategy, params", [("rsi_bands", {}), ("rsi_cross", {"time_stop_bars": 0})])
+def test_a_restart_after_a_stop_keeps_the_leg_and_its_exit_lock_until_the_signal_moves_off(strategy, params):
+    """Review round 13, E13-4: a restart after a stop or target forgot the leg and the exit lock, and the model
+    re-entered the trade the uninterrupted run declined. Both now stand until the signal moves off that side."""
+    rising = [90_000.0 + 10 * i for i in range(200)]  # RSI near 100: the short's exit (RSI down to 50) never comes
+    journal = [("entry", "SELL", 150, 1), ("stop_loss", "BUY", 160, 30)]
+    s = _restarted(strategy, rising, journal, **params)
+    assert (s._side, s._exit_lock) == (-1, -1)
+    # The same, but RSI falls through the short's exit after the stop: the leg ends and the lock clears.
+    s = _restarted(strategy, rising[:180] + [rising[179] - 50 * i for i in range(1, 21)], journal, **params)
+    assert s._side != -1 and s._exit_lock is False
+
+
+@pytest.mark.parametrize("ended_by", ["exit", "flatten", "kill_switch"])
+def test_a_restart_on_a_flat_book_after_a_leg_ended_by_its_signal_or_a_close_does_not_resume_it(ended_by):
+    """HoE review of item 9: a leg closed by its own signal, a PM close or a flatten (no stop or target) was put back
+    on a flat book when its exit was older than the warm-up, so the model woke long and bought on the first bar."""
+    calm = [100_000.0 + (5 if i % 2 else -5) for i in range(200)]  # RSI near 50: between the bands, nothing to do
+    s = _restarted("rsi_bands", calm, [("entry", "BUY", -60, 2), (ended_by, "SELL", -50, 2)])
+    assert s._side == 0 and s._exit_lock is False
+    s = _restarted("rsi_bands", calm, [("entry", "BUY", -60, 2), (ended_by, "SELL", -50, 2)], book_qty=-0.1)
+    assert s._side == -1  # a book holding the other side still comes back as held
+
+
+def test_a_restart_with_no_entry_in_the_journal_puts_the_held_leg_back():
+    s = _restarted("rsi_bands", FALLING, [], book_qty=-0.1)
+    assert s._side == -1 and s._exit_lock is False
+
+
 def test_two_strategies_whose_names_end_alike_journal_their_orders_sent_in_the_same_second():
     """Order ids carry only the last part of the trader and strategy ids. ping-pong-test and rsi-bands-test both
     gave O-<second>-TEST-TEST-<n>, so the second order sent in a second broke the journal's unique order id (as
