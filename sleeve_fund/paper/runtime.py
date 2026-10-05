@@ -9,6 +9,8 @@ concurrency inside it.
 
 from __future__ import annotations
 
+import math
+
 from decimal import Decimal
 
 from datetime import datetime, timedelta, timezone
@@ -292,6 +294,11 @@ class SleeveRuntime:
         d_cash = cash - book["cash"]
         # Compared in Decimal, each side as written, so float noise can't tip a one-lot gap into a halt.
         d_qty = float(Decimal(repr(float(qty))) - Decimal(repr(float(book["qty"]))))
+        # Neither side holds more figures than a float does: at 1.6e8 units one float step is 3e-8, wider than two
+        # lots of an 8-decimal instrument, so the tolerance is never finer than the float steps the journal's sum of
+        # fills can drift by (review round 12, M12-E1: a 3e-8 gap on 159,660,965.631 halted a backtest).
+        scale = max(abs(float(qty)), abs(float(book["qty"])))
+        qty_tolerance = max(qty_tolerance, (2 + book["fills"]) * math.ulp(scale))
         detail = (f"engine cash {cash:,.2f} vs journal {book['cash']:,.2f}; "
                   f"engine position {qty:.12g} vs journal {book['qty']:.12g}"
                   # %g's 6 figures hid a 1e-7 gap on 9075.15 (review round 10, m1).

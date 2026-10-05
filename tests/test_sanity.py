@@ -1143,3 +1143,20 @@ def test_a_flatten_of_a_short_cut_short_by_a_restart_buys_it_back(store, reason)
     t[0] += timedelta(minutes=1)
     assert _restarted(store, t).tick(equity=10_000, cash=13_000, qty=-0.05, price=60_000) == "flatten"
 
+
+
+def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():
+    """Review round 12, M12-E1: holding 1.6e8 units of a sub-cent instrument, one float step (3e-8) is wider than
+    two 8-decimal lots, so the reconcile read float noise as a gap and halted after the first entry: 2 fills
+    instead of a full run. The backtest trades to the end with no mismatch."""
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.venues import venue
+
+    bars = synthetic_ohlcv(days=600, seed=4, vol=0.04, start_price=0.00002)
+    bars["volume"] *= 1e9  # traded in hundreds of millions of units, as such instruments are
+    inst = venue("kraken").instrument("SHIB", "USD", price_precision=9)
+    res = run_backtest("trend_filter", bars, inst, {"fast": 5, "slow": 20}, starting_capital=10_000,
+                       risk_profile="balanced")
+    kinds = [e["kind"] for e in res.journal.events_]
+    assert "reconcile_mismatch" not in kinds, [e["message"] for e in res.journal.events_ if e["kind"] == "reconcile_mismatch"]
+    assert max(f["qty"] for f in res.journal.fills_) > 1e8 and len(res.fills) > 10
