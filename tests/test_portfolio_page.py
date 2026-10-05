@@ -138,9 +138,15 @@ def test_kpi_ledger_has_the_eight_tiles_with_the_detail_on_hover(client):  # noq
     assert "25,017.30" in kpis  # book value is the sum of strategy equities: 10,048.50 + 9,968.80 + 5,000
     # Fees and funding: 2.70 of fees, and the short received 0.30 of funding, so 2.40 net cost.
     assert ">2.40</div>" in kpis and "funding received 0.30" in kpis
-    # Margin used and Open risk wait on the corrected isolated-margin figures, and say so, rather than
-    # showing the old whole-equity margin.
-    assert kpis.count('class="kpi pending"') == 2
+    # Margin used and Open risk come from the position figures (item 7): until those exist they wait and say
+    # so, rather than show the old whole-equity margin.
+    from sleeve_fund.dashboard import trading
+
+    if hasattr(trading, "open_risk"):
+        assert 'title="3,000.00 isolated margin across open positions"><div class="k">Margin used</div><div class="v">12%' in kpis
+        assert "1 position without a stop, so unbounded" in kpis and '<div class="v warn">30.00+' in kpis
+    else:
+        assert kpis.count('class="kpi pending"') == 2
     assert "gross exposure" not in page.lower() and "Sharpe" not in kpis
 
 
