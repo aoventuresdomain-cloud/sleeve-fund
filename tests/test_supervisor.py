@@ -60,7 +60,12 @@ def test_the_seeded_strategies_are_the_two_test_strategies(store):
     import glob
 
     assert sorted(seed(store, sorted(glob.glob("configs/sleeves/*.toml")))) == [
-        "ping-pong-ls-test", "ping-pong-test", "rsi-bands-ls-test", "rsi-bands-test"]
+        "ping-pong-ls-test", "ping-pong-test", "rsi-bands-15m-ls-test", "rsi-bands-15m-test", "rsi-bands-ls-test",
+        "rsi-bands-test"]
+    # RSI(14) warms up on ten periods of history, whatever the file says (PM, 5 Oct 2026).
+    assert store.sleeve("rsi-bands-test").warmup_bars == 140
+    m15 = store.sleeve("rsi-bands-15m-ls-test")
+    assert (m15.bar_spec, m15.warmup_bars, m15.desired_state) == ("15-MINUTE-LAST-INTERNAL", 140, "stopped")
     assert store.sleeve("rsi-bands-test").bar_spec == "1-MINUTE-LAST-INTERNAL"
     # The long/short pair trade a perpetual and are added stopped, for the PM to start.
     ls = store.sleeve("ping-pong-ls-test")

@@ -37,7 +37,7 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
+from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.risk import PROFILES
@@ -1430,7 +1430,7 @@ def _clone_qs(s) -> str:
 
 # The backtest page's default interval. A sleeve made from a backtest decides on the bars it tested.
 BACKTEST_BAR_SPEC = "1-DAY-LAST-EXTERNAL"
-MAX_WARMUP_BARS = 720  # what the venue returns in one request; bars built from trades load from the store
+MAX_WARMUP_BARS = VENUE_WARMUP_BARS  # what the venue returns in one request; bars built from trades load from the store
 
 
 def _profile_cap(q) -> float:
@@ -1448,18 +1448,13 @@ def _defaults(strategy: str) -> dict:
 
 
 def _warmup_for(strategy: str, q, bar_spec: str = BACKTEST_BAR_SPEC) -> int:
-    """Bars to load at start so the slowest indicator is ready on the sleeve's first bar, as the
-    strategy itself says. Venue candles are capped at what the venue returns in one request; bars
-    built from live trades load from the history store, up to the sleeve limit."""
-    from sleeve_fund.paper.config import MAX_WARMUP_BARS as MAX_STORED_WARMUP_BARS
-
-    params = _defaults(strategy)
+    """Bars to load at start so the slowest indicator is settled on the sleeve's first bar, as the
+    strategy itself says (paper.config.auto_warmup)."""
     try:
-        params.update(_form_params(q, strategy))
+        params = _form_params(q, strategy)
     except ValueError:
-        pass
-    cap = MAX_STORED_WARMUP_BARS if bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
-    return min(cap, max(REGISTRY[strategy][0].warmup_needed(params, spec_minutes(bar_spec)), exit_warmup(params)))
+        params = {}
+    return auto_warmup(strategy, params, bar_spec)
 
 
 def _form_params(form, strategy: str) -> dict:

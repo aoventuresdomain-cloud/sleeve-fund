@@ -12,6 +12,18 @@ from collections import deque
 
 from nautilus_trader.model import Bar
 
+# Wilder's averages (RSI, ATR) and exponential ones (EMA) never forget their starting value, only discount it:
+# after k bars it still weighs (1 - 1/n)^k for Wilder, (1 - 2/(n+1))^k for an EMA. Ten lengths take it below
+# 0.01% for RSI(14), so a strategy started on that much history reads what a long-running one would (PM, 5 Oct
+# 2026: "if bare minimum it requires a warm up of 140+ then it requires 140+"). A simple average needs only its
+# own length.
+SETTLE_LENGTHS = 10
+
+
+def settle_bars(period: int) -> int:
+    """Bars of history a Wilder or exponential average of `period` needs before it reads as a settled one."""
+    return SETTLE_LENGTHS * int(period)
+
 
 class Sma:
     """Simple moving average over the last `period` values, O(1) per value. Before `period` values

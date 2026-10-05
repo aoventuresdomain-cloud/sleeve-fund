@@ -1,0 +1,20 @@
+# Test strategy 2 on 15-minute candles (PM, 5 Oct 2026: "i want to do the rsi on 15min candles"): long when
+# Wilder's RSI(14) on 15-minute closes is at or below 30 until it reaches 55; short at 70 until 50 (held flat
+# on spot). Added stopped: the PM starts it from the dashboard.
+
+[sleeve]
+name = "rsi-bands-15m-test"
+strategy = "rsi_bands"
+instrument = "BTC/USD"
+bar_spec = "15-MINUTE-LAST-INTERNAL"  # built locally from Kraken trades
+starting_balance = 10000
+# warm-up: automatic, the bars the model needs to settle (ten RSI periods, 140), from the stored history
+risk_profile = "balanced"
+start = false
+
+[params]
+rsi_period = 14
+long_entry = 30.0
+long_exit = 55.0
+short_entry = 70.0
+short_exit = 50.0

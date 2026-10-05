@@ -7,7 +7,7 @@ from nautilus_trader.indicators import ExponentialMovingAverage
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Atr, Rsi, Sma
+from sleeve_fund.strategies.indicators import Atr, Rsi, Sma, settle_bars
 
 SPEC = IdeaSpec(
     summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
@@ -46,6 +46,13 @@ class RsiPullbackConfig(LongFlatConfig):
 
 
 class RsiPullback(LongFlatStrategy):
+    @classmethod
+    def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
+        # Wilder's RSI and ATR and the EMA settle over ten lengths; the volume average over its own.
+        p = {"rsi_period": 14, "ema_period": 200, "vol_period": 20, "atr_period": 14, **params}
+        return max(settle_bars(int(p["rsi_period"])), settle_bars(int(p["ema_period"])),
+                   settle_bars(int(p["atr_period"])), int(p["vol_period"]) + 1)
+
     def __init__(self, config: RsiPullbackConfig) -> None:
         super().__init__(config)
         self.c = config

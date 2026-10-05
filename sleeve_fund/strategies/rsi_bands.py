@@ -6,7 +6,7 @@ from __future__ import annotations
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Rsi
+from sleeve_fund.strategies.indicators import Rsi, settle_bars
 
 SPEC = IdeaSpec(
     summary="Buys when RSI({rsi_period}) closes at or below {long_entry:g} and sells when it reaches {long_exit:g}; "
@@ -60,7 +60,7 @@ class RsiBands(LongFlatStrategy):
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
-        return 3 * int(params.get("rsi_period", 14))
+        return settle_bars(int(params.get("rsi_period", 14)))
 
     def on_start(self) -> None:
         super().on_start()
