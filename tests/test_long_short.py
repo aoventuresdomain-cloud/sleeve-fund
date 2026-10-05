@@ -871,3 +871,22 @@ def test_a_flip_opens_the_new_side_only_once_the_old_one_is_closed(prices, instr
             # From flat, or adding to its own side: never against an open position of the other side.
             assert before == 0 or (before > 0) == (step > 0), (f, before)
     assert len(entries) >= 4 and sides == {"BUY", "SELL"}, (len(entries), res.risk_events)
+
+
+def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkeypatch):
+    """Round 12, M12-U1: on a perp the benchmark held at the leverage cap (2x on balanced) and never
+    liquidated, so it ran from -200% to +400%. It is a 1x hold, paying the perp's taker fee, not spot's."""
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from test_dashboard import KRAKEN
+
+    bars = synthetic_ohlcv(days=200, seed=2, start_price=150)
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: bars)
+    d = preview.run("buy_and_hold", "SOL/USD", {**PERP}, starting=5000, risk_profile="balanced")
+    taker = float(markets.LOW_FEE_PERP.fees.taker)
+    assert d["cap"] == pytest.approx(2.0) and d["bench_cap"] == 1.0
+    assert d["fee_schedule"]["taker"] == pytest.approx(taker)
+    assert d["benchmark"][0] == pytest.approx(5000 * (1 - taker), abs=0.01)
+    held = 5000 * (1 - taker) * bars["close"].iloc[-1] / bars["close"].iloc[0]
+    assert d["benchmark"][-1] == pytest.approx(held, rel=1e-6)

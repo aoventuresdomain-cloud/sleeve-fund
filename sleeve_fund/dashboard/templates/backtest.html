@@ -53,7 +53,7 @@
       {% if result.data.note %}<p class="banner warn" style="margin:0 0 10px">{{ result.data.note }}</p>{% endif %}
       {% if result.execution.note %}<p class="{{ 'banner warn' if result.execution.matched_on is none else 'muted' }}" style="margin:0 0 10px;font-size:12.5px">{{ result.execution.note }}</p>{% endif %}
       <table class="compare">
-        <thead><tr><th></th><th class="num">Model</th><th class="num">Buy and hold{% if result.cap is not none and result.cap < 1 %}, {{ result.cap|pct0 }} invested{% endif %}</th></tr></thead>
+        <thead><tr><th></th><th class="num">Model</th>{% set bench_cap = result.bench_cap if result.bench_cap is defined else result.cap %}<th class="num">Buy and hold{% if bench_cap is not none and bench_cap < 1 %}, {{ bench_cap|pct0 }} invested{% elif result.cap is not none and result.cap > 1 %}, unlevered{% endif %}</th></tr></thead>
         <tbody>
           <tr><th scope="row">Return</th><td class="num">{{ signed(s.total_return) }}</td><td class="num">{{ h.total_return|pct }}</td></tr>
           <tr><th scope="row">A year (CAGR) {{ help('cagr') }}</th><td class="num">{{ signed(s.cagr) }}</td><td class="num">{{ h.cagr|pct }}</td></tr>
