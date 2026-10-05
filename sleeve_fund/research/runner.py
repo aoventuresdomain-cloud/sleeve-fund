@@ -90,6 +90,7 @@ def run_backtest(
     risk_profile: str | None = None,
     half_spread: float | None = None,
     progress=None,
+    fees: FeeSchedule | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -109,7 +110,9 @@ def run_backtest(
     one. The fills report shows the prices after the spread, as paper fills on the bid or ask would.
 
     progress: with a risk profile, called with the simulated time at every bar, to report how far a
-    long run has got."""
+    long run has got.
+
+    fees: charge this schedule instead of the market's or the instrument's (the cost ladder)."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     if starting_capital <= 0:
@@ -117,7 +120,8 @@ def run_backtest(
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
     perp = markets.is_perp(params)
-    fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
+    if fees is None:
+        fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
     if half_spread is None:
         from sleeve_fund.venues import venue as venue_profile
 
