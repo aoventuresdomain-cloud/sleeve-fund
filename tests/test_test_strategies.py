@@ -98,3 +98,68 @@ def test_ping_pong_in_the_paper_runtime_trades_the_same_cycle(tmp_path):
     assert "past the 1.0% rise" in orders[1]["reason"]
     assert "past the 0.5% dip" in orders[2]["reason"]
     assert all(o["filled_qty"] > 0 for o in orders[:3])
+
+
+def _cross(**params):
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.strategies.rsi_cross import RsiCross, RsiCrossConfig
+
+    cfg = RsiCrossConfig(instrument_id=InstrumentId.from_str("BTC/USD.KRAKEN"),
+                         bar_type=BarType.from_str("BTC/USD.KRAKEN-15-MINUTE-LAST-INTERNAL"), assumed_taker_fee=0.008,
+                         **params)
+    return RsiCross(cfg)
+
+
+def _walk(s, path):
+    out, prev = [], None
+    for r in path:
+        out.append(s.target_side(float(r), prev))
+        prev = float(r)
+    return out
+
+
+@pytest.mark.parametrize("path, sides", [
+    ([45, 25, 28, 31, 50, 55, 60], [0, 0, 0, 1, 1, 0, 0]),  # long on the cross back above 30, out at 55
+    ([45, 30, 40], [0, 0, 0]),  # touching 30 from above is not a cross back
+    ([60, 75, 71, 69, 50, 45], [0, 0, 0, -1, -1, 0]),  # short on the cross back below 70, out at 45
+    ([45, 25, 31, 29, 31], [0, 0, 1, 1, 1]),  # a dip during the long doesn't end it
+])
+def test_rsi_cross_enters_on_the_cross_back_and_exits_at_the_band(path, sides):
+    assert _walk(_cross(), path) == sides
+
+
+def test_rsi_cross_time_stop_ends_a_leg_that_never_recovers_and_waits_for_a_fresh_cross():
+    s = _cross(time_stop_bars=3)
+    assert _walk(s, [25, 31, 40, 40, 40, 40, 31]) == [0, 1, 1, 1, 0, 0, 0]
+    assert "time stop" in s._why[0] or "no cross" in s._why[0]
+    assert _walk(s, [25, 31]) == [0, 1]  # a new cross starts a new leg
+
+
+def test_rsi_cross_warm_up_settles_the_rsi_and_fills_the_trend_average():
+    from sleeve_fund.strategies.rsi_cross import RsiCross
+
+    assert RsiCross.warmup_needed({"rsi_period": 14}, 15) == 141
+    # A 4-hour SMA(50) on 15-minute bars needs 50 x 16 = 800 bars.
+    assert RsiCross.warmup_needed({"rsi_period": 14, "trend_sma": 50, "trend_minutes": 240}, 15) == 800
+
+
+def test_rsi_cross_trend_filter_takes_only_legs_with_the_larger_trend():
+    s = _cross(trend_sma=2, trend_minutes=240)
+    s.trend.update_raw(100.0)
+    s.trend.update_raw(110.0)  # average 105
+    s._trend_close = 110.0  # above: longs only
+    assert _walk(s, [25, 31]) == [0, 1]
+    s = _cross(trend_sma=2, trend_minutes=240)
+    s.trend.update_raw(110.0)
+    s.trend.update_raw(100.0)
+    s._trend_close = 100.0  # below its average: no long
+    assert _walk(s, [25, 31]) == [0, 0] and "average: no position" in s._why[0]
+
+
+def test_rsi_cross_trades_in_a_backtest_with_the_sprint_stop(prices, instrument):
+    closes = [100.0] * 30 + [100 - i for i in range(1, 12)] + [89 + 1.5 * i for i in range(1, 15)] + [110.0] * 5
+    res = run_backtest("rsi_cross", _path(prices, closes), instrument,
+                       {"rsi_period": 5, "stop_atr": 2.0, "atr_bars": 14}, half_spread=0)
+    sides = list(res.fills.sort_values("ts_last")["side"])
+    assert sides[:2] == ["BUY", "SELL"] and not res.handler_errors

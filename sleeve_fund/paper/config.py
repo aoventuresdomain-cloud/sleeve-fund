@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -30,6 +31,22 @@ ALLOWED_BAR_SPECS = {
 
 # Most warm-up bars a sleeve loads at start: about five weeks of 1-minute bars from the store.
 MAX_WARMUP_BARS = 50_000
+# What a venue returns in one request: the most history venue candles (EXTERNAL bars) can warm up on. Bars built
+# from trades (INTERNAL) load from the history store, up to MAX_WARMUP_BARS.
+VENUE_WARMUP_BARS = 720
+
+
+def auto_warmup(strategy: str, params: dict, bar_spec: str) -> int:
+    """Bars to load at start so every indicator the model and its exits use is settled on the first live bar,
+    as the model itself says (warmup_needed), within what can load for this kind of bar."""
+    from sleeve_fund.data import spec_minutes
+    from sleeve_fund.strategies.base import exit_warmup
+
+    cls = REGISTRY[strategy][0]
+    defaults = dict(getattr(importlib.import_module(cls.__module__), "SPEC").default_params or {})
+    p = {**defaults, **params}
+    cap = MAX_WARMUP_BARS if bar_spec.endswith("INTERNAL") else VENUE_WARMUP_BARS
+    return min(cap, max(cls.warmup_needed(p, spec_minutes(bar_spec)), exit_warmup(p)))
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,9 @@ class SleeveConfig:
             raise ValueError("max_notional must be positive")
         if not 0 <= self.warmup_bars <= MAX_WARMUP_BARS:
             raise ValueError(f"warmup_bars must be between 0 and {MAX_WARMUP_BARS}")
+        # Never fewer bars than the model's indicators need to settle (PM, 5 Oct 2026); more can be asked for.
+        object.__setattr__(self, "warmup_bars", max(self.warmup_bars, auto_warmup(self.strategy, self.params,
+                                                                                  self.bar_spec)))
         from sleeve_fund.risk import profile
 
         profile(self.risk_profile)  # raises on unknown

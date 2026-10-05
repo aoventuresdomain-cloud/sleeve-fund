@@ -10,7 +10,7 @@ strategy = "rsi_bands"
 instrument = "BTC/USD"
 bar_spec = "1-MINUTE-LAST-INTERNAL"   # built locally from Kraken trades
 starting_balance = 10000
-warmup_bars = 42                      # three RSI periods, from the stored history
+# warm-up: automatic, the bars the model needs to settle (ten RSI periods, 140), from the stored history
 risk_profile = "balanced"
 start = false
 

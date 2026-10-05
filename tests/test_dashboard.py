@@ -995,10 +995,10 @@ def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
     assert _new(c, name="auto-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="20").status_code == 303
     assert store.sleeve("auto-warm").warmup_bars == 20  # the slow average's length
     assert not [e for e in store.events("auto-warm") if e["kind"] == "warmup_short"]
+    # Fewer than the model needs is raised to what it needs (PM, 5 Oct 2026: the bare minimum is required).
     _new(c, name="short-warm", warmup_bars="10", p_trend_filter__fast="5", p_trend_filter__slow="20")
-    assert store.sleeve("short-warm").warmup_bars == 10
-    (e,) = [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
-    assert e["level"] == "info" and "needs 20 bars of history but 10 load at start" in e["message"]
+    assert store.sleeve("short-warm").warmup_bars == 20
+    assert not [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
     # Past the most the history store loads, the shortfall is an alert.
     _new(c, name="long-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="60000")
     assert store.sleeve("long-warm").warmup_bars == 50_000
