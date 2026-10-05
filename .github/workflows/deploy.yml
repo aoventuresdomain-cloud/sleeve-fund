@@ -9,8 +9,7 @@ name: deploy
 # Optional: BINANCE_DEMO_API_KEY and BINANCE_DEMO_API_SECRET, a key made inside Binance Demo Trading (never on the
 #   live account's API page), and DERIBIT_TESTNET_API_KEY and DERIBIT_TESTNET_API_SECRET, a Deribit TESTNET key (no
 #   withdrawals), for the demo mirror (sleeve_fund/mirror.py), which only the mirror container receives. Repository
-#   variable DEMO_MIRROR=off turns it off; repository variable BINANCE_DEMO_HOST=testnet.binancefuture.com sends Binance
-#   strategies to the futures testnet instead of Demo Trading (its key then comes from there). No live exchange credentials are involved: this stack is paper only.
+#   variable DEMO_MIRROR=off turns it off. No live exchange credentials are involved: this stack is paper only.
 # Deploys only main, and only a commit whose tests passed: it runs when the tests workflow finishes
 # green on a push to main, and a manual run (from main only) checks that the push run passed on the
 # commit it ships. The repository variable DEPLOY_ENABLED=true gates both.
@@ -91,15 +90,14 @@ jobs:
           DERIBIT_TESTNET_API_SECRET: ${{ secrets.DERIBIT_TESTNET_API_SECRET }}
           BINANCE_DEMO_API_KEY: ${{ secrets.BINANCE_DEMO_API_KEY }}
           BINANCE_DEMO_API_SECRET: ${{ secrets.BINANCE_DEMO_API_SECRET }}
-          BINANCE_DEMO_HOST: ${{ vars.BINANCE_DEMO_HOST }}
         run: |
           SITE="${SITE_ADDRESS:-$HOST.sslip.io}"
           # Secrets go over stdin, never on a command line.
-          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q ALERT_WEBHOOK_URL=%q HEALTHCHECK_PING_URL=%q DEMO_MIRROR=%q DERIBIT_TESTNET_API_KEY=%q DERIBIT_TESTNET_API_SECRET=%q BINANCE_DEMO_API_KEY=%q BINANCE_DEMO_API_SECRET=%q BINANCE_DEMO_HOST=%q\n' \
+          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q ALERT_WEBHOOK_URL=%q HEALTHCHECK_PING_URL=%q DEMO_MIRROR=%q DERIBIT_TESTNET_API_KEY=%q DERIBIT_TESTNET_API_SECRET=%q BINANCE_DEMO_API_KEY=%q BINANCE_DEMO_API_SECRET=%q\n' \
             "$DASHBOARD_PASSWORD" "$SITE" "$ALERT_WEBHOOK_URL" "$HEALTHCHECK_PING_URL" \
             "$DEMO_MIRROR" "$DERIBIT_TESTNET_API_KEY" "$DERIBIT_TESTNET_API_SECRET" "$BINANCE_DEMO_API_KEY" \
-            "$BINANCE_DEMO_API_SECRET" "$BINANCE_DEMO_HOST" | \
-            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL,DEMO_MIRROR,DERIBIT_TESTNET_API_KEY,DERIBIT_TESTNET_API_SECRET,BINANCE_DEMO_API_KEY,BINANCE_DEMO_API_SECRET,BINANCE_DEMO_HOST bash /opt/sleeve-fund/deploy/remote_up.sh'
+            "$BINANCE_DEMO_API_SECRET" | \
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL,DEMO_MIRROR,DERIBIT_TESTNET_API_KEY,DERIBIT_TESTNET_API_SECRET,BINANCE_DEMO_API_KEY,BINANCE_DEMO_API_SECRET bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
       - name: Check the sleeves are live
         if: steps.tip.outputs.current == 'true'
