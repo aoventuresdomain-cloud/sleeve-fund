@@ -279,3 +279,44 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         "unrealised": sum(p["unrealised"] for p in positions),
         "exposure": sum(p["value"] for p in positions),
     }
+
+
+AUDIT_COLUMNS = ["ts", "strategy", "venue", "instrument", "side", "qty", "price", "notional", "fee", "realised_pnl",
+                 "position_after", "intent", "reason", "order_id", "trade_id"]
+
+
+def audit_rows(sleeve, fills: list[dict], orders: dict[str, dict], venue: str) -> tuple[list[dict], list[str]]:
+    """One row per fill, oldest first, for checking every trade outside the dashboard (PM, 5 Oct 2026): what was
+    traded, at what price and fee, the P&L it realised (on the average entry, after this fill's fee) and the
+    position after it, with the reason and the indicator values the strategy decided on, from its order's signal.
+    Returns the rows and the signal's columns, in the order they first appear. fills: oldest first. Funding on a
+    perpetual is booked per trade, not per fill: the trades export carries it."""
+    rows, keys, qty, avg = [], [], 0.0, 0.0
+    for f in fills:
+        signed = f["qty"] if f["side"] == "BUY" else -f["qty"]
+        px, realised = float(f["price"]), 0.0
+        if qty and (qty > 0) != (signed > 0):  # reduces, closes or turns the position
+            closed = min(abs(signed), abs(qty))
+            realised = closed * (px - avg) * (1 if qty > 0 else -1)
+            rest = qty + signed
+            if abs(rest) < 1e-12:
+                qty, avg = 0.0, 0.0
+            elif (rest > 0) != (qty > 0):  # turned: what's left opens at this price
+                qty, avg = rest, px
+            else:
+                qty = rest
+        else:
+            avg = (avg * abs(qty) + px * abs(signed)) / (abs(qty) + abs(signed))
+            qty += signed
+        order = orders.get(f.get("order_id") or "") or {}
+        signal = {k: v for k, v in (order.get("signal") or {}).items() if k != "stop_cfg"}
+        for k in signal:
+            if k not in keys:
+                keys.append(k)
+        rows.append({"ts": f["ts"], "strategy": sleeve.name, "venue": venue, "instrument": sleeve.instrument,
+                     "side": f["side"], "qty": f["qty"], "price": px, "notional": round(f["qty"] * px, 8),
+                     "fee": f["fee"], "realised_pnl": round(realised - float(f["fee"]), 8),
+                     "position_after": round(qty, 12), "intent": order.get("intent"), "reason": order.get("reason"),
+                     "order_id": f.get("order_id"), "trade_id": f.get("trade_id"),
+                     **{k: v if not isinstance(v, (dict, list)) else str(v) for k, v in signal.items()}})
+    return rows, keys

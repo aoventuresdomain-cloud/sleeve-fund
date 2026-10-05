@@ -752,11 +752,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy")
         return page(request, "strategy.html", r=row, stages=pipeline.STAGES, summary=_idea(name))
 
-    @app.get("/research/{sheet}", response_class=HTMLResponse)
-    def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
+    def _sheet_path(sheet: str) -> Path:
         path = (TEARSHEETS / f"{sheet}.md").resolve()
         if path.parent != TEARSHEETS.resolve() or not path.exists():
             raise HTTPException(404, "no such tear sheet")
+        return path
+
+    @app.get("/research/{sheet}/download")
+    def tearsheet_download(sheet: str, _: str = Depends(require_pm)):
+        """The tear sheet as its Markdown file, to hand to the research thread as it is."""
+        path = _sheet_path(sheet)
+        return Response(path.read_bytes(), media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
+
+    @app.get("/research/{sheet}", response_class=HTMLResponse)
+    def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
+        path = _sheet_path(sheet)
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
         # Results as status chips, so a FAIL can't be missed in a wall of text.
         for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
@@ -812,6 +823,17 @@ def create_app(store: Store | None = None) -> FastAPI:
                     "funding", "insurance", "pnl",
                     "ret", "r", "planned_r", "exits_edited", "exit_kind", "entry_why", "exit_why", "entry_order",
                     "exit_order"]
+        elif kind == "audit":
+            from sleeve_fund.venues import DEFAULT_VENUE
+
+            rows, signal_cols = [], []
+            for n in chosen:
+                s = st().sleeve(n)
+                got, keys = trading.audit_rows(s, list(reversed(st().fills(n, limit=1_000_000))),
+                                               trading.orders_by_id(st(), n), getattr(s, "venue", None) or DEFAULT_VENUE)
+                rows += got
+                signal_cols += [k for k in keys if k not in signal_cols]
+            cols = trading.AUDIT_COLUMNS + signal_cols
         elif kind == "orders":
             rows = [dict(o, signal=json.dumps(o["signal"], sort_keys=True))
                     for n in chosen for o in reversed(st().orders(n, limit=1_000_000))]

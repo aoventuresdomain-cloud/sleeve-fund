@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ title }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
-<p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ title|replace('_', ' ') }}</span></p>
+<p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ title|replace('_', ' ') }}</span> <a class="button secondary" style="float:right" href="/research/{{ title }}/download" download>Download tear sheet</a></p>
 <article class="panel md">{{ body|safe }}</article>
 {% endblock %}
