@@ -38,6 +38,7 @@ from sleeve_fund.strategies.indicators import Atr
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
 MAKER_INTENTS = ("entry", "exit", "rebalance")
 OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
+EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
 MINUTE_NS = 60_000_000_000
 
 
@@ -1724,12 +1725,18 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "strategy's equity", ts=self.runtime.now())
 
-    def _wiped_out_why(self) -> str:
+    def _wiped_out_why(self, shortfall: float = 0.0) -> str:
+        """shortfall: an open position's equity below zero, which the insurance fund will cover once it closes, so
+        the halt says how much before the close journals it (fix re-check, mF-1)."""
         covered = sum(a for _, a in self.insurance_log)
         if not covered and self.runtime is not None:  # since a restart: the journal has it
             covered = self.runtime.store.insurance_total(self.runtime.name)
         why = "wiped out: a gap took the price past the bankruptcy price, so equity is zero"
-        return why + (f" and the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
+        if covered > 0:
+            return why + f" and the venue's insurance fund covered the {covered:,.2f} shortfall"
+        if shortfall > 0:
+            return why + f"; the venue's insurance fund covers the shortfall, about {shortfall:,.2f} at this price"
+        return why
 
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
@@ -1893,8 +1900,12 @@ class LongFlatStrategy(Strategy):
             if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
                 tol = 2 * float(self._lot())  # two units of the base currency (review rounds 9 and 10, B9-1, B10-1)
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
-                    self._drop_kept()  # halted: no trading, no flattening
-                    self.cancel_all_orders(self._cfg.instrument_id)
+                    # Halted: nothing new trades and nothing is flattened, but a resting stop-loss and target
+                    # stay, so the position isn't left unguarded until the PM acts (review round 10, m10-1).
+                    self._drop_kept()
+                    for order in self.cache.orders_open(strategy_id=self.strategy_id):
+                        if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
+                            self.cancel_order(order)
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
             if self._margin and qty != 0:
@@ -1907,7 +1918,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
-                wiped = self._wiped_out_why()
+                wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
                 equity = 0.0
                 cash = 0.0 if ruined else cash
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,

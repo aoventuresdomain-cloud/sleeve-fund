@@ -1145,6 +1145,32 @@ def test_a_flatten_of_a_short_cut_short_by_a_restart_buys_it_back(store, reason)
 
 
 
+def test_a_reconcile_halt_in_a_backtest_keeps_the_resting_stop(prices, instrument, monkeypatch):
+    """Review round 10, m10-1: a reconcile halt cancelled the stop and target and held the position with
+    no stop. It halts new trading only: the resting stop still sells on the fall."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from test_backtest import _path
+
+    real, calls = SleeveRuntime.reconcile, []
+
+    def mismatch_on_the_third(self, **kw):
+        calls.append(1)
+        if len(calls) == 3:
+            self._set("halted", "reconciliation mismatch")
+            return False
+        return real(self, **kw)
+
+    monkeypatch.setattr(SleeveRuntime, "reconcile", mismatch_on_the_third)
+    closes = [100.0] * 6 + [97.0, 95.0, 95.0, 95.0]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument, {"stop_loss": 0.02}, half_spread=0,
+                       risk_profile="balanced")
+    assert len(calls) >= 3
+    fills = res.fills.sort_values("ts_last")
+    intents = [res.decisions[o]["intent"] for o in fills.index]
+    assert intents == ["entry", "stop_loss"], intents
+    assert float(fills.loc[fills.index[1], "avg_px"]) == pytest.approx(98.0, rel=1e-3)
+
+
 def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():
     """Review round 12, M12-E1: holding 1.6e8 units of a sub-cent instrument, one float step (3e-8) is wider than
     two 8-decimal lots, so the reconcile read float noise as a gap and halted after the first entry: 2 fills

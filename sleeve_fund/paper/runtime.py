@@ -243,6 +243,12 @@ class SleeveRuntime:
             elif cmd["command"] == "pause":
                 if self.status != "halted":
                     self._set("paused", f"paused by PM: {cmd['reason']}")
+            elif cmd["command"] == "resume" and self.status == "running":
+                # Already running: a resume would only reset the day's loss baseline (review round 10, m10-3).
+                self.store.event(self.name, "info", "pm_resume_ignored",
+                                 f"resume ignored, the strategy is already running: {cmd['reason']}", ts=self.now())
+                self.store.mark_applied(cmd["id"])
+                continue
             elif cmd["command"] == "resume":
                 # Both resets are journaled (this tick's mark, and the events below) so a restart keeps them.
                 if self.status == "halted":
@@ -308,7 +314,8 @@ class SleeveRuntime:
             return True
         self._set("halted", "reconciliation mismatch")
         self.store.event(self.name, "error", "reconcile_mismatch",
-                         detail + ". Halted, nothing traded or corrected. Restart the strategy to rebuild "
+                         detail + ". Halted: no new trades, nothing flattened or corrected (a resting stop-loss stays). "
+                         "Restart the strategy to rebuild "
                          "from the journal, or resume once you have checked.", ts=self.now())
         return False
 

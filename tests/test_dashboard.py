@@ -1068,7 +1068,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/risk?killed=2"
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash" in fired and "data-once" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash" in fired and "data-once" in fired
     for name in ("btc-test", "eth-test"):
         (cmd,) = store.pending_commands(name)
         assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
@@ -1087,7 +1087,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     # Round 9, N1: a second fire logged "0 strategies" and its banner said "0 strategies are selling".
     assert second.headers["location"] == "/risk?killed=0" and len(store.decisions()) == logged
     said = c.get(second.headers["location"], auth=AUTH).text
-    assert "Nothing more to sell: btc-test, eth-test are already selling to cash. Nothing was logged." in said
+    assert "Nothing more to sell: btc-test, eth-test are already closing out to cash. Nothing was logged." in said
     # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
@@ -1368,7 +1368,7 @@ def test_the_kill_banner_counts_the_strategies_it_names(client):
     r = c.post("/book/flatten", data={"reason": "Market event"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.headers["location"] == "/risk?killed=1"  # only eth-test was new
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash at market (btc-test, eth-test)" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash at market (btc-test, eth-test)" in fired
 
 
 def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
@@ -1745,6 +1745,19 @@ def test_maker_first_orders_are_switched_off_by_default(client, prices, instrume
     assert r.status_code in (200, 303, 400) and "btc-test" not in [s.name for s in store.sleeves()]
     with pytest.raises(ValueError, match="switched off"):
         run_backtest("trend_filter", prices.iloc[:50], instrument, {"fast": 5, "slow": 20, "maker_wait_minutes": 10})
+
+
+def test_a_resume_on_a_running_strategy_is_refused_in_words(client):
+    """Review round 10, m10-3: there is nothing to resume on a running strategy."""
+    c, store = client
+    _new(c, name="eth-run", instrument="ETH/USD")
+    store.set_status("eth-run", "running", "")
+    r = c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "again"}, auth=AUTH, headers=SAME)
+    assert "Not done: it is already running, so there is nothing to resume." in r.text
+    assert store.pending_commands("eth-run") == []
+    store.set_status("eth-run", "paused", "paused by PM")
+    c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH, headers=SAME)
+    assert [x["command"] for x in store.pending_commands("eth-run")] == ["resume"]
 
 
 def test_the_g2_checklist_says_a_long_short_strategy_has_no_g1_yet(client):

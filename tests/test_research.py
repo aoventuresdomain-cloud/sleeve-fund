@@ -473,3 +473,10 @@ def test_checks_resting_on_missing_out_of_sample_are_not_failed_on_a_not_judged_
     assert rows["Enough out-of-sample trades to judge"][0] == NOT_APPLICABLE
     assert rows["Enough out-of-sample trades to judge"][1].startswith("not judged: 0 closed")
     assert "| FAIL |" not in render(r, ledger)
+
+
+def test_the_sensitivity_table_shows_grid_values_as_set():
+    """Round 11 minor: int() of each grid value crashed the tear sheet on a word and showed 0.005 as 0."""
+    from sleeve_fund.research.tearsheet import _param
+
+    assert [_param(v) for v in (20, 20.0, 0.005, 1.5, "ema")] == ["20", "20", "0.005", "1.5", "ema"]
