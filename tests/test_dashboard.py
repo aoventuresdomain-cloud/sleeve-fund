@@ -301,7 +301,8 @@ def test_research_pipeline_and_strategy_pages(client):
     c, _ = client
     _new(c)  # a buy_and_hold sleeve, with no real G1 pass, so it shows as an observation
     page = c.get("/research", auth=AUTH).text
-    assert "Pipeline" in page and "observation" in page and "trend filter" in page
+    # The pipeline folds into Development: a card per model, its stage and running strategies in its study.
+    assert 'data-plan="buy_and_hold"' in page and "on observation" in page and "Trend filter" in page
     s = c.get("/strategies/trend_filter", auth=AUTH).text
     assert "Exact rules" in s and "Start a strategy with this" in s
     assert c.get("/strategies/nope", auth=AUTH).status_code == 404
@@ -1222,7 +1223,7 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
 
     monkeypatch.setattr(KRAKEN, "check_listed", check)
     page = c.get("/research", auth=AUTH).text
-    assert 'id="history"' in page and "Collect another instrument" in page
+    assert 'data-panel="history"' in page and "Collect another instrument" in page
     assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Catching up", page, re.S)
     assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
     assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
@@ -1682,11 +1683,12 @@ def test_the_research_form_knows_which_holdouts_are_spent(client, tmp_path):
     c, _ = client
     IdeaLedger(tmp_path / "idea_ledger.jsonl").record(idea="trend_filter", family="trend", params={},
                                                        dataset="kraken-btcusd-store", stage="holdout", sharpe=0.4)
-    page = c.get("/research", auth=AUTH).text
+    page = c.get("/research?strategy=trend_filter&venue=kraken", auth=AUTH).text
     spent = json.loads(html.unescape(re.search(r'data-spent="([^"]*)"', page).group(1)))
     assert list(spent) == ["trend_filter|kraken-btcusd-store"]
     assert spent["trend_filter|kraken-btcusd-store"].endswith(", on daily bars")
-    assert 'data-venue="kraken"' in page
+    # The page script keys a spent holdout by the venue picked in the study, which switches in place.
+    assert '<input type="radio" name="venue" value="kraken" checked>' in page and "${venue()}-${pair}-store" in page
 
 
 def test_sub_dollar_numbers_read_in_full(client):
@@ -1874,11 +1876,14 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(3), cursor="x")
     history.HistoryStore().append("BINANCE", "SOL/USDT", _stored_minutes(3), cursor="y")
     monkeypatch.setattr(venue("binance"), "check_listed", lambda pair: None)
+    # The study's venue is picked in place (no reload); History lists every venue's stored instruments.
     page = c.get("/research?venue=binance", auth=AUTH).text
-    assert '<option value="binance" selected' in page and "data-reload" in page
-    assert '<td data-label="Instrument">SOL/USDT</td>' in page and '<td data-label="Instrument">ETH/USD</td>' not in page
+    assert '<input type="radio" name="venue" value="binance" checked>' in page and "data-reload" not in page
+    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>Binance USD-M perpetuals</td>', page)
+    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>Kraken spot</td>', page)
     assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
-    assert '<td data-label="Instrument">ETH/USD</td>' in c.get("/research", auth=AUTH).text
+    kraken = c.get("/research?venue=kraken", auth=AUTH).text
+    assert '<input type="radio" name="venue" value="kraken" checked>' in kraken and "run spot, long only" in kraken
     asked = c.post("/research/history", data={"instrument": "doge/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for DOGE/USDT" in asked.text and not store.history_requests("KRAKEN")
     assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["DOGE/USDT"]
