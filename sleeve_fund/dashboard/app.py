@@ -34,7 +34,7 @@ from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
-from sleeve_fund.history import REQUEST_YEARS
+from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
@@ -720,6 +720,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                 return research_page(request, pre=here, notice=(
                     f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now."))
+            if pair in (profile.core_pairs or CORE_PAIRS):
+                # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
+                # a request would change nothing, and its "from five years back" would misstate where it starts.
+                return research_page(request, pre=here, notice=(
+                    f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+                    "kept current, and this list shows how far it has got."))
             if profile.minute_loader is None:
                 raise ValueError(f"{profile.label} has no history loader")
             if profile.check_listed is not None:
@@ -757,6 +763,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         if path.parent != TEARSHEETS.resolve() or not path.exists():
             raise HTTPException(404, "no such tear sheet")
         return path
+
+    @app.get("/research/run")
+    @app.get("/research/history")
+    def research_form_reloaded(request: Request, venue: str = "", _: str = Depends(require_pm)):
+        """A refresh or Back after a study or a history request asks for the form's own address by GET, which
+        would otherwise be read as a tear sheet's name: back to the research page, on the same venue."""
+        try:
+            name = _research_venue(venue or None).name.lower()
+        except ValueError:
+            name = _research_venue().name.lower()
+        anchor = "#history" if request.url.path.endswith("/history") else ""
+        return RedirectResponse(f"/research?venue={name}{anchor}", status_code=303)
 
     @app.get("/research/{sheet}/download")
     def tearsheet_download(sheet: str, _: str = Depends(require_pm)):
