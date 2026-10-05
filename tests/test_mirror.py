@@ -268,3 +268,17 @@ def test_a_strategy_whose_demo_account_is_not_set_up_is_skipped_not_sent_elsewhe
     _fill(store, "bn-ls", "BUY", 0.05, 1)
     mirror.mirror_once(store, {"DERIBIT": testnet})
     assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "no Bybit demo account set up"
+
+
+def test_the_start_check_says_whether_the_key_signed_in_and_flags_hedge_mode():
+    def http(rows):
+        return lambda method, url, headers, body: {"retCode": 0, "result": {"list": rows}}
+
+    one_way = mirror.BybitDemo(mirror.Settings("k", "s"), http=http([{"positionIdx": 0, "side": "", "size": "0"}]))
+    assert one_way.check() == "key accepted, BTCUSDT position +0, one-way mode"
+    hedge = mirror.BybitDemo(mirror.Settings("k", "s"), http=http([{"positionIdx": 1, "side": "Buy", "size": "0.01"},
+                                                                   {"positionIdx": 2, "side": "", "size": "0"}]))
+    assert "HEDGE MODE" in hedge.check() and "+0.01" in hedge.check()
+    bad = mirror.BybitDemo(mirror.Settings("k", "s"), http=lambda *a: {"retCode": 10003, "retMsg": "API key is invalid."})
+    with pytest.raises(RuntimeError, match="API key is invalid"):
+        bad.check()

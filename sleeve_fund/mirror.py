@@ -169,6 +169,10 @@ class Testnet:
     def position(self, instrument: str) -> float:
         return float(self.call("private/get_position", {"instrument_name": instrument}, private=True)["size"])
 
+    def check(self) -> str:
+        """One signed read at start, so a bad key shows in the logs at once, not on the first fill."""
+        return f"key accepted, BTC-PERPETUAL position {self.position('BTC-PERPETUAL'):+g} USD"
+
 
 def bybit_demo_url(url: str = BYBIT_DEMO_URL) -> str:
     """Bybit Demo Trading's V5 API root. Any other host, the live one and the testnet included, is refused."""
@@ -263,6 +267,16 @@ class BybitDemo:
         rows = self.call("GET", "/v5/position/list", {"category": "linear", "symbol": instrument}).get("list") or []
         sides = {"Buy": 1.0, "Sell": -1.0}
         return sum(sides.get(r.get("side"), 0.0) * float(r.get("size") or 0) for r in rows)
+
+    def check(self) -> str:
+        """One signed read at start, so a bad key or hedge mode shows in the logs at once, not on the first fill."""
+        rows = self.call("GET", "/v5/position/list", {"category": "linear", "symbol": "BTCUSDT"}).get("list") or []
+        hedge = any(int(r.get("positionIdx") or 0) for r in rows)
+        sides = {"Buy": 1.0, "Sell": -1.0}
+        held = sum(sides.get(r.get("side"), 0.0) * float(r.get("size") or 0) for r in rows)
+        mode = ("HEDGE MODE: orders will be rejected until BTCUSDT is switched to one-way mode" if hedge
+                else "one-way mode")
+        return f"key accepted, BTCUSDT position {held:+g}, {mode}"
 
 
 def target_for(sleeve) -> str:
@@ -365,6 +379,11 @@ def main(argv: list[str] | None = None) -> int:
     clients = {"BYBIT": BybitDemo, "DERIBIT": Testnet}
     targets = {name: clients[name](c) for name, c in creds.items()}
     print("demo mirror on: " + ", ".join(f"{t.label} ({t.url})" for t in targets.values()), flush=True)
+    for t in targets.values():
+        try:
+            print(f"demo mirror: {t.label}: {t.check()}", flush=True)
+        except Exception as e:  # noqa: BLE001 - reported, and the loop still runs: each fill notes its own error
+            print(f"demo mirror: {t.label}: couldn't sign in: {str(e)[:300]}", flush=True)
     run(Store(), targets)
     return 0
 

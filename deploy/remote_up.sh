@@ -36,3 +36,6 @@ done
 docker compose up -d --build --remove-orphans
 docker image prune -f >/dev/null
 docker compose ps
+# The demo mirror's first lines say whether each demo key signed in (sleeve_fund/mirror.py); never a key.
+sleep 15
+docker compose logs --no-log-prefix --tail 10 mirror || true
