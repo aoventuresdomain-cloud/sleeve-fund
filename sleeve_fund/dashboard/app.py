@@ -1558,6 +1558,8 @@ def _chart_pairs(home: str, book: list[str]) -> list[str]:
 def _risk_view(x: dict, position: dict | None = None) -> dict:
     p = x["profile"]
     stop_px = position["stop_px"] if position else None
+    margin = position.get("margin", 0.0) if position else 0.0
+    margin_cap = p.max_position_pct * max(x.get("equity", 0.0), 0.0)
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
@@ -1565,6 +1567,10 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
         "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
+        "margin": margin,
+        "margin_cap": margin_cap,
+        "margin_used": min(margin / margin_cap, 1.0) if margin_cap > 0 else 0.0,
     }
 
 
