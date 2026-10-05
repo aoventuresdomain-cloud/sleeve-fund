@@ -62,7 +62,7 @@ def test_our_averages_have_no_period_limit():
 
 
 def test_strategies_only_use_engine_indicators_that_survive_long_periods():
-    for path in STRATEGIES.glob("*.py"):
+    for path in STRATEGIES.rglob("*.py"):  # the indicators package too
         for node in ast.walk(ast.parse(path.read_text())):
             # The module itself, however imported, would let any indicator in unchecked.
             whole = (isinstance(node, ast.Import) and any(a.name.startswith("nautilus_trader.indicators")
