@@ -1882,6 +1882,8 @@ class LongFlatStrategy(Strategy):
 
     def _market_seen(self) -> None:
         self._last_market_ns = self.clock.timestamp_ns()
+        if self.runtime is not None and not self._backtest:
+            self.runtime.market_seen()
         if self._noted & {"stale_price", "feed_dead"}:
             self._noted -= {"stale_price", "feed_dead"}
             if self.runtime is not None:

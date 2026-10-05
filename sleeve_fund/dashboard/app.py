@@ -396,6 +396,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
                     command_error=q.get("command_error", ""),
@@ -1407,6 +1408,24 @@ def _ago(t) -> str:
         if secs >= size:
             return f"{secs // size} {unit} ago"
     return "just now"
+
+
+FEED_FRESH_SECONDS = 60  # past this the strategy page's price feed reads as stale
+
+
+def _price_feed(s, seen) -> dict:
+    """The strategy's price feed for the page header: its venue and how long since that venue last sent
+    it a trade or quote, to the second."""
+    from sleeve_fund.venues import venue
+
+    label = venue(s.venue).label
+    if s.desired_state != "running":
+        return {"label": label, "state": "off", "age": "off while stopped"}
+    if seen is None:
+        return {"label": label, "state": "off", "age": "waiting for the first trade"}
+    secs = max(0, int((utcnow() - seen).total_seconds()))
+    age = f"{secs} s ago" if secs < 60 else f"{secs // 60} min ago" if secs < 3600 else f"{secs // 3600} h ago"
+    return {"label": label, "state": "ok" if secs <= FEED_FRESH_SECONDS else "stale", "age": age}
 
 
 def _bar_short(spec: str) -> str:
