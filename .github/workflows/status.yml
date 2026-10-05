@@ -1,0 +1,32 @@
+name: status
+# Reads the paper server's state and changes nothing: the strategies, the book's headline figures and the latest
+# warnings. Run it by hand from main; it uses the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and
+# variable DEPLOY_USER. Every query is a select, and the supervisor's book command only reads.
+on:
+  workflow_dispatch:
+jobs:
+  status:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Read the server
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose ps --format "{{.Service}} {{.State}} {{.Status}}"'
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.supervisor book'
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tA -F " | " -c "
+            select name, desired_state, status, status_reason, heartbeat_at, now() - heartbeat_at as since from sleeves where name not like '"'"'bt:%'"'"' order by id;
+            select sleeve, max(ts) as last_mark, count(*) as marks from equity where ts > now() - interval '"'"'1 hour'"'"' group by sleeve;
+            select ts, sleeve, level, kind, left(message, 200) from events where ts > now() - interval '"'"'2 hours'"'"' order by id desc limit 25;"'
