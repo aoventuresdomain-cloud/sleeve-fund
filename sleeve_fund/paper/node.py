@@ -139,8 +139,8 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
 
 
 def hub_address(venue: str, environ=None) -> tuple[str, int] | None:
-    """Where the venue's market data hub (v2 P1-1) serves, from HUB_<VENUE>=host:port (e.g. HUB_BINANCE=
-    hub-binance:7700), or None: then the node keeps a venue connection of its own, as before the hub."""
+    """Where the venue's market data hub (v2 P1-1) serves, from HUB_<VENUE>=host:port (e.g.
+    hub-<venue>:7700 in the stack), or None: then the node keeps a venue connection of its own, as before the hub."""
     raw = (os.environ if environ is None else environ).get(f"HUB_{venue.upper()}", "").strip()
     if not raw:
         return None
