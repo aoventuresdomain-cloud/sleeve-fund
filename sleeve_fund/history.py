@@ -32,9 +32,13 @@ class Coverage:
     last: pd.Timestamp  # open time of the last stored minute (from the REST loader it may still be forming)
     cursor: str  # the loader's resume point, opaque to the store
     closed: pd.Timestamp | None = None  # open time of the newest minute known closed (append_bars), if any
+    # open time of the REST loader's newest stored minute, which may be a part bar, until a complete bar for it
+    # is stored (by the loader's next page or by the hub); None when no stored minute is still forming
+    forming: pd.Timestamp | None = None
 
     def as_dict(self) -> dict:
-        out = {"first": self.first.isoformat(), "last": self.last.isoformat(), "cursor": self.cursor}
+        out = {"first": self.first.isoformat(), "last": self.last.isoformat(), "cursor": self.cursor,
+               "forming": self.forming.isoformat() if self.forming is not None else None}
         if self.closed is not None:
             out["closed"] = self.closed.isoformat()
         return out
@@ -68,7 +72,12 @@ class HistoryStore:
             return None
         raw = json.loads(path.read_text())
         closed = pd.Timestamp(raw["closed"]) if raw.get("closed") else None
-        return Coverage(pd.Timestamp(raw["first"]), pd.Timestamp(raw["last"]), raw.get("cursor", ""), closed)
+        last = pd.Timestamp(raw["last"])
+        if "forming" in raw:
+            forming = pd.Timestamp(raw["forming"]) if raw["forming"] else None
+        else:  # written before the forming minute was recorded: the loader's newest, unless the hub has passed it
+            forming = last if closed is None or last > closed else None
+        return Coverage(pd.Timestamp(raw["first"]), last, raw.get("cursor", ""), closed, forming)
 
     def append(self, venue: str, pair: str, minutes: pd.DataFrame, cursor: str, merge: bool = False) -> Coverage:
         """Add 1-minute bars (indexed by open time, UTC) and move the loader's cursor.
@@ -91,11 +100,14 @@ class HistoryStore:
                 # first-wins, as in append_bars: the loader fills holes but never overwrites a closed bar, and
                 # the span to the hub's end is not the loader's to vouch for, so it is not filled flat.
                 done = df[df.index <= cov.closed]
+                stored = done.index[:0]
                 if not done.empty:
-                    _write_first_wins(d, done, cov, "loader")
+                    stored = _write_first_wins(d, done, cov, "loader")[3]
                 df = df[df.index > cov.closed]
                 if df.empty:
-                    new = Coverage(cov.first, cov.last, cursor, cov.closed)
+                    # the page's newest minute is still the loader's own part bar only if it was stored here
+                    forming = done.index[-1] if done.index[-1] in stored else None
+                    new = Coverage(cov.first, cov.last, cursor, cov.closed, forming)
                     _write_coverage(d, new)
                     return new
             elif cov is not None and df.index[0] > cov.last:  # quiet minutes since the stored end
@@ -114,7 +126,7 @@ class HistoryStore:
                 _save(path, chunk)
             first = cov.first if cov is not None else df.index[0]
             new = Coverage(first, max(df.index[-1], cov.last if cov else df.index[-1]), cursor,
-                           cov.closed if cov else None)
+                           cov.closed if cov else None, df.index[-1])
             _write_coverage(d, new)
             return new
 
@@ -141,10 +153,13 @@ class HistoryStore:
         with _lock:
             d.mkdir(parents=True, exist_ok=True)
             cov = self.coverage(venue, pair)
-            written, unchanged, conflicts = _write_first_wins(d, df, cov, source)
+            written, unchanged, conflicts, _ = _write_first_wins(d, df, cov, source)
             lo, hi = df.index[0], df.index[-1]
+            # a complete bar for the loader's part bar replaces it (_forming), so it is no longer forming
+            forming = cov.forming if cov and cov.forming is not None and cov.forming not in df.index else None
             new_cov = Coverage(min(lo, cov.first) if cov else lo, max(hi, cov.last) if cov else hi,
-                               cov.cursor if cov else "", max(hi, cov.closed) if cov and cov.closed is not None else hi)
+                               cov.cursor if cov else "", max(hi, cov.closed) if cov and cov.closed is not None else hi,
+                               forming)
             _write_coverage(d, new_cov)
         return AppendResult(written, unchanged, conflicts)
 
@@ -225,6 +240,11 @@ class HistoryStore:
             seen = max(seen, last)
         if hi > seen:
             runs.append((seen + 60, hi))
+        if cov.forming is not None and cov.closed is not None and cov.forming < cov.closed:
+            # the loader's part bar, which the hub has since passed without storing a complete one: a hole
+            # until a refill closes it
+            f = int(cov.forming.timestamp())
+            runs = sorted(runs + [(f, f)])
         clipped = [(max(a, lo), min(b, hi)) for a, b in runs if b >= lo and a <= hi]
         return [(pd.Timestamp(a, unit="s", tz="UTC"), pd.Timestamp(b, unit="s", tz="UTC")) for a, b in clipped]
 
@@ -302,12 +322,12 @@ def _check_minutes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _forming(index: pd.DatetimeIndex, cov: Coverage | None) -> np.ndarray:
-    """Stored minutes that may still be forming: the REST loader's newest minute, unless the hub has
-    since stored that minute (or a later one) as closed."""
-    if cov is None:
+    """Stored minutes that may still be forming: the REST loader's newest minute, until a complete bar for it
+    is stored. Recorded rather than inferred from the hub's progress: a hub bar for a LATER minute says nothing
+    about this one (its refill may have failed), so the part bar is never served as complete (QA P1-H1)."""
+    if cov is None or cov.forming is None:
         return np.zeros(len(index), dtype=bool)
-    closed = cov.closed if cov.closed is not None else cov.last - pd.Timedelta("1min")
-    return np.asarray((index >= cov.last) & (index > closed))
+    return np.asarray(index == cov.forming)
 
 
 def _bars_frame(rows: list) -> pd.DataFrame:
@@ -333,11 +353,13 @@ def _bars_frame(rows: list) -> pd.DataFrame:
     return df.sort_index()
 
 
-def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None, source: str) -> tuple[int, int, int]:
+def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None,
+                      source: str) -> tuple[int, int, int, pd.DatetimeIndex]:
     """Write minutes nobody has stored yet (or that were still forming); keep every stored closed minute, and
     record in provenance.jsonl each offered minute that differs from it and, for a refill, what was filled.
-    Returns (written, unchanged, conflicts). The caller holds _lock and writes the coverage."""
+    Returns (written, unchanged, conflicts, the minutes written). The caller holds _lock and writes the coverage."""
     written = unchanged = 0
+    stored = []
     log: list[dict] = []
     now = pd.Timestamp.now(tz="UTC").isoformat()
     for month, chunk in df.groupby(df.index.strftime("%Y-%m")):
@@ -356,6 +378,7 @@ def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None, source: s
         if new.empty:
             continue
         written += len(new)
+        stored.append(new.index)
         _save(path, pd.concat([old[~old.index.isin(new.index)], new]).sort_index())
     if source != "live" and written:
         log.append({"kind": "refill", "at": now, "source": source, "first": df.index[0].isoformat(),
@@ -363,7 +386,8 @@ def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None, source: s
     if log:
         with open(d / "provenance.jsonl", "a") as f:
             f.writelines(json.dumps(e) + "\n" for e in log)
-    return written, unchanged, sum(e["kind"] == "conflict" for e in log)
+    return (written, unchanged, sum(e["kind"] == "conflict" for e in log),
+            stored[0].append(stored[1:]) if stored else df.index[:0])
 
 
 def _write_coverage(d: Path, cov: Coverage) -> None:
