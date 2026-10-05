@@ -2,10 +2,14 @@
 {% from "_fields.html" import exit_fields %}
 {% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
 {% from "_signals.html" import signals_tab, signals_panel %}
+{% from "_reasons.html" import reason_picker %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
+{% set realised = x.pnl - x.unrealised %}
+{% set closable = not backtest_id and s.desired_state == 'running' and not (pending|selectattr('command', 'equalto', 'flatten')|list) %}
 {% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
+{# The strategy page (combined build F2): header, seven figures, then the desk in tabs. #}
 <div class="page-head" data-live="head">
   <h1>{{ s.name }}</h1> {% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}
   <div class="actions">
@@ -21,7 +25,7 @@
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
-  <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }}{% if s.venue %} on {{ venue_label(s.venue) }}{% endif %}, {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
+  <p class="lede sub-line">{{ s.strategy|replace('_', ' ')|capitalize }} · {{ s.instrument }}{% if s.venue %} · {{ venue_label(s.venue) }}{% elif perp %} · perpetual{% endif %} · {{ bar_label(s.bar_spec).split(',')[0] }} · {{ x.profile.name }} profile</p>
 </div>
 
 <div data-live="banners">
@@ -37,18 +41,22 @@
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
 {% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
 {% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}
+{# Flatten and stop: the flatten went first; once flat, the stop is offered with the same reason (F4). #}
+{% if then_stop and not backtest_id %}{% if s.desired_state != 'running' %}{% elif held or flatten_waits %}<div class="banner warn" role="status">Flattening first. Once it is flat, this page asks you to stop it. Reason: {{ then_stop }}.</div>
+{% else %}<form class="banner then-stop" role="alert" method="post" action="/sleeves/{{ s.name }}/command"><input type="hidden" name="reason" value="{{ then_stop }}"><strong>Flat now. Stop it?</strong> <span class="muted">Reason: {{ then_stop }}.</span> <span class="then-acts"><a class="button secondary" href="/sleeves/{{ s.name }}">Not now</a><button name="command" value="stop">Stop strategy</button></span></form>{% endif %}{% endif %}
 </div>
 {# Outside the live part: the next refresh, without the query, would drop it before it is read. #}
 {% if command_error %}<div class="banner loss" role="alert" data-once>Not done: {{ command_error }}.</div>{% endif %}
+{% if done %}<div class="toast" role="status" data-once>{{ done }}</div>{% elif then_stop and not (held or flatten_waits) and s.desired_state == 'running' %}{% elif then_stop %}<div class="toast" role="status">Flatten sent first. Reason: {{ then_stop }}.</div>{% endif %}
 
-<section class="ledger" aria-label="Strategy figures">
-  <div><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">from {{ s.starting_balance|money }} {{ quote }}</div></div>
+<section class="ledger kpi7" aria-label="Strategy figures">
+  <div class="lead-box"><div class="k">Equity {{ help('equity') }}</div><div class="v lead">{{ x.equity|money }}</div><div class="s">started with {{ s.starting_balance|money }} {{ quote }}</div></div>
   {% if not backtest_id %}<div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(x.day_pnl) }}</div><div class="s">{{ x.day_ret|pct1s }} since midnight</div></div>{% endif %}
-  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">buy and hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Exposure {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ "short " if x.qty < 0 }}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% if perp and perp.leverage %} · {{ '%.2f'|format(perp.leverage) }}×{% if perp.liq_px %} · liq {{ perp.liq_px|px }}{% endif %}{% endif %}{% else %}all cash{% endif %}</div></div>
-  <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no open trade{% endif %}</div></div>
-  <div><div class="k">Closed trades {{ help('realised') }}</div><div class="v">{{ t.trades }}{% if t.trades %} <span class="muted" style="font-size:14px">{{ t.win_rate|pct0 }} won</span>{% endif %}</div><div class="s">{% if t.trades %}{{ t.pnl|smoney }} after fees{% if t.trades < 10 %} · <span class="warn" title="Win rate and expectancy mean little under 10 trades">n&lt;10</span>{% endif %}{% else %}none yet{% endif %}</div></div>
-  <div><div class="k" >Avg trade {{ help('expectancy') }}</div><div class="v">{{ t.expectancy|pctn }}</div><div class="s">profit factor {{ t.profit_factor|numn }}</div></div>
+  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(x.ret) }}</div><div class="s">vs buy and hold {{ x.bench_ret|pct1s }}</div></div>
+  {% if perp %}<div><div class="k" title="The margin the position takes at the risk profile's {{ '%g'|format(x.profile.max_leverage) }}x leverage cap: its notional over the cap, as a share of equity">Margin used</div><div class="v">{{ ((x.position_value|abs) / x.profile.max_leverage / x.equity if x.equity > 0 else 0)|pct0 }}</div><div class="s">{% if x.qty %}notional {{ x.exposure|abs|pct0 }} · {{ "short" if x.qty < 0 else "long" }}{% if perp.leverage %} {{ '%.2f'|format(perp.leverage) }}×{% endif %}{% else %}flat{% endif %}</div></div>
+  {% else %}<div><div class="k">In the market {{ help('in_market') }}</div><div class="v">{{ x.exposure|pct0 }}</div><div class="s">{% if x.qty %}{{ x.qty|abs|qty }} {{ base }} · {{ x.position_value|abs|money }}{% else %}all cash{% endif %} · spot, no margin</div></div>{% endif %}
+  <div><div class="k">Unrealised {{ help('unrealised') }}</div><div class="v">{{ money_signed(x.unrealised) }}</div><div class="s">{% if x.entry_px %}entry {{ x.entry_px|px }}{% else %}no position{% endif %}</div></div>
+  <div><div class="k">Realised {{ help('realised') }}</div><div class="v">{{ money_signed(realised) }}</div><div class="s">{{ t.trades }} closed trade{{ 's' if t.trades != 1 }}{% if t.trades %} · {{ t.win_rate|pct0 }} won{% endif %}</div></div>
   <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ x.fees|money }}</div><div class="s">over {{ x.fills }} fills</div></div>
 </section>
 
@@ -60,29 +68,55 @@
   <a href="#trades" role="tab" data-tab="trades">Trades<span class="n">{{ trips|length }}</span></a>
   <a href="#orders" role="tab" data-tab="orders">Orders<span class="n">{{ orders|length }}</span></a>
   <a href="#activity" role="tab" data-tab="activity">Activity</a>
+  {% if path %}<a href="#path" role="tab" data-tab="path">Path to live</a>{% endif %}
   <a href="#settings" role="tab" data-tab="settings">Settings</a>
 </nav>
 
 <div class="tab-panel" id="tab-overview" role="tabpanel" data-panel="overview">
-<section class="panel" aria-labelledby="curve-h" style="margin-bottom:16px">
-    <div class="panel-head"><h2 id="curve-h">Equity</h2>
-      <div class="right chart-tools">
-        <button type="button" class="toggle" data-compare aria-pressed="false" title="Show return against buying and holding the instrument">vs buy-and-hold</button>
-        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
-      </div></div>
-    <div class="chart"><canvas id="eq" aria-label="Strategy equity by day"></canvas></div>
-    <div class="chart short"><canvas id="dd" aria-label="Strategy drawdown by day"></canvas></div>
+<div class="ov-term">
+  <div class="ov-chart" data-mode="price">
+    <div class="seg ov-switch" role="group" aria-label="Chart"><button type="button" data-mode-to="price" aria-pressed="true">Price</button><button type="button" data-mode-to="equity" aria-pressed="false">Equity</button></div>
+    <div class="ov-price">{{ price_chart("pc", s.instrument, "") }}</div>
+    <section class="panel ov-equity" aria-labelledby="curve-h">
+      <div class="panel-head"><h2 id="curve-h">Equity</h2>
+        <div class="right chart-tools">
+          <button type="button" class="toggle" data-compare aria-pressed="false" title="Show return against buying and holding the instrument">vs buy-and-hold</button>
+          <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
+        </div></div>
+      <div class="chart"><canvas id="eq" aria-label="Strategy equity by day"></canvas></div>
+      <div class="chart short"><canvas id="dd" aria-label="Strategy drawdown by day"></canvas></div>
+    </section>
+  </div>
+  <section class="panel ov-pos" aria-labelledby="ovpos-h">
+    <div class="panel-head"><h2 id="ovpos-h">Position</h2>{% if position %}<span class="right"><span class="side {{ 'sell' if position.side < 0 else 'buy' }}">{{ "Short" if position.side < 0 else "Long" }}</span>{% if perp and perp.leverage %} {{ '%.2f'|format(perp.leverage) }}×{% endif %}</span>{% endif %}</div>
+    {% if position %}
+    <dl class="kv-list">
+      <div><dt>Size</dt><dd>{{ position.qty|abs|qty }} {{ base }}</dd></div>
+      {% if perp %}<div><dt title="Notional over the {{ '%g'|format(x.profile.max_leverage) }}x leverage cap">Margin</dt><dd>{{ ((x.position_value|abs) / x.profile.max_leverage)|money }}</dd></div>{% endif %}
+      <div><dt>Entry</dt><dd>{{ position.entry_px|px }}</dd></div>
+      <div><dt>Mark</dt><dd>{{ x.price|px }}</dd></div>
+      <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}</dd></div>
+      <div><dt>Realised, all trades</dt><dd>{{ money_signed(realised) }}</dd></div>
+      <div><dt>Fees paid</dt><dd>{{ x.fees|money }}</dd></div>
+      <div><dt>Stop</dt><dd>{% if risk.stop_px %}<span class="loss">{{ risk.stop_px|px }}</span>{% else %}<span class="warn">none</span>{% endif %}</dd></div>
+      <div><dt>Target</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% else %}<span class="muted">none</span>{% endif %}</dd></div>
+      {% if perp %}<div><dt>Liq. price</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }}{% else %}<span class="muted">none</span>{% endif %}</dd></div>{% endif %}
+    </dl>
+    <div class="ov-why"><div class="k">{{ "Why it sold short" if position.side < 0 else "Why it bought" }}</div><p>{{ position.why or 'Not recorded' }}</p></div>
+    {% if closable %}<button type="button" class="danger ov-close" data-open="dlg-close">Close position</button>{% endif %}
+    {% else %}
+    <p class="muted" style="margin:0">Flat. {% if s.desired_state != 'running' %}The strategy is stopped.{% else %}Waiting for the next signal.{% endif %}</p>
+    {% if idea %}<div class="ov-why"><div class="k">Next entry</div><p>{{ idea }}</p></div>{% endif %}
+    {% endif %}
+  </section>
+</div>
+<section class="panel flush" aria-labelledby="recent-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="recent-h">Recent trades</h2>{% if trips %}<a class="right" href="#trades">All {{ trips|length }}</a>{% endif %}</div>
+  {% if trips %}<table class="responsive" data-hide-md="2">
+    <thead><tr><th>Closed</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Fees</th><th>Exit</th></tr></thead>
+    <tbody>{% for tr in trips[:5] %}<tr><td>{{ tr.closed|ts }}</td><td data-m="hide">{{ "Short" if tr.side == -1 else "Long" }}</td><td class="num" data-m="hide">{{ tr.entry_px|px }}</td><td class="num" data-m="hide">{{ tr.exit_px|px }}</td><td class="num" data-m="right">{{ money_signed(tr.pnl) }}</td><td class="num" data-m="hide">{{ tr.fees|money }}</td><td data-m="hide">{{ tag(tr.reason, tr.exit_kind) }}</td></tr>{% endfor %}</tbody>
+  </table>{% else %}<p class="empty" style="padding:4px 18px 14px">No closed trades yet.</p>{% endif %}
 </section>
-{% if not backtest_id %}{% set met = path|selectattr('ok')|list|length %}<section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
-  <details class="g2">
-    <summary><h2 id="g2-h">Path to live</h2> {{ help('g2') }}
-      <span class="g2-bar" role="img" aria-label="{{ met }} of {{ path|length }} conditions met">{% for r in path %}<i class="{{ 'ok' if r.ok else ('bad' if r.bad else '') }}"></i>{% endfor %}</span>
-      <span class="hint">{{ met }} of {{ path|length }} G2 conditions met</span><span class="right faint g2-more">Details</span></summary>
-    <ul class="checklist cols">{% for r in path %}{% set cls = 'ok' if r.ok else ('bad' if r.bad else 'todo') %}
-      <li class="{{ cls }}"><span class="mark" aria-hidden="true">{{ '✓' if r.ok else ('!' if r.bad else ('?' if r.ok is none else '○')) }}</span><span><span class="sr-only">{{ 'Met' if r.ok else ('Problem' if r.bad else ('Your call' if r.ok is none else 'Not yet')) }}: </span>{{ r.label }}<small>{{ r.detail }}</small></span></li>{% endfor %}
-    </ul>
-  </details>
-</section>{% endif %}
 </div>
 
 {% if signals %}{{ signals_panel(signals) }}{% endif %}
@@ -131,7 +165,13 @@
     <summary><span class="k">{{ "Why it was sold short" if position.side < 0 else "Why it was bought" }}</span> <span class="why-peek">{{ position.why or 'Not recorded' }}</span></summary>
     {{ why('Decision at ' ~ (position.opened|ts if position.opened else 'entry'), position.why, position.sig) }}
   </details>{% endif %}
+  {% if position and closable %}<div class="pos-actions"><button type="button" class="danger" data-open="dlg-close">Close position</button></div>{% endif %}
 </section>
+{% if position %}<section class="panel flush pos" aria-labelledby="hist-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="hist-h">This position's history</h2><span class="right faint">fills, stop moves and funding since it opened</span></div>
+  {% if pos_history %}<ul class="feed history">{% for h in pos_history %}<li><span class="when">{{ h.ts|ts }}</span><span class="what"><strong>{{ h.what }}</strong> {{ h.text }}</span></li>{% endfor %}</ul>
+  {% else %}<p class="empty" style="padding:4px 18px 14px">Nothing recorded since it opened.</p>{% endif %}
+</section>{% endif %}
 <section class="panel pos" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits and health</h2></div>
   <div class="pos-grid two">
@@ -150,7 +190,6 @@
 </div>
 
 <div class="tab-panel" id="tab-trades" role="tabpanel" data-panel="trades">
-{{ price_chart("pc", s.instrument, "") }}
 <section class="panel flush" aria-labelledby="trips-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="trips-h">Closed trades</h2><span class="right"><a data-dl href="/exports/audit.csv?sleeve={{ s.name|urlencode }}" title="Every fill with its price, fee, P&amp;L and the indicator values behind it, for a spreadsheet or a chart">Audit CSV</a> · <a href="/trades?sleeve={{ s.name }}">All trades</a></span></div>
   {% if trips %}
@@ -180,43 +219,49 @@
 <section class="panel flush" aria-labelledby="ord-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="ord-h">Orders</h2><a class="right" href="/orders?sleeve={{ s.name }}">Blotter</a></div>
   {% if orders %}
+  <div class="chip-row" data-chips="ord-list" role="group" aria-label="Filter orders">{% for k, label in [('all', 'All'), ('filled', 'Filled'), ('canceled', 'Cancelled'), ('rejected', 'Rejected')] %}<button type="button" class="fchip" data-chip="{{ k }}" aria-pressed="{{ 'true' if k == 'all' else 'false' }}">{{ label }}</button>{% endfor %}</div>
   <table class="responsive" data-hide-md="3 6">
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Fee</th><th>Status</th><th>Reason</th></tr></thead>
-    <tbody>{% for o in orders %}
-    <tr><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
+    <tbody id="ord-list">{% for o in orders %}
+    <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="hide">{{ o.qty|qty }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
       <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
-    {% endfor %}</tbody>
+    {% endfor %}<tr data-none hidden><td colspan="8" class="muted">No orders match.</td></tr></tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No orders journaled yet. Each order is recorded here with its reason when it is sent.</p>{% endif %}
 </section>
 </div>
 
 <div class="tab-panel" id="tab-activity" role="tabpanel" data-panel="activity">
-<div class="grid">
-<section class="panel span-7" aria-labelledby="feed-h">
-    <div class="panel-head"><h2 id="feed-h">Activity</h2>
-      <nav class="right range" aria-label="Filter activity">
-        {% for k, label in [('all', 'All'), ('alerts', 'Warnings'), ('trades', 'Trades'), ('pm', 'PM and restarts')] %}<a class="seg" href="?feed={{ k }}#feed-h" {{ 'aria-current=true' if feed_kind == k }}>{{ label }}</a>{% endfor %}
-      </nav></div>
-    {% if feed %}
-    <ul class="feed">{% for e in feed %}
-      <li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what">{{ e.message }}</span></li>{% endfor %}
-    </ul>{% else %}<p class="empty">Nothing in this view yet.</p>{% endif %}
-  </section>
-  <section class="panel span-5" aria-labelledby="dec-h">
-    <div class="panel-head"><h2 id="dec-h">Decisions</h2></div>
-    <ul class="feed">{% for d in decisions %}<li><span class="when">{{ d.ts|ts }}</span><span class="what"><strong>{{ d.action|action_words }}</strong> by {{ d.actor }}: {{ d.reason }}</span></li>{% else %}<li class="muted">None yet.</li>{% endfor %}</ul>
-  </section>
+<section class="panel" aria-labelledby="feed-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="feed-h">Activity</h2><span class="right faint">events and decisions, newest first</span></div>
+  <div class="chip-row" data-chips="act-list" role="group" aria-label="Filter activity">{% for k, label in [('all', 'All'), ('decisions', 'Decisions'), ('risk', 'Risk'), ('system', 'System')] %}<button type="button" class="fchip" data-chip="{{ k }}" aria-pressed="{{ 'true' if k == 'all' else 'false' }}">{{ label }}</button>{% endfor %}</div>
+  {% if timeline %}
+  <ul class="feed timeline" id="act-list">{% for e in timeline %}
+    <li class="{{ e.level }}" data-kind="{{ e.kind }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><strong>{{ e.title }}</strong> {{ e.text }}</span></li>{% endfor %}
+    <li data-none hidden class="muted">Nothing of this kind yet.</li>
+  </ul>{% else %}<p class="empty">Nothing yet.</p>{% endif %}
+</section>
 </div>
-</div>
+
+{% if path %}{% set met = path|selectattr('ok')|list|length %}
+<div class="tab-panel" id="tab-path" role="tabpanel" data-panel="path">
+<section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="g2-h">Path to live</h2> {{ help('g2') }}<span class="right faint">{{ met }} of {{ path|length }} G2 conditions met · read-only</span></div>
+  <ol class="journey">{% for j in journey %}<li class="{{ j.state }}"><span class="c" aria-hidden="true">{{ '✓' if j.state == 'done' else loop.index }}</span><b>{{ j.label }}</b><span>{{ j.detail }}</span><span class="sr-only">{{ {'done': 'done', 'here': 'where it is now', 'todo': 'not yet'}[j.state] }}</span></li>{% endfor %}</ol>
+  <h3 class="sub-h">What is left</h3>
+  <ul class="checklist cols">{% for r in path %}{% set cls = 'ok' if r.ok else ('bad' if r.bad else 'todo') %}
+    <li class="{{ cls }}"><span class="mark" aria-hidden="true">{{ '✓' if r.ok else ('!' if r.bad else ('?' if r.ok is none else '○')) }}</span><span><span class="sr-only">{{ 'Met' if r.ok else ('Problem' if r.bad else ('Your call' if r.ok is none else 'Not yet')) }}: </span>{{ r.label }}<small>{{ r.detail }}</small></span></li>{% endfor %}
+  </ul>
+</section>
+</div>{% endif %}
 
 <div class="tab-panel" id="tab-settings" role="tabpanel" data-panel="settings">
 <div class="grid">
   <section class="panel span-7" aria-labelledby="set-h">
     <div class="panel-head"><h2 id="set-h">Settings</h2></div>
     <table class="compact kv">
-      <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
+      <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}{% if idea %}<div class="sub">{{ idea }}</div>{% endif %}</td></tr>
       <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}{% if s.venue %} on {{ venue_label(s.venue) }}{% endif %}, {{ bar_label(s.bar_spec) }}</td></tr>
       {% if not backtest_id %}{% set movable = not x.qty %}
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
@@ -244,13 +289,20 @@
     {% elif saved == 'account' %}<div class="banner" style="margin-bottom:12px" role="status">Moved to {{ account }}.</div>{% endif %}
     {% if archived %}<p class="muted">Restore the strategy to change its settings.</p>{% else %}
     <input type="hidden" name="instrument" value="{{ s.instrument }}">
-    <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
+    <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" data-limits="{{ p.name|capitalize }}: halts at {{ p.max_drawdown|pct0 }} drawdown and pauses for the day at a {{ p.daily_loss|pct0 }} daily loss, from now." {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
     <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
     {{ exit_fields(settings_pre, costs, position.side if position else none, s.params) }}
     <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
     {% if x.qty %}<div class="field"><label class="check" style="margin-top:10px"><input type="checkbox" name="confirm_looser" value="1"> Accept a looser stop on the open position</label></div>{% endif %}
-    <div class="field" style="margin-top:12px"><label for="r-settings">Reason for the decision log</label><input id="r-settings" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason"></div>
-    <button>Save settings</button>
+    <button type="button" data-diff-open>Save settings</button>
+    <dialog id="dlg-save" data-diff aria-labelledby="dlg-save-h">
+      <h2 id="dlg-save-h">Save settings for {{ s.name }}</h2>
+      <p>{% if s.desired_state == 'running' %}It restarts to trade under them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}</p>
+      <div class="eff" data-diff-rows></div>
+      <div class="warnbox" data-diff-warn hidden><b>Risk profile change.</b> <span></span> Drawdown so far counts against the new limit.</div>
+      {{ reason_picker('save', 'r-save') }}
+      <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button data-needs-reason data-needs-change disabled>Save</button></div>
+    </dialog>
     {% endif %}
   </form>
   {% endif %}
@@ -266,6 +318,7 @@
 
 {# One confirmation dialog per command: says exactly what will happen before it does. #}
 {% set dialogs = {
+  'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
   'resume': ('Resume ' ~ s.name, ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
@@ -275,15 +328,19 @@
   'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 {% if not backtest_id %}<div data-live="dialogs" data-live-forms>
-<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
 <dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
   <form method="post" action="/sleeves/{{ s.name }}/{{ 'archive' if cmd in ['archive', 'restore'] else 'command' }}">
     <h2 id="dlg-{{ cmd }}-h">{{ title }}</h2>
     <p>{{ effect }}</p>
-    <label for="r-{{ cmd }}">Reason for the decision log</label>
-    <input id="r-{{ cmd }}" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ cmd }}" class="{{ tone }}">{{ label }}</button></div>
+    {% if cmd == 'stop' and x.qty %}<div class="warnbox"><b>The position stays open.</b> Once stopped, nothing manages it except {% if risk.stop_px %}the stop at {{ risk.stop_px|px }}{% else %}nothing at all: it has no stop{% endif %}. Usually you want Flatten and stop: it closes the position first, then asks you to stop it once it is flat.</div>{% endif %}
+    {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now would drop it, so Stop is off until the strategy is flat.</div>{% endif %}
+    {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
+    {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
+    {{ reason_picker(cmd, 'r-' ~ cmd) }}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button>
+      {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
+      <button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button></div>
   </form>
 </dialog>
 {% endfor %}
@@ -293,9 +350,8 @@
     <p>Its history stays with the strategy. Only a flat strategy can move, so no position changes accounts.</p>
     <label for="move-to">Account</label>
     <select id="move-to" name="account" required>{% for a in accounts if a.name != account %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' or a.retired_at }}>{{ a.name }} ({{ 'retired' if a.retired_at else 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select>
-    <label for="r-move">Reason for the decision log</label>
-    <input id="r-move" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button>Move strategy</button></div>
+    {{ reason_picker('move', 'r-move') }}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button data-needs-reason disabled>Move strategy</button></div>
   </form>
 </dialog>
 </div>{% endif %}
@@ -305,5 +361,5 @@
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.tabs(); Console.dialogs(); Console.orderFields("settings-form"); Console.whys(); Console.priceChart("pc", "/api/sleeves/{{ s.name }}/candles"); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
+<script>Console.tabs(); Console.dialogs(); Console.reasons(); Console.chips(); Console.modes(); Console.orderFields("settings-form"); Console.settingsDiff("settings-form"); Console.whys(); Console.priceChart("pc", "/api/sleeves/{{ s.name }}/candles"); Console.pair("/api/sleeves/{{ s.name }}/equity", "eq", "dd", ["{{ s.name }}", "Buy-and-hold"]);</script>
 {% endblock %}
