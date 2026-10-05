@@ -272,6 +272,24 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
                f"fee drag {fee_drag:.2%} of average equity a year")
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append("")
+    if r.cost_ladder:
+        from sleeve_fund.research.study import breakeven_fee
+
+        _, words = breakeven_fee(r.cost_ladder)
+        out.append("## Cost ladder (full research period, default params)")
+        out.append("")
+        out.append(f"**Break-even fee:** {words}.")
+        out.append("")
+        out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for rung in r.cost_ladder:
+            out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
+                       f"| {rung.fees_paid:,.0f} |")
+        out.append("")
+        out.append("The same strategy and settings at each fee, maker and taker alike; half the bid-ask spread is charged "
+                   "on top as above. 0.02% and 0.05% are a low-fee perpetual venue's maker and taker rates, 0.80% a high-fee "
+                   "spot venue's taker rate.")
+        out.append("")
     out.append("## Walk-forward folds")
     out.append("")
     out.append("| Train | Test to | Chosen params | Train Sharpe | Test trades | Test CAGR | Benchmark CAGR | Test Sharpe | Benchmark Sharpe |")
