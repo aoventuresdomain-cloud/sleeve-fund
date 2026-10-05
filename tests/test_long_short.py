@@ -649,7 +649,7 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.0f}"[:5] in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
-    assert "· 0.59× · liq" in html  # the header
+    assert 'class="lev">0.6×' in html  # the Overview's position table, leverage in its own column
     csv = c.get("/exports/trades.csv?sleeve=pp-fund", auth=AUTH)
     assert csv.status_code == 200 and "funding" in csv.text.splitlines()[0] and "98.6" in csv.text
 
@@ -962,7 +962,7 @@ def test_a_saved_runs_screen_shows_the_benchmark_its_result_shows(client, monkey
     assert rows[-1]["benchmark"] == pytest.approx(d["benchmark"][-1], abs=0.01)
     screen = c.get(f"/sleeves/{name}", auth=AUTH).text
     bench_ret = d["benchmark"][-1] / 5000 - 1
-    assert f"buy and hold, {label}: {bench_ret * 100:+.1f}%" in screen, screen.split("Since start")[1].split("</button>")[1][:300]
+    assert f"buy-and-hold, {label}: {bench_ret * 100:+.1f}%" in screen  # the Since start tile's title
 
 
 @pytest.mark.sanity

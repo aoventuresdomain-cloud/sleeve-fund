@@ -647,6 +647,13 @@ window.Console = (() => {
       lines.forEach((l) => main.removePriceLine(l));
       lines = d.lines.map((l) => main.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
+      // The axis always takes in the open position's entry, SL and TP, so their lines are never off screen.
+      const levels = d.lines.map((l) => l.price).filter((v) => Number.isFinite(v));
+      main.applyOptions({autoscaleInfoProvider: (orig) => {
+        const r = orig();
+        if (r && levels.length) { r.priceRange.minValue = Math.min(r.priceRange.minValue, ...levels); r.priceRange.maxValue = Math.max(r.priceRange.maxValue, ...levels); }
+        return r;
+      }});
       if (!keepView) chart.timeScale().fitContent();
       fill();
       $(".pc-source").hidden = d.source !== "marks" && !d.note;
@@ -1034,6 +1041,24 @@ window.Console = (() => {
   // Tabs on a strategy page: one panel at a time, chosen by the URL hash so links and the back
   // button work. A hash that points inside a panel (an activity filter link) opens that panel.
   // Without JavaScript every panel shows, one after another.
+  // Tabs inside a panel ([data-subtabs]): buttons [data-sub] show one [data-sub-panel] at a time. The address
+  // keeps the page's own tab, so these keep their choice through live updates instead.
+  function subtabs() {
+    let chosen = null;
+    const apply = () => document.querySelectorAll("[data-subtabs]").forEach((box) => {
+      const want = chosen || box.querySelector("[data-sub]")?.dataset.sub;
+      box.querySelectorAll("[data-sub]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.sub === want)));
+      box.querySelectorAll("[data-sub-panel]").forEach((p) => { p.hidden = p.dataset.subPanel !== want; });
+    });
+    once("subtabsBound", () => {
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-subtabs] [data-sub]");
+        if (b) { chosen = b.dataset.sub; apply(); }
+      });
+      document.addEventListener("live:swap", () => { if (chosen) apply(); });
+    });
+  }
+
   function tabs() {
     const bar = document.querySelector("[data-tabs]");
     if (!bar) return;
@@ -1121,17 +1146,6 @@ window.Console = (() => {
   }
 
   // A two-way switch (Price / Equity on the overview chart): the box's data-mode picks what shows.
-  function modes() {
-    once("modesBound", () => document.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-mode-to]");
-      if (!b) return;
-      const box = b.closest("[data-mode]");
-      box.dataset.mode = b.dataset.modeTo;
-      box.querySelectorAll("[data-mode-to]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-      window.dispatchEvent(new Event("resize"));  // a chart drawn while hidden sizes itself now
-    }));
-  }
-
   // Settings: Save first lists every change, before and after, in its confirm dialog, with a warning when the
   // risk profile changes (its option carries the new limits in data-limits).
   function settingsDiff(formId) {
@@ -1176,5 +1190,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, chips, modes, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, tabs, subtabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();

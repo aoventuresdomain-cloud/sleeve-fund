@@ -39,33 +39,50 @@ def _panel(page, name):
     return page.split(f'data-panel="{name}"')[1].split('class="tab-panel"')[0]
 
 
-def test_positions_show_unrealised_realised_and_fees_with_a_totals_row(client):  # noqa: F811
+COLUMNS = ["Instrument", "Side", "Leverage", "Size", "Notional", "Entry", "Mark", "SL", "TP", "Liq. price",
+           "Unrealised", "Risk to stop", "Fees"]
+
+
+def _head(table):
+    return re.findall(r"<th[^>]*>([^<]+)</th>", table.split("</thead>")[0])
+
+
+def test_positions_table_has_the_v2_columns_and_no_percentages(client):  # noqa: F811
     c, store = client
     _book(store)
     page = c.get("/", auth=AUTH).text
     pos = _panel(page, "positions")
     table = pos.split('<table class="book-pos">')[1].split("</table>")[0]
-    head = table.split("</thead>")[0]
-    for col in ("Strategy", "Instrument", "Side", "Size", "Entry", "Mark", "Liq. price", "Stop", "Unrealised",
-                "Realised", "Fees paid"):
-        assert f">{col}</th>" in head, col
+    assert _head(table) == ["Strategy", *COLUMNS]
     rows = table.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")[1:]
     assert len(rows) == 2 and "flat-one" not in table  # only open positions
     short = next(r for r in rows if "pp-short" in r)
     long_ = next(r for r in rows if "rsi-long" in r)
     assert ">Short</span>" in short and ">Long</span>" in long_
-    # Unrealised on the open position; realised is the strategy's P&L less that (here, the entry fee); fees paid.
-    assert "+50.00" in short and "−1.50" in short and ">1.50</td>" in short
-    assert "−30.00" in long_ and "−1.20" in long_ and ">1.20</td>" in long_
-    # The short has no stop: an amber "none". The long's 2% stop sits under its entry.
+    # Leverage in its own column; notional in money; unrealised and fees; no realised (it moved to Trades).
+    assert 'class="lev">0.3×' in short and "2,950.00" in short and "+50.00" in short and ">1.50</td>" in short
+    assert "−30.00" in long_ and ">1.20</td>" in long_ and "Realised" not in table
+    # The short has neither stop nor target: an amber "none" stop, "none" target, and an unbounded risk.
     assert '<span class="warn" title="No stop-loss on this position">none</span>' in short
-    assert "2,940.00" in long_
+    assert '<span class="faint" title="No take-profit on this position">none</span>' in short and "unbounded" in short
+    assert "2,940.00" in long_  # the long's 2% stop under its 3,000 entry
+    # No cell contains a % (a distance or share goes in a title).
+    cells = re.sub(r'title="[^"]*"', "", table)
+    assert "%" not in cells
     foot = table.split("<tfoot>")[1].split("</tfoot>")[0]
-    assert "Total, 2 positions" in foot
-    assert "+20.00" in foot and "−2.70" in foot and ">2.70</td>" in foot
-    # Phones get a card per position with the three figures on one line, and the same totals.
+    assert "Total, 2 positions" in foot and "5,920.00" in foot and "+20.00" in foot and ">2.70</td>" in foot
+    # Phones get a card per position with the same figures.
     cards = pos.split('<ul class="pos-cards">')[1].split("</ul>")[0]
-    assert cards.count('<div class="g3">') == 3 and "Unrealised<b>" in cards and "Fees paid<b>" in cards
+    assert cards.count('<div class="g3">') == 2 and "Risk to stop<b>" in cards
+
+
+def test_strategy_page_positions_use_the_same_table(client):  # noqa: F811
+    c, store = client
+    _book(store)
+    page = c.get("/sleeves/rsi-long", auth=AUTH).text
+    table = page.split('data-sub-panel="pos"')[1].split('<table class="book-pos">')[1].split("</table>")[0]
+    assert _head(table) == COLUMNS  # no Strategy column on the strategy's own page
+    assert 'data-open="dlg-close"' in table and "2,940.00" in table and "<tfoot>" not in table
 
 
 def test_close_reuses_the_strategy_flatten_with_a_reason(client):  # noqa: F811

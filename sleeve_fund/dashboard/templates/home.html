@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, signed, money_signed, usage, spark, help, pts, tag %}
 {% from "_reasons.html" import reason_picker %}
+{% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
@@ -84,39 +85,9 @@
 
 <div class="tab-panel" id="tab-positions" role="tabpanel" data-panel="positions">
 <section class="panel flush" aria-labelledby="positions-h">
-  <div class="panel-head"><h2 id="positions-h">Open positions</h2><span class="hint">realised and fees are since each strategy started</span></div>
+  <div class="panel-head"><h2 id="positions-h">Open positions</h2></div>
   {% if positions.rows %}
-  <table class="book-pos">
-    <thead><tr><th>Strategy</th><th>Instrument</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">Liq. price</th><th>Stop</th>
-      <th class="num">Unrealised</th><th class="num">Realised</th><th class="num">Fees paid</th><th><span class="sr-only">Close</span></th></tr></thead>
-    <tbody>{% for p in positions.rows %}{% set base = p.pair.split('/')[0] %}
-    <tr><td class="cell-name"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a></td>
-      <td>{{ p.pair }}</td>
-      <td><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span>{% if p.perp %}{% if p.perp.leverage %} <span class="lev">{{ '%.1f'|format(p.perp.leverage) }}×</span>{% endif %}{% else %} <span class="faint">spot</span>{% endif %}</td>
-      <td class="num">{{ p.qty|abs|qty }} {{ base }}</td>
-      <td class="num">{{ p.entry_px|px }}</td>
-      <td class="num">{{ p.price|px }}</td>
-      <td class="num">{% if p.perp and p.perp.liq_px %}<span class="{{ 'loss' if p.perp.to_liq < 0.1 else ('warn' if p.perp.to_liq < 0.25) }}" title="{{ p.perp.to_liq|pct1 }} away">{{ p.perp.liq_px|px }}</span>{% elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>{% else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif %}</td>
-      <td>{% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn" title="No stop-loss on this position">none</span>{% endif %}</td>
-      <td class="num">{{ money_signed(p.unrealised) }}<div class="sub">{{ p.unrealised_ret|pct1s }}</div></td>
-      <td class="num">{{ money_signed(p.realised) }}</td>
-      <td class="num">{{ p.fees|money }}</td>
-      <td class="close-cell"><button type="button" class="quiet close-btn" data-open="dlg-close-{{ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Close</button></td></tr>
-    {% endfor %}</tbody>
-    <tfoot><tr><th scope="row" colspan="8">Total, {{ positions.rows|length }} position{{ 's' if positions.rows|length != 1 }}</th>
-      <td class="num">{{ money_signed(positions.unrealised) }}</td><td class="num">{{ money_signed(positions.realised) }}</td><td class="num">{{ positions.fees|money }}</td><td></td></tr></tfoot>
-  </table>
-  {# Phones: a card per position, its three P&L figures on one line. #}
-  <ul class="pos-cards">{% for p in positions.rows %}{% set base = p.pair.split('/')[0] %}
-    <li><div class="r"><span><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span> <strong>{{ p.pair }}</strong>{% if p.perp and p.perp.leverage %} <span class="lev">{{ '%.1f'|format(p.perp.leverage) }}×</span>{% endif %}</span>
-        <button type="button" class="quiet close-btn" data-open="dlg-close-{{ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Close</button></div>
-      <div class="m"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a> · {{ p.qty|abs|qty }} {{ base }} · entry {{ p.entry_px|px }} · mark {{ p.price|px }}</div>
-      <div class="m">Stop {% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn">none</span>{% endif %}{% if p.perp %} · liq. price {% if p.perp.liq_px %}{{ p.perp.liq_px|px }}{% else %}none{% endif %}{% endif %}</div>
-      <div class="g3"><span>Unrealised<b>{{ money_signed(p.unrealised) }}</b></span><span>Realised<b>{{ money_signed(p.realised) }}</b></span><span>Fees paid<b>{{ p.fees|money }}</b></span></div></li>
-    {% endfor %}
-    <li class="tot"><div class="m">Total, {{ positions.rows|length }} position{{ 's' if positions.rows|length != 1 }}</div>
-      <div class="g3"><span>Unrealised<b>{{ money_signed(positions.unrealised) }}</b></span><span>Realised<b>{{ money_signed(positions.realised) }}</b></span><span>Fees paid<b>{{ positions.fees|money }}</b></span></div></li>
-  </ul>
+  {{ positions_table(positions) }}
   {% else %}<p class="empty" style="padding:4px 18px 16px">All in cash. A position appears here as soon as a strategy buys or sells short.</p>{% endif %}
 </section>
 </div>

@@ -420,7 +420,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
         path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
                                                                      s.params), st().accounts(), utcnow())
+        # The Overview's Position table is the Portfolio's, one row; Open orders lists working orders only.
+        positions = trading.book_positions(st(), [x])
+        working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
+        fees_funding = x["fees"] - (perp_x["funding_total"] if perp_x else 0.0)  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
