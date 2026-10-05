@@ -210,6 +210,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
+            "start": sum(x["sleeve"].starting_balance for x in summaries),  # the chart's baseline for Change
             "t": [t.isoformat() for t in curve.index],
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
@@ -476,7 +477,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         else:
             frame = bookm.daily(st(), name)
             t, eq, bench = list(frame.index), list(frame["equity"]), list(frame["benchmark"])
-        peak, dd = 0.0, []
+        peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
         for v in eq:
             peak = max(peak, v)
             dd.append(round(1 - v / peak, 5) if peak else 0.0)
@@ -489,7 +490,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in eq],
             "benchmark": [round(v, 2) for v in bench],
             "drawdown": dd,
-            "worst": round(st().max_drawdown(name), 5),  # over every mark: the curve above is thinned or daily
+            "worst": round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
             "fills": fills,
         })
 

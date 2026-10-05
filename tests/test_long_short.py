@@ -980,6 +980,36 @@ def test_the_kill_switch_dialog_counts_shorts_by_their_size(client):  # noqa: F8
     assert "close to cash at market (longs sell, shorts buy back)" in dialog
 
 
+@pytest.mark.sanity
+def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(client):  # noqa: F811
+    """Round 12, M12-F1: the running peak started at the first daily close, never at the starting capital, so a
+    strategy wiped out on its first day left the book reading -20% since start beside a 0.0% drawdown, and a
+    second wipe-out read 25% worst (from that close), not 40%."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    day1, day2 = datetime(2026, 10, 4, 12, tzinfo=timezone.utc), datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+    for n in range(5):
+        store.create_sleeve(name=f"s{n}", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+        first = 0.0 if n == 0 else 10_000.0
+        store.record_equity(f"s{n}", equity=first, cash=first, qty=0.0, price=60_000.0, benchmark=10_000, ts=day1)
+        last = 0.0 if n <= 1 else 10_000.0  # a second strategy is wiped out on day two
+        store.record_equity(f"s{n}", equity=last, cash=last, qty=0.0, price=60_000.0, benchmark=10_000, ts=day2)
+    book = c.get("/api/book/equity", auth=AUTH).json()
+    assert book["start"] == 50_000 and book["equity"] == [40_000, 30_000]
+    assert book["drawdown"] == [pytest.approx(0.2), pytest.approx(0.4)]  # from 50,000, not the 40,000 close
+    tile = c.get("/", auth=AUTH).text.split("Drawdown")[1].split("</div></div>")[0]
+    assert "40.0%" in tile and "worst 40.0%" in tile, tile
+    # One strategy whose first mark is already a loss: its chart and figures count it from its starting balance.
+    store.create_sleeve(name="late", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+    store.record_equity("late", equity=9_000.0, cash=9_000.0, qty=0.0, price=60_000.0, benchmark=10_000, ts=day1)
+    one = c.get("/api/sleeves/late/equity", auth=AUTH).json()
+    assert one["drawdown"] == [pytest.approx(0.1)] and one["worst"] == pytest.approx(0.1)
+    assert store.max_drawdown("late") == 0.0 and store.max_drawdown("late", 10_000) == pytest.approx(0.1)
+
+
 def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F811
     """Round 12, M12-U2: the tile took the largest signed share, so a big short (a negative share) read as
     nothing and a small long elsewhere was shown as the book's concentration."""

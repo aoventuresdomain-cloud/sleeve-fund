@@ -42,8 +42,9 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
     }
     if series:
         last = series[-1]
-        peak = store.peak_equity(s.name) or max(p["equity"] for p in series)
-        mdd = store.max_drawdown(s.name)  # over every mark, not only the latest ones read here
+        # From the starting balance too, which a first mark that is already a loss never reaches (M12-F1).
+        peak = max(store.peak_equity(s.name) or max(p["equity"] for p in series), s.starting_balance)
+        mdd = store.max_drawdown(s.name, s.starting_balance)  # over every mark, not only the latest ones read here
         out.update(
             equity=last["equity"],
             benchmark=last["benchmark"],
