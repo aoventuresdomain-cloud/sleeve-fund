@@ -277,7 +277,7 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         "trades": closed,
         "stats": stats,
         "unrealised": sum(p["unrealised"] for p in positions),
-        "exposure": sum(p["value"] for p in positions),
+        "exposure": sum(abs(p["value"]) for p in positions),  # gross: a short counts as exposure too (U13-1)
     }
 
 

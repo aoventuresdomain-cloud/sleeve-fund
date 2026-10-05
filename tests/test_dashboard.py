@@ -2108,3 +2108,30 @@ def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervis
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/setup?reset=1" and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls", "btc-test"}
     assert "Demo copy <span" not in c.get("/sleeves/btc-test", auth=AUTH).text  # not copied to Bybit Demo
+
+
+def test_trades_gross_exposure_counts_a_short_as_exposure(client):
+    """Round 13, U13-1: /trades summed signed position values, so a long and a short netted out under a
+    label that says gross. Gross is the sum of the absolute values, as on the home page."""
+    c, store = client
+    for name, side, qty in (("bn-long", "BUY", 0.1), ("bn-short", "SELL", -0.08)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp", "allow_short": True}, venue="binance")
+        store.record_fill(name, side=side, qty=abs(qty), price=60_000.0, fee=0.0, order_id=f"{name}-o", trade_id=f"{name}-t")
+        store.record_equity(name, equity=10_000, cash=10_000, qty=qty, price=60_000, benchmark=10_000)
+    page = c.get("/trades", auth=AUTH).text
+    assert "10,800.00 gross exposure" in page  # 6,000 long + 4,800 short, not 1,200 net
+
+
+def test_room_to_halt_is_measured_from_the_peak(client):
+    """Round 13, U13-3: room to halt was (limit - drawdown) x equity, which understates it by equity / peak
+    once equity is below the peak. It is equity - peak x (1 - limit), as the stop check measures it."""
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+
+    c, store = client
+    _new(c, name="btc-room", starting_balance="10000")
+    store.record_equity("btc-room", equity=11_000, cash=11_000, qty=0, price=60_000, benchmark=10_000)
+    store.record_equity("btc-room", equity=10_000, cash=10_000, qty=0, price=60_000, benchmark=10_000)
+    x = sleeve_summary(store, store.sleeve("btc-room"))
+    assert x["room"] == pytest.approx(10_000 - 11_000 * (1 - 0.20))  # 1,200.00 on the balanced 20% limit
+    assert "1,200.00" in c.get("/", auth=AUTH).text and "1,200.00" in c.get("/risk", auth=AUTH).text

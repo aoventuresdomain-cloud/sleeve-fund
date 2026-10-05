@@ -28,6 +28,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         "drawdown": 0.0,
         "max_drawdown": 0.0,
         "dd_used": 0.0,
+        "room": s.starting_balance * prof.max_drawdown,  # what it can lose before the drawdown halt
         "exposure": 0.0,
         "points": len(series),
         "fills": len(fills),
@@ -56,4 +57,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
             exposure=(last["qty"] * last["price"]) / last["equity"] if last["equity"] else 0.0,
         )
         out["dd_used"] = min(out["drawdown"] / prof.max_drawdown, 1.0)
+        # In money from the peak, as the halt and the stop check measure it, not the drawdown gap times
+        # today's equity, which understates it by equity / peak (U13-3).
+        out["room"] = max(last["equity"] - peak * (1 - prof.max_drawdown), 0.0)
     return out
