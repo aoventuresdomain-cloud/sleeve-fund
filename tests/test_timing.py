@@ -88,3 +88,22 @@ def test_the_strategy_page_shows_close_to_fill(client):  # noqa: F811
     page = c.get("/sleeves/pp", auth=AUTH).text
     assert "Candle close to fill" in page and "120 ms median, 400 ms p95" in page and "7 ms to send, 4 orders" in page
     assert timing_view([]) is None
+
+
+def test_a_bar_that_closed_while_the_strategy_was_down_is_decided_once_if_still_the_latest():
+    """m13-E3: a restart spanning a bar close decided nothing on that bar; the signal was lost."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.base import late_bar
+
+    minute = 60_000_000_000
+    bars = [SimpleNamespace(ts_event=NS - minute), SimpleNamespace(ts_event=NS)]
+    at = lambda ns: datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)  # noqa: E731
+    down = at(NS - 40_000_000_000)  # the previous process's last heartbeat, 40 s before the close
+    assert late_bar(bars, NS + 20_000_000_000, minute, down, None) is bars[-1]  # down over the close: decide on it
+    assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS - 30 * minute)) is bars[-1]
+    assert late_bar(bars, NS + 20_000_000_000, minute, None, None) is None  # a first start: nothing was missed
+    assert late_bar(bars, NS + 20_000_000_000, minute, at(NS + 1_000_000_000), None) is None  # alive at the close
+    assert late_bar(bars, NS + minute, minute, down, None) is None  # a bar old: history, not a signal
+    assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS + 1_000_000)) is None  # acted on before
+    assert late_bar([], NS, minute, down, None) is None
