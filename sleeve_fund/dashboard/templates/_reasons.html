@@ -1,12 +1,24 @@
-{# Why the PM took an action: the action's own short list plus Other, which needs a note (dashboard/reasons.py).
-   Shared by every dialog that asks for a reason, on the strategy page and on Risk & health. Inside a form whose
-   submit buttons carry data-needs-reason (rendered disabled); Console.reasons() enables them once the pick is
-   complete and keeps the "Logged as" line current. The handler stores "<picked>" or "<picked>: <note>". #}
+{# Why the PM took an action, as a pick-list (UI v2, item 9): the action's suggested reasons, then the PM's own
+   reasons from the decision log ("You used recently"), then "+ Write your own reason", which needs a note
+   (dashboard/reasons.py). A search box filters the list; the arrow keys move through it. Shared by every dialog
+   that asks for a reason, on the strategy page, Portfolio, Risk & health and Setup. Inside a form whose submit
+   buttons carry data-needs-reason (rendered disabled); Console.reasons() enables them once the pick is complete
+   and keeps the "Logged as" line current. The handler stores "<picked>", "<picked>: <note>" or "Other: <note>". #}
 {% macro reason_picker(action, id, prefill='', note='') -%}
+{% set recent = recent_reasons() %}
 <fieldset class="reasons" data-reasons data-min="{{ reason_note_min }}">
   <legend>Why? This goes in the decision log and Records.</legend>
-  {% for r, hint in action_reasons[action] %}<label class="opt"><input type="radio" name="reason_pick" value="{{ r }}" required{{ ' checked' if prefill == r }}><span>{{ r }}<small>{{ hint }}</small></span></label>
-  {% endfor %}<label class="opt"><input type="radio" name="reason_pick" value="Other" required{{ ' checked' if prefill == 'Other' }}><span>Other<small>Write it below</small></span></label>
+  <input type="search" class="reason-search" data-reason-search placeholder="Pick or search a reason" aria-label="Search the reasons" autocomplete="off">
+  <div class="reason-list" role="radiogroup" aria-label="Reasons">
+    <p class="grp">Suggested</p>
+    {% for r, hint in action_reasons[action] %}<label class="opt"><input type="radio" name="reason_pick" value="{{ r }}" required{{ ' checked' if prefill == r }}><span>{{ r }}<small>{{ hint }}</small></span></label>
+    {% endfor %}
+    {% if recent %}<p class="grp">You used recently</p>
+    {% for r in recent %}<label class="opt own"><input type="radio" name="reason_pick" value="Other: {{ r.text }}" required{{ ' checked' if prefill == 'Other: ' ~ r.text }}><span>{{ r.text }}<small>{% if r.ts %}{{ r.ts.strftime('%d %b') }} · {% endif %}{{ r.action|replace('_', ' ')|capitalize }}</small></span></label>
+    {% endfor %}{% endif %}
+    <label class="opt write"><input type="radio" name="reason_pick" value="Other" required{{ ' checked' if prefill == 'Other' }}><span>+ Write your own reason<small>Saved to this list for next time</small></span></label>
+    <p class="none" data-reason-none hidden>No reason matches. Pick "+ Write your own reason".</p>
+  </div>
   <label class="note" for="{{ id }}-note">Note <span data-note-hint>(optional)</span></label>
   <textarea id="{{ id }}-note" name="reason_note" rows="2" maxlength="300" placeholder="Anything the log should say">{{ note }}</textarea>
   <p class="logline" data-logline>Logged as: no reason yet</p>
