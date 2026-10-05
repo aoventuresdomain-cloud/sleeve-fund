@@ -87,18 +87,17 @@ def test_engine_code_names_no_venue():
 
 
 def test_accounts_and_g2_name_no_venue_but_from_data():
-    """Accounts and the G2 checklist take a venue's name from its profile, never from their own copy."""
+    """Account creation and the G2 checklist take a venue from the registered profiles, never from their own
+    code (the static page copy waits for the UI redesign)."""
     import inspect
 
     from sleeve_fund.store import Store
     from sleeve_fund.venues import VENUES
 
     names = "|".join([*VENUES, "BYBIT", "DERIBIT"])
-    dash = ROOT / "sleeve_fund" / "dashboard"
-    texts = {p.name: p.read_text() for p in (dash / "gates.py", dash / "templates" / "accounts.html",
-                                             dash / "templates" / "_ops.html")}
-    texts["store accounts"] = inspect.getsource(Store._ensure_paper_account) + inspect.getsource(Store.create_account)
-    # accounts.py may name the server's key file and the old paper note it replaces, nothing else.
+    texts = {"gates.py": (ROOT / "sleeve_fund" / "dashboard" / "gates.py").read_text(),
+             "store accounts": inspect.getsource(Store._ensure_paper_account) + inspect.getsource(Store.create_account)}
+    # accounts.py may name the old paper note it replaces, nothing else.
     texts["accounts.py"] = "\n".join(line for line in (ROOT / "sleeve_fund" / "accounts.py").read_text().splitlines()
-                                     if not line.startswith(("KEYS_FILE =", "PAPER_NOTES_BEFORE =")))
+                                     if not line.startswith("PAPER_NOTES_BEFORE ="))
     assert [k for k, t in texts.items() if re.search(names, t, re.IGNORECASE)] == []

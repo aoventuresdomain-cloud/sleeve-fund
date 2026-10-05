@@ -28,7 +28,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
-from sleeve_fund.accounts import KEYS_FILE
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
@@ -1205,7 +1204,6 @@ def create_app(store: Store | None = None) -> FastAPI:
                 and abs(st().journal_book(s.name, s.starting_balance)["qty"]) > 1e-12}
         for r in rows:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
-            r["venue_label"] = venue_profile(r["venue"]).label if r["kind"] == "live" else None
             r["running"] = [n for n in r["sleeves"] if n in running]
             r["held"] = [n for n in r["sleeves"] if n in held]  # stopped, still holding a position
         return rows
@@ -1278,7 +1276,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         here = setup_view.stage(frame, sleeves, mirror)
         accounts = _accounts_rows()
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
-                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts, keys_file=KEYS_FILE,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
                     paper_count=sum(1 for x in sleeves if x.name not in st().archived()),

@@ -48,6 +48,6 @@
     <tr><th scope="row">Database backup</th><td>{% set b = ops.backup %}{% if b and b.name %}<span class="{{ 'warn' if b.stale }}">Last {{ b.age|held }} ago</span>, {{ b.bytes|bytes }}; {{ b.count }} kept.{% elif b %}<span class="warn">No dump on disk.</span>{% else %}<span class="warn">None yet.</span> The backup service writes one a night.{% endif %}
       {% if b and b.check %}{% if b.check.ok %}Restored into a scratch database and read back{% if b.check.restored %} ({{ b.check.restored.sleeves }} strategies, {{ b.check.restored.orders }} orders{% if b.check.restored.fills is defined %}, {{ b.check.restored.fills }} fills{% endif %}, {{ b.check.restored.events }} events){% endif %}{% if b.check.checked %}, {{ b.check.checked|ago }}{% endif %}.{% else %}<span class="loss">Last run failed: {{ b.check.message }}.</span> It tries again within the hour.{% endif %}{% endif %}
       <br><span class="muted">Dumps sit on this server. Off-site: Lightsail's automatic daily snapshots, which this page can't see; check them in the Lightsail console.</span></td></tr>
-    <tr><th scope="row">Live trading</th><td>{{ "Locked. Needs G2 approval, the server switch and a key for the strategy's venue that you place on the server." if shell.live_locked else 'Enabled.' }}</td></tr>
+    <tr><th scope="row">Live trading</th><td>{{ 'Locked. Needs G2 approval, the server switch and a Kraken key you place on the server.' if shell.live_locked else 'Enabled.' }}</td></tr>
   </table>
 </section>

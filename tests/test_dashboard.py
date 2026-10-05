@@ -629,7 +629,7 @@ def test_accounts_page_adds_live_accounts_and_shows_key_presence_only(client, mo
 
     c, store = client
     page = c.get("/accounts", auth=AUTH).text
-    assert "paper" in page and "Connect a live account" in page and "Never allow withdrawals" in page
+    assert "paper" in page and "Connect a Kraken sub-account" in page and "Never tick Withdraw Funds" in page
     r = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "venue": "kraken", "reason": "first live sub-account"},
                auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303

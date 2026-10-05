@@ -209,7 +209,7 @@ def test_setup_cards_and_detail(client):
     assert "halt at 10%" in page and "halt at 20%" in page and "halt at 35%" in page
     assert "Kraken spot" in page and "0.8% taker" in page
     # Today's Accounts and Settings content, unchanged, as the detail.
-    assert "Connect a live account" in page and "How to connect" in page and "Never allow withdrawals" in page
+    assert "Connect a Kraken sub-account" in page and "How to connect" in page and "Never tick Withdraw Funds" in page
     assert "Live trading" in page and "Pause at daily loss" in page and "DASHBOARD_PASSWORD" in page
     assert 'id="tab-accounts"' in page and 'id="tab-settings"' in page and "test-pw" not in page
     store.event(None, "info", "alerts_config", "Alerts go to api.telegram.org; uptime pings go to hc-ping.com.")
