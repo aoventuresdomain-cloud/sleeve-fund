@@ -3,7 +3,9 @@ same trades on a real venue's own screens. A strategy on Binance's USDT perpetua
 Trading (the same linear perpetual; Binance's own demo is closed to the PM's account); any other is copied to the
 Deribit testnet, the fallback. Demo money is not real and the paper journal
 stays the record of truth: the mirror never feeds anything back into a strategy, and a mirror order that fails
-is noted, not retried, so it can never trade twice.
+is noted, not retried, so it can never trade twice. On Bybit Demo, where the quantity is the paper quantity, a
+catch-up then brings the account back to the paper position (catch_up), only for a gap seen twice in a row and
+only as far as the account itself is short of it.
 
 Fail-closed by construction:
 - it only ever talks to the demo hosts, api-demo.bybit.com and test.deribit.com; any other environment or
@@ -54,6 +56,7 @@ BYBIT_CONTRACTS = {"BTCUSDT": (0.001, 5.0), "ETHUSDT": (0.01, 5.0)}
 CONTRACTS = {"BTC/USD": ("BTC-PERPETUAL", 10.0), "ETH/USD": ("ETH-PERPETUAL", 1.0)}
 POLL_SECONDS = 10
 DRIFT_SECONDS = 300
+CATCH_UP_SECONDS = 60  # a gap must be seen on two checks this far apart before the catch-up trades
 
 
 class MirrorRefused(RuntimeError):
@@ -318,6 +321,9 @@ def mirror_once(store, targets: dict) -> int:
             sign = 1 if f["side"] == "BUY" else -1
             if why:
                 store.record_mirror(s.name, fill_id=f["id"], status="skipped", instrument=instrument or "", message=why)
+                store.event(s.name, "warning", "mirror_skipped",
+                            f"Demo mirror didn't copy the {f['side'].lower()} of {f['qty']:.8g} to {venue.label}: "
+                            f"{why}. The paper book is unaffected.")
                 continue
             try:
                 order_id, price = venue.market(f["side"], instrument, amount, f"{s.name}:{f['id']}")
@@ -352,11 +358,79 @@ def check_drift(store, targets: dict, last: dict[str, float]) -> dict[str, float
     return out
 
 
+_CATCH_UP_FAILED: dict[str, str] = {}  # per strategy, the last catch-up failure warned about
+
+
+def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
+    """Bring Bybit Demo back to the paper position after a copy that failed, was skipped, or came before the
+    mirror first saw a strategy. Per mirrored strategy on Bybit, the gap is its paper position less what the
+    mirror has put on for it. It trades only a gap seen at the same size on two checks in a row (so a fill
+    being copied right now is never counted), and only as far as the account itself is short of the paper
+    book in that direction (so an order that errored but went in is never sent again). Returns the gaps seen.
+    Deribit is left to the drift warning: it is sized in dollars at each fill's price, so it has no exact
+    target."""
+    venue, out = targets.get("BYBIT"), {}
+    if venue is None:
+        return out
+    by_symbol: dict[str, list] = {}
+    for s in mirrored(store):
+        symbol = s.instrument.replace("/", "").upper()
+        if target_for(s) == "BYBIT" and symbol in BYBIT_CONTRACTS and store.mirror_watermark(s.name) is not None:
+            by_symbol.setdefault(symbol, []).append(s)
+    put_on = {}
+    for r in store.mirror_rows(limit=100_000):
+        if r["status"] == "filled":
+            put_on[r["sleeve"]] = put_on.get(r["sleeve"], 0.0) + float(r["amount"] or 0.0)
+    for symbol, sleeves in by_symbol.items():
+        step, min_notional = BYBIT_CONTRACTS[symbol]
+        paper = {s.name: store.journal_book(s.name, s.starting_balance) for s in sleeves}
+        gaps = {}
+        for s in sleeves:
+            gap = round(round((paper[s.name]["qty"] - put_on.get(s.name, 0.0)) / step) * step, 8)
+            if abs(gap) >= step:
+                gaps[s.name] = gap
+        out.update(gaps)
+        due = {n: g for n, g in gaps.items() if seen.get(n) == g}
+        if not due:
+            continue
+        account_gap = sum(p["qty"] for p in paper.values()) - venue.position(symbol)
+        for name, gap in due.items():
+            sign = 1 if gap > 0 else -1
+            room = max(0.0, sign * account_gap)  # how far the account is short of the paper book this way
+            qty = round(int(min(abs(gap), room) / step + 1e-9) * step, 8)
+            price = paper[name].get("entry_px") or 0.0
+            if qty < step or (price and qty * price < min_notional):
+                continue
+            side = "BUY" if sign > 0 else "SELL"
+            try:
+                order_id, filled = venue.market(side, symbol, qty, f"{name}:catch-up")
+            except Exception as e:  # noqa: BLE001 - the next check sees the same gap and tries again
+                if _CATCH_UP_FAILED.get(name) != str(e):  # warned once per new reason, not every minute
+                    _CATCH_UP_FAILED[name] = str(e)
+                    store.event(name, "warning", "mirror_failed",
+                                f"Demo mirror couldn't catch {venue.label} up to the paper position ({side.lower()} "
+                                f"{qty:g} {symbol}): {str(e)[:200]}. It tries again each minute; the paper book is "
+                                "unaffected.")
+                continue
+            _CATCH_UP_FAILED.pop(name, None)
+            store.record_mirror(name, fill_id=store.mirror_watermark(name), status="filled", instrument=symbol,
+                                amount=sign * qty, price=filled, order_id=order_id,
+                                message="catch-up to the paper position")
+            store.event(name, "info", "mirror_catch_up",
+                        f"Demo mirror caught {venue.label} up to the paper position: {side.lower()} {qty:g} "
+                        f"{symbol}, a copy it had missed")
+            account_gap -= sign * qty
+            out.pop(name, None)
+    return out
+
+
 def run(store, targets: dict, poll: float = POLL_SECONDS, stop=None) -> None:
-    drift, checked = {}, 0.0
+    drift, checked, gaps, caught = {}, 0.0, {}, 0.0
     while stop is None or not stop():
         try:
             mirror_once(store, targets)
+            if time.monotonic() - caught > CATCH_UP_SECONDS:
+                gaps, caught = catch_up(store, targets, gaps), time.monotonic()
             if time.monotonic() - checked > DRIFT_SECONDS:
                 drift, checked = check_drift(store, targets, drift), time.monotonic()
         except Exception as e:  # noqa: BLE001 - a database or network blip: try again next poll
