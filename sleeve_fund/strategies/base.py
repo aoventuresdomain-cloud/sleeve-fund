@@ -21,7 +21,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from nautilus_trader.config import StrategyConfig
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, Money, OrderSide,
@@ -409,6 +409,8 @@ class LongFlatStrategy(Strategy):
         # (the venue can't serve those bars). Attach with attach_history(); None requests them from
         # the venue's candles instead.
         self.history_loader = None
+        self.gap_loader = None  # paper: (instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars
+        self._held: list[Bar] = []  # paper: candles built while no trades arrived, held until the feed is back
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
@@ -458,6 +460,12 @@ class LongFlatStrategy(Strategy):
     def attach_history(self, loader) -> "LongFlatStrategy":
         """loader(instrument, bar_type, limit) -> the latest `limit` complete bars, oldest first."""
         self.history_loader = loader
+        return self
+
+    def attach_gap_loader(self, loader) -> "LongFlatStrategy":
+        """loader(instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars stamped in that span,
+        oldest first: what a candle built while no trades reached this process should have been."""
+        self.gap_loader = loader
         return self
 
     @property
@@ -592,6 +600,62 @@ class LongFlatStrategy(Strategy):
             self._highs.append(bar.high.as_double())
         self.update_indicators(bar)
         return True
+
+    def _hold_gap(self, bar: Bar) -> bool:
+        """Paper: a candle with no volume was built while no trades reached this process, a flat candle at the
+        last price (a dropped connection, or a quiet market). It is held, not decided on, until trades arrive
+        again, when _fill_gap checks it against the venue's own candles (PM, 5 Oct 2026)."""
+        if (self._backtest or self.gap_loader is None or bar.bar_type != self._cfg.bar_type
+                or bar.ts_event <= self._last_bar_ts or bar.volume.as_double() > 0):
+            return False
+        self._held.append(bar)
+        self.log.info(f"bar {bar} held: no trades arrived during it")
+        if self.runtime is not None:
+            self._maybe_tick()
+        return True
+
+    def _fill_gap(self, bar: Bar) -> Bar:
+        """The first candle with trades after held ones: feed the indicators the venue's own candles for the held
+        span first (or the held ones where the venue had no trades either), then return the bar to decide on,
+        the venue's own when it saw more of it than this process did."""
+        if not self._held:
+            return bar
+        held, self._held = self._held, []
+        try:
+            venue = {b.ts_event: b for b in self.gap_loader(self.instrument, self._cfg.bar_type, held[0].ts_event,
+                                                            bar.ts_event)}
+            err = ""
+        except Exception as exc:  # noqa: BLE001 - an unreachable venue: the held candles stand, and it says so
+            venue, err = {}, str(exc)[:200]
+        # The venue's candles reach back over the whole held span, so one it lacks had no trades there either.
+        covered = bool(venue) and min(venue) <= held[0].ts_event
+        rebuilt = unchecked = 0
+        for h in held:
+            v = venue.get(h.ts_event)
+            if v is not None and v.volume.as_double() > 0:
+                rebuilt += 1
+                self._accept(v)
+            else:
+                unchecked += v is None and not covered
+                self._accept(h)
+        own = venue.get(bar.ts_event)
+        if own is not None and own.volume.as_double() >= bar.volume.as_double():
+            bar = own
+        if (rebuilt or unchecked) and self.runtime is not None:
+            step = bar_minutes(self._cfg.bar_type)
+            first = datetime.fromtimestamp(held[0].ts_event / 1e9 - step * 60, tz=timezone.utc)
+            last = datetime.fromtimestamp(held[-1].ts_event / 1e9, tz=timezone.utc)
+            n = len(held)
+            msg = (f"No trades reached this process for {n} candle{'s' if n != 1 else ''} ({first:%d %b %H:%M} to "
+                   f"{last:%H:%M} UTC)")
+            if rebuilt:
+                msg += f"; {rebuilt} rebuilt from the venue's own candles before deciding"
+            if unchecked:
+                why = f"couldn't fetch the venue's candles: {err}" if err else "the venue's candles don't reach back"
+                msg += (f"; {unchecked} couldn't be checked ({why}), so the model used them flat at the last "
+                        "price")
+            self.runtime.store.event(self.runtime.name, "warning", "feed_gap", msg, ts=self.runtime.now())
+        return bar
 
     @property
     def _has_exits(self) -> bool:
@@ -935,6 +999,9 @@ class LongFlatStrategy(Strategy):
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
             return
+        if self._hold_gap(bar):
+            return
+        bar = self._fill_gap(bar)
         if not self._accept(bar):
             return
         self.log.info(f"bar {bar}")
