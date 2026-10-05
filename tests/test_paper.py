@@ -432,6 +432,17 @@ def test_a_restart_after_a_stop_keeps_the_leg_and_its_exit_lock_until_the_signal
     assert s._side != -1 and s._exit_lock is False
 
 
+@pytest.mark.parametrize("ended_by", ["exit", "flatten", "kill_switch"])
+def test_a_restart_on_a_flat_book_after_a_leg_ended_by_its_signal_or_a_close_does_not_resume_it(ended_by):
+    """HoE review of item 9: a leg closed by its own signal, a PM close or a flatten (no stop or target) was put back
+    on a flat book when its exit was older than the warm-up, so the model woke long and bought on the first bar."""
+    calm = [100_000.0 + (5 if i % 2 else -5) for i in range(200)]  # RSI near 50: between the bands, nothing to do
+    s = _restarted("rsi_bands", calm, [("entry", "BUY", -60, 2), (ended_by, "SELL", -50, 2)])
+    assert s._side == 0 and s._exit_lock is False
+    s = _restarted("rsi_bands", calm, [("entry", "BUY", -60, 2), (ended_by, "SELL", -50, 2)], book_qty=-0.1)
+    assert s._side == -1  # a book holding the other side still comes back as held
+
+
 def test_a_restart_with_no_entry_in_the_journal_puts_the_held_leg_back():
     s = _restarted("rsi_bands", FALLING, [], book_qty=-0.1)
     assert s._side == -1 and s._exit_lock is False

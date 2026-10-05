@@ -913,15 +913,22 @@ class LongFlatStrategy(Strategy):
         step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
         orders = self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
         at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
-        if at is None:
-            qty = self.runtime.book["qty"]
-            if qty:  # held with no entry in the journal's recent orders: that leg is on, from now
-                self._resume = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False}
+        qty = self.runtime.book["qty"]
+        held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False} if qty else None
+        if at is None:  # held with no entry in the journal's recent orders: that leg is on, from now
+            self._resume = held
             return
         entry = orders[at]
+        side = 1 if entry["side"] == "BUY" else -1
         lock = next((o for o in reversed(orders[:at]) if o["intent"] in LOCKING_INTENTS), None)
+        if qty * side <= 0 and lock is None:
+            # Not held on the entry's side, and no stop, target or liquidation closed it: its own signal, a PM
+            # close or a flatten ended the leg, and the exit may be older than the warm-up, so resuming it
+            # would wake the model in a trade the book doesn't hold. Only the book's own position comes back.
+            self._resume = held
+            return
         # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
-        self._resume = {"side": 1 if entry["side"] == "BUY" else -1, "bar": _ns(entry["ts"]) // step * step,
+        self._resume = {"side": side, "bar": _ns(entry["ts"]) // step * step,
                         "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
 
     def _replay(self, bar: Bar) -> None:
