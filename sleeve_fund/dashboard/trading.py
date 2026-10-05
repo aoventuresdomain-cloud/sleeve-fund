@@ -224,7 +224,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
 def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | None:
     """What a perpetual position adds to a spot one: leverage, isolated margin, how far it is from
     liquidation, and the funding it has paid or received. funding: newest first, as the store returns it."""
-    t = markets.terms(x["sleeve"].params)
+    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return None
     qty, price, equity, cash = x["qty"], x["price"], x["equity"], x["cash"]

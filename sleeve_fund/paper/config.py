@@ -58,6 +58,7 @@ class SleeveConfig:
         object.__setattr__(self, "instrument", self.instrument.strip().upper())  # frozen dataclass
         if not PAIR_RE.match(self.instrument):
             raise ValueError(f"instrument must look like BASE/QUOTE (e.g. SUI/USD), got {self.instrument!r}")
+        markets.check_venue(self.params, self.venue)  # a perpetual venue has no spot
         if self.starting_balance <= 0:
             raise ValueError("starting_balance must be positive")
         if self.max_notional is not None and self.max_notional <= 0:
@@ -79,11 +80,11 @@ class SleeveConfig:
     @property
     def fees(self) -> FeeSchedule:
         # A perpetual pays its market's schedule (sleeve_fund.markets); spot pays the venue's.
-        return markets.fees_for(self.params, self.fee_schedule or venue_profile(self.venue).fees)
+        return markets.fees_for(self.params, self.fee_schedule or venue_profile(self.venue).fees, self.venue)
 
     @property
     def instrument_id(self) -> str:
-        return f"{self.instrument}.{self.venue}"
+        return f"{venue_profile(self.venue).symbol_of(self.instrument)}.{self.venue}"
 
     @property
     def bar_type(self) -> str:

@@ -249,7 +249,8 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
     return {"pair": pair, "pages": pages, "last": cov.last if cov else None}
 
 
-# Always kept, so research has them before any sleeve trades them; sleeves' own instruments are added.
+# Always kept, so research has them before any sleeve trades them; sleeves' own instruments are added. A venue
+# whose instruments are named differently (USDT-quoted perpetuals) lists its own (VenueProfile.core_pairs).
 CORE_PAIRS = ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD")
 
 
@@ -261,7 +262,10 @@ REQUEST_YEARS = 5
 def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None]]:
     """(instrument, where a first backfill starts) for the core list, every strategy's instrument and
     every instrument the PM asked Research for."""
-    pairs: dict[str, pd.Timestamp | None] = {p: None for p in CORE_PAIRS}
+    from sleeve_fund.venues import VENUES
+
+    profile = VENUES.get(venue.upper())
+    pairs: dict[str, pd.Timestamp | None] = {p: None for p in (profile and profile.core_pairs) or CORE_PAIRS}
     try:
         from sleeve_fund.paper.config import from_store
         from sleeve_fund.store import Store
@@ -276,6 +280,18 @@ def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None
     except Exception as exc:  # noqa: BLE001 - no database (e.g. locally): the core list still loads
         print(f"could not read sleeves or history requests: {exc!r}")
     return list(pairs.items())
+
+
+def _refresh_funding(profile, pair: str, root, since) -> None:
+    """A perpetual venue's settled funding for the instrument, kept beside its prices (sleeve_fund.funding)."""
+    if profile.funding_loader is None:
+        return
+    from sleeve_fund import funding
+
+    try:
+        funding.refresh(profile.name, pair, root=root, since=since)
+    except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
+        print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -308,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "refresh":
         for pair, since in [(p, None) for p in args.pairs] or _pairs_in_use(profile.name):
             print(refresh(store, profile, pair, since=since))
+            _refresh_funding(profile, pair, args.root, since)
         return 0
     while True:  # run: round-robin so a long backfill on one instrument doesn't starve the others
         behind = False
@@ -315,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 out = refresh(store, profile, pair, max_pages=args.pages, since=since)
                 behind |= out["pages"] >= args.pages
+                _refresh_funding(profile, pair, args.root, since)
             except Exception as exc:  # noqa: BLE001 - one bad pair or a venue hiccup must not stop the rest
                 print(f"{profile.name} {pair}: refresh failed: {exc!r}")
         if not behind:

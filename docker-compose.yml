@@ -55,6 +55,17 @@ services:
     volumes: [history:/data/history]
     command: python -m sleeve_fund.history run
 
+  # The same store for Binance USD-M perpetuals (public data, no key): prices and settled funding.
+  history-binance:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+      HISTORY_DIR: /data/history
+    volumes: [history:/data/history]
+    command: python -m sleeve_fund.history run --venue binance
+
   # Copies the fills of strategies with demo_mirror = true to a Deribit TESTNET demo account
   # (sleeve_fund/mirror.py). The only service given the testnet key, and it refuses any other venue or
   # credential; off quietly unless DEMO_MIRROR is on and both testnet variables are set. Paper is unaffected.

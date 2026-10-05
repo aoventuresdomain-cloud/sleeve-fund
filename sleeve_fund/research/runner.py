@@ -18,7 +18,7 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 
 from sleeve_fund import markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
-from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model
+from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY
 
@@ -117,11 +117,12 @@ def run_backtest(
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
     perp = markets.is_perp(params)
-    fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee))
+    fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
     if half_spread is None:
         from sleeve_fund.venues import venue as venue_profile
 
-        half_spread = markets.half_spread_for(params, venue_profile(str(instrument.id.venue)).assumed_half_spread)
+        half_spread = markets.half_spread_for(params, venue_profile(str(instrument.id.venue)).assumed_half_spread,
+                                              str(instrument.id.venue))
     if not 0 <= half_spread < 0.05:
         raise ValueError(f"half spread {half_spread} outside [0, 5%)")
     if risk_profile is not None:
@@ -132,7 +133,7 @@ def run_backtest(
         params.pop("position_cap_pct", None)  # the runtime's profile sets the cap
         bt = bar_type_for(instrument, bar_minutes)
         runtime = SleeveRuntime.for_backtest(
-            strategy=strategy_name, instrument=str(instrument.id.symbol), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
+            strategy=strategy_name, instrument=pair_of(instrument), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
             starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60)
         runtime.progress = progress
 

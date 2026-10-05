@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 
 from nautilus_trader.execution import FeeModel
-from nautilus_trader.model import Currency, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol, Venue
+from nautilus_trader.model import (Currency, CryptoPerpetual, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol,
+                                   Venue)
 
 @dataclass(frozen=True)
 class FeeSchedule:
@@ -96,6 +97,53 @@ def spot_pair(
         ts_event=0,
         ts_init=0,
     )
+
+
+def perpetual(
+    base: str,
+    quote: str,
+    fees: FeeSchedule,
+    venue: Venue,
+    symbol: str,
+    price_precision: int = 2,
+    size_precision: int = 3,
+    min_quantity: float | None = None,
+    min_notional: float = 5.0,
+) -> CryptoPerpetual:
+    """Build a linear (quote-settled) perpetual as the venue lists it, under the venue's own symbol, so a
+    backtest trades the same instrument paper receives from the venue's data client. Use
+    VenueProfile.instrument(), which fills in the venue's symbol, fees and contract limits."""
+    base_ccy, quote_ccy = Currency.from_str(base), Currency.from_str(quote)
+    size_precision = min(size_precision, base_ccy.precision)
+    step = 10**-size_precision
+    sym = Symbol(symbol)
+    return CryptoPerpetual(
+        instrument_id=InstrumentId(symbol=sym, venue=venue),
+        raw_symbol=sym,
+        base_currency=base_ccy,
+        quote_currency=quote_ccy,
+        settlement_currency=quote_ccy,
+        is_inverse=False,
+        price_precision=price_precision,
+        size_precision=size_precision,
+        price_increment=Price(10**-price_precision, precision=price_precision),
+        size_increment=Quantity(step, precision=size_precision),
+        min_quantity=Quantity(max(min_quantity or step, step), precision=size_precision),
+        min_notional=Money(min_notional, quote_ccy),
+        min_price=Price(10**-price_precision, precision=price_precision),
+        margin_init=Decimal(0),
+        margin_maint=Decimal(0),
+        maker_fee=fees.maker,
+        taker_fee=fees.taker,
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def pair_of(instrument) -> str:
+    """BASE/QUOTE for an instrument, whatever the venue calls it (BTCUSDT-PERP is BTC/USDT)."""
+    symbol = str(instrument.id.symbol)
+    return symbol if "/" in symbol else f"{instrument.base_currency.code}/{instrument.quote_currency.code}"
 
 
 class ScheduleFeeModel(FeeModel):

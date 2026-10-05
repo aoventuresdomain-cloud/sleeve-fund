@@ -16,9 +16,9 @@ from decimal import Decimal
 from typing import Callable
 
 import pandas as pd
-from nautilus_trader.model import CurrencyPair, Venue
+from nautilus_trader.model import Venue
 
-from sleeve_fund.instruments import FeeSchedule, spot_pair
+from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
 
 
 @dataclass
@@ -51,17 +51,45 @@ class VenueProfile:
     # Half the bid-ask spread a backtest charges on orders that take liquidity, until a paper sleeve
     # on this venue has measured the instrument's own (sleeve_fund.spreads). Deliberately cautious.
     assumed_half_spread: float = 0.0005
+    # The venue lists linear perpetuals only (no spot): every strategy on it trades the "perp" market, under
+    # the venue's own instrument symbol (`symbol`), with its real funding (`funding_loader`).
+    perpetual: bool = False
+    # pair -> the venue's instrument symbol, as its data client names the instrument (BTC/USDT -> BTCUSDT-PERP)
+    symbol: Callable[[str], str] | None = None
+    # (pair, start in ms) -> up to a page of settled funding, [(time in ms, rate)], oldest first
+    funding_loader: Callable[[str, int], list] | None = None
+    funding_hours: tuple[int, ...] = (0, 8, 16)  # UTC hours the venue settles funding at
+    # pair -> {"price_precision", "size_precision", "min_quantity", "min_notional"}, the venue's contract limits
+    contract: Callable[[str], dict] | None = None
+    # Instruments the history store always keeps for this venue, before any strategy trades them
+    core_pairs: tuple[str, ...] = ()
 
     @property
     def venue(self) -> Venue:
         return Venue(self.name)
 
+    def symbol_of(self, pair: str) -> str:
+        """The venue's own symbol for a BASE/QUOTE pair: the instrument id paper subscribes to."""
+        return self.symbol(pair) if self.symbol is not None else pair
+
     def instrument(self, base: str, quote: str, price_precision: int = 2, size_precision: int = 8,
-                   fees: FeeSchedule | None = None) -> CurrencyPair:
-        """A spot instrument at this venue, carrying the given fees (sleeve_fund.fees.resolve: the
-        connected account's) or, without them, the venue's published schedule."""
-        return spot_pair(base, quote, fees=fees or self.fees, venue=self.venue, price_precision=price_precision,
-                         size_precision=size_precision)
+                   fees: FeeSchedule | None = None):
+        """An instrument at this venue, carrying the given fees (sleeve_fund.fees.resolve: the connected
+        account's) or, without them, the venue's published schedule: a spot pair, or on a perpetual venue
+        its perpetual, with the venue's own symbol and contract limits where it can be asked."""
+        if not self.perpetual:
+            return spot_pair(base, quote, fees=fees or self.fees, venue=self.venue, price_precision=price_precision,
+                             size_precision=size_precision)
+        limits: dict = {}
+        if self.contract is not None:
+            try:
+                limits = self.contract(f"{base}/{quote}")
+            except Exception as exc:  # noqa: BLE001 - unreachable venue: the precisions given, cautious limits
+                print(f"{self.label}: contract limits for {base}/{quote} unavailable ({exc!r})", file=sys.stderr)
+        return perpetual(base, quote, fees=fees or self.fees, venue=self.venue, symbol=self.symbol_of(f"{base}/{quote}"),
+                         price_precision=limits.get("price_precision", price_precision),
+                         size_precision=limits.get("size_precision", min(size_precision, 3)),
+                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0))
 
     def key_env(self, account: str) -> tuple[str, str]:
         """The two server environment variables holding a live account's key and secret on this venue."""
@@ -248,4 +276,177 @@ KRAKEN = register(VenueProfile(
     # Kraken's Trades `since` takes Unix seconds (its `last` cursor comes back in nanoseconds).
     minute_cursor_at=lambda ts: str(int(ts.timestamp())),
     check_listed=_kraken_listed,
+))
+
+
+# --- Binance USD-M perpetuals ------------------------------------------------------------------
+# Research and paper only, on public market data with no account and no key: Binance is closed to new UK
+# users, so live trading here is a G2 decision after tax and legal advice (PM, 5 Oct 2026).
+
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
+_BINANCE_INFO: dict = {}  # exchangeInfo, fetched once per process
+
+
+def binance_symbol(pair: str) -> str:
+    """BTC/USDT -> BTCUSDT, Binance's own symbol for the USD-M perpetual."""
+    base, quote = pair.upper().split("/")
+    return f"{base}{quote}"
+
+
+def _binance_info(get_json=None) -> dict:
+    from sleeve_fund.data import _get_json
+
+    if get_json is not None:
+        return get_json(f"{BINANCE_FAPI}/exchangeInfo")
+    if not _BINANCE_INFO:
+        _BINANCE_INFO.update(_get_json(f"{BINANCE_FAPI}/exchangeInfo"))
+    return _BINANCE_INFO
+
+
+def _binance_listing(pair: str, get_json=None) -> dict:
+    sym = binance_symbol(pair)
+    for info in _binance_info(get_json).get("symbols", []):
+        if info.get("symbol") == sym and info.get("contractType") == "PERPETUAL":
+            if info.get("status") != "TRADING":
+                raise ValueError(f"Binance lists {pair} but it is not trading ({info.get('status')})")
+            return info
+    raise ValueError(f"Binance does not list a {pair} USD-M perpetual")
+
+
+def binance_instruments(get_json=None) -> list[str]:
+    """Every USD-M perpetual Binance is trading, as BASE/QUOTE."""
+    return sorted(f"{i['baseAsset']}/{i['quoteAsset']}" for i in _binance_info(get_json).get("symbols", [])
+                  if i.get("contractType") == "PERPETUAL" and i.get("status") == "TRADING")
+
+
+def binance_contract(pair: str, get_json=None) -> dict:
+    """The perpetual's price and size steps, smallest order and smallest notional, from exchangeInfo."""
+    info = _binance_listing(pair, get_json)
+    f = {x["filterType"]: x for x in info.get("filters", [])}
+
+    def decimals(step: str) -> int:
+        d = Decimal(step).normalize()
+        return max(0, -d.as_tuple().exponent)
+
+    out = {"price_precision": decimals(f["PRICE_FILTER"]["tickSize"]) if "PRICE_FILTER" in f else info["pricePrecision"],
+           "size_precision": decimals(f["LOT_SIZE"]["stepSize"]) if "LOT_SIZE" in f else info["quantityPrecision"]}
+    if "LOT_SIZE" in f:
+        out["min_quantity"] = float(f["LOT_SIZE"]["minQty"])
+    if "MIN_NOTIONAL" in f:
+        out["min_notional"] = float(f["MIN_NOTIONAL"].get("notional", f["MIN_NOTIONAL"].get("minNotional", 5)))
+    return out
+
+
+def _binance_klines(pair: str, interval: str, start_ms: int | None = None, limit: int = 1500,
+                    get_json=None) -> pd.DataFrame:
+    """Candles by OPEN time, the forming one included."""
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    q = {"symbol": binance_symbol(pair), "interval": interval, "limit": limit}
+    if start_ms is not None:
+        q["startTime"] = start_ms
+    rows = (get_json or _get_json)(f"{BINANCE_FAPI}/klines?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):  # an error body: {"code": ..., "msg": ...}
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df = pd.DataFrame([r[:6] for r in rows], columns=["t", "open", "high", "low", "close", "volume"])
+    out = df[["open", "high", "low", "close", "volume"]].astype(float)
+    out.index = pd.to_datetime(df["t"].astype("int64"), unit="ms", utc=True)
+    out.index.name = "timestamp"
+    return out
+
+
+_BINANCE_INTERVALS = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 120: "2h", 240: "4h", 360: "6h",
+                      480: "8h", 720: "12h", 1440: "1d", 4320: "3d", 10080: "1w"}
+
+
+def binance_ohlc(pair: str, minutes: int, get_json=None) -> pd.DataFrame:
+    """Recent candles for charts and warm-up top-ups, by OPEN time, the forming one kept."""
+    if minutes not in _BINANCE_INTERVALS:
+        raise ValueError(f"Binance has no {minutes}-minute candles; use one of {sorted(_BINANCE_INTERVALS)}")
+    return _binance_klines(pair, _BINANCE_INTERVALS[minutes], get_json=get_json)
+
+
+def binance_daily(pair: str, get_json=None) -> pd.DataFrame:
+    """Daily candles since listing (pages of 1,500), closed bars only, indexed by CLOSE time."""
+    from sleeve_fund.data import validate_ohlcv
+
+    parts, start = [], 0
+    while True:
+        page = _binance_klines(pair, "1d", start_ms=start, get_json=get_json)
+        if page.empty:
+            break
+        parts.append(page)
+        if len(page) < 1500:
+            break
+        start = int(page.index[-1].timestamp() * 1000) + 1
+    if not parts:
+        raise ValueError(f"no daily history for {pair}")
+    df = pd.concat(parts)
+    df = df[~df.index.duplicated(keep="last")].iloc[:-1]  # the newest day is still forming
+    df.index = df.index + pd.Timedelta("1D")
+    return validate_ohlcv(df)
+
+
+def binance_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame, str, bool]:
+    """One page (1,500) of 1-minute candles from `cursor` (an open time in ms; empty starts at listing). Binance
+    keeps every minute since a perpetual listed. Caught up once a page reaches the forming minute."""
+    bars = _binance_klines(pair, "1m", start_ms=int(cursor) if cursor else 0, get_json=get_json)
+    if bars.empty:
+        return bars, cursor, True
+    nxt = str(int(bars.index[-1].timestamp() * 1000))  # resume on the last minute: it may still have been forming
+    return bars, nxt, len(bars) < 1500
+
+
+def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, float]]:
+    """Up to 1,000 settled funding rates from `start_ms`, [(settlement time in ms, rate)], oldest first. A
+    positive rate is paid by longs to shorts, on the position's value at the settlement."""
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    q = {"symbol": binance_symbol(pair), "startTime": start_ms, "limit": 1000}
+    rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingRate?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    return [(int(r["fundingTime"]), float(r["fundingRate"])) for r in rows]
+
+
+def _binance_data_client() -> tuple:
+    from nautilus_trader.adapters.binance import (
+        BinanceDataClientConfig,
+        BinanceDataClientFactory,
+        BinanceEnvironment,
+        BinanceProductType,
+    )
+
+    # Binance's production USD-M futures feed. No api_key/api_secret: public market data only.
+    return BinanceDataClientFactory(), BinanceDataClientConfig(product_type=BinanceProductType.USD_M,
+                                                               environment=BinanceEnvironment.LIVE)
+
+
+BINANCE = register(VenueProfile(
+    name="BINANCE",
+    label="Binance USD-M perpetuals",
+    # The published base tier (VIP 0) for USD-M futures, without the BNB discount: what a new account pays.
+    fees=FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.0005")),
+    fee_basis="VIP 0, published schedule, 5 Oct 2026",
+    daily_history=binance_daily,
+    ohlc_history=binance_ohlc,
+    list_instruments=binance_instruments,
+    data_client=_binance_data_client,
+    minute_loader=binance_minutes,
+    minute_cursor_at=lambda ts: str(int(ts.timestamp() * 1000)),
+    check_listed=lambda pair: (_binance_listing(pair), None)[1],
+    request_interval=0.5,  # a 1,500-candle page weighs 10 of Binance's 2,400 a minute
+    # BTC and ETH perpetuals trade a cent or less apart; 0.01% half spread is cautious for them, light for small ones.
+    assumed_half_spread=0.0001,
+    perpetual=True,
+    symbol=lambda pair: f"{binance_symbol(pair)}-PERP",
+    funding_loader=binance_funding,
+    contract=binance_contract,
+    core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
 ))
