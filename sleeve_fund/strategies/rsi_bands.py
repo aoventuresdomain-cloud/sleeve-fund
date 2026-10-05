@@ -62,11 +62,8 @@ class RsiBands(LongFlatStrategy):
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
         return settle_bars(int(params.get("rsi_period", 14)))
 
-    def on_start(self) -> None:
-        super().on_start()
-        if self.runtime is not None and self.runtime.book["qty"]:
-            # After a restart while holding: that leg is still on.
-            self._side = 1 if self.runtime.book["qty"] > 0 else -1
+    def resume_leg(self, side: int, held: int) -> None:
+        self._side = side  # after a restart: the leg the journal's last entry opened
 
     def update_indicators(self, bar: Bar) -> None:
         self.rsi.handle_bar(bar)
