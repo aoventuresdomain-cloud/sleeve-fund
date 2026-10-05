@@ -667,7 +667,10 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
-    assert 'class="lev">0.6×' in html  # the Overview's position table, leverage in its own column
+    # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once
+    # the figures exist, else notional over the whole equity.
+    own = f"{lev:g}×" if hasattr(__import__("sleeve_fund.dashboard.trading", fromlist=["x"]), "open_risk") else "0.6×"
+    assert f'class="lev">{own}' in html
     csv = c.get("/exports/trades.csv?sleeve=pp-fund", auth=AUTH)
     assert csv.status_code == 200 and "funding" in csv.text.splitlines()[0] and "98.6" in csv.text
 

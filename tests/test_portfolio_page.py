@@ -60,7 +60,12 @@ def test_positions_table_has_the_v2_columns_and_no_percentages(client):  # noqa:
     long_ = next(r for r in rows if "rsi-long" in r)
     assert ">Short</span>" in short and ">Long</span>" in long_
     # Leverage in its own column; notional in money; unrealised and fees; no realised (it moved to Trades).
-    assert 'class="lev">0.3×' in short and "2,950.00" in short and "+50.00" in short and ">1.50</td>" in short
+    from sleeve_fund.dashboard import trading
+
+    # The position's own leverage (item 7: notional at entry over its isolated margin, the profile's 2x cap)
+    # once the figures exist; until then notional over the strategy's whole equity.
+    lev = "2×" if hasattr(trading, "open_risk") else "0.3×"
+    assert f'class="lev">{lev}' in short and "2,950.00" in short and "+50.00" in short and ">1.50</td>" in short
     assert "−30.00" in long_ and ">1.20</td>" in long_ and "Realised" not in table
     # The short has neither stop nor target: an amber "none" stop, "none" target, and an unbounded risk.
     assert '<span class="warn" title="No stop-loss on this position">none</span>' in short
