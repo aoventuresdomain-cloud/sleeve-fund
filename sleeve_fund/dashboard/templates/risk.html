@@ -97,7 +97,6 @@
 
 <div class="tab-panel" id="tab-limits" role="tabpanel" data-panel="limits">
 <section class="ledger" aria-label="Book risk">
-  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }} · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}gross of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
@@ -131,6 +130,20 @@
     {% endfor %}</tbody>
   </table>
   <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact.</p>
+</section>
+{# How the strategies move together: moved here from the Portfolio's Allocation tab (UI v2), as a risk tool. #}
+<section class="panel" aria-labelledby="corr-h">
+  <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2> {{ help('correlation') }}</div>
+  {% if book.correlation.matrix %}
+  <div style="overflow-x:auto"><table class="corr">
+    <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
+    {% for row in book.correlation.matrix %}{% set ri = loop.index0 %}{% set rn = book.correlation.names[ri] %}
+    <tr><th scope="row" class="row">{{ rn }}</th>{% for v in row %}
+      {% if loop.index0 == ri %}<td class="self">·</td>{% elif v is none %}<td class="faint">n/a</td>
+      {% else %}<td style="background: color-mix(in srgb, var(--accent) {{ ([v, 0]|max * 60)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
+    {% endfor %}</tr>{% endfor %}
+  </table></div>
+  {% else %}<p class="empty">Needs two strategies with at least 20 days of history.</p>{% endif %}
 </section>
 </div>
 
