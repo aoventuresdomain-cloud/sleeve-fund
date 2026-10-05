@@ -560,15 +560,36 @@ def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None
 
 
 def _refresh_funding(profile, pair: str, root, since) -> None:
-    """A perpetual venue's settled funding for the instrument, kept beside its prices (sleeve_fund.funding)."""
-    if profile.funding_loader is None:
+    """A perpetual venue's settled funding for the instrument, kept beside its prices (sleeve_fund.funding), and
+    its open interest snapshots (sleeve_fund.open_interest)."""
+    funding_to = None
+    if profile.funding_loader is not None:
+        from sleeve_fund import funding
+
+        try:
+            kept = funding.refresh(profile.name, pair, root=root, since=since)
+            funding_to = kept.index[-1] if len(kept) else None
+        except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
+            print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+    _refresh_open_interest(profile, pair, root, funding_to)
+
+
+def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
+    """The venue's open interest snapshots for the instrument (sleeve_fund.open_interest), then one line saying how
+    far open interest and funding are kept, which the status workflow shows in the hub's log."""
+    if profile.open_interest_loader is None:
         return
-    from sleeve_fund import funding
+    from sleeve_fund import open_interest
 
     try:
-        funding.refresh(profile.name, pair, root=root, since=since)
-    except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
-        print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+        out = open_interest.refresh(profile.name, pair, root=root)
+    except Exception as exc:  # noqa: BLE001 - snapshots the venue still keeps are fetched on the next pass
+        print(f"{profile.name} {pair}: open interest refresh failed: {exc!r}")
+        return
+    oi = f"{out['latest']:%Y-%m-%d %H:%M}" if out["latest"] is not None else "none yet"
+    fr = f"{funding_to:%Y-%m-%d %H:%M}" if funding_to is not None else "none yet"
+    extra = f", {out['conflicts']} differing (provenance.jsonl)" if out["conflicts"] else ""
+    print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
 
 
 def unwritable(path: Path) -> str | None:

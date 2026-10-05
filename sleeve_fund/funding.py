@@ -86,3 +86,17 @@ def rate_at(series: pd.Series, ts: pd.Timestamp) -> float | None:
     if i < len(series) and abs(series.index[i] - ts) <= MATCH:
         return float(series.iloc[i])
     return None
+
+
+def gaps(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Settlements missing between the first and last rate kept, as (previous kept, next kept). A venue can change
+    an instrument's settlement interval (8 hours to 4, say), so a hole is an interval longer than one and a half
+    times both the one before it and the one after it, not a fixed grid."""
+    t = rates(venue, pair, root).index
+    steps = [b - a for a, b in zip(t, t[1:])]
+    out = []
+    for j, here in enumerate(steps):
+        near = steps[max(j - 1, 0):j] + steps[j + 1:j + 2]
+        if near and all(here > 1.5 * n for n in near):
+            out.append((t[j], t[j + 1]))
+    return out

@@ -59,6 +59,10 @@ class VenueProfile:
     # (pair, start in ms) -> up to a page of settled funding, [(time in ms, rate)], oldest first
     funding_loader: Callable[[str, int], list] | None = None
     funding_hours: tuple[int, ...] = (0, 8, 16)  # UTC hours the venue settles funding at
+    # (pair, start in ms) -> up to a page of open interest snapshots, [(time in ms, contracts, notional)], oldest
+    # first, one per `open_interest_minutes` (sleeve_fund.open_interest)
+    open_interest_loader: Callable[[str, int], list] | None = None
+    open_interest_minutes: int = 5
     # pair -> {"price_precision", "size_precision", "min_quantity", "min_notional"}, the venue's contract limits
     contract: Callable[[str], dict] | None = None
     # Instruments the history store always keeps for this venue, before any strategy trades them
@@ -415,6 +419,28 @@ def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, 
     return [(int(r["fundingTime"]), float(r["fundingRate"])) for r in rows]
 
 
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
+BINANCE_OI_DAYS = 30  # Binance keeps open interest history for the latest 30 days only
+
+
+def binance_open_interest(pair: str, start_ms: int, get_json=None, now_ms: int | None = None) -> list[tuple]:
+    """Up to 500 five-minute open interest snapshots from `start_ms`, [(time in ms, contracts, notional in the
+    quote currency)], oldest first. Each is the open interest at the end of a completed 5-minute period. Binance
+    keeps only the latest 30 days, so an earlier start is moved up to the oldest it still has."""
+    import time
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    oldest = now_ms - BINANCE_OI_DAYS * 86_400_000 + 300_000  # a period inside the window, or Binance refuses it
+    q = {"symbol": binance_symbol(pair), "period": "5m", "startTime": max(start_ms, oldest), "limit": 500}
+    rows = (get_json or _get_json)(f"{BINANCE_FUTURES_DATA}/openInterestHist?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    return [(int(r["timestamp"]), float(r["sumOpenInterest"]), float(r["sumOpenInterestValue"])) for r in rows]
+
+
 def _binance_data_client() -> tuple:
     from nautilus_trader.adapters.binance import (
         BinanceDataClientConfig,
@@ -447,6 +473,7 @@ BINANCE = register(VenueProfile(
     perpetual=True,
     symbol=lambda pair: f"{binance_symbol(pair)}-PERP",
     funding_loader=binance_funding,
+    open_interest_loader=binance_open_interest,
     contract=binance_contract,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
 ))
