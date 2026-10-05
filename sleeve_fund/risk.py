@@ -7,6 +7,7 @@ out of the strategy process into an independent risk service.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,13 @@ def profile(name: str) -> RiskProfile:
 class Breach:
     action: str  # "halt" | "pause_day"
     reason: str
+
+
+def trading_day(ts: datetime) -> date:
+    """The UTC day a mark belongs to, for the daily-loss guard. A mark at exactly 00:00 is the day before's
+    last: a backtest's bar that closes at midnight is stamped then, so the new day opens at its equity, as
+    paper's day opens at its last mark before midnight (coordinator, 5 Oct: it opened an hour early)."""
+    return (ts - timedelta(microseconds=1)).date()
 
 
 def check(profile: RiskProfile, equity: float, peak: float, day_open: float) -> Breach | None:

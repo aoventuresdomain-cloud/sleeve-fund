@@ -1492,7 +1492,12 @@ class LongFlatStrategy(Strategy):
         return working
 
     def _busy(self) -> bool:
-        return bool(self.cache.orders_inflight(strategy_id=self.strategy_id)) or bool(self._unsent())
+        """An order is on its way to the venue or being changed there, so the last decision is still being
+        carried out. The backtest's risk stop doesn't count: it is re-priced on most bars, just before the
+        decision, and counting its update stopped a perp backtest from ever deciding again."""
+        risk_stop = self._risk_stop_id
+        return (any(str(o.client_order_id) != risk_stop for o in self.cache.orders_inflight(strategy_id=self.strategy_id))
+                or any(str(o.client_order_id) != risk_stop for o in self._unsent()))
 
     def _is_long(self) -> bool:
         if self._margin:
@@ -1592,7 +1597,7 @@ class LongFlatStrategy(Strategy):
         # The next bar opens a new UTC day: the day then opens at this equity (SleeveRuntime.tick).
         step = timedelta(minutes=bar_minutes(self._exec_type or self._cfg.bar_type))
         now = self.clock.utc_now()
-        if (now + step).date() != now.date():
+        if risk.trading_day(now + step) != risk.trading_day(now):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
                   ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]

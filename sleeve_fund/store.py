@@ -845,11 +845,11 @@ class Store:
             return float(c.execute(q).scalar() or 0.0)
 
     def day_open_equity(self, sleeve: str, day_start: datetime) -> float | None:
-        """The equity the day opened at: the last mark before `day_start` (00:00 UTC), else the day's
+        """The equity the day opened at: the last mark at or before `day_start` (00:00 UTC), else the day's
         first mark. A restart reads it so the daily-loss guard keeps the day's real baseline."""
-        before = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts < day_start)
+        before = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts <= day_start)
                   .order_by(equity_t.c.ts.desc(), equity_t.c.id.desc()).limit(1))
-        first = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts >= day_start)
+        first = (select(equity_t.c.equity).where(equity_t.c.sleeve == sleeve, equity_t.c.ts > day_start)
                  .order_by(equity_t.c.ts, equity_t.c.id).limit(1))
         with self.engine.connect() as c:
             v = c.execute(before).scalar()
