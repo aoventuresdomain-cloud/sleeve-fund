@@ -721,11 +721,15 @@ class Store:
 
     def previous_book(self) -> dict[str, datetime]:
         """Strategies put away by the latest clean slate, or before it, and not brought back since: an
-        earlier book's. Their history stays and their pages still open; the book's figures leave them out."""
+        earlier book's. Their history stays and their pages still open; the book's figures leave them out.
+        One still holding a position stays in the current book until it is flat: left out, its position
+        counted in no exposure, risk figure or kill switch (5 Oct 2026, a clean slate that archived two
+        strategies still long)."""
         start = self.book_start()
         if start is None:
             return {}
-        return {name: at for name, at in self.archived().items() if at <= start}
+        return {name: at for name, at in self.archived().items()
+                if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}
 
     def archive(self, sleeve: str) -> None:
         """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""

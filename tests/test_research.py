@@ -506,3 +506,10 @@ def test_the_break_even_fee_is_read_between_the_rungs_either_side_of_zero():
     assert fee == pytest.approx(0.00075) and "about 0.075%" in words and "between 0.05% and 0.10%" in words
     assert breakeven_fee(ladder(-0.01, -0.02, -0.03, -0.04, -0.5)) == (None, "loses money even at 0.00% fees")
     assert breakeven_fee(ladder(0.5, 0.5, 0.4, 0.4, 0.1))[1] == "still makes money at 0.80% per side, the top of the ladder"
+
+
+def test_the_sensitivity_table_shows_grid_values_as_set():
+    """Round 11 minor: int() of each grid value crashed the tear sheet on a word and showed 0.005 as 0."""
+    from sleeve_fund.research.tearsheet import _param
+
+    assert [_param(v) for v in (20, 20.0, 0.005, 1.5, "ema")] == ["20", "20", "0.005", "1.5", "ema"]

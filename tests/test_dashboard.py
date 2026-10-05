@@ -1068,7 +1068,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/risk?killed=2"
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash" in fired and "data-once" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash" in fired and "data-once" in fired
     for name in ("btc-test", "eth-test"):
         (cmd,) = store.pending_commands(name)
         assert cmd["command"] == "flatten" and cmd["reason"] == "Book kill switch: Market event; standing aside"
@@ -1087,7 +1087,7 @@ def test_the_book_kill_switch_flattens_every_running_strategy(client):
     # Round 9, N1: a second fire logged "0 strategies" and its banner said "0 strategies are selling".
     assert second.headers["location"] == "/risk?killed=0" and len(store.decisions()) == logged
     said = c.get(second.headers["location"], auth=AUTH).text
-    assert "Nothing more to sell: btc-test, eth-test are already selling to cash. Nothing was logged." in said
+    assert "Nothing more to sell: btc-test, eth-test are already closing out to cash. Nothing was logged." in said
     # A command still waiting when its strategy is stopped lapses rather than firing on the next start.
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "done for now"}, auth=AUTH, headers=SAME)
     assert store.pending_commands("btc-test") == []
@@ -1368,7 +1368,7 @@ def test_the_kill_banner_counts_the_strategies_it_names(client):
     r = c.post("/book/flatten", data={"reason": "Market event"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.headers["location"] == "/risk?killed=1"  # only eth-test was new
     fired = c.get(r.headers["location"], auth=AUTH).text
-    assert "Kill switch fired: 2 strategies are selling to cash at market (btc-test, eth-test)" in fired
+    assert "Kill switch fired: 2 strategies are closing out to cash at market (btc-test, eth-test)" in fired
 
 
 def test_a_stopped_strategy_holding_a_position_is_never_stranded(client):
@@ -1710,6 +1710,29 @@ def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, 
     assert store.previous_book() == {}
 
 
+def test_a_strategy_a_clean_slate_put_away_still_holding_stays_in_the_book_until_flat(client, tmp_path):
+    """5 Oct 2026: the 4 Oct clean slate archived btc-trend-smoke and btc-trend-daily while they were still
+    long, and the book then left them out, so their positions sat in no exposure, risk page or kill switch.
+    One still holding stays in the book, the kill switch reaches it, and it leaves once it is flat."""
+    c, store = client
+    store.create_sleeve(name="old-long", strategy="trend_filter", instrument="BTC/USD",
+                        bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=7000)
+    store.record_fill("old-long", side="BUY", qty=0.05, price=60_000, fee=1.2, order_id="O-1", trade_id="T-1")
+    store.record_equity("old-long", equity=6998.8, cash=3998.8, qty=0.05, price=60_000, benchmark=7000)
+    store.set_desired_state("old-long", "stopped")
+    from sleeve_fund.store import sleeve_archive_t, utcnow
+
+    with store.engine.begin() as conn:  # archived with its position, as the clear did before #86
+        conn.execute(sleeve_archive_t.insert().values(sleeve="old-long", archived_at=utcnow()))
+    store.decide("system", "clear", "2026-10-04: new book (1 put away)")  # as the 4 Oct clear left it
+    assert "old-long" not in store.previous_book()
+    risk = c.get("/risk", auth=AUTH).text
+    assert 'href="/sleeves/old-long"' in risk and "Flatten everything" in risk
+    store.record_fill("old-long", side="SELL", qty=0.05, price=60_000, fee=1.2, order_id="O-2", trade_id="T-2")
+    assert set(store.previous_book()) == {"old-long"}
+    assert 'href="/sleeves/old-long"' not in c.get("/risk", auth=AUTH).text
+
+
 def test_maker_first_orders_are_switched_off_by_default(client, prices, instrument):
     """PM, 4 Oct 2026: market orders only until a strategy proves it needs maker fills. The form offers no
     order type, a hand-made maker request is refused in words, and so is a backtest asking for one."""
@@ -1722,6 +1745,19 @@ def test_maker_first_orders_are_switched_off_by_default(client, prices, instrume
     assert r.status_code in (200, 303, 400) and "btc-test" not in [s.name for s in store.sleeves()]
     with pytest.raises(ValueError, match="switched off"):
         run_backtest("trend_filter", prices.iloc[:50], instrument, {"fast": 5, "slow": 20, "maker_wait_minutes": 10})
+
+
+def test_a_resume_on_a_running_strategy_is_refused_in_words(client):
+    """Review round 10, m10-3: there is nothing to resume on a running strategy."""
+    c, store = client
+    _new(c, name="eth-run", instrument="ETH/USD")
+    store.set_status("eth-run", "running", "")
+    r = c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "again"}, auth=AUTH, headers=SAME)
+    assert "Not done: it is already running, so there is nothing to resume." in r.text
+    assert store.pending_commands("eth-run") == []
+    store.set_status("eth-run", "paused", "paused by PM")
+    c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH, headers=SAME)
+    assert [x["command"] for x in store.pending_commands("eth-run")] == ["resume"]
 
 
 def test_the_g2_checklist_says_a_long_short_strategy_has_no_g1_yet(client):

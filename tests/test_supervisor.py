@@ -73,6 +73,7 @@ def test_clear_puts_every_strategy_away_once_and_keeps_its_journal(store, sleeve
     untouched; the entry applies once, so restarts and strategies added afterwards are left alone."""
     store.set_desired_state("s", "running")
     store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
     store.create_sleeve(name="old", strategy="buy_and_hold", instrument="ETH/USD",
                         bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=500)
     store.set_desired_state("old", "stopped")
@@ -81,13 +82,30 @@ def test_clear_puts_every_strategy_away_once_and_keeps_its_journal(store, sleeve
     path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "PM asked for a clean slate"\n')
     assert clear(store, str(path)) == ["s"]
     assert store.sleeve("s").desired_state == "stopped" and set(store.archived()) == {"s", "old"}
-    assert len(store.fills("s")) == 1
+    assert len(store.fills("s")) == 2
     assert [d["action"] for d in store.decisions("s")][:2] in (["archive", "stop"], ["stop", "archive"])
     seed(store, ["configs/sleeves/ping_pong_test.toml"])
     assert clear(store, str(path)) == []  # applied already: the new strategy stays
     assert "ping-pong-test" not in store.archived()
     assert any(e["kind"] == "book_cleared" for e in store.events())
 
+
+
+def test_clear_never_archives_a_strategy_still_holding_a_position(store, sleeve, tmp_path):
+    """Archiving takes a strategy off the book: one still holding a position would drop it from every
+    total with nothing watching it. It is stopped, not archived, and the entry finishes on a later start
+    once it is flat (review round 11)."""
+    store.set_desired_state("s", "running")
+    store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "clean slate"\n')
+    assert clear(store, str(path)) == []
+    assert store.sleeve("s").desired_state == "stopped" and "s" not in store.archived()
+    assert any(e["kind"] == "clear_held" and "0.01" in e["message"] for e in store.events("s"))
+    assert store.decisions(action="clear") == []
+    store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
+    assert clear(store, str(path)) == ["s"]  # flat now: the next start finishes the entry
+    assert clear(store, str(path)) == []
 
 def test_the_shipped_clear_file_reads(store):
     assert clear(store, "configs/clear.toml") == []
