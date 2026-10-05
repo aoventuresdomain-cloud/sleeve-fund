@@ -1,6 +1,7 @@
 """Long and short on a perpetual (plan L1-L3, 4 Oct 2026): the margin account, short and flipping trades,
 funding, the liquidation price and guard, trade pairing, and a paper restart that carries a short."""
 
+import re
 import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -556,6 +557,10 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
         shorted = shorted or (net <= 1e-12 and f["side"] == "SELL")
         net += f["qty"] if f["side"] == "BUY" else -f["qty"]
     assert shorted, "the backtest never went short"
+    # M12-U5: the side rides on the entry cell, which no width hides (Size, which says it too, goes at 1440 px).
+    table = result.split('id="bt-tr-h"')[1].split("</table>")[0]
+    sides = re.findall(r'<tr><td data-m="hide">[^<]+<div class="sub">(long|short)</div></td>', table)
+    assert "short" in sides and len(sides) == table.count('<tr class="detail"'), sides
 
     # Start: the new strategy keeps the market, shorts and mirror.
     data = {k: v for k, v in q.items() if k not in ("from", "source")}
