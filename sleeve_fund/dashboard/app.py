@@ -194,7 +194,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(400, "days must be 1 or 7")
         cutoff = utcnow() - timedelta(days=days)
         prior = daily["equity"][daily.index < cutoff] if len(daily) else daily
-        curve = bookm.recent_curve(st(), sleeves, days, float(prior.max()) if len(prior) else None)
+        # The peak before the window counts the starting capital too, as the whole history does (M12-F1): from
+        # the daily closes alone a wiped-out strategy's was 0, and 0/0 made the range a 500 (mF2-1, mF2-2).
+        start = sum(s.starting_balance for s in sleeves)
+        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start))
         return JSONResponse({
             "res": "intraday",
             "t": [t.isoformat() for t in curve.index],
