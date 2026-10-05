@@ -170,7 +170,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         bar_type = BarType.from_str(f"{sleeve.instrument_id}-{spec}")
         data_factory = HubDataClientFactory()
         data_config = HubDataClientConfig(venue=profile.name, instrument_ids=(sleeve.instrument_id,), host=hub[0],
-                                          port=hub[1], bar_spec=spec)
+                                          port=hub[1], bar_spec=spec,
+                                          report=None if runtime is None else
+                                          lambda level, kind, message: runtime.store.event(sleeve.name, level, kind,
+                                                                                           message))
     else:
         bar_type = BarType.from_str(sleeve.bar_type)
         data_factory, data_config = profile.data_client()
@@ -208,9 +211,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 default_leverage=markets.VENUE_LEVERAGE if perp else None,
                 fee_model=fee_model,
                 fill_model=fill_model(),
-                # Fills come from trades and quotes only. The hub's 1-minute bars are EXTERNAL, which the
-                # matching engine would otherwise replay through the book a minute late, at their receive time.
-                bar_execution=False,
+                # A hub-fed node fills from trades and quotes only: its bars are EXTERNAL, which the matching
+                # engine would otherwise replay through the book a minute late, at their receive time. A node on
+                # its own venue connection keeps the engine's default until it moves to the hub.
+                bar_execution=hub is None,
             ),
         )
         .build()

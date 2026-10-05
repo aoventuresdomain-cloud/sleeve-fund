@@ -81,6 +81,93 @@ def test_a_bar_whose_last_minute_never_came_is_sent_with_the_next_minute_while_c
     assert d.building[BTC].end == E + 10 * M
 
 
+def test_a_minute_refilled_late_joins_the_bar_still_being_built():
+    """A late minute is history as a bar of its own, but the longer bar it closes in must hold it, or that bar
+    differs from the one a backtest builds from the store."""
+    d = Decoder("5-MINUTE-LAST-EXTERNAL")
+    for k in range(1, 6):
+        d(_bar(E - 5 * M + k * M), E - 5 * M + k * M + 5)  # a whole bar to 18:05, sent
+    d(_bar(E + M), E + M + 5)
+    d(_bar(E + 3 * M), E + 3 * M + 5)  # 18:08 live; the hub missed 18:07
+    assert d(_bar(E + 2 * M, h="60100.00", v="3.000", refilled=True), E + 3 * M + 40 * 10**9) is None  # 100 s late
+    d(_bar(E + 4 * M), E + 4 * M + 5)
+    b = d(_bar(E + 5 * M), E + 5 * M + 5)
+    assert (str(b.high), str(b.volume)) == ("60100.00", "8.000") and d.late == 0  # five minutes, the refill in them
+    d(_bar(E + 5 * M + M), E + 6 * M + 5)
+    assert d(_bar(E + 5 * M, refilled=True), E + 6 * M + 10) is None  # a minute of a bar already sent: history
+    assert d.building[BTC].minutes.keys() == {E + 6 * M}
+
+
+def test_minutes_refilled_in_order_after_an_outage_build_the_bar_and_a_late_bar_is_skipped_and_told():
+    said = []
+    d = Decoder("5-MINUTE-LAST-EXTERNAL", lambda *a: said.append(a))
+    for k in range(1, 6):
+        d(_bar(E - 5 * M + k * M), E - 5 * M + k * M + 5)
+    d(_bar(E + M), E + M + 5)  # 18:06; then the hub is away until 18:13
+    back = E + 8 * M
+    for k in range(2, 8):  # 18:07 to 18:12 refilled late on its return
+        assert d(_bar(E + k * M, refilled=True), back) is None
+    assert d.late == 1 and said == []  # the bar to 18:10, complete only at 18:13: not a signal
+    assert d.building[BTC].minutes.keys() == {E + 6 * M, E + 7 * M}  # the next bar's refilled minutes kept
+    d(_bar(E + 8 * M), back + 5)
+    d(_bar(E + 9 * M), E + 9 * M + 5)
+    b = d(_bar(E + 10 * M), E + 10 * M + 5)
+    assert b.ts_event == E + 10 * M and str(b.volume) == "6.250"  # whole: two refilled minutes and three live
+    assert said == [("warning", "bar_skipped", f"{BTC}: skipped 1 bar closing 05 Oct 18:10 UTC: complete only over "
+                     "90 s after the close (refilled after the feed was away), so not decided on")]
+
+
+def test_a_bar_sent_with_minutes_missing_is_told():
+    said = []
+    d = Decoder("5-MINUTE-LAST-EXTERNAL", lambda *a: said.append(a))
+    for k in (1, 2, 4, 5):
+        d(_bar(E - 5 * M + k * M), E - 5 * M + k * M + 5)
+    d(_bar(E - 5 * M + 3 * M), E + 5)  # 18:03 refilled after the bar to 18:05 was sent: too late for it
+    assert said == [("warning", "bar_incomplete",
+                     f"{BTC}: the bar closing 05 Oct 18:05 UTC was sent missing 1 of its 5 minutes")]
+
+
+def test_the_client_reconnects_whatever_broke_its_stream_and_says_so_once(monkeypatch):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from sleeve_fund.paper import hub_client
+
+    monkeypatch.setattr(hub_client, "RECONNECT_SECONDS", (0,))
+
+    def stream(*lines):
+        r = asyncio.StreamReader()
+        for line in lines:
+            r.feed_data(line + b"\n")
+        r.feed_eof()
+        return r
+
+    trade = json.dumps({"t": "trade", "id": BTC, "px": "60000.10", "qty": "0.005", "side": "SELL", "tid": "7",
+                        "ts": T0, "recv": T0}).encode()
+    got, said, opens = [], [], []
+
+    async def _open():
+        opens.append(1)
+        if len(opens) == 1:
+            raise ConnectionRefusedError("the hub is restarting")
+        if len(opens) == 2:
+            return stream(trade), {}
+        client._closing = True
+        raise OSError("stopped")
+
+    client = SimpleNamespace(_closing=False, clock=SimpleNamespace(timestamp_ns=lambda: T0 + 1), decode=Decoder(),
+                             _handle_data=got.append, report=lambda *a: said.append(a), _open=_open,
+                             last_heartbeat_ns=0, venue_up=False)
+    async def run():
+        await hub_client.HubDataClient._read(client, stream(b"{not json"))
+
+    asyncio.run(run())
+    assert len(got) == 1 and got[0].ts_event == T0 and len(opens) == 3
+    assert [(lvl, kind) for lvl, kind, _ in said] == [("warning", "hub"), ("info", "hub"), ("warning", "hub")]
+    assert "JSONDecodeError" in said[0][2] and "Reconnected" in said[1][2] and "closed the connection" in said[2][2]
+
+
 def test_one_minute_bars_go_through_as_they_come():
     d = Decoder()
     b = d(_bar(E), E + 5)
