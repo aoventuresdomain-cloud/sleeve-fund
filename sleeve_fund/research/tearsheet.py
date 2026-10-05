@@ -295,9 +295,9 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
             out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
                        f"| {rung.fees_paid:,.0f} |")
         out.append("")
-        out.append("The same strategy and settings at each fee, maker and taker alike; half the bid-ask spread is charged "
-                   "on top as above. 0.02% and 0.05% are a low-fee perpetual venue's maker and taker rates, 0.80% a high-fee "
-                   "spot venue's taker rate.")
+        out.append("The same strategy and settings at each fee, maker and taker alike. Every rung also pays half the "
+                   f"bid-ask spread as above plus {r.ladder_slippage:.2%} slippage on orders that take liquidity. 0.02% and "
+                   "0.05% are a low-fee perpetual venue's maker and taker rates, 0.80% a high-fee spot venue's taker rate.")
         out.append("")
     out.append("## Walk-forward folds")
     out.append("")

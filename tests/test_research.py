@@ -493,6 +493,10 @@ def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path,
     sheet = render(r, ledger)
     assert "## Cost ladder" in sheet and "**Break-even fee:**" in sheet and "| 0.80% |" in sheet
     assert not any(e["stage"].startswith("ladder") for e in ledger.entries())
+    assert r.ladder_slippage == 0.0002 and "0.02% slippage" in sheet  # BTC: 2 basis points; 5 elsewhere
+    from sleeve_fund.research.study import ladder_slippage
+
+    assert (ladder_slippage("ETH/USDT"), ladder_slippage("SUI/USD")) == (0.0002, 0.0005)
 
 
 def test_the_break_even_fee_is_read_between_the_rungs_either_side_of_zero():

@@ -80,6 +80,7 @@ class StudyResult:
     holdout_withheld: str = ""  # why the holdout asked for was left closed
     # The default params over the research period at each fee of COST_LADDER: what costs the idea survives.
     cost_ladder: list[LadderRung] = field(default_factory=list)
+    ladder_slippage: float = 0.0  # charged on every rung on top of the half spread, on orders that take liquidity
 
     @property
     def not_judged(self) -> str:
@@ -128,6 +129,13 @@ class StudyResult:
 # Fee per side the cost ladder tests every idea at (PM, 5 Oct 2026): free, the low-fee perp venues' maker
 # and taker rates, a mid venue, and a high-fee spot venue's taker rate (the stress case).
 COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.008)
+# Slippage beyond the spread each rung also pays on orders that take liquidity (strategy sprint, PM approved
+# 5 Oct 2026): 2 basis points on the deepest books (BTC, ETH), 5 on the rest.
+DEEP_BOOKS = ("BTC", "ETH")
+
+
+def ladder_slippage(pair: str) -> float:
+    return 0.0002 if pair.split("/")[0].upper() in DEEP_BOOKS else 0.0005
 
 
 @dataclass
@@ -249,7 +257,7 @@ def run_study(
     done = [0]
 
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
-           fees: FeeSchedule | None = None) -> BacktestResult:
+           fees: FeeSchedule | None = None, slippage: float = 0.0) -> BacktestResult:
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
@@ -263,7 +271,7 @@ def run_study(
             fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                           exec_minutes=exec_minutes or 1, half_spread=half_spread, fees=fees)
+                           exec_minutes=exec_minutes or 1, half_spread=half_spread + slippage, fees=fees)
         if res.handler_errors:
             errors.append((f"{name} {df.index[0]:%d %b %Y} to {df.index[-1]:%d %b %Y}", *res.handler_errors[0]))
             error_count[0] += res.handler_error_count or len(res.handler_errors)
@@ -294,9 +302,10 @@ def run_study(
 
     # The cost ladder: the default params over the research period at each fee. Not logged as variants, since
     # the strategy is the same; only what it pays changes.
-    ladder = []
+    ladder, slip = [], ladder_slippage(f"{instrument.base_currency.code}/{instrument.quote_currency.code}")
     for fee in COST_LADDER:
-        res = bt(spec.name, research, default_params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))))
+        res = bt(spec.name, research, default_params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
+                 slippage=slip)
         eq = res.equity
         ladder.append(LadderRung(fee=fee, total_return=float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0,
                                  sharpe=summary(daily_returns(eq))["sharpe"],
@@ -364,6 +373,7 @@ def run_study(
         errors=errors,
         error_count=error_count[0],
         cost_ladder=ladder,
+        ladder_slippage=slip,
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
