@@ -143,6 +143,47 @@ class HistoryStore:
                 "duplicates": int(df.index.duplicated().sum()),
                 "quiet_over_an_hour": quiet_runs(df[~df.index.duplicated()], 1)}
 
+    def gaps(self, venue: str, pair: str) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        """Runs of minutes missing inside the coverage, as (first, last) missing open times. append() fills
+        quiet minutes, so a run here is a write that never finished, not a market with no trades. Each
+        month's file is read once per version (its size and time), so the current month is the only one
+        re-read as the collector adds to it."""
+        cov = self.coverage(venue, pair)
+        if cov is None:
+            return []
+        lo, hi = int(cov.first.timestamp()), int(cov.last.timestamp())
+        runs, seen = [], lo - 60  # the last minute held so far
+        for path in sorted(self._dir(venue, pair).glob("*.npz")):
+            if path.name.endswith(".tmp.npz"):  # a month being rewritten (_save)
+                continue
+            first, last, holes = _month_minutes(path)
+            if first > seen + 60:
+                runs.append((seen + 60, first - 60))
+            runs += holes
+            seen = max(seen, last)
+        if hi > seen:
+            runs.append((seen + 60, hi))
+        clipped = [(max(a, lo), min(b, hi)) for a, b in runs if b >= lo and a <= hi]
+        return [(pd.Timestamp(a, unit="s", tz="UTC"), pd.Timestamp(b, unit="s", tz="UTC")) for a, b in clipped]
+
+
+_months: dict[Path, tuple[tuple[int, int], tuple[int, int, list[tuple[int, int]]]]] = {}
+
+
+def _month_minutes(path: Path) -> tuple[int, int, list[tuple[int, int]]]:
+    """A month file's first and last minute (epoch seconds) and the runs missing between them."""
+    stat = path.stat()
+    key = (stat.st_mtime_ns, stat.st_size)
+    hit = _months.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    with np.load(path) as z:
+        t = np.unique(z["t"])
+    steps = np.nonzero(np.diff(t) > 60)[0]
+    info = (int(t[0]), int(t[-1]), [(int(t[i]) + 60, int(t[i + 1]) - 60) for i in steps])
+    _months[path] = (key, info)
+    return info
+
 
 def quiet_runs(bars: pd.DataFrame, minutes: int, at_least: int = 60) -> dict:
     """Stretches of bars with no trades lasting `at_least` minutes or more. The store keeps them
@@ -294,6 +335,24 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
 
 
+def unwritable(path: Path) -> str | None:
+    """Why this process can't write under `path`, or None if it can. Checked once at start, so a store
+    it may not write says so in one line instead of failing every instrument on every pass."""
+    probe = path / f".write-check-{os.getpid()}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe.write_text("")
+        probe.unlink()
+        return None
+    except OSError as exc:
+        owner = next((p for p in (path, *path.parents) if p.exists()), path)
+        try:
+            owned = f"owned by uid {owner.stat().st_uid}"
+        except OSError:
+            owned = "owner unknown"
+        return f"cannot write {path} as uid {os.getuid()} ({owner} is {owned}): {exc!r}"
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import time
@@ -316,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
 
     store = HistoryStore(args.root)
     profile = venue_profile(args.venue)
+    if args.cmd in ("refresh", "run") and (problem := unwritable(store.root / profile.name.upper())):
+        print(f"{profile.name}: history store can't start: {problem}")
+        return 2
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:
