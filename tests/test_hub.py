@@ -157,7 +157,7 @@ def _relay(last_close=None, since=None):
     stored = []
     r = HubRelay(HubRelayConfig(instrument_ids=(BTC,)))
     recent = lambda pair, minutes: _candles("2026-10-05 11:50", 30)  # noqa: E731
-    r.attach(_Fan(), sink=stored.append, pairs={BTC: "BTC/USDT"}, recent=recent, last_close=last_close)
+    r.attach(_Fan(), sink=stored.extend, pairs={BTC: "BTC/USDT"}, recent=recent, last_close=last_close)
     r._refill = r._store = _Now()
     r._since[BTC] = since if since is not None else T0 - 10 * MINUTE_NS
     return r, stored
@@ -183,25 +183,28 @@ def test_the_first_bar_after_subscribing_is_a_part_bar_and_the_venues_candle_sta
     assert stored[-1]["c"] == "60002.00" and stored[-1]["refilled"] is False
 
 
-def test_bars_reach_the_stores_write_path_as_open_time_and_source():
-    calls = []
+def test_bars_reach_the_stores_write_path_as_open_time_and_source_a_refill_in_one_call():
+    calls, said = [], []
 
     class Store:
         def append_bars(self, venue, instrument, bars, source):
             calls.append((venue, instrument, bars, source))
+            return type("R", (), {"conflicts": [bars[0][0]] if source == "refill" else []})()
 
-    sink = store_sink(Store(), "BINANCE", {BTC: "BTC/USDT"})
-    sink(protocol.bar_from_nautilus(_bar(BTC, T0), T0))
-    sink({**protocol.bar_from_nautilus(_bar(BTC, T0 + MINUTE_NS), T0), "refilled": True})
-    sink(protocol.bar_from_nautilus(_bar(ETH, T0), T0))  # not one of the hub's instruments: not stored
-    assert calls == [("BINANCE", "BTC/USDT", [(T0 - MINUTE_NS, 60000.0, 60010.0, 59990.0, 60000.1, 1.25)], "live"),
-                     ("BINANCE", "BTC/USDT", [(T0, 60000.0, 60010.0, 59990.0, 60000.1, 1.25)], "refill")]
+    sink = store_sink(Store(), "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
+    sink([protocol.bar_from_nautilus(_bar(BTC, T0), T0)])
+    sink([{**protocol.bar_from_nautilus(_bar(BTC, T0 + k * MINUTE_NS), T0), "refilled": True} for k in (1, 2)])
+    sink([protocol.bar_from_nautilus(_bar(ETH, T0), T0)])  # not one of the hub's instruments: not stored
+    bar = lambda close: (close - MINUTE_NS, 60000.0, 60010.0, 59990.0, 60000.1, 1.25)  # noqa: E731
+    assert calls == [("BINANCE", "BTC/USDT", [bar(T0)], "live"),
+                     ("BINANCE", "BTC/USDT", [bar(T0 + MINUTE_NS), bar(T0 + 2 * MINUTE_NS)], "refill")]
+    assert len(said) == 1 and "differ from the stored" in said[0]  # the store kept its bar and recorded it
 
 
 def test_a_store_without_the_write_path_yet_is_skipped_and_said_once():
     said = []
     sink = store_sink(object(), "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
-    sink(protocol.bar_from_nautilus(_bar(BTC, T0), T0))
+    sink([protocol.bar_from_nautilus(_bar(BTC, T0), T0)])
     assert len(said) == 1 and "append_bars" in said[0]
 
 

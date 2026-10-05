@@ -49,21 +49,29 @@ class Gaps:
         return None
 
 
-def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callable[[dict], None]:
-    """Hands each closed bar to the history store's write path, HistoryStore.append_bars(venue, instrument,
-    bars, source), which the storage side owns: bars as (open_time_ns, open, high, low, close, volume), source
-    "live" or "refill". A store without it yet (until that lands) is skipped, said once."""
+def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callable[[list[dict]], None]:
+    """Hands closed bars to the history store's write path, HistoryStore.append_bars(venue, instrument, bars,
+    source), which the storage side owns: bars as (open_time_ns, open, high, low, close, volume), source "live"
+    or "refill", one call per instrument and source (a refill's bars in one call). Writes are idempotent, and a
+    refill differing from a stored bar is recorded by the store, not written over it; the hub logs those. A
+    store without append_bars yet is skipped, said once."""
     append = getattr(history, "append_bars", None)
     if append is None:
         log(f"hub {venue}: the history store has no append_bars yet; bars are relayed but not stored")
-        return lambda msg: None
+        return lambda msgs: None
 
-    def sink(msg: dict) -> None:
-        pair = pairs.get(msg["id"])
-        if pair is None:
-            return
-        bar = (msg["ts"] - MINUTE_NS, *(float(msg[k]) for k in ("o", "h", "l", "c", "v")))
-        append(venue, pair, [bar], "refill" if msg["refilled"] else "live")
+    def sink(msgs: list[dict]) -> None:
+        batches: dict[tuple[str, str], list] = {}
+        for m in msgs:
+            pair = pairs.get(m["id"])
+            if pair is not None:
+                bar = (m["ts"] - MINUTE_NS, *(float(m[k]) for k in ("o", "h", "l", "c", "v")))
+                batches.setdefault((pair, "refill" if m["refilled"] else "live"), []).append(bar)
+        for (pair, source), bars in batches.items():
+            out = append(venue, pair, bars, source)
+            if getattr(out, "conflicts", None):
+                log(f"hub {venue} {pair}: {len(out.conflicts)} {source} bar(s) differ from the stored ones; "
+                    "kept the stored, the store records the difference")
 
     return sink
 
@@ -90,7 +98,7 @@ class HubRelay(DataActor):
     def __init__(self, config: HubRelayConfig) -> None:
         super().__init__(config)
         self.fanout = None  # attach() before the node runs
-        self.sink: Callable[[dict], None] = lambda bar: None
+        self.sink: Callable[[list[dict]], None] = lambda bars: None
         self.pairs: dict[str, str] = {}  # instrument id -> pair, for the REST refill and the store
         self.recent = self.discover = None
         self.relayed: set[str] = set()
@@ -192,7 +200,7 @@ class HubRelay(DataActor):
             self._refill.submit(self._fill, iid, since, until)
         if not stand_in:
             self.fanout.publish(msg)
-            self._store.submit(self._keep, msg)
+            self._store.submit(self._keep, [msg])
 
     def _fill(self, iid: str, since_ns: int, until_ns: int) -> None:
         pair = self.pairs.get(iid)
@@ -205,10 +213,11 @@ class HubRelay(DataActor):
             return
         for b in bars:
             self.fanout.publish(b)
-            self._store.submit(self._keep, b)
+        if bars:
+            self._store.submit(self._keep, bars)
 
-    def _keep(self, msg: dict) -> None:
+    def _keep(self, msgs: list[dict]) -> None:
         try:
-            self.sink(msg)
+            self.sink(msgs)
         except Exception as exc:  # noqa: BLE001 - a failed write mustn't stop the relay; the store's gap shows it
-            print(f"hub: storing {msg['id']} {msg['ts']} failed: {exc!r}")
+            print(f"hub: storing {len(msgs)} bar(s) of {msgs[0]['id']} from {msgs[0]['ts']} failed: {exc!r}")
