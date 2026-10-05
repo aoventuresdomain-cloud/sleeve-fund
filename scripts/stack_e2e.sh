@@ -15,6 +15,9 @@ trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker comp
 docker compose run --rm --no-deps --build --entrypoint sh volume-init \
   -c 'mkdir -p /data/history/BINANCE /data/research/tearsheets && chown -R 0:0 /data/history /data/research'
 docker compose up -d --build
+# A fresh database is built by the migrations, and the result matches the code.
+docker compose logs --no-color migrate | grep -q "schema: at migration" || { echo "FAIL: migrate did not run"; exit 1; }
+docker compose exec -T supervisor python -m sleeve_fund.schema check
 q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
 # The supervisor applies configs/clear.toml before it starts; a strategy added before that is put away
 # with the rest. So add SUI only once the supervisor is up (the dashboard can be ready first).

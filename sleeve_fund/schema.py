@@ -1,6 +1,8 @@
 """Does the database's schema match the code's? A read-only check of a live database against store.py.
 
-    python -m sleeve_fund.schema check   # exit 0: matches; exit 1: drift, each difference listed
+    python -m sleeve_fund.schema check     # exit 0: matches; exit 1: drift, each difference listed
+    python -m sleeve_fund.schema migrate   # bring the database to the newest migration (run by the deploy)
+    python -m sleeve_fund.schema new "add x to y"   # draft a migration from store.py (developers, on SQLite)
 
 The app creates missing tables when it starts but never alters one that exists, so a column changed in
 store.py can pass every test and never reach the server. This check says so out loud. It only reads: on
@@ -11,12 +13,16 @@ from __future__ import annotations
 
 import sys
 
+from pathlib import Path
+
+from alembic import command
 from alembic.autogenerate import compare_metadata
+from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import Float, inspect, text
+from sqlalchemy import Float, insert, inspect, text
 from sqlalchemy.engine import Connection, Engine
 
-from sleeve_fund.store import make_engine, metadata
+from sleeve_fund.store import events_t, make_engine, metadata, utcnow
 
 # alembic's own bookkeeping table, once migrations are in (DA-1): not part of the app's schema.
 IGNORED_TABLES = {"alembic_version"}
@@ -76,10 +82,73 @@ def report(engine: Engine) -> tuple[list[str], list[str]]:
     return facts, diffs
 
 
+def _config(conn: Connection) -> Config:
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+    cfg.attributes["connection"] = conn
+    return cfg
+
+
+def head() -> str:
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_config(None)).get_current_head()
+
+
+class Drift(RuntimeError):
+    """An existing database without migration history that does not match the code: nothing was changed."""
+
+
+def migrate(engine: Engine, log=print) -> str:
+    """Bring the database to the newest migration and return what was done.
+
+    - Migration history present: apply the newer migrations, in one transaction where the engine allows.
+    - Empty database: build it by running every migration.
+    - Tables but no history (production before migrations existed): it is never rebuilt. If its schema
+      matches the code exactly it is STAMPED at the newest migration (history recorded, no table touched);
+      if it differs, Drift is raised listing each difference, and nothing is changed."""
+    with engine.connect() as conn:
+        tables = set(inspect(conn).get_table_names())
+        app_tables = tables & set(metadata.tables)
+        diffs = differences(conn) if "alembic_version" not in tables and app_tables else []
+        conn.rollback()  # end the reads' transaction; the writes below each run in their own
+        if "alembic_version" not in tables and app_tables:
+            if diffs:
+                raise Drift("the database has tables but no migration history, and differs from the code:\n"
+                            + "\n".join(f"  - {d}" for d in diffs))
+            with conn.begin():
+                command.stamp(_config(conn), "head")
+            done = f"stamped existing schema at {head()} (no table changed)"
+        else:
+            with conn.begin():
+                command.upgrade(_config(conn), "head")
+            done = f"at migration {head()}"
+    log(f"schema: {done}")
+    return done
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ["migrate"]:
+        engine = make_engine()
+        try:
+            migrate(engine)
+        except Drift as exc:
+            # Only before the first stamp: the database runs as it did before migrations existed, so the app
+            # may start as it always has. Nothing is migrated until the drift is fixed, and the alerts inbox
+            # (and the status workflow's events) say so on every deploy. A failing migration still exits 1.
+            msg = f"migrations held, nothing changed: {exc}"
+            print(f"SCHEMA DRIFT: {msg}", file=sys.stderr)
+            with engine.begin() as conn:
+                conn.execute(insert(events_t).values(sleeve=None, ts=utcnow(), level="error", kind="schema_drift",
+                                                     message=msg))
+        return 0
+    if len(argv) == 2 and argv[0] == "new":
+        with make_engine().connect() as conn, conn.begin():
+            command.revision(_config(conn), message=argv[1], autogenerate=True)
+        return 0
     if argv != ["check"]:
-        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        print("usage: python -m sleeve_fund.schema check | migrate | new MESSAGE", file=sys.stderr)
         return 2
     facts, diffs = report(make_engine())
     for line in facts:

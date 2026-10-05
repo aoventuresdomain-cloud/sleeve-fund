@@ -31,6 +31,7 @@ include = ["sleeve_fund*"]
 
 [tool.setuptools.package-data]
 "sleeve_fund.dashboard" = ["templates/*.html", "static/*", "static/fonts/*"]
+"sleeve_fund.migrations" = ["script.py.mako"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
