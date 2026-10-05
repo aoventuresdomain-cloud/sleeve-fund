@@ -96,3 +96,20 @@ def test_a_backtest_and_a_study_wait_while_the_history_has_gaps(client, tmp_path
     eth = next(i for i in got["instruments"] if i["pair"] == "ETH/USD")
     assert eth["state"] == "gaps" and eth["text"] == "1 gap · backtests wait until filled" and len(eth["gaps"]) == 1
     assert c.get("/api/history/coverage?venue=nope", auth=AUTH).status_code == 400
+
+
+def test_the_badge_reads_the_hubs_closed_minute_and_its_provenance(client, tmp_path, monkeypatch):  # noqa: F811
+    """The badge comes from the store's own records (#136): the last candle is the newest closed minute, and the
+    refills and conflicts it logged show on the Data coverage chip."""
+    from test_history_hub_writes import _rows
+
+    c, _ = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    store = HistoryStore()
+    start = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2)).floor("h").tz_localize(None)
+    store.append_bars("KRAKEN", "ETH/USD", _rows(start, 30), "live")
+    store.append_bars("KRAKEN", "ETH/USD", _rows(start + pd.Timedelta(minutes=30), 10), "refill")
+    store.append_bars("KRAKEN", "ETH/USD", _rows(start, 1, price=90.0), "refill")  # differs: kept out, logged
+    last = start + pd.Timedelta(minutes=39)
+    page = c.get("/research", auth=AUTH).text
+    assert (f'title="1 refill, 1 conflict recorded">stored · last candle {last:%H:%M} · no gaps</span>' in page)
