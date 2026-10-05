@@ -40,6 +40,7 @@ from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
+from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
@@ -92,6 +93,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         study_run.seed(LEDGER, TEARSHEETS)
     except OSError as exc:  # the pages still work; research shows what it has
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
+    try:  # the idea counter folded into the trials register; safe to repeat on every start
+        TrialsRegister(app.state.store).import_ledger(LEDGER)
+    except (OSError, ValueError, KeyError) as exc:
+        logging.getLogger(__name__).warning(f"couldn't fold the idea counter into the trials register: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
