@@ -42,8 +42,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    with op.batch_alter_table('trials', schema=None) as batch_op:
-        batch_op.drop_index('trials_idea_hash')
-        batch_op.drop_index('trials_definition_dataset')
-
-    op.drop_table('trials')
+    raise NotImplementedError("trials is an append-only record of every variant run: never dropped")
