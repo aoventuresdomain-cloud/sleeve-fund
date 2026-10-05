@@ -121,6 +121,40 @@ def test_clear_flattens_a_strategy_still_holding_a_position_before_archiving_it(
     assert clear(store, str(path)) == []
 
 
+def test_a_clean_slate_waiting_on_a_flatten_finishes_without_a_restart_and_touches_nothing_added_since(
+        store, sleeve, tmp_path, monkeypatch):
+    """PM, 5 Oct 2026: a fresh book once the clean slate deploys. One still holding is flattened first; the
+    supervisor retries the slate about every minute, so the book clears once it is flat rather than on the
+    next deploy, and a strategy the PM added in between is left alone."""
+    from sleeve_fund import supervisor
+    from sleeve_fund.supervisor import Supervisor
+
+    monkeypatch.setattr(supervisor, "POLL_SECONDS", 0)
+    store.set_desired_state("s", "stopped")
+    store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "fresh book"\n')
+    assert clear(store, str(path)) == []
+    store.create_sleeve(name="added-since", strategy="buy_and_hold", instrument="ETH/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=500)
+    store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
+    sup = Supervisor(store, clear_path=str(path))
+    sup.step = lambda: setattr(sup, "_stopping", True)  # one pass of the loop
+    sup.run()
+    assert "s" in store.archived() and "added-since" not in store.archived()
+    assert store.sleeve("added-since").desired_state == "running"
+    assert set(store.previous_book()) == {"s"}
+
+
+def test_the_deploy_log_says_what_the_book_holds(store, sleeve):
+    from sleeve_fund.supervisor import book_line
+
+    store.create_sleeve(name="fresh", strategy="buy_and_hold", instrument="ETH/USD",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10000, desired_state="stopped")
+    store.record_equity("s", equity=990, cash=990, qty=0, price=1, benchmark=1000)
+    assert book_line(store) == "s 1,000 (running, has history); fresh 10,000 (stopped, no history)"
+
+
 def test_clear_leaves_the_strategies_it_keeps(store, sleeve, tmp_path):
     store.set_desired_state("s", "running")
     store.create_sleeve(name="kept", strategy="buy_and_hold", instrument="ETH/USD", bar_spec="1-MINUTE-LAST-INTERNAL",

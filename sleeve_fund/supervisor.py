@@ -33,6 +33,7 @@ POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
 ALERT_EVERY = 12  # polls between alert sends and uptime pings: about a minute
+CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
@@ -66,9 +67,10 @@ def decide(sleeve: Sleeve, proc: Proc, now: datetime) -> str:
 
 
 class Supervisor:
-    def __init__(self, store: Store, python: str = sys.executable) -> None:
+    def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
         self.store = store
         self.python = python
+        self.clear_path = clear_path  # a clean slate still waiting on a flatten finishes here, not on a redeploy
         self.procs: dict[str, Proc] = {}
         self._stopping = False
 
@@ -177,6 +179,8 @@ class Supervisor:
                     self.check_keys()
                 if loops % FEE_CHECK_EVERY == 0:
                     self.check_fees()
+                if self.clear_path and loops % CLEAR_EVERY == 0 and os.path.exists(self.clear_path):
+                    clear(self.store, self.clear_path)
                 loops += 1
                 self.step()
             except Exception as exc:  # keep supervising; the dashboard shows the error
@@ -211,7 +215,8 @@ def clear(store: Store, path: str) -> list[str]:
     strategies added after it are never touched. A strategy still holding a position is not archived, since
     archiving would drop a position nobody then watches from the book (review round 11): it is flattened
     instead (a PM flatten, which also pauses it, so it opens nothing new), started if it was stopped so the
-    flatten can trade, and the entry stays open to finish on a later start, once it is flat."""
+    flatten can trade, and the entry stays open to finish once it is flat: the supervisor retries it about
+    every minute, and a retry touches only the strategies it was waiting on, never one added since."""
     with open(path, "rb") as fh:
         entries = tomllib.load(fh).get("clear", [])
     done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
@@ -222,9 +227,11 @@ def clear(store: Store, path: str) -> list[str]:
         if key in done:
             continue
         put_away = store.archived()
+        waiting = {e["sleeve"] for e in store.events_of(("clear_held",), limit=10_000)
+                   if e["message"].startswith(f"{reason}:")}
         holding = []
         for s in store.sleeves():
-            if s.name in keep or s.name in put_away:
+            if s.name in keep or s.name in put_away or (waiting and s.name not in waiting):
                 continue
             qty = store.journal_book(s.name, s.starting_balance)["qty"]
             if abs(qty) > 1e-12:
@@ -253,6 +260,19 @@ def clear(store: Store, path: str) -> list[str]:
     return cleared
 
 
+def book_line(store: Store) -> str:
+    """The current book in one line for the deploy log: each strategy with its starting balance and
+    whether it has traded or been marked yet, so a fresh book can be checked without the dashboard."""
+    archived = store.archived()
+    parts = []
+    for s in store.sleeves():
+        if s.name in archived:
+            continue
+        history = "has history" if store.fills(s.name, limit=1) or store.last_equity(s.name) else "no history"
+        parts.append(f"{s.name} {s.starting_balance:,.0f} ({s.desired_state}, {history})")
+    return "; ".join(parts) or "empty"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -260,15 +280,17 @@ def main(argv: list[str] | None = None) -> int:
     sd.add_argument("paths", nargs="+")
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
-    sub.add_parser("run", help="supervise sleeve processes until stopped")
+    rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
+    rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
     store = Store()
     if args.cmd == "seed":
         print("added:", seed(store, args.paths) or "nothing new")
     elif args.cmd == "clear":
         print("put away:", clear(store, args.path) or "nothing")
+        print("book:", book_line(store))
     else:
-        Supervisor(store).run()
+        Supervisor(store, clear_path=args.clear).run()
     return 0
 
 

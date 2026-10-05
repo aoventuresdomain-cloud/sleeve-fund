@@ -30,7 +30,7 @@ services:
     env_file:
       - path: kraken.env
         required: false
-    command: sh -c "python -m sleeve_fund.supervisor clear configs/clear.toml && python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run"
+    command: sh -c "python -m sleeve_fund.supervisor clear configs/clear.toml && python -m sleeve_fund.supervisor seed configs/sleeves/*.toml && python -m sleeve_fund.supervisor run --clear configs/clear.toml"
 
   # A compressed dump of the journal every night, proved by restoring it into a scratch database,
   # the newest 14 good ones kept (deploy/backup.sh). Lightsail's automatic snapshots copy the server.

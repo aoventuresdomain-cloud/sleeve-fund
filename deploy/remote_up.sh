@@ -39,3 +39,6 @@ docker compose ps
 # The demo mirror's first lines say whether each demo key signed in (sleeve_fund/mirror.py); never a key.
 sleep 15
 docker compose logs --no-log-prefix --tail 10 mirror || true
+# What the clean slates put away and the book left after them: each strategy's starting balance and
+# whether it has any history yet (sleeve_fund/supervisor.py, book_line).
+docker compose logs --no-log-prefix supervisor 2>/dev/null | grep -E '^(put away|book|added):' | tail -3 || true
