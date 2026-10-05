@@ -10,6 +10,7 @@ Writes to the store run on a thread of their own too, in the order the bars were
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -51,14 +52,9 @@ class Gaps:
 
 def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callable[[list[dict]], None]:
     """Hands closed bars to the history store's write path, HistoryStore.append_bars(venue, instrument, bars,
-    source), which the storage side owns: bars as (open_time_ns, open, high, low, close, volume), source "live"
-    or "refill", one call per instrument and source (a refill's bars in one call). Writes are idempotent, and a
-    refill differing from a stored bar is recorded by the store, not written over it; the hub logs those. A
-    store without append_bars yet is skipped, said once."""
-    append = getattr(history, "append_bars", None)
-    if append is None:
-        log(f"hub {venue}: the history store has no append_bars yet; bars are relayed but not stored")
-        return lambda msgs: None
+    source): bars as (open_time_ns, open, high, low, close, volume), source "live" or "refill", one call per
+    instrument and source (a refill's bars in one call). Writes are idempotent, and a refill differing from a
+    stored bar is recorded by the store, not written over it; the hub logs those."""
 
     def sink(msgs: list[dict]) -> None:
         batches: dict[tuple[str, str], list] = {}
@@ -68,9 +64,9 @@ def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callabl
                 bar = (m["ts"] - MINUTE_NS, *(float(m[k]) for k in ("o", "h", "l", "c", "v")))
                 batches.setdefault((pair, "refill" if m["refilled"] else "live"), []).append(bar)
         for (pair, source), bars in batches.items():
-            out = append(venue, pair, bars, source)
-            if getattr(out, "conflicts", None):
-                log(f"hub {venue} {pair}: {len(out.conflicts)} {source} bar(s) differ from the stored ones; "
+            out = history.append_bars(venue, pair, bars, source)
+            if out.conflicts:
+                log(f"hub {venue} {pair}: {out.conflicts} {source} bar(s) differ from the stored ones; "
                     "kept the stored, the store records the difference")
 
     return sink
@@ -111,9 +107,13 @@ class HubRelay(DataActor):
         self._store = ThreadPoolExecutor(1, thread_name_prefix="hub-store")
         self._initial = tuple(config.instrument_ids)
         self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
+        # Per instrument, [trades that arrived after their minute's bar was built, all trades], written to
+        # late_path every REFRESH_SECONDS as {pair: [late, total]} for the parity report (scripts/hub_parity.py).
+        self.late: dict[str, list[int]] = {}
+        self.late_path = None
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
-               last_close: dict[str, int] | None = None, discover=None) -> "HubRelay":
+               last_close: dict[str, int] | None = None, discover=None, late_path=None) -> "HubRelay":
         """pairs: {instrument id: pair}, kept up to date in place (the sink may hold the same dict). last_close:
         per instrument, the close of the last bar already stored, so the minutes the hub was down are refilled
         from its first bar. discover: () -> {instrument id: pair}, read every REFRESH_SECONDS, so a strategy
@@ -122,6 +122,7 @@ class HubRelay(DataActor):
         self.sink = sink or self.sink
         self.pairs = pairs if pairs is not None else {}
         self.gaps.last.update(last_close or {})
+        self.late_path = late_path
         return self
 
     # --- the fan-out asks, from its own thread ------------------------------------------
@@ -150,6 +151,7 @@ class HubRelay(DataActor):
                              callback=self._refresh)
 
     def _refresh(self, _event=None) -> None:
+        self._write_late()
         if self.discover is not None:
             try:
                 found = self.discover()
@@ -178,8 +180,22 @@ class HubRelay(DataActor):
             if inst is not None:  # sent to each client on connecting, so paper needs no venue connection of its own
                 self.definitions[iid] = inst.to_dict()
 
+    def _write_late(self) -> None:
+        if self.late_path is None:
+            return
+        counts = {self.pairs.get(iid, iid): n for iid, n in self.late.items()}
+        try:
+            tmp = self.late_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(counts))
+            tmp.replace(self.late_path)
+        except OSError as exc:
+            self.log.warning(f"hub: can't write {self.late_path}: {exc}")
+
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
+        n = self.late.setdefault(str(tick.instrument_id), [0, 0])
+        n[0] += tick.ts_event < self.gaps.last.get(str(tick.instrument_id), 0)  # its minute's bar already built
+        n[1] += 1
         self.fanout.publish(protocol.trade(tick, time.time_ns()))
 
     def on_quote(self, tick) -> None:
