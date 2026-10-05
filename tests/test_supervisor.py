@@ -252,3 +252,20 @@ def test_the_strategy_leaves_a_reload_to_the_supervisor(store, sleeve):
     rt.on_start(0.008)
     rt.tick(equity=1000, cash=1000, qty=0, price=1)
     assert store.pending_reload("s") is not None
+
+
+def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_without_a_restart(store):
+    path = "configs/sleeves/ping_pong_ls_binance.toml"
+    seed(store, [path])
+    s = store.sleeve("ping-pong-ls-binance")
+    params = {k: v for k, v in s.params.items() if k != "demo_mirror"}
+    store._update_sleeve(s.name, params=params, desired_state="running")  # as seeded before 5 Oct 11:20
+    assert seed(store, [path]) == []
+    s = store.sleeve("ping-pong-ls-binance")
+    assert s.params["demo_mirror"] is True and {k: v for k, v in s.params.items() if k != "demo_mirror"} == params
+    assert store.pending_commands(s.name) == []  # no reload: the running strategy is not restarted
+    assert store.decisions(s.name)[0]["action"] == "mirror"
+    # A PM who turned it off keeps it off.
+    store._update_sleeve(s.name, params={**params, "demo_mirror": False})
+    seed(store, [path])
+    assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False

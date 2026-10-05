@@ -1227,6 +1227,15 @@ class Store:
                                                 created_at=utcnow()))
         self.decide(actor, command, reason, sleeve)
 
+    def add_missing_param(self, sleeve: str, key: str, value) -> bool:
+        """Set one parameter a strategy has never had, without a restart (True if set). A key it already has,
+        whatever its value, is the PM's or the file's and is left alone."""
+        s = self.sleeve(sleeve)
+        if key in s.params:
+            return False
+        self._update_sleeve(sleeve, params={**s.params, key: value})
+        return True
+
     def change_settings(self, sleeve: str, *, risk_profile: str, params: dict, warmup_bars: int) -> bool:
         """Save new risk settings. A running strategy is restarted by the supervisor to trade under
         them (True); a stopped one picks them up when it next starts (False)."""
