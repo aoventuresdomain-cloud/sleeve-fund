@@ -468,6 +468,8 @@ class LongFlatStrategy(Strategy):
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
+        # Paper (v2 P1-2): the decision bar's close and arrival (ns) while on_bar decides, for each order's timing.
+        self._deciding: tuple[int, int] | None = None
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -1215,6 +1217,13 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
+        self._deciding = None
+        try:
+            self._on_bar(bar)
+        finally:
+            self._deciding = None
+
+    def _on_bar(self, bar: Bar) -> None:
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
@@ -1225,6 +1234,7 @@ class LongFlatStrategy(Strategy):
         bar = self._fill_gap(bar)
         if not self._accept(bar):
             return
+        self._deciding = (int(bar.ts_event), int(bar.ts_init))
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         if self._margin and self._backtest and self._exec_type is None:
@@ -1477,6 +1487,7 @@ class LongFlatStrategy(Strategy):
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
         """Send an order, journaling it with its reason first so the record exists before the venue sees
         it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first."""
+        decided = self.clock.timestamp_ns()
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         wait = self._cfg.maker_wait_minutes
         last, tick = self._price(), self.instrument.price_increment.as_double()
@@ -1513,6 +1524,10 @@ class LongFlatStrategy(Strategy):
             self.submit_order(order)
             if maker:
                 self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        if self.runtime is not None:
+            bar_close, bar_recv = self._deciding or (None, None)
+            self.runtime.on_timing(coid, bar_close=bar_close, bar_recv=bar_recv, decided=decided,
+                                   sent=None if coid in self._kept else self.clock.timestamp_ns())
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
@@ -2278,6 +2293,8 @@ class LongFlatStrategy(Strategy):
     def on_order_accepted(self, event) -> None:
         self._order_status(event, "accepted")
         coid = str(event.client_order_id)
+        if self.runtime is not None:
+            self.runtime.on_timing(coid, accepted=int(event.ts_event))
         if coid in self._cancel_on_accept:  # a flatten was waiting for the venue to have this order
             self._cancel_on_accept.discard(coid)
             order = self.cache.order(event.client_order_id)
@@ -2460,6 +2477,7 @@ class LongFlatStrategy(Strategy):
                 self._journal_risk_stop(order, px)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
+            self.runtime.on_timing(journal_id, fill=int(event.ts_event))
         if self._margin and self._entry_side == 0:
             self._cover_shortfall(px)
         if coid == self._risk_stop_id:

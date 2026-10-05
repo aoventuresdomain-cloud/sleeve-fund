@@ -367,6 +367,13 @@ class SleeveRuntime:
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
         self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=self.now())
 
+    def on_timing(self, order_id: str, **stamps: int | None) -> None:
+        """Paper and live (v2 P1-2): when the order's bar closed and arrived, the decision, the send, the venue's
+        acceptance and each fill (UNIX ns), for close-to-fill times per strategy. A backtest's are its own
+        replay clock, so it keeps none."""
+        if not self.backtest:
+            self.store.record_timing(self.name, order_id, **stamps)
+
     # --- display -------------------------------------------------------------------
 
     def publish_signals(self, state: dict) -> None:
