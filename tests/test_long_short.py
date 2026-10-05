@@ -631,7 +631,8 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
         store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
     # Positions: -3,000, -3,000 and +1,200. Gross 7,200 (24% of 30,000); net -4,800 (-16%).
     page = c.get("/risk", auth=AUTH).text
-    assert "7,200.00 of 30,000.00" in page and "net −16% short" in page.replace("-16%", "−16%")
+    # The Gross exposure tile is gone everywhere (UI v2, PM 5 Oct); gross and net stay on the Strategies header.
+    assert "Gross exposure" not in page and "Gross 24% · net 16% short" in page
     # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
     assert "+960.00" in page and "−960.00" in page
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
@@ -1021,8 +1022,11 @@ def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(
     book = c.get("/api/book/equity", auth=AUTH).json()
     assert book["start"] == 50_000 and book["equity"] == [40_000, 30_000]
     assert book["drawdown"] == [pytest.approx(0.2), pytest.approx(0.4)]  # from 50,000, not the 40,000 close
-    tile = c.get("/", auth=AUTH).text.split("Drawdown")[1].split("</div></div>")[0]
-    assert "40.0%" in tile and "worst 40.0%" in tile, tile
+    # The tile shows the drawdown; the worst is in its hover title (UI v2: a label and a number only).
+    page = c.get("/", auth=AUTH).text
+    before, after = page.split('<div class="k">Drawdown</div>', 1)
+    tile = before.rsplit('<div class="kpi"', 1)[1] + after.split("</div>")[0]
+    assert "40.0%" in tile and "Worst 40.0%" in tile, tile
     # One strategy whose first mark is already a loss: its chart and figures count it from its starting balance.
     store.create_sleeve(name="late", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
