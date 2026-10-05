@@ -1,14 +1,15 @@
 """Demo mirror: copies the fills of chosen paper strategies to a venue's demo account, so the PM can see the
-same trades on a real venue's own screens. A strategy on Binance is copied to Binance Demo Trading (USD-M
-futures); any other is copied to the Deribit testnet, the fallback. Demo money is not real and the paper journal
+same trades on a real venue's own screens. A strategy on Binance's USDT perpetuals is copied to Bybit Demo
+Trading (the same linear perpetual; Binance's own demo is closed to the PM's account); any other is copied to the
+Deribit testnet, the fallback. Demo money is not real and the paper journal
 stays the record of truth: the mirror never feeds anything back into a strategy, and a mirror order that fails
 is noted, not retried, so it can never trade twice.
 
 Fail-closed by construction:
-- it only ever talks to the demo hosts, demo-fapi.binance.com and test.deribit.com; any other environment or
+- it only ever talks to the demo hosts, api-demo.bybit.com and test.deribit.com; any other environment or
   host is refused. A live key is useless there: the demo systems don't know it;
-- it runs only when DEMO_MIRROR is on and a demo account's key and secret are both set (BINANCE_DEMO_API_KEY
-  and BINANCE_DEMO_API_SECRET, DERIBIT_TESTNET_API_KEY and DERIBIT_TESTNET_API_SECRET); otherwise it stays off
+- it runs only when DEMO_MIRROR is on and a demo account's key and secret are both set (BYBIT_DEMO_API_KEY
+  and BYBIT_DEMO_API_SECRET, DERIBIT_TESTNET_API_KEY and DERIBIT_TESTNET_API_SECRET); otherwise it stays off
   quietly, and a strategy whose demo account isn't set up has its fills noted as skipped;
 - it refuses to start if any other venue credential is in its environment, so a live key can't be picked up
   by mistake;
@@ -16,7 +17,7 @@ Fail-closed by construction:
   they do, sleeve_fund.paper.safety).
 
 A strategy is mirrored when its params carry demo_mirror = true. Each of its fills after the mirror first
-sees it is sent as a market order: on Binance the same quantity of the same perpetual, on Deribit the same
+sees it is sent as a market order: on Bybit the same quantity of the same perpetual, on Deribit the same
 notional rounded to the testnet contract (inverse perpetuals sized in USD); labelled with the strategy and fill.
 
     python -m sleeve_fund.mirror run
@@ -39,13 +40,16 @@ from dataclasses import dataclass
 FLAG_ENV = "DEMO_MIRROR"
 KEY_ENV = "DERIBIT_TESTNET_API_KEY"
 SECRET_ENV = "DERIBIT_TESTNET_API_SECRET"
-BINANCE_KEY_ENV = "BINANCE_DEMO_API_KEY"
-BINANCE_SECRET_ENV = "BINANCE_DEMO_API_SECRET"
+BYBIT_KEY_ENV = "BYBIT_DEMO_API_KEY"
+BYBIT_SECRET_ENV = "BYBIT_DEMO_API_SECRET"
 # Each demo account: (key variable, secret variable). A strategy's venue picks its account (target_for).
-ACCOUNTS = {"DERIBIT": (KEY_ENV, SECRET_ENV), "BINANCE": (BINANCE_KEY_ENV, BINANCE_SECRET_ENV)}
+ACCOUNTS = {"DERIBIT": (KEY_ENV, SECRET_ENV), "BYBIT": (BYBIT_KEY_ENV, BYBIT_SECRET_ENV)}
 TESTNET_HOST = "test.deribit.com"
-BINANCE_DEMO_HOST = "demo-fapi.binance.com"
-BINANCE_DEMO_URL = f"https://{BINANCE_DEMO_HOST}"
+BYBIT_DEMO_HOST = "api-demo.bybit.com"
+BYBIT_DEMO_URL = f"https://{BYBIT_DEMO_HOST}"
+# Bybit linear perpetuals the mirror copies to: symbol -> (quantity step, which is also the smallest order, and the
+# smallest notional in USDT), from Bybit's instrument list. A fill on anything else is noted as skipped.
+BYBIT_CONTRACTS = {"BTCUSDT": (0.001, 5.0), "ETHUSDT": (0.01, 5.0)}
 # Our instrument -> the testnet perpetual and its contract size in USD.
 CONTRACTS = {"BTC/USD": ("BTC-PERPETUAL", 10.0), "ETH/USD": ("ETH-PERPETUAL", 1.0)}
 POLL_SECONDS = 10
@@ -80,7 +84,7 @@ class Settings:
 
 
 def settings(environ: dict[str, str] | None = None) -> tuple[dict[str, Settings], str]:
-    """The demo accounts the mirror should copy to, {"BINANCE" | "DERIBIT": credentials}: each one whose key
+    """The demo accounts the mirror should copy to, {"BYBIT" | "DERIBIT": credentials}: each one whose key
     and secret are both set, once DEMO_MIRROR is on. Empty, with why, when the mirror is off."""
     from sleeve_fund.paper.safety import credential_var
 
@@ -166,93 +170,105 @@ class Testnet:
         return float(self.call("private/get_position", {"instrument_name": instrument}, private=True)["size"])
 
 
-def binance_demo_url(url: str = BINANCE_DEMO_URL) -> str:
-    """Binance Demo Trading's USD-M futures API root. Any other host, the live one included, is refused."""
+def bybit_demo_url(url: str = BYBIT_DEMO_URL) -> str:
+    """Bybit Demo Trading's V5 API root. Any other host, the live one and the testnet included, is refused."""
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != BINANCE_DEMO_HOST:
-        raise MirrorRefused(f"the demo mirror trades on Binance Demo Trading ({BINANCE_DEMO_HOST}) only, not {url}")
+    if parsed.scheme != "https" or parsed.hostname != BYBIT_DEMO_HOST:
+        raise MirrorRefused(f"the demo mirror trades on Bybit Demo Trading ({BYBIT_DEMO_HOST}) only, not {url}")
     return url.rstrip("/")
 
 
-def _http(method: str, url: str, headers: dict[str, str]):
-    req = urllib.request.Request(url, headers=headers, method=method)
+def _http(method: str, url: str, headers: dict[str, str], body: bytes | None = None):
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.load(r)
-    except urllib.error.HTTPError as e:  # Binance answers errors as JSON: {"code": -2019, "msg": "..."}
+    except urllib.error.HTTPError as e:  # Bybit answers most errors as JSON: {"retCode": 10001, "retMsg": "..."}
         try:
             return json.load(e)
         except ValueError:
             raise e from None
 
 
-class BinanceDemo:
-    """Binance Demo Trading's USD-M futures REST API, signed as Binance signs it (HMAC-SHA256 of the query),
-    on the demo host only. Mirrors strategies on Binance: the same perpetual, the same quantity."""
+class BybitDemo:
+    """Bybit Demo Trading's V5 REST API, signed as Bybit signs it (HMAC-SHA256 of timestamp, key, receive window
+    and the query or body), on the demo host only. Mirrors strategies on Binance's USD-M perpetuals to the same
+    linear USDT perpetual on Bybit, the same quantity. Bybit's demo allows 5 requests a second; the mirror sends
+    one or two per fill."""
 
-    label, host, unit = "Binance Demo Trading", BINANCE_DEMO_HOST, "contracts"
+    label, host, unit = "Bybit Demo Trading", BYBIT_DEMO_HOST, "contracts"
+    RECV_WINDOW = "10000"
 
-    def __init__(self, creds: Settings, http=_http, url: str = BINANCE_DEMO_URL, clock=time.time) -> None:
-        self.url = binance_demo_url(url)
+    def __init__(self, creds: Settings, http=_http, url: str = BYBIT_DEMO_URL, clock=time.time) -> None:
+        self.url = bybit_demo_url(url)
         self._creds, self._http, self._clock = creds, http, clock
-        self._info: dict = {}
 
-    def call(self, method: str, path: str, params: dict | None = None, signed: bool = False):
-        q = dict(params or {})
-        headers = {}
-        if signed:
-            q.update(timestamp=int(self._clock() * 1000), recvWindow=10_000)
-            query = urllib.parse.urlencode(q)
-            sig = hmac.new(self._creds.secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-            query += f"&signature={sig}"
-            headers["X-MBX-APIKEY"] = self._creds.key
+    def call(self, method: str, path: str, params: dict | None = None):
+        """A private V5 call; returns its result. GET sends params as the query, POST as a JSON body."""
+        params = dict(params or {})
+        ts = str(int(self._clock() * 1000))
+        if method == "GET":
+            payload, body, url = urllib.parse.urlencode(params), None, f"{self.url}{path}"
+            if params:
+                url += f"?{payload}"
         else:
-            query = urllib.parse.urlencode(q)
-        out = self._http(method, f"{self.url}{path}" + (f"?{query}" if query else ""), headers)
-        if isinstance(out, dict) and "code" in out and "msg" in out and out["code"] != 200:
-            raise RuntimeError(f"Binance Demo Trading {path}: {out['msg']} ({out['code']})")
-        return out
+            payload = json.dumps(params, separators=(",", ":"))
+            body, url = payload.encode(), f"{self.url}{path}"
+        sig = hmac.new(self._creds.secret.encode(), (ts + self._creds.key + self.RECV_WINDOW + payload).encode(),
+                       hashlib.sha256).hexdigest()
+        headers = {"X-BAPI-API-KEY": self._creds.key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": self.RECV_WINDOW,
+                   "X-BAPI-SIGN": sig, "Content-Type": "application/json"}
+        out = self._http(method, url, headers, body)
+        if not isinstance(out, dict) or out.get("retCode") != 0:
+            msg = out.get("retMsg", out) if isinstance(out, dict) else out
+            code = out.get("retCode", "") if isinstance(out, dict) else ""
+            raise RuntimeError(f"Bybit Demo Trading {path}: {msg} ({code})")
+        return out.get("result") or {}
 
     @staticmethod
     def owns(instrument: str) -> bool:
-        return instrument.isalnum()  # Binance's own symbols, BTCUSDT; Deribit's carry a dash
+        return instrument in BYBIT_CONTRACTS
 
-    def size(self, sleeve, fill: dict) -> tuple[str | None, float, str]:
+    @staticmethod
+    def size(sleeve, fill: dict) -> tuple[str | None, float, str]:
         """(symbol, quantity, why it is skipped or ""): the fill's own quantity, at the contract's step, if it
-        clears the smallest order and notional the demo venue takes."""
-        from sleeve_fund.venues import binance_contract, binance_symbol
-
-        if not self._info:
-            self._info = self.call("GET", "/fapi/v1/exchangeInfo")
-        try:
-            c = binance_contract(sleeve.instrument, get_json=lambda url: self._info)
-        except ValueError as e:
-            return None, 0.0, str(e)
-        symbol = binance_symbol(sleeve.instrument)
-        qty = round(float(fill["qty"]), c["size_precision"])
-        if qty < c["min_quantity"] or qty * fill["price"] < c["min_notional"]:
+        clears the smallest order and notional Bybit takes."""
+        symbol = sleeve.instrument.replace("/", "").upper()
+        contract = BYBIT_CONTRACTS.get(symbol)
+        if contract is None:
+            return None, 0.0, f"no Bybit demo perpetual set up for {sleeve.instrument}"
+        step, min_notional = contract
+        qty = round(round(float(fill["qty"]) / step) * step, 8)
+        if qty < step or qty * fill["price"] < min_notional:
             return symbol, 0.0, (f"{fill['qty']:.8g} ({fill['qty'] * fill['price']:,.2f} USDT) is under the smallest "
-                                 f"order the demo venue takes ({c['min_quantity']:g}, {c['min_notional']:g} USDT)")
+                                 f"order Bybit takes ({step:g}, {min_notional:g} USDT)")
         return symbol, qty, ""
 
     def market(self, side: str, instrument: str, amount: float, label: str) -> tuple[str, float | None]:
-        # Binance takes client order ids of up to 36 characters from [.A-Z:/a-z0-9_-].
-        cid = "".join(ch if ch.isalnum() or ch in "._:/-" else "-" for ch in label)[:36]
-        r = self.call("POST", "/fapi/v1/order", {"symbol": instrument, "side": side, "type": "MARKET",
-                                                  "quantity": f"{amount:.8f}".rstrip("0").rstrip("."),
-                                                  "newClientOrderId": cid, "newOrderRespType": "RESULT"}, signed=True)
-        avg = float(r.get("avgPrice") or 0) or None
-        return str(r.get("orderId", "")), avg
+        # Bybit takes order link ids of up to 36 characters: letters, digits, - and _.
+        link = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label)[:36]
+        r = self.call("POST", "/v5/order/create", {
+            "category": "linear", "symbol": instrument, "side": "Buy" if side == "BUY" else "Sell",
+            "orderType": "Market", "qty": f"{amount:.8f}".rstrip("0").rstrip("."), "positionIdx": 0,
+            "orderLinkId": link})
+        order_id = str(r.get("orderId", ""))
+        try:  # the create answer has no price; one look-up for it, and a miss costs only the price
+            rows = self.call("GET", "/v5/order/realtime", {"category": "linear", "orderId": order_id}).get("list") or []
+            avg = (float(rows[0].get("avgPrice") or 0) or None) if rows else None
+        except Exception:  # noqa: BLE001 - the order went in; its price is a nicety
+            avg = None
+        return order_id, avg
 
     def position(self, instrument: str) -> float:
-        rows = self.call("GET", "/fapi/v2/positionRisk", {"symbol": instrument}, signed=True)
-        return sum(float(r.get("positionAmt", 0)) for r in rows)
+        rows = self.call("GET", "/v5/position/list", {"category": "linear", "symbol": instrument}).get("list") or []
+        sides = {"Buy": 1.0, "Sell": -1.0}
+        return sum(sides.get(r.get("side"), 0.0) * float(r.get("size") or 0) for r in rows)
 
 
 def target_for(sleeve) -> str:
-    """The demo account a strategy's fills go to: Binance Demo Trading for a strategy on Binance, else the
-    Deribit testnet."""
-    return "BINANCE" if (sleeve.venue or "").upper() == "BINANCE" else "DERIBIT"
+    """The demo account a strategy's fills go to: Bybit Demo Trading for a strategy on Binance's USDT
+    perpetuals (Binance's own demo is closed to the PM's account), else the Deribit testnet."""
+    return "BYBIT" if (sleeve.venue or "").upper() == "BINANCE" else "DERIBIT"
 
 
 def mirrored(store) -> list:
@@ -262,7 +278,7 @@ def mirrored(store) -> list:
 
 def mirror_once(store, targets: dict) -> int:
     """Copy every mirrored strategy's new fills to its demo account; returns how many orders were sent.
-    targets: {"BINANCE" | "DERIBIT": the demo account's client}, those set up."""
+    targets: {"BYBIT" | "DERIBIT": the demo account's client}, those set up."""
     sent = 0
     for s in mirrored(store):
         name = target_for(s)
@@ -279,7 +295,7 @@ def mirror_once(store, targets: dict) -> int:
         for f in store.fills_after(s.name, mark):
             if venue is None:
                 store.record_mirror(s.name, fill_id=f["id"], status="skipped",
-                                    message=f"no demo account set up for {name.title()}")
+                                    message=f"no {name.title()} demo account set up")
                 continue
             try:
                 instrument, amount, why = venue.size(s, f)
@@ -346,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(3600)
     from sleeve_fund.store import Store
 
-    clients = {"BINANCE": BinanceDemo, "DERIBIT": Testnet}
+    clients = {"BYBIT": BybitDemo, "DERIBIT": Testnet}
     targets = {name: clients[name](c) for name, c in creds.items()}
     print("demo mirror on: " + ", ".join(f"{t.label} ({t.url})" for t in targets.values()), flush=True)
     run(Store(), targets)

@@ -28,7 +28,7 @@ mv .env.tmp .env
 # Optional alert settings and the demo mirror's demo keys follow their GitHub secrets too; an unset
 # secret removes the line. Only the mirror container is given the demo keys (docker-compose.yml).
 for var in ALERT_WEBHOOK_URL HEALTHCHECK_PING_URL DEMO_MIRROR DERIBIT_TESTNET_API_KEY DERIBIT_TESTNET_API_SECRET \
-           BINANCE_DEMO_API_KEY BINANCE_DEMO_API_SECRET; do
+           BYBIT_DEMO_API_KEY BYBIT_DEMO_API_SECRET; do
   grep -v "^$var=" .env > .env.tmp || true
   if [ -n "${!var:-}" ]; then printf '%s=%s\n' "$var" "${!var}" >> .env.tmp; fi
   mv .env.tmp .env
