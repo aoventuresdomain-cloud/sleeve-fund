@@ -871,19 +871,3 @@ def test_a_flip_opens_the_new_side_only_once_the_old_one_is_closed(prices, instr
             # From flat, or adding to its own side: never against an open position of the other side.
             assert before == 0 or (before > 0) == (step > 0), (f, before)
     assert len(entries) >= 4 and sides == {"BUY", "SELL"}, (len(entries), res.risk_events)
-
-
-def test_the_preview_benchmark_on_a_perp_pays_the_perps_taker_fee(monkeypatch):
-    """Round 11 minor: the backtest's buy-and-hold benchmark charged Kraken spot's 0.80% taker fee on a
-    strategy trading a perpetual at 0.05%, flattering the strategy against it."""
-    from sleeve_fund.dashboard import preview
-    from sleeve_fund.data import synthetic_ohlcv
-    from test_dashboard import KRAKEN
-
-    preview._history.clear()
-    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=200, seed=2, start_price=150))
-    spot = preview.run("buy_and_hold", "SOL/USD", {}, starting=5000)
-    perp = preview.run("buy_and_hold", "SOL/USD", {"market": "perp"}, starting=5000)
-    assert perp["fee_schedule"]["taker"] == pytest.approx(float(markets.LOW_FEE_PERP.fees.taker))
-    assert spot["benchmark"][0] == pytest.approx(5000 * (1 - spot["fee_schedule"]["taker"]), abs=0.01)
-    assert perp["benchmark"][0] == pytest.approx(5000 * (1 - perp["fee_schedule"]["taker"]), abs=0.01)

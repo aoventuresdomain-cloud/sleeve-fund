@@ -321,9 +321,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
                        half_spread=spread.half_spread, bar_minutes=minutes, progress=tick)
     if keep is not None:
         keep["journal"] = res.journal
-    fee_view = _fee_view(params, inst, quote_fees)
-    # Bought on the strategy's own market: a perpetual's taker fee, not the spot schedule (round 11 minor).
-    bench = benchmark(prices, starting, fee_view["taker"], cap if cap is not None else 1.0)
+    bench = benchmark(prices, starting, float(inst.taker_fee), cap if cap is not None else 1.0)
     # The worst drawdown over every mark, before the daily closes below hide the intraday low: the
     # journal marks each execution bar (as paper marks every tick), the curve each decision bar.
     worst = max_drawdown(res.equity)
@@ -333,7 +331,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     if exec_prices is not None:  # hold the benchmark to the same standard, on the same execution bars
         fine = exec_prices[exec_prices.index >= prices.index[0]]
         c = cap if cap is not None else 1.0
-        held = starting * (1 - c) + starting * c * (1 - fee_view["taker"]) * fine["close"] / prices["close"].iloc[0]
+        held = starting * (1 - c) + starting * c * (1 - float(inst.taker_fee)) * fine["close"] / prices["close"].iloc[0]
         bench_worst = max_drawdown(pd.concat([bench, held]).sort_index())
     if minutes < 1440:  # judge returns day by day, whatever the bar length, so Sharpe is annualised right
         equity, bench = _daily(res.equity), _daily(bench)
@@ -369,7 +367,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "errors": _errors(res.handler_errors, res.handler_error_count),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "short": spread.short, "source": spread.source},
-        "fee_schedule": fee_view,
+        "fee_schedule": _fee_view(params, inst, quote_fees),
     }
     if detail:
         from sleeve_fund.dashboard import trading
