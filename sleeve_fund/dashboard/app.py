@@ -187,10 +187,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves, frames, summaries = book_data()
         put_away = st().archived()
         earlier = st().previous_book()
+        names = [s.name for s in sleeves]
+        # The bottom tabs: the book's positions, working orders, latest fills and funding, from the same
+        # journal the strategy pages read. Every strategy in the book counts, archived ones still holding too.
+        working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
+                   if o["sleeve"] in names]
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
-                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves))
+                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves),
+                    positions=trading.book_positions(st(), summaries), working=working,
+                    book_fills=trading.book_fills(st(), sleeves), funding=trading.book_funding(st(), summaries),
+                    fill_count=sum(x["fills"] for x in summaries), reasons=COMMON_REASONS)
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""

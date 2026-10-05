@@ -644,6 +644,62 @@ table.movers .mv i.gain { background: var(--gain); } table.movers .mv i.loss { b
 table.movers tfoot th, table.movers tfoot td { border-top: 1px solid var(--line-strong); border-bottom: 0; color: var(--text); font-weight: 550; }
 td.health { line-height: 1.35; }
 
+/* --- Portfolio page ------------------------------------------------------------ */
+/* KPI boxes: one row of equal boxes on a wide desk (as many columns as boxes), two to a row on a phone
+   with the lead figure full width. */
+.kpis { display: grid; grid-auto-flow: column; grid-template-columns: minmax(0, 1.3fr); grid-auto-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 16px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 9px 12px; min-width: 0; }
+.kpi .k { display: flex; align-items: center; color: var(--muted); font-size: 11.5px; font-weight: 500; white-space: nowrap; }
+.kpi .k .help { flex: none; margin-left: 3px; }
+.kpi .v { font-size: 17px; font-weight: 550; letter-spacing: -0.02em; white-space: nowrap; margin-top: 3px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; }
+.kpi .s { color: var(--muted); font-size: 11.5px; margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
+.kpi.lead { background: linear-gradient(160deg, var(--accent-soft), var(--panel) 70%); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+.kpi.lead .v { font-size: 21px; letter-spacing: -0.03em; }
+@media (min-width: 901px) and (max-width: 1399px) { .kpis { grid-auto-flow: row; grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+@media (min-width: 1400px) and (max-width: 1599px) { .kpi .k { font-size: 11px; } .kpi .v { font-size: 16px; } }
+@media (max-width: 900px) {
+  .kpis { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi.lead { grid-column: 1 / -1; }
+  .kpi.lead .v { font-size: 26px; }
+  .kpi .v { font-size: 16px; }
+}
+/* Beside the chart: what moved the book, then what needs attention, in one panel. */
+.side-panel { display: flex; flex-direction: column; gap: 14px; }
+.side-panel .attn { border-top: 1px solid var(--line); padding-top: 12px; }
+.side-panel .attn .alerts li { grid-template-columns: 1fr auto; margin-bottom: 6px; padding: 8px 10px; border: 0; border-radius: var(--r-sm); background: var(--warn-bg); }
+.side-panel .attn .alerts li.error { background: var(--loss-bg); }
+.side-panel .attn .alerts li::before { display: none; }
+.side-panel .attn .empty { padding: 4px 0; }
+/* The bottom tabs sit flush on their panels. */
+nav.book-tabs { margin-bottom: 0; border-bottom: 0; padding: 0 6px; background: var(--page); }
+nav.book-tabs a[aria-current] { border-bottom-color: var(--warn); }
+.tab-panel > .panel.flush:first-child { border-top-left-radius: 0; }
+.tab-panel > details.archived { margin-top: 14px; }
+/* Positions: one row each with the P&L split and a total; on a phone a card each. */
+table.book-pos th, table.book-pos td { padding-left: 8px; padding-right: 8px; }
+table.book-pos th:first-child, table.book-pos td:first-child { padding-left: 18px; }
+table.book-pos th:last-child, table.book-pos td:last-child { padding-right: 14px; }
+table.book-pos tfoot th, table.book-pos tfoot td { border-top: 1px solid var(--line-strong); border-bottom: 0; font-weight: 550; color: var(--text); background: var(--hover); }
+table.book-pos tfoot th { text-align: left; }
+.lev { display: inline-block; padding: 0 4px; border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); border-radius: 4px; color: var(--warn); font-size: 11px; font-weight: 500; line-height: 16px; }
+button.close-btn { color: var(--loss); border-color: color-mix(in srgb, var(--loss) 45%, transparent); }
+button.close-btn:hover { color: var(--loss); background: var(--loss-bg); }
+.pos-cards { display: none; list-style: none; margin: 0; padding: 0; }
+.pos-cards li { display: grid; gap: 4px; padding: 11px 14px; border-top: 1px solid var(--line); font-size: 12.5px; }
+.pos-cards .r { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.pos-cards .m { color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }
+.pos-cards .g3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; color: var(--faint); font-size: 11.5px; }
+.pos-cards .g3 b { display: block; font-weight: 550; font-size: 13px; color: var(--text); }
+.pos-cards li.tot { background: var(--hover); border-top-color: var(--line-strong); }
+@media (max-width: 900px) { table.book-pos { display: none; } .pos-cards { display: block; } }
+.fund-split { margin: 0; padding: 8px 18px 14px; font-size: 12.5px; }
+/* Allocation: a ring beside the table. */
+.alloc { display: flex; align-items: center; gap: 18px; }
+.alloc .donut { flex: none; width: 128px; height: 128px; border-radius: 50%;
+  -webkit-mask: radial-gradient(circle, transparent 55%, #000 56%); mask: radial-gradient(circle, transparent 55%, #000 56%); }
+.alloc table { flex: 1; min-width: 0; }
+@media (max-width: 560px) { .alloc { flex-direction: column; align-items: stretch; } .alloc .donut { align-self: center; } }
+
 /* --- exit plan under the stop and target fields ----------------------------- */
 .exit-fields .grid2 + .grid2 { margin-top: 12px; }
 .exit-plan { margin: 12px 0 0; padding: 9px 12px; border-radius: var(--r-sm); background: var(--neutral-bg); font-size: 13px; line-height: 1.5; }

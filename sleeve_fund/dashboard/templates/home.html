@@ -1,47 +1,50 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, help, book_tabs, pts %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, help, pts, tag %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
   <h1>Portfolio</h1>
   <div class="actions"><a class="button secondary" href="/sleeves/new">New strategy</a></div>
   <p class="lede">
+    Paper · {{ book.sleeves }} strateg{{ 'ies' if book.sleeves != 1 else 'y' }}, {{ book.running }} running.
     {% if book.attention %}<span class="loss">{{ book.attention }} strategy{{ 's' if book.attention != 1 }} halted and waiting for you.</span>
     {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} strategy{{ 's' if book.unhealthy != 1 }} not reporting.</span>
     {% else %}All strategies healthy.{% endif %}
     After fees.
   </p>
 </div>
-{{ book_tabs('overview') }}
 
 {% if summaries or archived %}
-<section class="ledger" aria-label="Book figures">
-  <div><div class="k">Book equity {{ help('equity') }}</div><div class="v lead">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
-  <div><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">since 00:00 UTC</div></div>
-  <div><div class="k">Month to date {{ help('mtd') }}</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
-  <div><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">benchmark: {{ book.bench_ret|pct1s }}</div></div>
-  <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} in positions · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
-  <div><div class="k">Cash {{ help('cash') }}</div><div class="v">{{ book.cash|money }}</div><div class="s">open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
-  <div><div class="k">Drawdown {{ help('drawdown') }}</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
-  <div><div class="k">Sharpe {{ help('sharpe') }}</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
-  <div><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ book.fees|money }}</div><div class="s">volatility {{ book.vol|pctn0 }} a year</div></div>
+{# Nine figures for the whole book, one box each; on a phone two to a row under a full-width book equity. #}
+{% set day_base = book.equity - book.day_pnl %}
+{% set near_halt = (summaries|map(attribute='dd_used')|max) if summaries else 0 %}
+<section class="kpis" aria-label="Book figures">
+  <div class="kpi lead"><div class="k">Book equity {{ help('equity') }}</div><div class="v">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
+  <div class="kpi"><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">{% if day_base > 0 %}{{ (book.day_pnl / day_base)|pct }} · {% endif %}since 00:00 UTC</div></div>
+  <div class="kpi"><div class="k">Month to date {{ help('mtd') }}</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
+  <div class="kpi"><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">{{ book.pnl|smoney }} · buy-and-hold {{ book.bench_ret|pct1s }}</div></div>
+  <div class="kpi"><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
+  <div class="kpi"><div class="k">Cash {{ help('cash') }}</div><div class="v">{{ (book.cash / book.equity if book.equity > 0 else 0)|pct0 }}</div><div class="s">{{ book.cash|money }} · open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
+  <div class="kpi"><div class="k">Drawdown {{ help('drawdown') }}</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}{% if summaries %} · <span class="{{ 'loss' if near_halt >= 0.8 else ('warn' if near_halt >= 0.5) }}" title="The strategy nearest its halt line has used this share of the drawdown its risk profile allows">nearest halt {{ near_halt|pct0 }} used</span>{% endif %}</div></div>
+  <div class="kpi"><div class="k">Sharpe {{ help('sharpe') }}</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }} · volatility {{ book.vol|pctn0 }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
+  <div class="kpi"><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ book.fees|money }}</div><div class="s">{{ '{:,}'.format(fill_count) }}{{ '+' if summaries|selectattr('fills', 'ge', 10000)|list }} fill{{ 's' if fill_count != 1 }}</div></div>
 </section>
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h">
     <div class="panel-head"><h2 id="curve-h">Book equity</h2>
       <div class="right chart-tools">
+        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
         <button type="button" class="toggle" data-compare aria-pressed="false" title="Show return against buying and holding the instrument">vs buy-and-hold</button>
-        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
       </div></div>
     <div class="chart"><canvas id="eq" aria-label="Book equity by day"></canvas></div>
     <div class="chart short"><canvas id="dd" aria-label="Book drawdown by day"></canvas></div>
   </section>
-  <div class="span-4 col-stack">
   {% set movers = summaries|sort(attribute='day_pnl')|reverse|list %}
   {% set scale = [movers|map(attribute='day_pnl')|map('abs')|max, 0.01]|max if movers else 1 %}
-  <section class="panel" aria-labelledby="move-h">
-    <div class="panel-head"><h2 id="move-h">What moved the book</h2></div>
+  <div class="panel span-4 side-panel">
+  <section aria-labelledby="move-h">
+    <div class="panel-head"><h2 id="move-h">What moved the book today</h2></div>
     <table class="compact movers">
       <thead><tr><th>Strategy</th><th class="bar-col" aria-hidden="true"></th><th class="num">Today</th><th class="num">Month</th></tr></thead>
       <tbody>{% for x in movers %}{% set w = (x.day_pnl|abs / scale * 50)|round(1) %}
@@ -52,7 +55,7 @@
       <tfoot><tr><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(book.day_pnl) }}</td><td class="num">{{ money_signed(book.mtd_pnl) }}</td></tr></tfoot>
     </table>
   </section>
-  <section class="panel" aria-labelledby="alerts-h">
+  <section class="attn" aria-labelledby="alerts-h">
     <div class="panel-head"><h2 id="alerts-h">Needs attention</h2><a class="right" href="/alerts">All alerts</a></div>
     {% if alerts %}
     <ul class="alerts">
@@ -67,19 +70,70 @@
   </div>
 </div>
 
-<section class="panel flush" aria-labelledby="sleeves-h" style="margin-bottom:14px">
+{# The book in detail, one tab at a time; the address keeps the tab (#positions, #orders...), as on a strategy's
+   page. Without JavaScript every tab shows, one after another. #}
+<nav class="tabs desk-tabs book-tabs" role="tablist" aria-label="Book views" data-tabs data-live="book-tabs">
+  <a href="#positions" role="tab" data-tab="positions">Positions<span class="n">{{ positions.rows|length }}</span></a>
+  <a href="#strategies" role="tab" data-tab="strategies">Strategies<span class="n">{{ summaries|length }}</span></a>
+  <a href="#orders" role="tab" data-tab="orders">Open orders<span class="n">{{ working|length }}</span></a>
+  <a href="#history" role="tab" data-tab="history">Trade history</a>
+  <a href="#funding" role="tab" data-tab="funding">Funding</a>
+  <a href="#allocation" role="tab" data-tab="allocation">Allocation</a>
+</nav>
+
+<div class="tab-panel" id="tab-positions" role="tabpanel" data-panel="positions">
+<section class="panel flush" aria-labelledby="positions-h">
+  <div class="panel-head"><h2 id="positions-h">Open positions</h2><span class="hint">realised and fees are since each strategy started</span></div>
+  {% if positions.rows %}
+  <table class="book-pos">
+    <thead><tr><th>Strategy</th><th>Instrument</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">Liq. price</th><th>Stop</th>
+      <th class="num">Unrealised</th><th class="num">Realised</th><th class="num">Fees paid</th><th><span class="sr-only">Close</span></th></tr></thead>
+    <tbody>{% for p in positions.rows %}{% set base = p.pair.split('/')[0] %}
+    <tr><td class="cell-name"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a></td>
+      <td>{{ p.pair }}</td>
+      <td><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span>{% if p.perp %}{% if p.perp.leverage %} <span class="lev">{{ '%.1f'|format(p.perp.leverage) }}×</span>{% endif %}{% else %} <span class="faint">spot</span>{% endif %}</td>
+      <td class="num">{{ p.qty|abs|qty }} {{ base }}</td>
+      <td class="num">{{ p.entry_px|px }}</td>
+      <td class="num">{{ p.price|px }}</td>
+      <td class="num">{% if p.perp and p.perp.liq_px %}<span class="{{ 'loss' if p.perp.to_liq < 0.1 else ('warn' if p.perp.to_liq < 0.25) }}" title="{{ p.perp.to_liq|pct1 }} away">{{ p.perp.liq_px|px }}</span>{% elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>{% else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif %}</td>
+      <td>{% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn" title="No stop-loss on this position">none</span>{% endif %}</td>
+      <td class="num">{{ money_signed(p.unrealised) }}<div class="sub">{{ p.unrealised_ret|pct1s }}</div></td>
+      <td class="num">{{ money_signed(p.realised) }}</td>
+      <td class="num">{{ p.fees|money }}</td>
+      <td class="close-cell"><button type="button" class="quiet close-btn" data-open="dlg-close-{{ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Close</button></td></tr>
+    {% endfor %}</tbody>
+    <tfoot><tr><th scope="row" colspan="8">Total, {{ positions.rows|length }} position{{ 's' if positions.rows|length != 1 }}</th>
+      <td class="num">{{ money_signed(positions.unrealised) }}</td><td class="num">{{ money_signed(positions.realised) }}</td><td class="num">{{ positions.fees|money }}</td><td></td></tr></tfoot>
+  </table>
+  {# Phones: a card per position, its three P&L figures on one line. #}
+  <ul class="pos-cards">{% for p in positions.rows %}{% set base = p.pair.split('/')[0] %}
+    <li><div class="r"><span><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span> <strong>{{ p.pair }}</strong>{% if p.perp and p.perp.leverage %} <span class="lev">{{ '%.1f'|format(p.perp.leverage) }}×</span>{% endif %}</span>
+        <button type="button" class="quiet close-btn" data-open="dlg-close-{{ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Close</button></div>
+      <div class="m"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a> · {{ p.qty|abs|qty }} {{ base }} · entry {{ p.entry_px|px }} · mark {{ p.price|px }}</div>
+      <div class="m">Stop {% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn">none</span>{% endif %}{% if p.perp %} · liq. price {% if p.perp.liq_px %}{{ p.perp.liq_px|px }}{% else %}none{% endif %}{% endif %}</div>
+      <div class="g3"><span>Unrealised<b>{{ money_signed(p.unrealised) }}</b></span><span>Realised<b>{{ money_signed(p.realised) }}</b></span><span>Fees paid<b>{{ p.fees|money }}</b></span></div></li>
+    {% endfor %}
+    <li class="tot"><div class="m">Total, {{ positions.rows|length }} position{{ 's' if positions.rows|length != 1 }}</div>
+      <div class="g3"><span>Unrealised<b>{{ money_signed(positions.unrealised) }}</b></span><span>Realised<b>{{ money_signed(positions.realised) }}</b></span><span>Fees paid<b>{{ positions.fees|money }}</b></span></div></li>
+  </ul>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">All in cash. A position appears here as soon as a strategy buys or sells short.</p>{% endif %}
+</section>
+</div>
+
+<div class="tab-panel" id="tab-strategies" role="tabpanel" data-panel="strategies">
+<section class="panel flush" aria-labelledby="sleeves-h">
   <div class="panel-head"><h2 id="sleeves-h">Strategies</h2></div>
-  <table class="responsive sortable" data-hide-xl="9" data-hide-lg="3 9 11" data-hide-md="8 10">
+  <table class="responsive sortable" data-hide-xl="3 9" data-hide-lg="3 9 12" data-hide-md="8 10">
     <thead><tr>
       <th data-sort="text">Strategy</th><th data-sort="text">Status</th><th>Last 60 days</th>
       <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
       <th class="num" data-sort="num" title="Strategy return minus buy-and-hold return over the same period, in percentage points">vs buy-and-hold</th>
       <th class="num" data-sort="num">Exposure</th><th class="num" data-sort="num">Closed trades</th>
-      <th data-sort="num">Drawdown of limit</th><th>Health</th>
+      <th data-sort="num">Drawdown of limit</th><th class="num" data-sort="num" title="How much the strategy can still lose before its drawdown limit halts it">Room to halt</th><th>Health</th>
     </tr></thead>
     <tbody>
-    {% if not summaries %}<tr><td colspan="11" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
-    {% for x in summaries %}{% set s = x.sleeve %}
+    {% if not summaries %}<tr><td colspan="12" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
+    {% for x in summaries %}{% set s = x.sleeve %}{% set room = [x.profile.max_drawdown - x.drawdown, 0]|max * [x.equity, 0]|max %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
       <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
@@ -91,6 +145,7 @@
       <td class="num" data-v="{{ x.exposure }}" data-m="hide">{{ x.exposure|pct0 }}</td>
       <td class="num" data-v="{{ x.trades.trades }}" data-m="hide">{{ x.trades.trades }}{% if x.trades.trades %} <span class="muted">· {{ x.trades.win_rate|pct0 }} won</span>{% endif %}</td>
       <td data-v="{{ x.dd_used }}" data-m="hide">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
+      <td class="num" data-v="{{ room }}" data-label="Room to halt"><span class="{{ 'loss' if x.dd_used >= 0.8 else ('warn' if x.dd_used >= 0.5) }}">{{ room|money }}</span></td>
       <td data-m="hide" class="health">
         {% if s.desired_state == 'stopped' %}<span class="muted">Stopped</span>
         {% elif x.healthy %}<span title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot ok"></span>{{ s.heartbeat_at|ago }}</span>
@@ -104,7 +159,7 @@
 </section>
 
 {% if archived %}
-<details class="panel archived" style="margin-bottom:14px">
+<details class="panel archived">
   <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
@@ -113,23 +168,96 @@
 {% endif %}
 
 {% if earlier %}
-<details class="panel archived" style="margin-bottom:14px">
+<details class="panel archived">
   <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away when a new book began on {{ book_start.strftime('%d %b %Y') }}; kept with their history, and left out of this book's figures</span></summary>
   <ul class="feed" style="margin-top:10px">{% for s in earlier %}
     <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}
+</div>
 
+<div class="tab-panel" id="tab-orders" role="tabpanel" data-panel="orders">
+<section class="panel flush" aria-labelledby="open-orders-h">
+  <div class="panel-head"><h2 id="open-orders-h">Open orders</h2><span class="hint">sent and not yet filled or cancelled</span>
+    <span class="right"><a href="/orders">All orders</a> · <a href="/exports/orders.csv">orders.csv</a></span></div>
+  {% if working %}
+  <table class="responsive" data-hide-md="4 6">
+    <thead><tr><th>Sent</th><th>Strategy</th><th>Side</th><th>For</th><th class="num">Quantity</th><th>Type</th><th>Status</th><th>Reason</th></tr></thead>
+    <tbody>{% for o in working %}
+    <tr><td data-m="hide">{{ o.ts|ts }}</td>
+      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
+      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
+      <td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
+      <td class="num" data-m="right">{{ o.qty|qty }}{% if o.filled_qty %}<div class="sub">{{ o.filled_qty|qty }} filled</div>{% endif %}</td>
+      <td data-m="hide">{{ o.order_type|capitalize }}</td>
+      <td data-m="hide"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td>
+      <td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">No orders working. Strategies trade at market, so an order is normally open for seconds.</p>{% endif %}
+</section>
+</div>
+
+<div class="tab-panel" id="tab-history" role="tabpanel" data-panel="history">
+<section class="panel flush" aria-labelledby="fills-h">
+  <div class="panel-head"><h2 id="fills-h">Trade history</h2><span class="hint">every fill in the book, newest first{% if book_fills|length >= 100 %}; the latest 100{% endif %}</span>
+    <span class="right"><a href="/trades">Round trips</a> · <a href="/exports/fills.csv">fills.csv</a></span></div>
+  {% if book_fills %}
+  <table class="responsive" data-hide-lg="7" data-hide-md="4 8">
+    <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Instrument</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th><th>For</th><th>Reason</th></tr></thead>
+    <tbody>{% for f in book_fills %}
+    <tr><td data-m="hide">{{ f.ts|ts }}</td>
+      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a></td>
+      <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ f.sleeve }}</span> <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td data-m="hide">{{ f.pair }}</td>
+      <td class="num" data-m="right">{{ f.qty|qty }} {{ f.pair.split('/')[0] }}<span class="muted m-only"> at {{ f.price|px }}</span></td>
+      <td class="num" data-m="hide">{{ f.price|px }}</td>
+      <td class="num" data-m="hide">{{ f.fee|money }}</td>
+      <td data-m="hide">{% if f.intent %}{{ tag(f.intent_label, f.intent) }}{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="reason" title="{{ f.reason or '' }}">{% if f.reason %}{{ f.reason }}{% else %}<span class="faint">Not recorded</span>{% endif %}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">No fills yet. Each buy and sell a strategy makes lands here with the reason it gave.</p>{% endif %}
+</section>
+</div>
+
+<div class="tab-panel" id="tab-funding" role="tabpanel" data-panel="funding">
+<section class="panel flush" aria-labelledby="funding-h">
+  <div class="panel-head"><h2 id="funding-h">Funding</h2><span class="hint">settled on perpetual positions; + received, − paid</span></div>
+  {% if funding.payments %}
+  <table class="responsive" data-hide-md="4">
+    <thead><tr><th>Settled</th><th>Strategy</th><th>Instrument</th><th class="num">Rate</th><th class="num">Position</th><th class="num">Paid / received</th></tr></thead>
+    <tbody>{% for f in funding.payments %}
+    <tr><td data-m="hide">{{ f.ts|ts }}</td>
+      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a> <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td data-m="hide">{{ f.pair }}</td>
+      <td class="num" data-m="hide">{{ '%.4f%%'|format(f.rate * 100) }}</td>
+      <td class="num" data-m="hide">{{ 'Short' if f.qty < 0 else 'Long' }} {{ f.qty|abs|qty }}</td>
+      <td class="num" data-m="right">{{ money_signed(f.amount) }}</td></tr>
+    {% endfor %}</tbody>
+    <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
+  </table>
+  {% if funding.totals|length > 1 %}<p class="muted fund-split">{% for t in funding.totals %}<a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a> {{ money_signed(t.total) }}{{ ' · ' if not loop.last }}{% endfor %}</p>{% endif %}
+  {% elif funding.perps %}<p class="empty" style="padding:4px 18px 16px">No funding settled yet. A perpetual position pays or receives it at each funding time while it is open.</p>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">No perpetual strategies in the book, so no funding to show.</p>{% endif %}
+</section>
+</div>
+
+<div class="tab-panel" id="tab-allocation" role="tabpanel" data-panel="allocation">
 <div class="grid">
   <section class="panel span-5" aria-labelledby="alloc-h">
     <div class="panel-head"><h2 id="alloc-h">Allocation</h2></div>
     {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
-    <div class="stack" role="img" aria-label="Allocation by asset">{% for a in book.allocation %}<i style="width: {{ (a.bar * 100)|round(2) }}%; background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></i>{% endfor %}</div>
-    <table class="compact">
-      <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
-      <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
-    </table>
+    {% set ring = namespace(at=0.0, stops=[]) %}
+    {% for a in book.allocation %}{% set c = 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] %}{% set from_at = ring.at %}{% set ring.at = ring.at + a.bar * 100 %}{% set ring.stops = ring.stops + [c ~ ' ' ~ '%.2f'|format(from_at) ~ '% ' ~ '%.2f'|format(ring.at) ~ '%'] %}{% endfor %}
+    <div class="alloc">
+      <div class="donut" role="img" aria-label="Allocation by asset" style="background: conic-gradient({{ ring.stops|join(', ') }}{% if ring.at < 99.99 %}{{ ', ' if ring.stops }}var(--neutral-bg) {{ '%.2f'|format(ring.at) }}% 100%{% endif %})"></div>
+      <table class="compact">
+        <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
+        <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
   </section>
   <section class="panel span-7" aria-labelledby="corr-h">
     <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2> {{ help('correlation') }}</div>
@@ -145,6 +273,23 @@
     {% else %}<p class="empty">Needs two strategies with at least 20 days of history.</p>{% endif %}
   </section>
 </div>
+</div>
+
+{# Close sends the strategy's own flatten, as Flatten on its page does: at market, then the strategy pauses. #}
+<div data-live="close-dialogs" data-live-forms>
+<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
+{% for p in positions.rows %}{% set s = p.x.sleeve %}{% set base = p.pair.split('/')[0] %}{% set quote = p.pair.split('/')[1] %}
+<dialog id="dlg-close-{{ p.sleeve }}" aria-labelledby="dlg-close-{{ p.sleeve }}-h">
+  <form method="post" action="/sleeves/{{ p.sleeve }}/command">
+    <h2 id="dlg-close-{{ p.sleeve }}-h">Close {{ p.sleeve }}'s {{ 'short' if p.side < 0 else 'position' }}</h2>
+    <p>{% if s.desired_state != 'running' %}It is stopped, so it starts only to {{ 'buy back' if p.side < 0 else 'sell' }}{% else %}{{ 'Buys back' if p.side < 0 else 'Sells' }}{% endif %} {{ p.qty|abs|qty }} {{ base }} (about {{ p.value|abs|money }} {{ quote }}) at market, paying the taker fee, then pauses the strategy.</p>
+    <label for="r-close-{{ p.sleeve }}">Reason for the decision log</label>
+    <input id="r-close-{{ p.sleeve }}" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="flatten" class="danger">{{ 'Close to cash and pause' if p.side < 0 else 'Sell to cash and pause' }}</button></div>
+  </form>
+</dialog>
+{% endfor %}
+</div>
 {% else %}
 <section class="panel onboard" aria-labelledby="ob-h">
   <div class="panel-head"><h2 id="ob-h">Get started in three steps</h2></div>
@@ -153,6 +298,7 @@
     <li><span class="n">2</span><div><strong>Start it on paper</strong><p>Live prices, simulated money.</p><a class="button" href="/sleeves/new">+ New strategy</a></div></li>
     <li><span class="n">3</span><div><strong>Watch and judge</strong><p>Live trading unlocks after G2.</p><a class="button secondary" href="/accounts">Set up accounts</a></div></li>
   </ol>
+  <p class="muted" style="margin:14px 0 0">Earlier books' trades and orders stay in <a href="/trades">Positions and trades</a> and <a href="/orders">Orders</a>.</p>
 </section>
 {% endif %}
 {% endblock %}
@@ -160,5 +306,7 @@
 {% block scripts %}
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.sortable(); Console.bookCharts("/api/book/equity");</script>
+<script>Console.sortable(); Console.tabs(); Console.dialogs(); Console.bookCharts("/api/book/equity");
+// The tab bar's counts update live; this keeps the open tab marked after they do.
+document.addEventListener("live:swap", () => window.dispatchEvent(new HashChangeEvent("hashchange")));</script>
 {% endblock %}
