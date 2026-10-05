@@ -1554,7 +1554,8 @@ def _chart_pairs(home: str, book: list[str]) -> list[str]:
 def _risk_view(x: dict, position: dict | None = None) -> dict:
     p = x["profile"]
     stop_px = position["stop_px"] if position else None
-    margin, margin_cap = position["margin"] if position else 0.0, p.max_position_pct * max(x["equity"], 0.0)
+    margin = position.get("margin", 0.0) if position else 0.0
+    margin_cap = p.max_position_pct * max(x.get("equity", 0.0), 0.0)
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
