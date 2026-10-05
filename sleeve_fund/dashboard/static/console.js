@@ -787,7 +787,8 @@ window.Console = (() => {
       const opt = $("strategy").selectedOptions[0];
       // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
       const minutes = {MINUTE: 1, HOUR: 60, DAY: 1440};
-      const [step, unit] = document.getElementById("bar_spec").value.split("-");
+      const bar = form.querySelector("input[name=bar_spec]:checked, input[type=hidden][name=bar_spec], input[name=bar_spec_shown]:checked");
+      const [step, unit] = (bar ? bar.value : "1-HOUR").split("-");
       const here = `${($("instrument").value || "").toUpperCase()}@${Number(step) * (minutes[unit] || 0)}`;
       document.getElementById("g1-note").hidden = (opt.dataset.g1 || "").split("|").includes(here);
       const prof = $("risk_profile").selectedOptions[0].dataset;
@@ -795,7 +796,7 @@ window.Console = (() => {
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
       const items = [
-        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${document.getElementById("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
+        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
@@ -811,7 +812,9 @@ window.Console = (() => {
       const ul = document.getElementById("summary");
       ul.replaceChildren(...items.map((t) => Object.assign(document.createElement("li"), {textContent: t})));
       if (!$("name").dataset.touched) {
-        $("name").value = `${(pair.split("/")[0] || "").toLowerCase()}-${strat.replace(/_/g, "-")}`.replace(/^-/, "").slice(0, 40);
+        // Model, instrument and candle length: rsi-bands-solusdt-15m (UI v2, item 9).
+        const candle = bar ? bar.parentElement.textContent.trim().split(" ")[0] : "";
+        $("name").value = [strat.replace(/_/g, "-"), pair.replace("/", "").toLowerCase(), candle].filter(Boolean).join("-").replace(/[^a-z0-9-]/g, "").slice(0, 41);
       }
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
@@ -932,30 +935,132 @@ window.Console = (() => {
     return box.exitDescribe;
   }
 
-  // The venue: its instruments are the ones suggested, and a perpetual venue lists no spot, so its strategies
-  // trade its own perpetual. A page showing one venue's stored history reloads on another.
-  function venueField(form) {
-    const sel = form && form.elements.venue;
-    if (!(sel instanceof HTMLSelectElement)) return;  // the research study's venue switch runs itself
-    if (sel.hasAttribute("data-reload")) {
-      sel.addEventListener("change", () => { location.href = `${location.pathname}?venue=${encodeURIComponent(sel.value)}`; });
-      return;
-    }
-    const list = document.getElementById("pairs"), inst = form.elements.instrument, mk = form.elements.market;
-    const perpOpt = mk ? [...mk.options].find((o) => o.value === "perp") : null;
-    if (perpOpt) perpOpt.dataset.label = perpOpt.textContent;
-    const sync = (first) => {
-      const opt = sel.selectedOptions[0];
-      if (!opt) return;
-      const pairs = (opt.dataset.pairs || "").split(",").filter(Boolean), perp = !!opt.dataset.perp;
-      if (list) list.replaceChildren(...pairs.map((p) => Object.assign(document.createElement("option"), {value: p})));
-      if (!first && inst && pairs.length && !pairs.includes(inst.value.trim().toUpperCase())) inst.value = pairs[0];
-      if (!mk) return;
-      [...mk.options].forEach((o) => { o.disabled = perp && o.value !== "perp"; });
-      if (perpOpt) perpOpt.textContent = perp ? `${opt.textContent.split(":")[0]}: the venue's own fees and settled funding` : perpOpt.dataset.label;
-      if (perp && mk.value !== "perp") { mk.value = "perp"; mk.dispatchEvent(new Event("change")); }
+  // The instrument pick-list (templates/_fields.html instrument_field; UI v2, item 9): a combobox over every
+  // instrument the venues offer, grouped Perpetuals then Spot, recently used first, each with its history
+  // badge, and "Use '…' as typed" last. Picking sets the hidden venue field, which tells the form whether the
+  // market is a perpetual. The arrow keys move, Enter picks, Escape closes.
+  const RECENT = "pl-recent";
+  const recentPicks = () => { try { return JSON.parse(localStorage.getItem(RECENT) || "[]"); } catch (e) { return []; } };
+  const remember = (venue, pair) => {
+    try { localStorage.setItem(RECENT, JSON.stringify([`${venue}|${pair}`, ...recentPicks().filter((x) => x !== `${venue}|${pair}`)].slice(0, 8))); } catch (e) { /* private window */ }
+  };
+  let instOptions = null, instLoading = null;
+  const loadOptions = () => instLoading || (instLoading = fetch("/api/instruments?options=1", {cache: "no-store"})
+    .then((r) => r.json()).then((d) => { instOptions = d.options || []; }).catch(() => { instOptions = []; }));
+  function picklist(box) {
+    if (!box || box.dataset.bound) return;
+    box.dataset.bound = "1";
+    const input = box.querySelector("[role=combobox]"), list = box.querySelector("[role=listbox]");
+    const venue = box.querySelector("[data-pl-venue]"), kind = box.querySelector("[data-pl-kind]"), badge = box.querySelector("[data-pl-badge]");
+    const seed = JSON.parse(box.querySelector("[data-pl-seed]").textContent);
+    const venues = Object.fromEntries(seed.venues.map((v) => [v.key, v]));
+    const PAIR = /^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/;
+    // Until the full listing arrives: each venue's usual instruments.
+    const seedOptions = seed.venues.flatMap((v) => v.pairs.map((p) => ({value: p, venue: v.key, group: v.perpetual ? "Perpetuals" : "Spot",
+      label: `${p} ${v.perpetual ? "perpetual" : "spot"}`, badge: "", tone: ""})));
+    const all = () => instOptions && instOptions.length ? instOptions : seedOptions;
+    let shown = [], active = -1, typed = false;  // the list opens on everything; typing narrows it
+    const find = (v, p) => all().find((o) => o.venue === v && o.value === p);
+    const setVenue = (key) => {
+      if (!venues[key]) return;
+      const changed = venue.value !== key;
+      venue.value = key; venue.dataset.perp = venues[key].perpetual ? "1" : "";
+      if (kind) kind.textContent = venues[key].perpetual ? "perpetual" : "spot";
+      if (changed) venue.dispatchEvent(new Event("change", {bubbles: true}));
     };
-    sel.addEventListener("change", () => sync(false)); sync(true);
+    const showBadge = () => {
+      const o = find(venue.value, input.value.trim().toUpperCase());
+      badge.textContent = o ? (o.badge ? `History: ${o.badge}` : "") : PAIR.test(input.value.trim().toUpperCase()) ? "Typed: the venue is asked whether it lists it before a strategy can start on it." : "";
+      badge.className = `hint pl-badge ${o && o.tone ? o.tone : ""}`;
+    };
+    const close = () => { list.hidden = true; input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); };
+    const pick = (o) => {
+      input.value = o.value; setVenue(o.venue); remember(o.venue, o.value); close(); showBadge();
+      input.dispatchEvent(new Event("input", {bubbles: true})); input.dispatchEvent(new Event("change", {bubbles: true}));
+    };
+    const mark = () => {
+      [...list.querySelectorAll("[role=option]")].forEach((li, i) => {
+        li.setAttribute("aria-selected", String(i === active));
+        if (i === active) { input.setAttribute("aria-activedescendant", li.id); li.scrollIntoView({block: "nearest"}); }
+      });
+    };
+    const draw = () => {
+      const q = typed ? input.value.trim().toUpperCase() : "", bare = q.replace("/", "");
+      const recent = recentPicks();
+      const rank = (o) => { const i = recent.indexOf(`${o.venue}|${o.value}`); return i < 0 ? 99 : i; };
+      const hits = all().filter((o) => !q || o.value.replace("/", "").includes(bare));
+      // Starts-with matches first, then recently used, then stored history, then the rest as listed.
+      hits.sort((a, b) => (!a.value.startsWith(q) - !b.value.startsWith(q)) || rank(a) - rank(b) || (b.stored === true) - (a.stored === true));
+      const li = (cls, text) => Object.assign(document.createElement("li"), {className: cls, textContent: text});
+      const items = [];
+      shown = [];
+      const group = (name, os) => {
+        if (!os.length) return;
+        const g = li("grp", name); g.setAttribute("role", "presentation"); items.push(g);
+        os.forEach((o) => {
+          const el = li("opt", o.label); el.setAttribute("role", "option"); el.id = `${list.id}-${shown.length}`;
+          if (o.badge) el.append(Object.assign(document.createElement("small"), {className: o.tone, textContent: o.badge}));
+          el.addEventListener("mousedown", (e) => { e.preventDefault(); pick(o); });
+          shown.push(o); items.push(el);
+        });
+      };
+      const mine = q ? [] : hits.filter((o) => rank(o) < 99).slice(0, 5);
+      group("Recently used", mine);
+      group("Perpetuals", hits.filter((o) => o.group === "Perpetuals" && !mine.includes(o)).slice(0, 40));
+      group("Spot", hits.filter((o) => o.group === "Spot" && !mine.includes(o)).slice(0, 40));
+      if (PAIR.test(q) && !hits.some((o) => o.value === q)) {
+        const o = {value: q, venue: venue.value, label: `Use "${q}" as typed`, badge: "checked against the venue before a strategy can start on it"};
+        const g = li("grp", "Not in the list"); g.setAttribute("role", "presentation"); items.push(g);
+        const el = li("opt own", o.label); el.setAttribute("role", "option"); el.id = `${list.id}-${shown.length}`;
+        el.append(Object.assign(document.createElement("small"), {textContent: o.badge}));
+        el.addEventListener("mousedown", (e) => { e.preventDefault(); pick(o); });
+        shown.push(o); items.push(el);
+      }
+      if (!items.length) items.push(li("none", instOptions ? "Nothing matches. Write it as BASE/QUOTE to use it as typed." : "Loading every instrument…"));
+      list.replaceChildren(...items);
+      active = shown.length ? 0 : -1; mark();
+    };
+    const open = () => {
+      if (list.hidden) typed = false;
+      list.hidden = false; input.setAttribute("aria-expanded", "true"); draw();
+      if (!instOptions) loadOptions().then(() => { if (!list.hidden) draw(); showBadge(); });
+    };
+    input.addEventListener("focus", () => { input.select(); open(); });
+    input.addEventListener("click", open);
+    input.addEventListener("input", (e) => { if (e.isTrusted) { if (list.hidden) open(); typed = true; draw(); } showBadge(); });
+    input.addEventListener("blur", () => { input.value = input.value.trim().toUpperCase(); close(); showBadge(); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (list.hidden) return open();
+        active = e.key === "ArrowDown" ? Math.min(active + 1, shown.length - 1) : Math.max(active - 1, 0); mark();
+      } else if (e.key === "Enter" && !list.hidden && shown[active]) { e.preventDefault(); e.stopPropagation(); pick(shown[active]); }
+      else if (e.key === "Escape" && !list.hidden) { e.preventDefault(); e.stopPropagation(); close(); }
+    });
+    const form = input.form;
+    if (form) form.addEventListener("submit", () => remember(venue.value, input.value.trim().toUpperCase()));
+    showBadge();
+    loadOptions().then(showBadge);
+  }
+
+  // The venue follows the instrument pick: a perpetual venue lists no spot, so its strategies trade its own
+  // perpetual.
+  function venueField(form) {
+    const v = form && form.querySelector("[data-pl-venue]");
+    if (!v) return;
+    picklist(v.closest("[data-picklist]"));
+    const mk = form.elements.market;
+    if (!mk) return;
+    let was = null;
+    const sync = () => {
+      const perp = v.dataset.perp === "1";
+      [...mk.options].forEach((o) => { o.disabled = perp && o.value !== "perp"; });
+      // Onto a perpetual venue: its perpetual. Back to a spot one: spot, unless the PM picks a simulated perpetual.
+      const to = perp ? "perp" : was ? "spot" : mk.value;
+      if (mk.value !== to) { mk.value = to; mk.dispatchEvent(new Event("change")); }
+      was = perp;
+    };
+    v.addEventListener("change", sync); sync();
   }
 
   // Order type: the wait only matters for maker-first orders, so it shows only then.
@@ -1085,9 +1190,35 @@ window.Console = (() => {
       const line = fs.querySelector("[data-logline]");
       if (line) line.textContent = "Logged as: " + (pick ? pick + (note ? ": " + note : "") : "no reason yet");
     };
+    // The search box narrows the list; "+ Write your own reason" always stays.
+    const search = (fs) => {
+      const q = (fs.querySelector("[data-reason-search]")?.value || "").trim().toLowerCase();
+      let shown = 0;
+      fs.querySelectorAll("label.opt:not(.write)").forEach((l) => { l.hidden = Boolean(q) && !l.textContent.toLowerCase().includes(q); shown += !l.hidden; });
+      fs.querySelectorAll(".reason-list .grp").forEach((g) => {
+        let n = g.nextElementSibling, any = false;
+        while (n && !n.classList.contains("grp")) { if (n.matches("label.opt:not(.write)") && !n.hidden) any = true; n = n.nextElementSibling; }
+        g.hidden = !any;
+      });
+      const none = fs.querySelector("[data-reason-none]");
+      if (none) none.hidden = shown > 0;
+    };
     const all = () => document.querySelectorAll("[data-reasons]").forEach(check);
     once("reasonsBound", () => {
-      const on = (e) => { const fs = e.target.closest && e.target.closest("[data-reasons]"); if (fs) check(fs); };
+      const on = (e) => {
+        const fs = e.target.closest && e.target.closest("[data-reasons]");
+        if (!fs) return;
+        if (e.target.matches("[data-reason-search]")) search(fs);
+        check(fs);
+        if (e.type === "change" && e.target.value === "Other") fs.querySelector("textarea[name=reason_note]")?.focus();
+      };
+      // Enter in the search box picks the first reason still shown, rather than submitting the dialog.
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || !e.target.matches || !e.target.matches("[data-reason-search]")) return;
+        e.preventDefault();
+        const first = [...e.target.closest("[data-reasons]").querySelectorAll("label.opt")].find((l) => !l.hidden)?.querySelector("input");
+        if (first) { first.checked = true; first.focus(); first.dispatchEvent(new Event("change", {bubbles: true})); }
+      });
       document.addEventListener("change", on);
       document.addEventListener("input", on);
       document.addEventListener("live:swap", all);
@@ -1176,5 +1307,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, chips, modes, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, modes, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
 })();
