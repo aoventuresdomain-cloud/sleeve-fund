@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, usage, help, stop_words %}
+{% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
 {% macro tone_of(status) %}{{ {'running': 'ok', 'paused': 'warn', 'starting': 'warn', 'halted': 'bad', 'error': 'bad'}.get(status, 'off') }}{% endmacro %}
@@ -147,7 +148,6 @@
 </section>
 </div>
 {% if kill.all %}
-<datalist id="reasons">{% for r in reasons %}<option value="{{ r }}">{% endfor %}</datalist>
 <dialog id="dlg-kill" aria-labelledby="dlg-kill-h">
   <form method="post" action="/book/flatten">
     <h2 id="dlg-kill-h">Flatten everything</h2>
@@ -156,9 +156,8 @@
       {% set dayp = kill.all|selectattr('sleeve.paused_until')|map(attribute='sleeve.name')|list %}{% if dayp %}{{ dayp|join(', ') }} {{ 'is' if dayp|length == 1 else 'are' }} on a daily-loss pause, which then lasts until you resume too, not 24 hours.{% endif %}
       {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ kill.gross|money }} in total{% if kill.shorts %}, shorts counted by their size{% endif %}.{% endif %}
       {% if kill.stopped %}{{ kill.stopped|join(', ') }} {{ 'is' if kill.stopped|length == 1 else 'are' }} stopped, so {{ 'it starts' if kill.stopped|length == 1 else 'they start' }} just to sell.{% endif %}</p>
-    <label for="r-kill">Reason for the decision log</label>
-    <input id="r-kill" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger">{{ 'Close' if kill.shorts else 'Sell' }} everything and pause</button></div>
+    {{ reason_picker("book_flatten", "kill") }}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger" data-needs-reason disabled>{{ 'Close' if kill.shorts else 'Sell' }} everything and pause</button></div>
   </form>
 </dialog>
 {% endif %}
@@ -167,7 +166,7 @@
 {% block scripts %}
 <script src="/static/console.js"></script>
 <script>
-Console.tabs(); Console.dialogs();
+Console.tabs(); Console.dialogs(); Console.reasons();
 // "Live · 4s ago": seconds since the page last heard from the server (live.js says each time it does).
 (() => {
   const el = document.getElementById("rh-live");
