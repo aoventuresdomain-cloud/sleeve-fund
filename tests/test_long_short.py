@@ -305,9 +305,9 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert page.status_code == 200
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
-    # A perp is capped by balanced's 2x leverage, not its 33% spot position cap (PM, 4 Oct 2026).
-    assert "of 200%" in html and "over the cap" not in html
-    # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 2x it was sized to.
+    # A perp's 33% cap on balanced is its margin, so at 2x leverage a notional of 66% (PM, 5 Oct 2026).
+    assert "of 66%" in html and "over the cap" not in html
+    # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
     assert "over the cap" in c.get("/sleeves/pp-ls", auth=AUTH).text
     # The 2% stop sits above the entry; the open short gains as the price falls.
@@ -325,16 +325,16 @@ def test_default_explain_names_a_short():
     assert LongFlatStrategy.explain(None, None, False)[0] == "Signal to be flat"
 
 
-def test_a_perp_is_sized_by_the_leverage_cap(prices, instrument):
-    """PM, 4 Oct 2026: a perpetual's position is sized by the profile's leverage cap (2x on balanced),
-    not its spot position cap (33%); spot is unchanged."""
+def test_a_perp_puts_up_the_position_cap_as_margin_at_the_leverage_cap(prices, instrument):
+    """PM, 5 Oct 2026: on a perpetual the profile's position cap (33% on balanced) is the margin, and the
+    notional is that margin times the leverage cap (2x), so 66% of equity; spot is unchanged at 33%."""
     closes = [100.0, 100.2, 100.1, 100.3]
     perp = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="balanced")
     spot = run_backtest("ping_pong", _path(prices, closes), instrument, {}, half_spread=0, risk_profile="balanced")
     notional = lambda r: float(r.fills.iloc[0]["filled_qty"]) * float(r.fills.iloc[0]["avg_px"])  # noqa: E731
-    assert 1.9 * 10_000 < notional(perp) <= 2 * 10_000
+    assert 0.64 * 10_000 < notional(perp) <= 0.66 * 10_000 + 1
     assert notional(spot) <= 0.33 * 10_000 + 1
-    assert perp.decisions[perp.fills.index[0]]["signal"]["sized_by"] in ("2x leverage cap", "balanced risk profile cap")
+    assert perp.decisions[perp.fills.index[0]]["signal"]["sized_by"] == "balanced risk profile cap"
 
 
 def test_a_perp_position_is_read_exactly_not_from_its_float():
@@ -398,7 +398,7 @@ def _gapped(prices, closes):
     return feed
 
 
-def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(prices, instrument):
+def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(prices, instrument, full_margin):
     """Review round 11, M11-3: the liquidation close never traded (its intent wasn't journaled), so the
     short stayed open past liquidation. Shorted at 101.5, a gap to 160 is through any capped leverage."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 160.0, 160.0, 160.0]
@@ -414,7 +414,7 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(
     assert "liquidation" in {e["kind"] for e in res.risk_events}
 
 
-def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path):
+def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path, full_margin):
     """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
     as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
     from sleeve_fund.research.replay import replay
@@ -473,7 +473,7 @@ def test_every_short_and_every_long_rests_its_stop_over_a_long_run(prices, instr
     assert stops[-1] >= entries[-1] - 1 and stops[1] >= entries[1] - 1, (entries, stops)
 
 
-def test_nothing_opens_after_a_drawdown_halt(prices, instrument):
+def test_nothing_opens_after_a_drawdown_halt(prices, instrument, full_margin):
     """Review round 11, B11-3: after a halt, an exit resting for a position the strategy wrongly thought
     it held filled and opened a new short. Exits on a perp are reduce-only, and nothing new rests once the
     strategy is halted: no fill after the halt grows the position."""
@@ -726,7 +726,7 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(0, abs=0.05)
 
 
-def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(prices, instrument):
+def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(prices, instrument, full_margin):
     """Coordinator, 4 Oct: a wick through the daily-loss level that recovers inside the bar paused the
     strategy, but its buy-back filled at the bar's close, kinder than paper by the wick. A reduce-only stop
     now rests at the level the guard acts at, so the exit fills there, as paper's does on the breaching trade."""
@@ -764,7 +764,7 @@ def test_a_shorts_1r_and_r_target_carry_its_side():
     assert r_target(2, stop, leg, -1) != pytest.approx(r_target(2, stop, leg, 1), abs=1e-9)
 
 
-def test_an_entry_whose_stop_sits_past_half_way_to_liquidation_is_refused(prices, instrument):
+def test_an_entry_whose_stop_sits_past_half_way_to_liquidation_is_refused(prices, instrument, full_margin):
     """Aggressive sizes a perp at 3x, liquidated about 33% away: a 25% stop is past half of that, so the
     entry is refused and says why; a 10% stop is inside it and enters."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 101.0, 100.0]
@@ -790,7 +790,7 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
-def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path):
+def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path, full_margin):
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
     read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
     dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
@@ -921,8 +921,9 @@ def test_a_flip_opens_the_new_side_only_once_the_old_one_is_closed(prices, instr
 
 
 def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkeypatch):
-    """Round 12, M12-U1: on a perp the benchmark held at the leverage cap (2x on balanced) and never
-    liquidated, so it ran from -200% to +400%. It is a 1x hold, paying the perp's taker fee, not spot's."""
+    """Round 12, M12-U1: on a perp the benchmark held at the position cap past 1x and never liquidated, so it
+    ran from -200% to +400%. It is at most a 1x hold, paying the perp's taker fee, not spot's. Aggressive's
+    cap passes 1x: 50% of equity as margin at 3x is a notional of 150%."""
     from sleeve_fund.dashboard import preview
     from sleeve_fund.data import synthetic_ohlcv
     from test_dashboard import KRAKEN
@@ -930,9 +931,9 @@ def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkey
     bars = synthetic_ohlcv(days=200, seed=2, start_price=150)
     preview._history.clear()
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: bars)
-    d = preview.run("buy_and_hold", "SOL/USD", {**PERP}, starting=5000, risk_profile="balanced")
+    d = preview.run("buy_and_hold", "SOL/USD", {**PERP}, starting=5000, risk_profile="aggressive")
     taker = float(markets.LOW_FEE_PERP.fees.taker)
-    assert d["cap"] == pytest.approx(2.0) and d["bench_cap"] == 1.0
+    assert d["cap"] == pytest.approx(1.5) and d["bench_cap"] == 1.0
     assert d["fee_schedule"]["taker"] == pytest.approx(taker)
     assert d["benchmark"][0] == pytest.approx(5000 * (1 - taker), abs=0.01)
     held = 5000 * (1 - taker) * bars["close"].iloc[-1] / bars["close"].iloc[0]
@@ -940,7 +941,7 @@ def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkey
 
 
 @pytest.mark.sanity
-@pytest.mark.parametrize(("params", "label"), [({**PERP}, "unlevered"), ({}, "33% invested")], ids=["perp", "spot"])
+@pytest.mark.parametrize(("params", "label"), [({**PERP}, "66% invested"), ({}, "33% invested")], ids=["perp", "spot"])
 def test_a_saved_runs_screen_shows_the_benchmark_its_result_shows(client, monkeypatch, params, label):  # noqa: F811
     """Round 12, M12-U1 (re-check): the result held a perp's benchmark at 1x while the paper runtime, which
     writes the saved run's journal and every paper strategy's, held it at the profile's 33% spot cap, so the

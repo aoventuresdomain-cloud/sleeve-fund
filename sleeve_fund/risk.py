@@ -73,9 +73,10 @@ def check(profile: RiskProfile, equity: float, peak: float, day_open: float) -> 
 
 
 def position_cap(p: RiskProfile, params: dict | None = None) -> float:
-    """The largest position as a multiple of equity: the profile's position cap on spot; on a perpetual
-    its leverage cap, which the PM chose to size by (4 Oct 2026), with the stop-to-liquidation and
-    liquidation-distance guards bounding it."""
+    """The largest position's notional as a multiple of equity. On spot, the profile's position cap. On a
+    perpetual the same cap applies to the margin, and the notional is that margin times the leverage cap
+    (PM, 5 Oct 2026): balanced puts at most 33% of equity up as margin, at 2x a notional of 66%. The
+    stop-to-liquidation and liquidation-distance guards still bound it."""
     from sleeve_fund import markets
 
-    return p.max_leverage if markets.is_perp(params) else p.max_position_pct
+    return p.max_position_pct * p.max_leverage if markets.is_perp(params) else p.max_position_pct

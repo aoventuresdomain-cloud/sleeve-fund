@@ -297,7 +297,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
 
         from sleeve_fund.risk import position_cap
 
-        cap = position_cap(risk_profile_of(risk_profile), params)  # a perpetual sizes by its leverage cap
+        cap = position_cap(risk_profile_of(risk_profile), params)  # on a perpetual, the margin cap times the leverage cap
     elif cap is not None:
         params = {**params, "position_cap_pct": cap}
     wait = params.get("maker_wait_minutes")
@@ -323,7 +323,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         keep["journal"] = res.journal
     fee_view = _fee_view(params, inst, quote_fees)
     # Buy and hold on the strategy's own market (a perpetual's fee, not spot's), never above 1x: a perp's
-    # cap is its leverage cap, and a levered hold that can't be liquidated went to -200% (round 12, M12-U1).
+    # cap can pass 1x, and a levered hold that can't be liquidated went to -200% (round 12, M12-U1).
     bench_cap = min(cap if cap is not None else 1.0, 1.0)
     bench = benchmark(prices, starting, fee_view["taker"], bench_cap)
     # The worst drawdown over every mark, before the daily closes below hide the intraday low: the
