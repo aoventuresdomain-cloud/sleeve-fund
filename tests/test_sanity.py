@@ -836,6 +836,50 @@ def test_a_crash_under_a_leveraged_long_is_sold_by_the_guards_before_the_venue_w
         assert fills[closed["order_id"]]["price"] > opened["signal"]["liquidation_px"], (opened, closed)
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
     assert res.equity.iloc[-1] > 0
+    assert not res.insurance and not j.insurance_  # the guards acted in time: the venue's fund never paid
+
+
+_PATHS = {
+    "probe_long": np.r_[np.full(10, 60_000.0), np.linspace(60_000, 20_000, 200)],
+    "probe_short": np.r_[np.full(10, 60_000.0), np.linspace(60_000, 180_000, 200)],
+}
+
+
+@pytest.mark.parametrize("strategy", list(_PATHS))
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
+def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(profile, strategy):
+    """A perp backtest's risk exit is a stop resting where the limit is breached, as paper closes on the
+    breaching trade: it fills at its trigger, inside the bar that reached it (not at the bar's close), and
+    at that price the equity is exactly the limit: the starting equity less the daily loss for the first
+    day's pause, the peak less the maximum drawdown for the halt."""
+    prof = risk.PROFILES[profile]
+    bars = _ls_bars(_PATHS[strategy], minutes=60)
+    res = run_backtest(strategy, bars, TICK_INST, PERP, starting_capital=10_000, risk_profile=profile,
+                       bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    orders = {o["order_id"]: o for o in j.orders_.values()}
+    funding = [(pd.Timestamp(f["ts"]), f["amount"]) for f in j.funding_]
+    cash, qty, seen = 10_000.0, 0.0, []
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        o, ts = orders[f["order_id"]], pd.Timestamp(f["ts"])
+        if o["intent"] in ("risk_pause", "risk_halt"):
+            trigger = o["signal"]["trigger"]
+            assert f["price"] == pytest.approx(trigger, abs=1e-6), (o, f)  # at its level
+            bar = bars.loc[ts]
+            assert bar["low"] <= trigger <= bar["high"] and trigger != bar["close"], (o, bar)
+            equity = cash + sum(a for t, a in funding if t <= ts) + qty * trigger
+            if o["intent"] == "risk_halt":
+                peak = max(10_000.0, res.equity[res.equity.index < ts].max())
+                assert equity == pytest.approx(peak * (1 - prof.max_drawdown), abs=0.05), (o, equity)
+            elif ts.normalize() == bars.index[0].normalize():
+                assert equity == pytest.approx(10_000 * (1 - prof.daily_loss), abs=0.05), (o, equity)
+            seen.append(o["intent"])
+        sign = 1 if f["side"] == "BUY" else -1
+        cash -= sign * f["qty"] * f["price"] + f["fee"]
+        qty += sign * f["qty"]
+    assert seen and seen[0] == "risk_pause", seen  # the first day's limit was reached and checked
+    if (profile, strategy) != ("aggressive", "probe_short"):  # its pauses alone keep it short of the halt
+        assert "risk_halt" in seen, seen
 
 
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():
@@ -881,6 +925,19 @@ def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no
     liq = opened["signal"]["liquidation_px"]
     assert (gap > liq) if opened["side"] == "SELL" else (gap < liq)  # the gap went past it
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
+    # Isolated margin: what the gap lost past the strategy's equity is the venue's insurance fund's, booked
+    # once, to the cent, in the journal as in the result, and the strategy ends at zero, not below.
+    cash = 10_000.0 + sum(f["amount"] for f in j.funding_)
+    for f in j.fills_:
+        cash -= (1 if f["side"] == "BUY" else -1) * f["qty"] * f["price"] + f["fee"]
+    shortfall = max(0.0, -cash)
+    if shortfall:
+        assert len(res.insurance) == len(j.insurance_) == 1, (res.insurance, j.insurance_)
+        assert res.insurance[0]["amount"] == pytest.approx(shortfall, abs=0.011)
+        assert j.insurance_[0]["amount"] == pytest.approx(res.insurance[0]["amount"], abs=1e-8)
+        assert 0 <= res.equity.iloc[-1] < 0.02, res.equity.iloc[-1]
+    else:
+        assert not res.insurance and not j.insurance_
 
 
 XRP_INST = K.instrument("XRP", "USD", price_precision=5, size_precision=6)
@@ -930,14 +987,15 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
                    for o in legs.values()), (e, legs)
 
 
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
-def test_isolated_margin_a_liquidation_never_loses_more_than_the_strategys_equity(strategy, gap):
+def test_isolated_margin_a_liquidation_never_loses_more_than_the_strategys_equity(strategy, gap, profile):
     """Isolated margin (long/short verdict default): a liquidated position loses at most the margin behind
     it, the strategy's equity; the venue's insurance fund takes any shortfall past the bankruptcy price. So
     a strategy's equity never goes below zero, and never pulls the rest of the fund down with it."""
     c = np.r_[np.full(10, 60_000.0), np.full(20, gap)]
     res = run_backtest(strategy, _ls_bars(c, minutes=60, gaps=True), TICK_INST, PERP, starting_capital=10_000,
-                       risk_profile="aggressive", bar_minutes=60, half_spread=HALF)
+                       risk_profile=profile, bar_minutes=60, half_spread=HALF)
     assert res.equity.min() >= 0, res.equity.min()
 
 
