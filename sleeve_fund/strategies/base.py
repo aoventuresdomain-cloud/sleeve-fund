@@ -2294,7 +2294,7 @@ class LongFlatStrategy(Strategy):
         self._order_status(event, "accepted")
         coid = str(event.client_order_id)
         if self.runtime is not None:
-            self.runtime.on_timing(coid, accepted=int(event.ts_event))
+            self.runtime.on_timing(coid, accepted=int(event.ts_init))
         if coid in self._cancel_on_accept:  # a flatten was waiting for the venue to have this order
             self._cancel_on_accept.discard(coid)
             order = self.cache.order(event.client_order_id)
@@ -2477,7 +2477,7 @@ class LongFlatStrategy(Strategy):
                 self._journal_risk_stop(order, px)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
-            self.runtime.on_timing(journal_id, fill=int(event.ts_event))
+            self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
         if self._margin and self._entry_side == 0:
             self._cover_shortfall(px)
         if coid == self._risk_stop_id:

@@ -113,6 +113,9 @@ class MemoryJournal:
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
 
+    def record_timing(self, sleeve: str, order_id: str, **stamps) -> None:
+        """A backtest keeps no order timings: its stamps are its replay clock."""
+
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
                      qty: float | None = None) -> None:
