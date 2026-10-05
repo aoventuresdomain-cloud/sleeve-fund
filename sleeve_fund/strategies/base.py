@@ -410,7 +410,7 @@ class LongFlatStrategy(Strategy):
         # the venue's candles instead.
         self.history_loader = None
         self.gap_loader = None  # paper: (instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars
-        self._held: list[Bar] = []  # paper: candles built while no trades arrived, held until the feed is back
+        self._gap_bars: list[Bar] = []  # paper: candles built while no trades arrived, held until the feed is back
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
@@ -608,7 +608,7 @@ class LongFlatStrategy(Strategy):
         if (self._backtest or self.gap_loader is None or bar.bar_type != self._cfg.bar_type
                 or bar.ts_event <= self._last_bar_ts or bar.volume.as_double() > 0):
             return False
-        self._held.append(bar)
+        self._gap_bars.append(bar)
         self.log.info(f"bar {bar} held: no trades arrived during it")
         if self.runtime is not None:
             self._maybe_tick()
@@ -618,9 +618,9 @@ class LongFlatStrategy(Strategy):
         """The first candle with trades after held ones: feed the indicators the venue's own candles for the held
         span first (or the held ones where the venue had no trades either), then return the bar to decide on,
         the venue's own when it saw more of it than this process did."""
-        if not self._held:
+        if not self._gap_bars:
             return bar
-        held, self._held = self._held, []
+        held, self._gap_bars = self._gap_bars, []
         try:
             venue = {b.ts_event: b for b in self.gap_loader(self.instrument, self._cfg.bar_type, held[0].ts_event,
                                                             bar.ts_event)}
