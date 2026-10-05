@@ -84,6 +84,8 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
+                self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
+                                 "flatten pauses it, and it can't be started to trade")
                 return False
             self.store.set_desired_state(name, "stopped")
             self.store.set_status(name, "stopped", f"not started: {exc}")

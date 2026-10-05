@@ -90,6 +90,8 @@ def test_the_supervisor_refuses_to_start_or_restart_one_and_says_why(tmp_path, m
     store.set_desired_state("dc-perp", "running")
     sup.step()
     assert len(started) == 1
+    said = [e["message"] for e in store.events("dc-perp", limit=10) if e["kind"] == "start_refused"]
+    assert said[0].startswith("Started only to sell its position: Donchian is sized by weight")
 
 
 def test_a_backtest_and_a_study_refuse_it_before_reading_any_data():
