@@ -44,11 +44,30 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
         loss = sum(r["shocks"][i]["loss"] for r in rows if r["x"]["sleeve"].desired_state == "running")
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
-    largest = max((a for a in book["allocation"] if a["name"] != "Cash"), key=lambda a: a["share"], default=None)
+    largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
+
+
+def largest_asset(allocation: list[dict], equity: float) -> dict | None:
+    """The book's biggest concentration in one asset, by gross exposure: its long rows and its short rows
+    ("BTC short") together, both counted, with the net beside it. Taking the largest signed share read a
+    short's negative share as nothing (round 12, M12-U2)."""
+    assets: dict[str, dict] = {}
+    for a in allocation:
+        if a["name"] == "Cash":
+            continue
+        base = a["name"].removesuffix(" short")
+        row = assets.setdefault(base, {"name": base, "gross": 0.0, "net": 0.0})
+        row["gross"] += abs(a["value"])
+        row["net"] += a["value"]
+    if not assets:
+        return None
+    top = max(assets.values(), key=lambda r: r["gross"])
+    return {**top, "share": top["gross"] / equity if equity else 0.0,
+            "net_share": top["net"] / equity if equity else 0.0}
 
 
 def ops_view(store: Store, summaries: list[dict]) -> dict:
