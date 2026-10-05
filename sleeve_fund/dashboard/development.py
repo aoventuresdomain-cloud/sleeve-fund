@@ -161,17 +161,18 @@ def exits_sentence(v: dict) -> str:
 
 
 def history_chip(h: dict) -> dict:
-    """The chip beside a study's instrument: how much is stored and whether the collector is current."""
-    if h["first"] is None:
-        when = h.get("requested")
-        return {"text": f"Asked for {when:%d %b}, nothing stored yet" if when else "Asked for, nothing stored yet",
-                "tone": "paused"}
-    if h["state"] != "current":
-        return {"text": f"Catching up, from {h['first']:%d %b %Y}", "tone": "paused",
-                "days": (h["last"] - h["first"]).days if h.get("last") else 0}
-    days = (h["last"] - h["first"]).days
-    span = f"{days / 365.25:.1f} years" if days >= 365 else f"{days} day{'s' if days != 1 else ''}"
-    return {"text": f"{span} stored · current", "tone": "running", "days": days}
+    """The chip beside an instrument wherever it is picked: its history badge (UI v2, item 10), toned, with
+    the days stored that size the study windows."""
+    b = history_badge(h)
+    days = (h["last"] - h["first"]).days if h["first"] is not None and h.get("last") else None
+    # The store's own provenance records (HistoryStore.provenance): refills after a reconnect, and conflicts
+    # where a later bar for a stored minute differed and was kept out.
+    n, c = h.get("refills", 0), h.get("conflicts", 0)
+    title = f"{n} refill{'s' if n != 1 else ''}, {c} conflict{'s' if c != 1 else ''} recorded" if n or c else ""
+    return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
+
+
+BADGE_TONE = {"stored": "running", "filling": "paused", "gaps": "halted", "none": ""}
 
 
 MONTH = 30.44  # days, for the study-window sentence
