@@ -1555,16 +1555,20 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             continue
         try:
             cov = hist.coverage(v, pair)
-            first, last = cov.first, cov.last
+            # The last candle is the newest the store records as closed, once the hub writes (append_bars);
+            # the REST loader's newest minute may still be forming.
+            first, last = cov.first, cov.closed if cov.closed is not None else cov.last
             if last.tzinfo is None:  # stored without a zone: UTC, as the collector writes it
                 first, last = first.tz_localize("UTC"), last.tz_localize("UTC")
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
             gaps = hist.gaps(v, pair)
+            kinds = [e.get("kind") for e in hist.provenance(v, pair)]
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
         row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
-               "state": "catching up" if behind else "current", "gaps": gaps}
+               "state": "catching up" if behind else "current", "gaps": gaps,
+               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict")}
         out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],

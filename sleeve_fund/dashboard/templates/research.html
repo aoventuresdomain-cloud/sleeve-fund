@@ -160,7 +160,7 @@
       <td data-m="right" class="muted">{{ 'perpetual' if h.perpetual else 'spot' }}</td>
       <td data-label="Stored from">{{ h.first.strftime('%d %b %Y') if h.first else '–' }}</td>
       <td data-label="Last candle">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
-      <td data-label="History"><span class="chip {{ h.chip.tone }}">{{ h.chip.text }}</span></td></tr>
+      <td data-label="History"><span class="chip {{ h.chip.tone }}"{% if h.chip.title %} title="{{ h.chip.title }}"{% endif %}>{{ h.chip.text }}</span></td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="muted" style="padding:0 18px 16px">No instrument has stored history yet.</p>{% endif %}
