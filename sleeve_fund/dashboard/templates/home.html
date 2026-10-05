@@ -70,6 +70,12 @@
         <tr><td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a></td>
           <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if v >= 0 else 'loss' }}" style="{{ 'left:50%' if v >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
           <td class="num">{{ money_signed(v) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (v / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endfor %}
+      {# Archived strategies still count in the book's figures, so they get one row and the rows add up to Book (QA U1). #}
+      {% set arch = archived|sum(attribute=field) if archived else 0 %}
+      {% if arch|abs >= 0.005 %}{% set w = [arch|abs / scale * 50, 50]|min|round(1) %}
+        <tr class="archived-row"><td title="{{ archived|map(attribute='sleeve.name')|join(', ') }}"><a href="#archived" class="muted">Archived</a> <span class="faint">{{ archived|length }}</span></td>
+          <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if arch >= 0 else 'loss' }}" style="{{ 'left:50%' if arch >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
+          <td class="num">{{ money_signed(arch) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (arch / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endif %}
         <tr class="tot"><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(total) }}</td><td class="num muted">{% if total|abs >= 0.005 %}100%{% else %}–{% endif %}</td></tr>
       </tbody>
       {% endfor %}
@@ -158,7 +164,7 @@
 </section>
 
 {% if archived %}
-<details class="panel archived">
+<details class="panel archived" id="archived">
   <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
@@ -167,7 +173,7 @@
 {% endif %}
 
 {% if earlier %}
-<details class="panel archived">
+<details class="panel archived" id="archived">
   <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away when a new book began on {{ book_start.strftime('%d %b %Y') }}; kept with their history, and left out of this book's figures</span></summary>
   <ul class="feed" style="margin-top:10px">{% for s in earlier %}
     <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}

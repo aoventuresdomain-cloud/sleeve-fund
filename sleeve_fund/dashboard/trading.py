@@ -238,6 +238,9 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
     cost = abs(x["qty"]) * x["entry_px"]
     stop_px = x["entry_px"] * (1 - side * sl) if sl is not None else None
     margin, liq = position_margin(x)
+    # The position's own fees: its opening fill and every one after it (newest-first input), not the strategy's
+    # since it started (QA U4). By place in the journal, as fills in one second share a timestamp.
+    own = next((i for i, f in enumerate(fills) if f is lot), None)
     return {
         "sleeve": x["sleeve"].name,
         "pair": x["sleeve"].instrument,
@@ -262,6 +265,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
         "weight": x["position_value"] / x["equity"] if x["equity"] else 0.0,
+        "fees": sum(float(f["fee"] or 0.0) for f in fills[:own + 1]) if own is not None else None,
     }
 
 
@@ -329,14 +333,15 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
 def book_positions(store: Store, summaries: list[dict]) -> dict:
     """Every open position across the book for the Portfolio page, each with its strategy's P&L split as the
     strategy page shows it: unrealised on the open position, realised since the strategy started (its P&L
-    less the unrealised part, so closed trades and funding are in it) and the fees it has paid. Display only:
-    the summaries' own figures, added up."""
+    less the unrealised part, so closed trades and funding are in it) and the fees the open position has paid.
+    Display only: the summaries' own figures and the fills, added up."""
     rows = []
     for x in summaries:
         if not x["qty"] or not x["entry_px"]:
             continue
         name = x["sleeve"].name
-        pos = open_position(x, store.fills(name, limit=100_000), orders_by_id(store, name), store.exit_plans(name))
+        fills = store.fills(name, limit=100_000)
+        pos = open_position(x, fills, orders_by_id(store, name), store.exit_plans(name))
         if pos is None:
             continue
         perp = markets.is_perp(x["sleeve"].params)
@@ -345,7 +350,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
             "x": x,
             "perp": perp_view(x, pos, store.funding(name, limit=100_000)) if perp else None,
             "realised": x["pnl"] - x["unrealised"],
-            "fees": x["fees"],
+            "fees": pos["fees"] if pos["fees"] is not None else x["fees"],
             "flattening": any(c["command"] == "flatten" for c in store.pending_commands(name)),
         })
     return {
