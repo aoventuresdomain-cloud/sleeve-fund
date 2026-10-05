@@ -122,7 +122,7 @@ def _walk(s, path):
 @pytest.mark.parametrize("path, sides", [
     ([45, 25, 28, 31, 50, 55, 60], [0, 0, 0, 1, 1, 0, 0]),  # long on the cross back above 30, out at 55
     ([45, 30, 40], [0, 0, 0]),  # touching 30 from above is not a cross back
-    ([60, 75, 71, 69, 50, 45], [0, 0, 0, -1, -1, 0]),  # short on the cross back below 70, out at 45
+    ([60, 75, 71, 69, 52, 50], [0, 0, 0, -1, -1, 0]),  # short on the cross back below 70, out at 50 (PM bands 70/50)
     ([45, 25, 31, 29, 31], [0, 0, 1, 1, 1]),  # a dip during the long doesn't end it
 ])
 def test_rsi_cross_enters_on_the_cross_back_and_exits_at_the_band(path, sides):
