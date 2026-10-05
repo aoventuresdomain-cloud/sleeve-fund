@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from sleeve_fund.strategies.indicators._common import PERIOD_MAX, SETTLE_LENGTHS, Setting, settle_bars
 from sleeve_fund.strategies.indicators.averages import DAY_OF_MINUTE_BARS, NS_PER_DAY, Ema, Vwap, Wma
-from sleeve_fund.strategies.indicators.bands import FLAT_BAND, Bollinger
+from sleeve_fund.strategies.indicators.bands import FLAT_BAND, Bollinger, Donchian
 from sleeve_fund.strategies.indicators.classic import Atr, Rsi, Sma
 from sleeve_fund.strategies.indicators.filters import EfficiencyRatio, RelativeVolume
+from sleeve_fund.strategies.indicators.swings import RsiDivergence
 
 BLOCKS: dict[str, type] = {
     "sma": Sma,
@@ -30,6 +31,8 @@ BLOCKS: dict[str, type] = {
     "atr": Atr,
     "relative_volume": RelativeVolume,
     "efficiency_ratio": EfficiencyRatio,
+    "donchian": Donchian,
+    "rsi_divergence": RsiDivergence,
 }
 
 
@@ -63,6 +66,6 @@ def warmup_for(specs) -> int:
 
 __all__ = [
     "BLOCKS", "DAY_OF_MINUTE_BARS", "FLAT_BAND", "NS_PER_DAY", "PERIOD_MAX", "SETTLE_LENGTHS", "Atr", "Bollinger",
-    "EfficiencyRatio", "Ema", "RelativeVolume", "Rsi", "Setting", "Sma", "Vwap", "Wma", "make_block", "settle_bars",
+    "Donchian", "EfficiencyRatio", "Ema", "RelativeVolume", "Rsi", "RsiDivergence", "Setting", "Sma", "Vwap", "Wma", "make_block", "settle_bars",
     "warmup_for",
 ]
