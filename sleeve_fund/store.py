@@ -239,7 +239,7 @@ accounts_t = Table(
     metadata,
     Column("name", String(41), primary_key=True),
     Column("kind", String(8), nullable=False),  # paper | live
-    Column("venue", String(16), nullable=False, default="kraken"),
+    Column("venue", String(16), nullable=False, default=""),  # a live account's venue; "" for paper (any venue)
     Column("note", Text, nullable=False, default=""),
     Column("created_at", TS, nullable=False),
 )
@@ -349,6 +349,16 @@ resets_t = Table(
     Column("created_at", TS, nullable=False),
     Column("done_at", TS, nullable=True),
     Column("run", String(64), nullable=False, default=""),
+)
+# A pause or halt in force when a reset was asked for, carried onto the fresh run so a reset never lifts
+# the kill switch, a risk halt or the PM's pause (round 13, U13-4). A new table: CREATE TABLE.
+reset_holds_t = Table(
+    "strategy_reset_holds",
+    metadata,
+    Column("reset_id", Integer, primary_key=True),
+    Column("status", String(16), nullable=False),
+    Column("status_reason", Text, nullable=False, default=""),
+    Column("paused_until", TS, nullable=True),
 )
 # Tables whose rows are a strategy's own run: moved to the run's name on a reset. sleeve_accounts and
 # sleeve_venues are copied (both need them); feed_seen starts afresh; backtests are never strategies on a book.
@@ -672,22 +682,35 @@ class Store:
     # --- accounts ------------------------------------------------------------------
 
     def _ensure_paper_account(self, c) -> None:
-        if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == "paper")).first() is None:
-            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
-                                                note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+        from sleeve_fund.accounts import PAPER_NOTE, PAPER_NOTES_BEFORE
 
-    def create_account(self, name: str, kind: str, note: str = "") -> None:
+        row = c.execute(select(accounts_t).where(accounts_t.c.name == "paper")).first()
+        if row is None:
+            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="", note=PAPER_NOTE,
+                                                created_at=utcnow()))
+        elif row.venue or row.note in PAPER_NOTES_BEFORE:
+            # Made when every account was on one venue: paper trades at each strategy's own venue. A note
+            # the PM wrote is kept; only the old default one is replaced.
+            note = PAPER_NOTE if row.note in PAPER_NOTES_BEFORE else row.note
+            c.execute(update(accounts_t).where(accounts_t.c.name == "paper").values(venue="", note=note))
+
+    def create_account(self, name: str, kind: str, note: str = "", venue: str | None = None) -> None:
+        """A live account is on one venue, picked from the registered profiles; a paper one serves any."""
         from sleeve_fund.accounts import KINDS, NAME_RE
+        from sleeve_fund.venues import VENUES
 
         if not NAME_RE.fullmatch(name):
             raise ValueError("account name: lower-case letters, digits and dashes, 2 to 41 characters")
         if kind not in KINDS:
             raise ValueError(f"account kind must be one of {KINDS}")
+        if kind == "live" and (venue or "").upper() not in VENUES:
+            raise ValueError(f"a live account needs its venue, one of {', '.join(p.label for p in VENUES.values())}")
+        venue = (venue or "").lower() if kind == "live" else ""
         with self.engine.begin() as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == name)).first():
                 raise ValueError(f"an account called {name} already exists")
-            c.execute(insert(accounts_t).values(name=name, kind=kind, venue="kraken", note=note, created_at=utcnow()))
+            c.execute(insert(accounts_t).values(name=name, kind=kind, venue=venue, note=note, created_at=utcnow()))
 
     def accounts(self) -> list[dict]:
         """Every account with its sleeves and, for live ones, whether the supervisor sees a key."""
@@ -1045,8 +1068,12 @@ class Store:
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         with self.engine.begin() as c:
-            c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
-                                              restart=int(s.desired_state == "running"), run=""))
+            rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
+                                                    restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
+            # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
+            if s.status in ("paused", "halted"):
+                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
+                                                       paused_until=s.paused_until))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
@@ -1087,9 +1114,14 @@ class Store:
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
+            hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
+            # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
+            # process keeps a status it starts with until the PM resumes it.
+            kept = ({"status": hold.status, "status_reason": f"{hold.status_reason} (kept through a reset)".strip(),
+                     "paused_until": hold.paused_until} if hold else
+                    {"status": "stopped", "status_reason": "reset: starts afresh", "paused_until": None})
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(
-                status="stopped", status_reason="reset: starts afresh", paused_until=None, heartbeat_at=None,
-                created_at=now, updated_at=now))
+                **kept, heartbeat_at=None, created_at=now, updated_at=now))
             c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=now, run=run))
         return run
 

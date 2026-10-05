@@ -800,12 +800,11 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         profile):
     """Sizing on a perp (PM decision, 5 Oct): every entry, long or short, puts up the profile's position cap
     of equity as margin (20%, 33%, 50%) at its leverage cap (1x, 2x, 3x), so a notional of the two multiplied,
-    never over it; and the liquidation price it reports is where equity falls to the maintenance margin:
-    below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage) / (1 -/+ maintenance)
-    of the entry, and outside the profile's minimum distance. A long at 1x or less is fully paid for and has
-    none."""
+    never over it; and the liquidation price it reports is where that isolated margin falls to the maintenance
+    margin: below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage cap) /
+    (1 -/+ maintenance) of the entry, and outside the profile's minimum distance. A long at 1x is fully paid for
+    and has none."""
     prof = risk.PROFILES[profile]
-    cap = prof.max_position_pct * prof.max_leverage
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
                      risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
     entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
@@ -814,7 +813,7 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
     for o in entries:
         sig = o["signal"]
         assert sig["sized_by"] == f"{profile} risk profile cap", sig
-        if o["side"] == "BUY" and cap <= 1:
+        if o["side"] == "BUY" and prof.max_leverage <= 1:
             assert "liquidation_px" not in sig, sig
             continue
         lev, liq, close = sig["leverage"], sig["liquidation_px"], sig["close"]
@@ -822,7 +821,9 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         assert prof.max_position_pct * 0.94 <= lev / prof.max_leverage <= prof.max_position_pct, sig
         side = 1 if o["side"] == "BUY" else -1
         assert (liq < close) if side > 0 else (liq > close), sig
-        assert liq / close == pytest.approx((1 - side / lev) / (1 - side * m), rel=2e-3), sig
+        # Isolated: the margin is the notional over the leverage cap, so liquidation is the textbook price at
+        # that leverage, not at the notional over the whole equity (review round 13, U13-2).
+        assert liq / close == pytest.approx((1 - side / prof.max_leverage) / (1 - side * m), rel=2e-3), sig
         assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
 
 
