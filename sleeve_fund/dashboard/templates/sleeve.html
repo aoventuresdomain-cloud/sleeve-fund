@@ -140,7 +140,7 @@
   </div>
   <div data-sub-panel="history" role="tabpanel" hidden>
 <section class="panel flush" aria-labelledby="ord-h">
-  <div class="panel-head"><h2 id="ord-h" class="sr-only">Order history</h2><a class="right" href="/orders?sleeve={{ s.name }}">Blotter</a></div>
+  <div class="panel-head"><h2 id="ord-h" class="sr-only">Order history</h2><span class="right">{% if order_total > orders|length %}<span class="muted">Latest {{ orders|length }} of {{ order_total }} · </span>{% endif %}<a href="/orders?sleeve={{ s.name }}">{{ 'All in the Blotter' if order_total > orders|length else 'Blotter' }}</a></span></div>
   {% if orders %}
   <div class="chip-row" data-chips="ord-list" role="group" aria-label="Filter orders">{% for k, label in [('all', 'All'), ('filled', 'Filled'), ('canceled', 'Cancelled'), ('rejected', 'Rejected')] %}<button type="button" class="fchip" data-chip="{{ k }}" aria-pressed="{{ 'true' if k == 'all' else 'false' }}">{{ label }}</button>{% endfor %}</div>
   <table class="responsive" data-hide-md="3 6">

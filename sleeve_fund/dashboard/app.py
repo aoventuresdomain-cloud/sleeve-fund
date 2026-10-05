@@ -54,6 +54,7 @@ LEDGER = study_run.LEDGER
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
+ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
 security = HTTPBasic(realm="Multi-Strategy Fund")
 
@@ -434,7 +435,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None,
                               st().insurance(name) if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
-        recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
+        order_total = sum(st().order_counts(name).values())
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
         q = request.query_params
@@ -448,6 +450,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    order_total=order_total,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -795,7 +798,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         pre = pre or {}
         sheets = [dev.read_sheet(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                     reverse=True)]
-        rows = pipeline.strategies(TEARSHEETS, st().sleeves())
+        put_away = st().archived()  # an archived strategy is not in paper any more (QA U6)
+        rows = pipeline.strategies(TEARSHEETS, [s for s in st().sleeves() if s.name not in put_away])
         cards = dev.plans(rows, sheets)
         chosen = next((c for c in cards if c["name"] == pre.get("strategy")), cards[0])
         values = dev.form_values(chosen, pre)
