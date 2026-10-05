@@ -31,6 +31,7 @@ from sleeve_fund.research.metrics import (
     whole_days,
 )
 from sleeve_fund.research.runner import BacktestResult, run_backtest
+from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import IdeaSpec
 
 
@@ -218,6 +219,12 @@ def run_study(
     half_spread: the spread charged on orders that take liquidity (sleeve_fund.spreads.resolve gives
     the measured one); None uses the venue's assumption.
     progress: called with the share of the study's backtests done, 0 to 1."""
+    from sleeve_fund.venues import VENUES
+
+    perpetual = getattr(VENUES.get(str(instrument.id.venue)), "perpetual", False)
+    for combo in grid(spec.param_grid) or [{}]:  # refused up front, before any data is read or run
+        check_perp_sizing(spec.name, {**(default_params or spec.default_params or {}), **combo,
+                                      **({"market": PERP} if perpetual else {})})
     if risk_profile is not None:
         from sleeve_fund.risk import profile as risk_profile_of
 

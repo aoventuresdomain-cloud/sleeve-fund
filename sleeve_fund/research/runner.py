@@ -20,7 +20,7 @@ from sleeve_fund import markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
-from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 
 
 @dataclass
@@ -115,6 +115,7 @@ def run_backtest(
     fees: charge this schedule instead of the market's or the instrument's (the cost ladder)."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
+    check_perp_sizing(strategy_name, params)
     if starting_capital <= 0:
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})

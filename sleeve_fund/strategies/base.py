@@ -924,6 +924,12 @@ class LongFlatStrategy(Strategy):
         target = self.want_long(bar)
         return None if target is None else (1.0 if target else 0.0)
 
+    @classmethod
+    def weight_sized(cls, params: dict) -> bool:
+        """Whether, with these settings, the model holds a share of the capital below all of it (target_weight)
+        rather than all or nothing. A model that overrides target_weight does, unless it says otherwise."""
+        return cls.target_weight is not LongFlatStrategy.target_weight
+
     def want_side(self, bar: Bar) -> int | None:
         """The side to be on from this bar's close: +1 long, 0 flat, -1 short (taken only with allow_short);
         None = not enough data yet. The default is want_long's long or flat."""
