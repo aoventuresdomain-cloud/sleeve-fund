@@ -242,3 +242,86 @@ def test_a_strategy_always_warms_up_on_what_its_indicators_need():
     assert auto_warmup("rsi_pullback", {}, "1-MINUTE-LAST-INTERNAL") == 2000  # its EMA(200)
     assert auto_warmup("ping_pong", {}, "1-MINUTE-LAST-INTERNAL") == 0
     assert auto_warmup("trend_filter", {"slow": 20_000, "ema": True}, "1-MINUTE-LAST-INTERNAL") == MAX_WARMUP_BARS
+
+
+def _gap_strategy(loader, backtest=False):
+    from sleeve_fund.venues import venue
+
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    events = []
+    store = type("S", (), {"event": lambda self, *a, **k: events.append(a)})()
+    runtime = type("R", (), {"name": "s1", "store": store, "backtest": backtest, "now": lambda self: None})()
+    cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008)
+    s = TrendFilter(cfg).attach_gap_loader(loader)
+    s.instrument, s.runtime, s._maybe_tick = instrument, runtime, lambda: None
+
+    def bar(hour, close, volume):
+        ts = int((1_790_000_000 // 3600 + hour) * 3600 * 1e9)
+        return Bar(bt, Price(close, 1), Price(close, 1), Price(close, 1), Price(close, 1), Quantity(volume, 8), ts, ts)
+
+    def step(b):  # what on_bar does with a decision bar before deciding
+        if s._hold_gap(b):
+            return None
+        b = s._fill_gap(b)
+        s._accept(b)
+        return b
+
+    return s, bar, step, events
+
+
+def test_candles_built_while_no_trades_arrived_are_rebuilt_from_the_venue_before_deciding():
+    """PM, 5 Oct 2026: after a dropped feed, paper decided on flat candles at the last price. A candle with no
+    volume is now held; when trades are back, the venue's own candles replace the held ones before the model
+    decides, and the bar it decides on is the venue's when the venue saw more of it."""
+    asked = []
+    s, bar, step, events = _gap_strategy(lambda inst, bt, since, until: (asked.append((since, until)), venue)[1])
+    venue = [bar(2, 110.0, 5), bar(3, 120.0, 4), bar(4, 131.0, 9)]
+    assert step(bar(1, 100.0, 1)) is not None
+    assert step(bar(2, 100.0, 0)) is None and step(bar(3, 100.0, 0)) is None  # held, not decided on
+    assert s.slow.value == 0 or not s.slow.initialized
+    decided = step(bar(4, 130.0, 1))
+    assert decided.close.as_double() == 131.0 and asked == [(bar(2, 0, 0).ts_event, bar(4, 0, 0).ts_event)]
+    assert s.slow.value == pytest.approx((110 + 120 + 131) / 3)
+    (_, level, kind, msg), = events
+    assert (level, kind) == ("warning", "feed_gap")
+    assert "No trades reached this process for 2 candles" in msg and "2 rebuilt from the venue's own candles" in msg
+
+
+def test_a_quiet_market_is_used_flat_without_a_warning_and_an_unreachable_venue_says_so():
+    s, bar, step, events = _gap_strategy(lambda *a: [bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 2)])
+    for b in (bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 1)):
+        step(b)
+    assert events == [] and s.slow.value == pytest.approx((100 + 100 + 101) / 3)  # the venue had none either
+
+    def down(*a):
+        raise ConnectionError("503")
+
+    s, bar, step, events = _gap_strategy(down)
+    for b in (bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 1)):
+        step(b)
+    (_, level, kind, msg), = events
+    assert kind == "feed_gap" and "1 couldn't be checked (couldn't fetch the venue's candles: 503)" in msg
+    assert s.slow.value == pytest.approx((100 + 100 + 101) / 3)  # the held candle stood
+
+
+def test_a_backtest_never_holds_a_candle():
+    s, bar, step, _ = _gap_strategy(lambda *a: [], backtest=True)
+    assert step(bar(1, 100.0, 0)) is not None
+
+
+def test_the_gap_loader_returns_the_venues_closed_candles_stamped_at_their_close():
+    import pandas as pd
+
+    from sleeve_fund.paper.node import gap_loader
+    from sleeve_fund.venues import venue
+
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    idx = pd.date_range("2026-10-05 00:00", periods=6, freq="1h", tz="UTC")  # by open time, the last forming
+    c = [10.0, 11, 12, 13, 14, 15]
+    df = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx)
+    since, until = (pd.Timestamp(t, tz="UTC").value for t in ("2026-10-05 02:00", "2026-10-05 05:00"))
+    bars = gap_loader("BTC/USD", lambda pair, minutes: df)(instrument, bt, since, until)
+    assert [(pd.Timestamp(b.ts_event, tz="UTC").hour, b.close.as_double()) for b in bars] == [(2, 11.0), (3, 12.0),
+                                                                                             (4, 13.0), (5, 14.0)]
