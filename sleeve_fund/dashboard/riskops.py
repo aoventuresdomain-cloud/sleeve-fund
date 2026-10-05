@@ -13,7 +13,7 @@ from sleeve_fund.store import Store, utcnow
 # (a rally) shows as plainly as a long book's.
 SHOCKS = (-0.50, -0.20, -0.10, -0.05, 0.05, 0.10, 0.20, 0.50)
 BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not_found", "tick_failed", "liquidation",
-                "liquidation_cut")
+                "liquidation_cut", "insurance_fund")
 
 
 def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:

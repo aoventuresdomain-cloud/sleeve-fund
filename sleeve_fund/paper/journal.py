@@ -25,6 +25,7 @@ class MemoryJournal:
         self.equity: list[dict] = []
         self.fills_: list[dict] = []
         self.funding_: list[dict] = []
+        self.insurance_: list[dict] = []
         self.orders_: dict[str, dict] = {}
         self.events_: list[dict] = []
         self.exit_plans_: dict[str, list[dict]] = {}
@@ -197,7 +198,7 @@ class MemoryJournal:
     def journal_book(self, sleeve: str, starting_balance: float) -> dict:
         from sleeve_fund.store import replay_book
 
-        return replay_book(self.fills_, starting_balance, self.funding_total(sleeve))
+        return replay_book(self.fills_, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
                        ts: datetime | None = None) -> None:
@@ -208,6 +209,15 @@ class MemoryJournal:
 
     def funding_total(self, sleeve: str) -> float:
         return float(sum(f["amount"] for f in self.funding_))
+
+    def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
+        self.insurance_.append({"sleeve": sleeve, "ts": ts, "price": price, "amount": amount})
+
+    def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
+        return list(reversed(self.insurance_))[:limit]
+
+    def insurance_total(self, sleeve: str) -> float:
+        return float(sum(f["amount"] for f in self.insurance_))
 
     # --- into the real journal ---------------------------------------------------------
 

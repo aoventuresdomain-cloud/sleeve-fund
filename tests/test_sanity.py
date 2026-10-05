@@ -415,9 +415,10 @@ def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp
         gap = (b[4] / p[4] - 1) * 1e4
         if p[1] in RISK_EXITS:
             # At 2x leverage the probe can hit the daily-loss pause. Paper closes on the trade that breaches
-            # it, the backtest at the close of the minute it judged at its worst price: the same minute and
-            # size, a price a few bp kinder to the backtest at most (a known gap, like a stop's).
-            assert -15 <= gap * (1 if p[0] == "BUY" else -1) <= 0.3, (p, b)
+            # it; the backtest (spot) at the close of the minute that breached, or (perp) at the level its
+            # resting risk stop sat at: the same minute and size, never kinder to the backtest, and worse by
+            # at most a few bp.
+            assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
     spread_b = sum(r[3] * SPREAD / 2 for r in bt)
@@ -613,9 +614,11 @@ def _probe_ls(monkeypatch):
     monkeypatch.setitem(REGISTRY, "probe_long", (ProbeLong, ProbeConfig))
 
 
-def _ls_bars(closes, minutes=60, start="2025-10-03"):
+def _ls_bars(closes, minutes=60, start="2025-10-03", gaps=False):
+    """Bars that open at the last close and trade straight to their own; with gaps, each opens at its own
+    close, so a change between bars is a gap no order can trade inside."""
     c = np.asarray(closes, dtype=float)
-    o = np.r_[c[0], c[:-1]]
+    o = c.copy() if gaps else np.r_[c[0], c[:-1]]
     idx = pd.date_range(start, periods=len(c), freq=f"{minutes}min", tz="UTC") + pd.Timedelta(minutes=minutes)
     return pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c,
                          "volume": 1e12 / float(c[0])}, index=idx)
@@ -648,9 +651,10 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
         gap = (b[4] / p[4] - 1) * 1e4
         if p[1] in RISK_EXITS:
             # At 2x leverage the probe can hit the daily-loss pause. Paper closes on the trade that breaches
-            # it, the backtest at the close of the minute it judged at its worst price: the same minute and
-            # size, a price a few bp kinder to the backtest at most (a known gap, like a stop's).
-            assert -15 <= gap * (1 if p[0] == "BUY" else -1) <= 0.3, (p, b)
+            # it; the backtest (spot) at the close of the minute that breached, or (perp) at the level its
+            # resting risk stop sat at: the same minute and size, never kinder to the backtest, and worse by
+            # at most a few bp.
+            assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
     spread_b = sum(r[3] * SPREAD / 2 for r in bt)
@@ -801,7 +805,9 @@ def test_a_rally_against_a_short_is_bought_back_by_the_guards_before_the_venue_w
     j = res.journal
     orders = sorted(j.orders_.values(), key=lambda o: o["id"])
     fills = {f["order_id"]: f for f in j.fills_}
-    assert "risk_halt" in {o["intent"] for o in orders} or "liquidation_cut" in {o["intent"] for o in orders}
+    # The guards act at their levels (a resting risk stop in a backtest): the daily-loss pauses alone can keep
+    # the drawdown short of the halt, so any of the guards may be the one that buys it back.
+    assert {o["intent"] for o in orders} & {"risk_pause", "risk_halt", "liquidation_cut"}
     for opened, closed in zip(orders[::2], orders[1::2]):  # each short, then what bought it back
         assert (opened["side"], opened["intent"]) == ("SELL", "entry"), opened
         assert closed["side"] == "BUY" and closed["intent"] in ("risk_pause", "risk_halt", "liquidation_cut")
@@ -865,7 +871,7 @@ def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no
     to act on, is liquidated: one order with the 'liquidation' intent closes the whole position, the book is
     flat after it, and the strategy is halted (no entry after it)."""
     c = np.r_[np.full(10, 60_000.0), np.full(20, gap)]
-    res = run_backtest(strategy, _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000,
+    res = run_backtest(strategy, _ls_bars(c, minutes=60, gaps=True), TICK_INST, PERP, starting_capital=10_000,
                        risk_profile=profile, bar_minutes=60, half_spread=HALF)
     j = res.journal
     orders = sorted(j.orders_.values(), key=lambda o: o["id"])
@@ -924,15 +930,13 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
                    for o in legs.values()), (e, legs)
 
 
-@pytest.mark.xfail(strict=True, reason="sanity 5 Oct: a gap past liquidation books a loss beyond the strategy's "
-                                       "isolated margin (equity goes negative); reported to the build thread")
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
 def test_isolated_margin_a_liquidation_never_loses_more_than_the_strategys_equity(strategy, gap):
     """Isolated margin (long/short verdict default): a liquidated position loses at most the margin behind
     it, the strategy's equity; the venue's insurance fund takes any shortfall past the bankruptcy price. So
     a strategy's equity never goes below zero, and never pulls the rest of the fund down with it."""
     c = np.r_[np.full(10, 60_000.0), np.full(20, gap)]
-    res = run_backtest(strategy, _ls_bars(c, minutes=60), TICK_INST, PERP, starting_capital=10_000,
+    res = run_backtest(strategy, _ls_bars(c, minutes=60, gaps=True), TICK_INST, PERP, starting_capital=10_000,
                        risk_profile="aggressive", bar_minutes=60, half_spread=HALF)
     assert res.equity.min() >= 0, res.equity.min()
 
@@ -941,13 +945,13 @@ def _wilder(closes, n=14):
     """Wilder's RSI, written out from its definition, independent of the engine's indicators."""
     out = [None] * len(closes)
     ch = np.diff(np.asarray(closes, dtype=float))
-    g, l = np.clip(ch, 0, None), np.clip(-ch, 0, None)
+    g, lo = np.clip(ch, 0, None), np.clip(-ch, 0, None)
     if len(ch) < n:
         return out
-    ag, al = g[:n].mean(), l[:n].mean()
+    ag, al = g[:n].mean(), lo[:n].mean()
     for k in range(n, len(ch) + 1):
         if k > n:
-            ag, al = (ag * (n - 1) + g[k - 1]) / n, (al * (n - 1) + l[k - 1]) / n
+            ag, al = (ag * (n - 1) + g[k - 1]) / n, (al * (n - 1) + lo[k - 1]) / n
         out[k] = 100.0 if al == 0 and ag > 0 else 50.0 if al == ag == 0 else 100 - 100 / (1 + ag / al)
     return out
 

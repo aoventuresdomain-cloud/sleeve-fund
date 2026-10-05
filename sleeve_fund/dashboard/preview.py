@@ -342,7 +342,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         m["max_drawdown"] = min(m["max_drawdown"], w)
         m["calmar"] = m["cagr"] / abs(m["max_drawdown"]) if m["max_drawdown"] < 0 else 0.0
     rows = fills_to_rows(res.fills)
-    trips = trades(rows, res.shorts, res.funding)
+    trips = trades(rows, res.shorts, res.funding, res.insurance)
     stats = trade_stats(trips)
     step = 1 if detail else max(1, len(equity) // 400)
     out = {
@@ -375,7 +375,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         peak = equity.cummax()
         out["drawdown"] = [round(float(v), 6) for v in (1 - equity / peak)]
         out["fills"] = [{"t": r["ts"].isoformat(), "side": r["side"], "price": r["price"]} for r in rows]
-        out["trips"] = trading.trips(list(reversed(rows)), [], res.decisions, shorts=res.shorts, funding=res.funding)
+        out["trips"] = trading.trips(list(reversed(rows)), [], res.decisions, shorts=res.shorts, funding=res.funding,
+                                     insurance=res.insurance)
         out["stats"] = {k: _finite(v) for k, v in stats.items()}
         out["strategy"].update(sortino=s["sortino"], calmar=s["calmar"])
         out["hold"].update(sortino=b["sortino"], calmar=b["calmar"])

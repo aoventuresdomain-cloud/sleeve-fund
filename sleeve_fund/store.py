@@ -115,6 +115,19 @@ funding_t = Table(
     Index("funding_sleeve_ts", "sleeve", "ts"),
 )
 
+# A perpetual's loss past the bankruptcy price, which the venue's insurance fund takes under isolated margin
+# (a gap through the liquidation price): amount is what came back to the strategy's cash.
+insurance_t = Table(
+    "insurance",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("ts", TS, nullable=False),
+    Column("price", Float, nullable=False),
+    Column("amount", Float, nullable=False),
+    Index("insurance_sleeve_ts", "sleeve", "ts"),
+)
+
 # The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
 # failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
 mirror_t = Table(
@@ -330,8 +343,9 @@ def exact_sum(a: float, b: float) -> float:
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
-def replay_book(fills, starting_balance: float, funding: float = 0.0) -> dict:
-    """Cash, signed position and average entry from fills in time order, plus funding received.
+def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
+    """Cash, signed position and average entry from fills in time order, plus funding received and any
+    shortfall the venue's insurance fund took.
 
     Spot-style cash: a buy costs qty * price + fee and a sell returns qty * price - fee, so a short holds
     the sale's proceeds as cash against a negative position and equity is cash + qty * price on either
@@ -357,8 +371,8 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0) -> dict:
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
         qty = new
-    return {"cash": cash + float(funding), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding)}
+    return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
+            "funding": float(funding), "insurance": float(insurance)}
 
 
 def is_backtest(name: str | None) -> bool:
@@ -858,11 +872,11 @@ class Store:
 
     def journal_book(self, sleeve: str, starting_balance: float) -> dict:
         """Cash, signed position and average entry implied by the journal: the paper book's source of
-        truth (replay_book), with the perp's funding booked to cash."""
+        truth (replay_book), with the perp's funding and any insurance-fund cover booked to cash."""
         q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
         with self.engine.connect() as c:
             fills = _rows(c.execute(q))
-        return replay_book(fills, starting_balance, self.funding_total(sleeve))
+        return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
                        ts: datetime | None = None) -> None:
@@ -879,6 +893,20 @@ class Store:
         with self.engine.connect() as c:
             return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
                                    .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+
+    def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(insurance_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), price=price, amount=amount))
+
+    def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
+        q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def insurance_total(self, sleeve: str) -> float:
+        with self.engine.connect() as c:
+            return float(c.execute(select(func.coalesce(func.sum(insurance_t.c.amount), 0.0))
+                                   .where(insurance_t.c.sleeve == sleeve)).scalar() or 0.0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -1068,6 +1096,9 @@ class Store:
             if getattr(journal, "funding_", None):
                 c.execute(insert(funding_t), [{k: v for k, v in f.items() if k != "id"} | {"sleeve": name}
                                               for f in journal.funding_])
+            if getattr(journal, "insurance_", None):
+                c.execute(insert(insurance_t), [{k: v for k, v in f.items() if k != "id"} | {"sleeve": name}
+                                                for f in journal.insurance_])
             if journal.orders_:
                 c.execute(insert(orders_t), [{k: v for k, v in o.items() if k != "id"}
                                              | {"sleeve": name, "order_id": oid(o["order_id"])}
@@ -1134,7 +1165,7 @@ class Store:
             # otherwise block deleting its event (a foreign key) and with it every later prune.
             c.execute(delete(acks_t).where(acks_t.c.event_id.in_(select(events_t.c.id)
                                                                   .where(events_t.c.sleeve.in_(old)))))
-            for t in (equity_t, fills_t, funding_t, orders_t, events_t, exit_plans_t):
+            for t in (equity_t, fills_t, funding_t, insurance_t, orders_t, events_t, exit_plans_t):
                 c.execute(delete(t).where(t.c.sleeve.in_(old)))
             c.execute(delete(backtests_t).where(backtests_t.c.sleeve.in_(old)))
             c.execute(delete(sleeves_t).where(sleeves_t.c.name.in_(old)))
