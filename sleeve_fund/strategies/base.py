@@ -39,6 +39,8 @@ from sleeve_fund.strategies.indicators import Atr
 MAKER_INTENTS = ("entry", "exit", "rebalance")
 OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
 EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
+# Exits after which the side they closed isn't entered again until the signal has moved off it (_exit_lock).
+LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 MINUTE_NS = 60_000_000_000
 
 
@@ -156,6 +158,12 @@ def loss_at_stop(stop: float, leg: float, side: int = 1) -> float:
 def gain_at_target(tp: float, leg: float, side: int = 1) -> float:
     """The share of a position's entry value a target hit makes after both legs' costs."""
     return tp - leg - (1 + side * tp) * leg
+
+
+def _ns(ts: datetime) -> int:
+    """A journal time as clock nanoseconds (a stored time without a zone is UTC)."""
+    ts = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    return int(ts.timestamp()) * 1_000_000_000 + ts.microsecond * 1000
 
 
 def _from_entry(stop: float, side: int = 1) -> str:
@@ -416,6 +424,9 @@ class LongFlatStrategy(Strategy):
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
+        # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
+        # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
+        self._resume: dict | None = None
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
@@ -539,11 +550,15 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
+        self._plan_resume()
         if self._cfg.warmup_bars:
             if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
                 self._warm_from_history()
+                self._finish_resume()
             else:
-                self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)
+                self.request_bars(self._cfg.bar_type, limit=self._cfg.warmup_bars)  # resumed when they arrive
+        else:
+            self._finish_resume()
         self.subscribe_bars(self._cfg.bar_type)
         if self.runtime is not None:
             self.runtime.on_start(self._cfg.assumed_taker_fee, now=lambda: self.clock.utc_now().replace(microsecond=0))
@@ -875,8 +890,83 @@ class LongFlatStrategy(Strategy):
 
     def on_historical_bars(self, bars) -> None:
         for bar in sorted(bars, key=lambda b: b.ts_event):
-            self._accept(bar)
+            if self._accept(bar):
+                self._replay(bar)
+        self._finish_resume()
         self.log.info(f"warmed up on {len(bars)} historical bars")
+
+    def resume_leg(self, side: int, held: int) -> None:
+        """After a restart: put the model's rules back on the leg the journal's last entry opened (+1 long, -1
+        short), as they stood `held` decision bars after the entry's own bar. The warm-up bars since are then
+        decided on again, without trading (_replay), so the leg ends, its time stop falls and an exit lock
+        clears where they would have without the restart (review round 13, E13-3/E13-4). Models whose rules
+        keep a leg override this; for any other model a restart rebuilds nothing beyond its indicators."""
+
+    def _plan_resume(self) -> None:
+        """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first
+        exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
+        self._resume = None
+        if (self.runtime is None or self.runtime.backtest
+                or type(self).resume_leg is LongFlatStrategy.resume_leg):
+            return
+        step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
+        orders = self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
+        at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
+        if at is None:
+            qty = self.runtime.book["qty"]
+            if qty:  # held with no entry in the journal's recent orders: that leg is on, from now
+                self._resume = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False}
+            return
+        entry = orders[at]
+        lock = next((o for o in reversed(orders[:at]) if o["intent"] in LOCKING_INTENTS), None)
+        # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
+        self._resume = {"side": 1 if entry["side"] == "BUY" else -1, "bar": _ns(entry["ts"]) // step * step,
+                        "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
+
+    def _replay(self, bar: Bar) -> None:
+        """A warm-up bar after a restart, closed since the journal's last entry: decide on it as the run did, for
+        the model's state only. No order, no journal; the exit lock is set and cleared as on_bar would."""
+        r = self._resume
+        if r is None or r["bar"] is None or bar.ts_event <= r["bar"]:
+            return
+        if r["lock_ns"] is not None and bar.ts_event > r["lock_ns"]:
+            self._lock_resumed(r)
+        if not r["on"]:  # until the model's indicators are ready to decide, the leg's bars count on
+            self.resume_leg(r["side"], int((bar.ts_event - r["bar"]) // r["step"]) - 1)
+        if self._margin:
+            side = self.want_side(bar)
+            if side is None:
+                return
+            side = 0 if int(side) < 0 and not self._cfg.allow_short else int(side)
+            if self._exit_lock and self._exit_lock != side:
+                self._exit_lock = False
+        else:
+            raw = self.target_weight(bar)
+            if raw is None:
+                return
+            if min(max(float(raw), 0.0), 1.0, self._cap_pct()) == 0:
+                self._exit_lock = False
+        r["on"] = True
+
+    def _lock_resumed(self, r: dict) -> None:
+        self._exit_lock = r["side"] if self._margin else True
+        r["lock_ns"] = None
+
+    def _finish_resume(self) -> None:
+        """The warm-up is in: a leg no warm-up bar was decided on resumes at the bars counted to the next one,
+        and an exit lock set after the last warm-up bar is set now."""
+        r, self._resume = self._resume, None
+        if r is None:
+            return
+        if r["lock_ns"] is not None:
+            self._lock_resumed(r)
+        if not r["on"]:
+            if r["bar"] is None:
+                self.resume_leg(r["side"], 0)
+            else:
+                step = r["step"]
+                upcoming = self.clock.timestamp_ns() // step * step + step
+                self.resume_leg(r["side"], max(int((upcoming - r["bar"]) // step) - 1, 0))
 
     def _warm_from_history(self) -> None:
         """Feed the indicators the latest stored bars, so a model on bars built from live trades
@@ -1111,6 +1201,7 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
+        self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
