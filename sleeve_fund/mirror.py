@@ -3,9 +3,10 @@ same trades on a real venue's own screens. A strategy on Binance's USDT perpetua
 Trading (the same linear perpetual; Binance's own demo is closed to the PM's account); any other is copied to the
 Deribit testnet, the fallback. Demo money is not real and the paper journal
 stays the record of truth: the mirror never feeds anything back into a strategy, and a mirror order that fails
-is noted, not retried, so it can never trade twice. On Bybit Demo, where the quantity is the paper quantity, a
-catch-up then brings the account back to the paper position (catch_up), only for a gap seen twice in a row and
-only as far as the account itself is short of it.
+is noted, not retried, so it can never trade twice. Before copying to Bybit Demo it sets isolated margin at the
+paper leverage (prepare_margin), so margin and liquidation price match the paper book too. On Bybit Demo, where
+the quantity is the paper quantity, a catch-up then brings the account back to the paper position (catch_up),
+only for a gap seen twice in a row and only as far as the account itself is short of it.
 
 Fail-closed by construction:
 - it only ever talks to the demo hosts, api-demo.bybit.com and test.deribit.com; any other environment or
@@ -38,6 +39,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+
+from sleeve_fund import markets, risk
 
 FLAG_ENV = "DEMO_MIRROR"
 KEY_ENV = "DERIBIT_TESTNET_API_KEY"
@@ -271,15 +274,63 @@ class BybitDemo:
         sides = {"Buy": 1.0, "Sell": -1.0}
         return sum(sides.get(r.get("side"), 0.0) * float(r.get("size") or 0) for r in rows)
 
+    def margin_setup(self, symbol: str, leverage: float) -> str:
+        """Put the account on isolated margin and the symbol at this leverage, as the paper book models a
+        perpetual (isolated, the risk profile's leverage cap), so margin and liquidation price match it too.
+        A unified account sets isolated margin account-wide; a classic one per symbol. Raises if Bybit refuses;
+        returns what the account now says."""
+        lev = f"{leverage:g}"
+        try:
+            self.call("POST", "/v5/account/set-margin-mode", {"setMarginMode": "ISOLATED_MARGIN"})
+        except RuntimeError as unified:
+            try:
+                self.call("POST", "/v5/position/switch-isolated", {"category": "linear", "symbol": symbol,
+                                                                    "tradeMode": 1, "buyLeverage": lev,
+                                                                    "sellLeverage": lev})
+            except RuntimeError as classic:
+                if "(110026)" not in str(classic):  # 110026: already isolated
+                    raise RuntimeError(f"isolated margin refused: {unified}; {classic}") from None
+        try:
+            self.call("POST", "/v5/position/set-leverage", {"category": "linear", "symbol": symbol,
+                                                            "buyLeverage": lev, "sellLeverage": lev})
+        except RuntimeError as e:
+            if "(110043)" not in str(e):  # 110043: already at this leverage
+                raise
+        return self.margin_state(symbol)
+
+    def margin_state(self, symbol: str) -> str:
+        """The account's margin mode and the symbol's leverage, as Bybit reports them."""
+        try:
+            mode = str(self.call("GET", "/v5/account/info").get("marginMode") or "")
+        except RuntimeError:
+            mode = ""
+        rows = self.call("GET", "/v5/position/list", {"category": "linear", "symbol": symbol}).get("list") or []
+        row = rows[0] if rows else {}
+        if not mode:
+            mode = "ISOLATED_MARGIN" if str(row.get("tradeMode")) == "1" else "cross"
+        mode = {"ISOLATED_MARGIN": "isolated", "REGULAR_MARGIN": "cross", "PORTFOLIO_MARGIN": "portfolio"}.get(mode, mode)
+        return f"{mode} margin, {symbol} at {row.get('leverage') or '?'}x"
+
+    def equity(self) -> str:
+        rows = self.call("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"}).get("list") or []
+        return f"{float(rows[0].get('totalEquity') or 0):,.2f} USD equity" if rows else "equity unknown"
+
     def check(self) -> str:
-        """One signed read at start, so a bad key or hedge mode shows in the logs at once, not on the first fill."""
+        """One signed read at start, so a bad key or hedge mode shows in the logs at once, not on the first fill,
+        with the account's equity and margin set-up."""
         rows = self.call("GET", "/v5/position/list", {"category": "linear", "symbol": "BTCUSDT"}).get("list") or []
         hedge = any(int(r.get("positionIdx") or 0) for r in rows)
         sides = {"Buy": 1.0, "Sell": -1.0}
         held = sum(sides.get(r.get("side"), 0.0) * float(r.get("size") or 0) for r in rows)
         mode = ("HEDGE MODE: orders will be rejected until BTCUSDT is switched to one-way mode" if hedge
                 else "one-way mode")
-        return f"key accepted, BTCUSDT position {held:+g}, {mode}"
+        extra = []
+        for read in (self.equity, lambda: self.margin_state("BTCUSDT")):
+            try:
+                extra.append(read())
+            except Exception as e:  # noqa: BLE001 - only a report
+                extra.append(f"couldn't read: {str(e)[:120]}")
+        return f"key accepted, BTCUSDT position {held:+g}, {mode}, " + ", ".join(extra)
 
 
 def target_for(sleeve) -> str:
@@ -377,10 +428,7 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
         symbol = s.instrument.replace("/", "").upper()
         if target_for(s) == "BYBIT" and symbol in BYBIT_CONTRACTS and store.mirror_watermark(s.name) is not None:
             by_symbol.setdefault(symbol, []).append(s)
-    put_on = {}
-    for r in store.mirror_rows(limit=100_000):
-        if r["status"] == "filled":
-            put_on[r["sleeve"]] = put_on.get(r["sleeve"], 0.0) + float(r["amount"] or 0.0)
+    put_on = _put_on(store)
     for symbol, sleeves in by_symbol.items():
         step, min_notional = BYBIT_CONTRACTS[symbol]
         paper = {s.name: store.journal_book(s.name, s.starting_balance) for s in sleeves}
@@ -424,10 +472,88 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
     return out
 
 
+def bybit_leverage(store) -> dict[str, tuple[float, list]]:
+    """Per Bybit symbol, the leverage its mirrored strategies run at on paper (their risk profile's cap) and
+    the strategies. They share one Bybit position, so when their caps differ the lowest is used."""
+    out: dict[str, tuple[float, list]] = {}
+    for s in mirrored(store):
+        symbol = s.instrument.replace("/", "").upper()
+        if target_for(s) != "BYBIT" or symbol not in BYBIT_CONTRACTS or not markets.is_perp(s.params):
+            continue
+        lev = risk.profile(s.risk_profile).max_leverage
+        prev, names = out.get(symbol, (lev, []))
+        out[symbol] = (min(prev, lev), names + [s])
+    return out
+
+
+_MARGIN_WARNED: dict[str, str] = {}  # per symbol, the last margin set-up failure warned about
+_MARGIN_RESET: set[str] = set()  # symbols whose demo position was closed once to switch margin mode
+
+
+def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, float]:
+    """Before copying, set Bybit Demo to isolated margin at the paper leverage for each mirrored symbol
+    (once per change). If Bybit refuses while the demo account holds the symbol, the demo position is closed
+    once, the set-up tried again, and the catch-up reopens it at the new leverage. If it still fails, copies
+    go on (same quantity, so the same profit and loss) and a warning says the leverage could not be set.
+    Returns {symbol: leverage set}."""
+    venue, out = targets.get("BYBIT"), dict(done)
+    if venue is None:
+        return out
+    for symbol, (lev, sleeves) in bybit_leverage(store).items():
+        if out.get(symbol) == lev:
+            continue
+        try:
+            state = venue.margin_setup(symbol, lev)
+        except Exception as first:  # noqa: BLE001
+            held = venue.position(symbol)
+            state, err = None, first
+            if held and symbol not in _MARGIN_RESET:
+                _MARGIN_RESET.add(symbol)
+                side = "SELL" if held > 0 else "BUY"
+                try:
+                    order_id, price = venue.market(side, symbol, abs(held), f"{symbol}:margin-switch")
+                    put_on = _put_on(store)
+                    for s in sleeves:
+                        if put_on.get(s.name):
+                            store.record_mirror(s.name, fill_id=store.mirror_watermark(s.name) or 0, status="filled",
+                                                instrument=symbol, amount=-put_on[s.name], price=price,
+                                                order_id=order_id, message="closed to switch Bybit Demo to isolated "
+                                                "margin; the catch-up reopens it at the paper leverage")
+                    state = venue.margin_setup(symbol, lev)
+                except Exception as e:  # noqa: BLE001
+                    err = e
+            if state is None:
+                if _MARGIN_WARNED.get(symbol) != str(err):
+                    _MARGIN_WARNED[symbol] = str(err)
+                    for s in sleeves:
+                        store.event(s.name, "warning", "mirror_margin",
+                                    f"Demo mirror couldn't set {venue.label} to isolated margin at {lev:g}x for "
+                                    f"{symbol}: {str(err)[:200]}. Copies go on at the same quantity, so profit and "
+                                    "loss match, but margin and liquidation price on the demo account differ.")
+                continue
+        out[symbol] = lev
+        _MARGIN_WARNED.pop(symbol, None)
+        for s in sleeves:
+            store.event(s.name, "info", "mirror_margin",
+                        f"Demo mirror set {venue.label} to the paper book's terms for {symbol}: {state} "
+                        f"(the {s.risk_profile} profile's {lev:g}x cap)")
+    return out
+
+
+def _put_on(store) -> dict[str, float]:
+    """Per strategy, the net quantity the mirror has put on (its filled rows)."""
+    out: dict[str, float] = {}
+    for r in store.mirror_rows(limit=100_000):
+        if r["status"] == "filled":
+            out[r["sleeve"]] = out.get(r["sleeve"], 0.0) + float(r["amount"] or 0.0)
+    return out
+
+
 def run(store, targets: dict, poll: float = POLL_SECONDS, stop=None) -> None:
-    drift, checked, gaps, caught = {}, 0.0, {}, 0.0
+    drift, checked, gaps, caught, margin = {}, 0.0, {}, 0.0, {}
     while stop is None or not stop():
         try:
+            margin = prepare_margin(store, targets, margin)
             mirror_once(store, targets)
             if time.monotonic() - caught > CATCH_UP_SECONDS:
                 gaps, caught = catch_up(store, targets, gaps), time.monotonic()
