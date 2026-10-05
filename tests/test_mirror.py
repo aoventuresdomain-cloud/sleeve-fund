@@ -282,3 +282,118 @@ def test_the_start_check_says_whether_the_key_signed_in_and_flags_hedge_mode():
     bad = mirror.BybitDemo(mirror.Settings("k", "s"), http=lambda *a: {"retCode": 10003, "retMsg": "API key is invalid."})
     with pytest.raises(RuntimeError, match="API key is invalid"):
         bad.check()
+
+
+class _BybitFake(mirror.BybitDemo):
+    """Bybit Demo's answers, without the network: a position that the orders move."""
+
+    def __init__(self, fail=False):
+        super().__init__(mirror.Settings("k", "s"), http=self.http)
+        self.orders, self.held, self.fail = [], 0.0, fail
+
+    def http(self, method, url, headers, body):
+        import json
+
+        if "/v5/position/list" in url:
+            side = "Buy" if self.held > 0 else "Sell" if self.held < 0 else ""
+            return {"retCode": 0, "result": {"list": [{"symbol": "BTCUSDT", "side": side, "size": str(abs(self.held))}]}}
+        if "/v5/order/realtime" in url:
+            return {"retCode": 0, "result": {"list": [{"avgPrice": "60000"}]}}
+        if self.fail:
+            return {"retCode": 110007, "retMsg": "ab not enough for new order"}
+        o = json.loads(body)
+        self.orders.append(o)
+        self.held = round(self.held + (1 if o["side"] == "Buy" else -1) * float(o["qty"]), 8)
+        return {"retCode": 0, "result": {"orderId": str(len(self.orders))}}
+
+
+def _binance(store, name="bn-ls"):
+    store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True, "demo_mirror": True},
+                        venue="binance")
+
+
+def test_a_missed_copy_on_bybit_is_caught_up_once_the_gap_is_seen_twice():
+    store, demo = _store(), _BybitFake(fail=True)
+    _binance(store)
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "BUY", 0.05, 1)
+    mirror.mirror_once(store, targets)  # the copy is rejected: noted, not retried
+    assert demo.held == 0.0 and store.mirror_rows("bn-ls")[0]["status"] == "error"
+    demo.fail = False
+    seen = mirror.catch_up(store, targets, {})
+    assert seen == {"bn-ls": 0.05} and demo.orders == []  # seen once: no order yet
+    seen = mirror.catch_up(store, targets, seen)
+    assert demo.held == 0.05 and len(demo.orders) == 1 and demo.orders[0]["side"] == "Buy"
+    assert seen == {} and store.mirror_positions() == {"BTCUSDT": 0.05}
+    assert "mirror_catch_up" in [e["kind"] for e in store.events("bn-ls")]
+    assert mirror.catch_up(store, targets, seen) == {}  # level now: nothing more
+    # The catch-up row doesn't move the watermark: the next real fill is still copied.
+    _fill(store, "bn-ls", "SELL", 0.1, 2)
+    assert mirror.mirror_once(store, targets) == 1 and demo.held == pytest.approx(-0.05)
+    assert store.journal_book("bn-ls", 10_000)["qty"] == pytest.approx(-0.05)  # the paper book is untouched
+
+
+def test_a_position_held_before_the_mirror_first_saw_the_strategy_is_caught_up():
+    store, demo = _store(), _BybitFake()
+    _binance(store)
+    _fill(store, "bn-ls", "SELL", 0.05, 1)  # before the mirror's first look
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    assert demo.held == -0.05 and seen == {}
+
+
+def test_catch_up_never_resends_an_order_that_errored_but_went_in():
+    store, demo = _store(), _BybitFake()
+    _binance(store)
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "BUY", 0.05, 1)
+    store.record_mirror("bn-ls", fill_id=store.last_fill_id("bn-ls"), status="error", message="timed out")
+    demo.held = 0.05  # the order was filled after all
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    assert demo.orders == [] and demo.held == 0.05 and seen == {"bn-ls": 0.05}
+
+
+def test_two_strategies_on_one_bybit_symbol_are_caught_up_to_their_sum():
+    store, demo = _store(), _BybitFake(fail=True)
+    _binance(store, "bn-a")
+    _binance(store, "bn-b")
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-a", "BUY", 0.05, 1)
+    _fill(store, "bn-b", "SELL", 0.02, 2)
+    mirror.mirror_once(store, targets)
+    demo.fail = False
+    mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    assert demo.held == pytest.approx(0.03)
+    assert store.mirror_positions() == {"BTCUSDT": pytest.approx(0.03)}
+
+
+def test_a_skipped_copy_is_a_warning_the_pm_sees():
+    store, demo = _store(), _BybitFake()
+    _binance(store)
+    mirror.mirror_once(store, {"BYBIT": demo})
+    _fill(store, "bn-ls", "BUY", 0.0004, 1)
+    mirror.mirror_once(store, {"BYBIT": demo})
+    (e, _start) = store.events("bn-ls")
+    assert e["kind"] == "mirror_skipped" and e["level"] == "warning"
+
+
+def test_a_catch_up_that_keeps_failing_warns_once():
+    store, demo = _store(), _BybitFake(fail=True)
+    _binance(store, "bn-fail")
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-fail", "BUY", 0.05, 1)
+    mirror.mirror_once(store, targets)
+    seen = {}
+    for _ in range(4):
+        seen = mirror.catch_up(store, targets, seen)
+    kinds = [e["kind"] for e in store.events("bn-fail")]
+    assert kinds.count("mirror_failed") == 2  # the copy itself, then the catch-up once
+    demo.fail = False
+    mirror.catch_up(store, targets, seen)
+    assert demo.held == 0.05

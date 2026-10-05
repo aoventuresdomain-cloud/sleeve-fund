@@ -192,12 +192,17 @@ class Supervisor:
 
 def seed(store: Store, paths: list[str]) -> list[str]:
     """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
-    `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard."""
+    `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard.
+    One exception for a strategy already there: a file asking for the demo mirror turns it on when the strategy
+    has never had that setting (the Binance strategies were added before the mirror could copy them, 5 Oct
+    2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:
         cfg = load_sleeve(path)
         if cfg.name in existing:
+            if cfg.params.get("demo_mirror") and store.add_missing_param(cfg.name, "demo_mirror", True):
+                store.decide("system", "mirror", f"demo mirror turned on from {path}", cfg.name)
             continue
         with open(path, "rb") as fh:
             start = tomllib.load(fh).get("sleeve", {}).get("start", True)
