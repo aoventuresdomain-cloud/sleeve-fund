@@ -210,6 +210,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
+            "start": sum(x["sleeve"].starting_balance for x in summaries),  # the chart's baseline for Change
             "t": [t.isoformat() for t in curve.index],
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
@@ -235,8 +236,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         live = [x for x in summaries if x["sleeve"].name not in flattening]
         trading = [x for x in live if x["sleeve"].desired_state == "running" and x["sleeve"].status != "halted"]
         held = [x for x in live if x["qty"] and x not in trading]
+        # What the switch trades: every open position, longs and shorts, by its size (round 12, M12-U4: shorts
+        # were left out, so the dialog showed a seventh of the notional it would trade).
+        holding = [x for x in trading + held if x["qty"]]
         return {"trading": trading, "held": held, "all": trading + held, "flattening": flattening,
-                "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"]}
+                "stopped": [x["sleeve"].name for x in held if x["sleeve"].desired_state != "running"],
+                "holding": holding, "gross": sum(abs(x["position_value"]) for x in holding),
+                "shorts": sum(1 for x in holding if x["qty"] < 0)}
 
     @app.post("/book/flatten")
     def book_flatten(reason: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -392,7 +398,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec)),
+                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
                                                                st().accounts(), utcnow()))
 
     @app.get("/api/sleeves/{name}/candles")
@@ -471,7 +477,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         else:
             frame = bookm.daily(st(), name)
             t, eq, bench = list(frame.index), list(frame["equity"]), list(frame["benchmark"])
-        peak, dd = 0.0, []
+        peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
         for v in eq:
             peak = max(peak, v)
             dd.append(round(1 - v / peak, 5) if peak else 0.0)
@@ -484,7 +490,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in eq],
             "benchmark": [round(v, 2) for v in bench],
             "drawdown": dd,
-            "worst": round(st().max_drawdown(name), 5),  # over every mark: the curve above is thinned or daily
+            "worst": round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
             "fills": fills,
         })
 
@@ -821,7 +827,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         pair = q.get("instrument", "").strip().upper()
-        g1_here = pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec)) if pair else None
+        g1_here = (pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec),
+                                   {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
+                                    "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")})
+                   if pair else None)
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
@@ -1326,10 +1335,10 @@ def _strategy_choices() -> list[dict]:
     return out
 
 
-def _g1_of(strategy: str, instrument: str, minutes: int) -> str | None:
+def _g1_of(strategy: str, instrument: str, minutes: int, params: dict | None = None) -> str | None:
     from sleeve_fund.dashboard import pipeline
 
-    return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes)
+    return pipeline.g1_for(TEARSHEETS, strategy, instrument, minutes, params)
 
 
 # Exit settings the form takes as stored (the % ones are converted above): an ATR or swing-low stop,

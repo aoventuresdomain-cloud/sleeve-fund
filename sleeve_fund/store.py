@@ -834,15 +834,19 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(q).scalar()
 
-    def max_drawdown(self, sleeve: str) -> float:
+    def max_drawdown(self, sleeve: str, start: float | None = None) -> float:
         """The deepest fall from a running peak over every mark kept, however many: the screens read only
-        the latest marks, and a paper strategy marks every few seconds."""
+        the latest marks, and a paper strategy marks every few seconds. start, when given, is a peak before
+        the first mark (the starting balance), so a first mark that is already a loss counts (M12-F1)."""
         peak = func.max(equity_t.c.equity).over(order_by=(equity_t.c.ts, equity_t.c.id),
                                                 rows=(None, 0)).label("peak")
         marks = select(equity_t.c.equity, peak).where(equity_t.c.sleeve == sleeve).subquery()
-        q = select(func.max(1 - marks.c.equity / marks.c.peak)).where(marks.c.peak > 0)
+        q = select(func.max(1 - marks.c.equity / marks.c.peak), func.min(marks.c.equity)).where(marks.c.peak > 0)
         with self.engine.connect() as c:
-            return float(c.execute(q).scalar() or 0.0)
+            worst, low = c.execute(q).one()
+        worst = float(worst or 0.0)
+        # A running peak seeded with start: each mark's fall is the larger of the two, so the worst is too.
+        return max(worst, 1 - float(low) / start) if start and low is not None else worst
 
     def day_open_equity(self, sleeve: str, day_start: datetime) -> float | None:
         """The equity the day opened at: the last mark at or before `day_start` (00:00 UTC), else the day's

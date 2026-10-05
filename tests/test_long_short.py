@@ -1,6 +1,7 @@
 """Long and short on a perpetual (plan L1-L3, 4 Oct 2026): the margin account, short and flipping trades,
 funding, the liquidation price and guard, trade pairing, and a paper restart that carries a short."""
 
+import re
 import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -556,6 +557,11 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
         shorted = shorted or (net <= 1e-12 and f["side"] == "SELL")
         net += f["qty"] if f["side"] == "BUY" else -f["qty"]
     assert shorted, "the backtest never went short"
+    # M12-U5: the side rides on the entry cell, which no width hides (Size, which says it too, goes at 1440 px).
+    table = result.split('id="bt-tr-h"')[1].split("</table>")[0]
+    # Not hidden on a phone's card either (data-m="hide"), where Size is gone too.
+    sides = re.findall(r'<tr><td data-label="Entry">[^<]+<div class="sub">(long|short)</div></td>', table)
+    assert "short" in sides and len(sides) == table.count('<tr class="detail"'), sides
 
     # Start: the new strategy keeps the market, shorts and mirror.
     data = {k: v for k, v in q.items() if k not in ("from", "source")}
@@ -784,6 +790,46 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
+def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path):
+    """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
+    read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
+    dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
+    account text. Wiped out is a state: marked at zero, halted with the reason, through a resume and a restart."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+
+    store, name, params = Store.in_memory(), "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    gap = tmp_path / "gap.jsonl.gz"
+    _record(gap, _meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, then +60%
+    orders = replay(gap, store=store)
+    assert orders[-1]["intent"] == "liquidation" and orders[-1]["side"] == "BUY"
+    covered = store.insurance_total(name)
+    assert covered > 0
+    s = store.sleeve(name)
+    assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
+    last = store.equity_series(name)[-1]
+    assert (last["equity"], last["qty"]) == (0.0, 0.0)  # the book counts it at zero, not its last mark
+    book = store.journal_book(name, 10_000)
+    assert book["qty"] == 0 and book["cash"] == pytest.approx(0, abs=0.01)
+    assert "mark_unavailable" not in {e["kind"] for e in store.events(name, limit=500)}
+
+    # The PM resumes it and the process restarts: still nothing to trade, so it halts again, at zero.
+    store.command(name, "resume", "try again")
+    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+    seen = len(store.equity_series(name))
+    restart = tmp_path / "restart.jsonl.gz"
+    _record(restart, _meta(book["cash"], params), [(5, 0.0)], px=97_440.0)
+    assert len(replay(restart, store=store)) == len(orders)  # no new order
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
+    marks = store.equity_series(name)[seen:]
+    assert marks and all((m["equity"], m["qty"]) == (0.0, 0.0) for m in marks)
+    events = store.events(name, limit=500)
+    assert "mark_unavailable" not in {e["kind"] for e in events}
+    assert [e["kind"] for e in events].count("risk_halt") == 2
+
+
 def test_a_restart_holding_a_perp_settles_the_funding_it_was_down_for(tmp_path):
     """Funding owed while the process was down is settled on the first tick: from the last fill or funding
     payment, not from the restart. A short opened at 15:00 and restarted at midnight owes 16:00 and 00:00."""
@@ -871,3 +917,116 @@ def test_a_flip_opens_the_new_side_only_once_the_old_one_is_closed(prices, instr
             # From flat, or adding to its own side: never against an open position of the other side.
             assert before == 0 or (before > 0) == (step > 0), (f, before)
     assert len(entries) >= 4 and sides == {"BUY", "SELL"}, (len(entries), res.risk_events)
+
+
+def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkeypatch):
+    """Round 12, M12-U1: on a perp the benchmark held at the leverage cap (2x on balanced) and never
+    liquidated, so it ran from -200% to +400%. It is a 1x hold, paying the perp's taker fee, not spot's."""
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from test_dashboard import KRAKEN
+
+    bars = synthetic_ohlcv(days=200, seed=2, start_price=150)
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: bars)
+    d = preview.run("buy_and_hold", "SOL/USD", {**PERP}, starting=5000, risk_profile="balanced")
+    taker = float(markets.LOW_FEE_PERP.fees.taker)
+    assert d["cap"] == pytest.approx(2.0) and d["bench_cap"] == 1.0
+    assert d["fee_schedule"]["taker"] == pytest.approx(taker)
+    assert d["benchmark"][0] == pytest.approx(5000 * (1 - taker), abs=0.01)
+    held = 5000 * (1 - taker) * bars["close"].iloc[-1] / bars["close"].iloc[0]
+    assert d["benchmark"][-1] == pytest.approx(held, rel=1e-6)
+
+
+@pytest.mark.sanity
+@pytest.mark.parametrize(("params", "label"), [({**PERP}, "unlevered"), ({}, "33% invested")], ids=["perp", "spot"])
+def test_a_saved_runs_screen_shows_the_benchmark_its_result_shows(client, monkeypatch, params, label):  # noqa: F811
+    """Round 12, M12-U1 (re-check): the result held a perp's benchmark at 1x while the paper runtime, which
+    writes the saved run's journal and every paper strategy's, held it at the profile's 33% spot cap, so the
+    result and the strategy screen of the same run disagreed. One definition now (the position cap, never
+    above 1x), labelled with its exposure on both."""
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from test_dashboard import AUTH, KRAKEN
+
+    c, store = client
+    bars = synthetic_ohlcv(days=200, seed=2, start_price=150)
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: bars)
+    keep = {}
+    d = preview.run("buy_and_hold", "SOL/USD", params, starting=5000, risk_profile="balanced", keep=keep)
+    name = store.save_backtest(keep["journal"], run_id="u1", key="k", title="Benchmark run", query="", result=d)
+    rows = store.equity_series(name)
+    assert rows[-1]["benchmark"] == pytest.approx(d["benchmark"][-1], abs=0.01)
+    screen = c.get(f"/sleeves/{name}", auth=AUTH).text
+    bench_ret = d["benchmark"][-1] / 5000 - 1
+    assert f"buy and hold, {label}: {bench_ret * 100:+.1f}%" in screen, screen.split("Since start")[1].split("</button>")[1][:300]
+
+
+@pytest.mark.sanity
+def test_the_kill_switch_dialog_counts_shorts_by_their_size(client):  # noqa: F811
+    """Round 12, M12-U4: the kill switch's confirm dialog summed only long positions, so a book of shorts read
+    as about a seventh of the notional the switch would trade. Every open position counts, by its size."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    for name, qty, px in (("short-a", -0.3, 60_000.0), ("long-b", 0.05, 60_000.0)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+        store.set_desired_state(name, "running")
+        store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
+    dialog = c.get("/risk", auth=AUTH).text.split('id="dlg-kill"')[1].split("</dialog>")[0]
+    # 18,000 short and 3,000 long: 21,000 to trade, not the 3,000 of longs alone (nor the -15,000 net).
+    assert "worth about 21,000" in dialog, dialog
+    assert "close to cash at market (longs sell, shorts buy back)" in dialog
+
+
+@pytest.mark.sanity
+def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(client):  # noqa: F811
+    """Round 12, M12-F1: the running peak started at the first daily close, never at the starting capital, so a
+    strategy wiped out on its first day left the book reading -20% since start beside a 0.0% drawdown, and a
+    second wipe-out read 25% worst (from that close), not 40%."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    day1, day2 = datetime(2026, 10, 4, 12, tzinfo=timezone.utc), datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+    for n in range(5):
+        store.create_sleeve(name=f"s{n}", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+        first = 0.0 if n == 0 else 10_000.0
+        store.record_equity(f"s{n}", equity=first, cash=first, qty=0.0, price=60_000.0, benchmark=10_000, ts=day1)
+        last = 0.0 if n <= 1 else 10_000.0  # a second strategy is wiped out on day two
+        store.record_equity(f"s{n}", equity=last, cash=last, qty=0.0, price=60_000.0, benchmark=10_000, ts=day2)
+    book = c.get("/api/book/equity", auth=AUTH).json()
+    assert book["start"] == 50_000 and book["equity"] == [40_000, 30_000]
+    assert book["drawdown"] == [pytest.approx(0.2), pytest.approx(0.4)]  # from 50,000, not the 40,000 close
+    tile = c.get("/", auth=AUTH).text.split("Drawdown")[1].split("</div></div>")[0]
+    assert "40.0%" in tile and "worst 40.0%" in tile, tile
+    # One strategy whose first mark is already a loss: its chart and figures count it from its starting balance.
+    store.create_sleeve(name="late", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+    store.record_equity("late", equity=9_000.0, cash=9_000.0, qty=0.0, price=60_000.0, benchmark=10_000, ts=day1)
+    one = c.get("/api/sleeves/late/equity", auth=AUTH).json()
+    assert one["drawdown"] == [pytest.approx(0.1)] and one["worst"] == pytest.approx(0.1)
+    assert store.max_drawdown("late") == 0.0 and store.max_drawdown("late", 10_000) == pytest.approx(0.1)
+
+
+def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F811
+    """Round 12, M12-U2: the tile took the largest signed share, so a big short (a negative share) read as
+    nothing and a small long elsewhere was shown as the book's concentration."""
+    from sleeve_fund.dashboard.riskops import largest_asset
+    from test_dashboard import AUTH
+
+    # A short-only book: its one short is the concentration, by its size.
+    only = largest_asset([{"name": "BTC short", "value": -20_825.0}, {"name": "Cash", "value": 60_000.0}], 39_175.0)
+    assert only["name"] == "BTC" and only["share"] == pytest.approx(20_825 / 39_175)
+    assert only["net_share"] == pytest.approx(-20_825 / 39_175)
+    c, store = client
+    for name, qty, px in (("short-a", -0.05, 60_000.0), ("short-b", -1.0, 3_000.0), ("long-c", 0.02, 60_000.0)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="ETH/USD" if px == 3_000 else "BTC/USD",
+                            bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                            params={"rise": 0.01, "dip": 0.005, **PERP})
+        store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
+    # BTC: a 3,000 short and a 1,200 long, 4,200 gross (14% of 30,000), -1,800 net (-6%); ETH: a 3,000 short.
+    tile = c.get("/risk", auth=AUTH).text.split("Largest asset")[1].split("</div></div>")[0]
+    assert "BTC 14%" in tile and "net" in tile and "6%" in tile, tile

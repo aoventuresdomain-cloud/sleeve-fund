@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sleeve_fund.dashboard.pipeline import studied_as
 from sleeve_fund.store import Store
 
 PAPER_DAYS = 42  # G2: at least six weeks of paper trading
@@ -28,6 +29,8 @@ def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], no
     return [
         {"label": "Strategy passed G1", "ok": g1 == "PASS",
          "detail": "on real data, out of sample, for this instrument and interval" if g1 == "PASS"
+         else "not possible yet for a perpetual or long/short strategy: studies run spot, long only"
+         if not studied_as(s.params)
          else "not for this instrument and interval yet; paper results alone are not evidence"},
         {"label": "Six weeks of paper trading", "ok": days >= PAPER_DAYS,
          "detail": f"{days} of {PAPER_DAYS} days" if days < PAPER_DAYS else f"{days} days"},

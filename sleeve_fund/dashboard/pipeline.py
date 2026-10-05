@@ -6,6 +6,7 @@ import importlib
 import re
 from pathlib import Path
 
+from sleeve_fund import markets
 from sleeve_fund.strategies import REGISTRY
 
 STAGES = ["Idea", "Tested", "Passed G1", "Paper", "Passed G2", "Live"]
@@ -61,9 +62,19 @@ def _real(sheets: list[dict], strategy: str) -> list[dict]:
             and "synthetic" not in s["dataset"]]
 
 
-def g1_for(tearsheets: Path, strategy: str, instrument: str, minutes: int) -> str | None:
+def studied_as(params: dict | None) -> bool:
+    """Whether a G1 study tests this configuration: studies run spot, long only, so a strategy on a
+    perpetual or one that shorts has no G1 evidence until perp studies come (L4/L5). A spot long-only
+    pass must never tick G1 for a long/short strategy (round 12, M12-U3)."""
+    return not markets.is_perp(params) and not (params or {}).get("allow_short")
+
+
+def g1_for(tearsheets: Path, strategy: str, instrument: str, minutes: int, params: dict | None = None) -> str | None:
     """G1 for exactly this strategy on this instrument at this bar length: the newest real tear sheet
-    of that combination decides. A pass on one instrument or interval says nothing about another."""
+    of that combination decides. A pass on one instrument or interval says nothing about another, and
+    none says anything about a perpetual or long/short configuration (studied_as)."""
+    if not studied_as(params):
+        return None
     hit = next((s for s in _real(_sheets(tearsheets), strategy)
                 if s["instrument"] == instrument.upper() and s["minutes"] == minutes and s["g1"]), None)
     return hit["g1"] if hit else None
@@ -91,7 +102,8 @@ def strategies(tearsheets: Path, sleeves: list) -> list[dict]:
         # No pass that says where it holds: show the latest other verdict (an old, unplaced pass is none).
         g1 = "PASS" if passed_on else next((s["g1"] for s in real if s["g1"] and s["g1"] != "PASS"), None)
         running = [s for s in sleeves if s.strategy == name]
-        backed = [s for s in running if f"{s.instrument.upper()}@{spec_minutes(s.bar_spec)}" in passed_on]
+        backed = [s for s in running if f"{s.instrument.upper()}@{spec_minutes(s.bar_spec)}" in passed_on
+                  and studied_as(s.params)]
         if running:
             stage = 3  # in paper; without a pass on its own instrument and bars it is an observation
         elif passed_on:

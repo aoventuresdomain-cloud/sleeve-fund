@@ -1735,3 +1735,17 @@ def test_a_resume_on_a_running_strategy_is_refused_in_words(client):
     store.set_status("eth-run", "paused", "paused by PM")
     c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH, headers=SAME)
     assert [x["command"] for x in store.pending_commands("eth-run")] == ["resume"]
+
+
+def test_the_g2_checklist_says_a_long_short_strategy_has_no_g1_yet(client):
+    """Round 12, M12-U3: the G1 row explains why a perp or long/short strategy can't pass yet."""
+    from sleeve_fund.dashboard import gates
+    from sleeve_fund.dashboard.book import sleeve_extras
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+
+    c, store = client
+    store.create_sleeve(name="rsi-ls", strategy="rsi_bands", instrument="BTC/USD", bar_spec="1-HOUR-LAST-EXTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    x = sleeve_extras(store, sleeve_summary(store, store.sleeve("rsi-ls")), pd.DataFrame())
+    row = next(r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow()) if "G1" in r["label"])
+    assert not row["ok"] and "perpetual or long/short" in row["detail"]

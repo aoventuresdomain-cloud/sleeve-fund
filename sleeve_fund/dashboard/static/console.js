@@ -179,7 +179,8 @@ window.Console = (() => {
           item("", labels[0], pct(view.ret[at]), tone(view.ret[at]));
           item("bench", labels[1], pct(view.bench[at]));
         } else if (rest) {
-          const first = view.eq[0], last = view.eq[at], ch = last - first;
+          // The whole history's change is from the starting capital, which is never a point on it (M12-F1).
+          const first = view.whole && Number.isFinite(d.start) ? d.start : view.eq[0], last = view.eq[at], ch = last - first;
           item("", labels[0], cash(last));
           item(null, "Change", `${scash(ch)} (${pct(first ? (ch / first) * 100 : NaN)})`, tone(ch));
         } else {
@@ -273,7 +274,8 @@ window.Console = (() => {
         view = {full, eq: eqv, ret, bench, prior: from > 0 ? cur.equity[from - 1] : (cur.prior ?? null), dd: cur.drawdown.slice(from).map((x) => -x * 100)};
         // The whole run's worst comes from every mark, as the tables show it; the curve is daily or
         // thinned and can miss a fall that recovered between its points. A shorter range reads the curve.
-        view.worst = cur === d && from === 0 && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
+        view.whole = cur === d && from === 0;
+        view.worst = view.whole && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
         const top = compare ? ret : eqv;
         eq.data.labels = full; eq.data.datasets[0].data = top;
         eq.data.datasets[1].data = compare ? bench : [];

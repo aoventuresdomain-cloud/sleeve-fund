@@ -15,7 +15,7 @@
 
 <section class="ledger" aria-label="Book risk">
   <div><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v lead">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} of {{ book.equity|money }} · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
-  <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">of total capital</div></div>
+  <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}gross of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
@@ -62,10 +62,10 @@
 <dialog id="dlg-kill" aria-labelledby="dlg-kill-h">
   <form method="post" action="/book/flatten">
     <h2 id="dlg-kill-h">Flatten everything</h2>
-    {% set n = kill.all|length %}{% set holding = kill.all|selectattr('qty', 'gt', 0)|list %}
-    <p>{% if n == 1 %}{{ kill.all[0].sleeve.name }}, the one strategy still trading or holding a position, sells{% else %}{{ 'Both' if n == 2 else 'All ' ~ n }} strategies still trading or holding a position sell{% endif %} to cash at market, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
+    {% set n = kill.all|length %}{% set holding = kill.holding %}{% set verb = 'close' if kill.shorts else 'sell' %}
+    <p>{% if n == 1 %}{{ kill.all[0].sleeve.name }}, the one strategy still trading or holding a position, {{ verb }}s{% else %}{{ 'Both' if n == 2 else 'All ' ~ n }} strategies still trading or holding a position {{ verb }}{% endif %} to cash at market{% if kill.shorts %} (longs sell, shorts buy back){% endif %}, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
       {% set dayp = kill.all|selectattr('sleeve.paused_until')|map(attribute='sleeve.name')|list %}{% if dayp %}{{ dayp|join(', ') }} {{ 'is' if dayp|length == 1 else 'are' }} on a daily-loss pause, which then lasts until you resume too, not 24 hours.{% endif %}
-      {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ holding|sum(attribute='position_value')|money }} in total.{% endif %}
+      {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ kill.gross|money }} in total{% if kill.shorts %}, shorts counted by their size{% endif %}.{% endif %}
       {% if kill.stopped %}{{ kill.stopped|join(', ') }} {{ 'is' if kill.stopped|length == 1 else 'are' }} stopped, so {{ 'it starts' if kill.stopped|length == 1 else 'they start' }} just to sell.{% endif %}</p>
     <label for="r-kill">Reason for the decision log</label>
     <input id="r-kill" name="reason" list="reasons" required autocomplete="off" placeholder="Pick or type a reason">

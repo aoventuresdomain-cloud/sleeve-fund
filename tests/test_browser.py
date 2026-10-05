@@ -157,3 +157,20 @@ def test_backtest_result_comes_before_its_settings_on_a_phone(site, browser):
         page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "backtest-390.png"), full_page=False)
     ctx.close()
     assert head["y"] < form["y"]
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_a_long_short_backtests_trades_say_long_or_short_at_every_width(site, browser, width):
+    """Round 12, M12-U5: the side was only under Size, hidden at 1440 px and on phone cards, then only on the
+    entry cell, also hidden on phone cards. Every trade of a long/short run shows its side at every width."""
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                              viewport={"width": width, "height": 900})
+    page = ctx.new_page()
+    page.goto(site + "/backtest?run=1&instrument=ETH/USD&strategy=rsi_bands&market=perp&allow_short=1"
+              "&risk_profile=conservative")
+    page.wait_for_load_state("networkidle")
+    cells = page.locator("section[aria-labelledby=bt-tr-h] tbody tr:not(.detail) td:first-child")
+    sides = [cells.nth(i).inner_text() if cells.nth(i).is_visible() else "" for i in range(cells.count())]
+    ctx.close()
+    assert sides and all(s.rstrip().endswith(("long", "short")) for s in sides), sides[:5]
+    assert any(s.rstrip().endswith("short") for s in sides)

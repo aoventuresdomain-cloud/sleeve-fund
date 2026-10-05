@@ -95,8 +95,7 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     brets = curve["benchmark"].pct_change().dropna() if len(curve) else pd.Series(dtype=float)
     bench_sharpe = (float(brets.mean() / brets.std() * math.sqrt(DAYS_A_YEAR))
                     if len(brets) >= MIN_DAYS_FOR_RATIOS and brets.std() > 0 else float("nan"))
-    peak = curve["equity"].cummax() if len(curve) else pd.Series(dtype=float)
-    dd = (1 - curve["equity"] / peak) if len(curve) else pd.Series(dtype=float)
+    dd = curve["drawdown"] if len(curve) else pd.Series(dtype=float)  # from the starting capital too
     # Gross counts a short as exposure too; net lets a short offset a long. Signed values: + long, - short.
     exposure = sum(abs(x["position_value"]) for x in active)
     net = sum(x["position_value"] for x in active)
@@ -142,7 +141,10 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.Dat
         base = x["sleeve"].starting_balance
         for col in ("equity", "benchmark"):
             out[col] += f[col].reindex(out.index).ffill().fillna(base) if f is not None else base
-    peak = out["equity"].cummax()
+    # Measured from the capital the book started with too: its starting balances are never a daily close, so a
+    # book whose first close was already a loss read 0% drawdown (round 12, M12-F1).
+    start = sum(x["sleeve"].starting_balance for x in summaries)
+    peak = out["equity"].cummax().clip(lower=start)
     out["drawdown"] = 1 - out["equity"] / peak
     return out
 

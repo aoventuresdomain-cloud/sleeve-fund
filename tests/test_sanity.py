@@ -1092,6 +1092,45 @@ def test_rsi_bands_trades_on_the_standard_rsi_at_its_bands():
     assert seen == {("BUY", "entry"), ("SELL", "exit"), ("SELL", "entry"), ("BUY", "exit")}, seen
 
 
+@pytest.mark.parametrize("exits", [{}, {"stop_loss": 0.1, "take_profit": 0.2}], ids=["bare", "stop_and_target"])
+@pytest.mark.parametrize("bars", ["daily", "hourly", "hourly_over_minutes"])
+@pytest.mark.parametrize("profile", ["balanced", "aggressive"])
+def test_a_perp_backtest_keeps_deciding_every_bar_for_the_whole_run(profile, bars, exits):
+    """Liveness (M11-9, 5 Oct: a perp backtest re-prices its resting risk stop every bar, and the stop's
+    pending update read as an order in flight, so on daily bars, where the day's opening equity and so the
+    stop's level move every bar, it never decided again after its first entry). probe_ls on a calm swing
+    that reaches no risk limit, stop or target must enter every long and short leg the clock asks for and
+    leave each one, to the end of the run, on daily bars (the runner's default), hourly bars, and hourly
+    bars over minute execution bars."""
+    period, n = 3, 120
+    if bars == "daily":
+        decide = _ls_bars(60_000 * (1 + 0.004 * np.sin(np.arange(n) / 4)), minutes=1440)
+        kw, minutes = {}, 1440
+    else:
+        s = np.arange(0, n * 3600, 60)
+        minute = _ls_bars(60_000 * (1 + 0.004 * np.sin(2 * np.pi * s / (24 * 3600))), minutes=1)
+        decide = minute.resample("60min", closed="right", label="right").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        kw = {"exec_prices": minute, "exec_minutes": 1} if bars == "hourly_over_minutes" else {}
+        minutes = 60
+    j = run_backtest("probe_ls", decide, TICK_INST, {"period": period, **PERP, **exits}, starting_capital=10_000,
+                     risk_profile=profile, bar_minutes=minutes, half_spread=HALF, **kw).journal
+    filled = [o for o in sorted(j.orders_.values(), key=lambda o: o["id"]) if o["filled_qty"]]
+    assert {o["intent"] for o in filled} <= {"entry", "exit"}, {o["intent"] for o in filled}  # nothing else acted
+    # The legs the clock asks for: each run of `period` bars is long, short or flat in turn.
+    step = minutes * 60 * 10**9
+    sides = [(1, -1, 0)[(int(ts.value // step) // period) % 3] for ts in decide.index]
+    legs = sum(1 for k, x in enumerate(sides) if x and (k == 0 or x != sides[k - 1]))
+    entries = [o for o in filled if o["intent"] == "entry"]
+    exits_ = [o for o in filled if o["intent"] == "exit"]
+    assert legs >= 20
+    assert len(entries) >= legs - 2, (len(entries), legs)  # the first legs may fall in the warm-up
+    assert len(exits_) >= len(entries) - 1, (len(exits_), len(entries))  # and every leg is left
+    assert {o["side"] for o in entries} == {"BUY", "SELL"}
+    last = pd.Timestamp(entries[-1]["ts"])
+    assert last >= decide.index[-1] - 3 * period * pd.Timedelta(minutes=minutes), last  # deciding to the end
+
+
 @pytest.mark.parametrize("reason", ["PM flatten", "Book kill switch: stop everything"])
 def test_a_flatten_of_a_short_cut_short_by_a_restart_buys_it_back(store, reason):
     """S-3 on a short: the flatten is owed again after a restart while a short is still held."""
