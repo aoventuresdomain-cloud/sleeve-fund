@@ -1,10 +1,15 @@
 {% extends "base.html" %}
 {% from "_stages.html" import stepper %}
-{% from "_fields.html" import venue_field, pair_field, exit_fields %}
-{% block title %}Models · Multi-Strategy Fund{% endblock %}
+{% from "_fields.html" import exit_fields %}
+{% block title %}Development · Multi-Strategy Fund{% endblock %}
+{% macro messages() %}
+  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}{% if collect %}
+    <form method="post" action="/research/history" style="margin:8px 0 0"><input type="hidden" name="instrument" value="{{ collect }}"><input type="hidden" name="venue" value="{{ values.venue }}"><button>Collect {{ collect }} history</button></form>{% endif %}</div>{% endif %}
+  {% if notice %}<div class="notice-box" role="status">{{ notice }}</div>{% endif %}
+{% endmacro %}
 {% block content %}
 <div class="page-head">
-  <h1>Models</h1>
+  <h1>Research</h1>
   <p class="lede">Each model moves from idea to G1, paper trading, G2 and live.</p>
 </div>
 <section class="ledger" aria-label="Research counters">
@@ -14,104 +19,320 @@
   <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">parameter sets</div></div>
 </section>
 
-<section class="panel" style="margin-bottom:14px" aria-labelledby="study-h" id="study">
-  <div class="panel-head"><h2 id="study-h">Run a G1 study</h2><span class="hint">walk-forward on the stored history, under paper's rules</span></div>
-  <p class="muted" style="margin:0 0 10px;font-size:12.5px">{% if research_perpetual %}Studies on {{ history_venue }} trade its perpetual, long only, with the funding it settled.{% else %}Studies run spot, long only.{% endif %} A pass is not G1 for a strategy that shorts: those wait for long/short studies.</p>
-  {% if job %}
-  <div class="bt-job" id="study-job" data-job="{{ job.id }}" aria-live="polite">
-    <p style="margin:0 0 6px"><b>{{ job.title }}</b></p>
-    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (job.progress * 100)|round|int }}"><div style="width:{{ (job.progress * 100)|round|int }}%"></div></div>
-    <p class="muted" id="study-job-text">{% if job.status == 'error' %}Couldn't run it: {{ job.error }}{% elif job.ahead %}{{ job.ahead }} run{{ 's' if job.ahead != 1 }} ahead.{% else %}{{ (job.progress * 100)|round|int }}% of the backtests done.{% endif %} The tear sheet opens when it's done.</p>
-  </div>
-  {% endif %}
-  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}{% if collect %}
-    <form method="post" action="/research/history" style="margin:8px 0 0"><input type="hidden" name="instrument" value="{{ collect }}"><input type="hidden" name="venue" value="{{ research_venue }}"><button>Collect {{ collect }} history</button></form>{% endif %}</div>{% endif %}
-  {% if notice %}<div class="notice-box" role="status">{{ notice }}</div>{% endif %}
-  <form method="post" action="/research/run" class="study-form" id="study-form">
-    <div class="grid2">
-      {{ venue_field({'venue': research_venue}, reload=True) }}
-      <div class="field"><label for="strategy">Model</label><select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == pre.get('strategy') }}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
-      {{ pair_field(instruments, pre) }}
-      <div class="field"><label for="minutes">Bars</label><select id="minutes" name="minutes">{% for m in study_minutes %}<option value="{{ m }}" {{ 'selected' if m|string == pre.get('minutes', '1440')|string }}>{{ 'Daily' if m == 1440 else (m // 60)|string ~ '-hour' if m % 60 == 0 else m|string ~ '-minute' }}</option>{% endfor %}</select></div>
-      <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: {{ p.max_position_pct|pct0 }} cap, {{ p.max_drawdown|pct0 }} halt</option>{% endfor %}<option value="none" {{ 'selected' if pre.get('risk_profile') == 'none' }}>None: no cap, no halt</option></select></div>
-      <div class="field"><label for="train_days">Train window, days</label><input id="train_days" name="train_days" type="number" min="30" step="1" value="{{ pre.get('train_days', 365) }}"></div>
-      <div class="field"><label for="test_days">Test window, days</label><input id="test_days" name="test_days" type="number" min="30" step="1" value="{{ pre.get('test_days', 180) }}"></div>
-      <div class="field"><label for="holdout_days">Holdout, most recent days</label><input id="holdout_days" name="holdout_days" type="number" min="0" step="1" value="{{ pre.get('holdout_days', 365) }}"></div>
-      <div class="field"><label class="check"><input type="checkbox" id="use_holdout" name="use_holdout" {{ 'checked' if pre.get('use_holdout') == 'on' }} data-venue="{{ research_venue }}" data-spent="{{ spent_holdouts|tojson|forceescape }}"> Open the holdout</label><p class="hint" id="holdout-hint">Once per model and instrument, at any bar length.</p></div>
-    </div>
-    <details class="more-fields" {{ 'open' if pre.get('stop_loss_pct') or pre.get('stop_atr') or pre.get('stop_swing_bars') or pre.get('take_profit_pct') or pre.get('take_profit_r') or pre.get('risk_per_trade_pct') }}><summary>Stop-loss, take-profit and sizing</summary>{{ exit_fields(pre, costs) }}</details>
-    <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
-    <p style="margin:10px 0 0"><button>Run study</button></p>
-  </form>
-</section>
+<nav class="tabs desk-tabs research-tabs" role="tablist" aria-label="Research views" data-tabs{% if tab %} data-default="{{ tab }}"{% endif %}>
+  <a href="#development" role="tab" data-tab="development">Development<span class="n">{{ cards|length }}</span></a>
+  <a href="#results" role="tab" data-tab="results">Results<span class="n">{{ sheets|length }}</span></a>
+  <a href="#history" role="tab" data-tab="history">History<span class="n">{{ stored_all|length }}</span></a>
+</nav>
 
-<section class="panel flush" style="margin-bottom:14px" aria-labelledby="history-h" id="history">
-  <div class="panel-head"><h2 id="history-h">Stored history</h2><span class="hint">{{ history_venue }}</span></div>
-  {% if stored %}
+{# --- Development: a plan per model, and the study form for the one picked ------------------------------ #}
+<div class="tab-panel" id="tab-development" role="tabpanel" data-panel="development">
+<div class="dev" id="dev"{% if msg_in == 'development' and (job or error or notice) %} data-open{% endif %}>
+  <div class="plan-col">
+    <div class="plan-filters" role="group" aria-label="Show models">
+      <button type="button" data-filter="all" aria-pressed="true">All <span class="n">{{ cards|length }}</span></button>
+      {% for key, word in (('ready', 'Ready'), ('passed', 'Passed G1'), ('killed', 'Killed')) %}
+      <button type="button" data-filter="{{ key }}" aria-pressed="false">{{ word }} <span class="n">{{ cards|selectattr('status', 'equalto', key)|list|length }}</span></button>
+      {% endfor %}
+    </div>
+    <ul class="plan-list" aria-label="Models">
+      {% for c in cards %}
+      <li data-status="{{ c.status }}"><a class="plan-card" href="/research?strategy={{ c.name }}#development" data-plan="{{ c.name }}"{% if c.name == chosen.name %} aria-current="true"{% endif %}>
+        <span class="pc-top"><b>{{ c.label }}</b><span class="chip {{ c.tone }}">{{ c.status_word }}</span></span>
+        <span class="pc-q">{{ c.question }}</span>
+        <span class="pc-meta">{{ c.family|replace('-', ' ')|capitalize }} · {{ c.meta }}{% if c.studies > 1 %} · {{ c.studies }} studies{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% if c.row.observation %}, {{ c.row.observing|length }} on observation{% endif %}{% endif %}</span>
+      </a></li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="sheet-backdrop" data-close hidden></div>
+  <section class="panel study" id="study" aria-labelledby="study-h-{{ chosen.name }}">
+    <div class="grab" aria-hidden="true"></div>
+    {% for c in cards %}
+    <div class="study-intro" data-for="{{ c.name }}"{% if c.name != chosen.name %} hidden{% endif %}>
+      <div class="study-head">
+        <h2 id="study-h-{{ c.name }}">{{ c.label }}</h2>
+        <a href="/strategies/{{ c.name }}">Model details</a>
+        <button type="button" class="quiet m-close" data-close>Close</button>
+      </div>
+      <p class="answers"><b>Answers:</b> {{ c.answers }} <span class="kill">Kill</span> {{ c.kill_rule }}</p>
+      <div class="study-stage">
+        {{ stepper(c.row.stage, stages, c.row.observation) }}
+        <span class="muted">{{ stages[c.row.stage] }}{% if c.row.g1 == 'PASS' %}: passed on {{ c.row.passed_where|join(', ') }}{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% if c.row.observation %} <span class="warn" title="No G1 pass for: {{ c.row.observing|map(attribute='name')|join(', ') }}">· {{ c.row.observing|length }} of {{ c.row.sleeves|length }} on observation</span>{% endif %}{% endif %}</span>
+        <span class="stage-links"><a href="/backtest?strategy={{ c.name }}">Backtest</a> · <a href="/sleeves/new?strategy={{ c.name }}">New strategy</a></span>
+      </div>
+    </div>
+    {% endfor %}
+
+    <div class="study-msgs" data-for="{{ chosen.name }}">
+    {% if job %}
+    <div class="bt-job" id="study-job" data-job="{{ job.id }}" aria-live="polite">
+      <p style="margin:0 0 6px"><b>{{ job.title }}</b></p>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (job.progress * 100)|round|int }}"><div style="width:{{ (job.progress * 100)|round|int }}%"></div></div>
+      <p class="muted" id="study-job-text">{% if job.status == 'error' %}Couldn't run it: {{ job.error }}{% elif job.ahead %}{{ job.ahead }} run{{ 's' if job.ahead != 1 }} ahead.{% else %}{{ (job.progress * 100)|round|int }}% of the backtests done.{% endif %} The tear sheet opens when it's done.</p>
+    </div>
+    {% endif %}
+    {% if msg_in == 'development' %}{{ messages() }}{% endif %}
+    </div>
+
+    <form method="post" action="/research/run" class="study-form" id="study-form">
+      <input type="hidden" name="strategy" value="{{ chosen.name }}">
+      <div class="step"><span class="sn" aria-hidden="true">1</span><div class="step-body">
+        <h3>Where to test</h3>
+        <div class="where">
+          <fieldset class="venue-field"><legend>Venue</legend>
+            <div class="venue-seg">{% for v in venues %}<label><input type="radio" name="venue" value="{{ v.key }}" {{ 'checked' if v.key == values.venue }}><span>{{ v.label }}</span></label>{% endfor %}</div>
+          </fieldset>
+          <div class="field inst-field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs-{{ values.venue }}" value="{{ values.instrument }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"></div>
+          {% set held = on_venue.held.get(values.instrument|upper) %}
+          <div class="hist-status" aria-live="polite">
+            <span class="chip {{ held.tone if held }}" id="hist-chip">{{ held.text if held else 'Not stored' }}</span>
+            <button type="submit" form="collect-study" class="quiet" id="hist-collect"{% if held %} hidden{% endif %}>Collect</button>
+          </div>
+        </div>
+        <p class="hint"><span id="venue-note">{% if on_venue.perpetual %}Studies on {{ on_venue.label }} trade its perpetual, long only, with the funding it settled.{% else %}Studies on {{ on_venue.label }} run spot, long only.{% endif %}</span> A pass is not G1 for a strategy that shorts: those wait for long/short studies.</p>
+      </div></div>
+
+      <div class="step"><span class="sn" aria-hidden="true">2</span><div class="step-body">
+        <h3>How to test it {% for c in cards %}<span class="chip paper" data-for="{{ c.name }}"{% if c.name != chosen.name %} hidden{% endif %}>{{ 'Recommended by research' if c.recommended else 'Standard settings' }}</span>{% endfor %}</h3>
+        <details class="change" id="how-change"{% if error %} open{% endif %}>
+          <summary><span class="sentence-text" id="how-text">{{ how }}</span><span class="change-link">Change</span></summary>
+          <div class="grid2">
+            <div class="field"><label for="minutes">Candles</label><select id="minutes" name="minutes">{% for m in study_minutes %}<option value="{{ m }}" {{ 'selected' if m|string == values.minutes|string }}>{{ 'Daily' if m == 1440 else (m // 60)|string ~ '-hour' if m % 60 == 0 else m|string ~ '-minute' }}</option>{% endfor %}</select></div>
+            <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == values.risk_profile }}>{{ p.name|capitalize }}: {{ p.max_position_pct|pct0 }} cap, {{ p.max_drawdown|pct0 }} halt</option>{% endfor %}<option value="none" {{ 'selected' if values.risk_profile == 'none' }}>None: no cap, no halt</option></select></div>
+            <div class="field"><label for="train_days">Learn on, days</label><input id="train_days" name="train_days" type="number" min="30" step="1" value="{{ values.train_days }}"></div>
+            <div class="field"><label for="test_days">Then test on, days</label><input id="test_days" name="test_days" type="number" min="30" step="1" value="{{ values.test_days }}"></div>
+            <div class="field"><label for="holdout_days">Sealed: the most recent days</label><input id="holdout_days" name="holdout_days" type="number" min="0" step="1" value="{{ values.holdout_days }}"></div>
+            <div class="field"><label class="check"><input type="checkbox" id="use_holdout" name="use_holdout" {{ 'checked' if values.use_holdout }} data-spent="{{ spent_holdouts|tojson|forceescape }}"> Open the sealed days (the holdout)</label><p class="hint" id="holdout-hint">Once per model and instrument, at any candle length.</p></div>
+          </div>
+          <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
+        </details>
+        {% for c in cards %}<p class="hint why" data-for="{{ c.name }}"{% if c.name != chosen.name %} hidden{% endif %}><b>Why:</b> {{ c.why }}</p>{% endfor %}
+      </div></div>
+
+      <div class="step"><span class="sn" aria-hidden="true">3</span><div class="step-body">
+        <h3>Exits and sizing</h3>
+        <details class="change" id="exit-change"{% if error %} open{% endif %}>
+          <summary><span class="sentence-text" id="exit-text">{{ exits }}</span><span class="change-link">Change</span></summary>
+          {{ exit_fields(values, costs) }}
+        </details>
+      </div></div>
+
+      <div class="study-foot">
+        <span class="faint" id="study-runs">Runs {{ chosen.variants }} variant{{ 's' if chosen.variants != 1 }} and the cost ladder at {{ '%.2f'|format(on_venue.fee * 100) }}% ({{ on_venue.label }} taker fee). Long only.</span>
+        <button>Run study</button>
+      </div>
+    </form>
+  </section>
+</div>
+<form id="collect-study" method="post" action="/research/history" hidden>
+  <input type="hidden" name="from" value="study"><input type="hidden" name="strategy" value="{{ chosen.name }}">
+  <input type="hidden" name="venue" value="{{ values.venue }}"><input type="hidden" name="instrument" value="{{ values.instrument }}">
+</form>
+{% for v in venues %}<datalist id="pairs-{{ v.key }}">{% for i in v.suggest %}<option value="{{ i }}">{% endfor %}</datalist>{% endfor %}
+<script type="application/json" id="study-data">{{ study_data|tojson }}</script>
+</div>
+
+{# --- Results: every tear sheet, newest first ------------------------------------------------------------- #}
+<div class="tab-panel" id="tab-results" role="tabpanel" data-panel="results">
+<section class="panel flush" aria-labelledby="ts-h">
+  <div class="panel-head"><h2 id="ts-h">Tear sheets</h2><span class="hint">newest first · Kill is a G1 fail</span></div>
+  {% if sheets %}
+  <table class="responsive results" data-hide-md="4">
+    <thead><tr><th>Study</th><th>Verdict</th><th class="num">Break-even fee</th><th>Date</th><th><span class="sr-only">Download</span></th></tr></thead>
+    <tbody>{% for s in sheets %}<tr>
+      <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.label }}</a>
+        <span class="sub2">{{ [s.instrument, candle_words(s.minutes) if s.minutes else none, s.venue_label]|select|join(' · ') or s.name }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data</span>{% endif %}</span>
+        {% if s.settings %}<span class="settings">{{ s.settings }}</span>{% endif %}</td>
+      <td data-m="right"><span class="chip {{ s.tone }}" title="{{ s.evidence }}">{{ s.word }}</span></td>
+      <td class="num" data-m="hide">{{ breakeven_text(s) }}</td>
+      <td data-m="hide" class="muted">{{ s.when.strftime('%d %b %Y %H:%M') }}</td>
+      <td data-m="hide" class="num"><a href="/research/{{ s.name }}/download" download>Tear sheet .md</a></td></tr>{% endfor %}</tbody></table>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">No tear sheets yet. Each study run from Development produces one here.</p>{% endif %}
+</section>
+</div>
+
+{# --- History: what the collector has stored, on every venue ----------------------------------------------- #}
+<div class="tab-panel" id="tab-history" role="tabpanel" data-panel="history">
+<section class="panel flush" aria-labelledby="history-h" id="stored-history">
+  <div class="panel-head"><h2 id="history-h">Stored history</h2><span class="hint">every venue</span></div>
+  {% if msg_in == 'history' %}<div class="history-msgs">{{ messages() }}</div>{% endif %}
+  {% if stored_all %}
   <table class="responsive">
-    <thead><tr><th>Instrument</th><th>Stored from</th><th>Stored to</th><th>Collector</th></tr></thead>
-    <tbody>{% for h in stored %}
+    <thead><tr><th>Instrument</th><th>Venue</th><th>Stored from</th><th>Stored to</th><th>Collector</th></tr></thead>
+    <tbody>{% for h in stored_all %}
     <tr><td data-label="Instrument">{{ h.pair }}</td>
+      <td data-m="right" class="muted">{{ h.venue }}</td>
       <td data-label="Stored from">{{ h.first.strftime('%d %b %Y') if h.first else '–' }}</td>
       <td data-label="Stored to">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
-      <td data-label="Collector">{% if h.state == 'current' %}<span class="chip running">Current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Catching up</span>{% else %}<span class="chip stopped">Asked for {{ h.requested.strftime('%d %b') }}</span>{% endif %}</td></tr>
+      <td data-label="Collector">{% if h.state == 'current' %}<span class="chip running">Current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Catching up</span>{% else %}<span class="chip stopped">Asked for {{ h.requested.strftime('%d %b') if h.requested else '' }}</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
-  {% else %}<p class="muted" style="padding:0 16px">No instrument has stored history yet.</p>{% endif %}
-  <form method="post" action="/research/history" class="inline-form" style="padding:12px 16px">
-    <input type="hidden" name="venue" value="{{ research_venue }}">
+  {% else %}<p class="muted" style="padding:0 18px">No instrument has stored history yet.</p>{% endif %}
+  <form method="post" action="/research/history" class="collect-form">
     <label for="collect-instrument">Collect another instrument</label>
-    <input id="collect-instrument" name="instrument" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" placeholder="{{ instruments[1] if instruments|length > 1 else 'ETH/USD' }}" autocomplete="off" value="{{ collect }}">
-    <button>Collect history</button>
-    <p class="hint" style="margin:6px 0 0">The collector backfills the last {{ request_years }} years of {{ history_venue }} trades into 1-minute bars, then keeps them current. A heavily traded instrument can take a day or more to backfill; a study can run on what is stored so far, and its tear sheet says where the history ends.</p>
+    <div class="collect-row">
+      <select name="venue" aria-label="Venue" id="collect-venue">{% for v in venues %}<option value="{{ v.key }}" {{ 'selected' if v.key == values.venue }}>{{ v.label }}</option>{% endfor %}</select>
+      <input id="collect-instrument" name="instrument" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" placeholder="{{ on_venue.suggest[1] if on_venue.suggest|length > 1 else 'ETH/USD' }}" autocomplete="off" value="{{ collect }}">
+      <button>Collect history</button>
+    </div>
+    <p class="hint">The collector backfills the last {{ request_years }} years of the venue's trades into 1-minute bars, then keeps them current. A heavily traded instrument can take a day or more to backfill; a study can run on what is stored so far, and its tear sheet says where the history ends.</p>
   </form>
 </section>
-
-<section class="panel flush" style="margin-bottom:14px" aria-labelledby="pipe-h">
-  <div class="panel-head"><h2 id="pipe-h">Pipeline</h2></div>
-  <table class="responsive">
-    <thead><tr><th>Model</th><th>Stage</th><th>G1 on real data</th><th>Strategies</th><th></th></tr></thead>
-    <tbody>{% for r in rows %}
-    <tr>
-      <td class="cell-name"><a href="/strategies/{{ r.name }}">{{ r.name|replace('_', ' ') }}</a><span class="sub2">{{ r.spec.family }}</span></td>
-      <td data-m="right">{{ stepper(r.stage, stages, r.observation) }}</td>
-      <td data-label="G1">{% if r.g1 == 'PASS' %}<span class="chip running">Passed</span> <span class="muted">{{ r.passed_where|join(', ') }}</span>{% elif r.g1 == 'FAIL' %}<span class="chip halted">Failed</span>{% elif r.g1 == 'NOT JUDGED' %}<span class="chip paused">Not judged</span>{% elif r.sheets %}<span class="muted">Synthetic only</span>{% else %}<span class="muted">Not tested</span>{% endif %}</td>
-      <td data-m="right">{% if r.sleeves %}{{ r.sleeves|length }} running{% if r.observation %} <span class="warn" title="No G1 pass for: {{ r.observing|map(attribute='name')|join(', ') }}">· {{ r.observing|length }} of {{ r.sleeves|length }} observation</span>{% endif %}{% else %}<span class="muted">None</span>{% endif %}</td>
-      <td data-m="hide" class="num"><a class="button secondary" href="/backtest?strategy={{ r.name }}">Backtest</a> <a class="button secondary" href="/sleeves/new?strategy={{ r.name }}">New strategy</a></td>
-    </tr>{% endfor %}</tbody>
-  </table>
-</section>
-
-<section class="panel flush" aria-labelledby="ts-h">
-  <div class="panel-head"><h2 id="ts-h">Tear sheets</h2></div>
-  {% if sheets %}
-  <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th><th><span class="sr-only">Download</span></th></tr></thead>
-    <tbody>{% for s in sheets %}<tr>
-      <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.settings %}<div class="muted" style="font-size:12px;white-space:normal">{{ s.settings }}</div>{% endif %}</td>
-      <td data-m="right">{% if s.dataset == 'synthetic' %}<span class="warn">Synthetic</span>{% else %}{{ s.dataset }}{% endif %}</td>
-      <td>{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% elif s.g1 == 'NOT JUDGED' %}<span class="chip paused">Not judged</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
-      <td data-m="hide" class="muted wrap">{{ s.evidence }}</td>
-      <td data-m="right" class="num"><a href="/research/{{ s.name }}/download" download>Download</a></td></tr>{% endfor %}</tbody></table>
-  {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
-</section>
+</div>
 {% endblock %}
 {% block scripts %}
 <script src="/static/console.js"></script>
-<script>Console.orderFields("study-form");
+<script>
 (() => {
+  // A history request shows its answer on the tab it came from.
+  const bar = document.querySelector("[data-tabs]");
+  if (bar.dataset.default && !location.hash) history.replaceState(null, "", "#" + bar.dataset.default);
+})();
+Console.tabs();
+Console.orderFields("study-form");
+(() => {
+  const data = JSON.parse(document.getElementById("study-data").textContent);
+  const P = data.plans, V = data.venues;
+  const $ = (id) => document.getElementById(id);
+  const dev = $("dev"), form = $("study-form"), inst = form.elements.instrument, collect = $("collect-study");
+  const box = $("use_holdout"), spent = JSON.parse(box.dataset.spent), holdHint = $("holdout-hint"), holdPlain = holdHint.textContent;
+  const exitBox = form.querySelector(".exit-fields");
+  const PAIR = /^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/;
+  let current = data.chosen;
+  const venue = () => (form.querySelector("input[name=venue]:checked") || {}).value || data.default_venue;
+  const val = (n) => { const el = form.elements[n]; return el && !el.disabled ? el.value.trim() : ""; };
+  const p2 = (x) => `${(x * 100).toFixed(2)}%`;
+
+  // One sentence each for steps 2 and 3, worded as the server words them (development.py how_sentence,
+  // exits_sentence): keep the two in step.
+  const candle = (m) => m === 1440 ? "Daily" : m % 60 === 0 ? `${m / 60}-hour` : `${m}-minute`;
+  const span = (d, next) => {
+    if (d % 365 === 0) { const n = d / 365; return n === 1 ? (next ? "the next year" : "1 year") : `${next ? "the next " : ""}${n} years`; }
+    return `${next ? "the next " : ""}${d} days`;
+  };
+  const num = (x) => String(Number(x));
+  const howSentence = () => {
+    const hold = Number(val("holdout_days") || 0), held = hold === 365 ? "year" : `${hold} days`;
+    const sealed = !hold ? "Nothing held back." : box.checked ? `Latest ${held} opened for this read-out.` : `Latest ${held} sealed.`;
+    return `${candle(Number(val("minutes") || 1440))} candles. Learn on ${span(Number(val("train_days") || 365))}, test on ${span(Number(val("test_days") || 180), true)}. ${sealed}`;
+  };
+  const exitsSentence = () => {
+    const stop = val("stop_atr") ? `Stop ${num(val("stop_atr"))} average true ranges below entry (${num(val("atr_bars") || 14)} bars).`
+      : val("stop_loss_pct") ? `Stop ${num(val("stop_loss_pct"))}% below entry.`
+      : val("stop_swing_bars") ? `Stop at the lowest low of the last ${num(val("stop_swing_bars"))} bars.` : "No stop.";
+    const target = val("take_profit_pct") ? `Target ${num(val("take_profit_pct"))}% above entry.`
+      : val("take_profit_r") ? `Target ${num(val("take_profit_r"))}R after costs.` : "No target.";
+    const parts = [stop, target];
+    if (val("risk_per_trade_pct")) parts.push(`Risk ${num(val("risk_per_trade_pct"))}% of capital a trade.`);
+    const prof = val("risk_profile") || "balanced";
+    parts.push(prof === "none" ? "No risk profile." : `${prof[0].toUpperCase()}${prof.slice(1)} profile.`);
+    return parts.join(" ");
+  };
+
+  // The history chip beside the instrument, from what the page holds for every venue: no reload.
+  const histChip = () => {
+    const v = V[venue()], pair = inst.value.trim().toUpperCase(), h = v.held[pair], chip = $("hist-chip"), btn = $("hist-collect");
+    chip.className = "chip " + (h ? h.tone : "");
+    chip.textContent = h ? h.text : PAIR.test(pair) ? "Not stored" : "Pick an instrument";
+    btn.hidden = !!h || !PAIR.test(pair);
+    collect.elements.venue.value = venue(); collect.elements.instrument.value = pair; collect.elements.strategy.value = current;
+  };
   // A holdout already opened for this model and instrument stays closed, so the box is too (review round 10, M10-1).
-  const form = document.getElementById("study-form"), box = document.getElementById("use_holdout");
-  const hint = document.getElementById("holdout-hint"), spent = JSON.parse(box.dataset.spent), plain = hint.textContent;
-  const sync = () => {
-    const pair = form.elements.instrument.value.trim().replace("/", "").toLowerCase();
-    const when = spent[`${form.elements.strategy.value}|${box.dataset.venue}-${pair}-store`];
+  const syncHoldout = () => {
+    const pair = inst.value.trim().replace("/", "").toLowerCase();
+    const when = spent[`${current}|${venue()}-${pair}-store`];
     if (when) box.checked = false;
     box.disabled = !!when;
-    hint.textContent = when ? `Already opened for this model and instrument ${when}, so it stays closed.` : plain;
+    holdHint.textContent = when ? `Already opened for this model and instrument ${when}, so it stays closed.` : holdPlain;
   };
-  form.elements.strategy.addEventListener("change", sync);
-  form.elements.instrument.addEventListener("input", sync);
-  sync();
+  const sync = () => {
+    syncHoldout(); histChip();
+    $("how-text").textContent = howSentence();
+    $("exit-text").textContent = exitsSentence();
+    const v = V[venue()], n = (P[current] || {}).variants || 1;
+    $("study-runs").textContent = `Runs ${n} variant${n === 1 ? "" : "s"} and the cost ladder at ${p2(v.fee)} (${v.label} taker fee). Long only.`;
+  };
+
+  // The venue switch: its instruments, its history and its perpetual or spot market, in place.
+  const market = () => {
+    if (!exitBox) return;
+    exitBox.dataset.market = V[venue()].perpetual ? "perp" : "spot";
+    form.dispatchEvent(new Event("market-change"));
+  };
+  const onVenue = () => {
+    const key = venue(), v = V[key], pair = inst.value.trim().toUpperCase();
+    inst.setAttribute("list", "pairs-" + key);
+    if (v.suggest.length && !v.suggest.includes(pair) && !v.held[pair]) {
+      const base = pair.split("/")[0];
+      inst.value = v.suggest.find((p) => p.split("/")[0] === base) || v.suggest[0];
+    }
+    $("venue-note").textContent = v.perpetual
+      ? `Studies on ${v.label} trade its perpetual, long only, with the funding it settled.`
+      : `Studies on ${v.label} run spot, long only.`;
+    market(); sync();
+  };
+  form.querySelectorAll("input[name=venue]").forEach((r) => r.addEventListener("change", onVenue));
+  form.addEventListener("input", sync); form.addEventListener("change", sync);
+
+  // Each study keeps its own settings, venue included, while the PM looks at another model.
+  const state = {};
+  const fields = () => [...form.querySelectorAll("input[id], select[id]")];
+  const snapshot = () => ({venue: venue(), f: Object.fromEntries(fields().map((el) => [el.id, el.type === "checkbox" ? el.checked : el.value]))});
+  const setVenue = (key) => { const r = form.querySelector(`input[name=venue][value="${key}"]`); if (r) r.checked = true; };
+  const kinds = () => form.querySelectorAll("[data-kind]").forEach((k) => k.dispatchEvent(new Event("change")));
+  const restore = (s) => {
+    setVenue(s.venue);
+    fields().forEach((el) => { if (el.id in s.f) { if (el.type === "checkbox") el.checked = s.f[el.id]; else el.value = s.f[el.id]; } });
+    kinds();
+  };
+  const applyPlan = (name) => {
+    const v = P[name].values, set = (id, x) => { const el = $(id); if (el) el.value = x == null ? "" : x; };
+    setVenue(v.venue || data.default_venue);
+    const vv = V[venue()];
+    if (v.instrument) inst.value = v.instrument;
+    else if (!vv.suggest.includes(inst.value.trim().toUpperCase())) inst.value = vv.suggest.includes("BTC/USD") ? "BTC/USD" : vv.suggest[0];
+    ["minutes", "train_days", "test_days", "holdout_days", "risk_profile"].forEach((k) => set(k, v[k]));
+    box.checked = !!v.use_holdout;
+    ["stop_loss_pct", "stop_atr", "stop_swing_bars", "take_profit_pct", "take_profit_r", "risk_per_trade_pct"].forEach((k) => set(k, v[k]));
+    set("atr_bars", v.atr_bars || 14);
+    set("stop_kind", v.stop_atr ? "atr" : v.stop_loss_pct ? "pct" : v.stop_swing_bars ? "swing" : "");
+    set("tp_kind", v.take_profit_r ? "r" : v.take_profit_pct ? "pct" : "");
+    kinds();
+  };
+
+  // On a phone the study opens as a sheet over the list.
+  const phone = matchMedia("(max-width: 900px)"), backdrop = dev.querySelector(".sheet-backdrop");
+  const open = (on) => { dev.classList.toggle("open", on); backdrop.hidden = !on; document.body.classList.toggle("sheet-open", on && phone.matches); };
+  const select = (name) => {
+    if (name !== current) {
+      state[current] = snapshot();
+      current = name; form.elements.strategy.value = name;
+      if (state[name]) restore(state[name]); else applyPlan(name);
+      dev.querySelectorAll("[data-for]").forEach((el) => { el.hidden = el.dataset.for !== name; });
+      $("study").setAttribute("aria-labelledby", "study-h-" + name);
+      dev.querySelectorAll("[data-plan]").forEach((a) => { if (a.dataset.plan === name) a.setAttribute("aria-current", "true"); else a.removeAttribute("aria-current"); });
+      history.replaceState(null, "", `/research?strategy=${encodeURIComponent(name)}#development`);
+      onVenue();
+    }
+    if (phone.matches) open(true);
+  };
+  dev.querySelectorAll("[data-plan]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); select(a.dataset.plan); }));
+  dev.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => open(false)));
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && dev.classList.contains("open")) open(false); });
+
+  // Filters over the plan list.
+  const filters = [...document.querySelectorAll("[data-filter]")];
+  filters.forEach((b) => b.addEventListener("click", () => {
+    filters.forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    dev.querySelectorAll(".plan-list li").forEach((li) => { li.hidden = b.dataset.filter !== "all" && li.dataset.status !== b.dataset.filter; });
+  }));
+
+  // A field the browser refuses opens the step it sits in.
+  form.addEventListener("invalid", (e) => { const d = e.target.closest("details"); if (d) d.open = true; }, true);
+  market(); sync();
+  if (dev.hasAttribute("data-open") && phone.matches) open(true);
 })();</script>
 {% if job and job.status in ('queued', 'running') %}<script>
 (function () {

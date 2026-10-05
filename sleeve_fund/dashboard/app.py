@@ -29,7 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
-from sleeve_fund.dashboard import gates, reports, riskops, trading
+from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -118,6 +118,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
+    templates.env.globals["action_reasons"] = reasons.ACTION_REASONS  # templates/_reasons.html
+    templates.env.globals["reason_note_min"] = reasons.NOTE_MIN
     templates.env.filters["action_words"] = action_words
     templates.env.filters["kind_words"] = kind_words
     templates.env.filters["rmult"] = lambda r: "–" if r is None else f"{r:+.2f}R"
@@ -185,10 +187,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves, frames, summaries = book_data()
         put_away = st().archived()
         earlier = st().previous_book()
+        names = [s.name for s in sleeves]
+        # The bottom tabs: the book's positions, working orders, latest fills and funding, from the same
+        # journal the strategy pages read. Every strategy in the book counts, archived ones still holding too.
+        working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
+                   if o["sleeve"] in names]
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
-                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves))
+                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves),
+                    positions=trading.book_positions(st(), summaries), working=working,
+                    book_fills=trading.book_fills(st(), sleeves), funding=trading.book_funding(st(), summaries),
+                    fill_count=sum(x["fills"] for x in summaries))
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -227,8 +237,17 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves, frames, summaries = book_data()
         book = bookm.book_view(st(), summaries, frames)
         kill = _kill_targets(summaries)
-        return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
-                    shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
+        risk = riskops.risk_view(st(), summaries, book)
+        health = riskops.health_view(st(), summaries)
+        running = sum(1 for x in summaries if x["sleeve"].status == "running")
+        # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
+        profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
+        halt = next(iter(profiles.items())) if len(profiles) == 1 else None
+        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
+        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
+                    halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
+                    status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
+                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
@@ -250,11 +269,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                 "shorts": sum(1 for x in holding if x["qty"] < 0)}
 
     @app.post("/book/flatten")
-    def book_flatten(reason: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def book_flatten(reason: str = Form(""), reason_pick: str | None = Form(None), reason_note: str = Form(""),
+                     actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """The book's kill switch: every strategy still trading or holding a position sells to cash at
         market and pauses, each with the PM's reason in its decision log. A stopped strategy holding a
         position is started so its process can sell; it pauses once flat, as the others do."""
-        why = reason.strip()
+        try:
+            why = _reason("book_flatten", reason, reason_pick, reason_note)
+        except ValueError:
+            why = ""
         if not why:
             return RedirectResponse("/risk?kill_error=reason", status_code=303)
         _, _, summaries = book_data()
@@ -272,10 +295,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
-    @app.get("/ops", response_class=HTMLResponse)
-    def ops_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
-        return page(request, "ops.html", ops=riskops.ops_view(st(), summaries), shell=shell(sleeves))
+    @app.get("/ops")
+    def ops_page(_: str = Depends(require_pm)):
+        """Operations is the System tab of Risk & health now."""
+        return RedirectResponse("/risk#system", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)
     def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):
@@ -395,6 +418,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
+        path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
+                                                                     s.params), st().accounts(), utcnow())
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -406,14 +431,18 @@ def create_app(store: Store | None = None) -> FastAPI:
                     costs=exit_costs(), reload=st().pending_reload(name),
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
-                    pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
-                    reset_reasons=RESET_REASONS, resetting=None if bt_id else st().pending_reset(name),
+                    pending=st().pending_commands(name), risk=_risk_view(x, position),
+                    resetting=None if bt_id else st().pending_reset(name),
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    signals=None if bt_id else _signals_view(s, st().signal_state(name)),
+                    timeline=_timeline(events, st().decisions(name, limit=50)),
+                    pos_history=_position_history(events, funding, position),
+                    then_stop=q.get("then_stop", ""), done=q.get("done", ""),
+                    flatten_waits=any(c["command"] == "flatten" for c in st().pending_commands(name)),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
-                                                               st().accounts(), utcnow()))
+                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
@@ -509,9 +538,25 @@ def create_app(store: Store | None = None) -> FastAPI:
         })
 
     @app.post("/sleeves/{name}/command")
-    def sleeve_command(name: str, command: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_command(name: str, command: str = Form(...), reason: str = Form(""),
+                       reason_pick: str | None = Form(None), reason_note: str = Form(""), reason_for: str = Form(""),
+                       then: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """A PM command, with its reason: picked from the action's own list (reasons.py) or typed. Flatten with
+        then=stop is the Stop dialog's "Flatten and stop": the flatten goes now, and the page asks to stop once
+        the strategy is flat, as a stop sent now would drop the waiting flatten."""
+        then_stop = ""
+        if command == "flatten-stop":  # the Stop dialog's other button, with the Stop dialog's reasons
+            command, then, reason_for = "flatten", "stop", "stop"
         try:
+            action = reason_for if reason_for in ("stop", "close") and command == "flatten" else command
+            reason = _reason(action, reason, reason_pick, reason_note)
+            if not reason:
+                raise ValueError("every command needs a reason")
+            if command == "stop" and _flatten_waits(name):
+                raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
+                                 "drop it; stop it once it is flat")
+            if command == "flatten" and then == "stop":
+                then_stop = reason
             if command in ("start", "stop"):
                 if not reason.strip():
                     raise ValueError("a reason is required")
@@ -548,15 +593,29 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/sleeves/{name}", status_code=303)
+        done = {"pause": "Pause sent", "resume": "Resume sent", "stop": "Stopped", "start": "Started",
+                "flatten": "Close sent: it sells at market, then pauses" if reason_for == "close" else
+                "Flatten sent: it closes at market, then pauses"}.get(command, "Sent")
+        # Flatten and stop keeps then_stop in the address (the page asks to stop once flat), so no one-off toast.
+        q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
+        return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
+
+    def _flatten_waits(name: str) -> bool:
+        """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
+        drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
+        if not any(c["command"] == "flatten" for c in st().pending_commands(name)):
+            return False
+        hb = st().sleeve(name).heartbeat_at
+        return bool(hb and utcnow() - hb < STALE)
 
     @app.post("/sleeves/{name}/reset")
-    def sleeve_reset(name: str, reason: str = Form(...), actor: str = Depends(require_pm),
+    def sleeve_reset(name: str, reason: str = Form(""), reason_pick: str | None = Form(None),
+                     reason_note: str = Form(""), actor: str = Depends(require_pm),
                      _o: None = Depends(same_origin)):
         """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
-            st().request_reset(name, reason, actor=actor)
+            st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
@@ -564,15 +623,23 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
     @app.post("/book/reset")
-    def book_reset(reason: str = Form(...), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def book_reset(reason: str = Form(""), reason_pick: str | None = Form(None), reason_note: str = Form(""),
+                   actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """Reset every strategy on the current book (not archived, not a backtest, none already resetting)."""
-        if not reason.strip():
-            return RedirectResponse(f"/?{urlencode({'command_error': 'a reason is required'})}", status_code=303)
+        try:
+            reason = _reason("reset", reason, reason_pick, reason_note)
+        except ValueError as exc:
+            reason = ""
+            error = str(exc)
+        else:
+            error = "a reason is required"
+        if not reason:
+            return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
         gone = set(st().archived())
         for s in st().sleeves():
             if s.name not in gone and not st().pending_reset(s.name):
                 st().request_reset(s.name, reason, actor=actor)
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/setup?reset=1", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -591,7 +658,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         try:
-            reason = str(form.get("reason", "")).strip()
+            reason = reasons.from_form("save", form)
             if not reason:
                 raise ValueError("a reason is required")
             if is_backtest(name):
@@ -630,14 +697,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/sleeves/{name}?saved=settings#settings", status_code=303)
 
     @app.post("/sleeves/{name}/account")
-    def sleeve_account(name: str, account: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_account(name: str, account: str = Form(...), reason: str = Form(""), reason_pick: str | None = Form(None),
+                       reason_note: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         try:
             s = st().sleeve(name)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         try:
-            if not reason.strip():
+            reason = _reason("move", reason, reason_pick, reason_note)
+            if not reason:
                 raise ValueError("a reason is required")
             # Paper processes don't use the account yet (fees come from the venue's schedule), so a running,
             # flat strategy moves without a restart.
@@ -649,10 +717,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/sleeves/{name}?saved=account#settings", status_code=303)
 
     @app.post("/sleeves/{name}/archive")
-    def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(...),
-                       actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+    def sleeve_archive(name: str, action: str = Form(...), reason: str = Form(""), reason_pick: str | None = Form(None),
+                       reason_note: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         try:
-            if not reason.strip():
+            reason = _reason(action if action in ("archive", "restore") else "archive", reason, reason_pick, reason_note)
+            if not reason:
                 raise ValueError("a reason is required")
             if is_backtest(name):
                 raise ValueError("a saved backtest can't be archived")
@@ -670,27 +739,50 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
     def research_page(request: Request, job=None, error: str = "", pre: dict | None = None, collect: str = "",
-                      notice: str = ""):
+                      notice: str = "", tab: str | None = None):
+        """Research: Development (a plan per model and the study form), Results and History. Every venue's
+        stored history is on the page, so a study's venue changes in place (no reload)."""
+        from sleeve_fund.dashboard import development as dev
         from sleeve_fund.dashboard import pipeline
 
         pre = pre or {}
+        sheets = [dev.read_sheet(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
+                                                    reverse=True)]
+        rows = pipeline.strategies(TEARSHEETS, st().sleeves())
+        cards = dev.plans(rows, sheets)
+        chosen = next((c for c in cards if c["name"] == pre.get("strategy")), cards[0])
+        values = dev.form_values(chosen, pre)
         try:
-            profile = _research_venue(pre.get("venue"))
+            profile = _research_venue(values.get("venue"))
         except ValueError:
             profile = _research_venue()
-
-        sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
-                                                         reverse=True)]
-        stored = _stored_history(st(), profile)
+        values["venue"] = profile.name.lower()
+        venues, stored_all = [], []
+        for v in venue_choices():
+            vp = _research_venue(v["key"])
+            stored = _stored_history(st(), vp)
+            stored_all += [dict(h, venue=vp.label, venue_key=v["key"]) for h in stored]
+            venues.append(dict(v, fee=float(resolve_fees(vp.name, st()).fees.taker),
+                               suggest=[h["pair"] for h in stored] or _hints(vp.name),
+                               held={h["pair"]: dev.history_chip(h) for h in stored}))
+        here = next(v for v in venues if v["key"] == values["venue"])
+        if not values.get("instrument"):
+            values["instrument"] = "BTC/USD" if "BTC/USD" in here["suggest"] else here["suggest"][0]
         ledger = IdeaLedger(LEDGER)
         spent = {f"{idea}|{base}": opened_words(e) for (idea, base), e in ledger.holdouts().items()}
-        return page(request, "research.html", sheets=sheets, counts=ledger.counts(),
-                    rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
-                    error=error, pre=pre, strategies=_strategy_choices(),
-                    instruments=[h["pair"] for h in stored] or _hints(profile.name), stored=stored, collect=collect,
-                    notice=notice, request_years=REQUEST_YEARS, history_venue=profile.label,
-                    research_venue=profile.name.lower(), research_perpetual=profile.perpetual, spent_holdouts=spent,
-                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True))
+        # What the study panel's script needs to switch model and venue in place.
+        study_data = {"chosen": chosen["name"], "default_venue": _research_venue().name.lower(),
+                      "plans": {c["name"]: {"values": c["values"], "variants": c["variants"]} for c in cards},
+                      "venues": {v["key"]: {k: v[k] for k in ("label", "perpetual", "fee", "suggest", "held")}
+                                 for v in venues}}
+        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
+                    chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
+                    stages=pipeline.STAGES, job=job, error=error, notice=notice, collect=collect,
+                    tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent,
+                    profiles=PROFILES,
+                    study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True),
+                    how=dev.how_sentence(values), exits=dev.exits_sentence(values),
+                    breakeven_text=dev.breakeven_text, candle_words=dev.candle_words)
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -732,11 +824,19 @@ def create_app(store: Store | None = None) -> FastAPI:
         trades it (review round 8, R8-M6)."""
         form = dict((await request.form()).items())
         pair = str(form.get("instrument", "")).strip().upper()
+        # From a study's "Not stored: Collect", the answer shows in that study; else on the History tab.
+        tab = "development" if form.get("from") == "study" else "history"
+
+        def page_(**kw):
+            return research_page(request, tab=tab, **kw)
+
         try:
             profile = _research_venue(form.get("venue"))
         except ValueError as exc:
-            return research_page(request, error=str(exc))
+            return page_(error=str(exc))
         here = {"instrument": pair, "venue": profile.name.lower()}
+        if str(form.get("strategy", "")) in REGISTRY:
+            here["strategy"] = str(form["strategy"])
         try:
             if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
                 raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
@@ -744,13 +844,13 @@ def create_app(store: Store | None = None) -> FastAPI:
             held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
                         None)
             if held is not None:
-                return research_page(request, pre=here, notice=(
+                return page_(pre=here, notice=(
                     f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now."))
             if pair in (profile.core_pairs or CORE_PAIRS):
                 # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
                 # a request would change nothing, and its "from five years back" would misstate where it starts.
-                return research_page(request, pre=here, notice=(
+                return page_(pre=here, notice=(
                     f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
                     "kept current, and this list shows how far it has got."))
             if profile.minute_loader is None:
@@ -768,13 +868,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                                      "for; try again when the venue answers") from None
         except ValueError as exc:
             # No button to ask again: the same request would be refused the same way.
-            return research_page(request, error=str(exc), pre=here)
+            return page_(error=str(exc), pre=here)
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
         notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
                   "A study can run once some is stored; this list shows how far it has got."
                   if new else f"{pair} was already asked for; this list shows how far the collector has got.")
-        return research_page(request, pre=here, notice=notice)
+        return page_(pre=here, notice=notice)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -819,25 +919,82 @@ def create_app(store: Store | None = None) -> FastAPI:
                                   ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),
                                   ("N/A", "stopped", "Not judged")):
             html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{label}</span></td>')
-        return page(request, "tearsheet.html", title=sheet, body=html)
+        from sleeve_fund.dashboard import development as dev
 
-    @app.get("/decisions", response_class=HTMLResponse)
+        # On top of the sheet: its verdict in one sentence, four figures and the cost ladder, all read from it.
+        s = dev.read_sheet(path)
+        return page(request, "tearsheet.html", title=sheet, body=html, s=s, banner=dev.banner(s),
+                    breakeven=dev.breakeven_text(s), per_day=dev.per_day(s.get("oos_trades"), s.get("oos_days")),
+                    chart=dev.ladder_chart(s["rungs"], s["fee"]), candle_words=dev.candle_words)
+
+    def _moved(request: Request, to: str, hash_: str = "") -> RedirectResponse:
+        """An old page's address: the same query on its new page, so bookmarks and filter links still work."""
+        q = request.url.query
+        return RedirectResponse(f"{to}{'?' + q if q else ''}{hash_}", status_code=303)
+
+    @app.get("/decisions")
     def decisions(request: Request, _: str = Depends(require_pm)):
-        f = _decision_filters(request)
-        return page(request, "decisions.html", decisions=st().decisions(limit=500, **f["query"]), f=f,
-                    sleeves=[s.name for s in st().sleeves()], actions=DECISION_ACTIONS)
+        return _moved(request, "/records", "#log")
 
     @app.get("/decisions.csv")
     def decisions_csv(request: Request, _: str = Depends(require_pm)):
         rows = st().decisions(limit=100_000, **_decision_filters(request)["query"])
         return _csv("decisions", reports.to_csv(rows, ["ts", "actor", "action", "sleeve", "reason"]))
 
-    @app.get("/reports", response_class=HTMLResponse)
+    @app.get("/reports")
     def reports_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/records")
+
+    @app.get("/records", response_class=HTMLResponse)
+    def records_page(request: Request, _: str = Depends(require_pm)):
+        """Performance and the decision log under one period and strategy filter, which the exports follow."""
+        q = request.query_params
+        now = utcnow()
         sleeves, frames, summaries = book_data()
-        fills = {s.name: st().fills(s.name, limit=100_000) for s in sleeves}
-        return page(request, "reports.html", m=reports.monthly(summaries, frames, fills),
-                    sleeves=[s.name for s in sleeves], shell=shell(sleeves))
+        names = [s.name for s in st().sleeves()]
+        chosen = q.get("sleeve") if q.get("sleeve") in names else ""
+        if chosen and chosen not in frames:  # a strategy an earlier clean slate put away: its own figures
+            s = st().sleeve(chosen)
+            frames = {chosen: bookm.daily(st(), chosen)}
+            summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[chosen])]
+        elif chosen:
+            summaries = [x for x in summaries if x["sleeve"].name == chosen]
+        w = reports.window(q.get("period", ""), q.get("month", ""), now)
+        fills = {x["sleeve"].name: st().fills(x["sleeve"].name, limit=100_000) for x in summaries}
+        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"])
+        m = reports.monthly(summaries, frames, fills)
+        months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
+        keys = {r["month"] for r in months}
+        m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
+        # The log: the same window, unless an old Decisions link brought its own dates or action.
+        f = _decision_filters(request)
+        dq = {"sleeve": chosen or None, "action": f["query"]["action"],
+              "since": f["query"].get("since") or w["start"], "until": f["query"].get("until") or w["end"]}
+        decisions = st().decisions(limit=500, **dq)
+        decisions.sort(key=lambda d: d["ts"], reverse=True)  # the timeline reads newest first by time
+        log = reports.timeline(decisions, now)
+        kinds = {k: sum(1 for d in decisions if reports.decision_kind(d["action"]) in
+                        (("started", "stopped") if k == "startstop" else (k,))) for k, _l in reports.KIND_FILTERS}
+        kinds["all"] = len(decisions)
+        keep = {"period": w["period"] if w["period"] != reports.DEFAULT_PERIOD else "", "sleeve": chosen,
+                "month": w["month"] or ""}
+
+        def qs(**over) -> str:
+            out = urlencode({k: v for k, v in {**keep, **over}.items() if v})
+            return "?" + out if out else ""
+
+        dl = {"sleeve": chosen} if chosen else {}
+        dec_dl = {**dl, **({"from": dq["since"].strftime("%Y-%m-%d")} if dq["since"] else {}),
+                  **({"to": (dq["until"] - timedelta(days=1)).strftime("%Y-%m-%d")} if dq["until"] else {}),
+                  **({"action": dq["action"]} if dq["action"] else {})}
+        exports = [(label, f"/exports/{kind}.csv" + ("?" + urlencode(dl) if dl else ""), f"{kind}.csv", what)
+                   for kind, label, what in EXPORTS]
+        exports.insert(4, ("Decision log", "/decisions.csv" + ("?" + urlencode(dec_dl) if dec_dl else ""),
+                           "decisions.csv", "Every decision, with who made it and why."))
+        return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
+                    periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
+                    kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
+                    qs=qs, exports=exports, action=dq["action"], shell=shell(sleeves))
 
     @app.get("/exports/{kind}.csv")
     def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
@@ -1032,8 +1189,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names,
                     backtest=backtest)
 
-    @app.get("/accounts", response_class=HTMLResponse)
-    def accounts_page(request: Request, _: str = Depends(require_pm), error: str = ""):
+    @app.get("/accounts")
+    def accounts_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/setup", "#accounts")
+
+    def _accounts_rows() -> list[dict]:
         from sleeve_fund import accounts as acc
 
         rows = st().accounts()
@@ -1045,7 +1205,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
             r["running"] = [n for n in r["sleeves"] if n in running]
             r["held"] = [n for n in r["sleeves"] if n in held]  # stopped, still holding a position
-        return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
+        return rows
 
     @app.post("/accounts/new")
     async def new_account(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -1059,8 +1219,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
-        return RedirectResponse(f"/accounts#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
     @app.post("/accounts/{name}/note")
     def account_note(name: str, note: str = Form(""), reason: str = Form(...),
@@ -1071,8 +1231,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             st().set_account_note(name, note)
             st().decide(actor, "account_note", f"{name}: note set to \"{note.strip()[:200]}\". {reason.strip()}")
         except ValueError as exc:
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc)})}#accounts", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
     @app.post("/accounts/{name}/retire")
     def account_retire(name: str, action: str = Form(...), reason: str = Form(...),
@@ -1088,22 +1248,37 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("unknown action")
             st().decide(actor, f"{action}_account", f"{name}: {reason.strip()}")
         except ValueError as exc:
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc)})}#accounts", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
-    @app.get("/settings", response_class=HTMLResponse)
+    @app.get("/settings")
     def settings_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/setup", "#settings")
+
+    @app.get("/setup", response_class=HTMLResponse)
+    def setup_page(request: Request, _: str = Depends(require_pm), error: str = ""):
+        """Path to live, one card per setting area, and today's Accounts and Settings content as its detail."""
+        from sleeve_fund.dashboard import setup_view
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "source": q.source,
+        fee_quotes = [{"venue_label": q.venue_label, "source": q.source, "taker": float(q.fees.taker),
                        "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
                        "assumed_spread": f"{2 * v.assumed_half_spread:.2%}"}
                       for v in VENUES.values() for q in [resolve_fees(v.name, st())]]
-
-        return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
-                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
+        sleeves = current_sleeves()
+        frame = shell(sleeves)
+        mirror = setup_view.mirror_state(st(), sleeves)
+        here = setup_view.stage(frame, sleeves, mirror)
+        accounts = _accounts_rows()
+        return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
+                    error=error, pre=dict(request.query_params), shell=frame,
+                    steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
+                    paper_count=sum(1 for x in sleeves if x.name not in st().archived()),
+                    resettable=[x.name for x in sleeves if x.name not in st().archived()],
+                    alerts_out=setup_view.outside_alerts(st()), backup=setup_view.backup_state(frame["now"]))
 
     return app
 
@@ -1229,20 +1404,38 @@ def venue_choices() -> list[dict]:
 
 def _stored_history(store: Store, profile=None) -> list[dict]:
     """Each instrument research can use or has asked for, on the research venue: what is stored, and
-    whether the collector is current or still catching up."""
+    whether the collector is current or still catching up. One unreadable series (a coverage file being
+    rewritten, say) is left out and logged rather than taking the Research page down with it."""
     from sleeve_fund.history import HistoryStore
 
     profile = profile or _research_venue()
     hist = HistoryStore()
     now = utcnow()
-    asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
+    log = logging.getLogger(__name__)
+    try:
+        asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
+    except Exception as exc:  # noqa: BLE001 - an old database without the table: nothing asked for
+        log.warning(f"couldn't read the history requests for {profile.label}: {exc!r}")
+        asked = {}
     out = []
-    for v, pair in hist.series():
+    try:
+        series = hist.series()
+    except OSError as exc:
+        log.warning(f"couldn't list the stored history: {exc!r}")
+        series = []
+    for v, pair in series:
         if v != profile.name:
             continue
-        cov = hist.coverage(v, pair)
-        behind = now - cov.last.to_pydatetime() > study_run.STALE_HISTORY
-        out.append({"pair": pair, "first": cov.first, "last": cov.last, "requested": asked.get(pair, {}).get("requested_at"),
+        try:
+            cov = hist.coverage(v, pair)
+            first, last = cov.first, cov.last
+            if last.tzinfo is None:  # stored without a zone: UTC, as the collector writes it
+                first, last = first.tz_localize("UTC"), last.tz_localize("UTC")
+            behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
+            continue
+        out.append({"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
                     "state": "catching up" if behind else "current"})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for"}
@@ -1285,6 +1478,13 @@ def run_study_job(progress, job_id: str, store: Store | str, req, ledger: str, t
     return path.stem
 
 
+def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
+    """The PM's reason for an action: composed from the dialog's pick and note (reasons.compose, which says in
+    words what is missing), or the plain reason field older forms send."""
+    return reasons.compose(action, pick, note) if pick is not None else (reason or "").strip()
+
+
+
 def _demo_copy(store, s) -> dict | None:
     """What the strategy page shows of its demo copy: only for a perpetual strategy copied to Bybit Demo, the
     one demo account the mirror can trade to an exact quantity."""
@@ -1299,16 +1499,7 @@ def _demo_copy(store, s) -> dict | None:
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
-RESET_REASONS = ["Test finished; starting a clean run", "Settings changed; a fresh run to compare",
-                 "Demo copy out of line with paper", "After a fix to the engine or the mirror"]
-COMMON_REASONS = [
-    "Risk limit close; reducing exposure",
-    "Market event; standing aside",
-    "Strategy behaving outside its backtest range",
-    "Data or venue problem",
-    "Checked after an alert; safe to continue",
-    "Planned change of settings",
-]
+
 EXIT_KINDS = trading.EXIT_EVENTS
 
 
@@ -1378,6 +1569,12 @@ def _held(td) -> str:
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{secs / 60:.0f} min"
 
 
+# The Records page's Export menu: (file, what it is, what it's for), in the order the menu lists them.
+EXPORTS = [("trades", "Closed trades", "Round trips with P&L after fees and their reasons. Best for comparing."),
+           ("audit", "Full audit", "Every fill with its P&L, reason and indicator values."),
+           ("orders", "Orders", "Every order, filled or refused, with why."),
+           ("equity", "Daily equity", "Book and strategy value, cash and position each day."),
+           ("fills", "Fills", "Every fill as the venue reported it: time, side, quantity, price, fee.")]
 DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten", "change_settings", "move_account", "archive",
                     "restore", "flatten everything", "create_account", "account_note", "retire_account",
                     "reinstate_account"]
@@ -1452,7 +1649,7 @@ def _ago(t) -> str:
     return "just now"
 
 
-FEED_FRESH_SECONDS = 60  # past this the strategy page's price feed reads as stale
+FEED_FRESH_SECONDS = riskops.FEED_FRESH_SECONDS  # past this the strategy page's price feed reads as stale
 
 
 def _price_feed(s, seen) -> dict:
@@ -1737,6 +1934,174 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
         raise ValueError(f"a {new:.1%} stop is looser than the {working:.1%} the open position works to now: it "
                          f"risks {loss:,.2f} from here{in_r}. Tick \"Accept a looser stop on the open position\" "
                          "to save it")
+
+
+# The strategy page's Activity chips (combined build F2): every event and decision, each under one kind.
+_RISK_KINDS = {"risk_halt", "risk_pause", "reconcile_mismatch", "liquidation", "liquidation_cut", "stop_loss",
+               "take_profit", "flatten_retry", "flatten_failed", "drawdown_reset"}
+_TRADE_KINDS = {"fill", "order_rejected", "order_denied"}
+
+
+def _timeline(events: list[dict], decisions: list[dict]) -> list[dict]:
+    """Events and PM decisions in one list, newest first, each with a kind for the filter chips: decisions
+    (yours, and the strategy acting on them), risk (halts, pauses, stops, warnings and errors), trades (fills
+    and refused orders) and system (starts, warm-up, the feed and the rest). Routine reconcile passes stay out,
+    as before."""
+    rows = []
+    for e in events:
+        k = e["kind"]
+        if k == "reconcile":
+            continue
+        kind = ("decisions" if k.startswith("pm_") else "trades" if k in _TRADE_KINDS
+                else "risk" if k in _RISK_KINDS or e["level"] in ("warning", "error") else "system")
+        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": kind_words(k), "text": e["message"]})
+    for d in decisions:
+        rows.append({"ts": d["ts"], "kind": "decisions", "level": "info", "title": action_words(d["action"]),
+                     "text": f"by {d['actor']}: {d['reason']}"})
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:150]
+
+
+_HISTORY_KINDS = {"fill": "Fill", "exits_applied": "Stop and target changed", "stop_reset": "Stop set again",
+                  "stop_loss": "Stop-loss", "take_profit": "Take-profit", "liquidation_cut": "Cut back"}
+
+
+def _position_history(events: list[dict], funding: list[dict], position: dict | None) -> list[dict]:
+    """The open position's story, newest first: its fills (the entry and any adds), stop moves and funding."""
+    if not position or not position.get("opened"):
+        return []
+    since = position["opened"]
+    rows = [{"ts": e["ts"], "what": _HISTORY_KINDS[e["kind"]], "text": e["message"]}
+            for e in events if e["kind"] in _HISTORY_KINDS and e["ts"] >= since]
+    rows += [{"ts": f["ts"], "what": "Funding", "text": f"{f['amount']:+,.2f} at {f['rate'] * 100:.4f}%"}
+             for f in funding if f["ts"] >= since]
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:60]
+
+
+def _journey(s, x: dict, path: list[dict] | None, mirror: list[dict]) -> list[dict]:
+    """The strategy's road to live as five steps, from what the checklist and the mirror already show: Research
+    (passed G1), Paper (six weeks, ten trades, clean), Demo check (fills copied to a demo account), G2 approval
+    (yours) and Live. The first step not done is where it is now. Read-only: nothing here approves anything."""
+    if not path:
+        return []
+    ok = {r["label"]: r for r in path}
+    rows = list(ok.values())
+    g1, weeks, trades = rows[0], rows[1], rows[2]
+    clean = all(r["ok"] for r in rows[3:5])
+    filled = [m for m in mirror if m["status"] == "filled"]
+    errors = [m for m in mirror[:20] if m["status"] == "error"]
+    mirrored = bool(s.params.get("demo_mirror"))
+    steps = [
+        {"label": "Research", "done": bool(g1["ok"]), "detail": "passed G1" if g1["ok"] else "not passed G1"},
+        {"label": "Paper", "done": bool(weeks["ok"] and trades["ok"] and clean),
+         "detail": f"{weeks['detail']} · {trades['detail']}"},
+        {"label": "Demo check", "done": bool(filled) and not errors,
+         "detail": (f"{len(filled)} fill{'s' if len(filled) != 1 else ''} copied" + (", with errors" if errors else ""))
+         if filled else "mirror on, no fills yet" if mirrored else "not mirrored to a demo account"},
+        {"label": "G2 approval", "done": False, "detail": "your decision"},
+        {"label": "Live", "done": x.get("mode") == "live", "detail": "live" if x.get("mode") == "live" else "keys and the switch"},
+    ]
+    here = next((i for i, st_ in enumerate(steps) if not st_["done"]), None)
+    for i, st_ in enumerate(steps):
+        st_["state"] = "done" if st_["done"] else "here" if i == here else "todo"
+    return steps
+
+
+SIGNALS_FRESH_SECONDS = 60  # older than this, the Signals tab waits for the model rather than show old lights
+_OP_WORDS = {"<=": "≤", ">=": "≥", "<": "<", ">": ">"}
+
+
+def _signal_row(c: dict, guard: bool = False) -> dict:
+    """One condition as the Signals tab draws it: value, threshold, distance and the gauge's positions (%).
+    guard: a stop or target, which reads as how far away it is, or hit."""
+    unit, v, t = c.get("unit", "pts"), c.get("value"), c.get("threshold") or 0.0
+    fmt = (lambda n: f"{n:+.2f}%") if unit == "%" else (lambda n: f"{n:.1f}")
+    row = {"name": c["name"], "note": c.get("note", ""), "met": bool(c.get("met")),
+           "threshold": f"{_OP_WORDS.get(c.get('op'), c.get('op'))} {fmt(t)}", "value": "–", "distance": "", "gauge": None}
+    if v is None:
+        row["distance"] = "met" if row["met"] else "not yet"
+        return row
+    row["value"] = fmt(v)
+    gap = abs(v - t)
+    gap_words = f"{gap:.2f}%" if unit == "%" else f"{gap:.1f} pts"
+    if guard:
+        row["distance"] = "hit · exits at once" if row["met"] else f"{gap_words} away"
+    else:
+        row["distance"] = f"met · {gap_words} inside" if row["met"] else f"{gap_words} to go"
+    lo, hi = c.get("gauge_min"), c.get("gauge_max")
+    if lo is not None and hi is not None and hi > lo:
+        at = lambda n: round(min(max((n - lo) / (hi - lo), 0.0), 1.0) * 100, 2)  # noqa: E731
+        tick = at(t)
+        below = c.get("op") in ("<=", "<")
+        row["gauge"] = {"tick": tick, "dot": at(v), "zone_left": 0.0 if below else tick,
+                        "zone_width": tick if below else round(100 - tick, 2)}
+    return row
+
+
+def _signal_card(side: int, rows: list[dict] | None, guards: list[dict], held: int, flat_why: str) -> dict:
+    """One side's card: its rules (entry, or exit while the model is on that side), the count, and the
+    stop and target while a position on that side is open."""
+    card = {"label": "Long" if side > 0 else "Short", "key": "long" if side > 0 else "short", "flat": flat_why,
+            "rows": [], "exit": False, "met": 0, "total": 0, "all": False, "guards": []}
+    if flat_why:
+        return card
+    card["rows"] = [_signal_row(r) for r in rows or []]
+    card["exit"] = bool(rows) and all(r.get("exit") for r in rows)
+    card["met"] = sum(r["met"] for r in card["rows"])
+    card["total"] = len(card["rows"])
+    card["all"] = card["total"] > 0 and card["met"] == card["total"]
+    if held == side:
+        card["guards"] = [_signal_row(g, guard=True) for g in guards]
+    return card
+
+
+def _signals_view(s, row: dict | None) -> dict:
+    """The strategy page's Signals tab, from the latest conditions its paper process wrote
+    (LongFlatStrategy.signal_state): the long and short cards, the lights for the tab label, and when the
+    model next acts. Display only."""
+    cls = REGISTRY.get(s.strategy, (None,))[0]
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
+    if not view["supported"]:
+        return view
+    if s.desired_state != "running":
+        view["state"] = "stopped"
+        return view
+    if row is None:
+        return view
+    now = utcnow()
+    secs = max(0, int((now - row["ts"]).total_seconds()))
+    view["age"] = f"{secs} s ago" if secs < 60 else f"{secs // 60} min ago" if secs < 3600 else _ago(row["ts"])
+    if secs > SIGNALS_FRESH_SECONDS:
+        view["state"] = "stale"
+        return view
+    p = row["payload"]
+    held = int(p.get("held") or 0)
+    if not markets.is_perp(s.params):
+        short_flat = "held flat on spot"
+    elif not s.params.get("allow_short"):
+        short_flat = "held flat: shorts are off in its settings"
+    else:
+        short_flat = ""
+    view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
+                     _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
+    view["warming"] = not view["cards"][0]["rows"]
+    view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
+    view["state"] = "live"
+    # The model acts at its bar's close: the next one after the last bar it decided on.
+    minutes = int(p.get("bar_minutes") or 1)
+    step = minutes * 60
+    last = (p.get("bar_ts") or 0) / 1e9
+    t = now.timestamp()
+    nxt = last + step * max(1, math.ceil((t - last) / step)) if last else (t // step + 1) * step
+    left = max(0, int(nxt - t))
+    view["close_at"] = int(nxt * 1000)
+    view["close_in"] = f"{left // 3600}:{left // 60 % 60:02d}:{left % 60:02d}" if left >= 3600 else f"{left // 60:02d}:{left % 60:02d}"
+    view["every"] = ("daily" if minutes == 1440 else f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-minute")
+    return view
 
 
 def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:

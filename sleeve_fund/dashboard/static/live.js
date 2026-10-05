@@ -23,7 +23,8 @@
     if (el.querySelector("dialog[open], .help[aria-expanded=true]")) return true;
     // Never wipe something the PM is typing.
     if (el.contains(document.activeElement) && document.activeElement.matches("input, select, textarea")) return true;
-    if ([...el.querySelectorAll("input:not([type=hidden]), textarea")].some((i) => i.value)) return true;
+    // A choice or text the PM has made (a radio or box counts once ticked; its value is always there).
+    if ([...el.querySelectorAll("input:not([type=hidden]), textarea")].some((i) => (i.type === "radio" || i.type === "checkbox") ? i.checked : i.value)) return true;
     const sel = getSelection();
     return sel && !sel.isCollapsed && el.contains(sel.anchorNode);
   };
@@ -79,6 +80,7 @@
       }
       if (changed) document.dispatchEvent(new CustomEvent("live:swap"));
       last = Date.now();
+      document.dispatchEvent(new CustomEvent("live:pulled"));  // e.g. Risk & health's "Live · 4s ago"
       delay = EVERY;
     } catch {
       delay = Math.min(delay * 2, MAX_BACKOFF);

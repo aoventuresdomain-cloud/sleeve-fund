@@ -1,0 +1,14 @@
+{# Why the PM took an action: the action's own short list plus Other, which needs a note (dashboard/reasons.py).
+   Shared by every dialog that asks for a reason, on the strategy page and on Risk & health. Inside a form whose
+   submit buttons carry data-needs-reason (rendered disabled); Console.reasons() enables them once the pick is
+   complete and keeps the "Logged as" line current. The handler stores "<picked>" or "<picked>: <note>". #}
+{% macro reason_picker(action, id, prefill='', note='') -%}
+<fieldset class="reasons" data-reasons data-min="{{ reason_note_min }}">
+  <legend>Why? This goes in the decision log and Records.</legend>
+  {% for r, hint in action_reasons[action] %}<label class="opt"><input type="radio" name="reason_pick" value="{{ r }}" required{{ ' checked' if prefill == r }}><span>{{ r }}<small>{{ hint }}</small></span></label>
+  {% endfor %}<label class="opt"><input type="radio" name="reason_pick" value="Other" required{{ ' checked' if prefill == 'Other' }}><span>Other<small>Write it below</small></span></label>
+  <label class="note" for="{{ id }}-note">Note <span data-note-hint>(optional)</span></label>
+  <textarea id="{{ id }}-note" name="reason_note" rows="2" maxlength="300" placeholder="Anything the log should say">{{ note }}</textarea>
+  <p class="logline" data-logline>Logged as: no reason yet</p>
+</fieldset>
+{%- endmacro %}

@@ -238,6 +238,125 @@ def test_risk_page_stress_and_limits(client):
     assert "drawdown 21% hit the 20% limit" in page
 
 
+def _healthy_desk(c, store, tmp_path, monkeypatch, *names):
+    """Strategies running and reporting, balances checked, last night's backup on disk: an All clear desk."""
+    folder = tmp_path / "fresh-backups"
+    folder.mkdir(exist_ok=True)
+    (folder / "sleeve_fund-new.dump").write_bytes(b"x" * 100)
+    monkeypatch.setenv("BACKUP_DIR", str(folder))
+    for name in names:
+        _new(c, name=name)
+        store.set_status(name, "running")
+        store.heartbeat(name)
+        store.event(name, "info", "reconcile", "balance matches the venue")
+
+
+def _status_block(page):
+    block = page.split('aria-labelledby="status-h">', 1)[1].split("</section>", 1)[0]
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", block)).strip()
+
+
+def test_risk_status_word_rules(client, tmp_path, monkeypatch):
+    """Risk & health's one word: All clear when nothing is halted or paused, no limit is past 80%, every
+    process reports, feeds are fresh and backup and balance checks are fine; otherwise Needs a look (amber)
+    or Action needed (red), naming the first item."""
+    c, store = client
+    _healthy_desk(c, store, tmp_path, monkeypatch, "btc-a", "btc-b")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status ok"' in page
+    assert _status_block(page).startswith("All clear 2 strategies running. Every limit has room. Nothing needs you.")
+    assert "Processes 2/2" in page and "Feeds 2/2" in page and "Balances matched" in page and "Backup 0h ago" in page
+    assert 'href="/alerts"' in page and "Alerts 0 open" in page
+
+    # A stale price feed: amber, naming it; the feed coming back clears it.
+    store.event("btc-b", "warning", "stale_price", "No trade or quote from the venue for 6 minutes")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and "Feeds 1/2" in page
+    assert _status_block(page).startswith("Needs a look btc-b has had no trade or quote from the venue lately.")
+    store.event("btc-b", "info", "price_feed_back", "Market data is arriving again")
+    assert 'class="rh-status ok"' in c.get("/risk", auth=AUTH).text
+
+    # Paused: amber.
+    store.set_status("btc-a", "paused", "paused by the PM")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and "Needs a look btc-a is paused: paused by the PM." in _status_block(page)
+    store.set_status("btc-a", "running")
+
+    # A limit more than 80% used: amber, naming the strategy and the limit.
+    store.record_equity("btc-a", equity=5000, cash=5000, qty=0, price=100_000, benchmark=5000)
+    store.record_equity("btc-a", equity=4150, cash=4150, qty=0, price=100_000, benchmark=5000)  # 17% of a 20% limit
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and re.search(r"Needs a look btc-a has used \d+% of its \w[\w ]* limit",
+                                                          _status_block(page))
+
+    # Halted: red, and it comes first, with the rest listed under it.
+    store.set_status("btc-b", "halted", "drawdown 20.4% hit the 20% limit")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status bad"' in page
+    assert _status_block(page).startswith("Action needed btc-b is halted: drawdown 20.4% hit the 20% limit. And 1 more below.")
+
+
+def test_risk_status_turns_red_for_a_silent_process_a_balance_mismatch_and_amber_for_backups(client, tmp_path,
+                                                                                           monkeypatch):
+    from datetime import timedelta
+
+    from sleeve_fund.store import sleeves_t
+
+    c, store = client
+    _healthy_desk(c, store, tmp_path, monkeypatch, "btc-a")
+    store.event("btc-a", "error", "reconcile_mismatch", "venue holds 0.1 BTC, the journal 0")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status bad"' in page and "Balance mismatch: btc-a" in page
+    assert _status_block(page).startswith("Action needed btc-a&#39;s balance doesn&#39;t match the venue&#39;s.")
+    store.event("btc-a", "info", "reconcile", "balance matches the venue")
+    with store.engine.begin() as conn:  # the process stopped reporting four minutes ago
+        conn.execute(sleeves_t.update().values(heartbeat_at=utcnow() - timedelta(minutes=4)))
+    page = c.get("/risk", auth=AUTH).text
+    assert "Action needed btc-a is not reporting." in _status_block(page) and "Processes 0/1" in page
+    store.heartbeat("btc-a")
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "no-backups"))
+    page = c.get("/risk", auth=AUTH).text
+    assert _status_block(page).startswith("Needs a look No database backup has been written yet.")
+    assert "Backup none yet" in page
+
+
+def test_risk_status_word_names_the_worst_first():
+    from sleeve_fund.dashboard.riskops import status_word
+
+    assert status_word([], 0)["word"] == "All clear" and status_word([], 0)["line"].startswith("No strategy running.")
+    assert status_word([], 1)["line"].startswith("1 strategy running.")
+    warn = status_word([{"level": "warn", "text": "a is paused"}], 2)
+    assert (warn["word"], warn["tone"], warn["line"]) == ("Needs a look", "warn", "a is paused.")
+    bad = status_word([{"level": "bad", "text": "b is halted"}, {"level": "warn", "text": "a is paused"}], 2)
+    assert (bad["word"], bad["tone"], bad["line"]) == ("Action needed", "bad", "b is halted. And 1 more below.")
+
+
+def test_ops_redirects_to_the_system_tab_of_risk(client):
+    c, _ = client
+    _new(c)
+    r = c.get("/ops", auth=AUTH, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/risk#system"
+    assert c.get("/ops", follow_redirects=False).status_code == 401  # still behind the password
+    page = c.get("/ops", auth=AUTH).text
+    assert 'data-panel="system"' in page and "Technical" in page and "Strategy processes" in page
+    assert "Safety nets" in page and "Price watchdog" in page
+
+
+def test_risk_overview_lists_room_before_halt_and_stops(client):
+    c, store = client
+    _new(c, name="eth-stop", instrument="ETH/USD", stop_atr="2", atr_bars="14")
+    _new(c, name="sol-none", instrument="SOL/USD")
+    store.record_equity("sol-none", equity=5000, cash=5000, qty=0, price=100, benchmark=5000)
+    store.record_equity("sol-none", equity=4400, cash=1400, qty=30, price=100, benchmark=5000)  # 12% of 20%: amber
+    page = c.get("/risk", auth=AUTH).text
+    overview = page.split('data-panel="overview"', 1)[1].split('data-panel="limits"', 1)[0]
+    assert "Limits by strategy" not in overview and "Limits by strategy" in page  # the full table is on Limits
+    assert '<span class="rh-chip ok" title="2.0 ATR (14 bars) below entry">2 ATR</span>' in overview
+    assert '<span class="rh-chip warn">None</span>' in overview
+    assert 'class="w" style="width:60.0%"' in overview and "8.0% left" in overview
+    assert "If the market moved now" in overview and "Book drawdown, 30 days" in overview
+
+
 def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch):
     import os
     import time
@@ -301,7 +420,8 @@ def test_research_pipeline_and_strategy_pages(client):
     c, _ = client
     _new(c)  # a buy_and_hold sleeve, with no real G1 pass, so it shows as an observation
     page = c.get("/research", auth=AUTH).text
-    assert "Pipeline" in page and "observation" in page and "trend filter" in page
+    # The pipeline folds into Development: a card per model, its stage and running strategies in its study.
+    assert 'data-plan="buy_and_hold"' in page and "on observation" in page and "Trend filter" in page
     s = c.get("/strategies/trend_filter", auth=AUTH).text
     assert "Exact rules" in s and "Start a strategy with this" in s
     assert c.get("/strategies/nope", auth=AUTH).status_code == 404
@@ -425,7 +545,7 @@ def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
     c, _ = client
     page = c.get(path, auth=AUTH).text
     assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
-    for href in ("/", "/alerts", "/risk", "/ops", "/research", "/decisions", "/reports", "/settings"):
+    for href in ("/", "/alerts", "/research", "/backtest", "/risk", "/records", "/setup"):
         assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
     assert 'id="strats"' in page  # every strategy is listed under Portfolio (a sheet on phones)
     if path in ("/", "/trades", "/orders"):  # the book-wide blotters are tabs of the portfolio
@@ -1222,7 +1342,7 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
 
     monkeypatch.setattr(KRAKEN, "check_listed", check)
     page = c.get("/research", auth=AUTH).text
-    assert 'id="history"' in page and "Collect another instrument" in page
+    assert 'data-panel="history"' in page and "Collect another instrument" in page
     assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Catching up", page, re.S)
     assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
     assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
@@ -1527,7 +1647,7 @@ def test_raw_labels_read_as_words(client):
     store.event("btc-test", "warning", "maker_fill_above_tape", "Post-only order O-1 has filled more")
     page = c.get("/decisions", auth=AUTH).text
     assert "<strong>Moved account</strong>" in page and "<strong>Changed settings</strong>" in page
-    assert '<option value="move_account" >Moved account</option>' in page
+    assert 'data-kind="changed"' in page  # both drawn as settings changes in the Records log
     assert "Move_account" not in page and "Change_settings" not in page
     assert "Maker fill ahead of the tape" in c.get("/alerts", auth=AUTH).text
 
@@ -1682,11 +1802,12 @@ def test_the_research_form_knows_which_holdouts_are_spent(client, tmp_path):
     c, _ = client
     IdeaLedger(tmp_path / "idea_ledger.jsonl").record(idea="trend_filter", family="trend", params={},
                                                        dataset="kraken-btcusd-store", stage="holdout", sharpe=0.4)
-    page = c.get("/research", auth=AUTH).text
+    page = c.get("/research?strategy=trend_filter&venue=kraken", auth=AUTH).text
     spent = json.loads(html.unescape(re.search(r'data-spent="([^"]*)"', page).group(1)))
     assert list(spent) == ["trend_filter|kraken-btcusd-store"]
     assert spent["trend_filter|kraken-btcusd-store"].endswith(", on daily bars")
-    assert 'data-venue="kraken"' in page
+    # The page script keys a spent holdout by the venue picked in the study, which switches in place.
+    assert '<input type="radio" name="venue" value="kraken" checked>' in page and "${venue()}-${pair}-store" in page
 
 
 def test_sub_dollar_numbers_read_in_full(client):
@@ -1904,11 +2025,14 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(3), cursor="x")
     history.HistoryStore().append("BINANCE", "SOL/USDT", _stored_minutes(3), cursor="y")
     monkeypatch.setattr(venue("binance"), "check_listed", lambda pair: None)
+    # The study's venue is picked in place (no reload); History lists every venue's stored instruments.
     page = c.get("/research?venue=binance", auth=AUTH).text
-    assert '<option value="binance" selected' in page and "data-reload" in page
-    assert '<td data-label="Instrument">SOL/USDT</td>' in page and '<td data-label="Instrument">ETH/USD</td>' not in page
+    assert '<input type="radio" name="venue" value="binance" checked>' in page and "data-reload" not in page
+    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>Binance USD-M perpetuals</td>', page)
+    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>Kraken spot</td>', page)
     assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
-    assert '<td data-label="Instrument">ETH/USD</td>' in c.get("/research", auth=AUTH).text
+    kraken = c.get("/research?venue=kraken", auth=AUTH).text
+    assert '<input type="radio" name="venue" value="kraken" checked>' in kraken and "run spot, long only" in kraken
     asked = c.post("/research/history", data={"instrument": "doge/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for DOGE/USDT" in asked.text and not store.history_requests("KRAKEN")
     assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["DOGE/USDT"]
@@ -1930,7 +2054,28 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
-    assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it
+    # The header's line: model · instrument · venue · candle · profile (combined build F2).
+    assert "BTC/USDT · Binance USD-M perpetuals ·" in shown and "venue=binance" in shown  # clone keeps it
+
+
+def test_risk_and_health_reads_a_feed_as_fresh_from_its_venues_latest_trade():
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard import riskops
+    from sleeve_fund.store import Store, utcnow
+
+    store = Store.in_memory()
+    store.create_sleeve(name="bn", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={}, venue="binance")
+    x = {"sleeve": store.sleeve("bn"), "healthy": True}
+    assert riskops.feed_fresh(store, x)  # no trade seen yet and no stale-price warning
+    store.feed_seen("bn", utcnow() - timedelta(seconds=20))
+    assert riskops.feed_fresh(store, x)
+    store.feed_seen("bn", utcnow() - timedelta(seconds=riskops.FEED_FRESH_SECONDS + 5))
+    assert not riskops.feed_fresh(store, x)
+    assert not riskops.feed_fresh(store, {**x, "healthy": False})
+
+
 
 
 def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervisor(client):
@@ -1946,15 +2091,20 @@ def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervis
     assert "Closes the long of 0.076" in page and "and the copy on Bybit Demo Trading" in page
     assert "Puts this run away under Previous book" in page and "Starts bn-ls again at 10,000.00" in page
     assert "isolated margin at 2×" in page and "Demo copy" in page and "out of line" in page
-    r = c.post("/sleeves/bn-ls/reset", data={"reason": "Test finished; starting a clean run"}, auth=AUTH,
-               headers=SAME, follow_redirects=False)
+    r = c.post("/sleeves/bn-ls/reset", data={"reason_pick": "Test finished; starting a clean run", "reason_note": ""},
+               auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and store.pending_reset("bn-ls")["restart"] == 1
     assert store.decisions("bn-ls")[0]["action"] == "reset"
     assert "Resetting…" in c.get("/sleeves/bn-ls", auth=AUTH).text
     r = c.post("/sleeves/bn-ls/reset", data={"reason": "again"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert "already+under+way" in r.headers["location"]
     _new(c)
-    r = c.post("/book/reset", data={"reason": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
+    setup = c.get("/setup", auth=AUTH).text
+    assert 'data-open="dlg-reset-all"' in setup and 'action="/book/reset"' in setup and "Applies to: " in setup
+    r = c.post("/book/reset", data={"reason_pick": "Other", "reason_note": "short"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
-    assert r.status_code == 303 and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls", "btc-test"}
+    assert "reset_error=" in r.headers["location"] and not store.pending_reset("btc-test")
+    r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/setup?reset=1" and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls", "btc-test"}
     assert "Demo copy <span" not in c.get("/sleeves/btc-test", auth=AUTH).text  # not copied to Bybit Demo

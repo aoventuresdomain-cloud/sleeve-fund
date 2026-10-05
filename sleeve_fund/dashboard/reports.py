@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import csv
 import io
+import math
+import re
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -29,6 +32,8 @@ def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sle
         mf = fills[fills["month"] == period] if len(fills) else fills
         rows.append({
             "month": ts.strftime("%b %Y"),
+            "key": ts.strftime("%Y-%m"),  # the Records page's month chips filter by it
+            "short": ts.strftime("%b"),
             "equity": r["equity"],
             "pnl": r["equity"] - prev_eq[ts],
             "ret": r["equity"] / prev_eq[ts] - 1 if prev_eq[ts] else 0.0,
@@ -69,3 +74,159 @@ def to_csv(rows: list[dict], columns: list[str]) -> str:
     for r in rows:
         w.writerow([_cell(r.get(c)) for c in columns])
     return buf.getvalue()
+
+
+# --- Records page: one period and strategy filter over the performance figures and the decision log ---------
+
+PERIODS = {"1m": ("1M", 30), "6m": ("6M", 182), "1y": ("1Y", 365), "all": ("All", None)}
+DEFAULT_PERIOD = "all"  # what the Reports page showed: every month
+MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+
+# Decision log kinds, for the icon beside each line and the filter chips above the log.
+DECISION_KINDS = {
+    "started": ("Started", "▶"), "stopped": ("Stopped", "■"), "changed": ("Changed", "✎"),
+    "risk": ("Risk", "⏸"), "approval": ("Approval", "✓"),
+}
+KIND_FILTERS = [("all", "All"), ("startstop", "Started / stopped"), ("risk", "Risk"), ("changed", "Settings changed"),
+                ("approval", "Approvals")]
+_KIND_OF = {"create": "started", "start": "started", "resume": "started", "restore": "started",
+            "stop": "stopped", "archive": "stopped", "pause": "risk", "flatten": "risk", "flatten everything": "risk"}
+
+
+def decision_kind(action: str) -> str:
+    """started, stopped, changed, risk or approval: how the log draws a decision."""
+    a = (action or "").lower()
+    if "approv" in a or a.startswith("g2"):
+        return "approval"
+    return _KIND_OF.get(a, "changed")
+
+
+def window(period: str, month: str, now: datetime) -> dict:
+    """The dates the Records page covers: a month chip's month, else the period back from now.
+    start/end are UTC datetimes or None (open). `period` is always a key of PERIODS."""
+    period = period if period in PERIODS else DEFAULT_PERIOD
+    m = MONTH_RE.match(month or "")
+    days = PERIODS[period][1]
+    pstart = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0) if days else None
+    out = {"period": period, "month": None, "start": pstart, "end": None, "period_start": pstart}
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        start = datetime(y, mo, 1, tzinfo=timezone.utc)
+        out.update(month=month, start=start, end=datetime(y + (mo == 12), mo % 12 + 1, 1, tzinfo=timezone.utc),
+                   month_label=start.strftime("%b %Y"))
+    return out
+
+
+def _utc(t):
+    return None if t is None else pd.Timestamp(t).tz_convert("UTC") if pd.Timestamp(t).tzinfo else pd.Timestamp(t, tz="UTC")
+
+
+def _within(idx, start, end):
+    keep = pd.Series(True, index=idx)
+    if start is not None:
+        keep &= idx >= _utc(start)
+    if end is not None:
+        keep &= idx < _utc(end)
+    return keep.values
+
+
+def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: list[dict], start, end) -> dict:
+    """The four figures and the book vs benchmark curve over [start, end): return after fees, the gap to
+    buy-and-hold in points, the worst drawdown with its date, and fees and fills. Returns are measured
+    from the equity at the window's start (the starting capital when the window opens before the first mark)."""
+    curve = bookm.book_curve(summaries, frames)
+    capital = sum(x["sleeve"].starting_balance for x in summaries)
+    f = pd.DataFrame(fills)
+    if len(f):
+        f["ts"] = pd.to_datetime(f["ts"], utc=True)
+        f = f[_within(pd.DatetimeIndex(f["ts"]), start, end)]
+    fees, n_fills = (float(f["fee"].sum()), int(len(f))) if len(f) else (0.0, 0)
+    if not len(curve):
+        return {"empty": True, "fees": fees, "fills": n_fills}
+    before = curve[curve.index < _utc(start)] if start is not None else curve.iloc[0:0]
+    base_eq = float(before["equity"].iloc[-1]) if len(before) else capital
+    base_b = float(before["benchmark"].iloc[-1]) if len(before) else capital
+    w = curve[_within(curve.index, start, end)]
+    if not len(w) or not base_eq or not base_b:
+        return {"empty": True, "fees": fees, "fills": n_fills}
+    ret = float(w["equity"].iloc[-1]) / base_eq - 1
+    bench = float(w["benchmark"].iloc[-1]) / base_b - 1
+    peak = w["equity"].cummax().clip(lower=base_eq)
+    dd = 1 - w["equity"] / peak
+    worst = float(dd.max())
+    book = [0.0] + [float(v) / base_eq - 1 for v in w["equity"]]
+    bmk = [0.0] + [float(v) / base_b - 1 for v in w["benchmark"]]
+    first = (w.index[0] - pd.Timedelta(days=1)) if not len(before) else before.index[-1]
+    days = [first] + list(w.index)
+    return {"empty": False, "ret": ret, "bench": bench, "vs": ret - bench, "worst_dd": worst,
+            "worst_on": dd.idxmax() if worst > 0 else None, "fees": fees, "fills": n_fills,
+            "pnl": float(w["equity"].iloc[-1]) - base_eq, "chart": curve_chart(days, book, bmk)}
+
+
+def curve_chart(days: list, book: list[float], bench: list[float], width: int = 560, height: int = 170) -> dict:
+    """Book and benchmark returns as SVG polylines, with a zero line, three return ticks and month labels."""
+    left, right, top, bottom = 50.0, 8.0, 10.0, 24.0
+    lo, hi = min(0.0, *book, *bench), max(0.0, *book, *bench)
+    pad = (hi - lo) * 0.08 or 0.01
+    lo, hi = lo - pad, hi + pad
+    n = len(days)
+
+    def x(i):
+        return left + (width - left - right) * (i / (n - 1) if n > 1 else 1.0)
+
+    def y(v):
+        return top + (height - top - bottom) * (hi - v) / (hi - lo)
+
+    def line(vals):
+        return " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vals))
+
+    step = _nice_step(hi - lo)
+    first = math.ceil(lo / step)
+    vals = [k * step for k in range(first, math.floor(hi / step) + 1)]
+    ticks = [{"y": round(y(v), 1), "label": "0%" if abs(v) < 1e-12 else f"{v * 100:+.{0 if step >= 0.01 else 1}f}%"}
+             for v in vals]
+    months, seen = [], set()
+    for i, d in enumerate(days):
+        key = (d.year, d.month)
+        if i and key not in seen and d.day <= 7 and x(i) <= width - 34:  # room for the label before the edge
+            months.append({"x": round(x(i), 1), "label": d.strftime("%b")})
+        seen.add(key)
+    if len(months) > 8:  # a long range: every other month, so the labels never collide
+        months = months[::2]
+    end = len(book) - 1
+    return {"w": width, "h": height, "left": left, "bottom": height - bottom, "book": line(book), "bench": line(bench),
+            "area": f"{x(0):.1f},{y(0):.1f} " + line(book) + f" {x(end):.1f},{y(0):.1f}",
+            "zero": round(y(0), 1), "ticks": ticks, "months": months,
+            "end": {"x": round(x(end), 1), "y": round(y(book[-1]), 1), "by": round(y(bench[-1]), 1),
+                    "book": book[-1], "bench": bench[-1]}}
+
+
+def _nice_step(span: float) -> float:
+    """A round tick step (1, 2, 2.5 or 5 times a power of ten) giving two to four ticks over the span."""
+    raw = span / 3 if span > 0 else 0.01
+    mag = 10 ** math.floor(math.log10(raw))
+    return next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+
+
+def in_window(month_key: str, w: dict, use_month: bool = False) -> bool:
+    """Whether a 'YYYY-MM' month falls in the window (the period's, unless use_month)."""
+    start = w["start"] if use_month else w["period_start"]
+    end = w["end"] if use_month else None
+    if start is not None and month_key < start.strftime("%Y-%m"):
+        return False
+    return not (end is not None and month_key >= end.strftime("%Y-%m"))
+
+
+def timeline(decisions: list[dict], now: datetime) -> list[dict]:
+    """Decisions grouped by UTC day, newest first: [{"label": "Today" | "Yesterday" | "3 Oct", "items": [...]}]."""
+    days: list[dict] = []
+    today = now.date()
+    for d in decisions:
+        ts = d["ts"]
+        day = ts.date()
+        label = ("Today" if day == today else "Yesterday" if day == today - timedelta(days=1)
+                 else ts.strftime("%-d %b" if ts.year == now.year else "%-d %b %Y"))
+        if not days or days[-1]["label"] != label:
+            days.append({"label": label, "items": []})
+        days[-1]["items"].append({**d, "kind": decision_kind(d["action"])})
+    return days

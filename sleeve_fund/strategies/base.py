@@ -61,6 +61,45 @@ class IdeaSpec:
     summary: str = ""
 
 
+_OPS = {"<=": lambda v, t: v <= t, ">=": lambda v, t: v >= t, "<": lambda v, t: v < t, ">": lambda v, t: v > t}
+
+
+@dataclass(frozen=True, slots=True)
+class Condition:
+    """One of a model's rules on one bar, as the strategy page's Signals tab shows it: the rule in words,
+    the value it reads, the threshold, how they compare (op: <=, >=, < or >), whether it holds, the unit
+    (pts or %) and the span a gauge draws. exit: a rule that ends the leg the model is on, rather than one
+    that opens a new one. A rule with no measure (value None) only says whether it holds.
+
+    A model builds these in the code its decision uses (target_side, want_long), so the tab can't disagree
+    with what the model does on the bar."""
+
+    name: str
+    value: float | None
+    threshold: float
+    op: str
+    met: bool
+    unit: str = "pts"
+    gauge_min: float = 0.0
+    gauge_max: float = 100.0
+    exit: bool = False
+    note: str = ""
+
+    @classmethod
+    def check(cls, name: str, value: float, op: str, threshold: float, **kw) -> "Condition":
+        """The rule `value op threshold`, met as the comparison says."""
+        return cls(name, value, threshold, op, _OPS[op](value, threshold), **kw)
+
+
+def _condition_json(c: Condition) -> dict:
+    """A condition as plain JSON (the Signals tab's store row)."""
+    def r(v):
+        return None if v is None or not math.isfinite(v) else round(float(v), 6)
+
+    return {"name": c.name, "value": r(c.value), "threshold": r(c.threshold), "op": c.op, "met": bool(c.met),
+            "unit": c.unit, "gauge_min": r(c.gauge_min), "gauge_max": r(c.gauge_max), "exit": c.exit, "note": c.note}
+
+
 # StrategyConfig is a native type: Python passes the same keyword arguments to its
 # __new__, which reads the base fields (strategy_id etc.) from them. So __init__ must
 # not forward them, and we reject anything unrecognised so a typo in a sleeve file fails.
@@ -73,6 +112,9 @@ MAX_PARTICIPATION = 0.25
 # feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
 STALE_PRICE_WARN_MINUTES = 5
 STALE_PRICE_RESTART_MINUTES = 15
+# Paper: how often at most the model's conditions on the forming candle are written for the Signals tab
+# (and straight after each bar). Display only: never in a backtest.
+SIGNAL_WRITE_EVERY_NS = 5_000_000_000
 
 _BASE_FIELDS = {
     "strategy_id",
@@ -418,6 +460,12 @@ class LongFlatStrategy(Strategy):
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
         self._failed_handlers: set[str] = set()  # handlers already journaled as failed (see _report)
+        # Paper: when the Signals tab's conditions were last written (clock ns) and for which bar; off once it
+        # is known the model lists none. A failed write is said once in the log, never an order's concern.
+        self._signals_ns = 0
+        self._signals_bar = -1
+        self._signals_on = True
+        self._signals_warned = False
         for name in REPORTED_HANDLERS:
             setattr(self, name, self._reporting(name, getattr(self, name)))
 
@@ -550,6 +598,7 @@ class LongFlatStrategy(Strategy):
             self._on_tick()  # leveraged: the guards act on the trade, not on the next 30-second tick
             return
         self._maybe_tick()
+        self._publish_signals()
 
     def on_quote(self, quote) -> None:
         if self.recorder is not None:
@@ -888,6 +937,73 @@ class LongFlatStrategy(Strategy):
         if target is not True and target is not False and target < 0:
             return "Signal to be short", {}
         return ("Signal to be long" if target else "Signal to be flat"), {}
+
+    def conditions(self, side: int, price: float | None = None) -> list[Condition] | None:
+        """The model's rules for `side` (+1 long, -1 short) on this bar, for the strategy page's Signals tab:
+        those that would all have to hold for the model's decision to be that side, or, while the model is on
+        that side, the ones that end it (Condition.exit). price: the forming candle's would-be close, worked
+        out on a copy so nothing the model decides with changes; None reads the last closed bar. An empty
+        list: the model can't say yet (its indicators are warming up). None: this model doesn't list its
+        conditions. Overriding models build them in the same code their decision uses."""
+        return None
+
+    def guard_conditions(self, price: float) -> list[Condition]:
+        """The open position's stop-loss and take-profit at this price, as _check_exits judges them: either
+        one alone exits, at once rather than at the bar's close."""
+        if self._entry_px is None or not price or price <= 0:
+            return []
+        side = self._entry_side or 1
+        gain = side * (price / self._entry_px - 1)  # what the position made: a short gains as the price falls
+        rows = []
+        stop, tp = self._stop_frac, self._tp_frac
+        if stop is not None:
+            span = max(abs(stop) * 2, 0.002) * 100
+            rows.append(Condition(f"Stop-loss {_from_entry(stop, side)}", round(gain * 100, 4), round(-stop * 100, 4),
+                                  "<=", gain <= -stop, "%", -span, span, exit=True,
+                                  note=f"stop at {self._entry_px * (1 - side * stop):,.6g}"))
+        if tp:
+            span = max(abs(tp) * 2, 0.002) * 100
+            rows.append(Condition(f"Take-profit {tp:.1%} {'above' if side > 0 else 'below'} the entry",
+                                  round(gain * 100, 4), round(tp * 100, 4), ">=", gain >= tp, "%", -span, span,
+                                  exit=True, note=f"target at {self._entry_px * (1 + side * tp):,.6g}"))
+        return rows
+
+    def signal_state(self, price: float | None = None) -> dict | None:
+        """What the Signals tab shows, as JSON-ready data: both sides' conditions on the forming candle at
+        `price` (the latest price when None), and the open position's stop and target. None when the model
+        doesn't list its conditions. Reads only: nothing the model trades by changes."""
+        if type(self).conditions is LongFlatStrategy.conditions:
+            return None
+        price = price if price is not None else self._price()
+        sides = {}
+        for side, key in ((1, "long"), (-1, "short")):
+            rows = self.conditions(side, price if price > 0 else None)
+            sides[key] = None if rows is None else [_condition_json(r) for r in rows]
+        held = self._entry_side if self._entry_px is not None else 0
+        return {"price": price, "bar_ts": self._last_bar_ts or None, "bar_minutes": bar_minutes(self._cfg.bar_type),
+                **sides, "held": held, "guards": [_condition_json(r) for r in self.guard_conditions(price)]}
+
+    def _publish_signals(self) -> None:
+        """Paper: write the model's conditions on the forming candle for the Signals tab, at most every
+        SIGNAL_WRITE_EVERY_NS and straight after a new bar. Display only: never in a backtest, worked out on
+        copies of the model's state, and a failure here is logged once and never reaches the order path."""
+        if not self._signals_on or self.runtime is None or self._backtest:
+            return
+        now = self.clock.timestamp_ns()
+        if self._signals_bar == self._last_bar_ts and now - self._signals_ns < SIGNAL_WRITE_EVERY_NS:
+            return
+        self._signals_ns, self._signals_bar = now, self._last_bar_ts
+        try:
+            state = self.signal_state()
+            if state is None:
+                self._signals_on = False
+                return
+            self.runtime.publish_signals(state)
+            self._signals_warned = False
+        except Exception as exc:  # noqa: BLE001 - the tab goes stale and says so; trading carries on
+            if not self._signals_warned:
+                self._signals_warned = True
+                self.log.warning(f"Signals tab: couldn't write the model's conditions; it tries again: {exc!r}")
 
     def _on_bar_sided(self, bar: Bar) -> None:
         """A perpetual's decision: be long, short or flat, all or nothing. Turning from one side to the
@@ -1978,6 +2094,7 @@ class LongFlatStrategy(Strategy):
         self._last_tick_ns = self.clock.timestamp_ns()
         if self._feed_dead():
             return  # no heartbeat, so the supervisor restarts the process
+        self._publish_signals()  # a quiet market still shows the lights (display only)
         if self._restore is not None:
             # The carried-over position isn't back at the simulated venue yet: nothing to mark or guard
             # against the journal until it is, but the strategy is alive.

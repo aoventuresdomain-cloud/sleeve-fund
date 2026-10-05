@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Setup · Multi-Strategy Fund{% endblock %}
+{% from "_reasons.html" import reason_picker %}
+{% block content %}
+<div class="page-head">
+  <h1>Setup</h1>
+</div>
+
+<nav class="tabs desk-tabs" role="tablist" aria-label="Setup views" data-tabs>
+  <a href="#overview" role="tab" data-tab="overview">Overview</a>
+  <a href="#accounts" role="tab" data-tab="accounts">Accounts<span class="n">{{ accounts|length }}</span></a>
+  <a href="#settings" role="tab" data-tab="settings">Settings</a>
+</nav>
+
+<div class="tab-panel" id="tab-overview" role="tabpanel" data-panel="overview">
+  {% if pre.reset %}<div class="banner" role="status">Reset asked for every strategy on the book. Each one closes its position, is put away under Previous book and restarts at its starting capital; its page shows "Resetting…" until it has.</div>{% endif %}
+  {% if pre.reset_error %}<div class="banner loss" role="alert">Nothing was reset: {{ pre.reset_error }}.</div>{% endif %}
+  {# Path to live: read-only, from the real state (G2 not approved is Paper; the demo mirror on is Demo check). #}
+  <section class="panel journey-panel" aria-labelledby="ptl-h">
+    <h2 id="ptl-h" class="sr-only">Path to live</h2>
+    <ol class="journey">
+      {% for s in steps %}<li class="jn {{ s.state }}" {{ 'aria-current=step' if s.state == 'here' }}><span class="c" aria-hidden="true">{{ '✓' if s.state == 'done' else s.n }}</span><b>{{ s.label }}</b>{% if s.state == 'here' %}<span class="you">You are here</span>{% else %}<span class="note">{{ s.note }}</span>{% endif %}</li>{% endfor %}
+    </ol>
+    <div class="journey-m">
+      <div class="top"><b>Path to live</b><span class="chip paper step-chip">Step {{ stage_n + 1 }} of {{ steps|length }}</span></div>
+      <div class="progress" role="progressbar" aria-valuemin="1" aria-valuemax="{{ steps|length }}" aria-valuenow="{{ stage_n + 1 }}" aria-label="Path to live"><div style="width: {{ ((stage_n + 0.5) / steps|length * 100)|round(0) }}%"></div></div>
+    </div>
+    <p class="journey-next">{{ next_words }}</p>
+  </section>
+
+  {% set live = accounts|selectattr('kind', 'equalto', 'live')|rejectattr('retired_at')|list %}
+  {% set keyed = live|selectattr('key_present')|list %}
+  {% set b = backup.b %}
+  <div class="sgrid">
+    <a class="scard" href="#accounts">
+      <div class="top"><b>Accounts</b><span class="chip paper">{{ accounts|rejectattr('retired_at')|list|length }}</span><span class="sum">Paper{{ ', demo mirror' if mirror.on }}{{ ', %d live' % live|length if live }} ›</span></div>
+      <dl><dt>Paper book</dt><dd>{{ paper_count }} strateg{{ 'y' if paper_count == 1 else 'ies' }}</dd>
+        <dt>Demo mirror</dt><dd class="{{ 'gain' if mirror.on }}">{{ mirror.words }}</dd>
+        <dt>Live</dt><dd>{% if live %}{{ live|length }} account{{ 's' if live|length != 1 }}, {{ keyed|length }} keyed{% else %}none{% endif %}</dd></dl>
+      <span class="go">Manage accounts · How to connect</span>
+    </a>
+    <a class="scard" href="#costs">
+      <div class="top"><b>Venues and costs</b><span class="chip paper">{{ fee_quotes|length }}{{ ' + mirror' if mirror.on }}</span><span class="sum">{{ fee_quotes[0].venue_label }} {{ '%.3g'|format(fee_quotes[0].taker * 100) }}% ›</span></div>
+      <dl>{% for q in fee_quotes %}<dt>{{ q.venue_label }}</dt><dd>{{ '%.3g'|format(q.taker * 100) }}% taker</dd>{% endfor %}
+        <dt>Demo account</dt><dd>{{ 'mirroring, demo money' if mirror.on else 'off' }}</dd></dl>
+      <span class="go">See venues and costs</span>
+    </a>
+    <a class="scard" href="#profiles">
+      <div class="top"><b>Risk profiles</b><span class="chip paper">{{ profiles|length }}</span><span class="sum">{% for p in profiles.values() %}{{ p.max_drawdown|pct0 }}{{ ' / ' if not loop.last }}{% endfor %} ›</span></div>
+      <dl>{% for p in profiles.values() %}<dt>{{ p.name|capitalize }}</dt><dd>halt at {{ p.max_drawdown|pct0 }}</dd>{% endfor %}</dl>
+      <span class="go">See profiles</span>
+    </a>
+    <a class="scard {{ '' if alerts_out.on else 'att' }}" href="#outside-alerts">
+      <div class="top"><b>Outside alerts</b>{% if alerts_out.on %}<span class="chip running">On</span>{% else %}<span class="chip paused">Not set up</span>{% endif %}</div>
+      {% if alerts_out.on %}<dl><dt>Alerts go to</dt><dd>{{ alerts_out.where }}</dd><dt>Uptime ping</dt><dd>{{ 'on' if alerts_out.ping else 'off' }}</dd></dl>
+      {% else %}<p class="desc">Alerts only show on the dashboard. Set ALERT_WEBHOOK_URL on the server to a Telegram bot's sendMessage address to get them on your phone.</p>{% endif %}
+      <span class="go">{{ 'Details' if alerts_out.on else 'How to set up' }}</span>
+    </a>
+    <a class="scard {{ '' if backup.good or not b else 'att' }}" href="/risk#system">
+      <div class="top"><b>Backups</b>{% if backup.good %}<span class="chip running">Checked</span>{% elif b %}<span class="chip paused">Needs a look</span>{% else %}<span class="chip">None yet</span>{% endif %}</div>
+      <dl><dt>Last dump</dt><dd class="{{ 'warn' if b and b.stale }}">{{ (b.age|held ~ ' ago') if b and b.name else 'none yet' }}</dd>
+        <dt>Restore test</dt><dd class="{{ 'loss' if backup.restore == 'failed' }}">{{ backup.restore }}</dd>
+        <dt>Snapshots</dt><dd>Lightsail, daily</dd></dl>
+      <span class="go">See system</span>
+    </a>
+    <a class="scard" href="#access">
+      <div class="top"><b>Access</b><span class="chip paper">1 user</span><span class="sum">pm · {{ shell.version }} ›</span></div>
+      <dl><dt>Login</dt><dd>pm · HTTPS</dd><dt>Password</dt><dd>server secret</dd><dt>Version</dt><dd>{{ shell.version }}</dd></dl>
+      <span class="go">Details</span>
+    </a>
+  </div>
+
+  {# PM, 5 Oct 2026: during testing, start every strategy afresh in one go. #}
+  {% if resettable %}<section class="panel" aria-labelledby="reset-h">
+    <h2 id="reset-h">Start the paper book afresh</h2>
+    <p class="desc">Resets all {{ resettable|length }} strateg{{ 'y' if resettable|length == 1 else 'ies' }} on the book: positions closed, the runs so far kept under Previous book, each restarted at its starting capital.</p>
+    <button type="button" class="secondary" data-open="dlg-reset-all">Reset all</button>
+  </section>
+  <dialog id="dlg-reset-all" aria-labelledby="dlg-reset-all-h">
+    <form method="post" action="/book/reset">
+      <h2 id="dlg-reset-all-h">Reset all strategies</h2>
+      <ul class="reset-plan">
+        <li>Closes every open position at market on paper, and its copy on the demo account where one is mirrored. Open orders are cancelled on both. Closing fills are marked "reset".</li>
+        <li>Puts each run so far away under Previous book: kept, not counted, nothing deleted.</li>
+        <li>Restarts each strategy at its starting capital, with P&amp;L, drawdown and fees at zero. A running strategy runs again; a stopped one stays stopped.</li>
+        <li>Sets the demo account back to isolated margin at each strategy's leverage before it trades again.</li>
+        <li>Applies to: {{ resettable|join(', ') }}.</li>
+      </ul>
+      {{ reason_picker("reset", "r-reset-all") }}
+      <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger" data-needs-reason disabled>Reset all strategies</button></div>
+    </form>
+  </dialog>{% endif %}
+</div>
+
+<div class="tab-panel" id="tab-accounts" role="tabpanel" data-panel="accounts">
+{% include "accounts.html" %}
+</div>
+
+<div class="tab-panel" id="tab-settings" role="tabpanel" data-panel="settings">
+{% include "settings.html" %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/console.js"></script>
+<script>Console.tabs(); Console.dialogs(); Console.reasons();</script>
+{% endblock %}

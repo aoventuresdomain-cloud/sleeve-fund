@@ -367,6 +367,14 @@ class SleeveRuntime:
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
         self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=self.now())
 
+    # --- display -------------------------------------------------------------------
+
+    def publish_signals(self, state: dict) -> None:
+        """The model's conditions on the forming candle, for the strategy page's Signals tab (the strategy
+        throttles these). Display only, and paper only: a backtest's runtime never writes them."""
+        if not self.backtest:
+            self.store.set_signal_state(self.name, state, ts=self.now())
+
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:
         self.status, self.paused_until = status, paused_until
         self.store.set_status(self.name, status, reason, paused_until)

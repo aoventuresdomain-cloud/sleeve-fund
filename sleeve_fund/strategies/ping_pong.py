@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from nautilus_trader.model import Bar
 
-from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
     summary="Buys at the start, sells once the close rises {rise} above the close it bought on (0.01 = 1%), "
@@ -67,23 +67,62 @@ class PingPong(LongFlatStrategy):
         if last:
             self._side, self._ref = (-1 if last[0]["side"] == "SELL" else 1), float(last[0]["price"])
 
+    def _leg_ends(self, leg: int, close: float) -> bool:
+        """The rule that ends the leg the cycle is on, from the close it started from: the long leg once the
+        close is `rise` above it, the short leg once it is `dip` below it. What target_side() decides by and
+        conditions() shows."""
+        if leg == 1:
+            return close >= self._ref * (1 + self.c.rise)
+        return close <= self._ref * (1 - self.c.dip)
+
     def target_side(self, close: float) -> int:
         """The side the cycle wants from this close: +1 long, -1 short. Moves the cycle on when a leg ends."""
         c = self.c
         if self._side is None:
             self._side, self._ref = 1, close
             self._why = ("Start of the cycle: buys on the first bar", {})
-        elif self._side == 1 and close >= self._ref * (1 + c.rise):
+        elif self._side == 1 and self._leg_ends(1, close):
             move = close / self._ref - 1
             self._why = (f"Close {close:,.6g} is {move:+.2%} from the {self._ref:,.6g} close it bought on, past the "
                          f"{c.rise:.1%} rise", {"entry_close": self._ref, "move": move})
             self._side, self._ref = -1, close
-        elif self._side == -1 and close <= self._ref * (1 - c.dip):
+        elif self._side == -1 and self._leg_ends(-1, close):
             move = close / self._ref - 1
             self._why = (f"Close {close:,.6g} is {move:+.2%} from the {self._ref:,.6g} close it sold on, past the "
                          f"{c.dip:.1%} dip (the short leg's take-profit)", {"exit_close": self._ref, "move": move})
             self._side, self._ref = 1, close
         return self._side
+
+    def conditions(self, side: int, price: float | None = None) -> list[Condition]:
+        """The rule target_side() applies for `side` at this close (the forming candle's price, or the
+        latest one): on that leg, the move that ends it; on the other, the same move, which opens this side
+        on the same close. Before the first bar, the cycle starts with a buy."""
+        c = self.c
+        if self._side is None:
+            if side == 1:
+                return [Condition("Buys on the first bar of the cycle", None, 0.0, ">=", True, "%",
+                                  note="start of the cycle")]
+            return [Condition(f"Close {c.rise:.1%} above the first buy's close", None, round(c.rise * 100, 6), ">=",
+                              False, "%", note="the cycle starts with a buy")]
+        close = price if price is not None else self._last_close
+        if not close or not self._ref:
+            return []
+        leg, move = self._side, round((close / self._ref - 1) * 100, 6)
+        met = self._leg_ends(leg, close)
+        if leg == 1:
+            span = 2 * c.rise * 100
+            name = (f"Close {c.rise:.1%} above the entry close" if side == 1 else
+                    f"Close {c.rise:.1%} above the long's entry close")
+            note = (f"bought on the {self._ref:,.6g} close" if side == 1 else
+                    "the long is sold and the short opened on the same close")
+            return [Condition(name, move, round(c.rise * 100, 6), ">=", met, "%", -span, span, exit=side == 1,
+                              note=note)]
+        span = 2 * c.dip * 100
+        name = (f"Close {c.dip:.1%} below the short's entry close" if side == -1 else
+                f"Close {c.dip:.1%} below the close it sold on")
+        note = ("the short leg's take-profit" if side == -1 else f"sold on the {self._ref:,.6g} close")
+        return [Condition(name, move, round(-c.dip * 100, 6), "<=", met, "%", -span, span, exit=side == -1,
+                          note=note)]
 
     def want_side(self, bar: Bar) -> int | None:
         # A perpetual: the short leg is a short (held flat unless allow_short).

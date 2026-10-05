@@ -1,0 +1,60 @@
+{# The strategy page's Signals tab: the model's own rules for each side, lit by the forming candle. Display only.
+   Built from one dict (app.py _signals_view) so it slots into any tab set: signals_tab() goes in the tab row,
+   signals_panel() is the tab's panel with its own live region. #}
+
+{% macro signals_tab(sig) -%}
+<a href="#signals" role="tab" data-tab="signals">Signals<span class="sig-tab-lights" data-live="sig-tab"{% if sig.lights %} role="img" aria-label="Long side: {{ sig.lights|select|list|length }} of {{ sig.lights|length }} met"{% endif %}>{% for on in sig.lights %}<i class="sig-lamp {{ 'on' if on else 'off' }}"></i>{% endfor %}</span></a>
+{%- endmacro %}
+
+{# A stop or target not hit reads neutral, not red: nothing is wrong until it is. #}
+{% macro _rule(r, guard=False) -%}
+{% set lamp = ('hit' if r.met else 'idle') if guard else ('on' if r.met else 'off') %}
+<div class="sig-rule">
+  <span class="sig-lamp {{ lamp }}" role="img" aria-label="{{ ('Hit' if r.met else 'Not hit') if guard else ('Met' if r.met else 'Not met') }}"></span>
+  <div class="sig-name">{{ r.name }}{% if r.note %}<small>{{ r.note }}</small>{% endif %}</div>
+  <div class="sig-val">{{ r.value }}<small class="{{ ('loss' if r.met else '') if guard else ('gain' if r.met else 'loss') }}"><span class="sig-thr">{{ r.threshold }} · </span>{{ r.distance }}</small></div>
+  {% if r.gauge %}<div class="sig-gauge" aria-hidden="true"><i class="tr"></i><i class="zone" style="left:{{ r.gauge.zone_left }}%;width:{{ r.gauge.zone_width }}%"></i><i class="tick" style="left:{{ r.gauge.tick }}%"></i><i class="dot {{ lamp }}" style="left:{{ r.gauge.dot }}%"></i></div>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro signals_panel(sig) -%}
+<div class="tab-panel" id="tab-signals" role="tabpanel" data-panel="signals">
+<div data-live="signals">
+{% if not sig.supported %}
+  <section class="panel sig-empty"><p class="muted">This model doesn't list its conditions yet.</p></section>
+{% elif sig.state == 'stopped' %}
+  <section class="panel sig-empty"><p class="muted">The strategy is stopped. The lights show while it runs.</p></section>
+{% elif sig.state != 'live' %}
+  <section class="panel sig-empty"><p><strong>Waiting for the model.</strong> <span class="muted">{% if sig.age %}Its last reading came {{ sig.age }}; the lights show again once the strategy's process sends a fresh one.{% else %}The strategy's process hasn't sent its conditions yet.{% endif %}</span></p></section>
+{% else %}
+  <div class="sig-board">
+  {% for c in sig.cards %}
+    <section class="panel sig-card sig-{{ c.key }}{% if c.flat %} is-flat{% endif %}" aria-labelledby="sig-{{ c.key }}-h">
+      <div class="sig-head"><h2 id="sig-{{ c.key }}-h">{{ c.label }}{% if c.exit %} <span class="faint">· Exit conditions</span>{% endif %}</h2>
+        {% if c.flat %}<span class="sig-state">{{ c.flat }}</span>
+        {% elif c.total %}<span class="sig-state{{ ' ready' if c.all }}">{% if c.all %}All met · acts at close{% else %}{{ c.met }} of {{ c.total }} met{% endif %}</span>{% endif %}</div>
+      {% if not c.flat %}
+        {% if not c.rows %}<p class="muted sig-note">The model's indicators are still settling; its rules show once they can be read.</p>{% endif %}
+        {% for r in c.rows %}{{ _rule(r) }}{% endfor %}
+        {% if c.guards %}<h3 class="sig-sub">Stop and target <span class="faint">· either one exits at once</span></h3>
+          {% for r in c.guards %}{{ _rule(r, guard=True) }}{% endfor %}{% endif %}
+      {% endif %}
+    </section>
+  {% endfor %}
+  </div>
+  <p class="sig-timing">Lights are live · model acts at the {{ sig.every }} close in <b data-close-at="{{ sig.close_at }}">{{ sig.close_in }}</b> <span class="faint">· reading {{ sig.age }}</span></p>
+{% endif %}
+</div>
+</div>
+<script>
+// The countdown to the model's next close ticks each second between live updates.
+(() => {
+  const pad = (n) => String(n).padStart(2, "0");
+  setInterval(() => document.querySelectorAll("[data-close-at]").forEach((el) => {
+    const left = Math.max(0, Math.floor((Number(el.dataset.closeAt) - Date.now()) / 1000));
+    el.textContent = left >= 3600 ? `${Math.floor(left / 3600)}:${pad(Math.floor(left / 60) % 60)}:${pad(left % 60)}`
+      : `${pad(Math.floor(left / 60))}:${pad(left % 60)}`;
+  }), 1000);
+})();
+</script>
+{%- endmacro %}

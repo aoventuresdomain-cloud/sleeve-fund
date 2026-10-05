@@ -29,18 +29,13 @@
     </nav>
     {# Everything else: listed in the rail on wider screens, in the More sheet on phones. #}
     <nav class="secondary" aria-label="More">
-      <div class="group">Risk and operations</div>
-      <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') }}>{{ icon('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>') }}<span>Risk</span></a>
-      <a href="/ops" {{ 'aria-current=page' if here.startswith('/ops') }}>{{ icon('<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>') }}<span>Operations</span></a>
       <div class="group">Research</div>
+      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>{{ icon('<path d="M9 3h6M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3"/><path d="M7 15h10"/>') }}<span>Development</span></a>
       <a href="/backtest" {{ 'aria-current=page' if here.startswith('/backtest') }}>{{ icon('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>') }}<span>Backtest</span></a>
-      <a href="/research" {{ 'aria-current=page' if here.startswith('/research') or here.startswith('/strategies') }}>{{ icon('<path d="M9 3h6M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3"/><path d="M7 15h10"/>') }}<span>Models</span></a>
-      <div class="group">Records</div>
-      <a href="/decisions" {{ 'aria-current=page' if here.startswith('/decisions') }}>{{ icon('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 15l2 2 4-4"/>') }}<span>Decisions</span></a>
-      <a href="/reports" {{ 'aria-current=page' if here.startswith('/reports') }}>{{ icon('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>') }}<span>Reports</span></a>
-      <div class="group">Setup</div>
-      <a href="/accounts" {{ 'aria-current=page' if here.startswith('/accounts') }}>{{ icon('<path d="M3 21h18M5 21V10M19 21V10M9 21V10M15 21V10M2 10l10-7 10 7z"/>') }}<span>Accounts</span></a>
-      <a href="/settings" {{ 'aria-current=page' if here.startswith('/settings') }}>{{ icon('<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>') }}<span>Settings</span></a>
+      <div class="group">Desk</div>
+      <a href="/risk" {{ 'aria-current=page' if here.startswith('/risk') or here.startswith('/ops') }}>{{ icon('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>') }}<span>Risk &amp; health</span></a>
+      <a href="/records" {{ 'aria-current=page' if here.startswith('/records') or here.startswith('/decisions') or here.startswith('/reports') }}>{{ icon('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 15l2 2 4-4"/>') }}<span>Records</span></a>
+      <a href="/setup" {{ 'aria-current=page' if here.startswith('/setup') or here.startswith('/accounts') or here.startswith('/settings') }}>{{ icon('<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>') }}<span>Setup</span></a>
     </nav>
     <div class="rail-foot">
       <div class="meta">Version {{ shell.version }}</div>

@@ -1,6 +1,54 @@
 {% extends "base.html" %}
-{% block title %}{{ title }} · Multi-Strategy Fund{% endblock %}
+{% block title %}{{ s.label if s.strategy else title }} · Multi-Strategy Fund{% endblock %}
 {% block content %}
-<p style="margin:0 0 10px"><a href="/research">Research</a> <span class="faint">/</span> <span class="muted">{{ title|replace('_', ' ') }}</span> <a class="button secondary" style="float:right" href="/research/{{ title }}/download" download>Download tear sheet</a></p>
+<div class="page-head result-head">
+  <div>
+    <p class="crumb"><a href="/research#results">Results</a> <span class="faint">›</span></p>
+    <h1>{% if s.strategy %}{{ [s.label, s.instrument, candle_words(s.minutes)|lower ~ ' candles' if s.minutes else none]|select|join(' · ') }}{% else %}{{ title|replace('_', ' ') }}{% endif %}</h1>
+    <p class="lede">{{ [s.venue_label, s.when.strftime('%d %b %Y %H:%M') ~ ' UTC']|select|join(' · ') }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data: proves the pipeline, not the idea</span>{% endif %}</p>
+  </div>
+  <div class="actions"><a class="button secondary" href="/research/{{ title }}/download" download>Download tear sheet</a></div>
+</div>
+
+<section class="verdict {{ s.tone }}" aria-label="Verdict">
+  <span class="big">{{ s.word }}</span>
+  <p>{{ banner }}</p>
+  <span class="chip {{ s.tone }}">{{ {'PASS': 'G1 passed', 'FAIL': 'G1 failed'}.get(s.g1, 'G1 not judged') }}</span>
+</section>
+
+<section class="ledger result-figures" aria-label="Key figures">
+  <div><div class="k">Break-even fee</div>
+    <div class="v{% if s.breakeven is not none and s.fee is not none %} {{ 'loss' if s.breakeven < s.fee else 'gain' }}{% endif %}">{{ breakeven }}</div>
+    <div class="s">{% if s.fee is not none %}kill line {{ '%.2f'|format(s.fee * 100) }}%, the venue's fee{% else %}per side{% endif %}</div></div>
+  <div><div class="k">Return, out of sample</div>
+    {% set r = s.get('oos_cagr') %}<div class="v{% if r %} {{ 'loss' if r.startswith('-') else 'gain' if r.startswith('+') and r != '+0.0%' }}{% endif %}">{{ r or '–' }}</div>
+    <div class="s">a year{% if s.fee is not none %}, at the {{ '%.2f'|format(s.fee * 100) }}% fee{% endif %}{% if s.get('bench_cagr') %}; buy-and-hold {{ s.bench_cagr }}{% endif %}</div></div>
+  <div><div class="k">Sharpe vs buy-and-hold</div>
+    <div class="v">{% if s.get('oos_sharpe') %}{{ s.oos_sharpe }} <span class="faint">/</span> {{ s.bench_sharpe }}{% else %}–{% endif %}</div>
+    <div class="s">risk-adjusted return, out of sample</div></div>
+  <div><div class="k">Trades</div>
+    <div class="v">{{ '{:,}'.format(s.oos_trades) if s.oos_trades is not none else '–' }}</div>
+    <div class="s">out of sample{% if per_day %}, {{ per_day }}{% endif %}</div></div>
+</section>
+
+<div class="result-grid{% if not s.means %} solo{% endif %}">
+  <section class="panel ladder" aria-labelledby="ladder-h">
+    <div class="panel-head"><h2 id="ladder-h">Cost ladder</h2><span class="hint">return over the research period at each fee per side</span></div>
+    {% if chart %}
+    <svg viewBox="0 0 {{ chart.w }} {{ chart.h }}" role="img" aria-label="Return at each fee per side: {% for b in chart.bars %}{{ b.fee }} {{ b.value }}{{ '; ' if not loop.last }}{% endfor %}">
+      {% for t in chart.ticks %}<line x1="{{ chart.left }}" x2="{{ chart.right }}" y1="{{ t.y }}" y2="{{ t.y }}" class="{{ 'zero' if t.label == '0%' else 'grid' }}"/>
+      <text x="{{ chart.left - 6 }}" y="{{ t.y + 3.5 }}" text-anchor="end" class="tick">{{ t.label }}</text>{% endfor %}
+      {% for b in chart.bars %}<rect x="{{ b.x }}" y="{{ b.y }}" width="{{ b.w }}" height="{{ b.h }}" rx="3" class="{{ 'gain' if b.gain else 'loss' }}{{ ' cut' if b.cut }}"/>
+      <text x="{{ b.cx }}" y="{{ b.ly }}" text-anchor="middle" class="val">{{ b.value }}</text>
+      <text x="{{ b.cx }}" y="{{ chart.base }}" text-anchor="middle" class="fee{{ ' here' if b.here }}">{{ b.fee }}{{ ' ★' if b.here }}</text>{% endfor %}
+      {% if chart.marker %}<line x1="{{ chart.marker }}" x2="{{ chart.marker }}" y1="{{ chart.marker_top }}" y2="{{ chart.base - 12 }}" class="marker"/>
+      <text x="{{ chart.marker }}" y="{{ chart.marker_top - 2 }}" text-anchor="middle" class="fee here">★ {{ '%.2f'|format(s.fee * 100) }}%</text>{% endif %}
+    </svg>
+    <p class="hint">★ {{ s.venue_label or "the venue" }}'s own fee{% if s.fee is not none %}, {{ '%.2f'|format(s.fee * 100) }}% per side{% endif %}.{% if s.slippage is not none %} Every rung also pays half the bid-ask spread plus {{ '%.2f'|format(s.slippage * 100) }}% slippage on orders that take liquidity.{% endif %}{% if chart.bars|selectattr('cut')|list %} A bar cut short runs off the scale; its label gives the full figure.{% endif %}</p>
+    {% else %}<p class="muted">This tear sheet has no cost ladder: it was written before every study ran one.</p>{% endif %}
+  </section>
+  {% if s.means %}<section class="panel means" aria-labelledby="means-h"><div class="panel-head"><h2 id="means-h">What it means</h2></div>{{ s.means|safe }}</section>{% endif %}
+</div>
+
 <article class="panel md">{{ body|safe }}</article>
 {% endblock %}
