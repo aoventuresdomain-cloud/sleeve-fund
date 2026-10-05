@@ -789,6 +789,46 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
+def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path):
+    """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
+    read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
+    dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
+    account text. Wiped out is a state: marked at zero, halted with the reason, through a resume and a restart."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+
+    store, name, params = Store.in_memory(), "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    gap = tmp_path / "gap.jsonl.gz"
+    _record(gap, _meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, then +60%
+    orders = replay(gap, store=store)
+    assert orders[-1]["intent"] == "liquidation" and orders[-1]["side"] == "BUY"
+    covered = store.insurance_total(name)
+    assert covered > 0
+    s = store.sleeve(name)
+    assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
+    last = store.equity_series(name)[-1]
+    assert (last["equity"], last["qty"]) == (0.0, 0.0)  # the book counts it at zero, not its last mark
+    book = store.journal_book(name, 10_000)
+    assert book["qty"] == 0 and book["cash"] == pytest.approx(0, abs=0.01)
+    assert "mark_unavailable" not in {e["kind"] for e in store.events(name, limit=500)}
+
+    # The PM resumes it and the process restarts: still nothing to trade, so it halts again, at zero.
+    store.command(name, "resume", "try again")
+    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+    seen = len(store.equity_series(name))
+    restart = tmp_path / "restart.jsonl.gz"
+    _record(restart, _meta(book["cash"], params), [(5, 0.0)], px=97_440.0)
+    assert len(replay(restart, store=store)) == len(orders)  # no new order
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
+    marks = store.equity_series(name)[seen:]
+    assert marks and all((m["equity"], m["qty"]) == (0.0, 0.0) for m in marks)
+    events = store.events(name, limit=500)
+    assert "mark_unavailable" not in {e["kind"] for e in events}
+    assert [e["kind"] for e in events].count("risk_halt") == 2
+
+
 def test_a_restart_holding_a_perp_settles_the_funding_it_was_down_for(tmp_path):
     """Funding owed while the process was down is settled on the first tick: from the last fill or funding
     payment, not from the restart. A short opened at 15:00 and restarted at midnight owes 16:00 and 00:00."""

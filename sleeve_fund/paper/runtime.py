@@ -171,11 +171,13 @@ class SleeveRuntime:
     # --- periodic tick ----------------------------------------------------------
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
-             guard_equity: float | None = None, busy: bool = False) -> str | None:
+             guard_equity: float | None = None, busy: bool = False, ruined: str | None = None) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
         a perp), which the guard judges by when lower; the mark is still this tick's equity.
-        busy: the strategy has an order working, so a flatten still owed waits for it rather than send another."""
+        busy: the strategy has an order working, so a flatten still owed waits for it rather than send another.
+        ruined: why the strategy has nothing left (a gap past the bankruptcy price took its equity to zero): it
+        halts, from running or paused, and flattens whatever is still open."""
         now = self.now()
         self.store.heartbeat(self.name)
         if self.progress is not None:
@@ -207,7 +209,15 @@ class SleeveRuntime:
 
         flatten = False
         self.flatten_why = None
-        if self.status == "running":
+        if ruined and self.status != "halted":
+            self._set("halted", ruined)
+            held = abs(qty) >= max(self.close_floor, 1e-12)  # still open: past its liquidation price
+            self.store.event(self.name, "error", "risk_halt",
+                             ruined + ("; flattened" if held else "; nothing left to trade") + ", PM must resume",
+                             ts=self.now())
+            if held:
+                flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
+        elif self.status == "running":
             judged = min(equity, guard_equity) if guard_equity is not None else equity
             breach = risk.check(self.profile, judged, self.peak, self._day_open)
             if breach and breach.action == "halt":
