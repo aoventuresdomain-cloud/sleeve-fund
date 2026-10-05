@@ -373,3 +373,49 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
         expected.update_raw(b.close.as_double())
     assert s.rsi.initialized and s.rsi.value == pytest.approx(expected.value) and s.rsi.value >= 55
     assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later
+
+
+def test_two_strategies_whose_names_end_alike_journal_their_orders_sent_in_the_same_second():
+    """Order ids carry only the last part of the trader and strategy ids. ping-pong-test and rsi-bands-test both
+    gave O-<second>-TEST-TEST-<n>, so the second order sent in a second broke the journal's unique order id (as
+    ping-pong-ls-binance and rsi-bands-ls-binance could after each deploy). The strategy's part is now a hash of
+    its full name, so each strategy's ids are its own; journal rows already written are untouched."""
+    from sqlalchemy.exc import IntegrityError
+    from nautilus_trader.common import Clock, OrderFactory
+    from nautilus_trader.model import StrategyId, TraderId
+
+    from sleeve_fund.paper.node import _tag, strategy_id
+    from sleeve_fund.store import Store
+
+    def first_orders(make_id, names):
+        clock = Clock.new_test()  # one instant for every strategy: their orders go out in the same second
+        return [str(OrderFactory(TraderId.from_str(f"PAPER-{_tag(n)[:20]}"), make_id(cls, n), clock)
+                    .generate_client_order_id()) for cls, n in names]
+
+    names = [("PingPong", "ping-pong-test"), ("RsiBands", "rsi-bands-test"), ("RsiBands", "rsi-bands-tes-t")]
+    old = first_orders(lambda cls, n: StrategyId.from_str(f"{cls}-{_tag(n)[:20]}"), names[:2])
+    assert old[0] == old[1]  # the clash, as the stack test met it
+    store = Store.in_memory()
+    store.record_order("ping-pong-test", order_id=old[0], side="BUY", qty=0.1, intent="entry", reason="")
+    new = first_orders(strategy_id, names)
+    assert len(set(new)) == 3  # a hash of the whole name: "tes-t" and "test" differ too
+    for (_, n), coid in zip(names, new):
+        store.record_order(n, order_id=coid, side="BUY", qty=0.1, intent="entry", reason="")
+    assert {o["order_id"] for o in store.orders(limit=10)} == {old[0], *new}  # the old row is kept as it was
+    with pytest.raises(IntegrityError):  # the journal still refuses a repeated id
+        store.record_order("rsi-bands-test", order_id=old[0], side="BUY", qty=0.1, intent="entry", reason="")
+
+
+def test_the_paper_node_names_its_strategy_with_the_hashed_id(monkeypatch):
+    import sleeve_fund.paper.node as node_mod
+
+    made = []
+    real = node_mod.strategy_id
+    monkeypatch.setattr(node_mod, "strategy_id", lambda cls, name: made.append(real(cls, name)) or made[-1])
+    for k in list(__import__("os").environ):
+        if k.upper().startswith("KRAKEN_"):
+            monkeypatch.delenv(k)
+    node = build_node(_sleeve(name="rsi-bands-test"), log_level="ERROR", asset_fetch=dict)
+    node.dispose()
+    assert [str(i) for i in made] == [str(real("TrendFilter", "rsi-bands-test"))]
+    assert str(made[0]).startswith("TrendFilter-RSI-BANDS-TEST-") and len(str(made[0]).rsplit("-", 1)[1]) == 8
