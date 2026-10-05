@@ -190,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         quote = resolve(getattr(row, "venue", None), store)
         sleeve = from_store(row, fee_schedule=quote.fees)
         runtime = SleeveRuntime(store, sleeve.name)
-        perp = markets.terms(sleeve.params)
+        perp = markets.terms(sleeve.params, sleeve.venue)
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
                     f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "
                     "live prices; funding every 8 hours from our own ledger")

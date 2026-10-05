@@ -34,6 +34,9 @@ class PerpTerms:
     funding_rate: float  # per funding interval, as a share of the position's value: longs pay, shorts receive
     funding_hours: tuple[int, ...]  # UTC hours funding is exchanged at
     maintenance_margin: float  # share of the position's value the account must keep, or it is liquidated
+    # The venue whose settled funding rates are charged (sleeve_fund.funding); None charges funding_rate. With a
+    # venue, funding_rate is only the fallback for a settlement the venue's records don't have.
+    funding_venue: str | None = None
 
 
 # Published rates of the large perp venues' entry tiers (0.02% maker, 0.05% taker), a tight BTC book
@@ -55,19 +58,49 @@ def is_perp(params: dict | None) -> bool:
     return market_of(params) != SPOT
 
 
-def terms(params: dict | None) -> PerpTerms | None:
+def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
+    """What the strategy's market costs and risks. On a venue that lists perpetuals (sleeve_fund.venues), the
+    perp market is that venue's own: its fees, spread and settled funding. Elsewhere a perp is simulated on
+    the venue's spot prices at a low-fee perp venue's published rates."""
     m = market_of(params)
-    return None if m == SPOT else LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
+    if m == SPOT:
+        return None
+    if venue is not None:
+        from sleeve_fund.venues import venue as venue_profile
+
+        profile = venue_profile(venue)
+        if profile.perpetual:
+            if m != PERP:
+                raise ValueError(f"{profile.label} trades its own perpetuals: choose the perp market")
+            return native_terms(profile)
+    return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
 
-def fees_for(params: dict | None, venue_fees: FeeSchedule) -> FeeSchedule:
+def native_terms(profile) -> PerpTerms:
+    """A perpetual venue's own terms: its fee schedule and spread (None: the venue's), the funding it settles,
+    and a 0.5% maintenance margin, cautious for BTC and ETH (0.4% at the smallest tier), light for small
+    instruments (sleeve_fund.risk keeps the stop well inside liquidation either way)."""
+    return PerpTerms(profile.label, None, None, LOW_FEE_PERP.funding_rate, profile.funding_hours,
+                     LOW_FEE_PERP.maintenance_margin, funding_venue=profile.name)
+
+
+def check_venue(params: dict | None, venue: str) -> None:
+    """Raises ValueError when the market can't trade on the venue: a perpetual venue has no spot."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    if profile.perpetual and market_of(params) != PERP:
+        raise ValueError(f"{profile.label} lists perpetuals only: set market = \"perp\"")
+
+
+def fees_for(params: dict | None, venue_fees: FeeSchedule, venue: str | None = None) -> FeeSchedule:
     """The fee schedule a strategy pays: its market's, or the venue's."""
-    t = terms(params)
+    t = terms(params, venue)
     return t.fees if t is not None and t.fees is not None else venue_fees
 
 
-def half_spread_for(params: dict | None, venue_half_spread: float) -> float:
-    t = terms(params)
+def half_spread_for(params: dict | None, venue_half_spread: float, venue: str | None = None) -> float:
+    t = terms(params, venue)
     return t.half_spread if t is not None and t.half_spread is not None else venue_half_spread
 
 

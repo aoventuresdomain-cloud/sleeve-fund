@@ -79,7 +79,8 @@ def test_engine_code_names_no_venue():
     venues.py (and the venue's own data loaders) may name a venue."""
     paths = [*(ROOT / "sleeve_fund" / "strategies").glob("*.py"), *(ROOT / "sleeve_fund" / "research").glob("*.py"),
              *(ROOT / "sleeve_fund" / "paper").glob("*.py"), ROOT / "sleeve_fund" / "dashboard" / "preview.py",
-             ROOT / "sleeve_fund" / "dashboard" / "charts.py", ROOT / "sleeve_fund" / "instruments.py"]
-    offenders = [p.name for p in paths if re.search(r"kraken", p.read_text(), re.I)]
+             ROOT / "sleeve_fund" / "dashboard" / "charts.py", ROOT / "sleeve_fund" / "instruments.py",
+             ROOT / "sleeve_fund" / "markets.py", ROOT / "sleeve_fund" / "funding.py"]
+    offenders = [p.name for p in paths if re.search(r"kraken|binance", p.read_text(), re.I)]
     # safety.py lists venue credential prefixes so it can refuse any of them; that is the point of it.
     assert offenders == ["safety.py"]

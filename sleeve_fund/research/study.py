@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
-from sleeve_fund.instruments import FeeSchedule
+from sleeve_fund.instruments import FeeSchedule, pair_of
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -302,7 +302,7 @@ def run_study(
 
     # The cost ladder: the default params over the research period at each fee. Not logged as variants, since
     # the strategy is the same; only what it pays changes.
-    ladder, slip = [], ladder_slippage(f"{instrument.base_currency.code}/{instrument.quote_currency.code}")
+    ladder, slip = [], ladder_slippage(pair_of(instrument))
     for fee in COST_LADDER:
         res = bt(spec.name, research, default_params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
                  slippage=slip)
@@ -363,7 +363,7 @@ def run_study(
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
-        instrument=str(instrument.id.symbol),
+        instrument=pair_of(instrument),
         bar_minutes=minutes,
         venue=str(instrument.id.venue),
         risk_profile=risk_profile,

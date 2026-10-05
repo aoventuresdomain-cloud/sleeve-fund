@@ -31,7 +31,7 @@ from nautilus_trader.trading import Strategy
 
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
-from sleeve_fund.instruments import BOOK_SHARE, lot_decimals
+from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
 from sleeve_fund.strategies.indicators import Atr
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -290,7 +290,7 @@ class LongFlatConfig(StrategyConfig):
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
         self.allow_short = bool(allow_short)
-        self.perp = markets.terms({"market": market})
+        self.perp = markets.terms({"market": market}, str(instrument_id.venue))
         # Read by the Deribit testnet demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
 
@@ -349,6 +349,7 @@ class LongFlatStrategy(Strategy):
         self._restore_id: str | None = None
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
+        self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
         self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
         # (time, amount) for every shortfall the venue's insurance fund took past the bankruptcy price
         self.insurance_log: list[tuple] = []
@@ -1572,16 +1573,56 @@ class LongFlatStrategy(Strategy):
         if qty == 0:
             return
         for ts in markets.funding_times(since, now, terms.funding_hours):
-            amount = -qty * price * terms.funding_rate
+            rate = self._funding_rate(terms, ts, now)
+            if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
+                self._funding_since = ts - timedelta(seconds=1)
+                return
+            amount = -qty * price * rate
             self._cash_adj += amount
             self.funding_log.append((ts, amount))
             if self.runtime is not None:
-                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=price, rate=terms.funding_rate,
+                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=price, rate=rate,
                                                   amount=round(amount, 8), ts=ts)
                 self.runtime.store.event(self.runtime.name, "info", "funding",
                                          f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
-                                         f"{price:,.6g} ({terms.funding_rate:.4%})", ts=ts)
+                                         f"{price:,.6g} ({rate:.4%})", ts=ts)
+
+    # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
+    FUNDING_WAIT = timedelta(minutes=15)
+
+    def _funding_rate(self, terms, ts, now) -> float | None:
+        """The rate settled at `ts`: the venue's own where its terms name one (sleeve_fund.funding), else the
+        terms' fixed rate. A settlement the venue's records lack is charged the fixed rate as a fallback, said
+        once per run; paper first waits FUNDING_WAIT for the venue to publish it (None: not yet)."""
+        if terms.funding_venue is None:
+            return terms.funding_rate
+        import pandas as pd
+
+        from sleeve_fund import funding
+
+        pair = pair_of(self.instrument)
+        when = pd.Timestamp(ts)
+        series = funding.rates(terms.funding_venue, pair)
+        rate = funding.rate_at(series, when)
+        if rate is None and not self._backtest:
+            # Paper asks the venue directly (the history service keeps the store, which paper only reads).
+            try:
+                rate = funding.rate_at(funding.fetch(terms.funding_venue, pair, when - funding.MATCH), when)
+            except Exception as exc:  # noqa: BLE001 - the venue unreachable: wait, then the fallback
+                self.log.warning(f"funding rates unavailable: {exc!r}")
+            if rate is None and now - ts < self.FUNDING_WAIT:
+                return None
+        if rate is None:
+            if not self._funding_fallback_said:
+                self._funding_fallback_said = True
+                if self.runtime is not None:
+                    self.runtime.store.event(self.runtime.name, "warning", "funding_fallback",
+                                             f"No settled funding rate from {terms.label} for {pair} at {when:%d %b %Y %H:%M} "
+                                             f"UTC; charged the {terms.funding_rate:.4%} baseline instead (said once)",
+                                             ts=ts)
+            return terms.funding_rate
+        return rate
 
     def _risk_level(self) -> tuple[float, str] | None:
         """Backtest on a perp: the nearest price, from here, at which the risk guard or the liquidation cut
@@ -1809,7 +1850,7 @@ class LongFlatStrategy(Strategy):
 
     def _codes(self, side: str) -> set[str]:
         """Currency codes for one side of the pair: the venue's (e.g. ZUSD) and the plain one (USD)."""
-        base, quote = str(self._cfg.instrument_id.symbol).split("/")
+        base, quote = pair_of(self.instrument).split("/")
         cur = self.instrument.base_currency if side == "base" else self.instrument.quote_currency
         return {str(cur.code), base if side == "base" else quote}
 
