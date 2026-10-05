@@ -890,3 +890,24 @@ def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkey
     assert d["benchmark"][0] == pytest.approx(5000 * (1 - taker), abs=0.01)
     held = 5000 * (1 - taker) * bars["close"].iloc[-1] / bars["close"].iloc[0]
     assert d["benchmark"][-1] == pytest.approx(held, rel=1e-6)
+
+
+def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F811
+    """Round 12, M12-U2: the tile took the largest signed share, so a big short (a negative share) read as
+    nothing and a small long elsewhere was shown as the book's concentration."""
+    from sleeve_fund.dashboard.riskops import largest_asset
+    from test_dashboard import AUTH
+
+    # A short-only book: its one short is the concentration, by its size.
+    only = largest_asset([{"name": "BTC short", "value": -20_825.0}, {"name": "Cash", "value": 60_000.0}], 39_175.0)
+    assert only["name"] == "BTC" and only["share"] == pytest.approx(20_825 / 39_175)
+    assert only["net_share"] == pytest.approx(-20_825 / 39_175)
+    c, store = client
+    for name, qty, px in (("short-a", -0.05, 60_000.0), ("short-b", -1.0, 3_000.0), ("long-c", 0.02, 60_000.0)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="ETH/USD" if px == 3_000 else "BTC/USD",
+                            bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                            params={"rise": 0.01, "dip": 0.005, **PERP})
+        store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
+    # BTC: a 3,000 short and a 1,200 long, 4,200 gross (14% of 30,000), -1,800 net (-6%); ETH: a 3,000 short.
+    tile = c.get("/risk", auth=AUTH).text.split("Largest asset")[1].split("</div></div>")[0]
+    assert "BTC 14%" in tile and "net" in tile and "6%" in tile, tile
