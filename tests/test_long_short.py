@@ -390,11 +390,18 @@ def test_every_perp_exit_leaves_the_book_flat_and_every_entry_rests_its_stop(pri
     assert stops >= opened - 1, (stops, opened)
 
 
+def _gapped(prices, closes):
+    """Bars that each open at their own close: a change between bars is a gap no order can trade inside."""
+    feed = _path(prices, closes)
+    feed["open"] = feed["high"] = feed["low"] = feed["close"]
+    return feed
+
+
 def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(prices, instrument):
     """Review round 11, M11-3: the liquidation close never traded (its intent wasn't journaled), so the
     short stayed open past liquidation. Shorted at 101.5, a gap to 160 is through any capped leverage."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 160.0, 160.0, 160.0]
-    res = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
     assert not res.handler_errors, res.handler_errors
     fills = res.fills.sort_values("ts_last", kind="stable")
     intents = [res.decisions[o]["intent"] for o in fills.index]
@@ -703,7 +710,7 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     isolated margin the venue's insurance fund takes the rest: equity ends at zero, not below, and the trade's
     P&L (after fees, funding and the insurance fund) is the margin lost, as equity says."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
-    res = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
     assert res.insurance and res.insurance[0]["amount"] > 0
     assert res.equity.min() >= 0 and res.equity.iloc[-1] < 0.05
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
@@ -711,3 +718,24 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
     assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(0, abs=0.05)
+
+
+def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(prices, instrument):
+    """Coordinator, 4 Oct: a wick through the daily-loss level that recovers inside the bar paused the
+    strategy, but its buy-back filled at the bar's close, kinder than paper by the wick. A reduce-only stop
+    now rests at the level the guard acts at, so the exit fills there, as paper's does on the breaching trade."""
+    closes = [100.0, 100.0, 100.0, 100.0]
+    feed = _path(prices, closes)
+    feed.iloc[2, feed.columns.get_loc("low")] = 90.0  # a wick 10% down, back to 100 by the close
+    res = run_backtest("ping_pong", feed, instrument, {**PERP, "rise": 0.4, "dip": 0.4}, half_spread=0,
+                       risk_profile="balanced")
+    orders = sorted(res.journal.orders_.values(), key=lambda o: o["id"])
+    assert [o["intent"] for o in orders][:2] == ["entry", "risk_pause"], orders
+    exit_ = orders[1]
+    assert "Risk stop" in exit_["reason"] and exit_["order_type"] == "STOP"
+    # Balanced: 2x, a 5% daily loss, so the level is about 2.5% under the entry, far above the 90 low.
+    assert 97.0 < exit_["avg_px"] < 98.0, exit_
+    buy, sell = res.journal.fills_[:2]
+    loss = buy["qty"] * (buy["price"] - sell["price"]) + buy["fee"] + sell["fee"]
+    # The 5% daily loss, plus the exit's fee and a day's funding: not the 20% the wick reached.
+    assert res.starting_capital * 0.05 <= loss <= res.starting_capital * 0.053

@@ -6,6 +6,8 @@ so the benchmark and the strategy are measured identically.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -270,7 +272,7 @@ def _perp_mark_to_market(
         before = [(c, q) for t, c, q in flows if t <= ts]
         cash_now, qty_now = opening_cash + sum(c for c, _ in before), sum(q for _, q in before)
         if cash_now < 0 and abs(qty_now) < 1e-9:  # flat: equity is cash
-            flows.append((ts, -cash_now, 0.0))
+            flows.append((ts, math.ceil(-cash_now * 100) / 100, 0.0))  # to the cent, as the strategy books it
     if not flows:
         return (pd.Series(opening_cash, index=idx).rename("equity"),
                 pd.Series(0.0, index=idx).rename("exposure"))

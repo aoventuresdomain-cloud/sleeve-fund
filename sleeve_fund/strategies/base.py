@@ -355,6 +355,9 @@ class LongFlatStrategy(Strategy):
         # and that price when it went through the liquidation price.
         self._guard_equity: float | None = None
         self._guard_price: float | None = None
+        # Backtest on a perp: the reduce-only stop resting at the price the risk guard would act at
+        # (_rest_risk_stop), so a risk exit fills where it was judged, as a stop-loss does.
+        self._risk_stop_id: str | None = None
         # This position's stop and target as shares of the entry price, fixed when it was entered
         # (from the % settings, or from the market for an ATR or swing-low stop); None when flat.
         self._stop_frac: float | None = None
@@ -561,6 +564,7 @@ class LongFlatStrategy(Strategy):
             self._intrabar_guard(bar)
         if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
             self._on_tick()
+        self._rest_risk_stop()
 
     def _maybe_tick(self) -> None:
         if self.runtime is None:
@@ -938,6 +942,8 @@ class LongFlatStrategy(Strategy):
             # (_on_exec_bar does it for every shorter execution bar), as paper judges every trade.
             self._intrabar_guard(bar)
         self._maybe_tick()
+        if self._exec_type is None:
+            self._rest_risk_stop()
         if self._pending_exit is not None:
             return
         if self._replan_pending is not None and self._entry_px is not None:
@@ -1571,6 +1577,129 @@ class LongFlatStrategy(Strategy):
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
                                          f"{price:,.6g} ({terms.funding_rate:.4%})", ts=ts)
 
+    def _risk_level(self) -> tuple[float, str] | None:
+        """Backtest on a perp: the nearest price, from here, at which the risk guard or the liquidation cut
+        acts on the open position, and which one: the drawdown halt (equity falls to the peak less the
+        profile's drawdown), the daily-loss pause (to the day's opening equity less its daily loss), or the
+        cut (the price within the profile's distance of liquidation). None when flat or already past."""
+        rt = self.runtime
+        equity, cash, qty, price = self._mark()
+        if qty == 0 or equity <= 0 or price <= 0:
+            return None
+        p, side = rt.profile, (1 if qty > 0 else -1)
+        peak = max(rt.peak, equity)
+        day_open = rt._day_open or equity
+        # The next bar opens a new UTC day: the day then opens at this equity (SleeveRuntime.tick).
+        step = timedelta(minutes=bar_minutes(self._exec_type or self._cfg.bar_type))
+        now = self.clock.utc_now()
+        if (now + step).date() != now.date():
+            day_open = equity
+        levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
+                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
+        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        if liq is not None:
+            d = p.min_liquidation_distance
+            levels.append((liq / (1 - d) if side > 0 else liq / (1 + d), "liquidation_cut"))
+        ahead = [(lv, k) for lv, k in levels if lv > 0 and (lv < price if side > 0 else lv > price)]
+        if not ahead:
+            return None
+        return max(ahead) if side > 0 else min(ahead)
+
+    def _rest_risk_stop(self) -> None:
+        """Backtest on a perp: keep a reduce-only stop for the whole position resting at the price the risk
+        guard would act at (_risk_level), re-priced each bar. Paper judges every trade and closes on the one
+        that breaches; judged at a minute's worst price but closed at its close, a backtest's risk exit was
+        kinder by the wick. The stop fills at its level, or at the open if the price gaps through it."""
+        if not (self._backtest and self._margin and self.runtime is not None) or self.instrument is None:
+            return
+        order = self.cache.order(ClientOrderId(self._risk_stop_id)) if self._risk_stop_id else None
+        if order is not None and order.is_closed:
+            order, self._risk_stop_id = None, None
+        want = None
+        if self.runtime.status == "running" and self._pending_exit is None and self._flip is None:
+            want = self._risk_level()
+        qty = self._position_qty().quantize(self._lot(), rounding=ROUND_HALF_EVEN)
+        if want is None or qty < self._min_qty():
+            if order is not None and order.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
+                self.cancel_order(order.client_order_id)
+            return
+        level, intent = want
+        px = Price(level, self.instrument.price_precision)
+        quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
+        _, cash, net, _ = self._mark()
+        liq = markets.liquidation_price(cash, net, self._cfg.perp.maintenance_margin)
+        if order is not None:
+            if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
+                return  # in flight: re-priced at the next bar
+            d = self.decisions.get(self._risk_stop_id, {})
+            if d.get("intent") == intent:
+                d["liq"] = liq
+                if order.trigger_price != px or order.quantity != quantity:
+                    self.modify_order(order.client_order_id, quantity=quantity, trigger_price=px)
+                return
+            self.cancel_order(order.client_order_id)  # the nearest limit changed: rest one in its name
+        side = self._pos_side()
+        exit_side, word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
+        what = {"risk_halt": "the drawdown halt", "risk_pause": "the daily-loss pause",
+                "liquidation_cut": "the cut before liquidation"}[intent]
+        if side == 0:
+            return
+        coid = self.order_factory.generate_client_order_id()
+        stop = StopMarketOrder(self.trader_id, self.strategy_id, self._cfg.instrument_id, coid, exit_side, quantity,
+                               px, TriggerType.DEFAULT, TimeInForce.GTC, True, False, UUID4(), self.clock.timestamp_ns())
+        self._risk_stop_id = str(coid)
+        # Journaled when it trades (_journal_risk_stop), at the level it traded at: re-priced every bar and
+        # cancelled whenever the position closes some other way, most risk stops never trade.
+        self.decisions[self._risk_stop_id] = {"intent": intent, "reason": f"Risk stop: {word} where {what} acts",
+                                              "signal": {"kind": intent}, "journaled": False, "liq": liq}
+        self._sent.append(coid)
+        self.submit_order(stop)
+
+    def _journal_risk_stop(self, order, price: float) -> None:
+        """Journal the risk stop on its first fill, with the level it rested at then. Filled through the
+        liquidation price (a gap past it), the venue took the position first: journaled as a liquidation,
+        as paper's guard journals one (review round 11, M11-3)."""
+        d = self.decisions.get(str(order.client_order_id))
+        if d is None or d.get("journaled", True):
+            return
+        level, intent = order.trigger_price.as_double(), d["intent"]
+        word = "sell" if order.side == OrderSide.SELL else "buy"
+        held = "long" if order.side == OrderSide.SELL else "short"
+        liq = d.get("liq")
+        if liq is not None and (price <= liq if held == "long" else price >= liq):
+            d.update(journaled=True, intent="liquidation", signal={"price": price, "liquidation_px": round(liq, 8)},
+                     reason=f"Liquidated: the price {price:,.6g} gapped through the liquidation price {liq:,.6g}")
+            self.runtime.store.event(self.runtime.name, "error", "liquidation", d["reason"], ts=self.runtime.now())
+        else:
+            what = {"risk_halt": "the drawdown halt", "risk_pause": "the daily-loss pause",
+                    "liquidation_cut": "the cut before liquidation"}[intent]
+            d.update(journaled=True, signal={"trigger": round(level, 8), "kind": intent},
+                     reason=(f"Risk stop: rested a {word} at {level:,.6g}, where {what} acts on the open {held} "
+                             "(re-priced each bar); fills at that level, or the open if the price gaps through"))
+        intent = d["intent"]
+        self.runtime.on_order(order_id=str(order.client_order_id), side=word.upper(), qty=float(order.quantity),
+                              intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP")
+
+    def _risk_stop_filled(self, done: bool, sign: int, price: float) -> None:
+        """The risk stop traded: the guard acts as paper's would on that trade. A halt or pause is the
+        runtime's to set (its tick judges the equity now); a cut locks out the side it closed. Either way
+        the stop-loss and target still resting are cancelled with what is left (_sell_all)."""
+        if not done and self._pos_side() != 0:
+            return
+        intent = self.decisions.get(self._risk_stop_id, {}).get("intent")
+        self._risk_stop_id = None
+        if intent == "liquidation":
+            self._exit_lock, self._flip = -sign, None
+            self._on_tick()  # the risk check halts on what is left
+        elif intent == "liquidation_cut":
+            self.runtime.store.event(self.runtime.name, "warning", "liquidation_cut",
+                                     f"Cut to avoid liquidation: the risk stop filled at {price:,.6g}",
+                                     ts=self.runtime.now())
+            self._exit_lock, self._flip = -sign, None
+            self._sell_all("liquidation_cut", "Cut to avoid liquidation: the rest of the position", {"price": price})
+        else:
+            self._on_tick()
+
     def _cover_shortfall(self, price: float) -> None:
         """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)
         loses the strategy's equity and no more; the venue's insurance fund takes the rest. So once flat with
@@ -1936,6 +2065,7 @@ class LongFlatStrategy(Strategy):
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
                 # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
                 self._rest_exits()
+                self._rest_risk_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 # As in paper: no re-entry until the signal has moved off the side that was closed.
                 self._exit_lock = -sign if self._margin else True
@@ -1955,10 +2085,14 @@ class LongFlatStrategy(Strategy):
                             else:
                                 self.cancel_order(order.client_order_id)
         if self.runtime is not None:
+            if coid == self._risk_stop_id and order is not None:
+                self._journal_risk_stop(order, px)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
         if self._margin and self._entry_side == 0:
             self._cover_shortfall(px)
+        if coid == self._risk_stop_id:
+            self._risk_stop_filled(done, sign, px)
         if kept_id is not None and done:
             self._slice_done(coid)
         if done:
