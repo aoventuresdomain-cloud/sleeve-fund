@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, help, pts, tag %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag %}
 {% from "_reasons.html" import reason_picker %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
@@ -8,68 +8,96 @@
   <div class="actions"><a class="button secondary" href="/sleeves/new">New strategy</a></div>
   <p class="lede">
     Paper · {{ book.sleeves }} strateg{{ 'ies' if book.sleeves != 1 else 'y' }}, {{ book.running }} running.
-    {% if book.attention %}<span class="loss">{{ book.attention }} strategy{{ 's' if book.attention != 1 }} halted and waiting for you.</span>
-    {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} strategy{{ 's' if book.unhealthy != 1 }} not reporting.</span>
+    {% if book.attention %}<span class="loss">{{ book.attention }} strateg{{ 'ies' if book.attention != 1 else 'y' }} halted and waiting for you.</span>
+    {% elif book.unhealthy %}<span class="loss">{{ book.unhealthy }} strateg{{ 'ies' if book.unhealthy != 1 else 'y' }} not reporting.</span>
     {% else %}All strategies healthy.{% endif %}
     After fees.
   </p>
 </div>
 
 {% if summaries or archived %}
-{# Nine figures for the whole book, one box each; on a phone two to a row under a full-width book equity. #}
+{# Shown only when an alert is waiting to be acknowledged: the newest one, and a link to the rest. #}
+{% if alerts %}{% set a = alerts[0] %}
+<section class="needs-you" aria-label="Needs you" data-live-forms>
+  <span class="tag">Needs you</span>
+  <span class="grow">{% if a.sleeve %}<a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>: {% endif %}{{ a.message }} <span class="when" title="{{ a.ts|ts }}">{{ a.ts|ago }}</span>{% if alerts|length > 1 %} · <a href="/alerts">{{ alerts|length - 1 }} more</a>{% endif %}</span>
+  <form method="post" action="/alerts/{{ a.id }}/ack"><input type="hidden" name="next" value="/"><button class="secondary" title="Mark as seen">Acknowledge</button></form>
+</section>
+{% endif %}
+
+{# The book in eight figures: a label and a number each, the detail on hover. #}
 {% set day_base = book.equity - book.day_pnl %}
-{% set near_halt = (summaries|map(attribute='dd_used')|max) if summaries else 0 %}
-<section class="kpis" aria-label="Book figures">
-  <div class="kpi lead"><div class="k">Book equity {{ help('equity') }}</div><div class="v">{{ book.equity|money }}</div><div class="s">from {{ book.start|money }}</div></div>
-  <div class="kpi"><div class="k">Today {{ help('today') }}</div><div class="v">{{ money_signed(book.day_pnl) }}</div><div class="s">{% if day_base > 0 %}{{ (book.day_pnl / day_base)|pct }} · {% endif %}since 00:00 UTC</div></div>
-  <div class="kpi"><div class="k">Month to date {{ help('mtd') }}</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div><div class="s">since the 1st</div></div>
-  <div class="kpi"><div class="k">Since start {{ help('since_start') }}</div><div class="v">{{ signed(book.ret) }}</div><div class="s">{{ book.pnl|smoney }} · buy-and-hold {{ book.bench_ret|pct1s }}</div></div>
-  <div class="kpi"><div class="k">Gross exposure {{ help('in_market') }}</div><div class="v">{{ book.exposure_pct|pct0 }}</div><div class="s">{{ book.exposure|money }} · net {{ book.net_pct|pct0 }}{% if book.net_exposure < -0.005 %} short{% endif %}</div></div>
-  <div class="kpi"><div class="k">Cash {{ help('cash') }}</div><div class="v">{{ (book.cash / book.equity if book.equity > 0 else 0)|pct0 }}</div><div class="s">{{ book.cash|money }} · open P&amp;L {{ book.unrealised|smoney0 }}</div></div>
-  <div class="kpi"><div class="k">Drawdown {{ help('drawdown') }}</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}{% if summaries %} · <span class="{{ 'loss' if near_halt >= 0.8 else ('warn' if near_halt >= 0.5) }}" title="The strategy nearest its halt line has used this share of the drawdown its risk profile allows">nearest halt {{ near_halt|pct0 }} used</span>{% endif %}</div></div>
-  <div class="kpi"><div class="k">Sharpe {{ help('sharpe') }}</div><div class="v">{{ book.sharpe|numn }}</div><div class="s">{% if book.days >= 30 %}buy-and-hold {{ book.bench_sharpe|numn }} · volatility {{ book.vol|pctn0 }}{% else %}needs 30 days, have {{ book.days }}{% endif %}</div></div>
-  <div class="kpi"><div class="k">Fees paid {{ help('fees') }}</div><div class="v">{{ book.fees|money }}</div><div class="s">{{ '{:,}'.format(fill_count) }}{{ '+' if summaries|selectattr('fills', 'ge', 10000)|list }} fill{{ 's' if fill_count != 1 }}</div></div>
+{% set closest = (summaries|sort(attribute='dd_used')|last) if summaries else none %}
+<section class="kpis ledger8" aria-label="Book figures">
+  <div class="kpi lead" title="Sum of every strategy's equity; started at {{ book.start|money }}"><div class="k">Book value</div><div class="v">{{ book.equity|money }}</div></div>
+  <div class="kpi" title="Since 00:00 UTC{% if day_base > 0 %} · {{ (book.day_pnl / day_base)|pct }}{% endif %}"><div class="k">Today</div><div class="v">{{ money_signed(book.day_pnl) }}</div></div>
+  <div class="kpi" title="Since the 1st of the month, 00:00 UTC"><div class="k">Month to date</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div></div>
+  <div class="kpi" title="{{ book.pnl|smoney }} since the book started at {{ book.start|money }}"><div class="k">Since start</div><div class="v">{{ signed(book.ret) }}</div></div>
+  {# Margin used and Open risk come from the corrected isolated-margin figures (UI v2 item 7). Until the view
+     carries them, the tile says so rather than showing the old whole-equity margin. #}
+  {% if book.margin_used is defined and book.margin_used is not none %}
+  <div class="kpi" title="{{ book.margin_used|money }} isolated margin across open positions"><div class="k">Margin used</div><div class="v">{{ (book.margin_used / book.equity if book.equity > 0 else 0)|pct0 }}</div></div>
+  {% else %}<div class="kpi pending" title="Waiting on the corrected isolated-margin figures"><div class="k">Margin used</div><div class="v faint">–</div></div>{% endif %}
+  {% if book.open_risk is defined and book.open_risk is not none %}
+  <div class="kpi" title="Lost if every stop is hit{% if book.equity > 0 %}: {{ (book.open_risk / book.equity)|pct1 }} of book{% endif %}{% if book.unbounded %} · {{ book.unbounded }} position{{ 's' if book.unbounded != 1 }} without a stop, so unbounded{% endif %}"><div class="k">Open risk</div><div class="v {{ 'warn' if book.unbounded }}">{{ book.open_risk|money }}{% if book.unbounded %}+{% endif %}</div></div>
+  {% else %}<div class="kpi pending" title="Waiting on the corrected open-risk figures"><div class="k">Open risk</div><div class="v faint">–</div></div>{% endif %}
+  <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
+  <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{% if book.cost_share is defined and book.cost_share is not none %} · {{ book.cost_share|pct0 }} of gross P&amp;L{% endif %}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
 </section>
 
 <div class="grid">
-  <section class="panel span-8" aria-labelledby="curve-h">
-    <div class="panel-head"><h2 id="curve-h">Book equity</h2>
+  <section class="panel span-8" aria-labelledby="curve-h" data-live="off">
+    <div class="panel-head"><h2 id="curve-h">Book</h2>
       <div class="right chart-tools">
-        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="0" aria-pressed="true">All</button></div>
-        <button type="button" class="toggle" data-compare aria-pressed="false" title="Show return against buying and holding the instrument">vs buy-and-hold</button>
+        <div class="range" role="group" aria-label="Unit"><button type="button" data-unit="value" aria-pressed="true">Value</button><button type="button" data-unit="pct" aria-pressed="false">%</button></div>
+        <div class="range" role="group" aria-label="Range"><button type="button" data-days="1">1D</button><button type="button" data-days="7">1W</button><button type="button" data-range="30">1M</button><button type="button" data-range="90">3M</button><button type="button" data-range="0">All</button></div>
       </div></div>
-    <div class="chart"><canvas id="eq" aria-label="Book equity by day"></canvas></div>
-    <div class="chart short"><canvas id="dd" aria-label="Book drawdown by day"></canvas></div>
+    <div class="chart lw" id="eq" role="img" aria-label="Book value against its starting capital"></div>
   </section>
-  {% set movers = summaries|sort(attribute='day_pnl')|reverse|list %}
-  {% set scale = [movers|map(attribute='day_pnl')|map('abs')|max, 0.01]|max if movers else 1 %}
-  <div class="panel span-4 side-panel">
-  <section aria-labelledby="move-h">
-    <div class="panel-head"><h2 id="move-h">What moved the book today</h2></div>
+  {# P&L by strategy for one period at a time; each period's rows add up to its Book row. #}
+  <section class="panel span-4" aria-labelledby="move-h" data-periods>
+    <div class="panel-head"><h2 id="move-h">P&amp;L by strategy</h2>
+      <div class="right range" role="group" aria-label="Period"><button type="button" data-period="day" aria-pressed="true" title="Since 00:00 UTC">Today</button><button type="button" data-period="week" aria-pressed="false" title="Since Monday 00:00 UTC">Week</button><button type="button" data-period="mtd" aria-pressed="false" title="Since the 1st of the month">Month</button></div></div>
     <table class="compact movers">
-      <thead><tr><th>Strategy</th><th class="bar-col" aria-hidden="true"></th><th class="num">Today</th><th class="num">Month</th></tr></thead>
-      <tbody>{% for x in movers %}{% set w = (x.day_pnl|abs / scale * 50)|round(1) %}
+      <thead><tr><th>Strategy</th><th class="bar-col" aria-hidden="true"></th><th class="num">P&amp;L</th><th class="num">Share</th></tr></thead>
+      {% for key in ['day', 'week', 'mtd'] %}
+      {% set field = key ~ '_pnl' %}{% set total = book[field] %}
+      {% set movers = summaries|sort(attribute=field)|reverse|list %}
+      {% set scale = [movers|map(attribute=field)|map('abs')|max, 0.01]|max if movers else 1 %}
+      <tbody data-period-rows="{{ key }}"{% if key != 'day' %} hidden{% endif %}>
+      {% for x in movers %}{% set v = x[field] %}{% set w = (v|abs / scale * 50)|round(1) %}
         <tr><td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a></td>
-          <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if x.day_pnl >= 0 else 'loss' }}" style="{{ 'left:50%' if x.day_pnl >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
-          <td class="num">{{ money_signed(x.day_pnl) }}</td><td class="num">{{ money_signed(x.mtd_pnl) }}</td></tr>{% endfor %}
+          <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if v >= 0 else 'loss' }}" style="{{ 'left:50%' if v >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
+          <td class="num">{{ money_signed(v) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (v / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endfor %}
+        <tr class="tot"><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(total) }}</td><td class="num muted">{% if total|abs >= 0.005 %}100%{% else %}–{% endif %}</td></tr>
       </tbody>
-      <tfoot><tr><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(book.day_pnl) }}</td><td class="num">{{ money_signed(book.mtd_pnl) }}</td></tr></tfoot>
+      {% endfor %}
     </table>
   </section>
-  <section class="attn" aria-labelledby="alerts-h">
-    <div class="panel-head"><h2 id="alerts-h">Needs attention</h2><a class="right" href="/alerts">All alerts</a></div>
-    {% if alerts %}
-    <ul class="alerts">
-      {% for a in alerts[:6] %}
-      <li class="{{ a.level }}"><div><div class="when">{{ a.ts|ago }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</div><div class="msg">{{ a.message }}</div></div>
-        <form method="post" action="/alerts/{{ a.id }}/ack"><input type="hidden" name="next" value="/"><button class="quiet" title="Mark as seen">Acknowledge</button></form></li>
-      {% endfor %}
-    </ul>
-    {% if alerts|length > 6 %}<p class="muted" style="margin:8px 0 0">{{ alerts|length - 6 }} more in <a href="/alerts">Alerts</a>.</p>{% endif %}
-    {% else %}<p class="empty">Nothing needs you. Warnings and errors from any strategy land here.</p>{% endif %}
-  </section>
-  </div>
 </div>
+
+{# Allocation: one bar of each instrument's share of the summed notional, and the top holdings under it as its
+   legend, in the same order and colours. Strategies holding the same instrument are netted. #}
+{% set hues = ['--accent', '--ind-1', '--ind-2', '--ind-3', '--ind-5', '--ind-6', '--ind-7', '--ind-4', '--ind-8', '--muted'] %}
+<section class="panel flush" aria-labelledby="alloc-h">
+  <div class="panel-head"><h2 id="alloc-h">Allocation and top 10 holdings</h2>{% if holdings.count > holdings.rows|length %}<span class="right muted">{{ holdings.rows|length }} of {{ holdings.count }} instruments</span>{% endif %}</div>
+  {% if holdings.rows %}
+  <div class="alloc-bar" role="img" aria-label="Allocation by instrument">{% for h in holdings.rows %}<i style="flex:{{ '%.6f'|format(h.share) }};background:var({{ hues[loop.index0] }})" title="{{ h.instrument }}{{ ' perp' if h.perp }} {{ h.share|pct0 }}"></i>{% endfor %}</div>
+  <table class="holdings responsive" data-hide-md="1 6 8">
+    <thead><tr><th>#</th><th>Instrument</th><th>Net side</th><th class="num">Notional</th><th>Weight of book</th><th class="num">Margin</th><th class="num">Unrealised</th><th>Held by</th></tr></thead>
+    <tbody>{% for h in holdings.rows %}
+    <tr><td class="faint" data-m="hide">{{ loop.index }}</td>
+      <td><span class="swatch" style="background:var({{ hues[loop.index0] }})"></span>{{ h.instrument }}{% if h.perp %} <span class="faint">perp</span>{% endif %}</td>
+      <td>{% if h.side > 0 %}<span class="side buy">Long</span>{% elif h.side < 0 %}<span class="side sell">Short</span>{% else %}<span class="muted">Flat</span>{% endif %}</td>
+      <td class="num">{{ h.notional|money }}</td>
+      <td title="Notional over book value">{{ h.weight|pct0 }} <span class="wbar" aria-hidden="true"><i style="width:{{ (h.notional / holdings.rows[0].notional * 100 if holdings.rows[0].notional else 0)|round(1) }}%"></i></span></td>
+      <td class="num" data-m="hide">{% if h.margin is not none %}{{ h.margin|money }}{% else %}<span class="faint" title="Waiting on the corrected isolated-margin figures">–</span>{% endif %}</td>
+      <td class="num">{{ money_signed(h.unrealised) }}</td>
+      <td class="held-by" data-m="hide">{% for p in h.held %}<a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a>{% if h.crossing %} <span class="muted">{{ 'long' if p.side > 0 else 'short' }}</span>{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if h.crossing %} <span class="chip warn" title="Strategies hold opposite sides of this instrument">crossing</span>{% endif %}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% else %}<p class="empty" style="padding:4px 18px 16px">No open positions.</p>{% endif %}
+</section>
 
 {# The book in detail, one tab at a time; the address keeps the tab (#positions, #orders...), as on a strategy's
    page. Without JavaScript every tab shows, one after another. #}
@@ -79,7 +107,6 @@
   <a href="#orders" role="tab" data-tab="orders">Open orders<span class="n">{{ working|length }}</span></a>
   <a href="#history" role="tab" data-tab="history">Trade history</a>
   <a href="#funding" role="tab" data-tab="funding">Funding</a>
-  <a href="#allocation" role="tab" data-tab="allocation">Allocation</a>
 </nav>
 
 <div class="tab-panel" id="tab-positions" role="tabpanel" data-panel="positions">
@@ -245,37 +272,6 @@
 </section>
 </div>
 
-<div class="tab-panel" id="tab-allocation" role="tabpanel" data-panel="allocation">
-<div class="grid">
-  <section class="panel span-5" aria-labelledby="alloc-h">
-    <div class="panel-head"><h2 id="alloc-h">Allocation</h2></div>
-    {% set palette = ['var(--accent)', 'color-mix(in srgb, var(--accent) 65%, var(--panel))', 'color-mix(in srgb, var(--accent) 40%, var(--panel))', 'color-mix(in srgb, var(--text) 55%, var(--panel))', 'color-mix(in srgb, var(--text) 30%, var(--panel))'] %}
-    {% set ring = namespace(at=0.0, stops=[]) %}
-    {% for a in book.allocation %}{% set c = 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] %}{% set from_at = ring.at %}{% set ring.at = ring.at + a.bar * 100 %}{% set ring.stops = ring.stops + [c ~ ' ' ~ '%.2f'|format(from_at) ~ '% ' ~ '%.2f'|format(ring.at) ~ '%'] %}{% endfor %}
-    <div class="alloc">
-      <div class="donut" role="img" aria-label="Allocation by asset" style="background: conic-gradient({{ ring.stops|join(', ') }}{% if ring.at < 99.99 %}{{ ', ' if ring.stops }}var(--neutral-bg) {{ '%.2f'|format(ring.at) }}% 100%{% endif %})"></div>
-      <table class="compact">
-        <thead><tr><th>Asset</th><th class="num">Value</th><th class="num">Share</th></tr></thead>
-        <tbody>{% for a in book.allocation %}<tr><td><span class="swatch" style="background: {{ 'var(--faint)' if a.name == 'Cash' else palette[loop.index0 % 5] }}"></span>{{ a.name }}</td><td class="num">{{ a.value|money }}</td><td class="num">{{ a.share|pct1 }}</td></tr>{% endfor %}</tbody>
-      </table>
-    </div>
-  </section>
-  <section class="panel span-7" aria-labelledby="corr-h">
-    <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2> {{ help('correlation') }}</div>
-    {% if book.correlation.matrix %}
-    <div style="overflow-x:auto"><table class="corr">
-      <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
-      {% for row in book.correlation.matrix %}{% set ri = loop.index0 %}{% set rn = book.correlation.names[ri] %}
-      <tr><th scope="row" class="row">{{ rn }}</th>{% for v in row %}
-        {% if loop.index0 == ri %}<td class="self">·</td>{% elif v is none %}<td class="faint">n/a</td>
-        {% else %}<td style="background: color-mix(in srgb, var(--accent) {{ ([v, 0]|max * 60)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
-      {% endfor %}</tr>{% endfor %}
-    </table></div>
-    {% else %}<p class="empty">Needs two strategies with at least 20 days of history.</p>{% endif %}
-  </section>
-</div>
-</div>
-
 {# Close sends the strategy's own flatten, as Flatten on its page does: at market, then the strategy pauses. #}
 <div data-live="close-dialogs" data-live-forms>
 {% for p in positions.rows %}{% set s = p.x.sleeve %}{% set base = p.pair.split('/')[0] %}{% set quote = p.pair.split('/')[1] %}
@@ -304,9 +300,9 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/chart.umd.min.js"></script>
+<script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.sortable(); Console.tabs(); Console.dialogs(); Console.reasons(); Console.bookCharts("/api/book/equity");
+<script>Console.sortable(); Console.tabs(); Console.periods(); Console.dialogs(); Console.reasons(); Console.bookCharts("/api/book/equity");
 // The tab bar's counts update live; this keeps the open tab marked after they do.
 document.addEventListener("live:swap", () => window.dispatchEvent(new HashChangeEvent("hashchange")));</script>
 {% endblock %}
