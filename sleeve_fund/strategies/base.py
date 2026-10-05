@@ -891,7 +891,7 @@ class LongFlatStrategy(Strategy):
         level = "info" if bars else "warning"
         if bars:
             self.on_historical_bars(bars)
-            msg = f"Loaded {len(bars)} of {want} warm-up bars from the history store"
+            msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
             # Bars between the last one loaded and the first live one are a hole the indicators skip.
             step = bar_minutes(self._cfg.bar_type) * 60_000_000_000
             missing = int((time.time_ns() - bars[-1].ts_event) // step)

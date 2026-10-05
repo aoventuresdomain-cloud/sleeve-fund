@@ -31,5 +31,7 @@ jobs:
             select sleeve, max(ts) as last_mark, count(*) as marks from equity where ts > now() - interval '"'"'1 hour'"'"' group by sleeve;
             select ts, sleeve, level, kind, left(message, 200) from events where ts > now() - interval '"'"'2 hours'"'"' order by id desc limit 25;
             select f.ts, f.sleeve, f.id, f.side, f.qty, f.price from fills f where f.ts > now() - interval '"'"'2 hours'"'"' order by f.id desc limit 20;
-            select ts, sleeve, fill_id, status, instrument, amount, price, left(message, 200) from demo_mirror order by id desc limit 20;"'
+            select ts, sleeve, fill_id, status, instrument, amount, price, left(message, 200) from demo_mirror order by id desc limit 20;
+            select sleeve, ts, left(payload, 600) from signal_state order by sleeve;"'
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose logs --no-color --tail 30 mirror'
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose logs --no-color --tail 15 history-binance'
