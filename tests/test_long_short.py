@@ -21,6 +21,22 @@ PERP = {"market": "perp", "allow_short": True}
 # --- markets ------------------------------------------------------------------
 
 
+def test_isolated_liquidation_is_on_the_notional_over_the_leverage_not_the_whole_equity():
+    """A 2x short of 0.1 at 100,000 from a 20,000 balance puts up 5,000 of margin and is liquidated near
+    1.5 / 1.005 of the entry, as the venue's isolated 2x would; the whole equity as margin put it near 3x
+    (review round 13, U13-2)."""
+    balance, qty, entry = 20_000, -0.1, 100_000
+    cash = balance - qty * entry  # spot-style: a short holds its sale's proceeds
+    assert markets.isolated_margin(qty, entry, 2, balance) == pytest.approx(5_000)
+    liq = markets.isolated_liquidation(cash, qty, entry, 2, 0.005)
+    assert liq == pytest.approx(entry * 1.5 / 1.005) and liq == pytest.approx(149_253.73, abs=0.01)
+    assert markets.liquidation_price(cash, qty, 0.005) > 2.9 * entry  # the old, whole-equity answer
+    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 2, 0.005) == pytest.approx(entry * 0.5 / 0.995)
+    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 1, 0.005) is None  # paid for in full
+    # Never more margin than the balance: a 2x position worth 3x the balance has only the balance behind it.
+    assert markets.isolated_margin(-0.6, entry, 2, balance) == balance
+
+
 def test_liquidation_price_long_and_short():
     # A short of 1 at 70,000 cash (35,000 equity + 35,000 proceeds): liquidated where cash + q*p = 0.5% of q*p.
     assert markets.liquidation_price(70_000, -1, 0.005) == pytest.approx(70_000 / 1.005)
@@ -193,11 +209,11 @@ def test_entry_refused_when_its_stop_sits_too_near_liquidation():
     from sleeve_fund.strategies.base import entry_liquidation
 
     # 3x long of 30,000 on 10,000 equity: liquidated about 33% below; a 20% stop is past half of that.
-    liq, distance = entry_liquidation(cash=10_000, qty=0.3, close=100_000, side=1, fee=0.0005, maintenance=0.005)
+    liq, distance = entry_liquidation(cash=10_000, qty=0.3, close=100_000, side=1, fee=0.0005, maintenance=0.005, leverage=3)
     assert 0.32 < distance < 0.34
     assert liq == pytest.approx(100_000 * (1 - distance))
     # A 1x short is liquidated only near double the price.
-    _, distance = entry_liquidation(cash=10_000, qty=0.1, close=100_000, side=-1, fee=0.0005, maintenance=0.005)
+    _, distance = entry_liquidation(cash=10_000, qty=0.1, close=100_000, side=-1, fee=0.0005, maintenance=0.005, leverage=1)
     assert distance > 0.95
 
 
@@ -646,8 +662,10 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     cash = 10_000 + 6_000 - 5_900 + 5_900 - 3 + 1.19
     store.record_equity("pp-fund", equity=cash - 5_950, cash=cash, qty=-0.1, price=59_500.0, benchmark=10_000)
     html = c.get("/sleeves/pp-fund", auth=AUTH).text
-    liq = markets.liquidation_price(cash, -0.1, markets.LOW_FEE_PERP.maintenance_margin)
-    assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.0f}"[:5] in html and "above" in html
+    lev = __import__("sleeve_fund.risk", fromlist=["profile"]).profile(store.sleeve("pp-fund").risk_profile).max_leverage
+    liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
+    assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
+    assert "Margin" in html and "Short 0.59×" in html and f"liq {liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
     assert "· 0.59× · liq" in html  # the header

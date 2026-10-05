@@ -84,3 +84,20 @@ def test_engine_code_names_no_venue():
     offenders = [p.name for p in paths if re.search(r"kraken|binance", p.read_text(), re.I)]
     # safety.py lists venue credential prefixes so it can refuse any of them; that is the point of it.
     assert offenders == ["safety.py"]
+
+
+def test_accounts_and_g2_name_no_venue_but_from_data():
+    """Account creation and the G2 checklist take a venue from the registered profiles, never from their own
+    code (the static page copy waits for the UI redesign)."""
+    import inspect
+
+    from sleeve_fund.store import Store
+    from sleeve_fund.venues import VENUES
+
+    names = "|".join([*VENUES, "BYBIT", "DERIBIT"])
+    texts = {"gates.py": (ROOT / "sleeve_fund" / "dashboard" / "gates.py").read_text(),
+             "store accounts": inspect.getsource(Store._ensure_paper_account) + inspect.getsource(Store.create_account)}
+    # accounts.py may name the old paper note it replaces, nothing else.
+    texts["accounts.py"] = "\n".join(line for line in (ROOT / "sleeve_fund" / "accounts.py").read_text().splitlines()
+                                     if not line.startswith("PAPER_NOTES_BEFORE ="))
+    assert [k for k, t in texts.items() if re.search(names, t, re.IGNORECASE)] == []
