@@ -615,7 +615,8 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
         store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
     # Positions: -3,000, -3,000 and +1,200. Gross 7,200 (24% of 30,000); net -4,800 (-16%).
     page = c.get("/risk", auth=AUTH).text
-    assert "7,200.00 of 30,000.00" in page and "net −16% short" in page.replace("-16%", "−16%")
+    # The Gross exposure tile is gone everywhere (UI v2, PM 5 Oct); gross and net stay on the Strategies header.
+    assert "Gross exposure" not in page and "Gross 24% · net 16% short" in page
     # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
     assert "+960.00" in page and "−960.00" in page
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
