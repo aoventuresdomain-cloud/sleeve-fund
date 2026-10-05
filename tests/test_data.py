@@ -1,14 +1,14 @@
 import pandas as pd
 import pytest
 
-from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv, validate_ohlcv
+from sleeve_fund.data import load_ohlcvt_csv, synthetic_ohlcv, validate_ohlcv
 
 
 def test_kraken_bars_are_stamped_at_close(tmp_path):
     # Kraken timestamps are bar OPEN times; a daily bar opening 1 Jan is known at 2 Jan 00:00.
     csv = tmp_path / "XBTUSD_1440.csv"
     csv.write_text("1704067200,100,110,90,105,12.5,40\n1704153600,105,120,100,118,9.0,30\n")
-    df = load_kraken_ohlcvt(csv)
+    df = load_ohlcvt_csv(csv)
     assert df.index[0] == pd.Timestamp("2024-01-02", tz="UTC")
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
 

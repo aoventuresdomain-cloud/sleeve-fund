@@ -125,7 +125,7 @@ class Supervisor:
         """Carry each PM reset forward (5 Oct 2026): a strategy still holding is flattened first (a PM flatten,
         which pauses it; started if stopped so the flatten can trade); once flat its process is stopped, the run
         so far is put away under its own name (Store.split_run), and the strategy starts again at its starting
-        capital if it was running. A strategy copied to Bybit Demo then has its demo copy resynced (flat, on
+        capital if it was running. A strategy copied to a demo account by quantity then has its demo copy resynced (flat, on
         the paper margin terms) before it trades again."""
         for req in self.store.pending_resets():
             name = req["sleeve"]
@@ -250,8 +250,8 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
     `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard.
     One exception for a strategy already there: a file asking for the demo mirror turns it on when the strategy
-    has never had that setting (the Binance strategies were added before the mirror could copy them, 5 Oct
-    2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
+    has never had that setting (the first perpetual strategies were added before the mirror could copy them,
+    5 Oct 2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:

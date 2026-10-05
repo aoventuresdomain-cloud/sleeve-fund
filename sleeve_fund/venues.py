@@ -63,10 +63,16 @@ class VenueProfile:
     contract: Callable[[str], dict] | None = None
     # Instruments the history store always keeps for this venue, before any strategy trades them
     core_pairs: tuple[str, ...] = ()
+    # Instruments a form suggests on this venue (any other can still be typed); its core list when empty
+    instrument_hints: tuple[str, ...] = ()
 
     @property
     def venue(self) -> Venue:
         return Venue(self.name)
+
+    @property
+    def hints(self) -> tuple[str, ...]:
+        return self.instrument_hints or self.core_pairs
 
     def symbol_of(self, pair: str) -> str:
         """The venue's own symbol for a BASE/QUOTE pair: the instrument id paper subscribes to."""
@@ -101,7 +107,11 @@ class VenueProfile:
 
 
 VENUES: dict[str, VenueProfile] = {}
+# The venue of a strategy saved before strategies carried their own (all of them Kraken's then). Kept so those
+# journals still price on the venue they traded on; every strategy since names its venue.
 DEFAULT_VENUE = "KRAKEN"
+# The venue Research and the strategy sprint start a study on: the paper test venue (PM, 5 Oct 2026).
+RESEARCH_VENUE = "BINANCE"
 
 
 def register(profile: VenueProfile) -> VenueProfile:
@@ -273,6 +283,9 @@ KRAKEN = register(VenueProfile(
     fetch_fees=kraken_account_fees,
     minute_loader=kraken_minutes,
     merge_minutes=True,
+    core_pairs=("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD"),
+    instrument_hints=("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP",
+                      "ETH/GBP"),
     # Kraken's Trades `since` takes Unix seconds (its `last` cursor comes back in nanoseconds).
     minute_cursor_at=lambda ts: str(int(ts.timestamp())),
     check_listed=_kraken_listed,

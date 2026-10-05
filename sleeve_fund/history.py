@@ -256,9 +256,6 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
     return {"pair": pair, "pages": pages, "last": cov.last if cov else None}
 
 
-# Always kept, so research has them before any sleeve trades them; sleeves' own instruments are added. A venue
-# whose instruments are named differently (USDT-quoted perpetuals) lists its own (VenueProfile.core_pairs).
-CORE_PAIRS = ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD")
 
 
 # Where the backfill starts for an instrument the PM asks Research for: enough for the default study
@@ -267,12 +264,13 @@ REQUEST_YEARS = 5
 
 
 def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None]]:
-    """(instrument, where a first backfill starts) for the core list, every strategy's instrument and
-    every instrument the PM asked Research for."""
+    """(instrument, where a first backfill starts) for the venue's core list (VenueProfile.core_pairs, always
+    kept so research has them before any strategy trades them), every strategy's instrument and every
+    instrument the PM asked Research for."""
     from sleeve_fund.venues import VENUES
 
     profile = VENUES.get(venue.upper())
-    pairs: dict[str, pd.Timestamp | None] = {p: None for p in (profile and profile.core_pairs) or CORE_PAIRS}
+    pairs: dict[str, pd.Timestamp | None] = {p: None for p in (profile.core_pairs if profile else ())}
     try:
         from sleeve_fund.paper.config import from_store
         from sleeve_fund.store import Store

@@ -169,7 +169,7 @@ def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path
     strategy's, starting where the request says rather than at the instrument's listing."""
     from dataclasses import replace
 
-    from sleeve_fund.history import CORE_PAIRS, _pairs_in_use, refresh
+    from sleeve_fund.history import _pairs_in_use, refresh
     from sleeve_fund.store import Store
     from sleeve_fund.venues import KRAKEN
 
@@ -178,7 +178,7 @@ def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path
     assert store.request_history("KRAKEN", "ADA/EUR", since.to_pydatetime())
     assert not store.request_history("kraken", "ADA/EUR", since.to_pydatetime())  # asked once
     pairs = dict(_pairs_in_use("KRAKEN", store))
-    assert all(pairs[p] is None for p in CORE_PAIRS) and pairs["ADA/EUR"] == since
+    assert all(pairs[p] is None for p in KRAKEN.core_pairs) and pairs["ADA/EUR"] == since
     assert "ADA/EUR" not in dict(_pairs_in_use("OTHER", store))
 
     asked = []

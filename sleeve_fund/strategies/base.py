@@ -342,7 +342,7 @@ class LongFlatConfig(StrategyConfig):
         self.market = market
         self.allow_short = bool(allow_short)
         self.perp = markets.terms({"market": market}, str(instrument_id.venue))
-        # Read by the Deribit testnet demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
+        # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
 
 

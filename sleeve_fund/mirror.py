@@ -348,6 +348,13 @@ def target_for(sleeve) -> str:
     return "BYBIT" if (sleeve.venue or "").upper() == "BINANCE" else "DERIBIT"
 
 
+def exact_copy(sleeve) -> str | None:
+    """The demo account holding a mirrored strategy's own quantity, by its label, so its page can show the copy
+    beside the paper position: Bybit Demo Trading. None for one not mirrored, or copied to the Deribit
+    testnet, sized in dollars at each fill's price."""
+    return "Bybit Demo Trading" if sleeve.params.get("demo_mirror") and target_for(sleeve) == "BYBIT" else None
+
+
 def mirrored(store) -> list:
     """The strategies whose params ask for the demo mirror. A run archived by a reset is not one: it trades no
     more, and its risk profile mustn't set the leverage of a symbol it once shared (m13-E5)."""

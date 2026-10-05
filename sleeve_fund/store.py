@@ -129,7 +129,7 @@ insurance_t = Table(
     Index("insurance_sleeve_ts", "sleeve", "ts"),
 )
 
-# The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
+# The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
 # failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
 mirror_t = Table(
     "demo_mirror",

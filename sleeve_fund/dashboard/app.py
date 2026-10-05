@@ -34,7 +34,7 @@ from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
-from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
+from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
@@ -50,8 +50,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
-# Suggestions only: the field accepts any instrument Kraken spot lists.
-INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 
@@ -496,7 +494,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             return JSONResponse({"instruments": charts.instruments(), "source": "venue"})
         except (OSError, ValueError, KeyError):  # venue unreachable: the usual ones, and any other can still be typed
-            return JSONResponse({"instruments": INSTRUMENT_HINTS, "source": "fallback"})
+            return JSONResponse({"instruments": _hints(), "source": "fallback"})
 
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, days: int | None = None, _: str = Depends(require_pm)):
@@ -851,7 +849,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 return page_(pre=here, notice=(
                     f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now."))
-            if pair in (profile.core_pairs or CORE_PAIRS):
+            if pair in profile.core_pairs:
                 # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
                 # a request would change nothing, and its "from five years back" would misstate where it starts.
                 return page_(pre=here, notice=(
@@ -1065,7 +1063,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             if backtest and t.half_spread is not None:
                 per_market[m]["half_spread"] = t.half_spread
         return {"taker": float(venue_fees.taker), "default_spread": default, "markets": per_market,
-                "spreads": {p: resolve_spread(None, p, st()).half_spread for p in INSTRUMENT_HINTS}}
+                "spreads": {p: resolve_spread(None, p, st()).half_spread for p in _hints()}}
 
     def backtest_form(request: Request, q, *, result=None, error="", job=None, saved=None):
         """The backtest page: the settings form, plus a result, an error, or a run in progress."""
@@ -1396,9 +1394,8 @@ def _venue_name(value) -> str:
 
 
 def _hints(venue: str | None = None) -> list[str]:
-    """The instruments a form suggests on this venue: those the history store always keeps there, else the
-    default venue's usual list."""
-    return list(_research_venue(venue).core_pairs) or INSTRUMENT_HINTS
+    """The instruments a form suggests on this venue (VenueProfile.hints); any other can still be typed."""
+    return list(_research_venue(venue).hints)
 
 
 def venue_choices() -> list[dict]:
@@ -1493,16 +1490,17 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
 
 
 def _demo_copy(store, s) -> dict | None:
-    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to Bybit Demo, the
-    one demo account the mirror can trade to an exact quantity."""
+    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to a demo account the
+    mirror trades to an exact quantity (mirror.exact_copy)."""
     from sleeve_fund import mirror
 
-    if not s.params.get("demo_mirror") or not markets.is_perp(s.params) or mirror.target_for(s) != "BYBIT":
+    label = mirror.exact_copy(s)
+    if label is None or not markets.is_perp(s.params):
         return None
     put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
-    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+    return {"label": label, "put_on": put_on, "last": last,
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
