@@ -40,6 +40,8 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
                                      store.funding(s.name, limit=100_000) if markets.is_perp(s.params) else None,
                                      store.insurance(s.name) if markets.is_perp(s.params) else None)),
         "healthy": bool(s.heartbeat_at and utcnow() - s.heartbeat_at < STALE),
+        # Funding settled on a perpetual: + received, - paid. Already in its equity and P&L.
+        "funding": store.funding_total(s.name) if markets.is_perp(s.params) else 0.0,
     }
     if series:
         last = series[-1]
@@ -60,4 +62,14 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         # In money from the peak, as the halt and the stop check measure it, not the drawdown gap times
         # today's equity, which understates it by equity / peak (U13-3).
         out["room"] = max(last["equity"] - peak * (1 - prof.max_drawdown), 0.0)
+    out.update(costs(out["pnl"], out["fees"], out["funding"]))
     return out
+
+
+def costs(pnl: float, fees: float, funding: float) -> dict:
+    """Fees and funding paid, the P&L before them, and the share of that gross P&L they took (UI v2, item 7).
+    pnl is after both; funding is + received, - paid, so funding received lowers the cost. The share is of the
+    gross P&L's size, so a loss's costs read as a share too; None while there is no gross P&L."""
+    paid = fees - funding
+    gross = pnl + paid
+    return {"costs": paid, "gross_pnl": gross, "cost_share": paid / abs(gross) if gross else None}

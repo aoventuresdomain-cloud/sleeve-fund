@@ -167,10 +167,64 @@ def history_chip(h: dict) -> dict:
         return {"text": f"Asked for {when:%d %b}, nothing stored yet" if when else "Asked for, nothing stored yet",
                 "tone": "paused"}
     if h["state"] != "current":
-        return {"text": f"Catching up, from {h['first']:%d %b %Y}", "tone": "paused"}
+        return {"text": f"Catching up, from {h['first']:%d %b %Y}", "tone": "paused",
+                "days": (h["last"] - h["first"]).days if h.get("last") else 0}
     days = (h["last"] - h["first"]).days
     span = f"{days / 365.25:.1f} years" if days >= 365 else f"{days} day{'s' if days != 1 else ''}"
-    return {"text": f"{span} stored · current", "tone": "running"}
+    return {"text": f"{span} stored · current", "tone": "running", "days": days}
+
+
+MONTH = 30.44  # days, for the study-window sentence
+
+
+def months_words(days: float) -> str:
+    """2 years 4 months; 7 months; 20 days. Twin: monthsWords in research.html."""
+    m = round(days / MONTH)
+    if m < 1:
+        return f"{int(days)} day{'s' if int(days) != 1 else ''}"
+    y, m = divmod(m, 12)
+    parts = ([f"{y} year{'s' if y != 1 else ''}"] if y else []) + ([f"{m} month{'s' if m != 1 else ''}"] if m else [])
+    return " ".join(parts)
+
+
+def fit_windows(v: dict, days: int | None) -> tuple[dict, str]:
+    """Study windows sized to the stored history (UI v2, item 8): the plan's learn, test and sealed days when
+    they fit inside `days`, else the history split 2:1:1 (2:1 with nothing sealed). Returns the new windows and
+    the sentence the page shows. Twin: fitWindows in research.html."""
+    if not days:
+        return {}, ""
+    train, test, hold = (int(v.get(k) or d) for k, d in (("train_days", 365), ("test_days", 180), ("holdout_days", 0)))
+    have = months_words(days)
+    if train + test + hold <= days:
+        return {}, f"You have {have} of history; these windows fit inside it."
+    unit = days / (4 if hold else 3)
+    out = {"train_days": max(int(2 * unit), 30), "test_days": max(int(unit), 30), "holdout_days": int(unit) if hold else 0}
+    words = (f"learn on {months_words(out['train_days'])}, test on the next {months_words(out['test_days'])}"
+             + (f", newest {months_words(out['holdout_days'])} sealed" if hold else ""))
+    return out, f"You have {have} of history, so: {words}."
+
+
+def history_badge(h: dict | None) -> dict:
+    """An instrument's history badge (UI v2, item 10), from a _stored_history row (None: not stored or asked
+    for). state is what the page keys on: "stored", "filling", "gaps" or "none". Gaps hold backtests and
+    studies back until the collector fills them (blocked_by_gaps)."""
+    if h is None or h["first"] is None:
+        return {"state": "filling", "text": "being filled"} if h else {"state": "none", "text": "not stored yet"}
+    if h.get("gaps"):
+        return {"state": "gaps", "text": _gap_words(len(h["gaps"]))}
+    if h["state"] != "current":
+        return {"state": "filling", "text": "being filled"}
+    return {"state": "stored", "text": f"stored · last candle {h['last']:%H:%M} · no gaps"}
+
+
+def _gap_words(n: int) -> str:
+    return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
+
+
+def blocked_by_gaps(pair: str, gaps: list) -> str | None:
+    """Why a backtest or study on this instrument has to wait, or None: only gaps in what is stored hold it
+    back. A collector still catching up doesn't; the study says where its history ends."""
+    return f"{pair}: {_gap_words(len(gaps))}" if gaps else None
 
 
 def variants(spec) -> int:

@@ -88,7 +88,7 @@ def test_exits_entered_as_percent_and_stats_shown(client):
 
 def test_any_asset_pair_can_be_chosen(client):
     c, store = client
-    assert 'list="pairs"' in c.get("/sleeves/new", auth=AUTH).text
+    assert 'role="combobox"' in c.get("/sleeves/new", auth=AUTH).text  # the instrument pick-list
     r = _new(c, name="sui-trend", instrument="sui/usd")
     assert r.status_code == 303 and store.sleeve("sui-trend").instrument == "SUI/USD"
 
@@ -576,7 +576,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
     assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "From backtest." in form
     assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
-    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
+    assert 'name="bar_spec_shown" value="1-DAY-LAST-EXTERNAL" checked disabled' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
 
 
 def test_sleeve_from_a_backtest_cannot_change_its_interval(client):
@@ -618,10 +618,10 @@ def test_backtest_explains_bad_settings(client, monkeypatch, query, msg):
 
 def test_new_sleeve_errors_keep_what_was_typed(client):
     c, _ = client
-    r = _new(c, name="BAD NAME", reason="testing keeps fields")
+    r = _new(c, name="BAD NAME", reason_pick="Other", reason_note="testing keeps fields")
     assert r.status_code == 303
     form = c.get(r.headers["location"], auth=AUTH).text
-    assert "Not saved" in form and 'value="testing keeps fields"' in form
+    assert "Not saved" in form and ">testing keeps fields</textarea>" in form and 'value="Other" required checked' in form
 
 
 def test_accounts_page_adds_live_accounts_and_shows_key_presence_only(client, monkeypatch):
@@ -1086,7 +1086,7 @@ def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, 
          "&p_trend_filter__slow=20&bar_spec=1-HOUR-LAST-INTERNAL")
     page = c.get(q, auth=AUTH).text
     assert "Couldn't run it" not in page
-    assert 'value="1-HOUR-LAST-INTERNAL" selected' in page
+    assert 'value="1-HOUR-LAST-INTERNAL" checked' in page
     assert "bar_spec=1-HOUR-LAST-INTERNAL" in page and "tested_bar_spec=1-HOUR-LAST-INTERNAL" in page
     d = preview.run("trend_filter", "ETH/USD", {"fast": 5, "slow": 20}, minutes=1, detail=True)
     assert d["minutes"] == 1 and d["bars"] > 20 * 1400 and d["trades"]["trades"] > 0
@@ -1357,7 +1357,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     assert r.status_code == 303 and r.headers["location"].startswith("/research?job=")
     job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
     running = c.get(r.headers["location"], auth=AUTH).text
-    assert 'id="study-job"' in running and 'value="240" selected' in running  # the form shows what is running
+    assert 'id="study-job"' in running and 'value="240" checked' in running  # the form shows what is running
     for _ in range(600):
         j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
         if j["status"] not in ("queued", "running"):
@@ -1404,10 +1404,10 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
 
     monkeypatch.setattr(KRAKEN, "check_listed", check)
     page = c.get("/research", auth=AUTH).text
-    assert 'data-panel="history"' in page and "Collect another instrument" in page
-    assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Catching up", page, re.S)
-    assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
-    assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
+    # Data coverage is read-only (UI v2, item 8): what is stored, and how far along it is.
+    assert 'data-panel="history"' in page and "Collect another instrument" not in page
+    assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Being filled", page, re.S)
+    assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Stored, current", page, re.S)
     # Another site can't ask, an unlisted instrument is refused, and a listed one is queued once.
     assert c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH,
                   headers={"Origin": "https://evil.example"}).status_code == 403
@@ -1415,7 +1415,7 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     assert "Kraken does not list FOO/USD" in bad.text and not store.history_requests("KRAKEN")
     ok = c.post("/research/history", data={"instrument": "ada/usd"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for ADA/USD: it backfills from" in ok.text
-    assert re.search(r"ADA/USD</td>.*?Asked for", ok.text, re.S)
+    assert re.search(r"ADA/USD</td>.*?Not stored yet", ok.text, re.S)
     (req,) = store.history_requests("KRAKEN")
     assert req["instrument"] == "ADA/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
     again = c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH, headers=SAME)
@@ -1869,7 +1869,7 @@ def test_the_research_form_knows_which_holdouts_are_spent(client, tmp_path):
     assert list(spent) == ["trend_filter|kraken-btcusd-store"]
     assert spent["trend_filter|kraken-btcusd-store"].endswith(", on daily bars")
     # The page script keys a spent holdout by the venue picked in the study, which switches in place.
-    assert '<input type="radio" name="venue" value="kraken" checked>' in page and "${venue()}-${pair}-store" in page
+    assert 'name="venue" value="kraken" data-pl-venue' in page and "${venue()}-${pair}-store" in page
 
 
 def test_sub_dollar_numbers_read_in_full(client):
@@ -2089,12 +2089,12 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     monkeypatch.setattr(venue("binance"), "check_listed", lambda pair: None)
     # The study's venue is picked in place (no reload); History lists every venue's stored instruments.
     page = c.get("/research?venue=binance", auth=AUTH).text
-    assert '<input type="radio" name="venue" value="binance" checked>' in page and "data-reload" not in page
-    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>Binance USD-M perpetuals</td>', page)
-    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>Kraken spot</td>', page)
-    assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
+    assert 'name="venue" value="binance" data-pl-venue' in page and "data-reload" not in page
+    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>perpetual</td>', page)
+    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>spot</td>', page)
+    assert "A perpetual is studied long only" in page and "Binance" not in page.split('id="tab-history"')[1].split("</section>")[0]
     kraken = c.get("/research?venue=kraken", auth=AUTH).text
-    assert '<input type="radio" name="venue" value="kraken" checked>' in kraken and "run spot, long only" in kraken
+    assert 'name="venue" value="kraken" data-pl-venue' in kraken and "Spot is studied long only" in kraken
     asked = c.post("/research/history", data={"instrument": "doge/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for DOGE/USDT" in asked.text and not store.history_requests("KRAKEN")
     assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["DOGE/USDT"]
@@ -2103,7 +2103,7 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert "no stored Binance USD-M perpetuals history for BTC/USDT" in none.text
 
     bt = c.get("/backtest?venue=binance", auth=AUTH).text
-    assert '<option value="binance" selected' in bt and '<option value="BTC/USDT">' in bt
+    assert 'name="venue" value="binance" data-pl-venue' in bt and 'value="BTC/USDT"' in bt
     q = {"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance", "bar_spec": "1-DAY-LAST-EXTERNAL"}
     with pytest.raises(ValueError, match="perpetuals only"):
         _backtest_args(q)

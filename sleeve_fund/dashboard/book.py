@@ -11,6 +11,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from sleeve_fund.dashboard.metrics import costs
 from sleeve_fund.store import Store, utcnow
 
 DAYS_A_YEAR = 365  # the venue trades every day
@@ -123,6 +124,8 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "cash": sum(x["cash"] for x in active),
         "unrealised": sum(x["unrealised"] for x in active),
         "fees": sum(x["fees"] for x in active),
+        "funding": sum(x["funding"] for x in active),
+        **costs(equity - start, sum(x["fees"] for x in active), sum(x["funding"] for x in active)),
         "drawdown": float(dd.iloc[-1]) if len(dd) else 0.0,
         "max_drawdown": float(dd.max()) if len(dd) else 0.0,
         "vol": vol,

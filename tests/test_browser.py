@@ -45,6 +45,10 @@ def site(tmp_path_factory):
     mp.setenv("TEARSHEET_DIR", str(tmp))
     mp.setattr(app_mod, "TEARSHEETS", tmp)
     mp.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    from sleeve_fund.dashboard import charts
+
+    listed = {"kraken": ["BTC/USD", "ETH/USD", "ADA/USD"], "binance": ["BTC/USDT", "ETH/USDT"]}
+    mp.setattr(charts, "instruments", lambda get_json=None, venue=None: listed[venue])  # no venue calls
     preview._history.clear()
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -192,3 +196,60 @@ def test_a_long_short_backtests_trades_say_long_or_short_at_every_width(site, br
     ctx.close()
     assert sides and all(s.rstrip().endswith(("long", "short")) for s in sides), sides[:5]
     assert any(s.rstrip().endswith("short") for s in sides)
+
+
+def test_a_new_strategy_can_be_set_up_without_typing(site, browser):
+    """UI v2, item 9: the instrument, candle length, name and reason are all picked; nothing is typed."""
+    page, errors = _open(browser, f"{site}/sleeves/new")
+    page.click("#instrument")
+    page.wait_for_selector("#instrument-list .opt >> text=ETH/USDT perpetual")
+    assert page.locator("#instrument-list .grp").all_text_contents()[:2] == ["Perpetuals", "Spot"]
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")  # the keyboard picks too
+    assert page.input_value("#instrument") == "ETH/USDT" and page.input_value("input[name=venue]") == "binance"
+    assert page.input_value("#market") == "perp"  # a perpetual venue trades its perpetual
+    page.click("#instrument")
+    page.click("#instrument-list .opt >> text=ADA/USD spot")
+    assert page.input_value("#instrument") == "ADA/USD" and page.input_value("input[name=venue]") == "kraken"
+    assert page.input_value("#market") == "spot"
+    page.click(".chip-pick span:text-is('4h')")
+    assert page.input_value("#name") == "trend-filter-adausd-4h"
+    page.click(".wiz-nav button:has-text('Name and reason')")
+    page.click("fieldset.reasons label.opt:has-text('New test')")
+    page.evaluate("document.getElementById('sleeve-form').requestSubmit()")
+    page.wait_for_url("**/sleeves/trend-filter-adausd-4h")
+    assert errors == []
+    page.context.close()
+
+
+def test_a_reason_dialog_is_searchable_and_needs_no_typing(site, browser):
+    page, errors = _open(browser, f"{site}/sleeves/eth-trend")
+    opener = page.locator("[data-open=dlg-start], [data-open=dlg-pause]").first
+    which = opener.get_attribute("data-open")
+    word, reason = ("review", "Restart after review") if which == "dlg-start" else ("outage", "Data or venue problem")
+    opener.click()
+    dlg = page.locator(f"#{which}")
+    confirm = dlg.locator("[data-needs-reason]").first
+    assert confirm.is_disabled()
+    dlg.locator("[data-reason-search]").fill(word)
+    shown = [t.split("\n")[0] for t in dlg.locator("label.opt:visible").all_inner_texts()]
+    assert shown == [reason, "+ Write your own reason"]
+    dlg.locator("[data-reason-search]").fill("")
+    dlg.locator(f"label.opt:has-text('{reason}')").click()  # a click is all it takes
+    assert confirm.is_enabled() and f"Logged as: {reason}" in dlg.inner_text()
+    assert errors == []
+    page.context.close()
+
+
+def test_development_columns_end_on_the_same_line(site, browser):
+    """UI v2, item 8: at 1440 x 900 the model list and the study are the same height; the list scrolls."""
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                              viewport={"width": 1440, "height": 900})
+    page = ctx.new_page()
+    page.goto(f"{site}/research")
+    page.wait_for_load_state("networkidle")
+    col, study = page.locator(".plan-col").bounding_box(), page.locator("#study").bounding_box()
+    if os.environ.get("SCREENSHOT_DIR"):
+        page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "development-1440.png"), full_page=True)
+    ctx.close()
+    assert abs((col["y"] + col["height"]) - (study["y"] + study["height"])) <= 2
