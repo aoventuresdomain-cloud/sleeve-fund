@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
-{% from "_fields.html" import venue_field, pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
+{% from "_fields.html" import instrument_field, candle_chips, strategy_fields, exit_fields, order_fields, market_fields %}
 {% block title %}Backtest · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -12,12 +12,11 @@
   <form class="panel span-4 bt-form{{ ' has-result' if result or error }}" method="get" action="/backtest" id="bt-form">
     <input type="hidden" name="run" value="1">
     <div class="panel-head"><h2>Settings</h2></div>
-    {{ venue_field(pre) }}
-    {{ pair_field(instruments, pre) }}
+    {{ instrument_field(pre) }}
     {{ strategy_fields(strategies, chosen, g1, pre) }}
     <div class="grid2">
       <div class="field"><label for="starting_balance">Capital</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
-      <div class="field"><label for="bt_bar_spec">Decision interval</label><select id="bt_bar_spec" name="bar_spec">{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == bar_spec }}>{{ bar_label(b).split(' (')[0] }}{{ ' (from live trades in paper)' if b.endswith('INTERNAL') else '' }}</option>{% endfor %}</select>
+      <div class="field"><span class="label">Candle length</span>{{ candle_chips('bar_spec', bar_choices(bar_specs), bar_spec, id='bt_bar_spec') }}
         <p class="hint">Intraday: {% if stored %}{% for r in stored %}{{ r.pair }} (since {{ r.since.strftime('%b %Y') }}){{ ', ' if not loop.last }}{% endfor %}{% else %}none stored yet{% endif %}.</p></div>
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
@@ -78,8 +77,8 @@
     <section class="panel" aria-labelledby="bt-curve-h">
       <div class="panel-head"><h2 id="bt-curve-h">Equity against buy-and-hold</h2>
         <div class="right chart-tools"><button type="button" class="toggle" data-compare aria-pressed="true" title="Show return against buying and holding the instrument">vs buy-and-hold</button><div class="range" role="group" aria-label="Range"><button type="button" data-range="90">3M</button><button type="button" data-range="180">6M</button><button type="button" data-range="365">1Y</button><button type="button" data-range="0" aria-pressed="true">All</button></div></div></div>
-      <div class="chart"><canvas id="eq" aria-label="Backtest equity and buy-and-hold by day"></canvas></div>
-      <div class="chart short"><canvas id="dd" aria-label="Backtest drawdown by day"></canvas></div>
+      <div class="chart lw" id="eq" role="img" aria-label="Backtest equity and buy-and-hold by day"></div>
+      <div class="chart short lw" id="dd" role="img" aria-label="Backtest drawdown by day"></div>
     </section>
 
     <section class="panel flush" aria-labelledby="bt-tr-h">
@@ -119,7 +118,6 @@
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/chart.umd.min.js"></script>
 <script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
 {% if chart %}<script id="bt-data" type="application/json">{{ chart|tojson }}</script><script id="bt-price" type="application/json">{{ result.price|tojson }}</script>{% endif %}

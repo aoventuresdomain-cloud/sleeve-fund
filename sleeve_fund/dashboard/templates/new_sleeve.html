@@ -1,5 +1,6 @@
 {% extends "base.html" %}
-{% from "_fields.html" import venue_field, pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
+{% from "_reasons.html" import reason_picker %}
+{% from "_fields.html" import instrument_field, candle_chips, strategy_fields, exit_fields, order_fields, market_fields %}
 {% block title %}New strategy · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -16,9 +17,8 @@
     <fieldset class="panel step">
       <legend>1. Market</legend>
       <div class="grid2">
-        {{ venue_field(pre) }}
-        {{ pair_field(instruments, pre) }}
-        <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select>{% if from_bt %}<p class="hint">As backtested.</p>{% endif %}</div>
+        {{ instrument_field(pre) }}
+        <div class="field"><span class="label" id="bar_spec-l">Candle length</span>{{ candle_chips('bar_spec' if not from_bt else 'bar_spec_shown', bar_choices(bar_specs), pre.get('bar_spec', '1-HOUR-LAST-INTERNAL'), id='bar_spec', disabled=from_bt) }}{% if from_bt %}<p class="hint">As backtested.</p>{% endif %}</div>
       </div>
     </fieldset>
     <fieldset class="panel step">
@@ -44,10 +44,8 @@
     </fieldset>
     <fieldset class="panel step">
       <legend>5. Name and reason</legend>
-      <div class="grid2">
-        <div class="field"><label for="name">Strategy name</label><input id="name" name="name" placeholder="btc-trend-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}></div>
-        <div class="field"><label for="reason">Why start it?</label><input id="reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
-      </div>
+      <div class="field"><label for="name">Strategy name</label><input id="name" name="name" placeholder="trend-filter-btcusd-1h" pattern="[a-z0-9][a-z0-9\-]{1,40}" required value="{{ pre.get('name', '') }}" {{ 'data-touched=1' if pre.get('name') }}><p class="hint">Fills itself from the model, instrument and candle length.</p></div>
+      {{ reason_picker('start', 'r-new', pre.get('reason_pick', ''), pre.get('reason_note', '')) }}
     </fieldset>
   </div>
 
@@ -63,7 +61,6 @@
 </form>
 {% endblock %}
 {% block scripts %}
-<script src="/static/chart.umd.min.js"></script>
 <script src="/static/console.js"></script>
-<script>Console.sleeveForm();</script>
+<script>Console.sleeveForm(); Console.reasons();</script>
 {% endblock %}

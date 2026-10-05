@@ -631,7 +631,8 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
         store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
     # Positions: -3,000, -3,000 and +1,200. Gross 7,200 (24% of 30,000); net -4,800 (-16%).
     page = c.get("/risk", auth=AUTH).text
-    assert "7,200.00 of 30,000.00" in page and "net −16% short" in page.replace("-16%", "−16%")
+    # The Gross exposure tile is gone everywhere (UI v2, PM 5 Oct); gross and net stay on the Strategies header.
+    assert "Gross exposure" not in page and "Gross 24% · net 16% short" in page
     # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
     assert "+960.00" in page and "−960.00" in page
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
@@ -693,10 +694,13 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     lev = __import__("sleeve_fund.risk", fromlist=["profile"]).profile(store.sleeve("pp-fund").risk_profile).max_leverage
     liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
-    assert "Margin" in html and "Short 0.59×" in html and f"liq {liq:,.2f}" in html and "above" in html
+    assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
-    assert "· 0.59× · liq" in html  # the header
+    # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once
+    # the figures exist, else notional over the whole equity.
+    own = f"{lev:g}×" if hasattr(__import__("sleeve_fund.dashboard.trading", fromlist=["x"]), "open_risk") else "0.6×"
+    assert f'class="lev">{own}' in html
     csv = c.get("/exports/trades.csv?sleeve=pp-fund", auth=AUTH)
     assert csv.status_code == 200 and "funding" in csv.text.splitlines()[0] and "98.6" in csv.text
 
@@ -1009,7 +1013,7 @@ def test_a_saved_runs_screen_shows_the_benchmark_its_result_shows(client, monkey
     assert rows[-1]["benchmark"] == pytest.approx(d["benchmark"][-1], abs=0.01)
     screen = c.get(f"/sleeves/{name}", auth=AUTH).text
     bench_ret = d["benchmark"][-1] / 5000 - 1
-    assert f"buy and hold, {label}: {bench_ret * 100:+.1f}%" in screen, screen.split("Since start")[1].split("</button>")[1][:300]
+    assert f"buy-and-hold, {label}: {bench_ret * 100:+.1f}%" in screen  # the Since start tile's title
 
 
 @pytest.mark.sanity
@@ -1050,8 +1054,11 @@ def test_the_book_and_strategy_drawdowns_count_a_loss_from_the_starting_capital(
     book = c.get("/api/book/equity", auth=AUTH).json()
     assert book["start"] == 50_000 and book["equity"] == [40_000, 30_000]
     assert book["drawdown"] == [pytest.approx(0.2), pytest.approx(0.4)]  # from 50,000, not the 40,000 close
-    tile = c.get("/", auth=AUTH).text.split("Drawdown")[1].split("</div></div>")[0]
-    assert "40.0%" in tile and "worst 40.0%" in tile, tile
+    # The tile shows the drawdown; the worst is in its hover title (UI v2: a label and a number only).
+    page = c.get("/", auth=AUTH).text
+    before, after = page.split('<div class="k">Drawdown</div>', 1)
+    tile = before.rsplit('<div class="kpi"', 1)[1] + after.split("</div>")[0]
+    assert "40.0%" in tile and "Worst 40.0%" in tile, tile
     # One strategy whose first mark is already a loss: its chart and figures count it from its starting balance.
     store.create_sleeve(name="late", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})

@@ -1,0 +1,101 @@
+"""The hub's write path into the history store: closed bars, idempotent on (venue, instrument, minute),
+refills never overwrite a stored bar silently, and holes stay holes until refilled."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from sleeve_fund.history import HistoryStore
+
+V, P = "BINANCE", "BTC/USDT"
+
+
+def _rows(start, n, price=100.0):
+    t0 = pd.Timestamp(start, tz="UTC").value
+    return [(t0 + i * 60_000_000_000, price + i, price + i + 0.5, price + i - 0.5, price + i, 1.0) for i in range(n)]
+
+
+def test_live_bars_are_readable_up_to_the_last_closed_minute(tmp_path):
+    store = HistoryStore(tmp_path)
+    res = store.append_bars(V, P, _rows("2026-10-05 12:00", 3), "live")
+    assert (res.written, res.unchanged, res.conflicts) == (3, 0, 0)
+    one = store.read(V, P, 1)
+    # All three minutes are closed, so the newest is read too (stamped at its close, 12:03).
+    assert list(one.index) == list(pd.date_range("2026-10-05 12:01", periods=3, freq="1min", tz="UTC"))
+    cov = store.coverage(V, P)
+    assert cov.closed == cov.last == pd.Timestamp("2026-10-05 12:02", tz="UTC")
+
+
+def test_writing_the_same_bars_again_changes_nothing(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 5), "live")
+    before = store.read(V, P, 1)
+    res = store.append_bars(V, P, _rows("2026-10-05 12:00", 5), "live")
+    assert (res.written, res.unchanged, res.conflicts) == (0, 5, 0)
+    pd.testing.assert_frame_equal(store.read(V, P, 1), before)
+    assert store.provenance(V, P) == []
+
+
+def test_a_refill_never_overwrites_a_live_bar_and_records_the_difference(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 3), "live")
+    other = _rows("2026-10-05 12:01", 1, price=500.0)
+    res = store.append_bars(V, P, other, "refill")
+    assert (res.written, res.unchanged, res.conflicts) == (0, 0, 1)
+    assert store.read(V, P, 1).loc["2026-10-05 12:02", "close"] == 101.0  # the live bar is kept
+    (rec,) = store.provenance(V, P)
+    assert rec["kind"] == "conflict" and rec["source"] == "refill" and rec["minute"].startswith("2026-10-05T12:01")
+    assert rec["stored"][3] == 101.0 and rec["offered"][3] == 500.0
+
+
+def test_a_hole_stays_a_hole_until_refilled(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
+    store.append_bars(V, P, _rows("2026-10-05 12:05", 2, price=105.0), "live")  # 12:02-12:04 missed
+    hole = (pd.Timestamp("2026-10-05 12:02", tz="UTC"), pd.Timestamp("2026-10-05 12:04", tz="UTC"))
+    assert store.gaps(V, P) == [hole]
+    assert store.report(V, P)["missing"] == 3
+    # A 15-minute bar over the hole is incomplete, so it is not served.
+    assert store.read(V, P, 15).empty
+    res = store.append_bars(V, P, _rows("2026-10-05 12:02", 3, price=102.0), "refill")
+    assert res.written == 3 and store.gaps(V, P) == []
+    (rec,) = store.provenance(V, P)
+    assert rec["kind"] == "refill" and rec["minutes"] == 3
+
+
+def test_a_forming_minute_from_the_rest_loader_is_replaced_by_the_closed_bar(tmp_path):
+    store = HistoryStore(tmp_path)
+    idx = pd.date_range("2026-10-05 11:58", periods=3, freq="1min", tz="UTC")
+    store.append(V, P, pd.DataFrame({"open": 90.0, "high": 91.0, "low": 89.0, "close": 90.0, "volume": 1.0},
+                                    index=idx), cursor="c")
+    assert len(store.read(V, P, 1)) == 2  # 12:00 may still be forming
+    res = store.append_bars(V, P, _rows("2026-10-05 12:00", 1), "live")
+    assert (res.written, res.conflicts) == (1, 0)
+    one = store.read(V, P, 1)
+    assert len(one) == 3 and one.iloc[-1]["close"] == 100.0
+    assert store.coverage(V, P).cursor == "c"  # the loader's resume point is untouched
+
+
+def test_bars_cross_a_month_boundary(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-09-30 23:58", 4), "live")
+    names = sorted(p.name for p in (tmp_path / V / "BTC-USDT").glob("*.npz"))
+    assert names == ["2026-09.npz", "2026-10.npz"] and len(store.read(V, P, 1)) == 4
+
+
+@pytest.mark.parametrize("bad, why", [
+    ([(pd.Timestamp("2026-10-05 12:00:30", tz="UTC").value, 1, 1, 1, 1, 1)], "whole minutes"),
+    ([(pd.Timestamp("2026-10-05 12:00", tz="UTC").value, 1, 0.5, 1, 1, 1)], "impossible"),
+    ([(pd.Timestamp("2026-10-05 12:00", tz="UTC").value, 1, 1, 1, np.nan, 1)], "missing"),
+    (_rows("2026-10-05 12:00", 1) * 2, "same minute twice"),
+])
+def test_bad_bars_are_refused_and_nothing_is_written(tmp_path, bad, why):
+    store = HistoryStore(tmp_path)
+    with pytest.raises(ValueError, match=why):
+        store.append_bars(V, P, bad, "live")
+    assert store.coverage(V, P) is None
+
+
+def test_source_must_be_live_or_refill(tmp_path):
+    with pytest.raises(ValueError, match="source"):
+        HistoryStore(tmp_path).append_bars(V, P, _rows("2026-10-05 12:00", 1), "rest")

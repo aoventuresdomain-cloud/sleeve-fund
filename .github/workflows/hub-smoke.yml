@@ -1,0 +1,25 @@
+name: hub-smoke
+# Runs on PRs that touch the market data hub, or manually: runs the hub against Kraken's public feed and checks
+# two clients get the same trades, quotes and 1-minute bars. Public data only. No secrets are configured or used.
+on:
+  pull_request:
+    paths:
+      - "sleeve_fund/hub/**"
+      - "scripts/hub_smoke.py"
+      - ".github/workflows/hub-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to run"
+        default: "4"
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: python scripts/hub_smoke.py --venue kraken --pair BTC/USD --minutes "${{ inputs.minutes || '4' }}"

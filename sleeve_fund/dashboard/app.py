@@ -114,6 +114,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["qty"] = _qty
     templates.env.globals["bar_label"] = _bar_label
     templates.env.globals["bar_short"] = _bar_short
+    templates.env.globals["bar_choices"] = _bar_choices
     from sleeve_fund.dashboard.glossary import GLOSSARY
 
     templates.env.globals["glossary"] = GLOSSARY
@@ -129,6 +130,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     def st() -> Store:
         return app.state.store
+
+    def recent_reasons() -> list[dict]:
+        """The PM's own reasons, newest first, for every reason picker's "You used recently" (UI v2, item 9)."""
+        try:
+            return reasons.recent(st().decisions(limit=200))
+        except Exception as exc:  # noqa: BLE001 - an unreadable log leaves the group out, not the dialog
+            logging.getLogger(__name__).warning(f"couldn't read the recent reasons: {exc!r}")
+            return []
+
+    templates.env.globals["recent_reasons"] = recent_reasons
 
     def current_sleeves():
         """The current book's strategies: every one except those an earlier clean slate put away."""
@@ -191,12 +202,22 @@ def create_app(store: Store | None = None) -> FastAPI:
         # journal the strategy pages read. Every strategy in the book counts, archived ones still holding too.
         working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
                    if o["sleeve"] in names]
+        book = bookm.book_view(st(), summaries, frames)
+        positions = trading.book_positions(st(), summaries)
+        funding = trading.book_funding(st(), summaries)
+        # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
+        book["funding_paid"] = -funding["total"]
+        book["fees_funding"] = book.get("costs", book["fees"] - funding["total"])
+        # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
+        if "open_risk" in positions:
+            book.update(margin_used=positions["margin"], open_risk=positions["open_risk"],
+                        unbounded=len(positions["unbounded"]))
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
-                    book=bookm.book_view(st(), summaries, frames), alerts=st().alerts(limit=30), shell=shell(sleeves),
-                    positions=trading.book_positions(st(), summaries), working=working,
-                    book_fills=trading.book_fills(st(), sleeves), funding=trading.book_funding(st(), summaries),
+                    book=book, alerts=st().alerts(limit=30), shell=shell(sleeves),
+                    positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
+                    book_fills=trading.book_fills(st(), sleeves), funding=funding,
                     fill_count=sum(x["fills"] for x in summaries))
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
@@ -325,7 +346,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError:
             hints = _hints()
         return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=hints,
-                    bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
+                    bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
                     pre=dict(request.query_params), accounts=st().accounts(), costs=exit_costs())
 
     @app.post("/sleeves/new")
@@ -333,12 +354,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         form = dict(await request.form())
         try:
             name = str(form.get("name", "")).strip()
-            reason = str(form.get("reason", "")).strip()
+            reason = reasons.from_form("start", form)
             strategy = str(form.get("strategy", ""))
             if not NAME_RE.match(name):
                 raise ValueError("name: lower-case letters, digits and dashes, 2 to 41 characters")
             if not reason:
                 raise ValueError("a reason is required")
+            _check_listed(st(), str(form.get("venue") or "") or None, str(form.get("instrument", "")))
             params = _form_params(form, strategy)
             tested = str(form.get("tested_bar_spec") or BACKTEST_BAR_SPEC)
             if form.get("from") == "backtest" and form.get("bar_spec") != tested:
@@ -419,7 +441,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
         path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
                                                                      s.params), st().accounts(), utcnow())
+        # The Overview's Position table is the Portfolio's, one row; Open orders lists working orders only.
+        positions = trading.book_positions(st(), [x])
+        working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
+        fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
@@ -488,13 +515,29 @@ def create_app(store: Store | None = None) -> FastAPI:
         return JSONResponse(data)
 
     @app.get("/api/instruments")
-    def instruments_json(_: str = Depends(require_pm)):
+    def instruments_json(options: bool = False, _: str = Depends(require_pm)):
         from sleeve_fund.dashboard import charts
 
+        if options:  # the forms' instrument pick-list: every venue's listing, grouped, with a history badge
+            return JSONResponse({"options": instrument_options(st(), charts.instruments)})
         try:
             return JSONResponse({"instruments": charts.instruments(), "source": "venue"})
         except (OSError, ValueError, KeyError):  # venue unreachable: the usual ones, and any other can still be typed
             return JSONResponse({"instruments": _hints(), "source": "fallback"})
+
+    @app.get("/api/history/coverage")
+    def history_coverage_json(venue: str | None = None, _: str = Depends(require_pm)):
+        """Each instrument's stored history on a venue, for the pick-list's badges (UI v2, items 9 and 10): first
+        and last candle, gaps, and the badge's state and words. An instrument not listed reads "not stored yet"."""
+        try:
+            profile = _research_venue(venue)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return JSONResponse({"venue": profile.name.lower(), "instruments": [
+            {"pair": h["pair"], "first": h["first"].isoformat() if h["first"] is not None else None,
+             "last": h["last"].isoformat() if h["last"] is not None else None,
+             "gaps": [[a.isoformat(), b.isoformat()] for a, b in h["gaps"]], **h["badge"]}
+            for h in _stored_history(st(), profile)]})
 
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, days: int | None = None, _: str = Depends(require_pm)):
@@ -740,7 +783,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
-    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None, collect: str = "",
+    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None,
                       notice: str = "", tab: str | None = None):
         """Research: Development (a plan per model and the study form), Results and History. Every venue's
         stored history is on the page, so a study's venue changes in place (no reload)."""
@@ -763,13 +806,19 @@ def create_app(store: Store | None = None) -> FastAPI:
         for v in venue_choices():
             vp = _research_venue(v["key"])
             stored = _stored_history(st(), vp)
-            stored_all += [dict(h, venue=vp.label, venue_key=v["key"]) for h in stored]
+            stored_all += [dict(h, venue=vp.label, venue_key=v["key"], perpetual=vp.perpetual, chip=dev.history_chip(h))
+                           for h in stored]
             venues.append(dict(v, fee=float(resolve_fees(vp.name, st()).fees.taker),
                                suggest=[h["pair"] for h in stored] or _hints(vp.name),
                                held={h["pair"]: dev.history_chip(h) for h in stored}))
         here = next(v for v in venues if v["key"] == values["venue"])
         if not values.get("instrument"):
             values["instrument"] = "BTC/USD" if "BTC/USD" in here["suggest"] else here["suggest"][0]
+        # Study windows sized to the stored history, unless the form came back with its own (UI v2, item 8).
+        held = here["held"].get(str(values["instrument"]).upper())
+        fitted, fit_text = dev.fit_windows(values, held.get("days") if held else None)
+        if not any(k in pre for k in ("train_days", "test_days", "holdout_days")):
+            values.update(fitted)
         ledger = IdeaLedger(LEDGER)
         spent = {f"{idea}|{base}": opened_words(e) for (idea, base), e in ledger.holdouts().items()}
         # What the study panel's script needs to switch model and venue in place.
@@ -779,10 +828,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                                  for v in venues}}
         return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
                     chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
-                    stages=pipeline.STAGES, job=job, error=error, notice=notice, collect=collect,
-                    tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent,
+                    stages=pipeline.STAGES, job=job, error=error, notice=notice,
+                    tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent, fit_text=fit_text,
                     profiles=PROFILES,
-                    study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True),
+                    study_candles=[(m, "1d" if m == 1440 else f"{m // 60}h" if m % 60 == 0 else f"{m}m")
+                                   for m in study_run.STUDY_MINUTES],
+                    costs=exit_costs(backtest=True),
                     how=dev.how_sentence(values), exits=dev.exits_sentence(values),
                     breakeven_text=dev.breakeven_text, candle_words=dev.candle_words)
 
@@ -804,14 +855,23 @@ def create_app(store: Store | None = None) -> FastAPI:
             req.validate()
         except (ValueError, KeyError) as exc:
             return research_page(request, error=str(exc), pre=form)
-        # No history yet: say so now, with the way to get it, rather than from a failed job (R8-M6).
+        from sleeve_fund.dashboard import development as dev
+
+        # No history yet: say so now rather than from a failed job (R8-M6). There is no Collect button (UI v2,
+        # item 10): a study on an instrument not stored yet asks the collector for it itself.
         profile = _research_venue(req.venue)
         held = next((h for h in _stored_history(st(), profile) if h["pair"] == req.pair), None)
         if held is None or held["first"] is None:
-            label = profile.label
-            why = (f"{req.pair}'s history was asked for on {held['requested']:%d %b %Y}; the collector hasn't stored "
-                   "any yet." if held else f"there is no stored {label} history for {req.pair} yet.")
-            return research_page(request, error=why, pre=form, collect="" if held else req.pair)
+            if held:
+                why = f"{req.pair}: being filled · the study waits until some is stored."
+            else:
+                try:
+                    why = f"{req.pair}: not stored yet. {_ask_history(profile, req.pair)}"
+                except ValueError as exc:
+                    why = f"{req.pair}: not stored yet, and the collector wasn't asked: {exc}"
+            return research_page(request, error=why, pre=form)
+        if why := dev.blocked_by_gaps(req.pair, held["gaps"]):
+            return research_page(request, error=why, pre=form)
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
@@ -840,43 +900,46 @@ def create_app(store: Store | None = None) -> FastAPI:
         if str(form.get("strategy", "")) in REGISTRY:
             here["strategy"] = str(form["strategy"])
         try:
-            if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
-                raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
-                                 f"like {_hints(profile.name)[0]}")
-            held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
-                        None)
-            if held is not None:
-                return page_(pre=here, notice=(
-                    f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
-                    f"({held['state']}); the collector keeps it current, and a study can run on it now."))
-            if pair in profile.core_pairs:
-                # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
-                # a request would change nothing, and its "from five years back" would misstate where it starts.
-                return page_(pre=here, notice=(
-                    f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
-                    "kept current, and this list shows how far it has got."))
-            if profile.minute_loader is None:
-                raise ValueError(f"{profile.label} has no history loader")
-            if profile.check_listed is not None:
-                try:
-                    profile.check_listed(pair)
-                except ValueError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - venue unreachable
-                    # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
-                    # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
-                    logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
-                    raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
-                                     "for; try again when the venue answers") from None
+            notice = _ask_history(profile, pair)
         except ValueError as exc:
             # No button to ask again: the same request would be refused the same way.
             return page_(error=str(exc), pre=here)
+        return page_(pre=here, notice=notice)
+
+    def _ask_history(profile, pair: str) -> str:
+        """Ask the history collector to store an instrument, and say what happened; ValueError when it can't be
+        asked for. From the history request and from a study on an instrument not stored yet."""
+        if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
+            raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
+                             f"like {_hints(profile.name)[0]}")
+        held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
+                    None)
+        if held is not None:
+            return (f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
+                    f"({held['state']}); the collector keeps it current, and a study can run on it now.")
+        if pair in (profile.core_pairs or CORE_PAIRS):
+            # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
+            # a request would change nothing, and its "from five years back" would misstate where it starts.
+            return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+                    "kept current, and this list shows how far it has got.")
+        if profile.minute_loader is None:
+            raise ValueError(f"{profile.label} has no history loader")
+        if profile.check_listed is not None:
+            try:
+                profile.check_listed(pair)
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - venue unreachable
+                # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
+                # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
+                logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
+                raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                                 "for; try again when the venue answers") from None
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
-        notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
-                  "A study can run once some is stored; this list shows how far it has got."
-                  if new else f"{pair} was already asked for; this list shows how far the collector has got.")
-        return page_(pre=here, notice=notice)
+        return (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
+                "A study can run once some is stored; this list shows how far it has got."
+                if new else f"{pair} was already asked for; this list shows how far the collector has got.")
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -1325,12 +1388,26 @@ def _backtest_args(q) -> dict:
         if pair not in have:
             raise ValueError(f"interval: {pair} has no stored minute history here, so it can only be backtested on "
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
+    _check_gaps(venue, pair)
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
              f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
              f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
             "risk_profile": q.get("risk_profile") or "balanced", "title": title, "bar_spec": bar_spec}
+
+
+def _check_gaps(venue: str, pair: str) -> None:
+    """A backtest waits while the instrument's stored history has gaps (UI v2, item 10), with the badge's words."""
+    from sleeve_fund.dashboard import development as dev
+    from sleeve_fund.history import HistoryStore
+
+    try:
+        gaps = HistoryStore().gaps(venue, pair)
+    except OSError:  # an unreadable store: the run itself says what failed
+        return
+    if why := dev.blocked_by_gaps(pair, gaps):
+        raise ValueError(why)
 
 
 def _stored(venue: str | None = None) -> list[dict]:
@@ -1406,10 +1483,58 @@ def venue_choices() -> list[dict]:
             for v in VENUES.values() if v.data_client is not None or v.minute_loader is not None]
 
 
+def _check_listed(store: Store, venue: str | None, pair: str) -> None:
+    """A typed instrument ("Use '…' as typed") is asked of the venue before a strategy can start on it (UI v2,
+    item 9). The usual, stored and already-listed ones need no question. Raises ValueError in words for the page."""
+    from sleeve_fund.dashboard import charts
+
+    pair = pair.strip().upper()
+    profile = _research_venue(venue)
+    if not PAIR_RE.fullmatch(pair):
+        raise ValueError(f"instrument: write it as BASE/QUOTE, for example {_hints(profile.name)[0]}")
+    listed = charts._listed.get(profile.name, (0, []))[1]
+    if pair in {*_hints(profile.name), *INSTRUMENT_HINTS, *listed} or profile.check_listed is None:
+        return
+    if any(h["pair"] == pair for h in _stored_history(store, profile)):
+        return
+    try:
+        profile.check_listed(pair)
+    except ValueError:
+        raise ValueError(f"instrument: the venue doesn't list {pair}; pick one from the list") from None
+    except Exception as exc:  # noqa: BLE001 - venue unreachable
+        logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
+        raise ValueError(f"instrument: couldn't reach the venue to check it lists {pair}; try again, or pick one "
+                         "from the list") from None
+
+
+def instrument_options(store: Store, listing=None) -> list[dict]:
+    """Every instrument the venues offer, for the forms' instrument pick-list (UI v2, item 9): perpetuals
+    first, then spot, each with its history badge. A venue whose listing can't be fetched offers what its
+    history store keeps. Labels say perpetual or spot, never the venue's name; `venue` is the form value."""
+    from sleeve_fund.dashboard import development as dev
+
+    out = []
+    for v in sorted(venue_choices(), key=lambda v: not v["perpetual"]):
+        stored = {h["pair"]: dev.history_chip(h) for h in _stored_history(store, _research_venue(v["key"]))}
+        try:
+            listed = list(listing(venue=v["key"])) if listing else []
+        except Exception as exc:  # noqa: BLE001 - venue unreachable: the stored and usual ones, any other typed
+            logging.getLogger(__name__).info(f"couldn't list {v['label']}'s instruments: {exc!r}")
+            listed = []
+        kind = "perpetual" if v["perpetual"] else "spot"
+        pairs = list(dict.fromkeys([*stored, *v["pairs"], *sorted(listed)]))
+        out += [{"value": p, "venue": v["key"], "group": "Perpetuals" if v["perpetual"] else "Spot",
+                 "label": f"{p} {kind}", "badge": stored[p]["text"] if p in stored else "not stored yet",
+                 "tone": stored[p]["tone"] if p in stored else "", "stored": p in stored} for p in pairs]
+    return out
+
+
 def _stored_history(store: Store, profile=None) -> list[dict]:
-    """Each instrument research can use or has asked for, on the research venue: what is stored, and
-    whether the collector is current or still catching up. One unreadable series (a coverage file being
-    rewritten, say) is left out and logged rather than taking the Research page down with it."""
+    """Each instrument research can use or has asked for, on the research venue: what is stored, whether
+    the collector is current or still catching up, any gaps, and the badge that says so. One unreadable
+    series (a coverage file being rewritten, say) is left out and logged rather than taking the Research
+    page down with it."""
+    from sleeve_fund.dashboard import development as dev
     from sleeve_fund.history import HistoryStore
 
     profile = profile or _research_venue()
@@ -1432,17 +1557,24 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             continue
         try:
             cov = hist.coverage(v, pair)
-            first, last = cov.first, cov.last
+            # The last candle is the newest the store records as closed, once the hub writes (append_bars);
+            # the REST loader's newest minute may still be forming.
+            first, last = cov.first, cov.closed if cov.closed is not None else cov.last
             if last.tzinfo is None:  # stored without a zone: UTC, as the collector writes it
                 first, last = first.tz_localize("UTC"), last.tz_localize("UTC")
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
+            gaps = hist.gaps(v, pair)
+            kinds = [e.get("kind") for e in hist.provenance(v, pair)]
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
-        out.append({"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
-                    "state": "catching up" if behind else "current"})
+        row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
+               "state": "catching up" if behind else "current", "gaps": gaps,
+               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict")}
+        out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
-    out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for"}
+    out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],
+             "badge": dev.history_badge({"first": None})}
             for p, r in asked.items() if p not in held]
     return sorted(out, key=lambda h: h["pair"])
 
@@ -1556,6 +1688,8 @@ def _chart_pairs(home: str, book: list[str]) -> list[str]:
 def _risk_view(x: dict, position: dict | None = None) -> dict:
     p = x["profile"]
     stop_px = position["stop_px"] if position else None
+    margin = position.get("margin", 0.0) if position else 0.0
+    margin_cap = p.max_position_pct * max(x.get("equity", 0.0), 0.0)
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
@@ -1563,6 +1697,10 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
         "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
+        "margin": margin,
+        "margin_cap": margin_cap,
+        "margin_used": min(margin / margin_cap, 1.0) if margin_cap > 0 else 0.0,
     }
 
 
@@ -1675,6 +1813,17 @@ def _price_feed(s, seen) -> dict:
 def _bar_short(spec: str) -> str:
     step, unit = spec.split("-")[:2]
     return f"{step}{ {'SECOND': 's', 'MINUTE': 'm', 'HOUR': 'h', 'DAY': 'd'}.get(unit, unit.lower())} bars"
+
+
+def _bar_choices(specs) -> list[tuple[str, str]]:
+    """Candle-length chips: "15m", "1h"; the venue's own hourly candles say so beside the ones built from trades."""
+    out = []
+    for spec in specs:
+        step, unit, _, source = spec.split("-")
+        text = f"{step}{ {'SECOND': 's', 'MINUTE': 'm', 'HOUR': 'h', 'DAY': 'd'}.get(unit, unit.lower())}"
+        twin = sum(1 for o in specs if o.split("-")[:2] == [step, unit]) > 1
+        out.append((spec, f"{text} venue" if twin and source == "EXTERNAL" else text))
+    return out
 
 
 def _bar_label(spec: str) -> str:

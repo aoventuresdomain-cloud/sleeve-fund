@@ -10,6 +10,10 @@ DASHBOARD_PASSWORD=e2e-dash-pw
 SITE_ADDRESS=localhost
 ENV
 trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker compose down -v' EXIT
+# The server's volumes predate the non-root image: root-owned, with folders a root process made.
+# Start from that, so the run proves volume-init hands them to the image's user.
+docker compose run --rm --no-deps --build --entrypoint sh volume-init \
+  -c 'mkdir -p /data/history/BINANCE /data/research/tearsheets && chown -R 0:0 /data/history /data/research'
 docker compose up -d --build
 q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
 # The supervisor applies configs/clear.toml before it starts; a strategy added before that is put away
@@ -53,6 +57,29 @@ echo "dashboard: with password $CODE, without $NOAUTH"
 [ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
+# The history stores can write their venue folders (they refuse to start, in one line, when they can't).
+# The hub is run once rather than exec'd: it restarts while the runner can't reach its venue.
+for svc in history hub-binance; do
+  if [ "$svc" = history ]; then run="exec -T"; else run="run --rm -T --no-deps"; fi
+  docker compose $run "$svc" python -c "
+import sys
+from pathlib import Path
+from sleeve_fund.history import unwritable
+problem = unwritable(Path('/data/history/BINANCE'))
+print(problem or 'history store writable')
+sys.exit(1 if problem else 0)" || { docker compose logs --no-color --tail 20 volume-init "$svc"; echo "FAIL: $svc can't write the history store"; exit 1; }
+done
+# And the dashboard its tear sheets (Research writes them there).
+docker compose exec -T dashboard python -c "
+import os, sys
+from pathlib import Path
+from sleeve_fund.history import unwritable
+problem = unwritable(Path(os.environ['TEARSHEET_DIR']))
+print(problem or 'tear sheets writable')
+sys.exit(1 if problem else 0)" || { echo "FAIL: the dashboard can't write its tear sheets"; exit 1; }
+if docker compose logs --no-color dashboard | grep -q "couldn't bring the repository's research"; then
+  echo "FAIL: the dashboard couldn't copy the repository's research into its volume"; exit 1
+fi
 # Quotes put the venue's bid and ask in the paper book, so fills pay the spread as they would for real.
 QUOTED=$(docker compose logs --no-color supervisor | grep -c "first quote: bid" || true)
 echo "sleeves receiving live quotes: $QUOTED"

@@ -61,7 +61,7 @@ def test_create_sleeve_and_control_it(client):
     page = c.get("/sleeves/btc-test", auth=AUTH)
     assert page.status_code == 200 and "Flatten" in page.text
     # Listed under Portfolio in the rail, marked as the page you're on, with trades and orders as its tabs.
-    assert 'href="/sleeves/btc-test" aria-current=page' in page.text and 'data-tab="orders"' in page.text
+    assert 'href="/sleeves/btc-test" aria-current=page' in page.text and 'data-sub="history"' in page.text
     assert c.get("/api/sleeves/btc-test/equity", auth=AUTH).json()["equity"] == [5100.0]
 
     r = c.post("/sleeves/btc-test/command", data={"command": "flatten", "reason": "testing"}, auth=AUTH,
@@ -88,7 +88,7 @@ def test_exits_entered_as_percent_and_stats_shown(client):
 
 def test_any_asset_pair_can_be_chosen(client):
     c, store = client
-    assert 'list="pairs"' in c.get("/sleeves/new", auth=AUTH).text
+    assert 'role="combobox"' in c.get("/sleeves/new", auth=AUTH).text  # the instrument pick-list
     r = _new(c, name="sui-trend", instrument="sui/usd")
     assert r.status_code == 303 and store.sleeve("sui-trend").instrument == "SUI/USD"
 
@@ -156,14 +156,15 @@ def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
     store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
     store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
     page = c.get("/", auth=AUTH).text
-    for text in ("Book equity", "Month to date", "Gross exposure", "Allocation", "price feed quiet"):
+    for text in ("Book value", "Month to date", "Allocation and top", "Needs you", "price feed quiet"):
         assert text in page
     alert = store.alerts()[0]
     r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/"
     assert store.open_alert_count() == 0 and store.alerts(include_acked=True)[0]["ack_note"] == "seen"
-    assert "price feed quiet" not in c.get("/", auth=AUTH).text
+    after = c.get("/", auth=AUTH).text
+    assert "price feed quiet" not in after and 'class="needs-you"' not in after  # the bar goes once nothing waits
     assert "seen" in c.get("/alerts?show=all", auth=AUTH).text
 
 
@@ -575,7 +576,7 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
     assert 'value="ETH/USD"' in form and 'name="p_trend_filter__fast" value="5"' in form and "From backtest." in form
     assert '<input type="hidden" name="bar_spec" value="1-DAY-LAST-EXTERNAL">' in form
-    assert '<select id="bar_spec" disabled>' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
+    assert 'name="bar_spec_shown" value="1-DAY-LAST-EXTERNAL" checked disabled' in form and 'name="warmup_bars" type="number" min="0" max="50000" value="40"' in form
 
 
 def test_sleeve_from_a_backtest_cannot_change_its_interval(client):
@@ -617,10 +618,10 @@ def test_backtest_explains_bad_settings(client, monkeypatch, query, msg):
 
 def test_new_sleeve_errors_keep_what_was_typed(client):
     c, _ = client
-    r = _new(c, name="BAD NAME", reason="testing keeps fields")
+    r = _new(c, name="BAD NAME", reason_pick="Other", reason_note="testing keeps fields")
     assert r.status_code == 303
     form = c.get(r.headers["location"], auth=AUTH).text
-    assert "Not saved" in form and 'value="testing keeps fields"' in form
+    assert "Not saved" in form and ">testing keeps fields</textarea>" in form and 'value="Other" required checked' in form
 
 
 def test_accounts_page_adds_live_accounts_and_shows_key_presence_only(client, monkeypatch):
@@ -703,7 +704,7 @@ def test_price_chart_marks_fills_with_reasons_and_falls_back_to_marks(client, mo
     assert [m["text"] for m in d["markers"]] == ["", "Stop", ""]  # only the forced exit is labelled
     notes = list(d["notes"].values())
     assert notes[1]["reason"].startswith("Stop-loss: price 92") and notes[2]["reason"] == "RSI 25.1 below 30"
-    assert {ln["title"] for ln in d["lines"]} == {"Entry", "Stop"} and d["lines"][0]["price"] == 90
+    assert {ln["title"] for ln in d["lines"]} == {"Entry", "SL"} and d["lines"][0]["price"] == 90
 
     now = pd.Timestamp.now(tz="UTC").floor("h")
     kraken = pd.DataFrame({"open": [1.0, 2.0], "high": [2.0, 3.0], "low": [0.5, 1.5], "close": [2.0, 2.5],
@@ -762,7 +763,7 @@ def test_position_tab_is_compact_with_reason_folded(client):
     store.record_fill("sol-x", side="BUY", qty=10, price=90, fee=0.72, order_id="O-1", trade_id="t1")
     store.record_equity("sol-x", equity=10_049.28, cash=9_099.28, qty=10, price=95, benchmark=10_000)
     page = c.get("/sleeves/sol-x", auth=AUTH).text
-    tab = page[page.index('id="tab-positions"'):page.index('id="tab-trades"')]
+    tab = page[page.index('id="tab-positions"'):page.index('id="tab-activity"')]
     for label in ("Size", "Quantity", "Notional", "Share of equity", "Entry", "Stop-loss", "Take-profit", "Unrealised", "Realised", "Total"):
         assert f">{label}<" in tab or f">{label} " in tab, label
     assert "10 SOL" in tab and "950.00 USD" in tab  # quantity in the instrument and notional in the quote
@@ -794,14 +795,14 @@ def test_fetch_kraken_ohlc_keeps_the_forming_candle_and_uses_open_times():
 
 
 def test_every_headline_figure_explains_itself(client):
-    from sleeve_fund.dashboard.glossary import GLOSSARY
-
     c, store = client
     _new(c)
-    for path in ("/", "/sleeves/btc-test", "/trades"):
+    for path in ("/sleeves/btc-test", "/trades"):
         page = c.get(path, auth=AUTH).text
         assert 'class="help"' in page and 'aria-label="What does this mean?"' in page
-    assert GLOSSARY["drawdown"] in c.get("/", auth=AUTH).text
+    # Portfolio's tiles are a label and a number; the detail is each tile's hover title (UI v2, PM 5 Oct).
+    kpis = c.get("/", auth=AUTH).text.split('aria-label="Book figures">')[1].split("</section>")[0]
+    assert kpis.count('<div class="kpi') == kpis.count('title="') == 8 and 'class="s"' not in kpis
 
 
 def test_clone_with_changes_prefills_the_new_sleeve_form(client):
@@ -1085,7 +1086,7 @@ def test_backtest_runs_on_hourly_and_minute_bars_from_the_history_store(client, 
          "&p_trend_filter__slow=20&bar_spec=1-HOUR-LAST-INTERNAL")
     page = c.get(q, auth=AUTH).text
     assert "Couldn't run it" not in page
-    assert 'value="1-HOUR-LAST-INTERNAL" selected' in page
+    assert 'value="1-HOUR-LAST-INTERNAL" checked' in page
     assert "bar_spec=1-HOUR-LAST-INTERNAL" in page and "tested_bar_spec=1-HOUR-LAST-INTERNAL" in page
     d = preview.run("trend_filter", "ETH/USD", {"fast": 5, "slow": 20}, minutes=1, detail=True)
     assert d["minutes"] == 1 and d["bars"] > 20 * 1400 and d["trades"]["trades"] > 0
@@ -1356,7 +1357,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     assert r.status_code == 303 and r.headers["location"].startswith("/research?job=")
     job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
     running = c.get(r.headers["location"], auth=AUTH).text
-    assert 'id="study-job"' in running and 'value="240" selected' in running  # the form shows what is running
+    assert 'id="study-job"' in running and 'value="240" checked' in running  # the form shows what is running
     for _ in range(600):
         j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
         if j["status"] not in ("queued", "running"):
@@ -1378,10 +1379,11 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     assert f'/research/{first}"' in listing and f'/research/{j["run_id"]}"' in listing
     assert "exits: the signal only" in listing and "exits: stop-loss 5.0% below entry" in listing
     assert (tmp_path / "idea_ledger.jsonl").exists()  # counted in the server's ledger, not the repository's
-    # Missing history is said on the page at once, with the way to get it, and starts no job (R8-M6).
+    # Missing history is said on the page at once with its badge, and starts no job (R8-M6); no Collect
+    # button (UI v2, item 10): a core instrument is stored from its listing anyway.
     r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
-    assert r.status_code == 200 and "there is no stored Kraken spot history for SOL/USD yet" in r.text
-    assert 'name="instrument" value="SOL/USD"><input type="hidden" name="venue" value="kraken"><button>Collect SOL/USD history</button>' in r.text
+    assert r.status_code == 200 and "SOL/USD: not stored yet. SOL/USD is on the collector&#39;s core list" in r.text
+    assert ">Collect" not in r.text and "collect-study" not in r.text
 
 
 def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypatch):
@@ -1403,10 +1405,10 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
 
     monkeypatch.setattr(KRAKEN, "check_listed", check)
     page = c.get("/research", auth=AUTH).text
-    assert 'data-panel="history"' in page and "Collect another instrument" in page
-    assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?Catching up", page, re.S)
-    assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?Current", page, re.S)
-    assert '<option value="ETH/USD">' in page and '<option value="SUI/USD">' not in page  # suggests what is stored
+    # Data coverage is read-only (UI v2, item 8): what is stored, and how far along it is.
+    assert 'data-panel="history"' in page and "Collect another instrument" not in page
+    assert re.search(r"<td data-label=\"Instrument\">BTC/USD</td>.*?being filled", page, re.S)
+    assert re.search(r"<td data-label=\"Instrument\">ETH/USD</td>.*?stored · last candle \d\d:\d\d · no gaps", page, re.S)
     # Another site can't ask, an unlisted instrument is refused, and a listed one is queued once.
     assert c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH,
                   headers={"Origin": "https://evil.example"}).status_code == 403
@@ -1414,7 +1416,7 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     assert "Kraken does not list FOO/USD" in bad.text and not store.history_requests("KRAKEN")
     ok = c.post("/research/history", data={"instrument": "ada/usd"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for ADA/USD: it backfills from" in ok.text
-    assert re.search(r"ADA/USD</td>.*?Asked for", ok.text, re.S)
+    assert re.search(r"ADA/USD</td>.*?being filled", ok.text, re.S)
     (req,) = store.history_requests("KRAKEN")
     assert req["instrument"] == "ADA/USD" and 5 * 365 - 2 <= (utcnow() - req["since"]).days <= 5 * 365 + 1
     again = c.post("/research/history", data={"instrument": "ADA/USD"}, auth=AUTH, headers=SAME)
@@ -1438,12 +1440,20 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
     core = c.post("/research/history", data={"instrument": "sol/usd"}, auth=AUTH, headers=SAME)
     assert "SOL/USD is on the collector&#39;s core list for Kraken spot: it is stored from its listing" in core.text
     assert len(store.history_requests("KRAKEN")) == 1
-    # A study on it before anything is stored says so, without offering to ask again.
+    # A study on it before anything is stored says so with its badge, without asking again.
     form = {"strategy": "buy_and_hold", "instrument": "ADA/USD", "minutes": "240", "train_days": "60",
             "test_days": "30", "holdout_days": "0"}
     r = c.post("/research/run", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
-    assert r.status_code == 200 and "ADA/USD&#39;s history was asked for on" in r.text
-    assert "Collect ADA/USD history</button>" not in r.text
+    assert r.status_code == 200 and "ADA/USD: being filled · the study waits until some is stored." in r.text
+    assert len(store.history_requests("KRAKEN")) == 1
+    # A study on a listed instrument nobody asked for asks the collector itself: no Collect button (item 10).
+    monkeypatch.setattr(KRAKEN, "check_listed", check)
+    listed.add("DOT/USD")
+    r = c.post("/research/run", data={**form, "instrument": "DOT/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 200 and "DOT/USD: not stored yet. Asked the collector for DOT/USD" in r.text
+    assert [q["instrument"] for q in store.history_requests("KRAKEN")] == ["ADA/USD", "DOT/USD"]
+    r = c.post("/research/run", data={**form, "instrument": "FOO/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "FOO/USD: not stored yet, and the collector wasn&#39;t asked: Kraken does not list FOO/USD" in r.text
 
 
 def test_the_form_and_the_backtest_refuse_a_thin_target_at_the_same_round_trip(client, monkeypatch):
@@ -1868,7 +1878,7 @@ def test_the_research_form_knows_which_holdouts_are_spent(client, tmp_path):
     assert list(spent) == ["trend_filter|kraken-btcusd-store"]
     assert spent["trend_filter|kraken-btcusd-store"].endswith(", on daily bars")
     # The page script keys a spent holdout by the venue picked in the study, which switches in place.
-    assert '<input type="radio" name="venue" value="kraken" checked>' in page and "${venue()}-${pair}-store" in page
+    assert 'name="venue" value="kraken" data-pl-venue' in page and "${venue()}-${pair}-store" in page
 
 
 def test_sub_dollar_numbers_read_in_full(client):
@@ -2088,21 +2098,21 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     monkeypatch.setattr(venue("binance"), "check_listed", lambda pair: None)
     # The study's venue is picked in place (no reload); History lists every venue's stored instruments.
     page = c.get("/research?venue=binance", auth=AUTH).text
-    assert '<input type="radio" name="venue" value="binance" checked>' in page and "data-reload" not in page
-    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>Binance USD-M perpetuals</td>', page)
-    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>Kraken spot</td>', page)
-    assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
+    assert 'name="venue" value="binance" data-pl-venue' in page and "data-reload" not in page
+    assert re.search(r'<td data-label="Instrument">SOL/USDT</td>\s*<td[^>]*>perpetual</td>', page)
+    assert re.search(r'<td data-label="Instrument">ETH/USD</td>\s*<td[^>]*>spot</td>', page)
+    assert "A perpetual is studied long only" in page and "Binance" not in page.split('id="tab-history"')[1].split("</section>")[0]
     kraken = c.get("/research?venue=kraken", auth=AUTH).text
-    assert '<input type="radio" name="venue" value="kraken" checked>' in kraken and "run spot, long only" in kraken
+    assert 'name="venue" value="kraken" data-pl-venue' in kraken and "Spot is studied long only" in kraken
     asked = c.post("/research/history", data={"instrument": "doge/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
     assert "Asked the collector for DOGE/USDT" in asked.text and not store.history_requests("KRAKEN")
     assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["DOGE/USDT"]
     none = c.post("/research/run", data={"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance",
                                          "minutes": "1440", "risk_profile": "balanced"}, auth=AUTH, headers=SAME)
-    assert "no stored Binance USD-M perpetuals history for BTC/USDT" in none.text
+    assert "BTC/USDT: not stored yet." in none.text
 
     bt = c.get("/backtest?venue=binance", auth=AUTH).text
-    assert '<option value="binance" selected' in bt and '<option value="BTC/USDT">' in bt
+    assert 'name="venue" value="binance" data-pl-venue' in bt and 'value="BTC/USDT"' in bt
     q = {"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance", "bar_spec": "1-DAY-LAST-EXTERNAL"}
     with pytest.raises(ValueError, match="perpetuals only"):
         _backtest_args(q)

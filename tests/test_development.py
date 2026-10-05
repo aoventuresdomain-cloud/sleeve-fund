@@ -97,7 +97,7 @@ def test_the_development_tab_lists_every_model_with_its_status(client):
     (tmp / "trend_filter_kraken-btcusd-store-1440m_20261005-110000.md").write_text(
         _sheet("trend_filter", "PASS", venue="KRAKEN", pair="BTC/USD", minutes=1440, ladder=(9, 8, 7, 6, 2)))
     page = c.get("/research", auth=AUTH).text
-    by_model = {m: st for st, m in re.findall(r'<li data-status="(\w+)"><a class="plan-card" href="[^"]*" data-plan="(\w+)"', page)}
+    by_model = {m: st for st, m in re.findall(r'<li data-status="(\w+)" data-search="[^"]*"><a class="plan-row" href="[^"]*" data-plan="(\w+)"', page)}
     assert by_model == {"rsi_cross": "ready", "trend_filter": "passed", "rsi_bands": "killed",
                                   "buy_and_hold": "untested", "ping_pong": "untested", "rsi_pullback": "untested",
                                   "dip_buy": "untested", "donchian": "untested"}
@@ -128,12 +128,12 @@ def test_rsi_cross_comes_with_research_recommended_settings(client):
     page = c.get("/research?strategy=rsi_cross", auth=AUTH).text
     assert "15-minute candles. Learn on 2 years, test on the next year. Latest year sealed." in page
     assert "Recommended by research" in page and "<b>Answers:</b> Does buying after a sharp 15-minute dip" in page
-    assert '<option value="15" selected>' in page and 'value="730"' in page and 'name="stop_atr"' in page
-    assert '<input type="radio" name="venue" value="binance" checked>' in page and 'value="BTC/USDT"' in page
-    assert "Runs 4 variants and the cost ladder at 0.05% (Binance USD-M perpetuals taker fee). Long only." in page
+    assert 'name="minutes" value="15" checked' in page and 'value="730"' in page and 'name="stop_atr"' in page
+    assert 'name="venue" value="binance" data-pl-venue' in page and 'value="BTC/USDT"' in page
+    assert "Runs 4 variants and the cost ladder at 0.05% (the venue's taker fee). Long only." in page
     other = c.get("/research?strategy=trend_filter", auth=AUTH).text
     assert "Daily candles. Learn on 1 year, test on the next 180 days. Latest year sealed." in other
-    assert dev.GENERIC_WHY.replace("'", "&#39;") in other and '<input type="radio" name="venue" value="kraken" checked>' in other
+    assert dev.GENERIC_WHY.replace("'", "&#39;") in other and 'name="venue" value="kraken" data-pl-venue' in other
 
 
 def test_a_form_sent_back_keeps_what_was_sent_and_only_for_its_model():
@@ -152,15 +152,16 @@ def test_every_venue_s_history_is_on_the_page_for_the_study_to_switch_in_place(c
     _coverage(tmp, "KRAKEN", "ETH/USD", "2016-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00")
     page = c.get("/research", auth=AUTH).text
     data = json.loads(re.search(r'<script type="application/json" id="study-data">(.*?)</script>', page, re.S).group(1))
-    assert data["venues"]["binance"]["held"]["BTC/USDT"] == {"text": "77.3 years stored · current", "tone": "running"}
-    assert data["venues"]["kraken"]["held"]["ETH/USD"]["text"] == "Catching up, from 01 Jan 2016"
+    held = data["venues"]["binance"]["held"]["BTC/USDT"]
+    # The item 10 badge: coverage with no candles behind it reads as one gap, which holds a study back.
+    assert held["text"] == "1 gap · backtests wait until filled" and held["tone"] == "halted" and held["days"] > 28_000
+    assert data["venues"]["kraken"]["held"]["ETH/USD"]["text"] == "1 gap · backtests wait until filled"
     assert data["plans"]["rsi_cross"]["values"]["minutes"] == 15 and data["plans"]["trend_filter"]["variants"] == 11
-    assert '<span class="chip running" id="hist-chip">77.3 years stored · current</span>' in page
-    assert '<datalist id="pairs-binance"><option value="BTC/USDT">' in page and '<datalist id="pairs-kraken">' in page
-    # History tab: both venues, with the venue named; the collect form picks the venue.
-    assert re.search(r'ETH/USD</td>\s*<td[^>]*>Kraken spot</td>', page)
-    assert re.search(r'BTC/USDT</td>\s*<td[^>]*>Binance USD-M perpetuals</td>', page)
-    assert '<select name="venue" aria-label="Venue" id="collect-venue">' in page
+    assert '<span class="chip halted" id="hist-chip">1 gap · backtests wait until filled</span>' in page
+    # Data coverage: both venues, as perpetual or spot (no venue names), read-only.
+    assert re.search(r'ETH/USD</td>\s*<td[^>]*>spot</td>', page)
+    assert re.search(r'BTC/USDT</td>\s*<td[^>]*>perpetual</td>', page)
+    assert 'id="collect-venue"' not in page
 
 
 def test_get_research_history_never_errors(client):

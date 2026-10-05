@@ -1,4 +1,4 @@
-// Small helpers for the console: sortable tables and the equity/drawdown chart pair.
+// Small helpers for the console: sortable tables, the equity chart and the price chart.
 window.Console = (() => {
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   // Tokens are hex or rgba(); charts need a see-through version of a hex token.
@@ -7,25 +7,7 @@ window.Console = (() => {
     const n = parseInt(c.length === 4 ? c.slice(1).replace(/./g, "$&$&") : c.slice(1, 7), 16);
     return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
   };
-  // A round axis range with about five steps of 1, 2, 2.5 or 5 times a power of ten, padded so lines don't touch the edges.
-  const niceRange = (lo, hi, minPad = 0.5) => {
-    const pad = Math.max((hi - lo) * 0.06, minPad);
-    lo -= pad; hi += pad;
-    const raw = (hi - lo) / 5, mag = 10 ** Math.floor(Math.log10(raw));
-    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
-    return {min: Math.floor(lo / step) * step, max: Math.ceil(hi / step) * step, step};
-  };
-  // A dashed hairline under the cursor, like a trading terminal.
-  const crosshair = {id: "crosshair", afterDatasetsDraw(c) {
-    const a = c.getActiveElements();
-    if (!a.length) return;
-    const x = a[0].element.x, {top, bottom} = c.chartArea, g = c.ctx;
-    g.save(); g.strokeStyle = css("--line-strong"); g.lineWidth = 1; g.setLineDash([3, 3]);
-    g.beginPath(); g.moveTo(x, top); g.lineTo(x, bottom); g.stroke(); g.restore();
-  }};
   const money = new Intl.NumberFormat("en-GB", {maximumFractionDigits: 0});
-  const day = (t) => new Date(t).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "2-digit", timeZone: "UTC"});
-  const minute = (t) => new Date(t).toLocaleString("en-GB", {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "UTC"});
 
   // Listeners sit on the document, so they keep working after live updates replace a panel.
   const once = (key, fn) => { if (!document.documentElement.dataset[key]) { document.documentElement.dataset[key] = "1"; fn(); } };
@@ -90,82 +72,64 @@ window.Console = (() => {
     });
   }
 
-  // Two charts on one time axis: growth on top, drawdown underneath.
-  // By default the top chart shows equity in money, scaled to its own range, so day-to-day growth is
-  // readable. "Compare" rebases equity and buy-and-hold to 0% at the start of the range so the two
-  // share one honest scale. The legend reads out the hovered day: value, change on the day, drawdown.
-  // opts.compare starts in compare mode (the backtest, whose point is the comparison).
+  // Equity over time on TradingView Lightweight Charts: one line against the starting capital (green
+  // above it, red below), and on a strategy or backtest a drawdown strip underneath on the same axis.
+  // A unit switch ([data-unit] value / pct, or the [data-compare] toggle) re-plots the line as % from the
+  // start of the range; in % a strategy or backtest also draws buy-and-hold. The legend reads out the
+  // hovered point: value, change, drawdown. opts.compare starts in % (the backtest, whose point is the
+  // comparison). opts.book is the Portfolio's book chart: no buy-and-hold, no strip, and a book under two
+  // days old opens on 1D so it never shows as a dot.
   function pair(url, eqId, ddId, labels, opts = {}) {
-    const eqEl = document.getElementById(eqId), ddEl = document.getElementById(ddId);
-    if (!eqEl || !window.Chart) return;
+    const eqEl = document.getElementById(eqId), ddEl = ddId ? document.getElementById(ddId) : null;
+    if (!eqEl || !window.LightweightCharts) return;
     const scope = eqEl.closest("section") || document;
-    // url may be the data itself (the backtest page embeds its result) or an endpoint to fetch.
     (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
-      if (!d.t.length) { eqEl.parentElement.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; ddEl.parentElement.remove(); return; }
-      const grid = css("--line"), muted = css("--muted"), faint = css("--faint"), accent = css("--accent");
-      Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
-      Chart.defaults.font.size = 11;
-      const yWidth = (s) => { s.width = 64; };
-      const pctTick = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Number(Math.abs(v).toFixed(Math.abs(v) < 10 ? 1 : 0))}%`;
-      let compare = !!opts.compare, step = 1;
-      const moneyTick = (v) => v.toLocaleString("en-GB", {maximumFractionDigits: step < 1 ? 2 : 0, minimumFractionDigits: step < 1 ? 2 : 0});
-      const base = {
-        maintainAspectRatio: false, animation: false, interaction: {mode: "index", intersect: false},
-        plugins: {legend: {display: false}, tooltip: {enabled: false}},
-      };
-      const fade = (c) => {
-        const {ctx, chartArea} = c.chart;
-        if (!chartArea) return null;
-        const g = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-        g.addColorStop(0, rgba(accent, 0.24)); g.addColorStop(1, rgba(accent, 0));
-        return g;
-      };
-      // Dates under the drawdown chart: one label per week, month or quarter boundary, never a
-      // squeezed row of every other day. tickAt maps a point's index to its label.
-      let tickAt = {};
-      const xTicks = {color: muted, autoSkip: false, maxRotation: 0, padding: 6, align: "center",
-                      callback: (_v, i) => tickAt[i] ?? null};
-      const eq = new Chart(eqEl, {
-        type: "line",
-        data: {labels: [], datasets: [
-          {label: labels[0], data: [], borderColor: accent, backgroundColor: fade, fill: "start", borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, pointHoverBackgroundColor: accent, pointHoverBorderWidth: 0, tension: 0},
-          {label: labels[1], data: [], borderColor: muted, borderWidth: 1.3, borderDash: [3, 3], pointRadius: 0, pointHoverRadius: 3, pointHoverBackgroundColor: muted, tension: 0},
-          {label: "Buys", data: [], showLine: false, pointStyle: "triangle", pointRadius: 4.5, pointHoverRadius: 4.5, pointBackgroundColor: css("--gain"), pointBorderWidth: 0},
-          {label: "Sells", data: [], showLine: false, pointStyle: "triangle", rotation: 180, pointRadius: 4.5, pointHoverRadius: 4.5, pointBackgroundColor: css("--loss"), pointBorderWidth: 0},
-        ]},
-        options: {...base,
-          scales: {x: {display: false},
-                   y: {position: "right", afterFit: yWidth, ticks: {color: muted, padding: 8, callback: (v) => (compare ? pctTick(v) : moneyTick(v))}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
-        plugins: [crosshair],
+      if (!d.t.length) { eqEl.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; if (ddEl) ddEl.remove(); return; }
+      const book = !!opts.book;
+      let pctMode = !!opts.compare;
+      const base = (logo) => ({
+        autoSize: true,
+        layout: {background: {type: "solid", color: css("--panel")}, textColor: css("--muted"), fontSize: 11, fontFamily: getComputedStyle(document.body).fontFamily, attributionLogo: logo},
+        grid: {vertLines: {visible: false}, horzLines: {color: css("--line")}},
+        rightPriceScale: {borderVisible: false, minimumWidth: 76},
+        timeScale: {borderVisible: false, timeVisible: true, secondsVisible: false, fixLeftEdge: true, fixRightEdge: true},
+        crosshair: {mode: 0, vertLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}, horzLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}},
+        handleScroll: false, handleScale: false,
       });
-      const dd = new Chart(ddEl, {
-        type: "line",
-        data: {labels: [], datasets: [{label: "Drawdown", data: [], borderColor: css("--loss"), backgroundColor: css("--loss-bg"), fill: "origin", borderWidth: 1.2, pointRadius: 0, pointHoverRadius: 3, pointHoverBackgroundColor: css("--loss"), tension: 0}]},
-        options: {...base,
-          scales: {x: {ticks: xTicks, grid: {display: false}, border: {display: false}},
-                   y: {position: "right", max: 0, afterFit: yWidth, ticks: {color: muted, padding: 8, callback: pctTick}, grid: {color: grid, drawTicks: false}, border: {display: false}}}},
-        plugins: [crosshair],
-      });
+      const chart = LightweightCharts.createChart(eqEl, {...base(true), rightPriceScale: {...base(true).rightPriceScale, scaleMargins: {top: 0.1, bottom: 0.08}}});
+      const gain = css("--gain"), loss = css("--loss");
+      const line = chart.addBaselineSeries({lineWidth: 2, priceLineVisible: false,
+        topLineColor: gain, topFillColor1: rgba(gain, 0.22), topFillColor2: rgba(gain, 0.02),
+        bottomLineColor: loss, bottomFillColor1: rgba(loss, 0.02), bottomFillColor2: rgba(loss, 0.22)});
+      const bench = book ? null : chart.addLineSeries({color: css("--muted"), lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false});
+      let startLine = null;
+      let dd = null, ddLine = null;
+      if (ddEl) {
+        dd = LightweightCharts.createChart(ddEl, {...base(false), rightPriceScale: {...base(false).rightPriceScale, scaleMargins: {top: 0.05, bottom: 0.02}},
+          localization: {priceFormatter: (v) => `${v < 0 ? "−" : ""}${Math.abs(v).toFixed(1)}%`}});
+        ddLine = dd.addAreaSeries({lineColor: loss, topColor: rgba(loss, 0.05), bottomColor: rgba(loss, 0.28), invertFilledArea: true, lineWidth: 1, priceLineVisible: false, lastValueVisible: false});
+      }
 
-      // The legend doubles as the readout: the range's figures at rest, the hovered day's under the cursor.
-      let legend = eqEl.parentElement.previousElementSibling;
+      // The legend doubles as the readout: the range's figures at rest, the hovered point's under the cursor.
+      let legend = eqEl.previousElementSibling;
       if (!legend || !legend.classList.contains("chart-legend")) {
         legend = Object.assign(document.createElement("div"), {className: "chart-legend"});
         legend.setAttribute("aria-live", "off");
-        eqEl.parentElement.before(legend);
+        eqEl.before(legend);
       }
-      // Two decimals, or three when a small daily move would otherwise read as 0.00%.
+      // Two decimals, or three when a small move would otherwise read as 0.00%.
       const pct = (x) => (x === null || x === undefined || !Number.isFinite(x) ? "n/a"
         : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(x !== 0 && Math.abs(x) < 0.01 ? 3 : 2)}%`);
       const cash = (x) => x.toLocaleString("en-GB", {minimumFractionDigits: 2, maximumFractionDigits: 2});
       const scash = (x) => `${x >= 0 ? "+" : "−"}${cash(Math.abs(x))}`;
       const tone = (x) => (x > 0 ? "gain" : x < 0 ? "loss" : "");
-      // cur is the series on screen: the daily history, or the last day or week at minutes' resolution.
+      // en-GB writes September as "Sept"; trading screens use three letters throughout.
+      const fmtDate = (t, o) => new Date(t).toLocaleString("en-GB", {...o, timeZone: "UTC"}).replace("Sept", "Sep");
       let cur = d;
       const isIntra = () => cur.res === "intraday";
       let view = null, hovering = false;
       const readout = (i) => {
-        const rest = i === null || i === undefined;
+        const rest = i === null || i === undefined || i < 0 || i >= view.eq.length;
         const at = rest ? view.eq.length - 1 : i;
         legend.innerHTML = "";
         const item = (cls, name, value, t) => {
@@ -175,12 +139,12 @@ window.Console = (() => {
           s.append(Object.assign(document.createElement("b"), {textContent: value, className: t || ""}));
           legend.append(s);
         };
-        if (compare) {
+        if (pctMode) {
           item("", labels[0], pct(view.ret[at]), tone(view.ret[at]));
-          item("bench", labels[1], pct(view.bench[at]));
+          if (!book) item("bench", labels[1], pct(view.bench[at]));
         } else if (rest) {
           // The whole history's change is from the starting capital, which is never a point on it (M12-F1).
-          const first = view.whole && Number.isFinite(d.start) ? d.start : view.eq[0], last = view.eq[at], ch = last - first;
+          const first = view.base, last = view.eq[at], ch = last - first;
           item("", labels[0], cash(last));
           item(null, "Change", `${scash(ch)} (${pct(first ? (ch / first) * 100 : NaN)})`, tone(ch));
         } else {
@@ -194,107 +158,68 @@ window.Console = (() => {
         item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
         legend.append(Object.assign(document.createElement("span"), {textContent: rest ? `${view.full[0]} to ${view.full[view.full.length - 1]}` : view.full[at], className: "faint"}));
       };
-      const hover = (_e, els) => readout(els.length ? els[0].index : null);
-      eq.options.onHover = hover; dd.options.onHover = hover;
-      // Hovering either chart moves the hairline on both.
-      const sync = (i) => [eq, dd].forEach((c) => {
-        c.setActiveElements(i === null ? [] : [{datasetIndex: 0, index: i}]);
-        c.tooltip.setActiveElements(i === null ? [] : [{datasetIndex: 0, index: i}], {x: 0, y: 0});
-        c.update("none");
-      });
-      [eqEl, ddEl].forEach((el) => {
-        el.addEventListener("mouseenter", () => { hovering = true; });
-        el.addEventListener("mouseleave", () => { hovering = false; readout(null); sync(null); });
-      });
-      eqEl.addEventListener("mousemove", () => { const a = eq.getActiveElements(); if (a.length) { dd.setActiveElements([{datasetIndex: 0, index: a[0].index}]); dd.tooltip.setActiveElements([{datasetIndex: 0, index: a[0].index}], {x: 0, y: 0}); dd.update("none"); } });
-      ddEl.addEventListener("mousemove", () => { const a = dd.getActiveElements(); if (a.length) { eq.setActiveElements([{datasetIndex: 0, index: a[0].index}]); eq.tooltip.setActiveElements([{datasetIndex: 0, index: a[0].index}], {x: 0, y: 0}); eq.update("none"); } });
-
-      let times = [];
-      // Place each fill on the curve at the first point at or after it; fills before the first point are off the chart.
-      const fillIdx = (side) => {
-        const out = new Set();
-        (cur.fills || []).filter((f) => f.side === side && Date.parse(f.t) >= times[0]).forEach((f) => {
-          const ft = Date.parse(f.t);
-          let i = times.findIndex((x) => x >= ft);
-          if (i < 0) i = times.length - 1;
-          out.add(i);
-        });
-        return out;
+      // Hovering either chart moves the crosshair on both.
+      let mirroring = false;
+      const onMove = (from, to, toSeries) => (p) => {
+        hovering = p.point !== undefined && p.logical !== undefined;
+        readout(hovering ? Math.round(p.logical) : null);
+        if (!to || mirroring) return;
+        mirroring = true;
+        const i = hovering ? Math.round(p.logical) : -1;
+        if (i >= 0 && i < view.times.length) to.setCrosshairPosition(toSeries === ddLine ? view.dd[i] : (pctMode ? view.ret[i] : view.eq[i]), view.times[i], toSeries);
+        else to.clearCrosshairPosition();
+        mirroring = false;
       };
+      chart.subscribeCrosshairMove(onMove(chart, dd, ddLine));
+      if (dd) dd.subscribeCrosshairMove(onMove(dd, chart, line));
+
       const rebase = (arr, from) => {
         const b = arr.slice(from).find((v) => v !== null && v !== undefined && v > 0);
         return arr.slice(from).map((v) => (v === null || v === undefined || !b ? null : (v / b - 1) * 100));
       };
-      // en-GB writes September as "Sept"; trading screens use three letters throughout.
-      const fmtDate = (t, o) => new Date(t).toLocaleString("en-GB", {...o, timeZone: "UTC"}).replace("Sept", "Sep");
-      // Boundaries for the date axis, thinned so labels never touch at any width.
-      const boundaries = (ts) => {
-        const span = (ts[ts.length - 1] - ts[0]) / 864e5;
-        const out = {};
-        if (isIntra() && span < 8) {
-          // A day reads in hours; a week in days, the date at each midnight.
-          const every = span <= 0.5 ? 1 : span <= 1.5 ? 3 : 24;  // hours between labels
-          let prev = null;
-          ts.forEach((t, i) => {
-            const k = Math.floor(t / (every * 36e5));
-            if (prev !== null && k !== prev) out[i] = every === 24 ? fmtDate(t, {weekday: "short", day: "2-digit"}) : fmtDate(t, {hour: "2-digit", minute: "2-digit"});
-            prev = k;
-          });
-        } else {
-          const unit = span <= 45 ? "week" : span <= 420 ? "month" : "quarter";
-          let prev = null, first = true;
-          ts.forEach((t, i) => {
-            const dt = new Date(t), y = dt.getUTCFullYear(), m = dt.getUTCMonth();
-            const k = unit === "week" ? Math.floor((t / 864e5 + 3) / 7) : unit === "month" ? y * 12 + m : y * 4 + Math.floor(m / 3);
-            if (prev !== null && k !== prev) {
-              out[i] = unit === "week" ? fmtDate(t, {day: "2-digit", month: "short"})
-                : first || m === 0 ? fmtDate(t, {month: "short", year: "numeric"}) : fmtDate(t, {month: "short"});
-              first = false;
-            }
-            prev = k;
-          });
-        }
-        const keys = Object.keys(out).map(Number);
-        // Measured from the box, not the last drawn chart area, which is stale while the layout settles.
-        const room = Math.max(1, Math.floor(((ddEl.parentElement.clientWidth || 600) - 64) / 72));
-        const stride = Math.ceil(keys.length / room);
-        if (stride > 1) keys.forEach((k, n) => { if (n % stride) delete out[k]; });
-        return out;
-      };
-      const ddSteps = [-1, -2, -4, -6, -8, -10, -20, -30, -40, -60, -80, -100];
+      const points = (vals) => vals.map((v, i) => (v === null || v === undefined ? {time: view.times[i]} : {time: view.times[i], value: v}));
       // The range on screen: a number of daily points (0 for all), or days of minute-level marks.
       let range = {n: 0};
       const show = () => {
         const from = range.n ? Math.max(0, cur.t.length - range.n) : 0;
-        times = cur.t.map((x) => Date.parse(x));
-        const buys = fillIdx("BUY"), sells = fillIdx("SELL");
-        const ts = times.slice(from);
-        const full = ts.map((t) => fmtDate(t, isIntra() ? {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"} : {day: "2-digit", month: "short", year: "numeric"}));
-        const eqv = cur.equity.slice(from), ret = rebase(cur.equity, from), bench = rebase(cur.benchmark, from);
-        view = {full, eq: eqv, ret, bench, prior: from > 0 ? cur.equity[from - 1] : (cur.prior ?? null), dd: cur.drawdown.slice(from).map((x) => -x * 100)};
+        const ms = cur.t.slice(from).map((x) => Date.parse(x));
+        const full = ms.map((t) => fmtDate(t, isIntra() ? {day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"} : {day: "2-digit", month: "short", year: "numeric"}));
+        const eqv = cur.equity.slice(from);
+        view = {times: ms.map((t) => Math.floor(t / 1000)), full, eq: eqv, ret: rebase(cur.equity, from), bench: rebase(cur.benchmark, from),
+                prior: from > 0 ? cur.equity[from - 1] : (cur.prior ?? null), dd: cur.drawdown.slice(from).map((x) => -x * 100)};
+        // The whole history is measured from the starting capital; a shorter range from its own first point.
+        view.whole = cur === d && from === 0;
+        view.base = view.whole && Number.isFinite(d.start) ? d.start : eqv.find((v) => v !== null && v !== undefined);
+        // In % the whole history counts from the starting capital too, so the line starts where the money did.
+        if (view.whole && Number.isFinite(d.start) && d.start > 0) view.ret = eqv.map((v) => (v === null || v === undefined ? null : (v / d.start - 1) * 100));
         // The whole run's worst comes from every mark, as the tables show it; the curve is daily or
         // thinned and can miss a fall that recovered between its points. A shorter range reads the curve.
-        view.whole = cur === d && from === 0;
         view.worst = view.whole && d.worst !== undefined ? -d.worst * 100 : Math.min(...view.dd);
-        const top = compare ? ret : eqv;
-        eq.data.labels = full; eq.data.datasets[0].data = top;
-        eq.data.datasets[1].data = compare ? bench : [];
-        eq.data.datasets[0].fill = compare ? "origin" : "start";
-        eq.data.datasets[2].data = top.map((v, i) => (buys.has(i + from) ? v : null));
-        eq.data.datasets[3].data = top.map((v, i) => (sells.has(i + from) ? v : null));
-        const vals = (compare ? [...ret, ...bench] : eqv).filter((v) => v !== null && v !== undefined);
-        const lo = Math.min(...vals), hi = Math.max(...vals);
-        // Compare mode keeps 0% in view; money mode fits the equity line, padded so a flat line isn't a wall.
-        const r = compare ? niceRange(Math.min(0, lo), Math.max(0, hi)) : niceRange(lo, hi, Math.max(hi * 0.0005, 0.5));
-        step = r.step;
-        Object.assign(eq.options.scales.y, {min: r.min, max: r.max}); eq.options.scales.y.ticks.stepSize = r.step;
-        // Drawdown axis fits the worst point in view, on round steps: 0, half way, the floor.
-        const worst = Math.min(...view.dd);
-        const floor = ddSteps.find((s) => s <= worst * 1.1) ?? -100;
-        Object.assign(dd.options.scales.y, {min: floor}); dd.options.scales.y.ticks.stepSize = -floor / 2;
-        dd.data.labels = full; dd.data.datasets[0].data = view.dd;
-        tickAt = boundaries(ts);
-        eq.update(); dd.update();
+        const level = pctMode ? 0 : view.base;
+        line.applyOptions({baseValue: {type: "price", price: level},
+          priceFormat: pctMode ? {type: "custom", minMove: 0.01, formatter: (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(2)}%`}
+                               : {type: "custom", minMove: 0.01, formatter: (v) => cash(v)},
+          // Keep the starting line on screen, so above or below it reads at a glance.
+          autoscaleInfoProvider: (orig) => { const r = orig(); if (r) { r.priceRange.minValue = Math.min(r.priceRange.minValue, level); r.priceRange.maxValue = Math.max(r.priceRange.maxValue, level); } return r; }});
+        line.setData(points(pctMode ? view.ret : eqv));
+        if (startLine) line.removePriceLine(startLine);
+        startLine = line.createPriceLine({price: level, color: css("--muted"), lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "start"});
+        if (bench) { bench.applyOptions({visible: pctMode}); bench.setData(pctMode ? points(view.bench) : []); }
+        // A marker on each fill, at the first point at or after it; fills before the first point are off the chart.
+        const marks = [];
+        (cur.fills || []).forEach((f) => {
+          const ft = Date.parse(f.t);
+          if (ft < ms[0]) return;
+          let i = ms.findIndex((x) => x >= ft);
+          if (i < 0) i = ms.length - 1;
+          if (marks.some((m) => m.i === i && m.side === f.side)) return;
+          marks.push({i, side: f.side});
+        });
+        line.setMarkers(marks.sort((a, b) => a.i - b.i).map((m) => ({time: view.times[m.i], position: m.side === "BUY" ? "belowBar" : "aboveBar",
+          color: m.side === "BUY" ? gain : loss, shape: m.side === "BUY" ? "arrowUp" : "arrowDown"})));
+        if (ddLine) ddLine.setData(points(view.dd));
+        chart.timeScale().fitContent();
+        if (dd) dd.timeScale().fitContent();
         if (!hovering) readout(null);
       };
       const live = typeof url === "string";
@@ -308,23 +233,30 @@ window.Console = (() => {
         });
       };
       const buttons = scope.querySelectorAll("[data-range], [data-days]");
-      buttons.forEach((b) => b.addEventListener("click", () => {
+      const pick = (b) => {
         buttons.forEach((o) => o.setAttribute("aria-pressed", o === b ? "true" : "false"));
         range = b.dataset.days ? {days: parseInt(b.dataset.days, 10), n: 0} : {n: parseInt(b.dataset.range, 10)};
         if (!range.days) cur = d;
-        (range.days ? load() : Promise.resolve()).then(() => { if (cur.t.length) show(); });
-      }));
-      scope.querySelectorAll("[data-compare]").forEach((b) => {
-        b.setAttribute("aria-pressed", String(compare));
-        b.addEventListener("click", () => { compare = !compare; b.setAttribute("aria-pressed", String(compare)); show(); });
-      });
+        return (range.days ? load() : Promise.resolve()).then(() => { if (cur.t.length) show(); });
+      };
+      buttons.forEach((b) => b.addEventListener("click", () => pick(b)));
+      const setUnit = (p) => {
+        pctMode = p;
+        scope.querySelectorAll("[data-unit]").forEach((b) => b.setAttribute("aria-pressed", String((b.dataset.unit === "pct") === pctMode)));
+        scope.querySelectorAll("[data-compare]").forEach((b) => b.setAttribute("aria-pressed", String(pctMode)));
+        show();
+      };
+      scope.querySelectorAll("[data-unit]").forEach((b) => b.addEventListener("click", () => setUnit(b.dataset.unit === "pct")));
+      scope.querySelectorAll("[data-compare]").forEach((b) => b.addEventListener("click", () => setUnit(!pctMode)));
+      scope.querySelectorAll("[data-compare]").forEach((b) => b.setAttribute("aria-pressed", String(pctMode)));
       if (live) setInterval(() => {
         if (document.hidden || hovering) return;
         load().then(() => { if (cur.t.length) show(); }).catch(() => {});  // the strip already says when updates stop
       }, 60000);
-      // Charts drawn inside a hidden tab get their width when it opens; recount the date labels then.
-      new ResizeObserver(() => { if (view) { tickAt = boundaries(times.slice(range.n ? Math.max(0, cur.t.length - range.n) : 0)); dd.update("none"); } }).observe(ddEl.parentElement);
-      show();
+      // The opening range: the pressed button, else All; a book under two days old opens on 1D.
+      const young = book && Date.now() - Date.parse(d.t[0]) < 2 * 864e5;
+      const opening = (young && scope.querySelector('[data-days="1"]')) || scope.querySelector('[data-range][aria-pressed="true"]') || scope.querySelector('[data-range="0"]');
+      if (opening) pick(opening); else show();
     });
   }
 
@@ -647,6 +579,13 @@ window.Console = (() => {
       lines.forEach((l) => main.removePriceLine(l));
       lines = d.lines.map((l) => main.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
+      // The axis always takes in the open position's entry, SL and TP, so their lines are never off screen.
+      const levels = d.lines.map((l) => l.price).filter((v) => Number.isFinite(v));
+      main.applyOptions({autoscaleInfoProvider: (orig) => {
+        const r = orig();
+        if (r && levels.length) { r.priceRange.minValue = Math.min(r.priceRange.minValue, ...levels); r.priceRange.maxValue = Math.max(r.priceRange.maxValue, ...levels); }
+        return r;
+      }});
       if (!keepView) chart.timeScale().fitContent();
       fill();
       $(".pc-source").hidden = d.source !== "marks" && !d.note;
@@ -787,7 +726,8 @@ window.Console = (() => {
       const opt = $("strategy").selectedOptions[0];
       // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
       const minutes = {MINUTE: 1, HOUR: 60, DAY: 1440};
-      const [step, unit] = document.getElementById("bar_spec").value.split("-");
+      const bar = form.querySelector("input[name=bar_spec]:checked, input[type=hidden][name=bar_spec], input[name=bar_spec_shown]:checked");
+      const [step, unit] = (bar ? bar.value : "1-HOUR").split("-");
       const here = `${($("instrument").value || "").toUpperCase()}@${Number(step) * (minutes[unit] || 0)}`;
       document.getElementById("g1-note").hidden = (opt.dataset.g1 || "").split("|").includes(here);
       const prof = $("risk_profile").selectedOptions[0].dataset;
@@ -795,7 +735,7 @@ window.Console = (() => {
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
       const items = [
-        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${document.getElementById("bar_spec").selectedOptions[0].textContent.split(" (")[0]} bars.`,
+        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
@@ -811,7 +751,9 @@ window.Console = (() => {
       const ul = document.getElementById("summary");
       ul.replaceChildren(...items.map((t) => Object.assign(document.createElement("li"), {textContent: t})));
       if (!$("name").dataset.touched) {
-        $("name").value = `${(pair.split("/")[0] || "").toLowerCase()}-${strat.replace(/_/g, "-")}`.replace(/^-/, "").slice(0, 40);
+        // Model, instrument and candle length: rsi-bands-solusdt-15m (UI v2, item 9).
+        const candle = bar ? bar.parentElement.textContent.trim().split(" ")[0] : "";
+        $("name").value = [strat.replace(/_/g, "-"), pair.replace("/", "").toLowerCase(), candle].filter(Boolean).join("-").replace(/[^a-z0-9-]/g, "").slice(0, 41);
       }
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
@@ -932,30 +874,132 @@ window.Console = (() => {
     return box.exitDescribe;
   }
 
-  // The venue: its instruments are the ones suggested, and a perpetual venue lists no spot, so its strategies
-  // trade its own perpetual. A page showing one venue's stored history reloads on another.
-  function venueField(form) {
-    const sel = form && form.elements.venue;
-    if (!(sel instanceof HTMLSelectElement)) return;  // the research study's venue switch runs itself
-    if (sel.hasAttribute("data-reload")) {
-      sel.addEventListener("change", () => { location.href = `${location.pathname}?venue=${encodeURIComponent(sel.value)}`; });
-      return;
-    }
-    const list = document.getElementById("pairs"), inst = form.elements.instrument, mk = form.elements.market;
-    const perpOpt = mk ? [...mk.options].find((o) => o.value === "perp") : null;
-    if (perpOpt) perpOpt.dataset.label = perpOpt.textContent;
-    const sync = (first) => {
-      const opt = sel.selectedOptions[0];
-      if (!opt) return;
-      const pairs = (opt.dataset.pairs || "").split(",").filter(Boolean), perp = !!opt.dataset.perp;
-      if (list) list.replaceChildren(...pairs.map((p) => Object.assign(document.createElement("option"), {value: p})));
-      if (!first && inst && pairs.length && !pairs.includes(inst.value.trim().toUpperCase())) inst.value = pairs[0];
-      if (!mk) return;
-      [...mk.options].forEach((o) => { o.disabled = perp && o.value !== "perp"; });
-      if (perpOpt) perpOpt.textContent = perp ? `${opt.textContent.split(":")[0]}: the venue's own fees and settled funding` : perpOpt.dataset.label;
-      if (perp && mk.value !== "perp") { mk.value = "perp"; mk.dispatchEvent(new Event("change")); }
+  // The instrument pick-list (templates/_fields.html instrument_field; UI v2, item 9): a combobox over every
+  // instrument the venues offer, grouped Perpetuals then Spot, recently used first, each with its history
+  // badge, and "Use '…' as typed" last. Picking sets the hidden venue field, which tells the form whether the
+  // market is a perpetual. The arrow keys move, Enter picks, Escape closes.
+  const RECENT = "pl-recent";
+  const recentPicks = () => { try { return JSON.parse(localStorage.getItem(RECENT) || "[]"); } catch (e) { return []; } };
+  const remember = (venue, pair) => {
+    try { localStorage.setItem(RECENT, JSON.stringify([`${venue}|${pair}`, ...recentPicks().filter((x) => x !== `${venue}|${pair}`)].slice(0, 8))); } catch (e) { /* private window */ }
+  };
+  let instOptions = null, instLoading = null;
+  const loadOptions = () => instLoading || (instLoading = fetch("/api/instruments?options=1", {cache: "no-store"})
+    .then((r) => r.json()).then((d) => { instOptions = d.options || []; }).catch(() => { instOptions = []; }));
+  function picklist(box) {
+    if (!box || box.dataset.bound) return;
+    box.dataset.bound = "1";
+    const input = box.querySelector("[role=combobox]"), list = box.querySelector("[role=listbox]");
+    const venue = box.querySelector("[data-pl-venue]"), kind = box.querySelector("[data-pl-kind]"), badge = box.querySelector("[data-pl-badge]");
+    const seed = JSON.parse(box.querySelector("[data-pl-seed]").textContent);
+    const venues = Object.fromEntries(seed.venues.map((v) => [v.key, v]));
+    const PAIR = /^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/;
+    // Until the full listing arrives: each venue's usual instruments.
+    const seedOptions = seed.venues.flatMap((v) => v.pairs.map((p) => ({value: p, venue: v.key, group: v.perpetual ? "Perpetuals" : "Spot",
+      label: `${p} ${v.perpetual ? "perpetual" : "spot"}`, badge: "", tone: ""})));
+    const all = () => instOptions && instOptions.length ? instOptions : seedOptions;
+    let shown = [], active = -1, typed = false;  // the list opens on everything; typing narrows it
+    const find = (v, p) => all().find((o) => o.venue === v && o.value === p);
+    const setVenue = (key) => {
+      if (!venues[key]) return;
+      const changed = venue.value !== key;
+      venue.value = key; venue.dataset.perp = venues[key].perpetual ? "1" : "";
+      if (kind) kind.textContent = venues[key].perpetual ? "perpetual" : "spot";
+      if (changed) venue.dispatchEvent(new Event("change", {bubbles: true}));
     };
-    sel.addEventListener("change", () => sync(false)); sync(true);
+    const showBadge = () => {
+      const o = find(venue.value, input.value.trim().toUpperCase());
+      badge.textContent = o ? (o.badge ? `History: ${o.badge}` : "") : PAIR.test(input.value.trim().toUpperCase()) ? "Typed: the venue is asked whether it lists it before a strategy can start on it." : "";
+      badge.className = `hint pl-badge ${o && o.tone ? o.tone : ""}`;
+    };
+    const close = () => { list.hidden = true; input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); };
+    const pick = (o) => {
+      input.value = o.value; setVenue(o.venue); remember(o.venue, o.value); close(); showBadge();
+      input.dispatchEvent(new Event("input", {bubbles: true})); input.dispatchEvent(new Event("change", {bubbles: true}));
+    };
+    const mark = () => {
+      [...list.querySelectorAll("[role=option]")].forEach((li, i) => {
+        li.setAttribute("aria-selected", String(i === active));
+        if (i === active) { input.setAttribute("aria-activedescendant", li.id); li.scrollIntoView({block: "nearest"}); }
+      });
+    };
+    const draw = () => {
+      const q = typed ? input.value.trim().toUpperCase() : "", bare = q.replace("/", "");
+      const recent = recentPicks();
+      const rank = (o) => { const i = recent.indexOf(`${o.venue}|${o.value}`); return i < 0 ? 99 : i; };
+      const hits = all().filter((o) => !q || o.value.replace("/", "").includes(bare));
+      // Starts-with matches first, then recently used, then stored history, then the rest as listed.
+      hits.sort((a, b) => (!a.value.startsWith(q) - !b.value.startsWith(q)) || rank(a) - rank(b) || (b.stored === true) - (a.stored === true));
+      const li = (cls, text) => Object.assign(document.createElement("li"), {className: cls, textContent: text});
+      const items = [];
+      shown = [];
+      const group = (name, os) => {
+        if (!os.length) return;
+        const g = li("grp", name); g.setAttribute("role", "presentation"); items.push(g);
+        os.forEach((o) => {
+          const el = li("opt", o.label); el.setAttribute("role", "option"); el.id = `${list.id}-${shown.length}`;
+          if (o.badge) el.append(Object.assign(document.createElement("small"), {className: o.tone, textContent: o.badge}));
+          el.addEventListener("mousedown", (e) => { e.preventDefault(); pick(o); });
+          shown.push(o); items.push(el);
+        });
+      };
+      const mine = q ? [] : hits.filter((o) => rank(o) < 99).slice(0, 5);
+      group("Recently used", mine);
+      group("Perpetuals", hits.filter((o) => o.group === "Perpetuals" && !mine.includes(o)).slice(0, 40));
+      group("Spot", hits.filter((o) => o.group === "Spot" && !mine.includes(o)).slice(0, 40));
+      if (PAIR.test(q) && !hits.some((o) => o.value === q)) {
+        const o = {value: q, venue: venue.value, label: `Use "${q}" as typed`, badge: "checked against the venue before a strategy can start on it"};
+        const g = li("grp", "Not in the list"); g.setAttribute("role", "presentation"); items.push(g);
+        const el = li("opt own", o.label); el.setAttribute("role", "option"); el.id = `${list.id}-${shown.length}`;
+        el.append(Object.assign(document.createElement("small"), {textContent: o.badge}));
+        el.addEventListener("mousedown", (e) => { e.preventDefault(); pick(o); });
+        shown.push(o); items.push(el);
+      }
+      if (!items.length) items.push(li("none", instOptions ? "Nothing matches. Write it as BASE/QUOTE to use it as typed." : "Loading every instrument…"));
+      list.replaceChildren(...items);
+      active = shown.length ? 0 : -1; mark();
+    };
+    const open = () => {
+      if (list.hidden) typed = false;
+      list.hidden = false; input.setAttribute("aria-expanded", "true"); draw();
+      if (!instOptions) loadOptions().then(() => { if (!list.hidden) draw(); showBadge(); });
+    };
+    input.addEventListener("focus", () => { input.select(); open(); });
+    input.addEventListener("click", open);
+    input.addEventListener("input", (e) => { if (e.isTrusted) { if (list.hidden) open(); typed = true; draw(); } showBadge(); });
+    input.addEventListener("blur", () => { input.value = input.value.trim().toUpperCase(); close(); showBadge(); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (list.hidden) return open();
+        active = e.key === "ArrowDown" ? Math.min(active + 1, shown.length - 1) : Math.max(active - 1, 0); mark();
+      } else if (e.key === "Enter" && !list.hidden && shown[active]) { e.preventDefault(); e.stopPropagation(); pick(shown[active]); }
+      else if (e.key === "Escape" && !list.hidden) { e.preventDefault(); e.stopPropagation(); close(); }
+    });
+    const form = input.form;
+    if (form) form.addEventListener("submit", () => remember(venue.value, input.value.trim().toUpperCase()));
+    showBadge();
+    loadOptions().then(showBadge);
+  }
+
+  // The venue follows the instrument pick: a perpetual venue lists no spot, so its strategies trade its own
+  // perpetual.
+  function venueField(form) {
+    const v = form && form.querySelector("[data-pl-venue]");
+    if (!v) return;
+    picklist(v.closest("[data-picklist]"));
+    const mk = form.elements.market;
+    if (!mk) return;
+    let was = null;
+    const sync = () => {
+      const perp = v.dataset.perp === "1";
+      [...mk.options].forEach((o) => { o.disabled = perp && o.value !== "perp"; });
+      // Onto a perpetual venue: its perpetual. Back to a spot one: spot, unless the PM picks a simulated perpetual.
+      const to = perp ? "perp" : was ? "spot" : mk.value;
+      if (mk.value !== to) { mk.value = to; mk.dispatchEvent(new Event("change")); }
+      was = perp;
+    };
+    v.addEventListener("change", sync); sync();
   }
 
   // Order type: the wait only matters for maker-first orders, so it shows only then.
@@ -1034,6 +1078,42 @@ window.Console = (() => {
   // Tabs on a strategy page: one panel at a time, chosen by the URL hash so links and the back
   // button work. A hash that points inside a panel (an activity filter link) opens that panel.
   // Without JavaScript every panel shows, one after another.
+  // Tabs inside a panel ([data-subtabs]): buttons [data-sub] show one [data-sub-panel] at a time. The address
+  // keeps the page's own tab, so these keep their choice through live updates instead.
+  function subtabs() {
+    let chosen = null;
+    const apply = () => document.querySelectorAll("[data-subtabs]").forEach((box) => {
+      const want = chosen || box.querySelector("[data-sub]")?.dataset.sub;
+      box.querySelectorAll("[data-sub]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.sub === want)));
+      box.querySelectorAll("[data-sub-panel]").forEach((p) => { p.hidden = p.dataset.subPanel !== want; });
+    });
+    once("subtabsBound", () => {
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-subtabs] [data-sub]");
+        if (b) { chosen = b.dataset.sub; apply(); }
+      });
+      document.addEventListener("live:swap", () => { if (chosen) apply(); });
+    });
+  }
+
+  // A period switch over tables rendered once per period ([data-periods] holding [data-period] buttons and
+  // [data-period-rows] bodies). The choice survives live updates, which re-render the panel on Today.
+  function periods() {
+    let chosen = null;
+    const apply = () => document.querySelectorAll("[data-periods]").forEach((box) => {
+      const want = chosen || "day";
+      box.querySelectorAll("[data-period]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.period === want)));
+      box.querySelectorAll("[data-period-rows]").forEach((t) => { t.hidden = t.dataset.periodRows !== want; });
+    });
+    once("periodsBound", () => {
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-periods] [data-period]");
+        if (b) { chosen = b.dataset.period; apply(); }
+      });
+      document.addEventListener("live:swap", () => { if (chosen) apply(); });
+    });
+  }
+
   function tabs() {
     const bar = document.querySelector("[data-tabs]");
     if (!bar) return;
@@ -1085,9 +1165,35 @@ window.Console = (() => {
       const line = fs.querySelector("[data-logline]");
       if (line) line.textContent = "Logged as: " + (pick ? pick + (note ? ": " + note : "") : "no reason yet");
     };
+    // The search box narrows the list; "+ Write your own reason" always stays.
+    const search = (fs) => {
+      const q = (fs.querySelector("[data-reason-search]")?.value || "").trim().toLowerCase();
+      let shown = 0;
+      fs.querySelectorAll("label.opt:not(.write)").forEach((l) => { l.hidden = Boolean(q) && !l.textContent.toLowerCase().includes(q); shown += !l.hidden; });
+      fs.querySelectorAll(".reason-list .grp").forEach((g) => {
+        let n = g.nextElementSibling, any = false;
+        while (n && !n.classList.contains("grp")) { if (n.matches("label.opt:not(.write)") && !n.hidden) any = true; n = n.nextElementSibling; }
+        g.hidden = !any;
+      });
+      const none = fs.querySelector("[data-reason-none]");
+      if (none) none.hidden = shown > 0;
+    };
     const all = () => document.querySelectorAll("[data-reasons]").forEach(check);
     once("reasonsBound", () => {
-      const on = (e) => { const fs = e.target.closest && e.target.closest("[data-reasons]"); if (fs) check(fs); };
+      const on = (e) => {
+        const fs = e.target.closest && e.target.closest("[data-reasons]");
+        if (!fs) return;
+        if (e.target.matches("[data-reason-search]")) search(fs);
+        check(fs);
+        if (e.type === "change" && e.target.value === "Other") fs.querySelector("textarea[name=reason_note]")?.focus();
+      };
+      // Enter in the search box picks the first reason still shown, rather than submitting the dialog.
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || !e.target.matches || !e.target.matches("[data-reason-search]")) return;
+        e.preventDefault();
+        const first = [...e.target.closest("[data-reasons]").querySelectorAll("label.opt")].find((l) => !l.hidden)?.querySelector("input");
+        if (first) { first.checked = true; first.focus(); first.dispatchEvent(new Event("change", {bubbles: true})); }
+      });
       document.addEventListener("change", on);
       document.addEventListener("input", on);
       document.addEventListener("live:swap", all);
@@ -1121,17 +1227,6 @@ window.Console = (() => {
   }
 
   // A two-way switch (Price / Equity on the overview chart): the box's data-mode picks what shows.
-  function modes() {
-    once("modesBound", () => document.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-mode-to]");
-      if (!b) return;
-      const box = b.closest("[data-mode]");
-      box.dataset.mode = b.dataset.modeTo;
-      box.querySelectorAll("[data-mode-to]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-      window.dispatchEvent(new Event("resize"));  // a chart drawn while hidden sizes itself now
-    }));
-  }
-
   // Settings: Save first lists every change, before and after, in its confirm dialog, with a warning when the
   // risk profile changes (its option carries the new limits in data-limits).
   function settingsDiff(formId) {
@@ -1176,5 +1271,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, chips, modes, settingsDiff, bookCharts: (url) => pair(url, "eq", "dd", ["Book", "Buy-and-hold"]), pair};
+  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
 })();

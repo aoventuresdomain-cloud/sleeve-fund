@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from sleeve_fund import backups, markets
+from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
 
@@ -23,6 +24,9 @@ BREACH_KINDS = ("risk_halt", "risk_pause", "reconcile_mismatch", "instrument_not
 
 def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     rows = []
+    # Each open position with the same margin, liquidation and Risk to stop as Portfolio and its strategy page.
+    held = trading.book_positions(store, summaries)
+    positions = {r["sleeve"]: r for r in held["rows"]}
     for x in summaries:
         s, p = x["sleeve"], x["profile"]
         peak = store.peak_equity(s.name) or s.starting_balance
@@ -41,6 +45,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
             "headroom": x["room"],
             "has_stop": bool(s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
+            "position": positions.get(s.name),
             "shocks": shocks,
         })
     equity = book["equity"] or 1.0
@@ -51,6 +56,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
+            "margin": held["margin"], "open_risk": held["open_risk"], "unbounded": held["unbounded"],
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}

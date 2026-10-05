@@ -1,10 +1,9 @@
 {% extends "base.html" %}
 {% from "_stages.html" import stepper %}
-{% from "_fields.html" import exit_fields %}
+{% from "_fields.html" import exit_fields, instrument_field, candle_chips %}
 {% block title %}Development · Multi-Strategy Fund{% endblock %}
 {% macro messages() %}
-  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}{% if collect %}
-    <form method="post" action="/research/history" style="margin:8px 0 0"><input type="hidden" name="instrument" value="{{ collect }}"><input type="hidden" name="venue" value="{{ values.venue }}"><button>Collect {{ collect }} history</button></form>{% endif %}</div>{% endif %}
+  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}</div>{% endif %}
   {% if notice %}<div class="notice-box" role="status">{{ notice }}</div>{% endif %}
 {% endmacro %}
 {% block content %}
@@ -22,13 +21,15 @@
 <nav class="tabs desk-tabs research-tabs" role="tablist" aria-label="Research views" data-tabs{% if tab %} data-default="{{ tab }}"{% endif %}>
   <a href="#development" role="tab" data-tab="development">Development<span class="n">{{ cards|length }}</span></a>
   <a href="#results" role="tab" data-tab="results">Results<span class="n">{{ sheets|length }}</span></a>
-  <a href="#history" role="tab" data-tab="history">History<span class="n">{{ stored_all|length }}</span></a>
+  <a href="#history" role="tab" data-tab="history">Data coverage<span class="n">{{ stored_all|length }}</span></a>
 </nav>
 
 {# --- Development: a plan per model, and the study form for the one picked ------------------------------ #}
 <div class="tab-panel" id="tab-development" role="tabpanel" data-panel="development">
 <div class="dev" id="dev"{% if msg_in == 'development' and (job or error or notice) %} data-open{% endif %}>
+  {# The list and the study end on the same line; the list scrolls inside its own box (UI v2, item 8). #}
   <div class="plan-col">
+    <input type="search" class="plan-search" id="plan-search" placeholder="Search models" aria-label="Search models" autocomplete="off">
     <div class="plan-filters" role="group" aria-label="Show models">
       <button type="button" data-filter="all" aria-pressed="true">All <span class="n">{{ cards|length }}</span></button>
       {% for key, word in (('ready', 'Ready'), ('passed', 'Passed G1'), ('killed', 'Killed')) %}
@@ -37,12 +38,13 @@
     </div>
     <ul class="plan-list" aria-label="Models">
       {% for c in cards %}
-      <li data-status="{{ c.status }}"><a class="plan-card" href="/research?strategy={{ c.name }}#development" data-plan="{{ c.name }}"{% if c.name == chosen.name %} aria-current="true"{% endif %}>
-        <span class="pc-top"><b>{{ c.label }}</b><span class="chip {{ c.tone }}">{{ c.status_word }}</span></span>
-        <span class="pc-q">{{ c.question }}</span>
-        <span class="pc-meta">{{ c.family|replace('-', ' ')|capitalize }} · {{ c.meta }}{% if c.studies > 1 %} · {{ c.studies }} studies{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% if c.row.observation %}, {{ c.row.observing|length }} on observation{% endif %}{% endif %}</span>
+      <li data-status="{{ c.status }}" data-search="{{ (c.label ~ ' ' ~ c.family ~ ' ' ~ c.name)|lower|replace('-', ' ')|replace('_', ' ') }}"><a class="plan-row" href="/research?strategy={{ c.name }}#development" data-plan="{{ c.name }}"{% if c.name == chosen.name %} aria-current="true"{% endif %} title="{{ c.question }} · {{ c.meta }}">
+        <b>{{ c.label }}</b>
+        <span class="pr-meta">{{ c.family|replace('-', ' ')|capitalize }}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% endif %}</span>
+        <span class="chip {{ c.tone }}">{{ c.status_word }}</span>
       </a></li>
       {% endfor %}
+      <li class="plan-none" data-plan-none hidden>No model matches.</li>
     </ul>
   </div>
 
@@ -79,19 +81,15 @@
     <form method="post" action="/research/run" class="study-form" id="study-form">
       <input type="hidden" name="strategy" value="{{ chosen.name }}">
       <div class="step"><span class="sn" aria-hidden="true">1</span><div class="step-body">
-        <h3>Where to test</h3>
+        <h3>What to test on</h3>
         <div class="where">
-          <fieldset class="venue-field"><legend>Venue</legend>
-            <div class="venue-seg">{% for v in venues %}<label><input type="radio" name="venue" value="{{ v.key }}" {{ 'checked' if v.key == values.venue }}><span>{{ v.label }}</span></label>{% endfor %}</div>
-          </fieldset>
-          <div class="field inst-field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs-{{ values.venue }}" value="{{ values.instrument }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"></div>
+          {{ instrument_field(values) }}
           {% set held = on_venue.held.get(values.instrument|upper) %}
           <div class="hist-status" aria-live="polite">
-            <span class="chip {{ held.tone if held }}" id="hist-chip">{{ held.text if held else 'Not stored' }}</span>
-            <button type="submit" form="collect-study" class="quiet" id="hist-collect"{% if held %} hidden{% endif %}>Collect</button>
+            <span class="chip {{ held.tone if held }}" id="hist-chip">{{ held.text if held else 'not stored yet' }}</span>
           </div>
         </div>
-        <p class="hint"><span id="venue-note">{% if on_venue.perpetual %}Studies on {{ on_venue.label }} trade its perpetual, long only, with the funding it settled.{% else %}Studies on {{ on_venue.label }} run spot, long only.{% endif %}</span> A pass is not G1 for a strategy that shorts: those wait for long/short studies.</p>
+        <p class="hint"><span id="venue-note">{% if on_venue.perpetual %}A perpetual is studied long only, with the funding it settled.{% else %}Spot is studied long only.{% endif %}</span> A pass is not G1 for a strategy that shorts: those wait for long/short studies.</p>
       </div></div>
 
       <div class="step"><span class="sn" aria-hidden="true">2</span><div class="step-body">
@@ -99,7 +97,7 @@
         <details class="change" id="how-change"{% if error %} open{% endif %}>
           <summary><span class="sentence-text" id="how-text">{{ how }}</span><span class="change-link">Change</span></summary>
           <div class="grid2">
-            <div class="field"><label for="minutes">Candles</label><select id="minutes" name="minutes">{% for m in study_minutes %}<option value="{{ m }}" {{ 'selected' if m|string == values.minutes|string }}>{{ 'Daily' if m == 1440 else (m // 60)|string ~ '-hour' if m % 60 == 0 else m|string ~ '-minute' }}</option>{% endfor %}</select></div>
+            <div class="field"><span class="label">Candle length</span>{{ candle_chips('minutes', study_candles, values.minutes, id='minutes') }}</div>
             <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == values.risk_profile }}>{{ p.name|capitalize }}: {{ p.max_position_pct|pct0 }} cap, {{ p.max_drawdown|pct0 }} halt</option>{% endfor %}<option value="none" {{ 'selected' if values.risk_profile == 'none' }}>None: no cap, no halt</option></select></div>
             <div class="field"><label for="train_days">Learn on, days</label><input id="train_days" name="train_days" type="number" min="30" step="1" value="{{ values.train_days }}"></div>
             <div class="field"><label for="test_days">Then test on, days</label><input id="test_days" name="test_days" type="number" min="30" step="1" value="{{ values.test_days }}"></div>
@@ -108,6 +106,7 @@
           </div>
           <p class="hint">Every grid point and fold is counted in Variants tried. Shorter test windows give more out-of-sample days from the same history.</p>
         </details>
+        <p class="hint fit" id="fit-text"{% if not fit_text %} hidden{% endif %}>{{ fit_text }}</p>
         {% for c in cards %}<p class="hint why" data-for="{{ c.name }}"{% if c.name != chosen.name %} hidden{% endif %}><b>Why:</b> {{ c.why }}</p>{% endfor %}
       </div></div>
 
@@ -120,17 +119,12 @@
       </div></div>
 
       <div class="study-foot">
-        <span class="faint" id="study-runs">Runs {{ chosen.variants }} variant{{ 's' if chosen.variants != 1 }} and the cost ladder at {{ '%.2f'|format(on_venue.fee * 100) }}% ({{ on_venue.label }} taker fee). Long only.</span>
+        <span class="faint" id="study-runs">Runs {{ chosen.variants }} variant{{ 's' if chosen.variants != 1 }} and the cost ladder at {{ '%.2f'|format(on_venue.fee * 100) }}% (the venue's taker fee). Long only.</span>
         <button>Run study</button>
       </div>
     </form>
   </section>
 </div>
-<form id="collect-study" method="post" action="/research/history" hidden>
-  <input type="hidden" name="from" value="study"><input type="hidden" name="strategy" value="{{ chosen.name }}">
-  <input type="hidden" name="venue" value="{{ values.venue }}"><input type="hidden" name="instrument" value="{{ values.instrument }}">
-</form>
-{% for v in venues %}<datalist id="pairs-{{ v.key }}">{% for i in v.suggest %}<option value="{{ i }}">{% endfor %}</datalist>{% endfor %}
 <script type="application/json" id="study-data">{{ study_data|tojson }}</script>
 </div>
 
@@ -153,32 +147,23 @@
 </section>
 </div>
 
-{# --- History: what the collector has stored, on every venue ----------------------------------------------- #}
+{# --- Data coverage: what history is stored, read-only (UI v2, item 8) --------------------------------------- #}
 <div class="tab-panel" id="tab-history" role="tabpanel" data-panel="history">
 <section class="panel flush" aria-labelledby="history-h" id="stored-history">
-  <div class="panel-head"><h2 id="history-h">Stored history</h2><span class="hint">every venue</span></div>
+  <div class="panel-head"><h2 id="history-h">Data coverage</h2><span class="hint">every instrument with stored history</span></div>
   {% if msg_in == 'history' %}<div class="history-msgs">{{ messages() }}</div>{% endif %}
   {% if stored_all %}
   <table class="responsive">
-    <thead><tr><th>Instrument</th><th>Venue</th><th>Stored from</th><th>Stored to</th><th>Collector</th></tr></thead>
+    <thead><tr><th>Instrument</th><th>Market</th><th>Stored from</th><th>Last candle</th><th>History</th></tr></thead>
     <tbody>{% for h in stored_all %}
     <tr><td data-label="Instrument">{{ h.pair }}</td>
-      <td data-m="right" class="muted">{{ h.venue }}</td>
+      <td data-m="right" class="muted">{{ 'perpetual' if h.perpetual else 'spot' }}</td>
       <td data-label="Stored from">{{ h.first.strftime('%d %b %Y') if h.first else '–' }}</td>
-      <td data-label="Stored to">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
-      <td data-label="Collector">{% if h.state == 'current' %}<span class="chip running">Current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Catching up</span>{% else %}<span class="chip stopped">Asked for {{ h.requested.strftime('%d %b') if h.requested else '' }}</span>{% endif %}</td></tr>
+      <td data-label="Last candle">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
+      <td data-label="History"><span class="chip {{ h.chip.tone }}"{% if h.chip.title %} title="{{ h.chip.title }}"{% endif %}>{{ h.chip.text }}</span></td></tr>
     {% endfor %}</tbody>
   </table>
-  {% else %}<p class="muted" style="padding:0 18px">No instrument has stored history yet.</p>{% endif %}
-  <form method="post" action="/research/history" class="collect-form">
-    <label for="collect-instrument">Collect another instrument</label>
-    <div class="collect-row">
-      <select name="venue" aria-label="Venue" id="collect-venue">{% for v in venues %}<option value="{{ v.key }}" {{ 'selected' if v.key == values.venue }}>{{ v.label }}</option>{% endfor %}</select>
-      <input id="collect-instrument" name="instrument" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" placeholder="{{ on_venue.suggest[1] if on_venue.suggest|length > 1 else 'ETH/USD' }}" autocomplete="off" value="{{ collect }}">
-      <button>Collect history</button>
-    </div>
-    <p class="hint">The collector backfills the last {{ request_years }} years of the venue's trades into 1-minute bars, then keeps them current. A heavily traded instrument can take a day or more to backfill; a study can run on what is stored so far, and its tear sheet says where the history ends.</p>
-  </form>
+  {% else %}<p class="muted" style="padding:0 18px 16px">No instrument has stored history yet.</p>{% endif %}
 </section>
 </div>
 {% endblock %}
@@ -196,12 +181,12 @@ Console.orderFields("study-form");
   const data = JSON.parse(document.getElementById("study-data").textContent);
   const P = data.plans, V = data.venues;
   const $ = (id) => document.getElementById(id);
-  const dev = $("dev"), form = $("study-form"), inst = form.elements.instrument, collect = $("collect-study");
+  const dev = $("dev"), form = $("study-form"), inst = form.elements.instrument;
   const box = $("use_holdout"), spent = JSON.parse(box.dataset.spent), holdHint = $("holdout-hint"), holdPlain = holdHint.textContent;
   const exitBox = form.querySelector(".exit-fields");
   const PAIR = /^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/;
   let current = data.chosen;
-  const venue = () => (form.querySelector("input[name=venue]:checked") || {}).value || data.default_venue;
+  const venue = () => form.elements.venue.value || data.default_venue;
   const val = (n) => { const el = form.elements[n]; return el && !el.disabled ? el.value.trim() : ""; };
   const p2 = (x) => `${(x * 100).toFixed(2)}%`;
 
@@ -233,11 +218,9 @@ Console.orderFields("study-form");
 
   // The history chip beside the instrument, from what the page holds for every venue: no reload.
   const histChip = () => {
-    const v = V[venue()], pair = inst.value.trim().toUpperCase(), h = v.held[pair], chip = $("hist-chip"), btn = $("hist-collect");
+    const v = V[venue()], pair = inst.value.trim().toUpperCase(), h = v.held[pair], chip = $("hist-chip");
     chip.className = "chip " + (h ? h.tone : "");
-    chip.textContent = h ? h.text : PAIR.test(pair) ? "Not stored" : "Pick an instrument";
-    btn.hidden = !!h || !PAIR.test(pair);
-    collect.elements.venue.value = venue(); collect.elements.instrument.value = pair; collect.elements.strategy.value = current;
+    chip.textContent = h ? h.text : PAIR.test(pair) ? "not stored yet" : "Pick an instrument";
   };
   // A holdout already opened for this model and instrument stays closed, so the box is too (review round 10, M10-1).
   const syncHoldout = () => {
@@ -252,43 +235,71 @@ Console.orderFields("study-form");
     $("how-text").textContent = howSentence();
     $("exit-text").textContent = exitsSentence();
     const v = V[venue()], n = (P[current] || {}).variants || 1;
-    $("study-runs").textContent = `Runs ${n} variant${n === 1 ? "" : "s"} and the cost ladder at ${p2(v.fee)} (${v.label} taker fee). Long only.`;
+    $("study-runs").textContent = `Runs ${n} variant${n === 1 ? "" : "s"} and the cost ladder at ${p2(v.fee)} (the venue's taker fee). Long only.`;
   };
 
-  // The venue switch: its instruments, its history and its perpetual or spot market, in place.
+  // Study windows sized to the stored history (UI v2, item 8; twin of development.py fit_windows), until the
+  // PM sets them by hand.
+  let windowsSet = false;
+  const monthsWords = (d) => {
+    let m = Math.round(d / 30.44);
+    if (m < 1) return `${Math.floor(d)} day${Math.floor(d) === 1 ? "" : "s"}`;
+    const y = Math.floor(m / 12); m %= 12;
+    return [y ? `${y} year${y === 1 ? "" : "s"}` : "", m ? `${m} month${m === 1 ? "" : "s"}` : ""].filter(Boolean).join(" ");
+  };
+  const fit = () => {
+    const h = V[venue()].held[inst.value.trim().toUpperCase()], days = h && h.days, line = $("fit-text");
+    if (!days) { line.hidden = true; return; }
+    const plan = (P[current] || {}).values || {};
+    const n = (k, d) => Number((windowsSet ? val(k) : plan[k]) || d);
+    const train = n("train_days", 365), test = n("test_days", 180), hold = n("holdout_days", 0);
+    line.hidden = false;
+    if (windowsSet || train + test + hold <= days) {
+      if (!windowsSet) ["train_days", "test_days", "holdout_days"].forEach((k, i) => { $(k).value = [train, test, hold][i]; });
+      line.textContent = train + test + hold <= days ? `You have ${monthsWords(days)} of history; these windows fit inside it.`
+        : `You have ${monthsWords(days)} of history; these windows need ${monthsWords(train + test + hold)}.`;
+      return;
+    }
+    const unit = days / (hold ? 4 : 3), w = [Math.max(Math.floor(2 * unit), 30), Math.max(Math.floor(unit), 30), hold ? Math.floor(unit) : 0];
+    ["train_days", "test_days", "holdout_days"].forEach((k, i) => { $(k).value = w[i]; });
+    line.textContent = `You have ${monthsWords(days)} of history, so: learn on ${monthsWords(w[0])}, test on the next ${monthsWords(w[1])}${hold ? `, newest ${monthsWords(w[2])} sealed` : ""}.`;
+  };
+  ["train_days", "test_days", "holdout_days"].forEach((k) => $(k).addEventListener("input", (e) => { if (e.isTrusted) windowsSet = true; }));
+
+  // The venue follows the instrument pick: its history and its perpetual or spot market, in place.
   const market = () => {
     if (!exitBox) return;
     exitBox.dataset.market = V[venue()].perpetual ? "perp" : "spot";
     form.dispatchEvent(new Event("market-change"));
   };
   const onVenue = () => {
-    const key = venue(), v = V[key], pair = inst.value.trim().toUpperCase();
-    inst.setAttribute("list", "pairs-" + key);
-    if (v.suggest.length && !v.suggest.includes(pair) && !v.held[pair]) {
-      const base = pair.split("/")[0];
-      inst.value = v.suggest.find((p) => p.split("/")[0] === base) || v.suggest[0];
-    }
-    $("venue-note").textContent = v.perpetual
-      ? `Studies on ${v.label} trade its perpetual, long only, with the funding it settled.`
-      : `Studies on ${v.label} run spot, long only.`;
+    $("venue-note").textContent = V[venue()].perpetual ? "A perpetual is studied long only, with the funding it settled." : "Spot is studied long only.";
     market(); sync();
   };
-  form.querySelectorAll("input[name=venue]").forEach((r) => r.addEventListener("change", onVenue));
+  form.elements.venue.addEventListener("change", onVenue);
+  inst.addEventListener("change", () => { fit(); sync(); });
   form.addEventListener("input", sync); form.addEventListener("change", sync);
 
   // Each study keeps its own settings, venue included, while the PM looks at another model.
   const state = {};
   const fields = () => [...form.querySelectorAll("input[id], select[id]")];
-  const snapshot = () => ({venue: venue(), f: Object.fromEntries(fields().map((el) => [el.id, el.type === "checkbox" ? el.checked : el.value]))});
-  const setVenue = (key) => { const r = form.querySelector(`input[name=venue][value="${key}"]`); if (r) r.checked = true; };
+  const snapshot = () => ({venue: venue(), minutes: form.elements.minutes.value, set: windowsSet,
+    f: Object.fromEntries(fields().map((el) => [el.id, el.type === "checkbox" ? el.checked : el.value]))});
+  const setVenue = (key) => {
+    const v = form.elements.venue;
+    if (!V[key]) return;
+    v.value = key; v.dataset.perp = V[key].perpetual ? "1" : "";
+    const k = form.querySelector("[data-pl-kind]"); if (k) k.textContent = V[key].perpetual ? "perpetual" : "spot";
+  };
   const kinds = () => form.querySelectorAll("[data-kind]").forEach((k) => k.dispatchEvent(new Event("change")));
   const restore = (s) => {
-    setVenue(s.venue);
+    setVenue(s.venue); form.elements.minutes.value = s.minutes; windowsSet = s.set;
     fields().forEach((el) => { if (el.id in s.f) { if (el.type === "checkbox") el.checked = s.f[el.id]; else el.value = s.f[el.id]; } });
     kinds();
   };
   const applyPlan = (name) => {
-    const v = P[name].values, set = (id, x) => { const el = $(id); if (el) el.value = x == null ? "" : x; };
+    const v = P[name].values, set = (id, x) => { const el = form.elements[id] || $(id); if (el) el.value = x == null ? "" : String(x); };
+    windowsSet = false;
     setVenue(v.venue || data.default_venue);
     const vv = V[venue()];
     if (v.instrument) inst.value = v.instrument;
@@ -299,7 +310,7 @@ Console.orderFields("study-form");
     set("atr_bars", v.atr_bars || 14);
     set("stop_kind", v.stop_atr ? "atr" : v.stop_loss_pct ? "pct" : v.stop_swing_bars ? "swing" : "");
     set("tp_kind", v.take_profit_r ? "r" : v.take_profit_pct ? "pct" : "");
-    kinds();
+    kinds(); fit();
   };
 
   // On a phone the study opens as a sheet over the list.
@@ -322,12 +333,23 @@ Console.orderFields("study-form");
   dev.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => open(false)));
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && dev.classList.contains("open")) open(false); });
 
-  // Filters over the plan list.
-  const filters = [...document.querySelectorAll("[data-filter]")];
+  // Search and filter chips over the plan list.
+  const filters = [...document.querySelectorAll("[data-filter]")], find = $("plan-search");
+  let only = "all";
+  const narrow = () => {
+    const q = find.value.trim().toLowerCase();
+    let n = 0;
+    dev.querySelectorAll(".plan-list li[data-status]").forEach((li) => {
+      li.hidden = (only !== "all" && li.dataset.status !== only) || (q && !li.dataset.search.includes(q));
+      n += !li.hidden;
+    });
+    dev.querySelector("[data-plan-none]").hidden = n > 0;
+  };
   filters.forEach((b) => b.addEventListener("click", () => {
     filters.forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-    dev.querySelectorAll(".plan-list li").forEach((li) => { li.hidden = b.dataset.filter !== "all" && li.dataset.status !== b.dataset.filter; });
+    only = b.dataset.filter; narrow();
   }));
+  find.addEventListener("input", narrow);
 
   // A field the browser refuses opens the step it sits in.
   form.addEventListener("invalid", (e) => { const d = e.target.closest("details"); if (d) d.open = true; }, true);
