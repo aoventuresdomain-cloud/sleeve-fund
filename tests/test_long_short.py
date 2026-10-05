@@ -1,6 +1,7 @@
 """Long and short on a perpetual (plan L1-L3, 4 Oct 2026): the margin account, short and flipping trades,
 funding, the liquidation price and guard, trade pairing, and a paper restart that carries a short."""
 
+import re
 import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -556,6 +557,10 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
         shorted = shorted or (net <= 1e-12 and f["side"] == "SELL")
         net += f["qty"] if f["side"] == "BUY" else -f["qty"]
     assert shorted, "the backtest never went short"
+    # M12-U5: the side rides on the entry cell, which no width hides (Size, which says it too, goes at 1440 px).
+    table = result.split('id="bt-tr-h"')[1].split("</table>")[0]
+    sides = re.findall(r'<tr><td data-m="hide">[^<]+<div class="sub">(long|short)</div></td>', table)
+    assert "short" in sides and len(sides) == table.count('<tr class="detail"'), sides
 
     # Start: the new strategy keeps the market, shorts and mirror.
     data = {k: v for k, v in q.items() if k not in ("from", "source")}
@@ -930,6 +935,49 @@ def test_a_perp_backtests_benchmark_is_an_unlevered_hold_at_the_perps_fee(monkey
     assert d["benchmark"][0] == pytest.approx(5000 * (1 - taker), abs=0.01)
     held = 5000 * (1 - taker) * bars["close"].iloc[-1] / bars["close"].iloc[0]
     assert d["benchmark"][-1] == pytest.approx(held, rel=1e-6)
+
+
+@pytest.mark.sanity
+@pytest.mark.parametrize(("params", "label"), [({**PERP}, "unlevered"), ({}, "33% invested")], ids=["perp", "spot"])
+def test_a_saved_runs_screen_shows_the_benchmark_its_result_shows(client, monkeypatch, params, label):  # noqa: F811
+    """Round 12, M12-U1 (re-check): the result held a perp's benchmark at 1x while the paper runtime, which
+    writes the saved run's journal and every paper strategy's, held it at the profile's 33% spot cap, so the
+    result and the strategy screen of the same run disagreed. One definition now (the position cap, never
+    above 1x), labelled with its exposure on both."""
+    from sleeve_fund.dashboard import preview
+    from sleeve_fund.data import synthetic_ohlcv
+    from test_dashboard import AUTH, KRAKEN
+
+    c, store = client
+    bars = synthetic_ohlcv(days=200, seed=2, start_price=150)
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: bars)
+    keep = {}
+    d = preview.run("buy_and_hold", "SOL/USD", params, starting=5000, risk_profile="balanced", keep=keep)
+    name = store.save_backtest(keep["journal"], run_id="u1", key="k", title="Benchmark run", query="", result=d)
+    rows = store.equity_series(name)
+    assert rows[-1]["benchmark"] == pytest.approx(d["benchmark"][-1], abs=0.01)
+    screen = c.get(f"/sleeves/{name}", auth=AUTH).text
+    bench_ret = d["benchmark"][-1] / 5000 - 1
+    assert f"buy and hold, {label}: {bench_ret * 100:+.1f}%" in screen, screen.split("Since start")[1].split("</button>")[1][:300]
+
+
+@pytest.mark.sanity
+def test_the_kill_switch_dialog_counts_shorts_by_their_size(client):  # noqa: F811
+    """Round 12, M12-U4: the kill switch's confirm dialog summed only long positions, so a book of shorts read
+    as about a seventh of the notional the switch would trade. Every open position counts, by its size."""
+    from test_dashboard import AUTH
+
+    c, store = client
+    for name, qty, px in (("short-a", -0.3, 60_000.0), ("long-b", 0.05, 60_000.0)):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+        store.set_desired_state(name, "running")
+        store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
+    dialog = c.get("/risk", auth=AUTH).text.split('id="dlg-kill"')[1].split("</dialog>")[0]
+    # 18,000 short and 3,000 long: 21,000 to trade, not the 3,000 of longs alone (nor the -15,000 net).
+    assert "worth about 21,000" in dialog, dialog
+    assert "close to cash at market (longs sell, shorts buy back)" in dialog
 
 
 def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F811
