@@ -281,6 +281,71 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
     }
 
 
+def book_positions(store: Store, summaries: list[dict]) -> dict:
+    """Every open position across the book for the Portfolio page, each with its strategy's P&L split as the
+    strategy page shows it: unrealised on the open position, realised since the strategy started (its P&L
+    less the unrealised part, so closed trades and funding are in it) and the fees it has paid. Display only:
+    the summaries' own figures, added up."""
+    rows = []
+    for x in summaries:
+        if not x["qty"] or not x["entry_px"]:
+            continue
+        name = x["sleeve"].name
+        pos = open_position(x, store.fills(name, limit=100_000), orders_by_id(store, name), store.exit_plans(name))
+        if pos is None:
+            continue
+        perp = markets.is_perp(x["sleeve"].params)
+        rows.append({
+            **pos,
+            "x": x,
+            "perp": perp_view(x, pos, store.funding(name, limit=100_000)) if perp else None,
+            "realised": x["pnl"] - x["unrealised"],
+            "fees": x["fees"],
+            "flattening": any(c["command"] == "flatten" for c in store.pending_commands(name)),
+        })
+    return {
+        "rows": rows,
+        "unrealised": sum(r["unrealised"] for r in rows),
+        "realised": sum(r["realised"] for r in rows),
+        "fees": sum(r["fees"] for r in rows),
+    }
+
+
+def book_fills(store: Store, sleeves: list, limit: int = 100) -> list[dict]:
+    """The book's latest fills across its strategies, newest first, each with the reason its order journaled."""
+    out = []
+    for s in sleeves:
+        name = s.name
+        fills = store.fills(name, limit=limit)
+        if not fills:
+            continue
+        orders = {o["order_id"]: o for o in store.orders(name, limit=limit * 10)}
+        for f in fills:
+            o = orders.get(f["order_id"])
+            out.append({**f, "pair": s.instrument, "reason": o["reason"] if o else None,
+                        "intent": o["intent"] if o else None,
+                        "intent_label": INTENTS.get(o["intent"], o["intent"]) if o else None})
+    out.sort(key=lambda f: (f["ts"], f["id"]), reverse=True)
+    return out[:limit]
+
+
+def book_funding(store: Store, summaries: list[dict], limit: int = 50) -> dict:
+    """Funding settled on the book's perpetual positions: the latest payments, newest first, and each
+    strategy's total since it started (+ received, - paid)."""
+    payments, totals = [], []
+    for x in summaries:
+        s = x["sleeve"]
+        if not markets.is_perp(s.params):
+            continue
+        rows = store.funding(s.name, limit=limit)
+        payments += [{**f, "sleeve": s.name, "pair": s.instrument} for f in rows]
+        if rows:
+            totals.append({"sleeve": s.name, "pair": s.instrument, "total": store.funding_total(s.name)})
+    payments.sort(key=lambda f: (f["ts"], f["id"]), reverse=True)
+    return {"payments": payments[:limit], "totals": totals, "total": sum(t["total"] for t in totals),
+            "perps": sum(1 for x in summaries if markets.is_perp(x["sleeve"].params))}
+
+
 AUDIT_COLUMNS = ["ts", "strategy", "venue", "instrument", "side", "qty", "price", "notional", "fee", "realised_pnl",
                  "position_after", "intent", "reason", "order_id", "trade_id"]
 
