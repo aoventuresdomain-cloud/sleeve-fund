@@ -275,7 +275,7 @@ def test_the_start_check_says_whether_the_key_signed_in_and_flags_hedge_mode():
         return lambda method, url, headers, body: {"retCode": 0, "result": {"list": rows}}
 
     one_way = mirror.BybitDemo(mirror.Settings("k", "s"), http=http([{"positionIdx": 0, "side": "", "size": "0"}]))
-    assert one_way.check() == "key accepted, BTCUSDT position +0, one-way mode"
+    assert one_way.check().startswith("key accepted, BTCUSDT position +0, one-way mode, ")
     hedge = mirror.BybitDemo(mirror.Settings("k", "s"), http=http([{"positionIdx": 1, "side": "Buy", "size": "0.01"},
                                                                    {"positionIdx": 2, "side": "", "size": "0"}]))
     assert "HEDGE MODE" in hedge.check() and "+0.01" in hedge.check()
@@ -397,3 +397,163 @@ def test_a_catch_up_that_keeps_failing_warns_once():
     demo.fail = False
     mirror.catch_up(store, targets, seen)
     assert demo.held == 0.05
+
+
+class _BybitMargin(mirror.BybitDemo):
+    """Bybit Demo with its margin settings: cross at 10x until told otherwise, as a new demo account starts."""
+
+    def __init__(self, refuse_while_holding=False, refuse=False):
+        super().__init__(mirror.Settings("k", "s"), http=self.http)
+        self.orders, self.held, self.mode, self.lev, self.calls = [], 0.0, "REGULAR_MARGIN", "10", []
+        self.refuse_while_holding, self.refuse = refuse_while_holding, refuse
+
+    def http(self, method, url, headers, body):
+        import json
+
+        path = url.split("api-demo.bybit.com")[1].split("?")[0]
+        self.calls.append(path)
+        b = json.loads(body) if body else {}
+        if path == "/v5/account/set-margin-mode":
+            if self.refuse or (self.refuse_while_holding and self.held):
+                return {"retCode": 3400045, "retMsg": "Set margin mode failed"}
+            self.mode = b["setMarginMode"]
+            return {"retCode": 0, "result": {}}
+        if path == "/v5/position/switch-isolated":
+            return {"retCode": 100028, "retMsg": "unified account is forbidden"}
+        if path == "/v5/position/set-leverage":
+            if b["buyLeverage"] == self.lev:
+                return {"retCode": 110043, "retMsg": "Set leverage not modified"}
+            self.lev = b["buyLeverage"]
+            return {"retCode": 0, "result": {}}
+        if path == "/v5/account/info":
+            return {"retCode": 0, "result": {"marginMode": self.mode}}
+        if path == "/v5/account/wallet-balance":
+            return {"retCode": 0, "result": {"list": [{"totalEquity": "50000"}]}}
+        if path == "/v5/position/list":
+            side = "Buy" if self.held > 0 else "Sell" if self.held < 0 else ""
+            return {"retCode": 0, "result": {"list": [{"symbol": "BTCUSDT", "side": side, "size": str(abs(self.held)),
+                                                       "leverage": self.lev, "positionIdx": 0}]}}
+        if path == "/v5/order/realtime":
+            return {"retCode": 0, "result": {"list": [{"avgPrice": "60000"}]}}
+        if path == "/v5/order/cancel-all":
+            return {"retCode": 0, "result": {"list": []}}
+        o = json.loads(body)
+        self.orders.append(o)
+        self.held = round(self.held + (1 if o["side"] == "Buy" else -1) * float(o["qty"]), 8)
+        return {"retCode": 0, "result": {"orderId": str(len(self.orders))}}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_margin_state():
+    mirror._MARGIN_WARNED.clear()
+    mirror._MARGIN_RESET.clear()
+    mirror._CATCH_UP_FAILED.clear()
+
+
+@pytest.mark.sanity
+def test_bybit_is_set_to_isolated_margin_at_the_paper_leverage_before_copying():
+    store, demo = _store(), _BybitMargin()
+    _binance(store)  # balanced profile: a 2x cap on a perpetual
+    targets = {"BYBIT": demo}
+    assert mirror.bybit_leverage(store)["BTCUSDT"][0] == 2.0
+    done = mirror.prepare_margin(store, targets, {})
+    assert done == {"BTCUSDT": 2.0} and (demo.mode, demo.lev) == ("ISOLATED_MARGIN", "2")
+    (e,) = [e for e in store.events("bn-ls") if e["kind"] == "mirror_margin"]
+    assert e["level"] == "info" and "isolated margin, BTCUSDT at 2x" in e["message"]
+    n = len(demo.calls)
+    assert mirror.prepare_margin(store, targets, done) == done and len(demo.calls) == n  # once, not every poll
+
+
+def test_strategies_sharing_a_bybit_symbol_use_the_lowest_leverage_cap():
+    store = _store()
+    _binance(store, "bn-a")
+    _binance(store, "bn-b")
+    store._update_sleeve("bn-b", risk_profile="conservative")
+    lev, sleeves = mirror.bybit_leverage(store)["BTCUSDT"]
+    assert lev == 1.0 and {s.name for s in sleeves} == {"bn-a", "bn-b"}
+
+
+@pytest.mark.sanity
+def test_a_demo_position_opened_at_the_wrong_leverage_is_closed_switched_and_reopened():
+    store, demo = _store(), _BybitMargin(refuse_while_holding=True)
+    _binance(store)
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "BUY", 0.076, 1)
+    mirror.mirror_once(store, targets)  # copied at Bybit's 10x default, as on 5 Oct
+    assert demo.held == 0.076 and demo.lev == "10"
+    assert mirror.prepare_margin(store, targets, {}) == {"BTCUSDT": 2.0}
+    assert (demo.mode, demo.lev, demo.held) == ("ISOLATED_MARGIN", "2", 0.0)
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    assert demo.held == 0.076 and seen == {} and store.mirror_positions() == {"BTCUSDT": pytest.approx(0.076)}
+    assert store.journal_book("bn-ls", 10_000)["qty"] == pytest.approx(0.076)  # the paper book is untouched
+
+
+def test_when_bybit_refuses_the_margin_set_up_copies_go_on_and_it_warns_once():
+    store, demo = _store(), _BybitMargin(refuse=True)
+    _binance(store)
+    targets = {"BYBIT": demo}
+    for _ in range(3):
+        assert mirror.prepare_margin(store, targets, {}) == {}
+    warnings = [e for e in store.events("bn-ls") if e["kind"] == "mirror_margin"]
+    assert len(warnings) == 1 and warnings[0]["level"] == "warning"
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "SELL", 0.05, 1)
+    assert mirror.mirror_once(store, targets) == 1 and demo.held == -0.05
+
+
+def test_spot_strategies_and_other_venues_get_no_margin_set_up():
+    store, demo = _store(), _BybitMargin()
+    store.create_sleeve(name="bn-spot", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"demo_mirror": True}, venue="binance")
+    assert mirror.bybit_leverage(store) == {}  # pp-ls is on the Deribit testnet, bn-spot is spot
+    assert mirror.prepare_margin(store, {"BYBIT": demo}, {}) == {} and demo.calls == []
+
+
+def test_the_start_check_reports_equity_and_margin():
+    out = _BybitMargin().check()
+    assert "50,000.00 USD equity" in out and "cross margin, BTCUSDT at 10x" in out
+
+
+@pytest.mark.sanity
+def test_resync_brings_bybit_to_the_paper_position_at_once_on_the_paper_terms():
+    store, demo = _store(), _BybitMargin(refuse_while_holding=True)
+    _binance(store)
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-ls", "BUY", 0.076, 1)
+    mirror.mirror_once(store, targets)
+    demo.held = 0.1  # traded by hand on the demo account, and still at Bybit's 10x default
+    store.request_resync("bn-ls", "Demo copy out of line with paper")
+    margin = {}
+    assert mirror.process_resyncs(store, targets, margin) == 1
+    assert (demo.held, demo.mode, demo.lev) == (0.076, "ISOLATED_MARGIN", "2") and margin == {"BTCUSDT": 2.0}
+    assert "/v5/order/cancel-all" in demo.calls
+    links = [o["orderLinkId"] for o in demo.orders[1:]]
+    assert all("-resync-" in x for x in links) and len(set(links)) == len(links)
+    req = store.last_resync("bn-ls")
+    assert req["done_at"] and "paper +0.076 at 2x isolated" in req["result"]
+    assert "before +0.1, cross margin, BTCUSDT at 10x" in req["result"] and "after +0.076, isolated margin" in req["result"]
+    assert store.mirror_positions() == {"BTCUSDT": pytest.approx(0.076)}
+    assert all(r["message"].startswith("resync") for r in store.mirror_rows("bn-ls")[:2])
+    assert store.events("bn-ls")[0]["kind"] == "mirror_resync"
+    assert store.journal_book("bn-ls", 10_000)["qty"] == pytest.approx(0.076)  # the paper book is untouched
+    assert mirror.process_resyncs(store, targets, margin) == 0  # done once
+
+
+def test_resync_all_covers_every_bybit_strategy_and_refuses_what_is_not_copied():
+    store, demo = _store(), _BybitMargin()
+    _binance(store, "bn-a")
+    _binance(store, "bn-b")
+    targets = {"BYBIT": demo}
+    mirror.mirror_once(store, targets)
+    _fill(store, "bn-a", "BUY", 0.05, 1)
+    _fill(store, "bn-b", "SELL", 0.02, 2)
+    store.request_resync(None, "After a deploy or restart")
+    mirror.process_resyncs(store, targets, {})
+    assert demo.held == pytest.approx(0.03)
+    with pytest.raises(ValueError, match="isn't copied"):
+        store.request_resync("pp", "x")
+    with pytest.raises(ValueError, match="reason"):
+        store.request_resync("bn-a", " ")
+    assert "Deribit" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced

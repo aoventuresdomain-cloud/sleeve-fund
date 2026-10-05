@@ -1931,3 +1931,30 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
     assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it
+
+
+def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervisor(client):
+    """PM, 5 Oct 2026: a quick reset while testing that closes the position, puts the run away and starts
+    again at the starting capital. The confirm says exactly what happens; the supervisor carries it out."""
+    c, store = client
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True, "demo_mirror": True},
+                        venue="binance")
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    page = c.get("/sleeves/bn-ls", auth=AUTH).text
+    assert 'data-open="dlg-reset"' in page and 'action="/sleeves/bn-ls/reset"' in page
+    assert "Closes the long of 0.076" in page and "and the copy on Bybit Demo Trading" in page
+    assert "Puts this run away under Previous book" in page and "Starts bn-ls again at 10,000.00" in page
+    assert "isolated margin at 2×" in page and "Demo copy" in page and "out of line" in page
+    r = c.post("/sleeves/bn-ls/reset", data={"reason": "Test finished; starting a clean run"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and store.pending_reset("bn-ls")["restart"] == 1
+    assert store.decisions("bn-ls")[0]["action"] == "reset"
+    assert "Resetting…" in c.get("/sleeves/bn-ls", auth=AUTH).text
+    r = c.post("/sleeves/bn-ls/reset", data={"reason": "again"}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "already+under+way" in r.headers["location"]
+    _new(c)
+    r = c.post("/book/reset", data={"reason": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls", "btc-test"}
+    assert "Demo copy <span" not in c.get("/sleeves/btc-test", auth=AUTH).text  # not copied to Bybit Demo
