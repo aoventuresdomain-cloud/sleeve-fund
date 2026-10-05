@@ -1772,3 +1772,49 @@ def test_the_g2_checklist_says_a_long_short_strategy_has_no_g1_yet(client):
     x = sleeve_extras(store, sleeve_summary(store, store.sleeve("rsi-ls")), pd.DataFrame())
     row = next(r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow()) if "G1" in r["label"])
     assert not row["ok"] and "perpetual or long/short" in row["detail"]
+
+
+def test_the_audit_csv_has_every_fill_with_its_pnl_reason_and_indicator_values(client):
+    """PM, 5 Oct 2026: every trade checkable outside the dashboard, in a spreadsheet or against a chart: time,
+    instrument, side, price, size, fee, the P&L each fill realised, and the indicator values behind the decision."""
+    import csv
+    import io
+
+    c, store = client
+    store.create_sleeve(name="rsi", strategy="rsi_bands", instrument="BTC/USD", bar_spec="15-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    store.record_order("rsi", order_id="o1", side="BUY", qty=0.1, intent="entry",
+                       reason="RSI 29.5 at or below 30: long until it reaches 55", signal={"rsi": 29.5, "close": 60_000.0})
+    store.record_fill("rsi", side="BUY", qty=0.1, price=60_000.0, fee=4.8, order_id="o1", trade_id="t1")
+    store.record_order("rsi", order_id="o2", side="SELL", qty=0.1, intent="exit",
+                       reason="RSI 55.2 reached 55: the long leg ends", signal={"rsi": 55.2, "close": 60_600.0})
+    store.record_fill("rsi", side="SELL", qty=0.04, price=60_600.0, fee=1.94, order_id="o2", trade_id="t2")
+    store.record_fill("rsi", side="SELL", qty=0.06, price=60_500.0, fee=2.9, order_id="o2", trade_id="t3")
+    r = c.get("/exports/audit.csv?sleeve=rsi", auth=AUTH)
+    assert r.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    assert list(rows[0])[:15] == ["ts", "strategy", "venue", "instrument", "side", "qty", "price", "notional", "fee",
+                                  "realised_pnl", "position_after", "intent", "reason", "order_id", "trade_id"]
+    assert [(x["side"], x["rsi"], x["venue"]) for x in rows] == [("BUY", "29.5", "KRAKEN"), ("SELL", "55.2", "KRAKEN"),
+                                                                 ("SELL", "55.2", "KRAKEN")]
+    # The buy realises only its fee; each sell its share of the move off the 60,000 entry, after its fee.
+    assert [float(x["realised_pnl"]) for x in rows] == pytest.approx([-4.8, 0.04 * 600 - 1.94, 0.06 * 500 - 2.9])
+    assert [float(x["position_after"]) for x in rows] == pytest.approx([0.1, 0.06, 0.0])
+    assert rows[1]["reason"] == "RSI 55.2 reached 55: the long leg ends"
+    page = c.get("/sleeves/rsi", auth=AUTH).text
+    assert 'href="/exports/audit.csv?sleeve=rsi"' in page
+    assert 'href="/exports/audit.csv"' in c.get("/reports", auth=AUTH).text
+
+
+def test_the_audit_trail_books_a_turn_from_long_to_short_at_the_turning_price():
+    from types import SimpleNamespace
+
+    from sleeve_fund.dashboard.trading import audit_rows
+
+    s = SimpleNamespace(name="x", instrument="BTC/USD")
+    fills = [{"ts": 1, "side": "BUY", "qty": 1.0, "price": 100.0, "fee": 0.0},
+             {"ts": 2, "side": "SELL", "qty": 3.0, "price": 110.0, "fee": 0.0},  # closes 1 (+10), opens 2 short at 110
+             {"ts": 3, "side": "BUY", "qty": 2.0, "price": 105.0, "fee": 0.0}]  # covers 2 at 105: +10
+    rows, keys = audit_rows(s, fills, {}, "KRAKEN")
+    assert [r["realised_pnl"] for r in rows] == pytest.approx([0.0, 10.0, 10.0]) and keys == []
+    assert [r["position_after"] for r in rows] == pytest.approx([1.0, -2.0, 0.0])

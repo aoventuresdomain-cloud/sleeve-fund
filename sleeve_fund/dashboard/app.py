@@ -791,6 +791,17 @@ def create_app(store: Store | None = None) -> FastAPI:
                     "funding", "insurance", "pnl",
                     "ret", "r", "planned_r", "exits_edited", "exit_kind", "entry_why", "exit_why", "entry_order",
                     "exit_order"]
+        elif kind == "audit":
+            from sleeve_fund.venues import DEFAULT_VENUE
+
+            rows, signal_cols = [], []
+            for n in chosen:
+                s = st().sleeve(n)
+                got, keys = trading.audit_rows(s, list(reversed(st().fills(n, limit=1_000_000))),
+                                               trading.orders_by_id(st(), n), getattr(s, "venue", None) or DEFAULT_VENUE)
+                rows += got
+                signal_cols += [k for k in keys if k not in signal_cols]
+            cols = trading.AUDIT_COLUMNS + signal_cols
         elif kind == "orders":
             rows = [dict(o, signal=json.dumps(o["signal"], sort_keys=True))
                     for n in chosen for o in reversed(st().orders(n, limit=1_000_000))]

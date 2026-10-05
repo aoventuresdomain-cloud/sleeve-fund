@@ -148,7 +148,7 @@
 <div class="tab-panel" id="tab-trades" role="tabpanel" data-panel="trades">
 {{ price_chart("pc", s.instrument, "") }}
 <section class="panel flush" aria-labelledby="trips-h" style="margin-bottom:14px">
-  <div class="panel-head"><h2 id="trips-h">Closed trades</h2><a class="right" href="/trades?sleeve={{ s.name }}">All trades</a></div>
+  <div class="panel-head"><h2 id="trips-h">Closed trades</h2><span class="right"><a data-dl href="/exports/audit.csv?sleeve={{ s.name|urlencode }}" title="Every fill with its price, fee, P&amp;L and the indicator values behind it, for a spreadsheet or a chart">Audit CSV</a> · <a href="/trades?sleeve={{ s.name }}">All trades</a></span></div>
   {% if trips %}
   <table class="responsive" data-hide-md="3 4 8 10">
     <thead><tr><th>Opened</th><th>Closed</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry (or after a looser stop was set)">R</th><th class="num">Fees</th><th>Exit</th><th></th></tr></thead>
