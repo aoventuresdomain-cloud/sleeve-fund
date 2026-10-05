@@ -204,6 +204,29 @@ def fit_windows(v: dict, days: int | None) -> tuple[dict, str]:
     return out, f"You have {have} of history, so: {words}."
 
 
+def history_badge(h: dict | None) -> dict:
+    """An instrument's history badge (UI v2, item 10), from a _stored_history row (None: not stored or asked
+    for). state is what the page keys on: "stored", "filling", "gaps" or "none". Gaps hold backtests and
+    studies back until the collector fills them (blocked_by_gaps)."""
+    if h is None or h["first"] is None:
+        return {"state": "filling", "text": "being filled"} if h else {"state": "none", "text": "not stored yet"}
+    if h.get("gaps"):
+        return {"state": "gaps", "text": _gap_words(len(h["gaps"]))}
+    if h["state"] != "current":
+        return {"state": "filling", "text": "being filled"}
+    return {"state": "stored", "text": f"stored · last candle {h['last']:%H:%M} · no gaps"}
+
+
+def _gap_words(n: int) -> str:
+    return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
+
+
+def blocked_by_gaps(pair: str, gaps: list) -> str | None:
+    """Why a backtest or study on this instrument has to wait, or None: only gaps in what is stored hold it
+    back. A collector still catching up doesn't; the study says where its history ends."""
+    return f"{pair}: {_gap_words(len(gaps))}" if gaps else None
+
+
 def variants(spec) -> int:
     from sleeve_fund.research.study import grid
 

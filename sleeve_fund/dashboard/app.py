@@ -512,6 +512,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         except (OSError, ValueError, KeyError):  # venue unreachable: the usual ones, and any other can still be typed
             return JSONResponse({"instruments": INSTRUMENT_HINTS, "source": "fallback"})
 
+    @app.get("/api/history/coverage")
+    def history_coverage_json(venue: str | None = None, _: str = Depends(require_pm)):
+        """Each instrument's stored history on a venue, for the pick-list's badges (UI v2, items 9 and 10): first
+        and last candle, gaps, and the badge's state and words. An instrument not listed reads "not stored yet"."""
+        try:
+            profile = _research_venue(venue)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return JSONResponse({"venue": profile.name.lower(), "instruments": [
+            {"pair": h["pair"], "first": h["first"].isoformat() if h["first"] is not None else None,
+             "last": h["last"].isoformat() if h["last"] is not None else None,
+             "gaps": [[a.isoformat(), b.isoformat()] for a, b in h["gaps"]], **h["badge"]}
+            for h in _stored_history(st(), profile)]})
+
     @app.get("/api/sleeves/{name}/equity")
     def equity_json(name: str, days: int | None = None, _: str = Depends(require_pm)):
         try:
@@ -835,6 +849,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             why = (f"{req.pair}'s history was asked for on {held['requested']:%d %b %Y}; the collector hasn't stored "
                    "any yet." if held else f"there is no stored {label} history for {req.pair} yet.")
             return research_page(request, error=why, pre=form, collect="" if held else req.pair)
+        from sleeve_fund.dashboard import development as dev
+
+        if why := dev.blocked_by_gaps(req.pair, held["gaps"]):
+            return research_page(request, error=why, pre=form)
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
@@ -1348,12 +1366,26 @@ def _backtest_args(q) -> dict:
         if pair not in have:
             raise ValueError(f"interval: {pair} has no stored minute history here, so it can only be backtested on "
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
+    _check_gaps(venue, pair)
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
              f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
              f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
             "risk_profile": q.get("risk_profile") or "balanced", "title": title, "bar_spec": bar_spec}
+
+
+def _check_gaps(venue: str, pair: str) -> None:
+    """A backtest waits while the instrument's stored history has gaps (UI v2, item 10), with the badge's words."""
+    from sleeve_fund.dashboard import development as dev
+    from sleeve_fund.history import HistoryStore
+
+    try:
+        gaps = HistoryStore().gaps(venue, pair)
+    except OSError:  # an unreadable store: the run itself says what failed
+        return
+    if why := dev.blocked_by_gaps(pair, gaps):
+        raise ValueError(why)
 
 
 def _stored(venue: str | None = None) -> list[dict]:
@@ -1477,9 +1509,11 @@ def instrument_options(store: Store, listing=None) -> list[dict]:
 
 
 def _stored_history(store: Store, profile=None) -> list[dict]:
-    """Each instrument research can use or has asked for, on the research venue: what is stored, and
-    whether the collector is current or still catching up. One unreadable series (a coverage file being
-    rewritten, say) is left out and logged rather than taking the Research page down with it."""
+    """Each instrument research can use or has asked for, on the research venue: what is stored, whether
+    the collector is current or still catching up, any gaps, and the badge that says so. One unreadable
+    series (a coverage file being rewritten, say) is left out and logged rather than taking the Research
+    page down with it."""
+    from sleeve_fund.dashboard import development as dev
     from sleeve_fund.history import HistoryStore
 
     profile = profile or _research_venue()
@@ -1506,13 +1540,16 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             if last.tzinfo is None:  # stored without a zone: UTC, as the collector writes it
                 first, last = first.tz_localize("UTC"), last.tz_localize("UTC")
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
+            gaps = hist.gaps(v, pair)
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
-        out.append({"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
-                    "state": "catching up" if behind else "current"})
+        row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
+               "state": "catching up" if behind else "current", "gaps": gaps}
+        out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
-    out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for"}
+    out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],
+             "badge": dev.history_badge({"first": None})}
             for p, r in asked.items() if p not in held]
     return sorted(out, key=lambda h: h["pair"])
 
