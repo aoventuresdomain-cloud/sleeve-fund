@@ -38,6 +38,10 @@ CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten:
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
+# Flattens a reset or a clean slate queues for one strategy before it stops asking and says the PM must close
+# it: a position below the venue's smallest order can't be closed by an order, and asking again every step
+# only piled up commands (review round 13, m13-E1).
+SYSTEM_FLATTENS = 3
 
 
 @dataclass
@@ -127,9 +131,12 @@ class Supervisor:
             name = req["sleeve"]
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
-            if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
-                if not any(c["command"] == "flatten" for c in pending):
-                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"])
+            qty = self.store.journal_book(name, s.starting_balance)["qty"]
+            if abs(qty) > 1e-12:
+                why = f"Reset strategy: {req['reason']}"
+                if not any(c["command"] == "flatten" for c in pending) and _flatten_again(self.store, name, why,
+                                                                                         req["created_at"], qty):
+                    self.store.command(name, "flatten", why, actor=req["actor"])
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue
@@ -263,6 +270,22 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     return added
 
 
+def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool:
+    """Whether a reset or a clean slate may queue another flatten (`why`) for a strategy still holding qty: at
+    most SYSTEM_FLATTENS since `since` (the reset's request, or the last clean slate finished, so an earlier slate
+    with the same reason doesn't count). The last refusal says once what is left and that the PM must close it."""
+    asked = sum(1 for d in store.decisions(name, limit=1_000, action="flatten", since=since)
+                if d["reason"] == why.strip())
+    if asked < SYSTEM_FLATTENS:
+        return True
+    if not any(e["kind"] == "flatten_gave_up" and e["message"].endswith(why)
+               for e in store.events(name, limit=200)):
+        store.event(name, "error", "flatten_gave_up",
+                    f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the venue's smallest "
+                    f"order; the PM must close it before this can finish: {why}")
+    return False
+
+
 def clear(store: Store, path: str) -> list[str]:
     """Put away the strategies on the book, once per [[clear]] entry in the file: each is stopped and
     archived, and its journal stays as it is (nothing is deleted). An entry's optional `keep` list names
@@ -295,8 +318,10 @@ def clear(store: Store, path: str) -> list[str]:
             # flattened like any other holder: until it is flat it stays in the book's figures.
             if abs(qty) > 1e-12:
                 holding.append(s.name)
-                if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
-                    store.command(s.name, "flatten", f"{reason}: flattened so it can be archived", actor="system")
+                why = f"{reason}: flattened so it can be archived"
+                if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
+                        and _flatten_again(store, s.name, why, store.book_start(), qty)):
+                    store.command(s.name, "flatten", why, actor="system")
                 if s.desired_state != "running":
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)

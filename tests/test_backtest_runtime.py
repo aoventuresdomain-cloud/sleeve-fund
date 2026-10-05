@@ -301,3 +301,21 @@ def test_the_alert_send_bound_holds_whatever_the_far_end_does():
     from sleeve_fund import alerts
 
     assert 0 < alerts.TOTAL <= 3 * alerts.TIMEOUT
+
+
+def test_a_backtest_journals_the_spread_in_the_price_and_the_venue_fee_as_the_fee_as_paper_does(prices, instrument):
+    """Review round 13, m13-E7: the journal had the half spread in the fee and the bar's price, the reverse of
+    paper, which fills on real quotes. It now matches the research report; the cash is the same either way."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                                    starting_balance=10_000, risk_profile="balanced")
+    res = run_backtest("buy_and_hold", _path(prices, [100.0] * 10 + [110.0] * 10), instrument, runtime=rt,
+                       half_spread=0.001)
+    journal = rt.store.fills(rt.name)
+    assert len(journal) == len(res.fills) >= 1
+    for f in journal:
+        rep = res.fills.loc[f["order_id"]]
+        assert f["price"] == pytest.approx(float(rep["avg_px"]))  # on the ask or bid, as the report reads it
+        assert f["fee"] == pytest.approx(f["qty"] * f["price"] / (1 + (0.001 if f["side"] == "BUY" else -0.001))
+                                         * float(instrument.taker_fee), abs=0.01)  # the venue's fee alone

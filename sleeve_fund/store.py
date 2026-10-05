@@ -1120,6 +1120,8 @@ class Store:
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper

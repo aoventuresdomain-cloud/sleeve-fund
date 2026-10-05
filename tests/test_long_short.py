@@ -637,6 +637,35 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
 
 
+def test_a_perps_stress_loss_stops_at_its_isolated_margin_and_the_liquidation_fee(client):  # noqa: F811
+    """Round 13, m13-U6: the stress table capped a perp's loss at the strategy's whole equity, but on isolated
+    margin it is liquidated once its margin is gone: a 3x short of 6,000 can lose 2,000 and the closing fee."""
+    from sleeve_fund import markets
+    from sleeve_fund.dashboard.riskops import most_it_can_lose, risk_view
+    from sleeve_fund.risk import profile
+    from sleeve_fund.venues import venue as venue_profile
+
+    _, store = client
+    store.create_sleeve(name="pp-3x", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+    s, aggressive = store.sleeve("pp-3x"), profile("aggressive")
+    x = {"sleeve": s, "profile": aggressive, "equity": 10_000.0, "qty": -0.1, "price": 60_000.0, "entry_px": 60_000.0,
+         "cash": 16_000.0, "unrealised": 0.0, "position_value": -6_000.0, "dd_used": 0.0, "day_ret": 0.0,
+         "exposure": -0.6, "room": 1_000.0}
+    mm = markets.terms(s.params, s.venue).maintenance_margin
+    taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
+    assert aggressive.max_leverage == 3.0
+    # Margin 6,000 / 3 = 2,000; liquidated at (2,000 + 6,000) / (0.1 x (1 + mm)), paying the taker fee there.
+    cap = 2_000.0 + taker * 0.1 * 80_000.0 / (1 + mm)
+    assert most_it_can_lose(x) == pytest.approx(cap)
+    view = risk_view(store, [x], {"equity": 10_000.0, "allocation": []})
+    losses = dict(zip((sc["shock"] for sc in view["scenarios"]), (sh["loss"] for sh in view["rows"][0]["shocks"])))
+    assert losses[0.50] == pytest.approx(cap)  # not 3,000: the rest of the 10,000 isn't at stake
+    assert losses[0.20] == pytest.approx(1_200.0) and losses[-0.50] == pytest.approx(-3_000.0)  # inside it: as before
+    # Spot, or flat: at most the equity, as before.
+    assert most_it_can_lose({**x, "qty": 0.0}) == 10_000.0
+
+
 def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     """Review round 11, M11-5: the Position tab and header show what a perp adds, and every trade's P&L
     is after fees and funding, in the Trades tab, the header and the export alike."""

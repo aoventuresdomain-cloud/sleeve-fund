@@ -4,7 +4,11 @@ Trading (the same linear perpetual; Binance's own demo is closed to the PM's acc
 Deribit testnet, the fallback. Demo money is not real and the paper journal
 stays the record of truth: the mirror never feeds anything back into a strategy, and a mirror order that fails
 is noted, not retried, so it can never trade twice. Before copying to Bybit Demo it sets isolated margin at the
-paper leverage (prepare_margin), so margin and liquidation price match the paper book too. On Bybit Demo, where
+paper leverage (prepare_margin). Paper's isolated margin is the notional over that leverage (U13-2), so for one
+strategy on a symbol the demo position's margin and liquidation price match the paper book. Strategies that share
+a Bybit symbol share one demo position (one-way mode): it holds their net quantity at the lowest of their
+leverages, so its quantity and P&L in total match the paper books but its margin and liquidation price match
+neither; compare those per strategy on the paper book (m13-E8). On Bybit Demo, where
 the quantity is the paper quantity, a catch-up then brings the account back to the paper position (catch_up),
 only for a gap seen twice in a row and only as far as the account itself is short of it.
 
@@ -345,8 +349,10 @@ def target_for(sleeve) -> str:
 
 
 def mirrored(store) -> list:
-    """The strategies whose params ask for the demo mirror."""
-    return [s for s in store.sleeves() if s.params.get("demo_mirror")]
+    """The strategies whose params ask for the demo mirror. A run archived by a reset is not one: it trades no
+    more, and its risk profile mustn't set the leverage of a symbol it once shared (m13-E5)."""
+    archived = store.archived()
+    return [s for s in store.sleeves() if s.params.get("demo_mirror") and s.name not in archived]
 
 
 def mirror_once(store, targets: dict) -> int:

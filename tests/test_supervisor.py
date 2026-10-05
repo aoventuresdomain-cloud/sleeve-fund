@@ -306,6 +306,47 @@ def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_cap
     assert store.decisions("bn-ls")[0]["reason"].startswith("Started afresh at 10,000")
 
 
+def test_a_reset_that_cant_flatten_stops_asking_and_says_the_pm_must_close_it(store):
+    """Review round 13, m13-E1: a position the strategy can't close (less than the venue's smallest order) got a
+    fresh flatten every supervisor step, for ever. Now three, then one error event; the reset stays pending."""
+    from sleeve_fund.supervisor import SYSTEM_FLATTENS, Supervisor
+
+    store.create_sleeve(name="dust", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    store.record_fill("dust", side="BUY", qty=3e-8, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
+    store.set_signal_state("dust", {"rows": []})
+    store.request_reset("dust", "Test finished")
+    sup = Supervisor(store, python="true")
+    for _ in range(20):
+        sup.reset_pending()
+        for c in store.pending_commands("dust"):  # the process takes it, and the dust stays
+            store.mark_applied(c["id"])
+    assert len(store.decisions("dust", action="flatten")) == SYSTEM_FLATTENS
+    gave_up = [e for e in store.events("dust", limit=50) if e["kind"] == "flatten_gave_up"]
+    assert len(gave_up) == 1 and "3e-08" in gave_up[0]["message"] and gave_up[0]["level"] == "error"
+    assert store.pending_reset("dust") is not None
+    # Closed by the PM: the reset finishes, and the fresh run has no Signals left from the old one (m13-E2).
+    store.record_fill("dust", side="SELL", qty=3e-8, price=86_000.0, fee=0.0, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_reset("dust") is None and store.signal_state("dust") is None
+
+
+def test_a_clean_slate_that_cant_flatten_stops_asking_too(store, sleeve, tmp_path):
+    """m13-E1, the clean slate's side: the same three flattens, then one error event; the entry stays open."""
+    from sleeve_fund.supervisor import SYSTEM_FLATTENS
+
+    store.record_fill("s", side="BUY", qty=3e-8, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "clean slate"\n')
+    for _ in range(10):
+        assert clear(store, str(path)) == []
+        for c in store.pending_commands("s"):
+            store.mark_applied(c["id"])
+    assert len(store.decisions("s", action="flatten")) == SYSTEM_FLATTENS
+    assert [e["level"] for e in store.events("s", limit=100) if e["kind"] == "flatten_gave_up"] == ["error"]
+    assert "s" not in store.archived()
+
+
 def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):
     from sleeve_fund.supervisor import Supervisor
 

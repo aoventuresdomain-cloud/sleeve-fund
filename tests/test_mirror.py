@@ -473,6 +473,19 @@ def test_strategies_sharing_a_bybit_symbol_use_the_lowest_leverage_cap():
     assert lev == 1.0 and {s.name for s in sleeves} == {"bn-a", "bn-b"}
 
 
+def test_a_run_archived_by_a_reset_is_not_mirrored_and_does_not_set_the_leverage():
+    store = _store()
+    _binance(store, "bn-a")
+    _binance(store, "bn-b")
+    store._update_sleeve("bn-b", risk_profile="conservative")
+    store.request_reset("bn-b", "Settings changed")
+    run = store.split_run(store.pending_resets()[0])
+    store._update_sleeve("bn-b", risk_profile="balanced")  # the fresh run at 2x; the archived one kept 1x
+    assert run in store.archived() and run not in {s.name for s in mirror.mirrored(store)}
+    lev, sleeves = mirror.bybit_leverage(store)["BTCUSDT"]
+    assert lev == 2.0 and {s.name for s in sleeves} == {"bn-a", "bn-b"}
+
+
 @pytest.mark.sanity
 def test_a_demo_position_opened_at_the_wrong_leverage_is_closed_switched_and_reopened():
     store, demo = _store(), _BybitMargin(refuse_while_holding=True)

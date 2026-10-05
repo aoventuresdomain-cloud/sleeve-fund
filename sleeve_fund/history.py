@@ -116,12 +116,12 @@ class HistoryStore:
                 continue
             part = _load(path)
             part = part[(part.index >= cov.first) & (part.index < cov.last)]  # the last minute may still be forming
-            parts.append(_resample(part, minutes) if by_month else part)
+            parts.append(_resample(part, minutes, cov.first, cov.last) if by_month else part)
         if not parts:
             return pd.DataFrame(columns=OHLCV)
         bars = pd.concat(parts).sort_index()
         if minutes > 1 and not by_month:
-            bars = _resample(bars, minutes)
+            bars = _resample(bars, minutes, cov.first, cov.last)
         bars = bars.set_axis(bars.index + pd.Timedelta(minutes=minutes))
         bars.index.name = "timestamp"
         if lo is not None:
@@ -205,13 +205,20 @@ def _save(path: Path, df: pd.DataFrame) -> None:
     tmp.replace(path)
 
 
-def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """1-minute bars by open time -> complete `minutes` bars by open time."""
-    if minutes <= 1:
+def _resample(df: pd.DataFrame, minutes: int, first: pd.Timestamp | None = None,
+              end: pd.Timestamp | None = None) -> pd.DataFrame:
+    """1-minute bars by open time -> `minutes` bars by open time. A bar the stored minutes only partly cover at
+    either end, from `first` (the first minute) to `end` (just past the last), is left out: a part-day isn't a
+    daily bar. A bar inside the series missing a minute is kept from the minutes it has, as paper builds every
+    bar (m13-E6); only a bar with no minutes at all is left out. The bounds default to the frame's own."""
+    if minutes <= 1 or df.empty:
         return df
+    first = df.index[0] if first is None else first
+    end = df.index[-1] + pd.Timedelta(minutes=1) if end is None else end
     g = df.resample(f"{minutes}min", origin="epoch", label="left", closed="left")
     bars = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-    return bars[g["close"].count() == minutes]  # complete bars only: a part-day isn't a daily bar
+    whole = (bars.index >= first) & (bars.index + pd.Timedelta(minutes=minutes) <= end)
+    return bars[whole & (g["close"].count() > 0).to_numpy()]
 
 
 def _load(path: Path) -> pd.DataFrame:

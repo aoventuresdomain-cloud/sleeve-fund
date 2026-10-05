@@ -990,6 +990,11 @@ class LongFlatStrategy(Strategy):
         if bars:
             self.on_historical_bars(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
+            if len(bars) < want:  # the venue's recent candles stop short of a long look-back (m13-E4)
+                level = "warning"
+                short = want - len(bars)
+                msg += (f"; {short} short of what the model looks back over, so its indicators are unsettled "
+                        f"until {short} more bar{'s' if short != 1 else ''} close")
             # Bars between the last one loaded and the first live one are a hole the indicators skip.
             step = bar_minutes(self._cfg.bar_type) * 60_000_000_000
             missing = int((time.time_ns() - bars[-1].ts_event) // step)
@@ -2458,7 +2463,17 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             if coid == self._risk_stop_id and order is not None:
                 self._journal_risk_stop(order, px)
-            self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
+            # A backtest's bars have no bid or ask, so the fee model charges the half spread with the fee. Journal
+            # it as paper fills on real quotes, in the price (on the ask or bid) and not the fee, so a journal's
+            # price and fee mean the same in both; the cash is the same either way (m13-E7, as the research
+            # report's _spread_into_prices does).
+            spread = self._cfg.assumed_half_spread if self._backtest and kept_id is None else 0.0  # the fee model's
+            if spread and not getattr(order, "is_post_only", False):
+                fee -= qty * px * spread
+                px_journal = px * (1 + sign * spread)
+            else:
+                px_journal = px
+            self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px_journal, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
         if self._margin and self._entry_side == 0:
             self._cover_shortfall(px)
