@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
+from sleeve_fund.instruments import pair_of
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -307,7 +308,7 @@ def run_study(
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
-        instrument=str(instrument.id.symbol),
+        instrument=pair_of(instrument),
         bar_minutes=minutes,
         venue=str(instrument.id.venue),
         risk_profile=risk_profile,
