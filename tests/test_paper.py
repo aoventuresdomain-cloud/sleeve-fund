@@ -325,3 +325,51 @@ def test_the_gap_loader_returns_the_venues_closed_candles_stamped_at_their_close
     bars = gap_loader("BTC/USD", lambda pair, minutes: df)(instrument, bt, since, until)
     assert [(pd.Timestamp(b.ts_event, tz="UTC").hour, b.close.as_double()) for b in bars] == [(2, 11.0), (3, 12.0),
                                                                                              (4, 13.0), (5, 14.0)]
+
+
+def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_long_can_exit(tmp_path):
+    """PM, 5 Oct 2026: rsi-bands-ls-binance held a long it should have exited. Binance's history store was empty,
+    so after each deploy the model rebuilt RSI from live bars: no exit for its first 15 bars, then an unsettled
+    RSI unlike the chart's. With no stored bars it now warms up on the venue's own recent candles, so RSI is
+    ready and settled on the first live bar and the restored long ends when RSI has recovered."""
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.strategies.indicators import Rsi
+    from sleeve_fund.strategies.rsi_bands import RsiBands, RsiBandsConfig
+    from sleeve_fund.venues import venue
+
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
+    # The venue's last 300 one-minute candles by open time, the newest still forming: a dip, then a recovery.
+    closes = np.concatenate([np.linspace(86_000, 85_800, 150), np.linspace(85_800, 86_100, 150)])
+
+    def recent(pair, minutes):
+        assert minutes == 1
+        idx = pd.date_range(end=now, periods=len(closes), freq="1min", tz="UTC")
+        return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0}, index=idx)
+
+    empty = HistoryStore(tmp_path)
+    with pytest.raises(LookupError, match="no stored history"):  # without venue candles: nothing, as before
+        history_loader("BINANCE", "BTC/USD", empty)(instrument, bt, 140)
+    load = history_loader("BINANCE", "BTC/USD", empty, recent=recent)
+    bars = load(instrument, bt, 140)
+    assert len(bars) == 140 and pd.Timestamp(bars[-1].ts_event, tz="UTC") == now  # the forming candle left out
+
+    events = []
+    runtime = type("R", (), {"name": "rb", "book": {"qty": 0.076, "entry_px": 85_878.2},
+                             "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    s = RsiBands(RsiBandsConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005, warmup_bars=140))
+    s.attach_history(load)
+    s.instrument, s.runtime = instrument, runtime
+    s._side = 1  # the long restored from the journal (on_start)
+    s._warm_from_history()
+    assert events == [("rb", "info", "warmup", "Loaded 140 of 140 warm-up bars from the venue's recent candles")]
+    expected = Rsi(14)
+    for b in bars:
+        expected.update_raw(b.close.as_double())
+    assert s.rsi.initialized and s.rsi.value == pytest.approx(expected.value) and s.rsi.value >= 55
+    assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later

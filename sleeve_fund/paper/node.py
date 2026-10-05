@@ -59,19 +59,42 @@ def history_loader(venue: str, pair: str, store=None, recent=None):
 
     def load(instrument, bar_type, limit: int):
         hs = store or HistoryStore()
-        cov = hs.coverage(venue, pair)
-        if cov is None:
-            raise LookupError(f"no stored history for {pair}")
-        lag = pd.Timestamp.now(tz="UTC") - cov.last
-        if lag > HISTORY_MAX_LAG:
-            raise LookupError(f"the stored history for {pair} is {lag.total_seconds() / 3600:.0f} hours old")
         minutes = bar_minutes(bar_type)
+        cov = hs.coverage(venue, pair)
+        why = None
+        if cov is None:
+            why = f"no stored history for {pair}"
+        elif (lag := pd.Timestamp.now(tz="UTC") - cov.last) > HISTORY_MAX_LAG:
+            why = f"the stored history for {pair} is {lag.total_seconds() / 3600:.0f} hours old"
+        if why is not None:
+            # Without usable stored bars, warm up on the venue's own recent candles (Binance serves 1,500, Kraken
+            # 720), so after a restart the model's indicators are ready and settled on its first live bar rather
+            # than waiting out their look-back with no exits (PM, 5 Oct 2026: a long that should have exited).
+            df = _recent_closed(recent, pair, minutes, why) if recent is not None else None
+            if df is None or not len(df):
+                raise LookupError(why)
+            load.source = "the venue's recent candles"
+            return to_bars(df.tail(limit), instrument, bar_type)
         df = hs.read(venue, pair, minutes, start=cov.last - pd.Timedelta(minutes=minutes * (limit + 2)))
         if recent is not None and len(df):
             df = _top_up(df, recent, pair, minutes)
+        load.source = "the history store"
         return to_bars(df.tail(limit), instrument, bar_type)
 
+    load.source = "the history store"
     return load
+
+
+def _recent_closed(recent, pair: str, minutes: int, why: str) -> pd.DataFrame:
+    """The venue's complete recent candles, stamped at their close as the store's bars are. Raises LookupError
+    with both reasons when the venue can't serve them either."""
+    try:
+        r = recent(pair, minutes)
+    except Exception as exc:  # noqa: BLE001 - an unreachable venue or interval: nothing to warm up on
+        raise LookupError(f"{why}, and the venue's recent candles failed: {exc}") from exc
+    r = r.iloc[:-1]  # the newest candle is still forming
+    r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
+    return r[["open", "high", "low", "close", "volume"]]
 
 
 def gap_loader(pair: str, recent):
