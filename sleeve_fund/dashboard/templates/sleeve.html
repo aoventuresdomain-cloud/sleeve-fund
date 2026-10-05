@@ -93,7 +93,8 @@
     {# Three limits: margin (or position) against its cap, room before the drawdown halt, today's loss against the pause. #}
     {% set room = x.room if x.room is defined else none %}
     <div class="limit-bars">
-      <div title="{{ x.exposure|abs|pct1 }} of equity in {{ 'notional' if perp else 'the position' }}, against a cap of {{ x.cap|pct0 }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.cap_used) }}</div>
+      {% if risk.margin_used is defined %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.margin_used) }}</div>
+      {% else %}<div title="{{ x.exposure|abs|pct1 }} of equity in {{ 'notional' if perp else 'the position' }}, against a cap of {{ x.cap|pct0 }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.cap_used) }}</div>{% endif %}
       <div title="Drawdown {{ x.drawdown|pct1 }} of the {{ x.profile.max_drawdown|pct0 }} halt"><span class="k">Room to halt</span>{{ usage(x.dd_used) }} <b>{% if room is not none %}{{ room|money }}{% else %}<span class="faint" title="Waiting on the corrected room-to-halt figure">–</span>{% endif %}</b></div>
       {% if not backtest_id %}<div title="Today's loss {{ [0 - x.day_ret, 0]|max|pct1 }} of the {{ x.profile.daily_loss|pct0 }} pause limit"><span class="k">Today's loss</span>{{ usage(risk.day_used) }}</div>{% endif %}
     </div>
@@ -189,7 +190,7 @@
   {% if perp %}<div class="pos-grid two">
     <div class="pos-card"><h3>Margin <span class="faint">isolated</span></h3><dl>
       <div><dt>Side and leverage</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }} {{ '%.2f'|format(perp.leverage) if perp.leverage else '–' }}× <span class="faint">cap {{ '%g'|format(x.cap) }}× ({{ x.profile.max_position_pct|pct0 }} margin at {{ '%g'|format(x.profile.max_leverage) }}×)</span>{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
-      <div><dt title="Under isolated margin the strategy's whole equity backs its one position">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
+      <div><dt title="Isolated: the notional at entry over the leverage cap">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
       <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>Funding <span class="faint">{{ quote }}, + received</span></h3><dl>

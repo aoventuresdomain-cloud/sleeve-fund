@@ -10,7 +10,9 @@
 {%- endmacro %}
 
 {% macro _liq(p) -%}
-{%- if p.perp and p.perp.liq_px -%}<span class="{{ 'loss' if p.perp.to_liq < 0.1 else ('warn' if p.perp.to_liq < 0.25) }}" title="{{ p.perp.to_liq|pct1 }} from the mark">{{ p.perp.liq_px|px }}</span>
+{%- set liq = p.liq_px if p.liq_px is defined else (p.perp.liq_px if p.perp else none) -%}
+{%- set to_liq = p.to_liq if p.to_liq is defined else (p.perp.to_liq if p.perp else none) -%}
+{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>
 {%- elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>
 {%- else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif -%}
 {%- endmacro %}
@@ -51,7 +53,7 @@
   {% if rows|length > 1 %}<tfoot><tr><th scope="row" colspan="{{ 5 if show_strategy else 4 }}">Total, {{ rows|length }} positions</th>
     <td class="num">{{ positions.notional|money }}</td><td colspan="5"></td>
     <td class="num">{{ money_signed(positions.unrealised) }}</td>
-    <td class="num">{% if positions.risk_to_stop is defined and positions.risk_to_stop is not none %}{{ positions.risk_to_stop|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
+    <td class="num">{% if positions.open_risk is defined %}<span{% if positions.unbounded %} class="warn" title="{{ positions.unbounded|join(', ') }}: no stop, so unbounded"{% endif %}>{{ positions.open_risk|money }}{{ '+' if positions.unbounded }}</span>{% else %}<span class="faint" title="Waiting on the corrected figure">–</span>{% endif %}</td>
     <td class="num">{{ positions.fees|money }}</td><td></td></tr></tfoot>{% endif %}
 </table>
 {# Phones: a card per position. #}

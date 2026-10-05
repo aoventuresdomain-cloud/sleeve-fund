@@ -424,7 +424,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The Overview's Position table is the Portfolio's, one row; Open orders lists working orders only.
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
-        fees_funding = x["fees"] - (perp_x["funding_total"] if perp_x else 0.0)  # funding is + received
+        fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
