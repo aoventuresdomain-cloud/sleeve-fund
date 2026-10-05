@@ -172,3 +172,15 @@ def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path
     assert asked == [str(int(since.timestamp()))]  # Kraken's `since` in seconds
     refresh(hist, replace(KRAKEN, minute_loader=loader), "ADA/EUR", since=since)
     assert asked[-1] == "c2"  # then it resumes from its own cursor
+
+
+def test_the_store_refuses_to_start_with_one_clear_line_when_it_cannot_write(tmp_path, capfd):
+    from sleeve_fund.history import main, unwritable
+
+    assert unwritable(tmp_path / "BINANCE") is None  # writable: the probe file is cleaned up
+    assert list((tmp_path / "BINANCE").iterdir()) == []
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("")  # a file where the store's folder should be fails for root too
+    assert main(["--root", str(blocked), "run", "--venue", "binance"]) == 2
+    out = capfd.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and "history store can't start: cannot write" in out[0] and "uid" in out[0]
