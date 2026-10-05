@@ -85,12 +85,13 @@
 <section class="panel flush" aria-labelledby="ts-h">
   <div class="panel-head"><h2 id="ts-h">Tear sheets</h2></div>
   {% if sheets %}
-  <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th></tr></thead>
+  <table class="responsive"><thead><tr><th>Tear sheet</th><th>Data</th><th>G1</th><th>Evidence</th><th><span class="sr-only">Download</span></th></tr></thead>
     <tbody>{% for s in sheets %}<tr>
       <td class="cell-name"><a href="/research/{{ s.name }}">{{ s.name|replace('_', ' ') }}</a>{% if s.settings %}<div class="muted" style="font-size:12px;white-space:normal">{{ s.settings }}</div>{% endif %}</td>
       <td data-m="right">{% if s.dataset == 'synthetic' %}<span class="warn">Synthetic</span>{% else %}{{ s.dataset }}{% endif %}</td>
       <td>{% if s.g1 == 'PASS' %}<span class="chip running">Pass</span>{% elif s.g1 == 'FAIL' %}<span class="chip halted">Fail</span>{% elif s.g1 == 'NOT JUDGED' %}<span class="chip paused">Not judged</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
-      <td data-m="hide" class="muted wrap">{{ s.evidence }}</td></tr>{% endfor %}</tbody></table>
+      <td data-m="hide" class="muted wrap">{{ s.evidence }}</td>
+      <td data-m="right" class="num"><a href="/research/{{ s.name }}/download" download>Download</a></td></tr>{% endfor %}</tbody></table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No tear sheets yet. Each idea that goes through the research loop produces one here.</p>{% endif %}
 </section>
 {% endblock %}

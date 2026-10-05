@@ -133,6 +133,14 @@ def test_research_and_tearsheet(client):
     assert "trend_filter_x" in c.get("/research", auth=AUTH).text
     assert "<table>" in c.get("/research/trend_filter_x", auth=AUTH).text
     assert c.get("/research/..%2F..%2Fetc%2Fpasswd", auth=AUTH).status_code == 404
+    # Each tear sheet downloads as its Markdown file, to hand to the research thread as it is.
+    assert 'href="/research/trend_filter_x/download"' in c.get("/research", auth=AUTH).text
+    assert 'href="/research/trend_filter_x/download"' in c.get("/research/trend_filter_x", auth=AUTH).text
+    md = c.get("/research/trend_filter_x/download", auth=AUTH)
+    assert md.status_code == 200 and md.headers["content-type"].startswith("text/markdown")
+    assert md.headers["content-disposition"] == 'attachment; filename="trend_filter_x.md"' and "|" in md.text
+    assert c.get("/research/..%2F..%2Fetc%2Fpasswd/download", auth=AUTH).status_code == 404
+    assert c.get("/research/nope/download", auth=AUTH).status_code == 404
     assert c.get("/decisions", auth=AUTH).status_code == 200
     assert c.get("/sleeves/new", auth=AUTH).status_code == 200
 

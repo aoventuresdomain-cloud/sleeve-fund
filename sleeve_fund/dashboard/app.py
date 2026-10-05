@@ -752,11 +752,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy")
         return page(request, "strategy.html", r=row, stages=pipeline.STAGES, summary=_idea(name))
 
-    @app.get("/research/{sheet}", response_class=HTMLResponse)
-    def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
+    def _sheet_path(sheet: str) -> Path:
         path = (TEARSHEETS / f"{sheet}.md").resolve()
         if path.parent != TEARSHEETS.resolve() or not path.exists():
             raise HTTPException(404, "no such tear sheet")
+        return path
+
+    @app.get("/research/{sheet}/download")
+    def tearsheet_download(sheet: str, _: str = Depends(require_pm)):
+        """The tear sheet as its Markdown file, to hand to the research thread as it is."""
+        path = _sheet_path(sheet)
+        return Response(path.read_bytes(), media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
+
+    @app.get("/research/{sheet}", response_class=HTMLResponse)
+    def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
+        path = _sheet_path(sheet)
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
         # Results as status chips, so a FAIL can't be missed in a wall of text.
         for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
