@@ -112,8 +112,14 @@ jobs:
             select name, instrument, status, heartbeat_at from sleeves order by id;
             select count(*) as marks_last_5_min from equity where ts > now() - interval '"'"'5 minutes'"'"';
             select ts, sleeve, level, kind, message from events where level <> '"'"'info'"'"' order by id desc limit 10;"' | tee health.txt
-          LIVE=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "select count(*) from sleeves where desired_state = '"'"'running'"'"' and (heartbeat_at is null or heartbeat_at < now() - interval '"'"'3 minutes'"'"')"')
-          echo "running sleeves not reporting: $LIVE"
+          # A strategy the PM starts during the deploy has had no time to report yet: look again each minute for
+          # three more minutes, and fail only on one still silent then. Nothing here starts, stops or changes one.
+          for i in 1 2 3 4; do
+            LIVE=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "select count(*) from sleeves where desired_state = '"'"'running'"'"' and (heartbeat_at is null or heartbeat_at < now() - interval '"'"'3 minutes'"'"')"')
+            echo "running sleeves not reporting: $LIVE"
+            if [ "$LIVE" = "0" ] || [ "$i" = 4 ]; then break; fi
+            sleep 60
+          done
           # One line per strategy as a notice, so the run's annotations show what the server is running.
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T db psql -U sleeve -d sleeve_fund -tA -F " " -c "
             select s.name, s.desired_state, s.status, case when a.sleeve is null then '"'"'on the book'"'"' else '"'"'archived'"'"' end
