@@ -840,23 +840,74 @@ def create_app(store: Store | None = None) -> FastAPI:
                     breakeven=dev.breakeven_text(s), per_day=dev.per_day(s.get("oos_trades"), s.get("oos_days")),
                     chart=dev.ladder_chart(s["rungs"], s["fee"]), candle_words=dev.candle_words)
 
-    @app.get("/decisions", response_class=HTMLResponse)
+    def _moved(request: Request, to: str, hash_: str = "") -> RedirectResponse:
+        """An old page's address: the same query on its new page, so bookmarks and filter links still work."""
+        q = request.url.query
+        return RedirectResponse(f"{to}{'?' + q if q else ''}{hash_}", status_code=303)
+
+    @app.get("/decisions")
     def decisions(request: Request, _: str = Depends(require_pm)):
-        f = _decision_filters(request)
-        return page(request, "decisions.html", decisions=st().decisions(limit=500, **f["query"]), f=f,
-                    sleeves=[s.name for s in st().sleeves()], actions=DECISION_ACTIONS)
+        return _moved(request, "/records", "#log")
 
     @app.get("/decisions.csv")
     def decisions_csv(request: Request, _: str = Depends(require_pm)):
         rows = st().decisions(limit=100_000, **_decision_filters(request)["query"])
         return _csv("decisions", reports.to_csv(rows, ["ts", "actor", "action", "sleeve", "reason"]))
 
-    @app.get("/reports", response_class=HTMLResponse)
+    @app.get("/reports")
     def reports_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/records")
+
+    @app.get("/records", response_class=HTMLResponse)
+    def records_page(request: Request, _: str = Depends(require_pm)):
+        """Performance and the decision log under one period and strategy filter, which the exports follow."""
+        q = request.query_params
+        now = utcnow()
         sleeves, frames, summaries = book_data()
-        fills = {s.name: st().fills(s.name, limit=100_000) for s in sleeves}
-        return page(request, "reports.html", m=reports.monthly(summaries, frames, fills),
-                    sleeves=[s.name for s in sleeves], shell=shell(sleeves))
+        names = [s.name for s in st().sleeves()]
+        chosen = q.get("sleeve") if q.get("sleeve") in names else ""
+        if chosen and chosen not in frames:  # a strategy an earlier clean slate put away: its own figures
+            s = st().sleeve(chosen)
+            frames = {chosen: bookm.daily(st(), chosen)}
+            summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[chosen])]
+        elif chosen:
+            summaries = [x for x in summaries if x["sleeve"].name == chosen]
+        w = reports.window(q.get("period", ""), q.get("month", ""), now)
+        fills = {x["sleeve"].name: st().fills(x["sleeve"].name, limit=100_000) for x in summaries}
+        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"])
+        m = reports.monthly(summaries, frames, fills)
+        months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
+        keys = {r["month"] for r in months}
+        m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
+        # The log: the same window, unless an old Decisions link brought its own dates or action.
+        f = _decision_filters(request)
+        dq = {"sleeve": chosen or None, "action": f["query"]["action"],
+              "since": f["query"].get("since") or w["start"], "until": f["query"].get("until") or w["end"]}
+        decisions = st().decisions(limit=500, **dq)
+        decisions.sort(key=lambda d: d["ts"], reverse=True)  # the timeline reads newest first by time
+        log = reports.timeline(decisions, now)
+        kinds = {k: sum(1 for d in decisions if reports.decision_kind(d["action"]) in
+                        (("started", "stopped") if k == "startstop" else (k,))) for k, _l in reports.KIND_FILTERS}
+        kinds["all"] = len(decisions)
+        keep = {"period": w["period"] if w["period"] != reports.DEFAULT_PERIOD else "", "sleeve": chosen,
+                "month": w["month"] or ""}
+
+        def qs(**over) -> str:
+            out = urlencode({k: v for k, v in {**keep, **over}.items() if v})
+            return "?" + out if out else ""
+
+        dl = {"sleeve": chosen} if chosen else {}
+        dec_dl = {**dl, **({"from": dq["since"].strftime("%Y-%m-%d")} if dq["since"] else {}),
+                  **({"to": (dq["until"] - timedelta(days=1)).strftime("%Y-%m-%d")} if dq["until"] else {}),
+                  **({"action": dq["action"]} if dq["action"] else {})}
+        exports = [(label, f"/exports/{kind}.csv" + ("?" + urlencode(dl) if dl else ""), f"{kind}.csv", what)
+                   for kind, label, what in EXPORTS]
+        exports.insert(4, ("Decision log", "/decisions.csv" + ("?" + urlencode(dec_dl) if dec_dl else ""),
+                           "decisions.csv", "Every decision, with who made it and why."))
+        return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
+                    periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
+                    kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
+                    qs=qs, exports=exports, action=dq["action"], shell=shell(sleeves))
 
     @app.get("/exports/{kind}.csv")
     def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
@@ -1051,8 +1102,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names,
                     backtest=backtest)
 
-    @app.get("/accounts", response_class=HTMLResponse)
-    def accounts_page(request: Request, _: str = Depends(require_pm), error: str = ""):
+    @app.get("/accounts")
+    def accounts_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/setup", "#accounts")
+
+    def _accounts_rows() -> list[dict]:
         from sleeve_fund import accounts as acc
 
         rows = st().accounts()
@@ -1064,7 +1118,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
             r["running"] = [n for n in r["sleeves"] if n in running]
             r["held"] = [n for n in r["sleeves"] if n in held]  # stopped, still holding a position
-        return page(request, "accounts.html", accounts=rows, error=error, pre=dict(request.query_params))
+        return rows
 
     @app.post("/accounts/new")
     async def new_account(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -1078,8 +1132,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
-        return RedirectResponse(f"/accounts#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
     @app.post("/accounts/{name}/note")
     def account_note(name: str, note: str = Form(""), reason: str = Form(...),
@@ -1090,8 +1144,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             st().set_account_note(name, note)
             st().decide(actor, "account_note", f"{name}: note set to \"{note.strip()[:200]}\". {reason.strip()}")
         except ValueError as exc:
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc)})}#accounts", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
     @app.post("/accounts/{name}/retire")
     def account_retire(name: str, action: str = Form(...), reason: str = Form(...),
@@ -1107,22 +1161,36 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("unknown action")
             st().decide(actor, f"{action}_account", f"{name}: {reason.strip()}")
         except ValueError as exc:
-            return RedirectResponse(f"/accounts?{urlencode({'error': str(exc)})}", status_code=303)
-        return RedirectResponse(f"/accounts?saved={name}#acct-{name}", status_code=303)
+            return RedirectResponse(f"/setup?{urlencode({'error': str(exc)})}#accounts", status_code=303)
+        return RedirectResponse(f"/setup?saved={name}#acct-{name}", status_code=303)
 
-    @app.get("/settings", response_class=HTMLResponse)
+    @app.get("/settings")
     def settings_page(request: Request, _: str = Depends(require_pm)):
+        return _moved(request, "/setup", "#settings")
+
+    @app.get("/setup", response_class=HTMLResponse)
+    def setup_page(request: Request, _: str = Depends(require_pm), error: str = ""):
+        """Path to live, one card per setting area, and today's Accounts and Settings content as its detail."""
+        from sleeve_fund.dashboard import setup_view
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "source": q.source,
+        fee_quotes = [{"venue_label": q.venue_label, "source": q.source, "taker": float(q.fees.taker),
                        "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
                        "assumed_spread": f"{2 * v.assumed_half_spread:.2%}"}
                       for v in VENUES.values() for q in [resolve_fees(v.name, st())]]
-
-        return page(request, "settings.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
-                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=st().accounts())
+        sleeves = current_sleeves()
+        frame = shell(sleeves)
+        mirror = setup_view.mirror_state(st(), sleeves)
+        here = setup_view.stage(frame, sleeves, mirror)
+        accounts = _accounts_rows()
+        return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
+                    error=error, pre=dict(request.query_params), shell=frame,
+                    steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
+                    paper_count=sum(1 for x in sleeves if x.name not in st().archived()),
+                    alerts_out=setup_view.outside_alerts(st()), backup=setup_view.backup_state(frame["now"]))
 
     return app
 
@@ -1399,6 +1467,12 @@ def _held(td) -> str:
     return f"{hours / 24:.1f} d" if hours >= 48 else f"{hours:.0f} h" if hours >= 1 else f"{secs / 60:.0f} min"
 
 
+# The Records page's Export menu: (file, what it is, what it's for), in the order the menu lists them.
+EXPORTS = [("trades", "Closed trades", "Round trips with P&L after fees and their reasons. Best for comparing."),
+           ("audit", "Full audit", "Every fill with its P&L, reason and indicator values."),
+           ("orders", "Orders", "Every order, filled or refused, with why."),
+           ("equity", "Daily equity", "Book and strategy value, cash and position each day."),
+           ("fills", "Fills", "Every fill as the venue reported it: time, side, quantity, price, fee.")]
 DECISION_ACTIONS = ["create", "start", "stop", "pause", "resume", "flatten", "change_settings", "move_account", "archive",
                     "restore", "flatten everything", "create_account", "account_note", "retire_account",
                     "reinstate_account"]

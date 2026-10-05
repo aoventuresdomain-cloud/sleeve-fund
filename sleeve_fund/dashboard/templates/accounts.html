@@ -1,10 +1,8 @@
-{% extends "base.html" %}
-{% block title %}Accounts · Multi-Strategy Fund{% endblock %}
-{% block content %}
-<div class="page-head">
-  <h1>Accounts</h1>
-  <div class="actions"><a class="button secondary" href="#add">Add an account</a></div>
+{# The Accounts detail of the Setup page (formerly the /accounts page), included by setup.html. #}
+<div class="page-head sub-head">
+  <h2 class="sr-only">Accounts</h2>
   <p class="lede">Live keys stay on the server.</p>
+  <div class="actions"><a class="button secondary" href="#add">Add an account</a></div>
 </div>
 {% if error %}<div class="error-box" role="alert">Not saved: {{ error }}</div>
 {% elif pre.get('saved') %}<div class="banner" role="status" data-once>Saved {{ pre.get('saved') }}.</div>{% endif %}
@@ -59,7 +57,7 @@
 <div class="grid" style="align-items:start">
   <section class="panel span-7" aria-labelledby="how-h">
     <div class="panel-head"><h2 id="how-h">Connect a Kraken sub-account</h2></div>
-    <details class="more-fields"><summary>Five steps, about ten minutes</summary>
+    <details class="more-fields"><summary>How to connect: five steps, about ten minutes</summary>
     <ol class="steps-list">
       <li><strong>On Kraken:</strong> create the sub-account and move into it only the money that strategy may trade. Keeping each live strategy on its own sub-account limits what any one model can lose.</li>
       <li><strong>Create an API key in that sub-account</strong> with these permissions only: Query Funds, Query Open Orders &amp; Trades, Query Closed Orders &amp; Trades, Create &amp; Modify Orders, and Cancel/Close Orders. <strong>Never tick Withdraw Funds.</strong></li>
@@ -88,9 +86,3 @@
     <button>Add account</button>
   </form>
 </div>
-{% endblock %}
-
-{% block scripts %}
-<script src="/static/console.js"></script>
-<script>Console.dialogs();</script>
-{% endblock %}
