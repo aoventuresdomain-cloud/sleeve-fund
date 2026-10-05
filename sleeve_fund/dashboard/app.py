@@ -37,7 +37,7 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig
+from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, SleeveConfig, to_store_kwargs
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.risk import PROFILES
@@ -94,6 +94,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
+    templates.env.globals["venue_choices"] = venue_choices
+    templates.env.globals["venue_label"] = lambda name: _research_venue(name).label
     templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
@@ -296,7 +298,11 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         chosen = strategy if strategy in REGISTRY else "trend_filter"
-        return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS,
+        try:
+            hints = _hints(request.query_params.get("venue"))
+        except ValueError:
+            hints = _hints()
+        return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=hints,
                     bar_specs=sorted(ALLOWED_BAR_SPECS), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
                     pre=dict(request.query_params), accounts=st().accounts(), costs=exit_costs())
 
@@ -322,7 +328,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             warmup = _warmup_for(strategy, form, bar_spec) if auto else int(form.get("warmup_bars", 0) or 0)
             cfg = SleeveConfig(name=name, strategy=strategy, instrument=str(form.get("instrument", "")),
                                bar_spec=bar_spec, starting_balance=float(form.get("starting_balance", 0) or 0),
-                               params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")))
+                               params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")),
+                               venue=_venue_name(form.get("venue")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
@@ -338,7 +345,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
             st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
                                starting_balance=cfg.starting_balance, params=params,
-                               risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars)
+                               risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars,
+                               venue=to_store_kwargs(cfg)["venue"])
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
             if needed > cfg.warmup_bars:
@@ -420,7 +428,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             if not PAIR_RE.fullmatch(pair):
                 raise HTTPException(400, "instrument must look like BASE/QUOTE")
             try:
-                df, note = charts.candles(pair, minutes), ""
+                df, note = charts.candles(pair, minutes, venue=s.venue), ""
             except (OSError, ValueError, KeyError):
                 df, note = charts.from_marks([], minutes), f"The venue has no candles for {pair}."
             data = charts.payload(df, minutes, [], {}, [], "venue")
@@ -432,7 +440,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             if is_backtest(name):  # the venue's recent candles aren't the replayed period
                 raise ValueError("backtest")
-            df, source = charts.candles(s.instrument, minutes), "venue"
+            df, source = charts.candles(s.instrument, minutes, venue=s.venue), "venue"
         except (OSError, ValueError):  # venue unreachable or pair unknown: chart the sleeve's own marks
             df, source = charts.from_marks(st().equity_series(name, limit=500_000), minutes), "marks"
         fills = list(reversed(st().fills(name, limit=100_000)))
@@ -638,17 +646,23 @@ def create_app(store: Store | None = None) -> FastAPI:
                       notice: str = ""):
         from sleeve_fund.dashboard import pipeline
 
+        pre = pre or {}
+        try:
+            profile = _research_venue(pre.get("venue"))
+        except ValueError:
+            profile = _research_venue()
+
         sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                          reverse=True)]
-        stored = _stored_history(st())
+        stored = _stored_history(st(), profile)
         ledger = IdeaLedger(LEDGER)
         spent = {f"{idea}|{base}": opened_words(e) for (idea, base), e in ledger.holdouts().items()}
         return page(request, "research.html", sheets=sheets, counts=ledger.counts(),
                     rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
-                    error=error, pre=pre or {}, strategies=_strategy_choices(),
-                    instruments=[h["pair"] for h in stored] or INSTRUMENT_HINTS, stored=stored, collect=collect,
-                    notice=notice, request_years=REQUEST_YEARS, history_venue=_research_venue().label,
-                    research_venue=_research_venue().name.lower(), spent_holdouts=spent,
+                    error=error, pre=pre, strategies=_strategy_choices(),
+                    instruments=[h["pair"] for h in stored] or _hints(profile.name), stored=stored, collect=collect,
+                    notice=notice, request_years=REQUEST_YEARS, history_venue=profile.label,
+                    research_venue=profile.name.lower(), research_perpetual=profile.perpetual, spent_holdouts=spent,
                     profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True))
 
     @app.get("/research", response_class=HTMLResponse)
@@ -670,16 +684,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         except (ValueError, KeyError) as exc:
             return research_page(request, error=str(exc), pre=form)
         # No history yet: say so now, with the way to get it, rather than from a failed job (R8-M6).
-        held = next((h for h in _stored_history(st()) if h["pair"] == req.pair), None)
+        profile = _research_venue(req.venue)
+        held = next((h for h in _stored_history(st(), profile) if h["pair"] == req.pair), None)
         if held is None or held["first"] is None:
-            label = _research_venue().label
+            label = profile.label
             why = (f"{req.pair}'s history was asked for on {held['requested']:%d %b %Y}; the collector hasn't stored "
                    "any yet." if held else f"there is no stored {label} history for {req.pair} yet.")
             return research_page(request, error=why, pre=form, collect="" if held else req.pair)
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
-        title = f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair}, {study_run._bars(req.minutes)} bars"
+        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({profile.label}), "
+                 f"{study_run._bars(req.minutes)} bars")
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
         return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
 
@@ -689,14 +705,19 @@ def create_app(store: Store | None = None) -> FastAPI:
         trades it (review round 8, R8-M6)."""
         form = dict((await request.form()).items())
         pair = str(form.get("instrument", "")).strip().upper()
-        profile = _research_venue()
+        try:
+            profile = _research_venue(form.get("venue"))
+        except ValueError as exc:
+            return research_page(request, error=str(exc))
+        here = {"instrument": pair, "venue": profile.name.lower()}
         try:
             if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
                 raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
-                                 "like BTC/USD")
-            held = next((h for h in _stored_history(st()) if h["pair"] == pair and h["first"] is not None), None)
+                                 f"like {_hints(profile.name)[0]}")
+            held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
+                        None)
             if held is not None:
-                return research_page(request, pre={"instrument": pair}, notice=(
+                return research_page(request, pre=here, notice=(
                     f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now."))
             if profile.minute_loader is None:
@@ -714,13 +735,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                                      "for; try again when the venue answers") from None
         except ValueError as exc:
             # No button to ask again: the same request would be refused the same way.
-            return research_page(request, error=str(exc), pre={"instrument": pair})
+            return research_page(request, error=str(exc), pre=here)
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
         notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
                   "A study can run once some is stored; this list shows how far it has got."
                   if new else f"{pair} was already asked for; this list shows how far the collector has got.")
-        return research_page(request, pre={"instrument": pair}, notice=notice)
+        return research_page(request, pre=here, notice=notice)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -825,6 +846,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         strategy = q.get("strategy") if q.get("strategy") in REGISTRY else "trend_filter"
         period = q.get("period") if q.get("period") in BACKTEST_PERIODS else "all"
         bar_spec = q.get("bar_spec") if q.get("bar_spec") in ALLOWED_BAR_SPECS else BACKTEST_BAR_SPEC
+        try:
+            venue = _venue_name(q.get("venue"))
+        except ValueError:
+            venue = _venue_name(None)
         # The sleeve must decide on the bars that were tested, with indicators warm from its first bar.
         carry = {k: v for k, v in q.items() if k not in ("run", "period") and v}
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
@@ -841,14 +866,18 @@ def create_app(store: Store | None = None) -> FastAPI:
                      "worst": round(-result["strategy"]["max_drawdown"], 5)}  # over every mark, as the table
         market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
         shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
+        try:
+            label = markets.terms({"market": market}, venue).label if market != markets.SPOT else ""
+        except ValueError:  # a spot market on a perpetual venue: the run itself is refused, with the reason
+            label = markets.terms({"market": market}).label
         market_words = ("Spot, long only" if market == markets.SPOT else
-                        f"{markets.terms({'market': market}).label}, {'long and short' if shorts else 'long only'}")
+                        f"{label}, {'long and short' if shorts else 'long only'}")
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
                     market_words=market_words,
-                    chosen=strategy, strategies=_strategy_choices(), instruments=INSTRUMENT_HINTS, g1=g1, g1_here=g1_here,
+                    chosen=strategy, strategies=_strategy_choices(), instruments=_hints(venue), g1=g1, g1_here=g1_here,
                     period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
-                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(),
+                    sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(venue),
                     runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs(backtest=True))
 
     @app.get("/backtest", response_class=HTMLResponse)
@@ -864,7 +893,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         except (ValueError, TypeError, KeyError) as exc:
             return backtest_form(request, q, error=backtest_error(exc))
         # The same settings, fees and spread within a few minutes show the saved run rather than a copy.
-        key = _backtest_key(q, resolve_fees(None, st()).text, resolve_spread(None, args["pair"], st()).text)
+        key = _backtest_key(q, resolve_fees(args["venue"], st()).text,
+                            resolve_spread(args["venue"], args["pair"], st()).text)
         hit = st().fresh_backtest(key, utcnow() - BACKTEST_FRESH)
         if hit:
             return RedirectResponse(f"/backtest/{hit['id']}", status_code=303)
@@ -1033,31 +1063,34 @@ def _backtest_args(q) -> dict:
     strategy = q.get("strategy") if q.get("strategy") in REGISTRY else "trend_filter"
     period = q.get("period") if q.get("period") in BACKTEST_PERIODS else "all"
     bar_spec = q.get("bar_spec") if q.get("bar_spec") in ALLOWED_BAR_SPECS else BACKTEST_BAR_SPEC
+    venue = _venue_name(q.get("venue"))
     pair = q.get("instrument", "").strip().upper()
     if not PAIR_RE.fullmatch(pair):
-        raise ValueError("instrument: write it as BASE/QUOTE, for example SOL/USD")
+        raise ValueError(f"instrument: write it as BASE/QUOTE, for example {_hints(venue)[0]}")
     starting = float(q.get("starting_balance") or 10_000)
     if not 100 <= starting <= 1e9:
         raise ValueError("capital: between 100 and 1,000,000,000")
     params = _form_params(q, strategy)
     _profile_cap(q)  # validates the profile name
+    markets.check_venue(params, venue)  # a perpetual venue has no spot
     if spec_minutes(bar_spec) < 1440:
-        have = [r["pair"] for r in _stored()]
+        have = [r["pair"] for r in _stored(venue)]
         if pair not in have:
             raise ValueError(f"interval: {pair} has no stored minute history here, so it can only be backtested on "
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
-    title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}, {_bar_short(bar_spec)}, "
-             f"{BACKTEST_PERIODS[period][0].lower()}")
-    return {"strategy": strategy, "pair": pair, "params": params, "starting": starting,
+    title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
+             f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
+             f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
+    return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
             "risk_profile": q.get("risk_profile") or "balanced", "title": title, "bar_spec": bar_spec}
 
 
-def _stored() -> list[dict]:
+def _stored(venue: str | None = None) -> list[dict]:
     from sleeve_fund.dashboard import preview
 
     try:
-        return preview.stored()
+        return preview.stored(venue)
     except OSError:  # an unreadable store reads as empty; the run itself says what failed
         return []
 
@@ -1079,7 +1112,8 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
     keep: dict = {}
     result = preview.run(args["strategy"], args["pair"], args["params"], starting=args["starting"],
                          days=args["days"], detail=True, minutes=args["minutes"], risk_profile=args["risk_profile"],
-                         fee_quote=resolve_fees(None, store), spread_quote=resolve_spread(None, args["pair"], store),
+                         venue=args["venue"], fee_quote=resolve_fees(args["venue"], store),
+                         spread_quote=resolve_spread(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
@@ -1100,18 +1134,38 @@ def _qty(x: float) -> str:
     return f"{x:,.{d}f}".rstrip("0").rstrip(".") if d else f"{x:,.0f}"
 
 
-def _research_venue():
+def _research_venue(name: str | None = None):
     from sleeve_fund.venues import venue
 
-    return venue(None)
+    return venue(name or None)
 
 
-def _stored_history(store: Store) -> list[dict]:
+def _venue_name(value) -> str:
+    """A venue picked on a form (any case; blank is the default venue), as its profile names it. Raises
+    ValueError on a venue with no profile."""
+    return _research_venue(str(value or "").strip() or None).name
+
+
+def _hints(venue: str | None = None) -> list[str]:
+    """The instruments a form suggests on this venue: those the history store always keeps there, else the
+    default venue's usual list."""
+    return list(_research_venue(venue).core_pairs) or INSTRUMENT_HINTS
+
+
+def venue_choices() -> list[dict]:
+    """Every venue a strategy can be researched, backtested or paper traded on, for the forms' venue field."""
+    from sleeve_fund.venues import VENUES
+
+    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual, "pairs": _hints(v.name)}
+            for v in VENUES.values() if v.data_client is not None or v.minute_loader is not None]
+
+
+def _stored_history(store: Store, profile=None) -> list[dict]:
     """Each instrument research can use or has asked for, on the research venue: what is stored, and
     whether the collector is current or still catching up."""
     from sleeve_fund.history import HistoryStore
 
-    profile = _research_venue()
+    profile = profile or _research_venue()
     hist = HistoryStore()
     now = utcnow()
     asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
@@ -1145,7 +1199,7 @@ def _study_request(form: dict) -> "study_run.StudyRequest":
     if profile != "none" and profile not in PROFILES:
         raise ValueError(f"unknown risk profile {profile!r}")
     return study_run.StudyRequest(
-        strategy=strategy, pair=str(form.get("instrument", "")).strip().upper(),
+        strategy=strategy, pair=str(form.get("instrument", "")).strip().upper(), venue=_venue_name(form.get("venue")),
         minutes=num("minutes", 1440, int), risk_profile=None if profile == "none" else profile,
         train_days=num("train_days", 3 * 365, int), test_days=num("test_days", 365, int),
         holdout_days=num("holdout_days", 365, int), use_holdout=form.get("use_holdout") == "on",
@@ -1323,7 +1377,7 @@ def _bar_short(spec: str) -> str:
 def _bar_label(spec: str) -> str:
     step, unit, _, source = spec.split("-")
     unit = unit.lower() + ("s" if step != "1" else "")
-    how = "built from live trades" if source == "INTERNAL" else "Kraken candles, supports warm-up"
+    how = "built from live trades" if source == "INTERNAL" else "the venue's candles, supports warm-up"
     return f"{step} {unit} ({how})"
 
 
@@ -1421,7 +1475,7 @@ def _clone_qs(s) -> str:
     q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
          "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
          "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params),
-         **_market_form(s.params)}
+         **_market_form(s.params), **({"venue": s.venue.lower()} if s.venue else {})}
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
     q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
