@@ -33,7 +33,7 @@ from nautilus_trader.model import (
 
 from sleeve_fund.hub import protocol
 
-RECONNECT_SECONDS = (1, 2, 5, 10, 30)
+RECONNECT_SECONDS = (1, 2, 5)  # the hub is on the same host: back within seconds of it
 CONNECT_TIMEOUT = 90  # the hub picks up an instrument it doesn't relay yet within a minute
 LATE_BAR_SECONDS = 90  # a bar refilled this long after its close is history, not a signal
 
