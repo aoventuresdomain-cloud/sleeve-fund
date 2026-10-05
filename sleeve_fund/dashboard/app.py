@@ -643,27 +643,50 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
     def research_page(request: Request, job=None, error: str = "", pre: dict | None = None, collect: str = "",
-                      notice: str = ""):
+                      notice: str = "", tab: str | None = None):
+        """Research: Development (a plan per model and the study form), Results and History. Every venue's
+        stored history is on the page, so a study's venue changes in place (no reload)."""
+        from sleeve_fund.dashboard import development as dev
         from sleeve_fund.dashboard import pipeline
 
         pre = pre or {}
+        sheets = [dev.read_sheet(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
+                                                    reverse=True)]
+        rows = pipeline.strategies(TEARSHEETS, st().sleeves())
+        cards = dev.plans(rows, sheets)
+        chosen = next((c for c in cards if c["name"] == pre.get("strategy")), cards[0])
+        values = dev.form_values(chosen, pre)
         try:
-            profile = _research_venue(pre.get("venue"))
+            profile = _research_venue(values.get("venue"))
         except ValueError:
             profile = _research_venue()
-
-        sheets = [pipeline.sheet_facts(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
-                                                         reverse=True)]
-        stored = _stored_history(st(), profile)
+        values["venue"] = profile.name.lower()
+        venues, stored_all = [], []
+        for v in venue_choices():
+            vp = _research_venue(v["key"])
+            stored = _stored_history(st(), vp)
+            stored_all += [dict(h, venue=vp.label, venue_key=v["key"]) for h in stored]
+            venues.append(dict(v, fee=float(resolve_fees(vp.name, st()).fees.taker),
+                               suggest=[h["pair"] for h in stored] or _hints(vp.name),
+                               held={h["pair"]: dev.history_chip(h) for h in stored}))
+        here = next(v for v in venues if v["key"] == values["venue"])
+        if not values.get("instrument"):
+            values["instrument"] = "BTC/USD" if "BTC/USD" in here["suggest"] else here["suggest"][0]
         ledger = IdeaLedger(LEDGER)
         spent = {f"{idea}|{base}": opened_words(e) for (idea, base), e in ledger.holdouts().items()}
-        return page(request, "research.html", sheets=sheets, counts=ledger.counts(),
-                    rows=pipeline.strategies(TEARSHEETS, st().sleeves()), stages=pipeline.STAGES, job=job,
-                    error=error, pre=pre, strategies=_strategy_choices(),
-                    instruments=[h["pair"] for h in stored] or _hints(profile.name), stored=stored, collect=collect,
-                    notice=notice, request_years=REQUEST_YEARS, history_venue=profile.label,
-                    research_venue=profile.name.lower(), research_perpetual=profile.perpetual, spent_holdouts=spent,
-                    profiles=PROFILES, study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True))
+        # What the study panel's script needs to switch model and venue in place.
+        study_data = {"chosen": chosen["name"], "default_venue": _research_venue().name.lower(),
+                      "plans": {c["name"]: {"values": c["values"], "variants": c["variants"]} for c in cards},
+                      "venues": {v["key"]: {k: v[k] for k in ("label", "perpetual", "fee", "suggest", "held")}
+                                 for v in venues}}
+        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
+                    chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
+                    stages=pipeline.STAGES, job=job, error=error, notice=notice, collect=collect,
+                    tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent,
+                    profiles=PROFILES,
+                    study_minutes=study_run.STUDY_MINUTES, costs=exit_costs(backtest=True),
+                    how=dev.how_sentence(values), exits=dev.exits_sentence(values),
+                    breakeven_text=dev.breakeven_text, candle_words=dev.candle_words)
 
     @app.get("/research", response_class=HTMLResponse)
     def research(request: Request, _: str = Depends(require_pm)):
@@ -705,11 +728,19 @@ def create_app(store: Store | None = None) -> FastAPI:
         trades it (review round 8, R8-M6)."""
         form = dict((await request.form()).items())
         pair = str(form.get("instrument", "")).strip().upper()
+        # From a study's "Not stored: Collect", the answer shows in that study; else on the History tab.
+        tab = "development" if form.get("from") == "study" else "history"
+
+        def page_(**kw):
+            return research_page(request, tab=tab, **kw)
+
         try:
             profile = _research_venue(form.get("venue"))
         except ValueError as exc:
-            return research_page(request, error=str(exc))
+            return page_(error=str(exc))
         here = {"instrument": pair, "venue": profile.name.lower()}
+        if str(form.get("strategy", "")) in REGISTRY:
+            here["strategy"] = str(form["strategy"])
         try:
             if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
                 raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
@@ -717,13 +748,13 @@ def create_app(store: Store | None = None) -> FastAPI:
             held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
                         None)
             if held is not None:
-                return research_page(request, pre=here, notice=(
+                return page_(pre=here, notice=(
                     f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now."))
             if pair in (profile.core_pairs or CORE_PAIRS):
                 # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
                 # a request would change nothing, and its "from five years back" would misstate where it starts.
-                return research_page(request, pre=here, notice=(
+                return page_(pre=here, notice=(
                     f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
                     "kept current, and this list shows how far it has got."))
             if profile.minute_loader is None:
@@ -741,13 +772,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                                      "for; try again when the venue answers") from None
         except ValueError as exc:
             # No button to ask again: the same request would be refused the same way.
-            return research_page(request, error=str(exc), pre=here)
+            return page_(error=str(exc), pre=here)
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
         notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
                   "A study can run once some is stored; this list shows how far it has got."
                   if new else f"{pair} was already asked for; this list shows how far the collector has got.")
-        return research_page(request, pre=here, notice=notice)
+        return page_(pre=here, notice=notice)
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):
@@ -792,7 +823,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                                   ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),
                                   ("N/A", "stopped", "Not judged")):
             html = html.replace(f"<td>{word}</td>", f'<td><span class="chip {tone}">{label}</span></td>')
-        return page(request, "tearsheet.html", title=sheet, body=html)
+        from sleeve_fund.dashboard import development as dev
+
+        # On top of the sheet: its verdict in one sentence, four figures and the cost ladder, all read from it.
+        s = dev.read_sheet(path)
+        return page(request, "tearsheet.html", title=sheet, body=html, s=s, banner=dev.banner(s),
+                    breakeven=dev.breakeven_text(s), per_day=dev.per_day(s.get("oos_trades"), s.get("oos_days")),
+                    chart=dev.ladder_chart(s["rungs"], s["fee"]), candle_words=dev.candle_words)
 
     @app.get("/decisions", response_class=HTMLResponse)
     def decisions(request: Request, _: str = Depends(require_pm)):
@@ -1202,20 +1239,38 @@ def venue_choices() -> list[dict]:
 
 def _stored_history(store: Store, profile=None) -> list[dict]:
     """Each instrument research can use or has asked for, on the research venue: what is stored, and
-    whether the collector is current or still catching up."""
+    whether the collector is current or still catching up. One unreadable series (a coverage file being
+    rewritten, say) is left out and logged rather than taking the Research page down with it."""
     from sleeve_fund.history import HistoryStore
 
     profile = profile or _research_venue()
     hist = HistoryStore()
     now = utcnow()
-    asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
+    log = logging.getLogger(__name__)
+    try:
+        asked = {r["instrument"]: r for r in store.history_requests(profile.name)}
+    except Exception as exc:  # noqa: BLE001 - an old database without the table: nothing asked for
+        log.warning(f"couldn't read the history requests for {profile.label}: {exc!r}")
+        asked = {}
     out = []
-    for v, pair in hist.series():
+    try:
+        series = hist.series()
+    except OSError as exc:
+        log.warning(f"couldn't list the stored history: {exc!r}")
+        series = []
+    for v, pair in series:
         if v != profile.name:
             continue
-        cov = hist.coverage(v, pair)
-        behind = now - cov.last.to_pydatetime() > study_run.STALE_HISTORY
-        out.append({"pair": pair, "first": cov.first, "last": cov.last, "requested": asked.get(pair, {}).get("requested_at"),
+        try:
+            cov = hist.coverage(v, pair)
+            first, last = cov.first, cov.last
+            if last.tzinfo is None:  # stored without a zone: UTC, as the collector writes it
+                first, last = first.tz_localize("UTC"), last.tz_localize("UTC")
+            behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
+            continue
+        out.append({"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
                     "state": "catching up" if behind else "current"})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for"}

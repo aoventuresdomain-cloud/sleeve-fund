@@ -936,7 +936,7 @@ window.Console = (() => {
   // trade its own perpetual. A page showing one venue's stored history reloads on another.
   function venueField(form) {
     const sel = form && form.elements.venue;
-    if (!sel) return;
+    if (!(sel instanceof HTMLSelectElement)) return;  // the research study's venue switch runs itself
     if (sel.hasAttribute("data-reload")) {
       sel.addEventListener("change", () => { location.href = `${location.pathname}?venue=${encodeURIComponent(sel.value)}`; });
       return;
