@@ -227,8 +227,17 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves, frames, summaries = book_data()
         book = bookm.book_view(st(), summaries, frames)
         kill = _kill_targets(summaries)
-        return page(request, "risk.html", book=book, risk=riskops.risk_view(st(), summaries, book),
-                    shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
+        risk = riskops.risk_view(st(), summaries, book)
+        health = riskops.health_view(st(), summaries)
+        running = sum(1 for x in summaries if x["sleeve"].status == "running")
+        # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
+        profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
+        halt = next(iter(profiles.items())) if len(profiles) == 1 else None
+        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
+        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
+                    halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
+                    status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
+                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
@@ -272,10 +281,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
-    @app.get("/ops", response_class=HTMLResponse)
-    def ops_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
-        return page(request, "ops.html", ops=riskops.ops_view(st(), summaries), shell=shell(sleeves))
+    @app.get("/ops")
+    def ops_page(_: str = Depends(require_pm)):
+        """Operations is the System tab of Risk & health now."""
+        return RedirectResponse("/risk#system", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)
     def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):

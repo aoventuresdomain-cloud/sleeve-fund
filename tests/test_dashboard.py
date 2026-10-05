@@ -238,6 +238,125 @@ def test_risk_page_stress_and_limits(client):
     assert "drawdown 21% hit the 20% limit" in page
 
 
+def _healthy_desk(c, store, tmp_path, monkeypatch, *names):
+    """Strategies running and reporting, balances checked, last night's backup on disk: an All clear desk."""
+    folder = tmp_path / "fresh-backups"
+    folder.mkdir(exist_ok=True)
+    (folder / "sleeve_fund-new.dump").write_bytes(b"x" * 100)
+    monkeypatch.setenv("BACKUP_DIR", str(folder))
+    for name in names:
+        _new(c, name=name)
+        store.set_status(name, "running")
+        store.heartbeat(name)
+        store.event(name, "info", "reconcile", "balance matches the venue")
+
+
+def _status_block(page):
+    block = page.split('aria-labelledby="status-h">', 1)[1].split("</section>", 1)[0]
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", block)).strip()
+
+
+def test_risk_status_word_rules(client, tmp_path, monkeypatch):
+    """Risk & health's one word: All clear when nothing is halted or paused, no limit is past 80%, every
+    process reports, feeds are fresh and backup and balance checks are fine; otherwise Needs a look (amber)
+    or Action needed (red), naming the first item."""
+    c, store = client
+    _healthy_desk(c, store, tmp_path, monkeypatch, "btc-a", "btc-b")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status ok"' in page
+    assert _status_block(page).startswith("All clear 2 strategies running. Every limit has room. Nothing needs you.")
+    assert "Processes 2/2" in page and "Feeds 2/2" in page and "Balances matched" in page and "Backup 0h ago" in page
+    assert 'href="/alerts"' in page and "Alerts 0 open" in page
+
+    # A stale price feed: amber, naming it; the feed coming back clears it.
+    store.event("btc-b", "warning", "stale_price", "No trade or quote from the venue for 6 minutes")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and "Feeds 1/2" in page
+    assert _status_block(page).startswith("Needs a look btc-b has had no trade or quote from the venue lately.")
+    store.event("btc-b", "info", "price_feed_back", "Market data is arriving again")
+    assert 'class="rh-status ok"' in c.get("/risk", auth=AUTH).text
+
+    # Paused: amber.
+    store.set_status("btc-a", "paused", "paused by the PM")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and "Needs a look btc-a is paused: paused by the PM." in _status_block(page)
+    store.set_status("btc-a", "running")
+
+    # A limit more than 80% used: amber, naming the strategy and the limit.
+    store.record_equity("btc-a", equity=5000, cash=5000, qty=0, price=100_000, benchmark=5000)
+    store.record_equity("btc-a", equity=4150, cash=4150, qty=0, price=100_000, benchmark=5000)  # 17% of a 20% limit
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status warn"' in page and re.search(r"Needs a look btc-a has used \d+% of its \w[\w ]* limit",
+                                                          _status_block(page))
+
+    # Halted: red, and it comes first, with the rest listed under it.
+    store.set_status("btc-b", "halted", "drawdown 20.4% hit the 20% limit")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status bad"' in page
+    assert _status_block(page).startswith("Action needed btc-b is halted: drawdown 20.4% hit the 20% limit. And 1 more below.")
+
+
+def test_risk_status_turns_red_for_a_silent_process_a_balance_mismatch_and_amber_for_backups(client, tmp_path,
+                                                                                           monkeypatch):
+    from datetime import timedelta
+
+    from sleeve_fund.store import sleeves_t
+
+    c, store = client
+    _healthy_desk(c, store, tmp_path, monkeypatch, "btc-a")
+    store.event("btc-a", "error", "reconcile_mismatch", "venue holds 0.1 BTC, the journal 0")
+    page = c.get("/risk", auth=AUTH).text
+    assert 'class="rh-status bad"' in page and "Balance mismatch: btc-a" in page
+    assert _status_block(page).startswith("Action needed btc-a&#39;s balance doesn&#39;t match the venue&#39;s.")
+    store.event("btc-a", "info", "reconcile", "balance matches the venue")
+    with store.engine.begin() as conn:  # the process stopped reporting four minutes ago
+        conn.execute(sleeves_t.update().values(heartbeat_at=utcnow() - timedelta(minutes=4)))
+    page = c.get("/risk", auth=AUTH).text
+    assert "Action needed btc-a is not reporting." in _status_block(page) and "Processes 0/1" in page
+    store.heartbeat("btc-a")
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "no-backups"))
+    page = c.get("/risk", auth=AUTH).text
+    assert _status_block(page).startswith("Needs a look No database backup has been written yet.")
+    assert "Backup none yet" in page
+
+
+def test_risk_status_word_names_the_worst_first():
+    from sleeve_fund.dashboard.riskops import status_word
+
+    assert status_word([], 0)["word"] == "All clear" and status_word([], 0)["line"].startswith("No strategy running.")
+    assert status_word([], 1)["line"].startswith("1 strategy running.")
+    warn = status_word([{"level": "warn", "text": "a is paused"}], 2)
+    assert (warn["word"], warn["tone"], warn["line"]) == ("Needs a look", "warn", "a is paused.")
+    bad = status_word([{"level": "bad", "text": "b is halted"}, {"level": "warn", "text": "a is paused"}], 2)
+    assert (bad["word"], bad["tone"], bad["line"]) == ("Action needed", "bad", "b is halted. And 1 more below.")
+
+
+def test_ops_redirects_to_the_system_tab_of_risk(client):
+    c, _ = client
+    _new(c)
+    r = c.get("/ops", auth=AUTH, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/risk#system"
+    assert c.get("/ops", follow_redirects=False).status_code == 401  # still behind the password
+    page = c.get("/ops", auth=AUTH).text
+    assert 'data-panel="system"' in page and "Technical" in page and "Strategy processes" in page
+    assert "Safety nets" in page and "Price watchdog" in page
+
+
+def test_risk_overview_lists_room_before_halt_and_stops(client):
+    c, store = client
+    _new(c, name="eth-stop", instrument="ETH/USD", stop_atr="2", atr_bars="14")
+    _new(c, name="sol-none", instrument="SOL/USD")
+    store.record_equity("sol-none", equity=5000, cash=5000, qty=0, price=100, benchmark=5000)
+    store.record_equity("sol-none", equity=4400, cash=1400, qty=30, price=100, benchmark=5000)  # 12% of 20%: amber
+    page = c.get("/risk", auth=AUTH).text
+    overview = page.split('data-panel="overview"', 1)[1].split('data-panel="limits"', 1)[0]
+    assert "Limits by strategy" not in overview and "Limits by strategy" in page  # the full table is on Limits
+    assert '<span class="rh-chip ok" title="2.0 ATR (14 bars) below entry">2 ATR</span>' in overview
+    assert '<span class="rh-chip warn">None</span>' in overview
+    assert 'class="w" style="width:60.0%"' in overview and "8.0% left" in overview
+    assert "If the market moved now" in overview and "Book drawdown, 30 days" in overview
+
+
 def test_ops_page_shows_processes_and_safety_nets(client, tmp_path, monkeypatch):
     import os
     import time
