@@ -31,7 +31,7 @@ SPEC = IdeaSpec(
     default_risk_profile="balanced",
     # The sprint's four pre-registered variants: bands 30/55 or 25/50, with or without the 4-hour SMA(50) filter.
     param_grid={"long_entry": [25.0, 30.0], "trend_sma": [0, 50]},
-    default_params={"rsi_period": 14, "long_entry": 30.0, "long_exit": 55.0, "short_entry": 70.0, "short_exit": 45.0,
+    default_params={"rsi_period": 14, "long_entry": 30.0, "long_exit": 55.0, "short_entry": 70.0, "short_exit": 50.0,
                     "time_stop_bars": 48, "trend_minutes": 240, "trend_sma": 0},
     known_weaknesses=(
         "Prior lab work lost on every 15-minute idea even at 0.03% a side: many short trades, so fees dominate. "
@@ -42,7 +42,7 @@ SPEC = IdeaSpec(
 
 class RsiCrossConfig(LongFlatConfig):
     def __init__(self, *, rsi_period: int = 14, long_entry: float = 30.0, long_exit: float = 55.0,
-                 short_entry: float = 70.0, short_exit: float = 45.0, time_stop_bars: int = 48,
+                 short_entry: float = 70.0, short_exit: float = 50.0, time_stop_bars: int = 48,
                  trend_minutes: int = 240, trend_sma: int = 0, **kwargs) -> None:
         super().__init__(**kwargs)
         if int(rsi_period) != rsi_period or not 2 <= rsi_period <= 500:
@@ -50,7 +50,7 @@ class RsiCrossConfig(LongFlatConfig):
         if not 0 < long_entry < long_exit < 100:
             raise ValueError("the long side needs 0 < entry < exit < 100, e.g. in at 30, out at 55")
         if not 0 < short_exit < short_entry < 100:
-            raise ValueError("the short side needs 0 < exit < entry < 100, e.g. in at 70, out at 45")
+            raise ValueError("the short side needs 0 < exit < entry < 100, e.g. in at 70, out at 50")
         if int(time_stop_bars) != time_stop_bars or time_stop_bars < 0:
             raise ValueError("time_stop_bars is a whole number of bars; 0 means no time stop")
         if int(trend_minutes) != trend_minutes or trend_minutes <= 0 or 1440 % trend_minutes:
