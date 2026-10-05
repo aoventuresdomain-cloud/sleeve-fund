@@ -10,3 +10,8 @@ reason = "PM asked to remove every existing strategy and start again with two te
 id = "2026-10-05"
 reason = "PM asked to archive every strategy not in use, keeping the two Binance long/short test strategies"
 keep = ["ping-pong-ls-binance", "rsi-bands-ls-binance"]
+
+[[clear]]
+id = "2026-10-05-flat"
+reason = "PM asked for a fresh book: a strategy archived on 4 Oct while still holding is flattened and put away"
+keep = ["ping-pong-ls-binance", "rsi-bands-ls-binance"]

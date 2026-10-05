@@ -1773,6 +1773,36 @@ def test_a_strategy_a_clean_slate_put_away_still_holding_stays_in_the_book_until
     assert 'href="/sleeves/old-long"' not in c.get("/risk", auth=AUTH).text
 
 
+def test_the_strategy_page_shows_how_old_its_price_feed_is(client):
+    """PM, 5 Oct 2026: next to the Live badge, the seconds since the strategy's venue last sent it a trade or
+    quote, so a quiet feed is seen at once. Stale past a minute; off while the strategy is stopped."""
+    from datetime import timedelta
+
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    c, store = client
+    _new(c)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'data-live="feed"' in page and "Kraken spot prices: waiting for the first trade" in page
+    now = [utcnow()]
+    rt = SleeveRuntime(store, "btc-test", now=lambda: now[0])
+    rt.market_seen()
+    now[0] += timedelta(seconds=1)
+    rt.market_seen()  # within the write interval: not written again
+    assert store.last_feed("btc-test") == now[0] - timedelta(seconds=1)
+    store.feed_seen("btc-test", utcnow() - timedelta(seconds=7))
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Kraken spot prices: 7 s ago" in page or "Kraken spot prices: 8 s ago" in page
+    assert '<span class="ok">Kraken spot prices' in page
+    store.feed_seen("btc-test", utcnow() - timedelta(seconds=150))
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert '<span class="bad-dot">Kraken spot prices: 2 min ago' in page
+    store.set_desired_state("btc-test", "stopped")
+    assert "Kraken spot prices: off while stopped" in c.get("/sleeves/btc-test", auth=AUTH).text
+    home = c.get("/", auth=AUTH).text
+    assert "Prices: live venue feeds" in home and "Kraken live feed" not in home
+
+
 def test_maker_first_orders_are_switched_off_by_default(client, prices, instrument):
     """PM, 4 Oct 2026: market orders only until a strategy proves it needs maker fills. The form offers no
     order type, a hand-made maker request is refused in words, and so is a backtest asking for one."""
