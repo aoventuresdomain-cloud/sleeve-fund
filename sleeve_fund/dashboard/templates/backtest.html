@@ -86,10 +86,11 @@
       {% if result.trips %}
       <table class="responsive tight" data-hide-xl="3 4" data-hide-lg="3 4 5 7" data-hide-md="3 4 5 6 7">
         <thead><tr><th>Entry</th><th>Exit</th><th class="num">Held</th><th class="num">Size</th><th class="num">Entry price</th><th class="num">Exit price</th><th class="num">Fees</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num" title="P&amp;L over the loss at the stop, as sized at entry">R</th><th>Exit</th><th></th></tr></thead>
-        {# The side rides on the entry, which no width hides: Size, which also says it, goes at 1440 px (round 12, M12-U5). #}
+        {# The side rides on the entry, which shows at every width, phone cards included, when the run has shorts: Size,
+           which also says it, goes at 1440 px (round 12, M12-U5). #}
         {% set ls = result.trips|selectattr('side', 'equalto', -1)|list|length > 0 %}
         <tbody>{% for t in result.trips|reverse %}{% set rid = 'bt-' ~ loop.index %}
-        <tr><td data-m="hide">{{ t.opened.strftime(dfmt) }}{% if ls %}<div class="sub">{{ 'short' if t.side == -1 else 'long' }}</div>{% endif %}</td><td>{{ t.closed.strftime(dfmt) }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
+        <tr><td{% if not ls %} data-m="hide"{% endif %}{% if ls %} data-label="Entry"{% endif %}>{{ t.opened.strftime(dfmt) }}{% if ls %}<div class="sub">{{ 'short' if t.side == -1 else 'long' }}</div>{% endif %}</td><td>{{ t.closed.strftime(dfmt) }}</td><td class="num" data-m="hide">{{ t.held|held }}</td>
           <td class="num" data-m="hide">{{ '%g'|format(t.qty) }}{% if t.side == -1 %}<div class="sub">short</div>{% endif %}</td>
           <td class="num" data-m="hide">{{ t.entry_px|px }}</td><td class="num" data-m="hide">{{ t.exit_px|px }}</td>
           <td class="num" data-m="hide">{{ t.fees|money }}{% if t.funding|abs >= 0.005 %}<div class="sub" title="Funding over the trade: + received, − paid. P&amp;L is after fees and funding.">funding {{ t.funding|smoney }}</div>{% endif %}{% if t.insurance %}<div class="sub" title="Closed past the bankruptcy price: under isolated margin the venue's insurance fund took the loss beyond the strategy's equity.">insurance fund {{ t.insurance|smoney }}</div>{% endif %}</td>
