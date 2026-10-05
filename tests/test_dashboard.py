@@ -156,14 +156,15 @@ def test_portfolio_shows_book_figures_and_alerts_can_be_acknowledged(client):
     store.record_equity("eth-book", equity=10_100, cash=5_000, qty=2, price=2_550, benchmark=10_050)
     store.event("eth-book", "warning", "mark_unavailable", "price feed quiet")
     page = c.get("/", auth=AUTH).text
-    for text in ("Book equity", "Month to date", "Gross exposure", "Allocation", "price feed quiet"):
+    for text in ("Book value", "Month to date", "Allocation and top", "Needs you", "price feed quiet"):
         assert text in page
     alert = store.alerts()[0]
     r = c.post(f"/alerts/{alert['id']}/ack", data={"note": "seen", "next": "/"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/"
     assert store.open_alert_count() == 0 and store.alerts(include_acked=True)[0]["ack_note"] == "seen"
-    assert "price feed quiet" not in c.get("/", auth=AUTH).text
+    after = c.get("/", auth=AUTH).text
+    assert "price feed quiet" not in after and 'class="needs-you"' not in after  # the bar goes once nothing waits
     assert "seen" in c.get("/alerts?show=all", auth=AUTH).text
 
 
@@ -794,14 +795,14 @@ def test_fetch_kraken_ohlc_keeps_the_forming_candle_and_uses_open_times():
 
 
 def test_every_headline_figure_explains_itself(client):
-    from sleeve_fund.dashboard.glossary import GLOSSARY
-
     c, store = client
     _new(c)
-    for path in ("/", "/sleeves/btc-test", "/trades"):
+    for path in ("/sleeves/btc-test", "/trades"):
         page = c.get(path, auth=AUTH).text
         assert 'class="help"' in page and 'aria-label="What does this mean?"' in page
-    assert GLOSSARY["drawdown"] in c.get("/", auth=AUTH).text
+    # Portfolio's tiles are a label and a number; the detail is each tile's hover title (UI v2, PM 5 Oct).
+    kpis = c.get("/", auth=AUTH).text.split('aria-label="Book figures">')[1].split("</section>")[0]
+    assert kpis.count('<div class="kpi') == kpis.count('title="') == 8 and 'class="s"' not in kpis
 
 
 def test_clone_with_changes_prefills_the_new_sleeve_form(client):
