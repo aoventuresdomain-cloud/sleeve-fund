@@ -129,7 +129,8 @@ class Supervisor:
             pending = self.store.pending_commands(name)
             if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
                 if not any(c["command"] == "flatten" for c in pending):
-                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"])
+                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"],
+                                       holds_through_reset=False)
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue

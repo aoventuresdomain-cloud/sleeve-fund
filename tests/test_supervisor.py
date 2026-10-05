@@ -306,6 +306,33 @@ def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_cap
     assert store.decisions("bn-ls")[0]["reason"].startswith("Started afresh at 10,000")
 
 
+@pytest.mark.sanity
+def test_a_kill_switch_pressed_while_a_reset_is_under_way_is_kept_on_the_fresh_run(store):
+    """Round 13, m13-U5: a reset waits for its flatten to fill, and a PM pause or flatten (the kill switch) asked for
+    in that window was dropped with the other pending commands, so the fresh run started trading. It is kept, as a
+    pause in force before the reset is; the reset's own flatten still restarts the strategy as it was."""
+    from sleeve_fund.supervisor import Supervisor
+
+    for name in ("bn-killed", "bn-plain"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp", "allow_short": True}, venue="binance")
+        store.set_status(name, "running")
+        store.record_fill(name, side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+        store.request_reset(name, "Test finished")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()  # both still long: the reset's flatten is sent
+    store.command("bn-killed", "flatten", "Book kill switch: drawdown")  # pressed before the reset completes
+    for name in ("bn-killed", "bn-plain"):
+        for cmd in store.pending_commands(name):
+            store.mark_applied(cmd["id"])
+        store.record_fill(name, side="SELL", qty=0.076, price=86_100.0, fee=3.27, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_reset() is None
+    killed, plain = store.sleeve("bn-killed"), store.sleeve("bn-plain")
+    assert killed.status == "paused" and "kill switch" in killed.status_reason and "kept through a reset" in killed.status_reason
+    assert plain.status == "stopped" and plain.desired_state == "running"  # its own flatten doesn't pause it
+
+
 def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):
     from sleeve_fund.supervisor import Supervisor
 
