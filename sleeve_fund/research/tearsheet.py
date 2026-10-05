@@ -49,6 +49,15 @@ def _share(x: float) -> str:
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.0%}"
 
 
+def _param(v) -> str:
+    """A grid value as set: 20, 0.005 or "ema", not int() of it, which crashed on a word and showed a
+    0.5% threshold as 0 (round 11 minor)."""
+    if isinstance(v, str):
+        return v
+    f = float(v)
+    return str(int(f)) if f.is_integer() else f"{f:g}"
+
+
 def _num(x: float) -> str:
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.2f}"
 
@@ -290,7 +299,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- |")
     for _, row in r.sensitivity.iterrows():
         out.append(
-            "| " + " | ".join(str(int(row[c])) for c in cols)
+            "| " + " | ".join(_param(row[c]) for c in cols)
             + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} |"
         )
     out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}.")

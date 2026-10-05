@@ -504,6 +504,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # weeks later; it lapses instead, and the decision log says so.
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
+            elif (command == "resume" and st().sleeve(name).status == "running"
+                  and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
+                # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
+                raise ValueError("it is already running, so there is nothing to resume")
             elif command == "flatten" and any(c["command"] == "flatten" for c in st().pending_commands(name)):
                 # A second would sell again whatever the first left (review round 10, m5).
                 raise ValueError("a flatten is already waiting for the strategy to act on it")

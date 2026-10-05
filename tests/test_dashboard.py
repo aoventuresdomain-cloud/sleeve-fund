@@ -1722,3 +1722,16 @@ def test_maker_first_orders_are_switched_off_by_default(client, prices, instrume
     assert r.status_code in (200, 303, 400) and "btc-test" not in [s.name for s in store.sleeves()]
     with pytest.raises(ValueError, match="switched off"):
         run_backtest("trend_filter", prices.iloc[:50], instrument, {"fast": 5, "slow": 20, "maker_wait_minutes": 10})
+
+
+def test_a_resume_on_a_running_strategy_is_refused_in_words(client):
+    """Review round 10, m10-3: there is nothing to resume on a running strategy."""
+    c, store = client
+    _new(c, name="eth-run", instrument="ETH/USD")
+    store.set_status("eth-run", "running", "")
+    r = c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "again"}, auth=AUTH, headers=SAME)
+    assert "Not done: it is already running, so there is nothing to resume." in r.text
+    assert store.pending_commands("eth-run") == []
+    store.set_status("eth-run", "paused", "paused by PM")
+    c.post("/sleeves/eth-run/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH, headers=SAME)
+    assert [x["command"] for x in store.pending_commands("eth-run")] == ["resume"]

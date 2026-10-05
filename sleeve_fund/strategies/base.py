@@ -38,6 +38,7 @@ from sleeve_fund.strategies.indicators import Atr
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
 MAKER_INTENTS = ("entry", "exit", "rebalance")
 OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
+EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
 MINUTE_NS = 60_000_000_000
 
 
@@ -1881,8 +1882,12 @@ class LongFlatStrategy(Strategy):
             if self.runtime.reconcile_due() and not self.cache.orders_inflight(strategy_id=self.strategy_id):
                 tol = 2 * float(self._lot())  # two units of the base currency (review rounds 9 and 10, B9-1, B10-1)
                 if not self.runtime.reconcile(cash=cash, qty=qty, qty_tolerance=tol):
-                    self._drop_kept()  # halted: no trading, no flattening
-                    self.cancel_all_orders(self._cfg.instrument_id)
+                    # Halted: nothing new trades and nothing is flattened, but a resting stop-loss and target
+                    # stay, so the position isn't left unguarded until the PM acts (review round 10, m10-1).
+                    self._drop_kept()
+                    for order in self.cache.orders_open(strategy_id=self.strategy_id):
+                        if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
+                            self.cancel_order(order)
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
             if self._margin and qty != 0:

@@ -207,7 +207,10 @@ def seed(store: Store, paths: list[str]) -> list[str]:
 def clear(store: Store, path: str) -> list[str]:
     """Put away every strategy on the book, once per [[clear]] entry in the file: each is stopped and
     archived, and its journal stays as it is (nothing is deleted). An entry already applied is skipped,
-    so this can run on every start; strategies added after it are never touched."""
+    so this can run on every start; strategies added after it are never touched. A strategy still
+    holding a position is stopped but not archived, since archiving would drop a position nobody then
+    watches from the book (review round 11): the entry stays open and finishes on a later start, once
+    the PM has flattened it."""
     with open(path, "rb") as fh:
         entries = tomllib.load(fh).get("clear", [])
     done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
@@ -217,15 +220,26 @@ def clear(store: Store, path: str) -> list[str]:
         if key in done:
             continue
         put_away = store.archived()
+        holding = []
         for s in store.sleeves():
             if s.desired_state != "stopped":
                 store.set_desired_state(s.name, "stopped")
                 store.drop_pending(s.name, "lapsed: the strategy was stopped before it acted")
                 store.decide("system", "stop", reason, s.name)
-            if s.name not in put_away:
-                store.archive(s.name)
-                store.decide("system", "archive", reason, s.name)
-                cleared.append(s.name)
+            if s.name in put_away:
+                continue
+            qty = store.journal_book(s.name, s.starting_balance)["qty"]
+            if abs(qty) > 1e-12:
+                holding.append(s.name)
+                store.event(s.name, "warning", "clear_held",
+                            f"{reason}: not archived, it still holds {qty:.12g}; flatten it and the next start "
+                            "archives it")
+                continue
+            store.archive(s.name)
+            store.decide("system", "archive", reason, s.name)
+            cleared.append(s.name)
+        if holding:
+            continue  # applied again on the next start, once those are flat
         store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away)")
         store.event(None, "info", "book_cleared", f"{reason}: {', '.join(cleared) or 'nothing to put away'}")
         done.add(key)

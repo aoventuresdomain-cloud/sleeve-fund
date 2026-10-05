@@ -600,3 +600,23 @@ def test_an_expired_daily_loss_pause_owes_nothing_after_a_restart(store):
     t[0] += timedelta(hours=25)
     rt = _restart(store, t)
     assert rt.tick(equity=9_400, cash=0, qty=1.0, price=9_400) is None
+
+
+def test_a_resume_on_a_running_strategy_is_ignored_and_keeps_the_days_baseline(store):
+    """Review round 10, m10-3: a resume on a strategy already running reset the day's loss baseline."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 12, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=100)
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=9_700, cash=9_700, qty=0.0, price=100)
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    assert rt.tick(equity=9_700, cash=9_700, qty=0.0, price=100) is None
+    assert rt._day_open == 10_000
+    assert any(e["kind"] == "pm_resume_ignored" for e in store.events("s1"))
+    t[0] += timedelta(minutes=1)
+    assert rt.tick(equity=9_450, cash=9_450, qty=0.0, price=100) == "flatten"  # 5.5% on the day: paused
