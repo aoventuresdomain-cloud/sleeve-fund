@@ -175,9 +175,14 @@ def test_a_strategy_archived_while_still_holding_is_flattened_and_leaves_the_boo
     assert clear(store, str(path)) == []
     assert store.sleeve("s").desired_state == "running"
     assert [c["command"] for c in store.pending_commands("s")] == ["flatten"]
+    from sleeve_fund.supervisor import book_figures, book_line
+
+    assert "s 1,000 (archived, still holding 0.01, running)" in book_line(store)
+    assert book_figures(store).startswith("from 1,500.00")
     store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
     assert clear(store, str(path)) == ["s"]
     assert store.sleeve("s").desired_state == "stopped" and set(store.previous_book()) == {"s"}
+    assert book_figures(store) == "from 500.00, equity 500.00, fees 0.00, positions none, first mark none"
     assert store.sleeve("kept").desired_state == "stopped" and "kept" not in store.archived()
 
 

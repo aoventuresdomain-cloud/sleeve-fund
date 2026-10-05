@@ -280,6 +280,20 @@ def book_line(store: Store) -> str:
     return "; ".join(parts) or "empty"
 
 
+def book_figures(store: Store) -> str:
+    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
+    starting capital, equity, fees, open positions and the first mark, for the deploy log."""
+    earlier = store.previous_book()
+    current = [s for s in store.sleeves() if s.name not in earlier]
+    start = sum(s.starting_balance for s in current)
+    equity = sum((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"] for s in current)
+    fees = sum(f["fee"] for s in current for f in store.fills(s.name, limit=1_000_000))
+    held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
+    firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
+    return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
+            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -287,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     sd.add_argument("paths", nargs="+")
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
+    sub.add_parser("book", help="print the book's strategies and headline figures")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
@@ -296,6 +311,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "clear":
         print("put away:", clear(store, args.path) or "nothing")
         print("book:", book_line(store))
+    elif args.cmd == "book":
+        print("book:", book_line(store))
+        print("book figures:", book_figures(store))
     else:
         Supervisor(store, clear_path=args.clear).run()
     return 0
