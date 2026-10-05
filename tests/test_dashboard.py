@@ -2055,3 +2055,21 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
     assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it
+
+
+def test_risk_and_health_reads_a_feed_as_fresh_from_its_venues_latest_trade():
+    from datetime import timedelta
+
+    from sleeve_fund.dashboard import riskops
+    from sleeve_fund.store import Store, utcnow
+
+    store = Store.in_memory()
+    store.create_sleeve(name="bn", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={}, venue="binance")
+    x = {"sleeve": store.sleeve("bn"), "healthy": True}
+    assert riskops.feed_fresh(store, x)  # no trade seen yet and no stale-price warning
+    store.feed_seen("bn", utcnow() - timedelta(seconds=20))
+    assert riskops.feed_fresh(store, x)
+    store.feed_seen("bn", utcnow() - timedelta(seconds=riskops.FEED_FRESH_SECONDS + 5))
+    assert not riskops.feed_fresh(store, x)
+    assert not riskops.feed_fresh(store, {**x, "healthy": False})

@@ -11,6 +11,8 @@ import pandas as pd
 from sleeve_fund import backups
 from sleeve_fund.store import Store, utcnow
 
+FEED_FRESH_SECONDS = 60  # past this a strategy's price feed reads as stale, here and on its page
+
 # Market moves the stress table applies to every position at once: falls and rallies, so a short book's risk
 # (a rally) shows as plainly as a long book's.
 SHOCKS = (-0.50, -0.20, -0.10, -0.05, 0.05, 0.10, 0.20, 0.50)
@@ -123,12 +125,14 @@ STRESS_SHOWN = (-0.20, -0.10, 0.10, 0.20)  # the overview's chart; the Limits ta
 def feed_fresh(store: Store, x: dict) -> bool:
     """Whether a strategy's price feed is fresh: trades or quotes from its venue are arriving.
 
-    Today's measure, from what the journal already holds: the process is reporting (a dead feed stops its
-    heartbeat, so the supervisor restarts it) and the price watchdog's latest word since it started is not a
-    stale-price warning. Once the journal keeps the time of each venue's latest trade or quote
-    (Store.last_feed), this is the one place to switch over to it."""
+    The process is reporting, and its venue's latest trade or quote (Store.last_feed) is at most a minute
+    old, the same line as the strategy page's feed badge. Before its first trade arrives, the price
+    watchdog's latest word since it started decides: not a stale-price warning."""
     if not x["healthy"]:
         return False
+    seen = store.last_feed(x["sleeve"].name)
+    if seen is not None:
+        return (utcnow() - seen).total_seconds() <= FEED_FRESH_SECONDS
     last = store.last_event(x["sleeve"].name, FEED_KINDS)
     return not (last and last["kind"] in STALE_FEED)
 

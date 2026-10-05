@@ -1548,7 +1548,7 @@ def _ago(t) -> str:
     return "just now"
 
 
-FEED_FRESH_SECONDS = 60  # past this the strategy page's price feed reads as stale
+FEED_FRESH_SECONDS = riskops.FEED_FRESH_SECONDS  # past this the strategy page's price feed reads as stale
 
 
 def _price_feed(s, seen) -> dict:

@@ -99,7 +99,8 @@ def test_the_development_tab_lists_every_model_with_its_status(client):
     page = c.get("/research", auth=AUTH).text
     by_model = {m: st for st, m in re.findall(r'<li data-status="(\w+)"><a class="plan-card" href="[^"]*" data-plan="(\w+)"', page)}
     assert by_model == {"rsi_cross": "ready", "trend_filter": "passed", "rsi_bands": "killed",
-                                  "buy_and_hold": "untested", "ping_pong": "untested", "rsi_pullback": "untested"}
+                                  "buy_and_hold": "untested", "ping_pong": "untested", "rsi_pullback": "untested",
+                                  "dip_buy": "untested", "donchian": "untested"}
     # Ready first (and picked), then what passed; the meta line says where the last verdict came from.
     assert page.index('data-plan="rsi_cross"') < page.index('data-plan="trend_filter"') < page.index('data-plan="rsi_bands"')
     assert "Kill on BTC/USDT, Binance USD-M perpetuals · break-even 0.03%" in page
