@@ -43,6 +43,9 @@ SPEC = IdeaSpec(
 )
 
 
+WARMUP_LOOKBACKS = 4  # warm-up length in multiples of the longest lookback (warmup_needed)
+
+
 def _lookbacks(value) -> list[int]:
     raw = value.split(",") if isinstance(value, str) else list(value)
     try:
@@ -84,7 +87,11 @@ class Donchian(LongFlatStrategy):
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
-        return max(max(_lookbacks(params.get("lookbacks", "20,55,100"))), int(params.get("vol_lookback_days", 90))) + 1
+        # A third stays on until the close breaks its half-length low, which can be any time after its breakout,
+        # so one lookback of warm-up can miss a breakout that is still on (review round 13, E13-5). WARMUP_LOOKBACKS
+        # of them reach back past the last time each third was out in all but very long unbroken trends.
+        longest = max(_lookbacks(params.get("lookbacks", "20,55,100")))
+        return max(WARMUP_LOOKBACKS * longest, int(params.get("vol_lookback_days", 90))) + 1
 
     def update_indicators(self, bar: Bar) -> None:
         close = bar.close.as_double()
