@@ -1160,3 +1160,31 @@ def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():
     kinds = [e["kind"] for e in res.journal.events_]
     assert "reconcile_mismatch" not in kinds, [e["message"] for e in res.journal.events_ if e["kind"] == "reconcile_mismatch"]
     assert max(f["qty"] for f in res.journal.fills_) > 1e8 and len(res.fills) > 10
+
+
+def test_the_day_and_week_ranges_of_a_wiped_out_strategy_measure_from_the_starting_capital(monkeypatch):
+    """Round 12 fix re-check, mF2-1 and mF2-2: the 1D and 1W ranges took the peak before the window from daily
+    closes alone. A strategy wiped out before the window had a peak of 0, so 0/0 made the range a 500, and the
+    book's week read 25% worst beside its 40% drawdown."""
+    from datetime import timedelta
+
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard.app import create_app
+    from sleeve_fund.store import Store, utcnow
+
+    store = Store.in_memory()
+    now = utcnow()
+    for name, marks in (("gone", [0.0, 0.0]), ("alive", [10_000.0, 10_000.0])):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, "market": "perp"})
+        for back, eq in zip((timedelta(days=3), timedelta(minutes=10)), marks):
+            store.record_equity(name, equity=eq, cash=eq, qty=0.0, price=60_000.0, benchmark=10_000, ts=now - back)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    c = TestClient(create_app(store))
+    auth = ("pm", "pw")
+    for days in (1, 7):
+        one = c.get(f"/api/sleeves/gone/equity?days={days}", auth=auth)
+        assert one.status_code == 200 and one.json()["drawdown"][-1] == 1.0, one.text[:300]
+        book = c.get(f"/api/book/equity?days={days}", auth=auth).json()
+        assert max(book["drawdown"]) == pytest.approx(0.5)  # 10,000 of 20,000, from the starting capital
