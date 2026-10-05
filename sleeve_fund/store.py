@@ -11,6 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -239,7 +240,7 @@ accounts_t = Table(
     metadata,
     Column("name", String(41), primary_key=True),
     Column("kind", String(8), nullable=False),  # paper | live
-    Column("venue", String(16), nullable=False, default="kraken"),
+    Column("venue", String(16), nullable=False, default=""),  # a live account's venue; "" for paper (any venue)
     Column("note", Text, nullable=False, default=""),
     Column("created_at", TS, nullable=False),
 )
@@ -421,6 +422,7 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
     goes negative; if it does, the negative stays visible so reconciliation catches it."""
     cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
         price = float(f["price"])
@@ -428,9 +430,14 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
         sign = 1 if f["side"] == "BUY" else -1
         cash -= sign * float(f["qty"]) * price + float(f["fee"])
         new = qty + sign * q
-        if abs(new) < DUST:  # float residue from a fill's own arithmetic, far below any lot
+        big, legs = max(big, abs(float(f["qty"]))), legs + 1
+        # Float residue from the fills' own arithmetic: below DUST, or for fills too large for a float to hold
+        # every lot (1.6e8 units: one float step is 3e-8, wider than a 1e-8 lot) within a few float steps per
+        # fill since flat. Left in, an exit back to flat read as 3e-8 held (review round 13, E13-2).
+        if abs(new) < DUST or abs(new) <= (legs + 2) * Decimal(math.ulp(big)):
             new = Decimal(0)
         if new == 0:
+            legs = 0
             entry = None
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
@@ -682,22 +689,35 @@ class Store:
     # --- accounts ------------------------------------------------------------------
 
     def _ensure_paper_account(self, c) -> None:
-        if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == "paper")).first() is None:
-            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
-                                                note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+        from sleeve_fund.accounts import PAPER_NOTE, PAPER_NOTES_BEFORE
 
-    def create_account(self, name: str, kind: str, note: str = "") -> None:
+        row = c.execute(select(accounts_t).where(accounts_t.c.name == "paper")).first()
+        if row is None:
+            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="", note=PAPER_NOTE,
+                                                created_at=utcnow()))
+        elif row.venue or row.note in PAPER_NOTES_BEFORE:
+            # Made when every account was on one venue: paper trades at each strategy's own venue. A note
+            # the PM wrote is kept; only the old default one is replaced.
+            note = PAPER_NOTE if row.note in PAPER_NOTES_BEFORE else row.note
+            c.execute(update(accounts_t).where(accounts_t.c.name == "paper").values(venue="", note=note))
+
+    def create_account(self, name: str, kind: str, note: str = "", venue: str | None = None) -> None:
+        """A live account is on one venue, picked from the registered profiles; a paper one serves any."""
         from sleeve_fund.accounts import KINDS, NAME_RE
+        from sleeve_fund.venues import VENUES
 
         if not NAME_RE.fullmatch(name):
             raise ValueError("account name: lower-case letters, digits and dashes, 2 to 41 characters")
         if kind not in KINDS:
             raise ValueError(f"account kind must be one of {KINDS}")
+        if kind == "live" and (venue or "").upper() not in VENUES:
+            raise ValueError(f"a live account needs its venue, one of {', '.join(p.label for p in VENUES.values())}")
+        venue = (venue or "").lower() if kind == "live" else ""
         with self.engine.begin() as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == name)).first():
                 raise ValueError(f"an account called {name} already exists")
-            c.execute(insert(accounts_t).values(name=name, kind=kind, venue="kraken", note=note, created_at=utcnow()))
+            c.execute(insert(accounts_t).values(name=name, kind=kind, venue=venue, note=note, created_at=utcnow()))
 
     def accounts(self) -> list[dict]:
         """Every account with its sleeves and, for live ones, whether the supervisor sees a key."""

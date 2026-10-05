@@ -41,7 +41,7 @@ def test_kraken_account_fees_reads_trade_volume():
 def test_resolve_prefers_the_latest_fetched_account_schedule(store):
     q = resolve("KRAKEN", store)
     assert q.source == "published" and "no account on this venue is connected" in q.text
-    store.create_account("kraken-main", "live")
+    store.create_account("kraken-main", "live", venue="kraken")
     store.record_fees("KRAKEN", "kraken-main", 0.003, 0.006)
     q = resolve("KRAKEN", store)
     assert q.source == "account" and (q.fees.maker, q.fees.taker) == (Decimal("0.003"), Decimal("0.006"))
@@ -53,8 +53,8 @@ def test_resolve_prefers_the_latest_fetched_account_schedule(store):
 def test_supervisor_fetches_fees_for_connected_live_accounts_only(store, monkeypatch):
     from sleeve_fund.supervisor import Supervisor
 
-    store.create_account("kraken-main", "live")
-    store.create_account("kraken-nokey", "live")
+    store.create_account("kraken-main", "live", venue="kraken")
+    store.create_account("kraken-nokey", "live", venue="kraken")
     calls = []
 
     def fake_fetch(key, secret):
@@ -91,7 +91,7 @@ def test_backtest_charges_the_fetched_account_fees(store):
     from sleeve_fund.dashboard import preview
     from sleeve_fund.data import synthetic_ohlcv
 
-    store.create_account("kraken-main", "live")
+    store.create_account("kraken-main", "live", venue="kraken")
     store.record_fees("KRAKEN", "kraken-main", 0.002, 0.004)
     preview._history.clear()
     res = preview.run("trend_filter", "BTC/USD", {"fast": 5, "slow": 20}, fee_quote=resolve("KRAKEN", store),

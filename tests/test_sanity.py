@@ -800,12 +800,11 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         profile):
     """Sizing on a perp (PM decision, 5 Oct): every entry, long or short, puts up the profile's position cap
     of equity as margin (20%, 33%, 50%) at its leverage cap (1x, 2x, 3x), so a notional of the two multiplied,
-    never over it; and the liquidation price it reports is where equity falls to the maintenance margin:
-    below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage) / (1 -/+ maintenance)
-    of the entry, and outside the profile's minimum distance. A long at 1x or less is fully paid for and has
-    none."""
+    never over it; and the liquidation price it reports is where that isolated margin falls to the maintenance
+    margin: below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage cap) /
+    (1 -/+ maintenance) of the entry, and outside the profile's minimum distance. A long at 1x is fully paid for
+    and has none."""
     prof = risk.PROFILES[profile]
-    cap = prof.max_position_pct * prof.max_leverage
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
                      risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
     entries = [o for o in j.orders_.values() if o["intent"] == "entry"]
@@ -814,7 +813,7 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
     for o in entries:
         sig = o["signal"]
         assert sig["sized_by"] == f"{profile} risk profile cap", sig
-        if o["side"] == "BUY" and cap <= 1:
+        if o["side"] == "BUY" and prof.max_leverage <= 1:
             assert "liquidation_px" not in sig, sig
             continue
         lev, liq, close = sig["leverage"], sig["liquidation_px"], sig["close"]
@@ -822,7 +821,9 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         assert prof.max_position_pct * 0.94 <= lev / prof.max_leverage <= prof.max_position_pct, sig
         side = 1 if o["side"] == "BUY" else -1
         assert (liq < close) if side > 0 else (liq > close), sig
-        assert liq / close == pytest.approx((1 - side / lev) / (1 - side * m), rel=2e-3), sig
+        # Isolated: the margin is the notional over the leverage cap, so liquidation is the textbook price at
+        # that leverage, not at the notional over the whole equity (review round 13, U13-2).
+        assert liq / close == pytest.approx((1 - side / prof.max_leverage) / (1 - side * m), rel=2e-3), sig
         assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
 
 
@@ -1190,6 +1191,26 @@ def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():
     kinds = [e["kind"] for e in res.journal.events_]
     assert "reconcile_mismatch" not in kinds, [e["message"] for e in res.journal.events_ if e["kind"] == "reconcile_mismatch"]
     assert max(f["qty"] for f in res.journal.fills_) > 1e8 and len(res.fills) > 10
+
+
+def test_an_exit_back_to_flat_on_1e8_unit_fills_reads_flat_for_reconcile_and_reset():
+    """Review round 13, E13-2: two buys of a sub-cent instrument and the one sell that closes them, as floats,
+    left the journal 2e-8 long (one float step at 1.8e8 units is 3e-8). Once flat, reconcile halted on it and
+    Reset issued a flatten that could never trade. The journal reads that residue as flat; a real lot left on
+    a position small enough for a float to hold it still counts."""
+    from decimal import Decimal
+
+    from sleeve_fund.store import replay_book
+
+    a, b = 156348949.76671064, 25248169.5075285
+    fills = [{"side": "BUY", "qty": a, "price": 2e-5, "fee": 0.0}, {"side": "BUY", "qty": b, "price": 2e-5, "fee": 0.0},
+             {"side": "SELL", "qty": a + b, "price": 2e-5, "fee": 0.0}]
+    assert Decimal(repr(a)) + Decimal(repr(b)) - Decimal(repr(a + b)) == Decimal("2e-8")  # the float residue
+    book = replay_book(fills, 10_000)
+    assert book["qty"] == 0 and book["entry_px"] is None
+    one_lot = [{"side": "BUY", "qty": 0.1, "price": 60_000.0, "fee": 0.0},
+               {"side": "SELL", "qty": 0.09999999, "price": 60_000.0, "fee": 0.0}]
+    assert replay_book(one_lot, 10_000)["qty"] == pytest.approx(1e-8, abs=1e-15)
 
 
 def test_the_day_and_week_ranges_of_a_wiped_out_strategy_measure_from_the_starting_capital(monkeypatch):

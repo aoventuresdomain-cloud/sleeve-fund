@@ -159,7 +159,7 @@ class Supervisor:
                 proc.crashes = 0  # healthy again
 
     def check_keys(self) -> None:
-        """Tell the dashboard which live accounts have a Kraken key on this server (presence only)."""
+        """Tell the dashboard which live accounts have their venue's key on this server (presence only)."""
         live = [a for a in self.store.accounts() if a["kind"] == "live"]
         if live:
             self.store.report_keys({a["name"]: accounts.key_present(a["name"], venue=a["venue"]) for a in live})
