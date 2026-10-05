@@ -1,17 +1,35 @@
 {# Form sections shared by the new-sleeve form and the backtest page, so a backtest's settings
    carry straight into a sleeve. `pre` holds values to prefill (from the query string). #}
-{% macro pair_field(instruments, pre) %}
-<div class="field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument') or ('BTC/USD' if 'BTC/USD' in instruments or not instruments else instruments[0]) }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist></div>
+{% macro instrument_field(pre, label='Instrument') %}
+{# One searchable pick-list for the instrument, the venue folded into it (UI v2, items 8 and 9): Perpetuals and
+   Spot from every venue's listing (/api/instruments?options=1), each with its history badge, recently used
+   first, and "Use '…' as typed" last; the server checks a typed one against the venue. The hidden `venue` field
+   follows the pick (Console.picklist). Without JavaScript it is a plain text field on the chosen venue. #}
+{% set vs = venue_choices() %}
+{% set typed = (pre.get('instrument') or '')|upper %}
+{% set asked = (pre.get('venue') or '')|lower %}
+{% set listing = namespace(v=none) %}{% for v in vs if not listing.v and typed in v.pairs %}{% set listing.v = v %}{% endfor %}
+{% set home = (vs|selectattr('key', 'equalto', asked)|first) or listing.v or vs|first %}
+{% set value = typed or ('BTC/USD' if 'BTC/USD' in home.pairs or not home.pairs else home.pairs[0]) %}
+<div class="field picklist" data-picklist>
+  <label for="instrument">{{ label }}</label>
+  <div class="pl-box">
+    <input id="instrument" name="instrument" value="{{ value }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off" spellcheck="false"
+      role="combobox" aria-expanded="false" aria-controls="instrument-list" aria-autocomplete="list" placeholder="Search every instrument">
+    <span class="pl-kind" data-pl-kind>{{ 'perpetual' if home.perpetual else 'spot' }}</span>
+  </div>
+  <input type="hidden" name="venue" value="{{ home.key }}" data-pl-venue data-perp="{{ '1' if home.perpetual }}">
+  <ul class="pl-menu" id="instrument-list" role="listbox" aria-label="Instruments" hidden></ul>
+  <p class="hint pl-badge" data-pl-badge aria-live="polite"></p>
+  <script type="application/json" data-pl-seed>{{ {'venues': vs, 'default': home.key}|tojson }}</script>
+</div>
 {% endmacro %}
 
-{% macro venue_field(pre, reload=False) %}
-{# Where the strategy is researched, tested and paper traded. A perpetual venue has no spot, so picking one
-   sets the market to its perpetual (console.js venueField). `reload`: the page shows that venue's stored
-   history, so it reloads on a change. #}
-{% set chosen = (pre.get('venue') or '')|lower %}
-<div class="field"><label for="venue">Venue</label><select id="venue" name="venue"{% if reload %} data-reload{% endif %}>
-  {% for v in venue_choices() %}<option value="{{ v.key }}" {{ 'selected' if v.key == chosen or (not chosen and loop.first) }} data-perp="{{ '1' if v.perpetual }}" data-pairs="{{ v.pairs|join(',') }}">{{ v.label }}{{ ': perpetuals only' if v.perpetual else ': spot, or a simulated perpetual' }}</option>{% endfor %}
-</select></div>
+{% macro candle_chips(name, choices, chosen, id=none, disabled=False) %}
+{# Candle length as chips, not a dropdown (UI v2, item 9): `choices` is [(value, label)]. #}
+<div class="chip-pick" role="radiogroup" aria-label="Candle length"{% if id %} id="{{ id }}"{% endif %}>
+  {% for value, text in choices %}<label><input type="radio" name="{{ name }}" value="{{ value }}"{{ ' checked' if value|string == chosen|string }}{{ ' disabled' if disabled }}><span>{{ text }}</span></label>{% endfor %}
+</div>
 {% endmacro %}
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
