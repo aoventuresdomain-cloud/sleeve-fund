@@ -247,7 +247,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
-                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill, reasons=COMMON_REASONS,
+                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
@@ -432,6 +432,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     position=position, perp=perp_x,
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position),
+                    resetting=None if bt_id else st().pending_reset(name),
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
                     signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     timeline=_timeline(events, st().decisions(name, limit=50)),
@@ -439,6 +440,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     then_stop=q.get("then_stop", ""), done=q.get("done", ""),
                     flatten_waits=any(c["command"] == "flatten" for c in st().pending_commands(name)),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
+                    demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
@@ -605,6 +607,39 @@ def create_app(store: Store | None = None) -> FastAPI:
             return False
         hb = st().sleeve(name).heartbeat_at
         return bool(hb and utcnow() - hb < STALE)
+
+    @app.post("/sleeves/{name}/reset")
+    def sleeve_reset(name: str, reason: str = Form(""), reason_pick: str | None = Form(None),
+                     reason_note: str = Form(""), actor: str = Depends(require_pm),
+                     _o: None = Depends(same_origin)):
+        """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
+        puts the run so far away under Previous book, and restarts it at its starting capital."""
+        try:
+            st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        except ValueError as exc:
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}", status_code=303)
+
+    @app.post("/book/reset")
+    def book_reset(reason: str = Form(""), reason_pick: str | None = Form(None), reason_note: str = Form(""),
+                   actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Reset every strategy on the current book (not archived, not a backtest, none already resetting)."""
+        try:
+            reason = _reason("reset", reason, reason_pick, reason_note)
+        except ValueError as exc:
+            reason = ""
+            error = str(exc)
+        else:
+            error = "a reason is required"
+        if not reason:
+            return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
+        gone = set(st().archived())
+        for s in st().sleeves():
+            if s.name not in gone and not st().pending_reset(s.name):
+                st().request_reset(s.name, reason, actor=actor)
+        return RedirectResponse("/setup?reset=1", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1242,6 +1277,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
                     paper_count=sum(1 for x in sleeves if x.name not in st().archived()),
+                    resettable=[x.name for x in sleeves if x.name not in st().archived()],
                     alerts_out=setup_view.outside_alerts(st()), backup=setup_view.backup_state(frame["now"]))
 
     return app
@@ -1448,16 +1484,22 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
     return reasons.compose(action, pick, note) if pick is not None else (reason or "").strip()
 
 
-# Only the kill switch on Risk & health still offers these; it moves to reasons.ACTION_REASONS["book_flatten"]
-# (templates/_reasons.html) when that page is rebuilt, and this list can go then.
-COMMON_REASONS = [
-    "Risk limit close; reducing exposure",
-    "Market event; standing aside",
-    "Strategy behaving outside its backtest range",
-    "Data or venue problem",
-    "Checked after an alert; safe to continue",
-    "Planned change of settings",
-]
+
+def _demo_copy(store, s) -> dict | None:
+    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to Bybit Demo, the
+    one demo account the mirror can trade to an exact quantity."""
+    from sleeve_fund import mirror
+
+    if not s.params.get("demo_mirror") or not markets.is_perp(s.params) or mirror.target_for(s) != "BYBIT":
+        return None
+    put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
+                 if r["status"] == "filled")
+    last = store.last_resync(s.name)
+    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+            "leverage": PROFILES[s.risk_profile].max_leverage}
+
+
+
 EXIT_KINDS = trading.EXIT_EVENTS
 
 

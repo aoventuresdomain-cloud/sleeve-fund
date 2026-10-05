@@ -66,6 +66,13 @@ ACTION_REASONS: dict[str, list[tuple[str, str]]] = {
         ("Separate the books", "Keep this test apart from the others"),
         ("Move onto the demo mirror", "Check fills against the demo account"),
     ],
+    # Reset strategy: flatten, put the run away under Previous book, restart at starting capital (PM, 5 Oct 2026).
+    "reset": [
+        ("Test finished; starting a clean run", "Keep the run so far under Previous book and begin again"),
+        ("Settings changed; a fresh run to compare", "Compare the new settings from a clean start"),
+        ("Demo copy out of line with paper", "Set paper and the demo account level again"),
+        ("After a fix to the engine or the mirror", "Start over on the fixed code"),
+    ],
 }
 ACTION_REASONS["close"] = ACTION_REASONS["flatten"]
 ACTION_REASONS["book_flatten"] = ACTION_REASONS["flatten"]

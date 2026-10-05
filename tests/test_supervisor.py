@@ -269,3 +269,50 @@ def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_with
     store._update_sleeve(s.name, params={**params, "demo_mirror": False})
     seed(store, [path])
     assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False
+
+
+@pytest.mark.sanity
+def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_capital(store):
+    """PM, 5 Oct 2026. Nothing is deleted: the run so far moves to its own archived name under Previous book."""
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True, "demo_mirror": True},
+                        venue="binance")
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.record_equity("bn-ls", equity=9_990.0, cash=3_460.0, qty=0.076, price=86_000.0, benchmark=10_000.0)
+    store.event("bn-ls", "info", "fill", "BUY 0.076")
+    store.request_reset("bn-ls", "Test finished")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()  # still long: flattened first, nothing moved yet
+    (cmd,) = store.pending_commands("bn-ls")
+    assert cmd["command"] == "flatten" and cmd["reason"].startswith("Reset strategy: Test finished")
+    sup.reset_pending()
+    assert len(store.pending_commands("bn-ls")) == 1  # not sent twice
+    store.mark_applied(cmd["id"])
+    store.record_fill("bn-ls", side="SELL", qty=0.076, price=86_100.0, fee=3.27, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None
+    run = next(iter(store.reset_runs()))
+    assert run.startswith("bn-ls--") and run in store.archived() and run in store.previous_book()
+    fresh = store.sleeve("bn-ls")
+    book = store.journal_book("bn-ls", 10_000)
+    assert (book["qty"], book["cash"]) == (0.0, 10_000.0)
+    assert store.fills("bn-ls") == [] and store.equity_series("bn-ls") == [] and store.events("bn-ls")[0]["kind"] == "reset"
+    assert fresh.desired_state == "running" and fresh.params == store.sleeve(run).params
+    assert store.sleeve(run).venue == "BINANCE" and store.sleeve(run).desired_state == "stopped"
+    assert store.journal_book(run, 10_000)["qty"] == 0.0 and len(store.fills(run)) == 2  # kept, not deleted
+    assert store.pending_resyncs()[-1]["sleeve"] == "bn-ls"  # the demo copy is set flat on the paper terms
+    assert store.decisions("bn-ls")[0]["reason"].startswith("Started afresh at 10,000")
+
+
+def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):
+    from sleeve_fund.supervisor import Supervisor
+
+    seed(store, ["configs/sleeves/ping_pong_test.toml"])
+    store.set_desired_state("ping-pong-test", "stopped")
+    store.request_reset("ping-pong-test", "Settings changed")
+    Supervisor(store, python="true").reset_pending()
+    assert store.pending_reset() is None and store.sleeve("ping-pong-test").desired_state == "stopped"
+    with pytest.raises(ValueError, match="archived"):
+        store.request_reset(next(iter(store.reset_runs())), "x")

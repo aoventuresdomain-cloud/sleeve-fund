@@ -322,6 +322,36 @@ feed_seen_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("seen_at", TS, nullable=False),
 )
+# A PM's "resync the demo copy" request, for the mirror container to act on (only it holds the demo keys):
+# sleeve null means every mirrored strategy. done_at and result once it has. A new table: CREATE TABLE.
+mirror_requests_t = Table(
+    "mirror_requests",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=True),
+    Column("reason", Text, nullable=False),
+    Column("actor", String(64), nullable=False),
+    Column("created_at", TS, nullable=False),
+    Column("done_at", TS, nullable=True),
+    Column("result", Text, nullable=False, default=""),
+)
+# A PM's "reset strategy" (5 Oct 2026): flatten, put the run so far away under its own name, and start again
+# at the starting capital. run is the name the old run was put away under, once done; restart says whether
+# the strategy was running when asked. A new table: CREATE TABLE.
+resets_t = Table(
+    "strategy_resets",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), nullable=False),
+    Column("reason", Text, nullable=False),
+    Column("actor", String(64), nullable=False),
+    Column("restart", Integer, nullable=False, default=1),
+    Column("created_at", TS, nullable=False),
+    Column("done_at", TS, nullable=True),
+    Column("run", String(64), nullable=False, default=""),
+)
+# Tables whose rows are a strategy's own run: moved to the run's name on a reset. sleeve_accounts and
+# sleeve_venues are copied (both need them); feed_seen starts afresh; backtests are never strategies on a book.
 # A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
 # fills, equity marks and events) in the ordinary tables under a sleeve named BACKTEST_PREFIX + id, so
 # the run opens in the same Orders, Trades and strategy screens as paper. A new table: CREATE TABLE.
@@ -768,11 +798,12 @@ class Store:
         One still holding a position stays in the current book until it is flat: left out, its position
         counted in no exposure, risk figure or kill switch (5 Oct 2026, a clean slate that archived two
         strategies still long)."""
+        runs = self.reset_runs()  # a reset's earlier run is an earlier book's too
         start = self.book_start()
         if start is None:
-            return {}
-        return {name: at for name, at in self.archived().items()
-                if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}
+            return runs
+        return {**runs, **{name: at for name, at in self.archived().items()
+                           if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}}
 
     def archive(self, sleeve: str) -> None:
         """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
@@ -996,6 +1027,104 @@ class Store:
         """The last fill the mirror has dealt with for a strategy, or None if it has never run for it."""
         with self.engine.connect() as c:
             return c.execute(select(func.max(mirror_t.c.fill_id)).where(mirror_t.c.sleeve == sleeve)).scalar()
+
+    def order_reason(self, order_id: str) -> str:
+        with self.engine.connect() as c:
+            return c.execute(select(orders_t.c.reason).where(orders_t.c.order_id == order_id)).scalar() or ""
+
+    def request_reset(self, sleeve: str, reason: str, actor: str = "PM") -> None:
+        """Ask the supervisor to reset a strategy: it flattens it, puts the run so far away and restarts it at
+        its starting capital (supervisor.Supervisor.reset_pending)."""
+        s = self.sleeve(sleeve)
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest can't be reset; run a new backtest instead")
+        if sleeve in self.archived():
+            raise ValueError("an archived strategy can't be reset; restore it first")
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        if self.pending_reset(sleeve):
+            raise ValueError("a reset is already under way")
+        with self.engine.begin() as c:
+            c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
+                                              restart=int(s.desired_state == "running"), run=""))
+        self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
+
+    def pending_reset(self, sleeve: str | None = None) -> dict | None:
+        rows = self.pending_resets()
+        return next((r for r in rows if sleeve is None or r["sleeve"] == sleeve), None)
+
+    def pending_resets(self) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(resets_t).where(resets_t.c.done_at.is_(None)).order_by(resets_t.c.id)))
+
+    def reset_runs(self) -> dict[str, datetime]:
+        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's."""
+        with self.engine.connect() as c:
+            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
+
+    def split_run(self, request: dict, now: datetime | None = None) -> str:
+        """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
+        journal (fills, marks, orders, events, decisions, mirror record) moves to the run, archived, and the
+        strategy keeps its name and settings with an empty journal, so it replays to its starting capital.
+        Nothing is deleted. Returns the run's name."""
+        name, now = request["sleeve"], now or utcnow()
+        s = self.sleeve(name)
+        if abs(self.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+            raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
+        run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
+        moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
+                 insurance_t, orders_t, mirror_requests_t)
+        with self.engine.begin() as c:
+            row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
+            row.pop("id")
+            c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
+                                                  "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
+                                                  "updated_at": now}))
+            for t in moved:
+                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
+            for t in (sleeve_accounts_t, sleeve_venues_t):
+                for r in c.execute(select(t).where(t.c.sleeve == name)).all():
+                    c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
+            c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
+            c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(
+                status="stopped", status_reason="reset: starts afresh", paused_until=None, heartbeat_at=None,
+                created_at=now, updated_at=now))
+            c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=now, run=run))
+        return run
+
+    def request_resync(self, sleeve: str | None, reason: str, actor: str = "PM") -> None:
+        """Ask the mirror to bring the demo account in line with the paper book now (sleeve None: all)."""
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        if sleeve is not None and not self.sleeve(sleeve).params.get("demo_mirror"):
+            raise ValueError("this strategy isn't copied to a demo account, so there is nothing to resync")
+        self.queue_resync(sleeve, reason, actor)
+        self.decide(actor, "resync", f"Resync the demo copy: {reason.strip()}", sleeve)
+
+    def queue_resync(self, sleeve: str | None, reason: str, actor: str = "system") -> None:
+        with self.engine.begin() as c:
+            c.execute(insert(mirror_requests_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor,
+                                                       created_at=utcnow(), result=""))
+
+    def pending_resyncs(self) -> list[dict]:
+        q = select(mirror_requests_t).where(mirror_requests_t.c.done_at.is_(None)).order_by(mirror_requests_t.c.id)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    def finish_resync(self, request_id: int, result: str) -> None:
+        with self.engine.begin() as c:
+            c.execute(update(mirror_requests_t).where(mirror_requests_t.c.id == request_id)
+                      .values(done_at=utcnow(), result=result))
+
+    def last_resync(self, sleeve: str) -> dict | None:
+        """The latest resync request covering this strategy (its own or one for all)."""
+        q = (select(mirror_requests_t).where(or_(mirror_requests_t.c.sleeve == sleeve,
+                                                  mirror_requests_t.c.sleeve.is_(None)))
+             .order_by(mirror_requests_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def mirror_rows(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         q = select(mirror_t)

@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Setup · Multi-Strategy Fund{% endblock %}
+{% from "_reasons.html" import reason_picker %}
 {% block content %}
 <div class="page-head">
   <h1>Setup</h1>
@@ -12,6 +13,8 @@
 </nav>
 
 <div class="tab-panel" id="tab-overview" role="tabpanel" data-panel="overview">
+  {% if pre.reset %}<div class="banner" role="status">Reset asked for every strategy on the book. Each one closes its position, is put away under Previous book and restarts at its starting capital; its page shows "Resetting…" until it has.</div>{% endif %}
+  {% if pre.reset_error %}<div class="banner loss" role="alert">Nothing was reset: {{ pre.reset_error }}.</div>{% endif %}
   {# Path to live: read-only, from the real state (G2 not approved is Paper; the demo mirror on is Demo check). #}
   <section class="panel journey-panel" aria-labelledby="ptl-h">
     <h2 id="ptl-h" class="sr-only">Path to live</h2>
@@ -66,6 +69,27 @@
       <span class="go">Details</span>
     </a>
   </div>
+
+  {# PM, 5 Oct 2026: during testing, start every strategy afresh in one go. #}
+  {% if resettable %}<section class="panel" aria-labelledby="reset-h">
+    <h2 id="reset-h">Start the paper book afresh</h2>
+    <p class="desc">Resets all {{ resettable|length }} strateg{{ 'y' if resettable|length == 1 else 'ies' }} on the book: positions closed, the runs so far kept under Previous book, each restarted at its starting capital.</p>
+    <button type="button" class="secondary" data-open="dlg-reset-all">Reset all</button>
+  </section>
+  <dialog id="dlg-reset-all" aria-labelledby="dlg-reset-all-h">
+    <form method="post" action="/book/reset">
+      <h2 id="dlg-reset-all-h">Reset all strategies</h2>
+      <ul class="reset-plan">
+        <li>Closes every open position at market on paper, and its copy on the demo account where one is mirrored. Open orders are cancelled on both. Closing fills are marked "reset".</li>
+        <li>Puts each run so far away under Previous book: kept, not counted, nothing deleted.</li>
+        <li>Restarts each strategy at its starting capital, with P&amp;L, drawdown and fees at zero. A running strategy runs again; a stopped one stays stopped.</li>
+        <li>Sets the demo account back to isolated margin at each strategy's leverage before it trades again.</li>
+        <li>Applies to: {{ resettable|join(', ') }}.</li>
+      </ul>
+      {{ reason_picker("reset", "r-reset-all") }}
+      <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger" data-needs-reason disabled>Reset all strategies</button></div>
+    </form>
+  </dialog>{% endif %}
 </div>
 
 <div class="tab-panel" id="tab-accounts" role="tabpanel" data-panel="accounts">
@@ -78,5 +102,5 @@
 {% endblock %}
 {% block scripts %}
 <script src="/static/console.js"></script>
-<script>Console.tabs(); Console.dialogs();</script>
+<script>Console.tabs(); Console.dialogs(); Console.reasons();</script>
 {% endblock %}
