@@ -39,6 +39,11 @@ docker compose ps
 # The demo mirror's first lines say whether each demo key signed in (sleeve_fund/mirror.py); never a key.
 sleep 15
 docker compose logs --no-log-prefix --tail 10 mirror || true
-# What the clean slates put away and the book left after them: each strategy's starting balance and
-# whether it has any history yet (sleeve_fund/supervisor.py, book_line).
-docker compose logs --no-log-prefix supervisor 2>/dev/null | grep -E '^(put away|book|added):' | tail -3 || true
+# What the clean slates put away, then the book as the Portfolio counts it. A slate waiting on a
+# flatten finishes within a few minutes (the supervisor retries it), so wait for that before reporting.
+docker compose logs --no-log-prefix supervisor 2>/dev/null | grep -E '^(put away|added):' | tail -2 || true
+for _ in $(seq 1 24); do
+  book=$(docker compose exec -T supervisor python -m sleeve_fund.supervisor book 2>/dev/null || true)
+  case "$book" in *"still holding"*) sleep 10 ;; *) break ;; esac
+done
+echo "$book"
