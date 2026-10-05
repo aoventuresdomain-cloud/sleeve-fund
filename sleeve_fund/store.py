@@ -314,6 +314,14 @@ sleeve_archive_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
 )
+# When each paper strategy last saw a trade or quote from its venue: the price feed's age on its page.
+# Written at most every few seconds by the strategy's process. A new table: CREATE TABLE.
+feed_seen_t = Table(
+    "feed_seen",
+    metadata,
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
+    Column("seen_at", TS, nullable=False),
+)
 # A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
 # fills, equity marks and events) in the ordinary tables under a sleeve named BACKTEST_PREFIX + id, so
 # the run opens in the same Orders, Trades and strategy screens as paper. A new table: CREATE TABLE.
@@ -544,6 +552,17 @@ class Store:
     def heartbeat(self, name: str) -> None:
         with self.engine.begin() as c:
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(heartbeat_at=utcnow()))
+
+    def feed_seen(self, name: str, at: datetime) -> None:
+        """Paper only: the time of the latest trade or quote the strategy's venue sent."""
+        with self.engine.begin() as c:
+            c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            c.execute(insert(feed_seen_t).values(sleeve=name, seen_at=at))
+
+    def last_feed(self, name: str) -> datetime | None:
+        with self.engine.connect() as c:
+            row = c.execute(select(feed_seen_t.c.seen_at).where(feed_seen_t.c.sleeve == name)).first()
+        return _aware(row[0]) if row else None
 
     # --- journal -----------------------------------------------------------------
 
@@ -1207,6 +1226,15 @@ class Store:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
         self.decide(actor, command, reason, sleeve)
+
+    def add_missing_param(self, sleeve: str, key: str, value) -> bool:
+        """Set one parameter a strategy has never had, without a restart (True if set). A key it already has,
+        whatever its value, is the PM's or the file's and is left alone."""
+        s = self.sleeve(sleeve)
+        if key in s.params:
+            return False
+        self._update_sleeve(sleeve, params={**s.params, key: value})
+        return True
 
     def change_settings(self, sleeve: str, *, risk_profile: str, params: dict, warmup_bars: int) -> bool:
         """Save new risk settings. A running strategy is restarted by the supervisor to trade under

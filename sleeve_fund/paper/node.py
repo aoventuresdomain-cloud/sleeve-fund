@@ -74,6 +74,23 @@ def history_loader(venue: str, pair: str, store=None, recent=None):
     return load
 
 
+def gap_loader(pair: str, recent):
+    """The venue's own closed candles stamped from since_ns to until_ns (at their close, as live bars are), for
+    candles built while no trades reached the process (LongFlatStrategy._fill_gap). recent: the venue profile's
+    ohlc_history; the newest candle it returns is still forming and is left out."""
+    from sleeve_fund.data import bar_minutes, to_bars
+
+    def load(instrument, bar_type, since_ns: int, until_ns: int):
+        minutes = bar_minutes(bar_type)
+        r = recent(pair, minutes).iloc[:-1]
+        r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
+        stamps = r.index.as_unit("ns").asi8
+        r = r[(stamps >= since_ns) & (stamps <= until_ns)]
+        return to_bars(r[["open", "high", "low", "close", "volume"]], instrument, bar_type)
+
+    return load
+
+
 def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
     """The stored bars plus the venue's complete candles after them, stamped at their close as the
     store's are. A venue that can't serve this interval leaves the stored bars as they are; the
@@ -162,6 +179,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         ).attach_runtime(runtime).attach_recorder(recorder)
         .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
     )
+    if profile.ohlc_history is not None:
+        strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
     strategy.simulated_venue = True
     strategy.fee_model = fee_model

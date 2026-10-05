@@ -155,6 +155,37 @@ def test_the_deploy_log_says_what_the_book_holds(store, sleeve):
     assert book_line(store) == "s 1,000 (running, has history); fresh 10,000 (stopped, no history)"
 
 
+def test_a_strategy_archived_while_still_holding_is_flattened_and_leaves_the_book(store, sleeve, tmp_path):
+    """PM, 5 Oct 2026: after the fresh book the Portfolio still read 30,000 with a position open. The 4 Oct
+    slate had archived a strategy still long (before holders were flattened first), and later slates
+    skipped it as already put away, so it stayed in the book's figures. A slate now flattens it too."""
+    from sleeve_fund.store import sleeve_archive_t
+
+    store.set_desired_state("s", "stopped")
+    store.record_fill("s", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    with store.engine.begin() as conn:  # archived with its position, as the 4 Oct slate left it
+        conn.execute(sleeve_archive_t.insert().values(sleeve="s", archived_at=utcnow()))
+    store.decide("system", "clear", "2026-10-04: first slate (1 put away)")
+    store.create_sleeve(name="kept", strategy="buy_and_hold", instrument="ETH/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=500, desired_state="stopped")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "first slate"\n'
+                    '[[clear]]\nid = "flat"\nreason = "fresh book"\nkeep = ["kept"]\n')
+    assert "s" not in store.previous_book()  # still holding: still in the book
+    assert clear(store, str(path)) == []
+    assert store.sleeve("s").desired_state == "running"
+    assert [c["command"] for c in store.pending_commands("s")] == ["flatten"]
+    from sleeve_fund.supervisor import book_figures, book_line
+
+    assert "s 1,000 (archived, still holding 0.01, running)" in book_line(store)
+    assert book_figures(store).startswith("from 1,500.00")
+    store.record_fill("s", side="SELL", qty=0.01, price=101.0, fee=0.008, order_id="o2", trade_id="t2")
+    assert clear(store, str(path)) == ["s"]
+    assert store.sleeve("s").desired_state == "stopped" and set(store.previous_book()) == {"s"}
+    assert book_figures(store) == "from 500.00, equity 500.00, fees 0.00, positions none, first mark none"
+    assert store.sleeve("kept").desired_state == "stopped" and "kept" not in store.archived()
+
+
 def test_clear_leaves_the_strategies_it_keeps(store, sleeve, tmp_path):
     store.set_desired_state("s", "running")
     store.create_sleeve(name="kept", strategy="buy_and_hold", instrument="ETH/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
@@ -167,7 +198,8 @@ def test_clear_leaves_the_strategies_it_keeps(store, sleeve, tmp_path):
 
 def test_the_shipped_clear_file_reads(store):
     assert clear(store, "configs/clear.toml") == []
-    assert sorted(d["reason"][:10] for d in store.decisions(action="clear")) == ["2026-10-04", "2026-10-05"]
+    assert sorted(d["reason"].split(":")[0] for d in store.decisions(action="clear")) == [
+        "2026-10-04", "2026-10-05", "2026-10-05-flat"]
 
 
 def test_the_shipped_clear_keeps_only_the_binance_strategies(store, tmp_path):
@@ -220,3 +252,20 @@ def test_the_strategy_leaves_a_reload_to_the_supervisor(store, sleeve):
     rt.on_start(0.008)
     rt.tick(equity=1000, cash=1000, qty=0, price=1)
     assert store.pending_reload("s") is not None
+
+
+def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_without_a_restart(store):
+    path = "configs/sleeves/ping_pong_ls_binance.toml"
+    seed(store, [path])
+    s = store.sleeve("ping-pong-ls-binance")
+    params = {k: v for k, v in s.params.items() if k != "demo_mirror"}
+    store._update_sleeve(s.name, params=params, desired_state="running")  # as seeded before 5 Oct 11:20
+    assert seed(store, [path]) == []
+    s = store.sleeve("ping-pong-ls-binance")
+    assert s.params["demo_mirror"] is True and {k: v for k, v in s.params.items() if k != "demo_mirror"} == params
+    assert store.pending_commands(s.name) == []  # no reload: the running strategy is not restarted
+    assert store.decisions(s.name)[0]["action"] == "mirror"
+    # A PM who turned it off keeps it off.
+    store._update_sleeve(s.name, params={**params, "demo_mirror": False})
+    seed(store, [path])
+    assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False

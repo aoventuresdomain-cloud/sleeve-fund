@@ -192,12 +192,17 @@ class Supervisor:
 
 def seed(store: Store, paths: list[str]) -> list[str]:
     """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
-    `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard."""
+    `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard.
+    One exception for a strategy already there: a file asking for the demo mirror turns it on when the strategy
+    has never had that setting (the Binance strategies were added before the mirror could copy them, 5 Oct
+    2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:
         cfg = load_sleeve(path)
         if cfg.name in existing:
+            if cfg.params.get("demo_mirror") and store.add_missing_param(cfg.name, "demo_mirror", True):
+                store.decide("system", "mirror", f"demo mirror turned on from {path}", cfg.name)
             continue
         with open(path, "rb") as fh:
             start = tomllib.load(fh).get("sleeve", {}).get("start", True)
@@ -231,9 +236,13 @@ def clear(store: Store, path: str) -> list[str]:
                    if e["message"].startswith(f"{reason}:")}
         holding = []
         for s in store.sleeves():
-            if s.name in keep or s.name in put_away or (waiting and s.name not in waiting):
+            if s.name in keep or (waiting and s.name not in waiting):
                 continue
             qty = store.journal_book(s.name, s.starting_balance)["qty"]
+            if s.name in put_away and abs(qty) <= 1e-12 and s.name not in waiting:
+                continue  # put away flat by an earlier slate
+            # One archived while still holding (the 4 Oct slate, before holders were flattened first) is
+            # flattened like any other holder: until it is flat it stays in the book's figures.
             if abs(qty) > 1e-12:
                 holding.append(s.name)
                 if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
@@ -267,10 +276,27 @@ def book_line(store: Store) -> str:
     parts = []
     for s in store.sleeves():
         if s.name in archived:
+            qty = store.journal_book(s.name, s.starting_balance)["qty"]
+            if abs(qty) > 1e-12:  # still counted in the book until it is flat
+                parts.append(f"{s.name} {s.starting_balance:,.0f} (archived, still holding {qty:.12g}, {s.desired_state})")
             continue
         history = "has history" if store.fills(s.name, limit=1) or store.last_equity(s.name) else "no history"
         parts.append(f"{s.name} {s.starting_balance:,.0f} ({s.desired_state}, {history})")
     return "; ".join(parts) or "empty"
+
+
+def book_figures(store: Store) -> str:
+    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
+    starting capital, equity, fees, open positions and the first mark, for the deploy log."""
+    earlier = store.previous_book()
+    current = [s for s in store.sleeves() if s.name not in earlier]
+    start = sum(s.starting_balance for s in current)
+    equity = sum((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"] for s in current)
+    fees = sum(f["fee"] for s in current for f in store.fills(s.name, limit=1_000_000))
+    held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
+    firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
+    return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
+            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     sd.add_argument("paths", nargs="+")
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
+    sub.add_parser("book", help="print the book's strategies and headline figures")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
@@ -289,6 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "clear":
         print("put away:", clear(store, args.path) or "nothing")
         print("book:", book_line(store))
+    elif args.cmd == "book":
+        print("book:", book_line(store))
+        print("book figures:", book_figures(store))
     else:
         Supervisor(store, clear_path=args.clear).run()
     return 0
