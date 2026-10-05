@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% from "_macros.html" import signed, money_signed %}
+{% block title %}Records · Multi-Strategy Fund{% endblock %}
+{% macro tl_item(d, link=True) %}{% set k = kinds[d.kind] %}
+<li class="tl" data-kind="{{ d.kind }}"><span class="when">{{ d.ts.strftime('%H:%M') }}</span><span class="ic {{ d.kind }}" aria-hidden="true">{{ k[1] }}</span>
+  <span class="what"><span class="sr-only">{{ k[0] }}: </span><strong>{{ d.action|action_words }}</strong>{% if d.sleeve %} {% if link %}<a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% else %}{{ d.sleeve }}{% endif %}{% endif %}
+  <span class="why">{{ d.reason }}{% if d.actor %} <span class="faint">· {{ d.actor }}</span>{% endif %}</span></span></li>
+{% endmacro %}
+{% block content %}
+<div class="page-head rec-head">
+  <h1>Records</h1>
+  <div class="actions rec-bar">
+    <nav class="range" aria-label="Period">{% for k, (label, _d) in periods.items() %}<a class="seg" data-keep-hash href="/records{{ qs(period=('' if k == 'all' else k), month='') }}" {{ 'aria-current=true' if w.period == k and not w.month }}>{{ label }}</a>{% endfor %}</nav>
+    <form method="get" action="/records" id="rec-filter" class="rec-strat">
+      {% if w.period != 'all' %}<input type="hidden" name="period" value="{{ w.period }}">{% endif %}
+      {% if w.month %}<input type="hidden" name="month" value="{{ w.month }}">{% endif %}
+      <label for="rec-sleeve" class="sr-only">Strategy</label>
+      <select id="rec-sleeve" name="sleeve"><option value="">All strategies</option>{% for n in sleeves %}<option {{ 'selected' if chosen == n }}>{{ n }}</option>{% endfor %}</select>
+      <noscript><button class="secondary">Show</button></noscript>
+    </form>
+    <details class="export-menu">
+      <summary class="button secondary">Export <span aria-hidden="true">▾</span></summary>
+      <div class="pc-pop export-pop" role="menu">
+        <p class="faint">{{ 'For ' ~ chosen if chosen else 'For all strategies' }}{% if w.month or w.period != 'all' %}; the decision log also for this period{% endif %}.</p>
+        {% for label, href, file, what in exports %}<a role="menuitem" href="{{ href }}" download><span><strong>{{ label }}</strong> <span class="faint">· {{ file }}</span></span><small>{{ what }}</small></a>{% endfor %}
+      </div>
+    </details>
+  </div>
+</div>
+
+<nav class="tabs desk-tabs" role="tablist" aria-label="Records views" data-tabs>
+  <a href="#performance" role="tab" data-tab="performance">Performance</a>
+  <a href="#log" role="tab" data-tab="log">Decision log<span class="n">{{ total }}</span></a>
+</nav>
+
+{% if w.month or action %}<div class="banner rec-note" role="status">Showing {% if w.month %}<strong>{{ w.month_label }}</strong> only{% endif %}{% if action %}{{ ', ' if w.month }}decisions of the kind <strong>{{ action|action_words }}</strong> only{% endif %}{% if chosen %}, for {{ chosen }}{% endif %}. <a data-keep-hash href="/records{{ qs(month='') }}">Show {{ periods[w.period][0] if w.period != 'all' else 'all' }}</a></div>{% endif %}
+
+<div class="tab-panel" id="tab-performance" role="tabpanel" data-panel="performance">
+  {% set label = chosen or 'Book' %}
+  <div class="ledger rec-figs">
+    <div><div class="k">{{ label }}</div>
+      {% if perf.empty %}<div class="v faint">–</div><div class="s">no marks in this period</div>
+      {% else %}<div class="v {{ 'gain' if perf.ret >= 0 else 'loss' }}">{{ perf.ret|pct1s }}</div><div class="s">after fees · {{ perf.pnl|smoney }}</div>{% endif %}</div>
+    <div><div class="k">vs benchmark</div>
+      {% if perf.empty %}<div class="v faint">–</div>
+      {% else %}<div class="v {{ 'gain' if perf.vs >= 0 else 'loss' }}">{{ '%+.1f'|format(perf.vs * 100) }} pts</div><div class="s">buy-and-hold {{ perf.bench|pct1s }}</div>{% endif %}</div>
+    <div><div class="k">Worst drawdown</div>
+      {% if perf.empty %}<div class="v faint">–</div>
+      {% else %}<div class="v">{{ '−' if perf.worst_dd > 0 }}{{ perf.worst_dd|pct1 }}</div><div class="s">{{ perf.worst_on.strftime('%-d %b %Y') if perf.worst_on else 'none in this period' }}</div>{% endif %}</div>
+    <div><div class="k">Fees paid</div><div class="v">{{ perf.fees|money }}</div><div class="s">{{ '{:,}'.format(perf.fills) }} fill{{ 's' if perf.fills != 1 }}</div></div>
+  </div>
+
+  <div class="grid rec-split">
+    <section class="panel span-8" aria-labelledby="curve-h">
+      <div class="panel-head"><h2 id="curve-h">{{ label }} vs benchmark</h2>{% if m.rows %}<span class="right faint">Tap a month to see only that month</span>{% endif %}</div>
+      {% if not perf.empty %}{% set c = perf.chart %}
+      <svg class="rec-curve" viewBox="0 0 {{ c.w }} {{ c.h }}" role="img" aria-label="{{ label }} return {{ perf.ret|pct1s }} against buy-and-hold {{ perf.bench|pct1s }} over the period">
+        {% for t in c.ticks %}<line x1="{{ c.left }}" x2="{{ c.w }}" y1="{{ t.y }}" y2="{{ t.y }}" class="grid-l"/><text x="{{ c.left - 6 }}" y="{{ t.y }}" text-anchor="end" dominant-baseline="middle" class="tick">{{ t.label }}</text>{% endfor %}
+        {% for mo in c.months %}<text x="{{ mo.x + 3 }}" y="{{ c.h - 6 }}" class="tick">{{ mo.label }}</text><line x1="{{ mo.x }}" x2="{{ mo.x }}" y1="8" y2="{{ c.bottom }}" class="grid-l"/>{% endfor %}
+        <line x1="{{ c.left }}" x2="{{ c.w }}" y1="{{ c.zero }}" y2="{{ c.zero }}" class="zero"/>
+        <polygon points="{{ c.area }}" class="area"/>
+        <polyline points="{{ c.bench }}" class="bench"/>
+        <polyline points="{{ c.book }}" class="book"/>
+        <circle cx="{{ c.end.x }}" cy="{{ c.end.y }}" r="3.5" class="dot-end"/>
+      </svg>
+      <div class="chart-legend"><span><i></i>{{ label }}<b>{{ perf.ret|pct1s }}</b></span><span><i class="bench"></i>Buy-and-hold<b>{{ perf.bench|pct1s }}</b></span></div>
+      {% else %}<p class="empty">No marks yet in this period. The curve appears once strategies have run.</p>{% endif %}
+      {% if m.rows %}
+      <div class="mchips" aria-label="Return by month">
+        {% for r in m.rows|reverse %}<a class="mchip {{ 'g' if r.ret >= 0 else 'l' }}" data-keep-hash href="/records{{ qs(month=('' if w.month == r.key else r.key)) }}" {{ 'aria-current=true' if w.month == r.key }} title="{{ r.month }}: {{ r.ret|pct1s }}"><span>{{ r.short }}</span><b>{{ r.ret|pct1s }}</b></a>{% endfor %}
+      </div>{% endif %}
+    </section>
+    <section class="panel span-4" aria-labelledby="latest-h">
+      <div class="panel-head"><h2 id="latest-h">Decision log</h2>{% if total %}<a class="right" href="#log">All {{ total }}</a>{% endif %}</div>
+      {% if latest %}
+      {% set shown = namespace(n=0) %}
+      {% for day in log if shown.n < 5 %}<div class="day">{{ day.label }}</div><ul class="timeline">
+        {% for d in day['items'] if shown.n < 5 %}{% set shown.n = shown.n + 1 %}{{ tl_item(d) }}{% endfor %}</ul>{% endfor %}
+      {% else %}<p class="empty">No decisions in this period. Every control you use is recorded here with its reason.</p>{% endif %}
+    </section>
+  </div>
+
+  {% if m.grid and m.months %}
+  <section class="panel flush" aria-labelledby="g-h">
+    <div class="panel-head"><h2 id="g-h">Strategies by month</h2></div>
+    <div style="overflow-x:auto"><table class="corr heat">
+      <tr><th></th>{% for mo in m.months|reverse %}<th scope="col">{{ mo }}</th>{% endfor %}</tr>
+      {% for n in m.sleeves %}<tr><th scope="row" class="row"><a href="/sleeves/{{ n }}">{{ n }}</a></th>
+        {% for mo in m.months|reverse %}{% set v = m.grid[n].get(mo) %}
+        {% if v is none %}<td class="faint">·</td>{% else %}<td style="background: color-mix(in srgb, {{ 'var(--gain)' if v >= 0 else 'var(--loss)' }} {{ [(v|abs) * 300, 60]|min|round(0) }}%, var(--panel))">{{ '%+.1f'|format(v * 100) }}%</td>{% endif %}
+        {% endfor %}</tr>{% endfor %}
+    </table></div>
+  </section>
+  {% endif %}
+
+  <section class="panel flush" aria-labelledby="m-h">
+    <div class="panel-head"><h2 id="m-h">{{ label }} by month</h2></div>
+    {% if m.rows %}
+    <table class="responsive" data-hide-lg="7 8">
+      <thead><tr><th>Month</th><th class="num">P&amp;L</th><th class="num">Return</th><th class="num">Benchmark</th><th class="num">Worst drawdown</th><th class="num">Fees</th><th class="num">Fills</th><th class="num">Traded</th><th class="num">Month-end equity</th></tr></thead>
+      <tbody>{% for r in m.rows %}
+      <tr><td><strong>{{ r.month }}</strong></td><td class="num" data-m="right">{{ money_signed(r.pnl) }}</td><td class="num" data-label="Return">{{ signed(r.ret) }}</td>
+        <td class="num" data-m="right" data-label="Benchmark">{{ r.bench_ret|pct }}</td><td class="num" data-m="hide">{{ r.worst_dd|pct1 }}</td><td class="num" data-m="hide">{{ r.fees|money }}</td>
+        <td class="num" data-m="hide">{{ r.fills }}</td><td class="num" data-m="hide">{{ r.turnover|money }}</td><td class="num" data-m="hide">{{ r.equity|money }}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+    {% else %}<p class="empty" style="padding:4px 18px 14px">No marks yet. Months appear once strategies have run.</p>{% endif %}
+  </section>
+</div>
+
+<div class="tab-panel" id="tab-log" role="tabpanel" data-panel="log">
+  <nav class="status-filter kind-filter" aria-label="Kind of decision">{% for k, label in kind_filters %}<button type="button" data-kind="{{ k }}" {{ 'aria-pressed=true' if k == 'all' else 'aria-pressed=false' }}>{{ label }}<span class="n">{{ kind_counts[k] }}</span></button>{% endfor %}</nav>
+  <section class="panel rec-log" aria-label="Decision log">
+    {% for day in log %}<div class="day">{{ day.label }}</div><ul class="timeline">{% for d in day['items'] %}{{ tl_item(d) }}{% endfor %}</ul>
+    {% else %}<p class="empty">{{ 'Nothing matches these filters.' if chosen or w.month or w.period != 'all' or action else 'No decisions yet. Every control you use is recorded here with its reason.' }}</p>{% endfor %}
+    <p class="empty kind-none" hidden>No decisions of this kind in this period.</p>
+    {% if total >= 500 %}<p class="faint" style="font-size:12px;margin:10px 0 0">Showing the latest 500. Export decisions.csv for all of them.</p>{% endif %}
+  </section>
+</div>
+
+<p class="muted rec-foot">Amounts are in each instrument's quote currency (USD for */USD instruments). Pound values and UK capital gains are not included yet.</p>
+{% endblock %}
+{% block scripts %}
+<script src="/static/console.js"></script>
+<script>
+Console.tabs();
+(() => {
+  // The filters keep the tab you are on.
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("a[data-keep-hash]");
+    if (a && location.hash) a.href = a.href.split("#")[0] + location.hash;
+  });
+  const form = document.getElementById("rec-filter");
+  form.querySelector("select").addEventListener("change", () => { form.action = "/records" + location.hash; form.submit(); });
+  // Kind chips: show only that kind of decision; a day with none left hides its heading.
+  const log = document.querySelector(".rec-log"), none = log.querySelector(".kind-none");
+  document.querySelectorAll(".kind-filter button").forEach((b) => b.addEventListener("click", () => {
+    const k = b.dataset.kind, want = k === "startstop" ? ["started", "stopped"] : [k];
+    document.querySelectorAll(".kind-filter button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    let any = false;
+    log.querySelectorAll("ul.timeline").forEach((ul) => {
+      let shown = 0;
+      ul.querySelectorAll(".tl").forEach((li) => { const on = k === "all" || want.includes(li.dataset.kind); li.hidden = !on; shown += on; });
+      ul.hidden = !shown; ul.previousElementSibling.hidden = !shown; any = any || shown > 0;
+    });
+    none.hidden = any || !log.querySelector(".tl");
+  }));
+  // Close the Export menu on a click elsewhere or Esc.
+  const menu = document.querySelector(".export-menu");
+  document.addEventListener("click", (e) => { if (!menu.contains(e.target)) menu.open = false; });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu.open = false; });
+})();
+</script>
+{% endblock %}

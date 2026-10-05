@@ -1527,7 +1527,7 @@ def test_raw_labels_read_as_words(client):
     store.event("btc-test", "warning", "maker_fill_above_tape", "Post-only order O-1 has filled more")
     page = c.get("/decisions", auth=AUTH).text
     assert "<strong>Moved account</strong>" in page and "<strong>Changed settings</strong>" in page
-    assert '<option value="move_account" >Moved account</option>' in page
+    assert 'data-kind="changed"' in page  # both drawn as settings changes in the Records log
     assert "Move_account" not in page and "Change_settings" not in page
     assert "Maker fill ahead of the tape" in c.get("/alerts", auth=AUTH).text
 
