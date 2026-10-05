@@ -8,6 +8,7 @@ engine's versions to floating-point precision at any period both accept (tests/t
 
 from __future__ import annotations
 
+import copy
 from collections import deque
 
 from nautilus_trader.model import Bar
@@ -133,3 +134,11 @@ class Rsi:
 
     def handle_bar(self, bar) -> None:
         self.update_raw(bar.close.as_double())
+
+    def peek(self, close: float) -> float | None:
+        """The value this RSI would read if `close` closed the next bar, worked out on a copy so the RSI
+        itself is untouched: the forming candle's value for display, never for a decision. None until the
+        copy has enough bars."""
+        probe = copy.deepcopy(self)
+        probe.update_raw(close)
+        return probe.value if probe.initialized else None

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from nautilus_trader.model import Bar
 
-from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.indicators import Rsi, settle_bars
 
 SPEC = IdeaSpec(
@@ -71,23 +71,66 @@ class RsiBands(LongFlatStrategy):
     def update_indicators(self, bar: Bar) -> None:
         self.rsi.handle_bar(bar)
 
+    def _entry_rule(self, side: int, rsi: float) -> Condition:
+        """The band that opens `side` from flat: RSI at or below long_entry, or at or above short_entry."""
+        c = self.c
+        if side == 1:
+            return Condition.check(f"RSI({c.rsi_period}) at or below {c.long_entry:g}", rsi, "<=", c.long_entry,
+                                   note="opens the long leg")
+        return Condition.check(f"RSI({c.rsi_period}) at or above {c.short_entry:g}", rsi, ">=", c.short_entry,
+                               note="opens the short leg")
+
+    def _exit_rule(self, leg: int, rsi: float) -> Condition:
+        """The band that ends the leg the rules are on: RSI back up to long_exit, or down to short_exit."""
+        c = self.c
+        if leg == 1:
+            return Condition.check(f"RSI({c.rsi_period}) at or above {c.long_exit:g}", rsi, ">=", c.long_exit,
+                                   exit=True, note="ends the long leg")
+        return Condition.check(f"RSI({c.rsi_period}) at or below {c.short_exit:g}", rsi, "<=", c.short_exit,
+                               exit=True, note="ends the short leg")
+
     def target_side(self, rsi: float) -> int:
-        """The side the rules want from this RSI: +1 long, -1 short, 0 flat."""
+        """The side the rules want from this RSI: +1 long, -1 short, 0 flat. Decided by the same rules
+        conditions() shows on the Signals tab."""
         c, was = self.c, self._side
-        if self._side == 1 and rsi >= c.long_exit:
+        if self._side == 1 and self._exit_rule(1, rsi).met:
             self._side, self._why = 0, (f"RSI {rsi:.1f} reached {c.long_exit:g}: the long leg ends", {})
-        elif self._side == -1 and rsi <= c.short_exit:
+        elif self._side == -1 and self._exit_rule(-1, rsi).met:
             self._side, self._why = 0, (f"RSI {rsi:.1f} fell to {c.short_exit:g}: the short leg ends", {})
         if self._side == 0:
-            if rsi <= c.long_entry:
+            if self._entry_rule(1, rsi).met:
                 self._side, self._why = 1, (f"RSI {rsi:.1f} at or below {c.long_entry:g}: long until it reaches "
                                             f"{c.long_exit:g}", {})
-            elif rsi >= c.short_entry:
+            elif self._entry_rule(-1, rsi).met:
                 self._side, self._why = -1, (f"RSI {rsi:.1f} at or above {c.short_entry:g}: short until it falls to "
                                              f"{c.short_exit:g}", {})
             elif was == 0:
                 self._why = (f"RSI {rsi:.1f} between {c.long_entry:g} and {c.short_entry:g}: no position", {})
         return self._side
+
+    def conditions(self, side: int, price: float | None = None) -> list[Condition]:
+        """The rules target_side() applies for `side` on this bar: on that leg, the band that ends it;
+        otherwise the band that opens it, after the band that ends the other leg when one is on. With
+        `price`, on the forming candle's RSI, worked out on a copy (Rsi.peek)."""
+        if price is None:
+            rsi = self.rsi.value if self.rsi.initialized else None
+        else:
+            rsi = self.rsi.peek(price)
+        if rsi is None:
+            return []
+        leg = self._side
+        if leg == side:
+            return [self._exit_rule(side, rsi)]
+        rows = []
+        if leg == -side:
+            end = self._exit_rule(leg, rsi)
+            rows.append(Condition(end.name, end.value, end.threshold, end.op, end.met, note=end.note))
+        rows.append(self._entry_rule(side, rsi))
+        if side == -1 and leg == 0 and self.c.long_entry >= self.c.short_entry:
+            # Overlapping bands: target_side checks the long band first, so a short needs RSI above it.
+            rows.append(Condition.check(f"RSI({self.c.rsi_period}) above {self.c.long_entry:g}", rsi, ">",
+                                        self.c.long_entry, note="the long band is checked first"))
+        return rows
 
     def want_side(self, bar: Bar) -> int | None:
         if not self.rsi.initialized:

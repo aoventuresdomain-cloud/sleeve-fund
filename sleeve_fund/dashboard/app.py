@@ -407,6 +407,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position), reasons=COMMON_REASONS,
                     idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec), s.params),
@@ -1676,6 +1677,102 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
         raise ValueError(f"a {new:.1%} stop is looser than the {working:.1%} the open position works to now: it "
                          f"risks {loss:,.2f} from here{in_r}. Tick \"Accept a looser stop on the open position\" "
                          "to save it")
+
+
+SIGNALS_FRESH_SECONDS = 60  # older than this, the Signals tab waits for the model rather than show old lights
+_OP_WORDS = {"<=": "≤", ">=": "≥", "<": "<", ">": ">"}
+
+
+def _signal_row(c: dict, guard: bool = False) -> dict:
+    """One condition as the Signals tab draws it: value, threshold, distance and the gauge's positions (%).
+    guard: a stop or target, which reads as how far away it is, or hit."""
+    unit, v, t = c.get("unit", "pts"), c.get("value"), c.get("threshold") or 0.0
+    fmt = (lambda n: f"{n:+.2f}%") if unit == "%" else (lambda n: f"{n:.1f}")
+    row = {"name": c["name"], "note": c.get("note", ""), "met": bool(c.get("met")),
+           "threshold": f"{_OP_WORDS.get(c.get('op'), c.get('op'))} {fmt(t)}", "value": "–", "distance": "", "gauge": None}
+    if v is None:
+        row["distance"] = "met" if row["met"] else "not yet"
+        return row
+    row["value"] = fmt(v)
+    gap = abs(v - t)
+    gap_words = f"{gap:.2f}%" if unit == "%" else f"{gap:.1f} pts"
+    if guard:
+        row["distance"] = "hit · exits at once" if row["met"] else f"{gap_words} away"
+    else:
+        row["distance"] = f"met · {gap_words} inside" if row["met"] else f"{gap_words} to go"
+    lo, hi = c.get("gauge_min"), c.get("gauge_max")
+    if lo is not None and hi is not None and hi > lo:
+        at = lambda n: round(min(max((n - lo) / (hi - lo), 0.0), 1.0) * 100, 2)  # noqa: E731
+        tick = at(t)
+        below = c.get("op") in ("<=", "<")
+        row["gauge"] = {"tick": tick, "dot": at(v), "zone_left": 0.0 if below else tick,
+                        "zone_width": tick if below else round(100 - tick, 2)}
+    return row
+
+
+def _signal_card(side: int, rows: list[dict] | None, guards: list[dict], held: int, flat_why: str) -> dict:
+    """One side's card: its rules (entry, or exit while the model is on that side), the count, and the
+    stop and target while a position on that side is open."""
+    card = {"label": "Long" if side > 0 else "Short", "key": "long" if side > 0 else "short", "flat": flat_why,
+            "rows": [], "exit": False, "met": 0, "total": 0, "all": False, "guards": []}
+    if flat_why:
+        return card
+    card["rows"] = [_signal_row(r) for r in rows or []]
+    card["exit"] = bool(rows) and all(r.get("exit") for r in rows)
+    card["met"] = sum(r["met"] for r in card["rows"])
+    card["total"] = len(card["rows"])
+    card["all"] = card["total"] > 0 and card["met"] == card["total"]
+    if held == side:
+        card["guards"] = [_signal_row(g, guard=True) for g in guards]
+    return card
+
+
+def _signals_view(s, row: dict | None) -> dict:
+    """The strategy page's Signals tab, from the latest conditions its paper process wrote
+    (LongFlatStrategy.signal_state): the long and short cards, the lights for the tab label, and when the
+    model next acts. Display only."""
+    cls = REGISTRY.get(s.strategy, (None,))[0]
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
+    if not view["supported"]:
+        return view
+    if s.desired_state != "running":
+        view["state"] = "stopped"
+        return view
+    if row is None:
+        return view
+    now = utcnow()
+    secs = max(0, int((now - row["ts"]).total_seconds()))
+    view["age"] = f"{secs} s ago" if secs < 60 else f"{secs // 60} min ago" if secs < 3600 else _ago(row["ts"])
+    if secs > SIGNALS_FRESH_SECONDS:
+        view["state"] = "stale"
+        return view
+    p = row["payload"]
+    held = int(p.get("held") or 0)
+    if not markets.is_perp(s.params):
+        short_flat = "held flat on spot"
+    elif not s.params.get("allow_short"):
+        short_flat = "held flat: shorts are off in its settings"
+    else:
+        short_flat = ""
+    view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
+                     _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
+    view["warming"] = not view["cards"][0]["rows"]
+    view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
+    view["state"] = "live"
+    # The model acts at its bar's close: the next one after the last bar it decided on.
+    minutes = int(p.get("bar_minutes") or 1)
+    step = minutes * 60
+    last = (p.get("bar_ts") or 0) / 1e9
+    t = now.timestamp()
+    nxt = last + step * max(1, math.ceil((t - last) / step)) if last else (t // step + 1) * step
+    left = max(0, int(nxt - t))
+    view["close_at"] = int(nxt * 1000)
+    view["close_in"] = f"{left // 3600}:{left // 60 % 60:02d}:{left % 60:02d}" if left >= 3600 else f"{left // 60:02d}:{left % 60:02d}"
+    view["every"] = ("daily" if minutes == 1440 else f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-minute")
+    return view
 
 
 def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:

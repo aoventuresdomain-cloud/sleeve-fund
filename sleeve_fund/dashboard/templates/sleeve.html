@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
 {% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
+{% from "_signals.html" import signals_tab, signals_panel %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
@@ -54,6 +55,7 @@
 {# The strategy's own desk: headline figures stay on top, the detail sits in tabs. Without JavaScript every tab shows, one after another. #}
 <nav class="tabs desk-tabs" role="tablist" aria-label="Strategy views" data-tabs>
   <a href="#overview" role="tab" data-tab="overview">Overview</a>
+  {% if signals %}{{ signals_tab(signals) }}{% endif %}
   <a href="#positions" role="tab" data-tab="positions">Position<span class="n">{{ 1 if x.qty else 0 }}</span></a>
   <a href="#trades" role="tab" data-tab="trades">Trades<span class="n">{{ trips|length }}</span></a>
   <a href="#orders" role="tab" data-tab="orders">Orders<span class="n">{{ orders|length }}</span></a>
@@ -82,6 +84,8 @@
   </details>
 </section>{% endif %}
 </div>
+
+{% if signals %}{{ signals_panel(signals) }}{% endif %}
 
 <div class="tab-panel" id="tab-positions" role="tabpanel" data-panel="positions">
 {# One card per question a PM asks of a position: how big, at what price, where it exits, what it has made. #}

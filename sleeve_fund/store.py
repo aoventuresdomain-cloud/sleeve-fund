@@ -331,6 +331,16 @@ backtests_t = Table(
     Column("result", Text, nullable=False),
     Index("backtests_key", "key", "created_at"),
 )
+# What each paper strategy's model reads on the forming candle: its long and short rules, met or not, for the
+# strategy page's Signals tab. One row per strategy, replaced at most every few seconds by its process; display
+# only. JSON text, as backtests.result. A new table: CREATE TABLE.
+signal_state_t = Table(
+    "signal_state",
+    metadata,
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
+    Column("ts", TS, nullable=False),
+    Column("payload", Text, nullable=False),
+)
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -815,6 +825,19 @@ class Store:
         with self.engine.connect() as c:
             rows = _rows(c.execute(q.order_by(fee_schedules_t.c.fetched_at.desc(), fee_schedules_t.c.id.desc()).limit(1)))
         return rows[0] if rows else None
+
+    def set_signal_state(self, sleeve: str, payload: dict, ts: datetime | None = None) -> None:
+        """Paper only: the model's conditions on the forming candle, replacing the last ones (Signals tab)."""
+        with self.engine.begin() as c:
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == sleeve))
+            c.execute(insert(signal_state_t).values(sleeve=sleeve, ts=ts or utcnow(), payload=json.dumps(payload)))
+
+    def signal_state(self, sleeve: str) -> dict | None:
+        """The latest conditions the strategy's process wrote, as {"ts": ..., "payload": {...}}, or None."""
+        with self.engine.connect() as c:
+            row = c.execute(select(signal_state_t.c.ts, signal_state_t.c.payload)
+                            .where(signal_state_t.c.sleeve == sleeve)).first()
+        return None if row is None else {"ts": _aware(row[0]), "payload": json.loads(row[1])}
 
     def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None) -> None:
         if level not in LEVELS:
