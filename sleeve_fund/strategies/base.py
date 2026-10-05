@@ -1724,6 +1724,13 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "strategy's equity", ts=self.runtime.now())
 
+    def _wiped_out_why(self) -> str:
+        covered = sum(a for _, a in self.insurance_log)
+        if not covered and self.runtime is not None:  # since a restart: the journal has it
+            covered = self.runtime.store.insurance_total(self.runtime.name)
+        why = "wiped out: a gap took the price past the bankruptcy price, so equity is zero"
+        return why + (f" and the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
+
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
         take it), or comes within the risk profile's minimum distance of it (cut back before the venue
@@ -1866,7 +1873,12 @@ class LongFlatStrategy(Strategy):
             # A perp position valued at or below zero equity is past its liquidation price (a gap the guards
             # couldn't trade inside), not a book that can't be valued: liquidate it, and the risk check halts.
             underwater = self._margin and qty != 0 and price > 0 and equity <= 0
-            if price <= 0 or (equity <= 0 and not underwater):
+            # Flat with nothing left after a gap past the bankruptcy price (the insurance fund took the rest): a
+            # strategy that was wiped out, not one that can't be valued. It is marked at zero and halted
+            # (review round 12, B12-1: it kept its last mark before the gap and stayed running).
+            ruined = (self._margin and qty == 0 and price > 0 and equity <= 0
+                      and self._account() is not None and self.instrument is not None)
+            if price <= 0 or (equity <= 0 and not underwater and not ruined):
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
                 self.runtime.store.heartbeat(self.runtime.name)
                 if not self._mark_warned:
@@ -1893,8 +1905,13 @@ class LongFlatStrategy(Strategy):
                 if underwater or (liq is not None and (probe <= liq if qty > 0 else probe >= liq)):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
+            wiped = None
+            if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
+                wiped = self._wiped_out_why()
+                equity = 0.0
+                cash = 0.0 if ruined else cash
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
-                                 busy=bool(self._working())) == "flatten":
+                                 busy=bool(self._working()), ruined=wiped) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
