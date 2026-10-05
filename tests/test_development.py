@@ -153,10 +153,11 @@ def test_every_venue_s_history_is_on_the_page_for_the_study_to_switch_in_place(c
     page = c.get("/research", auth=AUTH).text
     data = json.loads(re.search(r'<script type="application/json" id="study-data">(.*?)</script>', page, re.S).group(1))
     held = data["venues"]["binance"]["held"]["BTC/USDT"]
-    assert held["text"] == "77.3 years stored · current" and held["tone"] == "running" and held["days"] > 28_000
-    assert data["venues"]["kraken"]["held"]["ETH/USD"]["text"] == "Catching up, from 01 Jan 2016"
+    # The item 10 badge: coverage with no candles behind it reads as one gap, which holds a study back.
+    assert held["text"] == "1 gap · backtests wait until filled" and held["tone"] == "halted" and held["days"] > 28_000
+    assert data["venues"]["kraken"]["held"]["ETH/USD"]["text"] == "1 gap · backtests wait until filled"
     assert data["plans"]["rsi_cross"]["values"]["minutes"] == 15 and data["plans"]["trend_filter"]["variants"] == 11
-    assert '<span class="chip running" id="hist-chip">77.3 years stored · current</span>' in page
+    assert '<span class="chip halted" id="hist-chip">1 gap · backtests wait until filled</span>' in page
     # Data coverage: both venues, as perpetual or spot (no venue names), read-only.
     assert re.search(r'ETH/USD</td>\s*<td[^>]*>spot</td>', page)
     assert re.search(r'BTC/USDT</td>\s*<td[^>]*>perpetual</td>', page)

@@ -17,9 +17,7 @@
 </div>
 {%- endmacro %}
 
-{% macro signals_panel(sig) -%}
-<div class="tab-panel" id="tab-signals" role="tabpanel" data-panel="signals">
-<div data-live="signals">
+{% macro _board(sig, pre) -%}
 {% if not sig.supported %}
   <section class="panel sig-empty"><p class="muted">This model doesn't list its conditions yet.</p></section>
 {% elif sig.state == 'stopped' %}
@@ -29,8 +27,8 @@
 {% else %}
   <div class="sig-board">
   {% for c in sig.cards %}
-    <section class="panel sig-card sig-{{ c.key }}{% if c.flat %} is-flat{% endif %}" aria-labelledby="sig-{{ c.key }}-h">
-      <div class="sig-head"><h2 id="sig-{{ c.key }}-h">{{ c.label }}{% if c.exit %} <span class="faint">· Exit conditions</span>{% endif %}</h2>
+    <section class="panel sig-card sig-{{ c.key }}{% if c.flat %} is-flat{% endif %}" aria-labelledby="{{ pre }}sig-{{ c.key }}-h">
+      <div class="sig-head"><h2 id="{{ pre }}sig-{{ c.key }}-h">{{ c.label }}{% if c.exit %} <span class="faint">· Exit conditions</span>{% endif %}</h2>
         {% if c.flat %}<span class="sig-state">{{ c.flat }}</span>
         {% elif c.total %}<span class="sig-state{{ ' ready' if c.all }}">{% if c.all %}All met · acts at close{% else %}{{ c.met }} of {{ c.total }} met{% endif %}</span>{% endif %}</div>
       {% if not c.flat %}
@@ -44,6 +42,19 @@
   </div>
   <p class="sig-timing">Lights are live · model acts at the {{ sig.every }} close in <b data-close-at="{{ sig.close_at }}">{{ sig.close_in }}</b> <span class="faint">· reading {{ sig.age }}</span></p>
 {% endif %}
+{%- endmacro %}
+
+{# The Overview's right-hand column: the same lamps, beside the price chart (UI v2). #}
+{% macro signals_side(sig) -%}
+<aside class="ov-signals" aria-label="Signals">
+<div data-live="sig-side">{{ _board(sig, "side-") }}</div>
+</aside>
+{%- endmacro %}
+
+{% macro signals_panel(sig) -%}
+<div class="tab-panel" id="tab-signals" role="tabpanel" data-panel="signals">
+<div data-live="signals">
+{{ _board(sig, "") }}
 </div>
 </div>
 <script>

@@ -1,0 +1,68 @@
+{# Open positions, one table for the Portfolio and the strategy page (UI v2 item 5): the same columns in the same
+   order, Strategy first on the Portfolio only. Rows are trading.book_positions rows. No percentages in cells; a
+   distance or share goes in the cell's title. Margin, liquidation and risk to stop read the view's figures. #}
+{% from "_macros.html" import money_signed %}
+
+{% macro _lev(p) -%}
+{%- set lev = p.leverage if p.leverage is defined and p.leverage is not none else (p.perp.leverage if p.perp else none) -%}
+{%- if p.perp -%}{% if lev %}<span class="lev">{{ '%g'|format((lev * 10)|round / 10) }}×</span>{% else %}<span class="faint">–</span>{% endif %}
+{%- else %}<span class="lev" title="Spot: no leverage">1×</span>{% endif -%}
+{%- endmacro %}
+
+{% macro _liq(p) -%}
+{%- set liq = p.liq_px if p.liq_px is defined else (p.perp.liq_px if p.perp else none) -%}
+{%- set to_liq = p.to_liq if p.to_liq is defined else (p.perp.to_liq if p.perp else none) -%}
+{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>
+{%- elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>
+{%- else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif -%}
+{%- endmacro %}
+
+{% macro _risk(p) -%}
+{%- if not p.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>
+{%- elif p.risk_to_stop is defined and p.risk_to_stop is not none %}{{ p.risk_to_stop|money }}
+{%- else %}<span class="faint" title="Waiting on the corrected open-risk figures">–</span>{% endif -%}
+{%- endmacro %}
+
+{% macro _close(p, close_id, closable) -%}
+<button type="button" class="quiet close-btn" data-open="{{ close_id or 'dlg-close-' ~ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not closable %}disabled{% endif %}>Close</button>
+{%- endmacro %}
+
+{% macro positions_table(positions, show_strategy=True, close_id=None, closable=True) %}
+{% set rows = positions.rows %}
+<table class="book-pos">
+  <thead><tr>{% if show_strategy %}<th>Strategy</th>{% endif %}<th>Instrument</th><th>Side</th><th class="num">Leverage</th><th class="num">Size</th><th class="num">Notional</th>
+    <th class="num">Entry</th><th class="num">Mark</th><th class="num">SL</th><th class="num">TP</th><th class="num">Liq. price</th>
+    <th class="num">Unrealised</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th><th class="num">Fees</th><th><span class="sr-only">Close</span></th></tr></thead>
+  <tbody>{% for p in rows %}{% set base = p.pair.split('/')[0] %}
+  <tr>{% if show_strategy %}<td class="cell-name"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a></td>{% endif %}
+    <td>{{ p.pair }}{% if p.perp %} <span class="faint">perp</span>{% endif %}</td>
+    <td><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span></td>
+    <td class="num">{{ _lev(p) }}</td>
+    <td class="num">{{ p.qty|abs|qty }} {{ base }}</td>
+    <td class="num">{{ p.value|abs|money }}</td>
+    <td class="num">{{ p.entry_px|px }}</td>
+    <td class="num">{{ p.price|px }}</td>
+    <td class="num">{% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn" title="No stop-loss on this position">none</span>{% endif %}</td>
+    <td class="num">{% if p.target_px %}{{ p.target_px|px }}{% else %}<span class="faint" title="No take-profit on this position">none</span>{% endif %}</td>
+    <td class="num">{{ _liq(p) }}</td>
+    <td class="num">{{ money_signed(p.unrealised) }}</td>
+    <td class="num">{{ _risk(p) }}</td>
+    <td class="num">{{ p.fees|money }}</td>
+    <td class="close-cell">{{ _close(p, close_id, closable) }}</td></tr>
+  {% endfor %}</tbody>
+  {% if rows|length > 1 %}<tfoot><tr><th scope="row" colspan="{{ 5 if show_strategy else 4 }}">Total, {{ rows|length }} positions</th>
+    <td class="num">{{ positions.notional|money }}</td><td colspan="5"></td>
+    <td class="num">{{ money_signed(positions.unrealised) }}</td>
+    <td class="num">{% if positions.open_risk is defined %}<span{% if positions.unbounded %} class="warn" title="{{ positions.unbounded|join(', ') }}: no stop, so unbounded"{% endif %}>{{ positions.open_risk|money }}{{ '+' if positions.unbounded }}</span>{% else %}<span class="faint" title="Waiting on the corrected figure">–</span>{% endif %}</td>
+    <td class="num">{{ positions.fees|money }}</td><td></td></tr></tfoot>{% endif %}
+</table>
+{# Phones: a card per position. #}
+<ul class="pos-cards">{% for p in rows %}{% set base = p.pair.split('/')[0] %}
+  <li><div class="r"><span><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span> <strong>{{ p.pair }}</strong> {{ _lev(p) }}</span>
+      {{ _close(p, close_id, closable) }}</div>
+    <div class="m">{% if show_strategy %}<a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a> · {% endif %}{{ p.qty|abs|qty }} {{ base }} · notional {{ p.value|abs|money }} · entry {{ p.entry_px|px }} · mark {{ p.price|px }}</div>
+    <div class="m">SL {% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn">none</span>{% endif %} · TP {% if p.target_px %}{{ p.target_px|px }}{% else %}none{% endif %}{% if p.perp %} · liq. price {{ _liq(p) }}{% endif %}</div>
+    <div class="g3"><span>Unrealised<b>{{ money_signed(p.unrealised) }}</b></span><span>Risk to stop<b>{{ _risk(p) }}</b></span><span>Fees<b>{{ p.fees|money }}</b></span></div></li>
+  {% endfor %}
+</ul>
+{% endmacro %}

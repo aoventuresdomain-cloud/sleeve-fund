@@ -351,6 +351,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
     return {
         "rows": rows,
         "unrealised": sum(r["unrealised"] for r in rows),
+        "notional": sum(abs(r["value"]) for r in rows),
         "realised": sum(r["realised"] for r in rows),
         "fees": sum(r["fees"] for r in rows),
         **open_risk(rows),

@@ -15,10 +15,23 @@ services:
       interval: 5s
       retries: 20
 
+  # Runs once per deploy, before anything that uses the database: applies new schema migrations
+  # (python -m sleeve_fund.schema migrate). An existing database without migration history is stamped,
+  # never rebuilt, and only if it matches the code; if it doesn't, nothing is changed and an error event
+  # lists the drift (re-checked after every deploy). If a migration fails it exits non-zero, the services below don't start on the new
+  # code and the deploy fails. The backup keeps running regardless.
+  migrate:
+    build: .
+    restart: "no"
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+    command: python -m sleeve_fund.schema migrate
+
   supervisor:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history  # warm-up for sleeves on bars built from live trades
@@ -59,7 +72,8 @@ services:
   history:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
+                  volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
@@ -67,15 +81,20 @@ services:
     command: python -m sleeve_fund.history run
 
   # The same store for Binance USD-M perpetuals (public data, no key): prices and settled funding.
-  history-binance:
+  # The Binance market data hub (v2 P1-1, sleeve_fund/hub): one public websocket relaying trades, quotes and
+  # 1-minute bars to every client on port 7700 of this network, and handing closed bars to the history store.
+  # The venue's one history writer: it also runs the store's REST backfill and funding refresh (it replaces
+  # history-binance). Public data only: it refuses to start with any venue credential.
+  hub-binance:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
+                  volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
     volumes: [history:/data/history]
-    command: python -m sleeve_fund.history run --venue binance
+    command: python -m sleeve_fund.hub run --venue binance --port 7700
 
   # Copies the fills of strategies with demo_mirror = true to a demo account (sleeve_fund/mirror.py): Bybit
   # Demo Trading for strategies on Binance's USDT perpetuals, the Deribit TESTNET for the rest. The only
@@ -84,7 +103,7 @@ services:
   mirror:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       DEMO_MIRROR: ${DEMO_MIRROR:-}
@@ -100,7 +119,8 @@ services:
     # The pages plus one backtest at a time, each in its own process (5 years of 1-minute bars
     # peaked at 0.54 GB). A run past this is stopped and says so; the pages carry on.
     mem_limit: 1536m
-    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
+                  volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
