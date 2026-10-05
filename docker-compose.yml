@@ -26,6 +26,7 @@ services:
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       HEALTHCHECK_PING_URL: ${HEALTHCHECK_PING_URL:-}
       BACKUP_DIR: /data/backups  # read only: a late or failed backup raises an alert
+      CLOCK_SERVER: time.aws.com  # the server clock is checked against it; drift past 250 ms raises an alert
     volumes: [history:/data/history:ro, backups:/data/backups:ro]
     env_file:
       - path: kraken.env
