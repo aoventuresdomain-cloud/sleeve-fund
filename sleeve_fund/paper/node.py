@@ -67,8 +67,8 @@ def history_loader(venue: str, pair: str, store=None, recent=None):
         elif (lag := pd.Timestamp.now(tz="UTC") - cov.last) > HISTORY_MAX_LAG:
             why = f"the stored history for {pair} is {lag.total_seconds() / 3600:.0f} hours old"
         if why is not None:
-            # Without usable stored bars, warm up on the venue's own recent candles (Binance serves 1,500, Kraken
-            # 720), so after a restart the model's indicators are ready and settled on its first live bar rather
+            # Without usable stored bars, warm up on the venue's own recent candles (one request serves 720 to
+            # 1,500 candles), so after a restart the model's indicators are ready and settled on its first live bar rather
             # than waiting out their look-back with no exits (PM, 5 Oct 2026: a long that should have exited).
             df = _recent_closed(recent, pair, minutes, why) if recent is not None else None
             if df is None or not len(df):
