@@ -121,3 +121,46 @@ def test_a_backtest_charges_the_rates_the_venue_settled(tmp_path, monkeypatch):
     assert any("(0.0300%)" in m for m in paid) and any("(0.0100%)" in m for m in paid)
     fallback = [e for e in r.journal.events_ if e["kind"] == "funding_fallback"]
     assert len(fallback) == 1 and "0.0100% baseline" in fallback[0]["message"]
+
+
+@pytest.fixture
+def offline_binance(tmp_path, monkeypatch):
+    """Binance's contract limits and funding records without the network (CI runs where Binance is blocked)."""
+    b = venue("binance")
+    monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
+    monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
+    return b
+
+
+def test_a_study_on_the_venue_trades_its_perpetual_long_only(tmp_path, offline_binance):
+    """A perpetual venue has no spot, so a G1 study there trades the perpetual, and its tear sheet says so."""
+    from test_research import _stored_minutes
+
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+
+    hist = HistoryStore(tmp_path / "hist")
+    hist.append("BINANCE", "BTC/USDT", _stored_minutes(130), cursor="x")
+    req = StudyRequest(strategy="buy_and_hold", pair="BTC/USDT", venue="binance", minutes=240,
+                       train_days=60, test_days=30, holdout_days=30)
+    sheet = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts", history=hist)
+    text = sheet.read_text()
+    assert sheet.name.startswith("buy_and_hold_binance-btcusdt-store-240m_")
+    assert "lists perpetuals only, so every run traded the perpetual, long only" in text
+    assert "exits: the signal only" in text and "Exits on top of the signal" not in text
+    with pytest.raises(ValueError, match="no stored Binance USD-M perpetuals history for ETH/USDT"):
+        run_store_study(StudyRequest(strategy="buy_and_hold", pair="ETH/USDT", venue="binance"), history=hist)
+
+
+def test_a_strategy_keeps_its_venue_and_a_backtest_prune_takes_it_away():
+    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.store import Store
+
+    store = Store("sqlite://")
+    store.create_sleeve(name="bn", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=1000, params={"market": "perp"}, venue="binance")
+    store.create_sleeve(name="kr", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=1000)
+    assert store.sleeve("bn").venue == "BINANCE" and store.sleeve("kr").venue is None
+    assert {s.name: s.venue for s in store.sleeves()} == {"bn": "BINANCE", "kr": None}
+    assert from_store(store.sleeve("bn")).venue == "BINANCE" and from_store(store.sleeve("kr")).venue == "KRAKEN"

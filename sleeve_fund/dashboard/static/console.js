@@ -932,10 +932,37 @@ window.Console = (() => {
     return box.exitDescribe;
   }
 
+  // The venue: its instruments are the ones suggested, and a perpetual venue lists no spot, so its strategies
+  // trade its own perpetual. A page showing one venue's stored history reloads on another.
+  function venueField(form) {
+    const sel = form && form.elements.venue;
+    if (!sel) return;
+    if (sel.hasAttribute("data-reload")) {
+      sel.addEventListener("change", () => { location.href = `${location.pathname}?venue=${encodeURIComponent(sel.value)}`; });
+      return;
+    }
+    const list = document.getElementById("pairs"), inst = form.elements.instrument, mk = form.elements.market;
+    const perpOpt = mk ? [...mk.options].find((o) => o.value === "perp") : null;
+    if (perpOpt) perpOpt.dataset.label = perpOpt.textContent;
+    const sync = (first) => {
+      const opt = sel.selectedOptions[0];
+      if (!opt) return;
+      const pairs = (opt.dataset.pairs || "").split(",").filter(Boolean), perp = !!opt.dataset.perp;
+      if (list) list.replaceChildren(...pairs.map((p) => Object.assign(document.createElement("option"), {value: p})));
+      if (!first && inst && pairs.length && !pairs.includes(inst.value.trim().toUpperCase())) inst.value = pairs[0];
+      if (!mk) return;
+      [...mk.options].forEach((o) => { o.disabled = perp && o.value !== "perp"; });
+      if (perpOpt) perpOpt.textContent = perp ? `${opt.textContent.split(":")[0]}: the venue's own fees and settled funding` : perpOpt.dataset.label;
+      if (perp && mk.value !== "perp") { mk.value = "perp"; mk.dispatchEvent(new Event("change")); }
+    };
+    sel.addEventListener("change", () => sync(false)); sync(true);
+  }
+
   // Order type: the wait only matters for maker-first orders, so it shows only then.
   function orderFields(formId) {
     const form = document.getElementById(formId);
     exitFields(form);
+    venueField(form);
     if (form && form.elements.market) {  // shorts and the testnet mirror only on a perpetual
       const perp = [...form.querySelectorAll("[data-when-perp]")];
       const syncMarket = () => {

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
+{% from "_fields.html" import venue_field, pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
 {% block title %}New strategy · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -16,6 +16,7 @@
     <fieldset class="panel step">
       <legend>1. Market</legend>
       <div class="grid2">
+        {{ venue_field(pre) }}
         {{ pair_field(instruments, pre) }}
         <div class="field"><label for="bar_spec">Decision interval</label><select id="bar_spec" {{ 'disabled' if from_bt else 'name=bar_spec' }}>{% for b in bar_specs %}<option value="{{ b }}" {{ 'selected' if b == pre.get('bar_spec', '1-HOUR-LAST-INTERNAL') }}>{{ bar_label(b) }}</option>{% endfor %}</select>{% if from_bt %}<p class="hint">As backtested.</p>{% endif %}</div>
       </div>

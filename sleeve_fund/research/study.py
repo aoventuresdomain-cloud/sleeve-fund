@@ -17,6 +17,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.instruments import pair_of
+from sleeve_fund.markets import PERP
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -197,6 +198,11 @@ def run_study(
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
+    from sleeve_fund.venues import VENUES
+
+    profile = VENUES.get(str(instrument.id.venue))
+    # A venue that lists perpetuals only has no spot: every run, the benchmark too, holds its perpetual.
+    market = {"market": PERP} if profile is not None and profile.perpetual else {}
     if half_spread is None:
         from sleeve_fund.venues import venue as venue_profile
 
@@ -218,6 +224,7 @@ def run_study(
         if progress is not None:
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
+        params = {**params, **market}
         if not benchmark:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
@@ -343,6 +350,9 @@ def run_study(
         result.notes.append(
             f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
+    if market:
+        result.notes.append(f"{profile.label} lists perpetuals only, so every run traded the perpetual, long only, "
+                            "paying the funding the venue settled.")
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + _exit_words(exits)
