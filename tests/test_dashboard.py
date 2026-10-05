@@ -1187,7 +1187,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     # Missing history is said on the page at once, with the way to get it, and starts no job (R8-M6).
     r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 200 and "there is no stored Kraken spot history for SOL/USD yet" in r.text
-    assert 'name="instrument" value="SOL/USD"><button>Collect SOL/USD history</button>' in r.text
+    assert 'name="instrument" value="SOL/USD"><input type="hidden" name="venue" value="kraken"><button>Collect SOL/USD history</button>' in r.text
 
 
 def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypatch):
