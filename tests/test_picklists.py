@@ -58,7 +58,7 @@ def test_every_venues_instruments_come_grouped_with_a_history_badge_and_no_venue
     assert groups == sorted(groups, key=lambda g: g != "Perpetuals")  # perpetuals first, then spot
     assert {(o["value"], o["venue"]) for o in opts} >= {("PEPE/USDT", "binance"), ("PEPE/USD", "kraken")}
     btc = next(o for o in opts if o["value"] == "BTC/USDT")
-    assert btc["label"] == "BTC/USDT perpetual" and btc["stored"] and "stored · current" in btc["badge"]
+    assert btc["label"] == "BTC/USDT perpetual" and btc["stored"] and btc["badge"] == "1 gap · backtests wait until filled"
     eth = next(o for o in opts if o["value"] == "ETH/USD")
     assert eth["label"] == "ETH/USD spot" and eth["badge"] == "not stored yet"
     assert not any(re.search("binance|kraken", o["label"] + o["badge"], re.IGNORECASE) for o in opts)

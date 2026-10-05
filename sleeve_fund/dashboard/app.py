@@ -770,7 +770,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
 
-    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None, collect: str = "",
+    def research_page(request: Request, job=None, error: str = "", pre: dict | None = None,
                       notice: str = "", tab: str | None = None):
         """Research: Development (a plan per model and the study form), Results and History. Every venue's
         stored history is on the page, so a study's venue changes in place (no reload)."""
@@ -793,7 +793,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         for v in venue_choices():
             vp = _research_venue(v["key"])
             stored = _stored_history(st(), vp)
-            stored_all += [dict(h, venue=vp.label, venue_key=v["key"], perpetual=vp.perpetual) for h in stored]
+            stored_all += [dict(h, venue=vp.label, venue_key=v["key"], perpetual=vp.perpetual, chip=dev.history_chip(h))
+                           for h in stored]
             venues.append(dict(v, fee=float(resolve_fees(vp.name, st()).fees.taker),
                                suggest=[h["pair"] for h in stored] or _hints(vp.name),
                                held={h["pair"]: dev.history_chip(h) for h in stored}))
@@ -814,7 +815,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                  for v in venues}}
         return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
                     chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
-                    stages=pipeline.STAGES, job=job, error=error, notice=notice, collect=collect,
+                    stages=pipeline.STAGES, job=job, error=error, notice=notice,
                     tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent, fit_text=fit_text,
                     profiles=PROFILES,
                     study_candles=[(m, "1d" if m == 1440 else f"{m // 60}h" if m % 60 == 0 else f"{m}m")
@@ -841,16 +842,21 @@ def create_app(store: Store | None = None) -> FastAPI:
             req.validate()
         except (ValueError, KeyError) as exc:
             return research_page(request, error=str(exc), pre=form)
-        # No history yet: say so now, with the way to get it, rather than from a failed job (R8-M6).
+        from sleeve_fund.dashboard import development as dev
+
+        # No history yet: say so now rather than from a failed job (R8-M6). There is no Collect button (UI v2,
+        # item 10): a study on an instrument not stored yet asks the collector for it itself.
         profile = _research_venue(req.venue)
         held = next((h for h in _stored_history(st(), profile) if h["pair"] == req.pair), None)
         if held is None or held["first"] is None:
-            label = profile.label
-            why = (f"{req.pair}'s history was asked for on {held['requested']:%d %b %Y}; the collector hasn't stored "
-                   "any yet." if held else f"there is no stored {label} history for {req.pair} yet.")
-            return research_page(request, error=why, pre=form, collect="" if held else req.pair)
-        from sleeve_fund.dashboard import development as dev
-
+            if held:
+                why = f"{req.pair}: being filled · the study waits until some is stored."
+            else:
+                try:
+                    why = f"{req.pair}: not stored yet. {_ask_history(profile, req.pair)}"
+                except ValueError as exc:
+                    why = f"{req.pair}: not stored yet, and the collector wasn't asked: {exc}"
+            return research_page(request, error=why, pre=form)
         if why := dev.blocked_by_gaps(req.pair, held["gaps"]):
             return research_page(request, error=why, pre=form)
         jobs = app.state.jobs
@@ -881,43 +887,46 @@ def create_app(store: Store | None = None) -> FastAPI:
         if str(form.get("strategy", "")) in REGISTRY:
             here["strategy"] = str(form["strategy"])
         try:
-            if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
-                raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
-                                 f"like {_hints(profile.name)[0]}")
-            held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
-                        None)
-            if held is not None:
-                return page_(pre=here, notice=(
-                    f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
-                    f"({held['state']}); the collector keeps it current, and a study can run on it now."))
-            if pair in (profile.core_pairs or CORE_PAIRS):
-                # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
-                # a request would change nothing, and its "from five years back" would misstate where it starts.
-                return page_(pre=here, notice=(
-                    f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
-                    "kept current, and this list shows how far it has got."))
-            if profile.minute_loader is None:
-                raise ValueError(f"{profile.label} has no history loader")
-            if profile.check_listed is not None:
-                try:
-                    profile.check_listed(pair)
-                except ValueError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - venue unreachable
-                    # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
-                    # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
-                    logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
-                    raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
-                                     "for; try again when the venue answers") from None
+            notice = _ask_history(profile, pair)
         except ValueError as exc:
             # No button to ask again: the same request would be refused the same way.
             return page_(error=str(exc), pre=here)
+        return page_(pre=here, notice=notice)
+
+    def _ask_history(profile, pair: str) -> str:
+        """Ask the history collector to store an instrument, and say what happened; ValueError when it can't be
+        asked for. From the history request and from a study on an instrument not stored yet."""
+        if not re.fullmatch(r"[A-Z0-9]{1,12}/[A-Z0-9]{2,6}", pair):
+            raise ValueError(f"{pair or 'that'} isn't an instrument: write it as base and quote with a slash, "
+                             f"like {_hints(profile.name)[0]}")
+        held = next((h for h in _stored_history(st(), profile) if h["pair"] == pair and h["first"] is not None),
+                    None)
+        if held is not None:
+            return (f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
+                    f"({held['state']}); the collector keeps it current, and a study can run on it now.")
+        if pair in (profile.core_pairs or CORE_PAIRS):
+            # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
+            # a request would change nothing, and its "from five years back" would misstate where it starts.
+            return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+                    "kept current, and this list shows how far it has got.")
+        if profile.minute_loader is None:
+            raise ValueError(f"{profile.label} has no history loader")
+        if profile.check_listed is not None:
+            try:
+                profile.check_listed(pair)
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - venue unreachable
+                # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
+                # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
+                logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
+                raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                                 "for; try again when the venue answers") from None
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
-        notice = (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
-                  "A study can run once some is stored; this list shows how far it has got."
-                  if new else f"{pair} was already asked for; this list shows how far the collector has got.")
-        return page_(pre=here, notice=notice)
+        return (f"Asked the collector for {pair}: it backfills from {since:%d %b %Y}, then keeps it current. "
+                "A study can run once some is stored; this list shows how far it has got."
+                if new else f"{pair} was already asked for; this list shows how far the collector has got.")
 
     @app.get("/strategies/{name}", response_class=HTMLResponse)
     def strategy_page(request: Request, name: str, _: str = Depends(require_pm)):

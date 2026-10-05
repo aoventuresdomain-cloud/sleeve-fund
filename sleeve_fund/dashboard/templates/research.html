@@ -3,8 +3,7 @@
 {% from "_fields.html" import exit_fields, instrument_field, candle_chips %}
 {% block title %}Development · Multi-Strategy Fund{% endblock %}
 {% macro messages() %}
-  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}{% if collect %}
-    <form method="post" action="/research/history" style="margin:8px 0 0"><input type="hidden" name="instrument" value="{{ collect }}"><input type="hidden" name="venue" value="{{ values.venue }}"><button>Collect {{ collect }} history</button></form>{% endif %}</div>{% endif %}
+  {% if error %}<div class="error-box" role="alert">Couldn't run it: {{ error }}</div>{% endif %}
   {% if notice %}<div class="notice-box" role="status">{{ notice }}</div>{% endif %}
 {% endmacro %}
 {% block content %}
@@ -87,8 +86,7 @@
           {{ instrument_field(values) }}
           {% set held = on_venue.held.get(values.instrument|upper) %}
           <div class="hist-status" aria-live="polite">
-            <span class="chip {{ held.tone if held }}" id="hist-chip">{{ held.text if held else 'Not stored' }}</span>
-            <button type="submit" form="collect-study" class="quiet" id="hist-collect"{% if held %} hidden{% endif %}>Collect</button>
+            <span class="chip {{ held.tone if held }}" id="hist-chip">{{ held.text if held else 'not stored yet' }}</span>
           </div>
         </div>
         <p class="hint"><span id="venue-note">{% if on_venue.perpetual %}A perpetual is studied long only, with the funding it settled.{% else %}Spot is studied long only.{% endif %}</span> A pass is not G1 for a strategy that shorts: those wait for long/short studies.</p>
@@ -127,10 +125,6 @@
     </form>
   </section>
 </div>
-<form id="collect-study" method="post" action="/research/history" hidden>
-  <input type="hidden" name="from" value="study"><input type="hidden" name="strategy" value="{{ chosen.name }}">
-  <input type="hidden" name="venue" value="{{ values.venue }}"><input type="hidden" name="instrument" value="{{ values.instrument }}">
-</form>
 <script type="application/json" id="study-data">{{ study_data|tojson }}</script>
 </div>
 
@@ -160,13 +154,13 @@
   {% if msg_in == 'history' %}<div class="history-msgs">{{ messages() }}</div>{% endif %}
   {% if stored_all %}
   <table class="responsive">
-    <thead><tr><th>Instrument</th><th>Market</th><th>Stored from</th><th>Last candle</th><th>State</th></tr></thead>
+    <thead><tr><th>Instrument</th><th>Market</th><th>Stored from</th><th>Last candle</th><th>History</th></tr></thead>
     <tbody>{% for h in stored_all %}
     <tr><td data-label="Instrument">{{ h.pair }}</td>
       <td data-m="right" class="muted">{{ 'perpetual' if h.perpetual else 'spot' }}</td>
       <td data-label="Stored from">{{ h.first.strftime('%d %b %Y') if h.first else '–' }}</td>
       <td data-label="Last candle">{{ h.last.strftime('%d %b %Y %H:%M') if h.last else '–' }}</td>
-      <td data-label="State">{% if h.state == 'current' %}<span class="chip running">Stored, current</span>{% elif h.state == 'catching up' %}<span class="chip paused">Being filled</span>{% else %}<span class="chip stopped">Not stored yet</span>{% endif %}</td></tr>
+      <td data-label="History"><span class="chip {{ h.chip.tone }}">{{ h.chip.text }}</span></td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="muted" style="padding:0 18px 16px">No instrument has stored history yet.</p>{% endif %}
@@ -187,7 +181,7 @@ Console.orderFields("study-form");
   const data = JSON.parse(document.getElementById("study-data").textContent);
   const P = data.plans, V = data.venues;
   const $ = (id) => document.getElementById(id);
-  const dev = $("dev"), form = $("study-form"), inst = form.elements.instrument, collect = $("collect-study");
+  const dev = $("dev"), form = $("study-form"), inst = form.elements.instrument;
   const box = $("use_holdout"), spent = JSON.parse(box.dataset.spent), holdHint = $("holdout-hint"), holdPlain = holdHint.textContent;
   const exitBox = form.querySelector(".exit-fields");
   const PAIR = /^[A-Z0-9]{1,12}\/[A-Z0-9]{2,6}$/;
@@ -224,11 +218,9 @@ Console.orderFields("study-form");
 
   // The history chip beside the instrument, from what the page holds for every venue: no reload.
   const histChip = () => {
-    const v = V[venue()], pair = inst.value.trim().toUpperCase(), h = v.held[pair], chip = $("hist-chip"), btn = $("hist-collect");
+    const v = V[venue()], pair = inst.value.trim().toUpperCase(), h = v.held[pair], chip = $("hist-chip");
     chip.className = "chip " + (h ? h.tone : "");
-    chip.textContent = h ? h.text : PAIR.test(pair) ? "Not stored" : "Pick an instrument";
-    btn.hidden = !!h || !PAIR.test(pair);
-    collect.elements.venue.value = venue(); collect.elements.instrument.value = pair; collect.elements.strategy.value = current;
+    chip.textContent = h ? h.text : PAIR.test(pair) ? "not stored yet" : "Pick an instrument";
   };
   // A holdout already opened for this model and instrument stays closed, so the box is too (review round 10, M10-1).
   const syncHoldout = () => {
