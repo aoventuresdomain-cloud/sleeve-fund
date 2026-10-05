@@ -101,6 +101,34 @@ def test_donchian_thirds_enter_on_their_breakouts_and_leave_at_their_half_length
     assert s._on == {2: False, 4: False}
 
 
+def test_donchian_warm_up_reaches_back_to_a_breakout_that_is_still_on():
+    """Review round 13, E13-5: a third stays on until its half-length low breaks, which can be long after its
+    breakout. Warmed up over one lookback (101 days), a restart found the 100-day third off while the run over all
+    history held it on. The warm-up now covers four lookbacks, so it sees the breakout."""
+    from nautilus_trader.model import Price
+
+    from sleeve_fund.strategies.donchian import Donchian
+
+    class _Bar:
+        def __init__(self, c):
+            self.close = Price(c, 2)
+
+    # A rise to 250 by day 150 (every third breaks out), then 250 days between 240 and 250: no new 100-day high,
+    # and never below the 100-day third's 50-day low, so that third stays on.
+    closes = [100 + i for i in range(151)] + [250 - 10 * (i % 2) for i in range(250)]
+    full = _donchian()
+    for c in closes:
+        full.update_indicators(_Bar(float(c)))
+    assert full._on[100]
+    need = Donchian.warmup_needed({}, 1440)
+    assert need == 401
+    for n in (101, need):  # the old warm-up, then the new one, both ending on the last day
+        warm = _donchian()
+        for c in closes[-n:]:
+            warm.update_indicators(_Bar(float(c)))
+        assert (warm._on == full._on) is (n == need)
+
+
 def test_donchian_sizes_the_share_of_thirds_long_to_the_volatility_target():
     s = _donchian(lookbacks="2,4", vol_target=0.25, vol_lookback_days=10)
     s._closes.extend([100.0] * 5)
