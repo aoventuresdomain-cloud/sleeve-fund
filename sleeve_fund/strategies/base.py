@@ -165,12 +165,13 @@ def _from_entry(stop: float, side: int = 1) -> str:
     return f"{abs(stop):.1%} {'below' if below else 'above'} the entry"
 
 
-def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float,
-                      maintenance: float) -> tuple[float | None, float]:
-    """The liquidation price of an entry of qty at close once it fills (the fee paid, the strategy's whole
-    equity as its isolated margin), and how far that is from close as a share of it (inf when none)."""
-    notional = qty * close
-    liq = markets.liquidation_price(cash - side * notional * (1 + side * fee), side * qty, maintenance)
+def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: float,
+                      leverage: float) -> tuple[float | None, float]:
+    """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
+    leverage as its isolated margin: markets.isolated_margin), and how far that is from close as a share of
+    it (inf when none)."""
+    notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
+    liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
@@ -1084,7 +1085,7 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2)}
         notional = float(qty) * close
         liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
-                                          self._cfg.perp.maintenance_margin)
+                                          self._cfg.perp.maintenance_margin, lev)
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / equity, 4)
@@ -1607,6 +1608,12 @@ class LongFlatStrategy(Strategy):
         step = self._lot()
         return max(self.instrument.min_quantity.as_decimal(), step) if self.instrument.min_quantity else step
 
+    def _liq(self, cash: float, qty: float) -> float | None:
+        """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
+        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin)."""
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        return markets.isolated_liquidation(cash, qty, self._net_position()[1], lev, self._cfg.perp.maintenance_margin)
+
     def _net_position(self) -> tuple[float, float]:
         """Perp: the signed position at the simulated venue and its average entry there."""
         net = notional = 0.0
@@ -1826,7 +1833,7 @@ class LongFlatStrategy(Strategy):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
                   ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
             levels.append((liq / (1 - d) if side > 0 else liq / (1 + d), "liquidation_cut"))
@@ -1857,7 +1864,7 @@ class LongFlatStrategy(Strategy):
         px = Price(level, self.instrument.price_precision)
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         _, cash, net, _ = self._mark()
-        liq = markets.liquidation_price(cash, net, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, net)
         if order is not None:
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 return  # in flight: re-priced at the next bar
@@ -1965,11 +1972,11 @@ class LongFlatStrategy(Strategy):
     def _liquidation_guard(self, cash: float, qty: float, price: float) -> None:
         """The position closes at market once the price reaches its liquidation price (the venue would
         take it), or comes within the risk profile's minimum distance of it (cut back before the venue
-        does), with the strategy's equity as the position's isolated margin."""
+        does), on the position's isolated margin (_liq)."""
         terms = self._cfg.perp
         if terms is None or qty == 0 or price <= 0 or self._pending_exit is not None or self._busy():
             return
-        liq = markets.liquidation_price(cash, qty, terms.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is None:
             return
         side = 1 if qty > 0 else -1
@@ -2000,7 +2007,7 @@ class LongFlatStrategy(Strategy):
         day_open = self.runtime._day_open or equity
         if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
             return True
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
 
     def _intrabar_guard(self, bar: Bar) -> None:
@@ -2014,7 +2021,7 @@ class LongFlatStrategy(Strategy):
         worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
         _, cash, _, _ = self._mark()
         self._guard_equity = cash + qty * worst
-        liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+        liq = self._liq(cash, qty)
         if liq is not None and (worst <= liq if qty > 0 else worst >= liq):
             self._guard_price = worst
 
@@ -2139,7 +2146,7 @@ class LongFlatStrategy(Strategy):
                 # Through the liquidation price: the venue takes the position whatever our own risk check says,
                 # so the liquidation goes first and is journaled as one (review round 11, M11-3).
                 probe = price if underwater or worst is None else worst
-                liq = markets.liquidation_price(cash, qty, self._cfg.perp.maintenance_margin)
+                liq = self._liq(cash, qty)
                 if underwater or (liq is not None and (probe <= liq if qty > 0 else probe >= liq)):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))

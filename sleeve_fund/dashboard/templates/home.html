@@ -134,7 +134,7 @@
     </tr></thead>
     <tbody>
     {% if not summaries %}<tr><td colspan="12" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
-    {% for x in summaries %}{% set s = x.sleeve %}{% set room = [x.profile.max_drawdown - x.drawdown, 0]|max * [x.equity, 0]|max %}
+    {% for x in summaries %}{% set s = x.sleeve %}{% set room = x.room %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
       <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>

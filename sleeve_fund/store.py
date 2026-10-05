@@ -11,6 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -239,7 +240,7 @@ accounts_t = Table(
     metadata,
     Column("name", String(41), primary_key=True),
     Column("kind", String(8), nullable=False),  # paper | live
-    Column("venue", String(16), nullable=False, default="kraken"),
+    Column("venue", String(16), nullable=False, default=""),  # a live account's venue; "" for paper (any venue)
     Column("note", Text, nullable=False, default=""),
     Column("created_at", TS, nullable=False),
 )
@@ -350,6 +351,16 @@ resets_t = Table(
     Column("done_at", TS, nullable=True),
     Column("run", String(64), nullable=False, default=""),
 )
+# A pause or halt in force when a reset was asked for, carried onto the fresh run so a reset never lifts
+# the kill switch, a risk halt or the PM's pause (round 13, U13-4). A new table: CREATE TABLE.
+reset_holds_t = Table(
+    "strategy_reset_holds",
+    metadata,
+    Column("reset_id", Integer, primary_key=True),
+    Column("status", String(16), nullable=False),
+    Column("status_reason", Text, nullable=False, default=""),
+    Column("paused_until", TS, nullable=True),
+)
 # Tables whose rows are a strategy's own run: moved to the run's name on a reset. sleeve_accounts and
 # sleeve_venues are copied (both need them); feed_seen starts afresh; backtests are never strategies on a book.
 # A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
@@ -411,6 +422,7 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
     goes negative; if it does, the negative stays visible so reconciliation catches it."""
     cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
         price = float(f["price"])
@@ -418,9 +430,14 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
         sign = 1 if f["side"] == "BUY" else -1
         cash -= sign * float(f["qty"]) * price + float(f["fee"])
         new = qty + sign * q
-        if abs(new) < DUST:  # float residue from a fill's own arithmetic, far below any lot
+        big, legs = max(big, abs(float(f["qty"]))), legs + 1
+        # Float residue from the fills' own arithmetic: below DUST, or for fills too large for a float to hold
+        # every lot (1.6e8 units: one float step is 3e-8, wider than a 1e-8 lot) within a few float steps per
+        # fill since flat. Left in, an exit back to flat read as 3e-8 held (review round 13, E13-2).
+        if abs(new) < DUST or abs(new) <= (legs + 2) * Decimal(math.ulp(big)):
             new = Decimal(0)
         if new == 0:
+            legs = 0
             entry = None
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
@@ -672,22 +689,35 @@ class Store:
     # --- accounts ------------------------------------------------------------------
 
     def _ensure_paper_account(self, c) -> None:
-        if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == "paper")).first() is None:
-            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
-                                                note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+        from sleeve_fund.accounts import PAPER_NOTE, PAPER_NOTES_BEFORE
 
-    def create_account(self, name: str, kind: str, note: str = "") -> None:
+        row = c.execute(select(accounts_t).where(accounts_t.c.name == "paper")).first()
+        if row is None:
+            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="", note=PAPER_NOTE,
+                                                created_at=utcnow()))
+        elif row.venue or row.note in PAPER_NOTES_BEFORE:
+            # Made when every account was on one venue: paper trades at each strategy's own venue. A note
+            # the PM wrote is kept; only the old default one is replaced.
+            note = PAPER_NOTE if row.note in PAPER_NOTES_BEFORE else row.note
+            c.execute(update(accounts_t).where(accounts_t.c.name == "paper").values(venue="", note=note))
+
+    def create_account(self, name: str, kind: str, note: str = "", venue: str | None = None) -> None:
+        """A live account is on one venue, picked from the registered profiles; a paper one serves any."""
         from sleeve_fund.accounts import KINDS, NAME_RE
+        from sleeve_fund.venues import VENUES
 
         if not NAME_RE.fullmatch(name):
             raise ValueError("account name: lower-case letters, digits and dashes, 2 to 41 characters")
         if kind not in KINDS:
             raise ValueError(f"account kind must be one of {KINDS}")
+        if kind == "live" and (venue or "").upper() not in VENUES:
+            raise ValueError(f"a live account needs its venue, one of {', '.join(p.label for p in VENUES.values())}")
+        venue = (venue or "").lower() if kind == "live" else ""
         with self.engine.begin() as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == name)).first():
                 raise ValueError(f"an account called {name} already exists")
-            c.execute(insert(accounts_t).values(name=name, kind=kind, venue="kraken", note=note, created_at=utcnow()))
+            c.execute(insert(accounts_t).values(name=name, kind=kind, venue=venue, note=note, created_at=utcnow()))
 
     def accounts(self) -> list[dict]:
         """Every account with its sleeves and, for live ones, whether the supervisor sees a key."""
@@ -1045,8 +1075,12 @@ class Store:
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         with self.engine.begin() as c:
-            c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
-                                              restart=int(s.desired_state == "running"), run=""))
+            rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
+                                                    restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
+            # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
+            if s.status in ("paused", "halted"):
+                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
+                                                       paused_until=s.paused_until))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
@@ -1087,9 +1121,14 @@ class Store:
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
+            hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
+            # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
+            # process keeps a status it starts with until the PM resumes it.
+            kept = ({"status": hold.status, "status_reason": f"{hold.status_reason} (kept through a reset)".strip(),
+                     "paused_until": hold.paused_until} if hold else
+                    {"status": "stopped", "status_reason": "reset: starts afresh", "paused_until": None})
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(
-                status="stopped", status_reason="reset: starts afresh", paused_until=None, heartbeat_at=None,
-                created_at=now, updated_at=now))
+                **kept, heartbeat_at=None, created_at=now, updated_at=now))
             c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=now, run=run))
         return run
 

@@ -62,7 +62,7 @@ def test_old_pages_redirect_with_their_query(client):
 
 def test_account_forms_land_on_setup_with_their_result(client):
     c, store = client
-    ok = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "reason": "first"}, auth=AUTH,
+    ok = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "venue": "kraken", "reason": "first"}, auth=AUTH,
                 headers=SAME, follow_redirects=False)
     assert ok.headers["location"] == "/setup?saved=kraken-trend#acct-kraken-trend"
     page = c.get(ok.headers["location"], auth=AUTH).text
