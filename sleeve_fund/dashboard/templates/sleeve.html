@@ -91,7 +91,7 @@
     {% if positions.rows %}{{ positions_table(positions, show_strategy=False, close_id='dlg-close', closable=closable) }}
     {% else %}<p class="empty" style="padding:4px 18px 14px">Flat. {% if s.desired_state != 'running' %}The strategy is stopped.{% else %}Waiting for the next signal.{% endif %}{% if idea %} Next entry: {{ idea }}{% endif %}</p>{% endif %}
     {# Three limits: margin (or position) against its cap, room before the drawdown halt, today's loss against the pause. #}
-    {% set room = risk.room_to_halt if risk.room_to_halt is defined else none %}
+    {% set room = x.room if x.room is defined else none %}
     <div class="limit-bars">
       <div title="{{ x.exposure|abs|pct1 }} of equity in {{ 'notional' if perp else 'the position' }}, against a cap of {{ x.cap|pct0 }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.cap_used) }}</div>
       <div title="Drawdown {{ x.drawdown|pct1 }} of the {{ x.profile.max_drawdown|pct0 }} halt"><span class="k">Room to halt</span>{{ usage(x.dd_used) }} <b>{% if room is not none %}{{ room|money }}{% else %}<span class="faint" title="Waiting on the corrected room-to-halt figure">–</span>{% endif %}</b></div>

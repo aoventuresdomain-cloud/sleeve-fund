@@ -44,6 +44,7 @@ from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -1220,8 +1221,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = str(form.get("reason", "")).strip()
             if not reason:
                 raise ValueError("a reason is required")
-            st().create_account(name, str(form.get("kind", "")), str(form.get("note", "")).strip()[:200])
-            st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
+            kind = str(form.get("kind", ""))
+            st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
+            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
             return RedirectResponse(f"/setup?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
