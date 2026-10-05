@@ -178,3 +178,15 @@ def test_coverage_written_before_the_forming_minute_was_recorded_reads_as_it_did
     raw.pop("forming")
     path.write_text(json.dumps(raw))
     assert s.coverage(V, P).forming == pd.Timestamp("2026-10-05 12:00", tz="UTC")
+
+
+def test_a_loader_page_ahead_of_the_hub_keeps_the_venues_candles_and_records_the_hubs_later_bars(tmp_path):
+    """Code Reviewer's question on #143: the loader writes past the hub's end; only its newest minute is forming.
+    The hub's live bars arriving later for the minutes in between are conflicts, and the venue's candles stay."""
+    s = HistoryStore(tmp_path)
+    s.append_bars(V, P, _rows("2026-10-05 12:00", 6), "live")  # closed 12:05
+    s.append(V, P, _rest("2026-10-05 12:04", 5, 200.0), cursor="c")  # 12:04-12:08; 12:08 forming
+    res = s.append_bars(V, P, _rows("2026-10-05 12:06", 2, 106.0), "live")
+    assert (res.written, res.conflicts) == (0, 2)
+    assert s.read(V, P, 1).loc[pd.Timestamp("2026-10-05 12:07", tz="UTC"), "close"] == 200.0
+    assert s.coverage(V, P).forming == pd.Timestamp("2026-10-05 12:08", tz="UTC")

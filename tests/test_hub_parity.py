@@ -89,3 +89,18 @@ def test_quiet_minutes_with_no_volume_on_both_sides_match():
 def test_the_window_leaves_out_the_forming_minute():
     start, end = window(24, now=pd.Timestamp("2026-10-05 12:00:42", tz="UTC"))
     assert end == pd.Timestamp("2026-10-05 12:00", tz="UTC") and end - start == pd.Timedelta("24h")
+
+
+def test_the_hubs_late_trade_counts_are_read_from_its_own_file_by_default(tmp_path):
+    import json
+
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.parity import late_counts
+
+    store = HistoryStore(tmp_path)
+    assert late_counts(store, "BINANCE") is None
+    (tmp_path / "hub-late-BINANCE.json").write_text(json.dumps({"BTC/USDT": [3, 1200]}))
+    assert late_counts(store, "BINANCE") == {"BTC/USDT": (3, 1200)}
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"BTC/USDT": [1, 10]}))
+    assert late_counts(store, "BINANCE", other) == {"BTC/USDT": (1, 10)}

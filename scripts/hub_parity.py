@@ -4,19 +4,18 @@
     python scripts/hub_parity.py --venue binance --pair BTC/USDT --late late.json --out /path/report.md
 
 Without --pair, every instrument the store holds for the venue. --late is the hub's late-trade counts,
-{"BTC/USDT": [late, total], ...}. Reads the store and the venue's public candles; writes only the report.
+{"BTC/USDT": [late, total], ...}; by default the file the hub keeps beside the store. Reads the store and the venue's public candles; writes only the report.
 Exit 0 when every instrument matches, 1 when any differs.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from sleeve_fund.history import HistoryStore
-from sleeve_fund.parity import markdown, run, window
+from sleeve_fund.parity import late_counts, markdown, run, window
 from sleeve_fund.venues import venue
 
 
@@ -26,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--pair", action="append", help="repeat for several; default: all the store holds")
     ap.add_argument("--tolerance", type=float, default=0.0, help="OHLC difference allowed, in price units")
-    ap.add_argument("--late", type=Path, help="the hub's late-trade counts (JSON)")
+    ap.add_argument("--late", type=Path, help="the hub's late-trade counts (JSON; default: the hub's own file)")
     ap.add_argument("--history", type=Path, help="the store's root (default: HISTORY_DIR)")
     ap.add_argument("--out", type=Path, help="write the report here as well as printing it")
     args = ap.parse_args(argv)
@@ -36,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     if not pairs:
         print(f"no stored history for {profile.label}", file=sys.stderr)
         return 2
-    late = {k: tuple(v) for k, v in json.loads(args.late.read_text()).items()} if args.late else None
+    late = late_counts(store, profile.name, args.late)
     start, end = window(args.hours)
     results = run(store, profile, pairs, start, end, args.tolerance, late)
     report = markdown(profile.label, results)

@@ -128,6 +128,19 @@ def markdown(venue: str, results: list[Parity]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def late_counts(store, venue_name: str, path=None) -> dict | None:
+    """The hub's late-trade counts, {pair: (late, total)}: from `path` if given, else from the file the hub keeps
+    beside the store (<store root>/hub-late-<VENUE>.json), so the report shows the rate without being asked
+    (spec P1-1). None when neither exists."""
+    import json
+    from pathlib import Path
+
+    path = Path(path) if path is not None else store.root / f"hub-late-{venue_name}.json"
+    if not path.exists():
+        return None
+    return {k: tuple(v) for k, v in json.loads(path.read_text()).items()}
+
+
 def run(store: HistoryStore, profile, pairs: list[str], start: pd.Timestamp, end: pd.Timestamp,
         price_tolerance: float = 0.0, late: dict | None = None) -> list[Parity]:
     if profile.minute_loader is None or profile.minute_cursor_at is None:

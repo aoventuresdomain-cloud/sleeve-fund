@@ -103,6 +103,10 @@ class HistoryStore:
                 stored = done.index[:0]
                 if not done.empty:
                     stored = _write_first_wins(d, done, cov, "loader")[3]
+                # Past the hub's end the loader writes as before. Those minutes, apart from its newest (forming),
+                # are the venue's own closed candles, so they are first-wins too: a hub live bar arriving later for
+                # one of them is recorded as a conflict and the venue's candle kept. Intended: the REST candle is
+                # the venue's record of the minute, and the parity report counts such differences.
                 df = df[df.index > cov.closed]
                 if df.empty:
                     # the page's newest minute is still the loader's own part bar only if it was stored here
