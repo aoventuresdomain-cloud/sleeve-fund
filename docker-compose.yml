@@ -43,12 +43,22 @@ services:
     volumes: [backups:/backups, research:/research:ro, ./deploy/backup.sh:/backup.sh:ro]
     entrypoint: ["bash", "/backup.sh"]
 
+  # Runs once per deploy, as root, and hands the history volume to the image's user (uid 1000).
+  # Volumes made before the image dropped root (#64) are root-owned, and a folder a root process made
+  # in one stays root-owned, so the store couldn't add a venue's folder. Only what isn't 1000 changes.
+  volume-init:
+    build: .
+    user: "0"
+    restart: "no"
+    volumes: [history:/data/history]
+    command: [find, /data/history, "!", -uid, "1000", -exec, chown, "1000:1000", "{}", +]
+
   # Keeps every instrument's minute history current from its venue, into the shared store that
   # research and the backtest page read. Public market data only, no keys.
   history:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history
@@ -59,7 +69,7 @@ services:
   history-binance:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy } }
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history

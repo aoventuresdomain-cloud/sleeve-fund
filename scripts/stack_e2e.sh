@@ -10,6 +10,10 @@ DASHBOARD_PASSWORD=e2e-dash-pw
 SITE_ADDRESS=localhost
 ENV
 trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker compose down -v' EXIT
+# The server's history volume predates the non-root image: root-owned, with a venue folder a root
+# process made. Start from that, so the run proves volume-init hands it to the store's user.
+docker compose run --rm --no-deps --build --user 0 --entrypoint sh history-binance \
+  -c 'mkdir -p /data/history/BINANCE && chown -R 0:0 /data/history'
 docker compose up -d --build
 q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
 # The supervisor applies configs/clear.toml before it starts; a strategy added before that is put away
@@ -53,6 +57,16 @@ echo "dashboard: with password $CODE, without $NOAUTH"
 [ "$MARKS" -ge 3 ] || { echo "FAIL: no equity marks"; exit 1; }
 [ "$ERRS" -eq 0 ] || { echo "FAIL: error events recorded"; exit 1; }
 [ "$CODE" = "200" ] && [ "$NOAUTH" = "401" ] || { echo "FAIL: dashboard auth"; exit 1; }
+# The history stores can write their venue folders (they refuse to start, in one line, when they can't).
+for svc in history history-binance; do
+  docker compose exec -T "$svc" python -c "
+import sys
+from pathlib import Path
+from sleeve_fund.history import unwritable
+problem = unwritable(Path('/data/history/BINANCE'))
+print(problem or 'history store writable')
+sys.exit(1 if problem else 0)" || { docker compose logs --no-color --tail 20 volume-init "$svc"; echo "FAIL: $svc can't write the history store"; exit 1; }
+done
 # Quotes put the venue's bid and ask in the paper book, so fills pay the spread as they would for real.
 QUOTED=$(docker compose logs --no-color supervisor | grep -c "first quote: bid" || true)
 echo "sleeves receiving live quotes: $QUOTED"

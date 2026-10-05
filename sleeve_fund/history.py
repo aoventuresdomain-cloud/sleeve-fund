@@ -294,6 +294,24 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
 
 
+def unwritable(path: Path) -> str | None:
+    """Why this process can't write under `path`, or None if it can. Checked once at start, so a store
+    it may not write says so in one line instead of failing every instrument on every pass."""
+    probe = path / f".write-check-{os.getpid()}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe.write_text("")
+        probe.unlink()
+        return None
+    except OSError as exc:
+        owner = next((p for p in (path, *path.parents) if p.exists()), path)
+        try:
+            owned = f"owned by uid {owner.stat().st_uid}"
+        except OSError:
+            owned = "owner unknown"
+        return f"cannot write {path} as uid {os.getuid()} ({owner} is {owned}): {exc!r}"
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import time
@@ -316,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
 
     store = HistoryStore(args.root)
     profile = venue_profile(args.venue)
+    if args.cmd in ("refresh", "run") and (problem := unwritable(store.root / profile.name.upper())):
+        print(f"{profile.name}: history store can't start: {problem}")
+        return 2
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:
