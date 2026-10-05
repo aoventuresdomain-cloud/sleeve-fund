@@ -40,3 +40,16 @@ def maker_on(monkeypatch):
     """Maker-first orders are switched off by default (strategies.base.maker_orders_enabled); the tests of
     the post-only path switch them on."""
     monkeypatch.setenv("SLEEVE_MAKER_ORDERS", "1")
+
+
+@pytest.fixture
+def full_margin(monkeypatch):
+    """Every risk profile puts the strategy's whole equity up as margin, so a perpetual sizes at its full
+    leverage cap (2x on balanced) and its liquidation price is near enough to test. The default margin
+    cap (PM, 5 Oct 2026: 33% on balanced, so 0.66x notional) leaves liquidation out of reach."""
+    import dataclasses
+
+    from sleeve_fund import risk
+
+    for name, p in list(risk.PROFILES.items()):
+        monkeypatch.setitem(risk.PROFILES, name, dataclasses.replace(p, max_position_pct=1.0))

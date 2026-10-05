@@ -66,9 +66,9 @@ services:
     volumes: [history:/data/history]
     command: python -m sleeve_fund.history run --venue binance
 
-  # Copies the fills of strategies with demo_mirror = true to a demo account (sleeve_fund/mirror.py): Binance
-  # Demo Trading for strategies on Binance, the Deribit TESTNET for the rest. The only service given the demo
-  # keys, and it refuses any other host or credential; off quietly unless DEMO_MIRROR is on and a demo
+  # Copies the fills of strategies with demo_mirror = true to a demo account (sleeve_fund/mirror.py): Bybit
+  # Demo Trading for strategies on Binance's USDT perpetuals, the Deribit TESTNET for the rest. The only
+  # service given the demo keys, and it refuses any other host or credential; off quietly unless DEMO_MIRROR is on and a demo
   # account's key and secret are both set. Paper is unaffected.
   mirror:
     build: .
