@@ -81,6 +81,7 @@ services:
       DERIBIT_TESTNET_API_SECRET: ${DERIBIT_TESTNET_API_SECRET:-}
       BINANCE_DEMO_API_KEY: ${BINANCE_DEMO_API_KEY:-}
       BINANCE_DEMO_API_SECRET: ${BINANCE_DEMO_API_SECRET:-}
+      BINANCE_DEMO_HOST: ${BINANCE_DEMO_HOST:-}   # unset: Demo Trading; testnet.binancefuture.com: the futures testnet
     command: python -m sleeve_fund.mirror run
 
   dashboard:

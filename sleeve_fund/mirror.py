@@ -5,8 +5,8 @@ stays the record of truth: the mirror never feeds anything back into a strategy,
 is noted, not retried, so it can never trade twice.
 
 Fail-closed by construction:
-- it only ever talks to the demo hosts, demo-fapi.binance.com and test.deribit.com; any other environment or
-  host is refused. A live key is useless there: the demo systems don't know it;
+- it only ever talks to the demo hosts: demo-fapi.binance.com (or, chosen with BINANCE_DEMO_HOST, Binance's
+  futures testnet, testnet.binancefuture.com) and test.deribit.com; any other environment or host is refused. A live key is useless there: the demo systems don't know it;
 - it runs only when DEMO_MIRROR is on and a demo account's key and secret are both set (BINANCE_DEMO_API_KEY
   and BINANCE_DEMO_API_SECRET, DERIBIT_TESTNET_API_KEY and DERIBIT_TESTNET_API_SECRET); otherwise it stays off
   quietly, and a strategy whose demo account isn't set up has its fills noted as skipped;
@@ -46,6 +46,10 @@ ACCOUNTS = {"DERIBIT": (KEY_ENV, SECRET_ENV), "BINANCE": (BINANCE_KEY_ENV, BINAN
 TESTNET_HOST = "test.deribit.com"
 BINANCE_DEMO_HOST = "demo-fapi.binance.com"
 BINANCE_DEMO_URL = f"https://{BINANCE_DEMO_HOST}"
+# The only Binance hosts the mirror will talk to: Demo Trading (the default) and the separate futures testnet, a
+# fallback chosen with BINANCE_DEMO_HOST. Both are demo money; anything else, the live host included, is refused.
+BINANCE_DEMO_HOSTS = {BINANCE_DEMO_HOST: "Binance Demo Trading", "testnet.binancefuture.com": "the Binance futures testnet"}
+BINANCE_HOST_ENV = "BINANCE_DEMO_HOST"
 # Our instrument -> the testnet perpetual and its contract size in USD.
 CONTRACTS = {"BTC/USD": ("BTC-PERPETUAL", 10.0), "ETH/USD": ("ETH-PERPETUAL", 1.0)}
 POLL_SECONDS = 10
@@ -167,11 +171,19 @@ class Testnet:
 
 
 def binance_demo_url(url: str = BINANCE_DEMO_URL) -> str:
-    """Binance Demo Trading's USD-M futures API root. Any other host, the live one included, is refused."""
+    """A Binance demo USD-M futures API root: Demo Trading or the futures testnet. Any other host, the live one
+    included, is refused."""
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != BINANCE_DEMO_HOST:
-        raise MirrorRefused(f"the demo mirror trades on Binance Demo Trading ({BINANCE_DEMO_HOST}) only, not {url}")
+    if parsed.scheme != "https" or parsed.hostname not in BINANCE_DEMO_HOSTS or parsed.path.strip("/"):
+        raise MirrorRefused(f"the demo mirror trades on Binance's demo hosts only ({', '.join(BINANCE_DEMO_HOSTS)}), "
+                            f"not {url}")
     return url.rstrip("/")
+
+
+def binance_demo_host(environ: dict[str, str] | None = None) -> str:
+    """The Binance demo API root BINANCE_DEMO_HOST picks (a host name), Demo Trading when it is unset."""
+    env = os.environ if environ is None else environ
+    return binance_demo_url(f"https://{(env.get(BINANCE_HOST_ENV) or BINANCE_DEMO_HOST).strip()}")
 
 
 def _http(method: str, url: str, headers: dict[str, str]):
@@ -194,6 +206,8 @@ class BinanceDemo:
 
     def __init__(self, creds: Settings, http=_http, url: str = BINANCE_DEMO_URL, clock=time.time) -> None:
         self.url = binance_demo_url(url)
+        self.host = urllib.parse.urlparse(self.url).hostname
+        self.label = BINANCE_DEMO_HOSTS[self.host]
         self._creds, self._http, self._clock = creds, http, clock
         self._info: dict = {}
 
@@ -346,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(3600)
     from sleeve_fund.store import Store
 
-    clients = {"BINANCE": BinanceDemo, "DERIBIT": Testnet}
-    targets = {name: clients[name](c) for name, c in creds.items()}
+    targets = {name: BinanceDemo(c, url=binance_demo_host()) if name == "BINANCE" else Testnet(c)
+               for name, c in creds.items()}
     print("demo mirror on: " + ", ".join(f"{t.label} ({t.url})" for t in targets.values()), flush=True)
     run(Store(), targets)
     return 0

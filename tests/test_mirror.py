@@ -253,3 +253,18 @@ def test_a_strategy_whose_demo_account_is_not_set_up_is_skipped_not_sent_elsewhe
     _fill(store, "bn-ls", "BUY", 0.05, 1)
     mirror.mirror_once(store, {"DERIBIT": testnet})
     assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "no demo account set up for Binance"
+
+
+def test_the_binance_futures_testnet_is_the_one_other_host_it_takes():
+    """A fallback for an account without Demo Trading: BINANCE_DEMO_HOST picks the futures testnet. Nothing else."""
+    assert mirror.binance_demo_host({}) == "https://demo-fapi.binance.com"
+    assert mirror.binance_demo_host({"BINANCE_DEMO_HOST": "testnet.binancefuture.com"}) == "https://testnet.binancefuture.com"
+    for host in ("fapi.binance.com", "testnet.binancefuture.com.evil.example", "binance.com",
+                 "testnet.binancefuture.com/../fapi"):
+        with pytest.raises(mirror.MirrorRefused):
+            mirror.binance_demo_host({"BINANCE_DEMO_HOST": host})
+    calls = []
+    t = mirror.BinanceDemo(mirror.Settings("k", "s"), url="https://testnet.binancefuture.com",
+                           http=lambda m, url, h: calls.append(url) or {"orderId": 1, "avgPrice": "1"})
+    t.market("BUY", "BTCUSDT", 0.01, "x:1")
+    assert calls[0].startswith("https://testnet.binancefuture.com/fapi/v1/order?") and t.label == "the Binance futures testnet"
