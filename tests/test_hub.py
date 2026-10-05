@@ -183,29 +183,24 @@ def test_the_first_bar_after_subscribing_is_a_part_bar_and_the_venues_candle_sta
     assert stored[-1]["c"] == "60002.00" and stored[-1]["refilled"] is False
 
 
-def test_bars_reach_the_stores_write_path_as_open_time_and_source_a_refill_in_one_call():
-    calls, said = [], []
+def test_bars_reach_the_stores_write_path_as_open_time_and_source_a_refill_in_one_call(tmp_path, monkeypatch):
+    from sleeve_fund.history import HistoryStore
 
-    class Store:
-        def append_bars(self, venue, instrument, bars, source):
-            calls.append((venue, instrument, bars, source))
-            return type("R", (), {"conflicts": [bars[0][0]] if source == "refill" else []})()
-
-    sink = store_sink(Store(), "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
+    store, calls, said = HistoryStore(tmp_path), [], []
+    real = store.append_bars
+    monkeypatch.setattr(store, "append_bars", lambda *a: calls.append(a) or real(*a))
+    sink = store_sink(store, "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
     sink([protocol.bar_from_nautilus(_bar(BTC, T0), T0)])
-    sink([{**protocol.bar_from_nautilus(_bar(BTC, T0 + k * MINUTE_NS), T0), "refilled": True} for k in (1, 2)])
+    # A refill of the same minute with another close, and the next minute: one call, the stored bar kept.
+    sink([{**protocol.bar_from_nautilus(_bar(BTC, T0 + k * MINUTE_NS, c="60005.00"), T0), "refilled": True}
+          for k in (0, 1)])
     sink([protocol.bar_from_nautilus(_bar(ETH, T0), T0)])  # not one of the hub's instruments: not stored
-    bar = lambda close: (close - MINUTE_NS, 60000.0, 60010.0, 59990.0, 60000.1, 1.25)  # noqa: E731
-    assert calls == [("BINANCE", "BTC/USDT", [bar(T0)], "live"),
-                     ("BINANCE", "BTC/USDT", [bar(T0 + MINUTE_NS), bar(T0 + 2 * MINUTE_NS)], "refill")]
-    assert len(said) == 1 and "differ from the stored" in said[0]  # the store kept its bar and recorded it
-
-
-def test_a_store_without_the_write_path_yet_is_skipped_and_said_once():
-    said = []
-    sink = store_sink(object(), "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
-    sink([protocol.bar_from_nautilus(_bar(BTC, T0), T0)])
-    assert len(said) == 1 and "append_bars" in said[0]
+    bar = lambda close, c: (close - MINUTE_NS, 60000.0, 60010.0, 59990.0, c, 1.25)  # noqa: E731
+    assert calls == [("BINANCE", "BTC/USDT", [bar(T0, 60000.1)], "live"),
+                     ("BINANCE", "BTC/USDT", [bar(T0, 60005.0), bar(T0 + MINUTE_NS, 60005.0)], "refill")]
+    assert len(said) == 1 and "1 refill bar(s) differ from the stored" in said[0]
+    cov = store.coverage("BINANCE", "BTC/USDT")
+    assert cov.last == pd.Timestamp(T0, unit="ns", tz="UTC")  # both minutes stored, the first one not overwritten
 
 
 def test_an_instrument_added_while_the_hub_runs_is_picked_up_on_the_next_pass():
@@ -239,3 +234,16 @@ def test_the_hub_runs_the_store_backfill_in_its_own_process(monkeypatch):
     monkeypatch.setattr(history, "main", lambda argv: calls.append(argv) or 0)
     collector(SimpleNamespace(name="BINANCE")).join(5)
     assert calls == [["run", "--venue", "binance"]]
+
+
+def test_trades_arriving_after_their_minutes_bar_are_counted_for_the_parity_report(tmp_path):
+    r, _ = _relay()
+    r.late_path = tmp_path / "hub-late-BINANCE.json"
+    trade = lambda ts: TradeTick(InstrumentId.from_str(BTC), Price.from_str("60000.10"),  # noqa: E731
+                                 Quantity.from_str("0.005"), AggressorSide.from_str("BUY"), TradeId(str(ts)), ts, ts)
+    r.on_trade(trade(T0 - 1))
+    r.on_bar(_bar(BTC, T0))
+    r.on_trade(trade(T0 - 2))  # in the minute just built: late
+    r.on_trade(trade(T0 + 1))
+    r._write_late()
+    assert json.loads(r.late_path.read_text()) == {"BTC/USDT": [1, 3]}
