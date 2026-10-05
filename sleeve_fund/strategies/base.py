@@ -183,29 +183,41 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
-# m13-E3: a bar that closed while the strategy was down is decided on only this soon after its close, the same
-# limit the hub client puts on a refilled bar; later, its price has moved on and it is warm-up only.
+# A decision this long after its bar's close (a bar missed over a restart, m13-E3) opens or adds to nothing: the
+# price has moved on from the signal. Exits and reductions always run, however late (Independent Quant Advisor,
+# 5 Oct 2026). The same limit the hub client puts on a refilled bar.
 LATE_DECISION_NS = 90 * 1_000_000_000
-
-
-def _stale(age_ns: int, step_ns: int) -> bool:
-    return age_ns >= step_ns or age_ns > LATE_DECISION_NS
 
 
 def late_bar(bars: list, now_ns: int, step_ns: int, last_alive: datetime | None, last_order_at: datetime | None):
     """m13-E3: the latest warm-up bar, when it closed while the strategy was down and is still the latest
     closed bar, so it is decided on once rather than only warmed up on. last_alive: the previous process's last
     heartbeat. None (warm-up only) for a first start, when that process was still alive at the close (it saw
-    the bar), when an order was journaled at or after the close (it acted on it), or when the bar closed more
-    than LATE_DECISION_NS ago or is a bar or more old (deciding on it now would trade on a stale signal)."""
+    the bar), when an order was journaled at or after the close (it acted on it), or when the bar is a bar or
+    more old (a newer bar decides instead). Decided more than LATE_DECISION_NS after its close, it can only
+    exit or reduce (_late_entry)."""
     if not bars or last_alive is None:
         return None
     last = bars[-1]
-    if _stale(now_ns - last.ts_event, step_ns) or _ns(last_alive) >= last.ts_event:
+    if now_ns - last.ts_event >= step_ns or _ns(last_alive) >= last.ts_event:
         return None
     if last_order_at is not None and _ns(last_order_at) >= last.ts_event:
         return None
     return last
+
+
+def outage_fill_note(decision: dict | None, px: float) -> str | None:
+    """For the first fill of an exit sent because its level was crossed while the strategy was down
+    (_check_outage_exits): how far from that level it filled. None for any other fill, or a later one."""
+    level = ((decision or {}).get("signal") or {}).pop("outage_level", None)
+    if level is None:
+        return None
+    return (f"The {decision.get('intent', 'exit').replace('_', '-')} closed at {px:,.6g}, {px / level - 1:+.2%} from "
+            f"its {level:,.6g} level, reached while the strategy was down")
+
+
+def _hhmm(ns: int) -> str:
+    return f"{datetime.fromtimestamp(ns / 1e9, tz=timezone.utc):%H:%M}"
 
 
 def _side_word(side: int) -> str:
@@ -496,6 +508,9 @@ class LongFlatStrategy(Strategy):
         # Paper (v2 P1-2): the decision bar's close and arrival (ns) while on_bar decides, for each order's timing.
         self._deciding: tuple[int, int] | None = None
         self._late: Bar | None = None  # paper, m13-E3: a bar that closed while the strategy was down (late_bar)
+        self._lag: int | None = None  # ns: this decision came more than LATE_DECISION_NS after its bar's close
+        self._last_alive: datetime | None = None  # paper: the previous process's last heartbeat
+        self._outage_check = False  # paper: check the open position's stop and target over the outage first
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -579,6 +594,8 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
+        if self.runtime is not None and not self.runtime.backtest:  # before this process writes a heartbeat
+            self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
         self._plan_resume()
         if self._cfg.warmup_bars:
             if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
@@ -596,6 +613,7 @@ class LongFlatStrategy(Strategy):
                 self._entry_px, self._entry_qty = book["entry_px"], abs(book["qty"])
                 self._entry_side = 1 if book["qty"] > 0 else -1
                 self._restore_plan()
+                self._outage_check = not self.runtime.backtest and self._last_alive is not None
                 if self._margin and not self.runtime.backtest:
                     self._restore = {"qty": book["qty"], "entry": book["entry_px"]}
             if self._margin:
@@ -634,6 +652,11 @@ class LongFlatStrategy(Strategy):
         if self._restore is not None:
             self._send_restore()
             return
+        if self._outage_check:
+            self._outage_check = False
+            if self._check_outage_exits():
+                self._late = None  # out of the position: the missed bar is warm-up only, nothing to exit
+                return
         if self._late is not None:
             self._decide_late()
         if self._kept:
@@ -1020,8 +1043,7 @@ class LongFlatStrategy(Strategy):
         if bars and self.runtime is not None and not self.runtime.backtest:
             last = self.runtime.store.orders(self.runtime.name, limit=1)
             self._late = late_bar(bars, time.time_ns(), bar_minutes(self._cfg.bar_type) * 60_000_000_000,
-                                  self.runtime.store.sleeve(self.runtime.name).heartbeat_at,
-                                  last[0]["ts"] if last else None)
+                                  self._last_alive, last[0]["ts"] if last else None)
             if self._late is not None:  # decided on with the first trade, once the position is back (_decide_late)
                 bars = bars[:-1]
         if bars:
@@ -1166,8 +1188,14 @@ class LongFlatStrategy(Strategy):
         reason, values = self.explain(bar, side)
         values = {**values, "close": close}
         if current != 0:
-            self._flip = (side, bar, reason, values) if side != 0 else None
+            # Late, a reversal only closes: the new side would open on a stale signal.
+            flip = side != 0 and not self._late_entry(bar, f"{_side_word(side)} entry after closing the "
+                                                           f"{_side_word(current)}")
+            self._flip = (side, bar, reason, values) if flip else None
+            self._late_exit(bar)
             self._sell_all("exit", reason, values)
+            return
+        if self._late_entry(bar, f"{_side_word(side)} entry"):
             return
         self._open(side, bar, reason, values)
 
@@ -1256,19 +1284,83 @@ class LongFlatStrategy(Strategy):
         try:
             self._on_bar(bar)
         finally:
-            self._deciding = None
+            self._deciding = self._lag = None
 
     def _decide_late(self) -> None:
-        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest
-        and closed at most LATE_DECISION_NS ago; a bar since, or no trade in time, makes it warm-up only."""
+        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest.
+        A bar since makes it warm-up only. Past LATE_DECISION_NS it only exits or reduces (_late_entry)."""
         late, self._late = self._late, None
-        if _stale(self.clock.timestamp_ns() - late.ts_event, bar_minutes(self._cfg.bar_type) * 60_000_000_000):
+        lag = self._now_ns() - late.ts_event
+        if lag >= bar_minutes(self._cfg.bar_type) * 60_000_000_000:
             self.on_historical_bars([late])
             return
-        when = datetime.fromtimestamp(late.ts_event / 1e9, tz=timezone.utc)
         self.runtime.store.event(self.runtime.name, "info", "late_bar",
-                                 f"Decided on the {when:%H:%M} candle, which closed while the strategy was down")
+                                 f"Decided on the {_hhmm(late.ts_event)} candle {lag / 1e9:.0f} s after its close: it "
+                                 "closed while the strategy was down")
         self.on_bar(late)
+
+    def _now_ns(self) -> int:
+        return self.clock.timestamp_ns()
+
+    def _late_entry(self, bar: Bar, what: str) -> bool:
+        """True when this decision is too late to open or add (LATE_DECISION_NS after its bar's close), saying
+        so with the lag, so the fills-against-model check before G2 can count what was skipped."""
+        if self._lag is None:
+            return False
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "late_entry_skipped",
+                                     f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: decided "
+                                     f"{self._lag / 1e9:.0f} s after its close, past the {LATE_DECISION_NS // 10**9} s "
+                                     f"limit for opening (candle close {bar.close.as_double():,.6g}, price now "
+                                     f"{self._price():,.6g})")
+        return True
+
+    def _late_exit(self, bar: Bar) -> None:
+        """An exit or reduction runs however late; a late one is said with its lag and both prices."""
+        if self._lag is not None and self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "late_exit",
+                                     f"Exiting on the {_hhmm(bar.ts_event)} candle {self._lag / 1e9:.0f} s after its "
+                                     f"close (candle close {bar.close.as_double():,.6g}, price now "
+                                     f"{self._price():,.6g})")
+
+    def _check_outage_exits(self) -> bool:
+        """Paper, on the first trade after a restart with a position open: the stop and target were watched by
+        the process that was down, so check them against the high and low since its last heartbeat, from the
+        stored minutes, and close at once on a breach (the stop first when one minute crossed both). The gap
+        from the level to the fill is said when it fills. True if an exit was sent."""
+        stop, tp, entry, side = self._stop_frac, self._tp_frac, self._entry_px, self._entry_side or 1
+        if entry is None or (stop is None and not tp) or self.history_loader is None or self._busy():
+            return False
+        since = _ns(self._last_alive)
+        minute = BarType.from_str(f"{self._cfg.instrument_id}-1-MINUTE-LAST-INTERNAL")
+        try:
+            bars = self.history_loader(self.instrument, minute, int((time.time_ns() - since) // 60_000_000_000) + 2)
+        except Exception as exc:  # noqa: BLE001 - said; the live checks carry on from the next trade
+            self.runtime.store.event(self.runtime.name, "warning", "outage_unchecked",
+                                     f"Couldn't check the stop and target over the time the strategy was down: {exc}")
+            return False
+        stop_px = entry * (1 - side * stop) if stop is not None else None
+        tp_px = entry * (1 + side * tp) if tp else None
+        for b in sorted(bars, key=lambda b: b.ts_event):
+            if b.ts_event <= since:
+                continue
+            worst, best = (b.low.as_double(), b.high.as_double()) if side > 0 else (b.high.as_double(), b.low.as_double())
+            hit, level = ((("stop_loss", stop_px) if stop_px is not None and side * (worst - stop_px) <= 0 else
+                          ("take_profit", tp_px) if tp_px is not None and side * (best - tp_px) >= 0 else (None, None)))
+            if hit is None:
+                continue
+            words = "stop" if hit == "stop_loss" else "target"
+            price = self._price()
+            reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'} reached while the strategy was down: "
+                      f"the price passed the {level:,.6g} {words} in the minute to {_hhmm(b.ts_event)}; closing at "
+                      f"market now, at about {price:,.6g}")
+            self.runtime.store.event(self.runtime.name, "warning", "outage_exit", reason)
+            self._exit_lock = side if self._margin else True
+            self._entry_px = None  # don't fire again while the order is in flight
+            self._sell_all(hit, reason, {"entry_px": entry, hit: stop if hit == "stop_loss" else tp,
+                                         "outage_level": level, "breached_at": _hhmm(b.ts_event)})
+            return True
+        return False
 
     def _on_bar(self, bar: Bar) -> None:
         if self._late is not None and bar.ts_event > self._late.ts_event:  # a newer bar first: warm-up only
@@ -1285,6 +1377,8 @@ class LongFlatStrategy(Strategy):
         if not self._accept(bar):
             return
         self._deciding = (int(bar.ts_event), int(bar.ts_init))
+        lag = 0 if self._backtest or self.runtime is None else self._now_ns() - bar.ts_event
+        self._lag = lag if lag > LATE_DECISION_NS else None
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         if self._margin and self._backtest and self._exec_type is None:
@@ -1317,7 +1411,7 @@ class LongFlatStrategy(Strategy):
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
-            if self._exit_lock:
+            if self._exit_lock or self._late_entry(bar, "long entry"):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
@@ -1346,6 +1440,7 @@ class LongFlatStrategy(Strategy):
             self._held_w = w
         elif w == 0 and is_long:
             reason, values = self.explain(bar, False)
+            self._late_exit(bar)
             self._sell_all("exit", reason, {**values, "close": close})
             self._held_w = 0.0
         elif w > 0 and is_long and self._cfg.rebalance_band is not None:
@@ -1353,6 +1448,10 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
+                if w > self._held_w and self._late_entry(bar, "addition"):
+                    return
+                if w < self._held_w:
+                    self._late_exit(bar)
                 reason, values = self.explain(bar, True)
                 if self._rebalance(bar, w, reason, {**values, "target_weight": round(float(raw), 6), "close": close}):
                     self._held_w = w
@@ -2482,6 +2581,9 @@ class LongFlatStrategy(Strategy):
             px = float(self.fee_model.maker_slices[coid][0]) if self.fee_model is not None else px
             journal_id = kept_id
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
+        note = outage_fill_note(self.decisions.get(journal_id), px)
+        if note is not None and self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
         sign = 1 if event.is_buy else -1
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)

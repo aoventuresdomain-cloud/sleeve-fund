@@ -109,8 +109,8 @@ def test_a_bar_that_closed_while_the_strategy_was_down_is_decided_once_if_still_
     assert late_bar(bars, NS + minute, minute, down, None) is None  # a bar old: history, not a signal
     hour = 60 * minute
     hourly = [SimpleNamespace(ts_event=NS - hour), SimpleNamespace(ts_event=NS)]
-    assert late_bar(hourly, NS + 90_000_000_000, hour, down, None) is hourly[-1]  # within 90 s of the close
-    assert late_bar(hourly, NS + 91_000_000_000, hour, down, None) is None  # later: its price has moved on
+    assert late_bar(hourly, NS + 90_000_000_000, hour, down, None) is hourly[-1]
+    assert late_bar(hourly, NS + 50 * minute, hour, down, None) is hourly[-1]  # late: it may still exit (below)
     assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS + 1_000_000)) is None  # acted on before
     assert late_bar([], NS, minute, down, None) is None
 
