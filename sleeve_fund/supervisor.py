@@ -28,6 +28,7 @@ from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import Sleeve, Store, utcnow
+from sleeve_fund.strategies import check_perp_sizing
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -74,7 +75,27 @@ class Supervisor:
         self.procs: dict[str, Proc] = {}
         self._stopping = False
 
+    def _refused(self, name: str) -> bool:
+        """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
+        rather than started into a crash loop. A start that only sells a position it holds (a flatten waiting:
+        the kill switch, a PM close) still goes ahead."""
+        s = self.store.sleeve(name)
+        try:
+            check_perp_sizing(s.strategy, s.params)
+        except ValueError as exc:
+            if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
+                self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
+                                 "flatten pauses it, and it can't be started to trade")
+                return False
+            self.store.set_desired_state(name, "stopped")
+            self.store.set_status(name, "stopped", f"not started: {exc}")
+            self.store.event(name, "error", "start_refused", f"Not started: {exc}")
+            return True
+        return False
+
     def _start(self, name: str, proc: Proc) -> None:
+        if self._refused(name):
+            return
         # Paper processes never need a venue key, so they don't inherit one.
         env = {k: v for k, v in os.environ.items() if not credential_var(k)}
         reload = self.store.pending_reload(name)
@@ -232,6 +253,7 @@ def seed(store: Store, paths: list[str]) -> list[str]:
             if cfg.params.get("demo_mirror") and store.add_missing_param(cfg.name, "demo_mirror", True):
                 store.decide("system", "mirror", f"demo mirror turned on from {path}", cfg.name)
             continue
+        check_perp_sizing(cfg.strategy, cfg.params)
         with open(path, "rb") as fh:
             start = tomllib.load(fh).get("sleeve", {}).get("start", True)
         store.create_sleeve(**to_store_kwargs(cfg), desired_state="running" if start else "stopped")

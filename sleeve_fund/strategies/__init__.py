@@ -19,8 +19,25 @@ REGISTRY = {
     "trend_filter": (TrendFilter, TrendFilterConfig),
 }
 
+PERP_WEIGHT_REFUSAL = "sized by weight: not available on perpetuals until order sizing is rebuilt"
+
+
+def check_perp_sizing(strategy: str, params: dict | None) -> None:
+    """Refuse a model that sizes its position by a target weight (Donchian, trend filter with vol_target) on a
+    perpetual. A perp entry ignores the weight and opens at the full cap (review round 13, E13-6), and order sizing
+    is being rebuilt, so until then such a model is refused up front wherever it could start, backtest or be
+    studied; every entry point calls this. Side-only models and spot are unaffected."""
+    from sleeve_fund import markets
+
+    params = params or {}
+    if strategy in REGISTRY and markets.is_perp(params) and REGISTRY[strategy][0].weight_sized(params):
+        raise ValueError(f"{strategy.replace('_', ' ').capitalize()} is {PERP_WEIGHT_REFUSAL}")
+
+
 __all__ = [
+    "PERP_WEIGHT_REFUSAL",
     "REGISTRY",
+    "check_perp_sizing",
     "BuyAndHold",
     "BuyAndHoldConfig",
     "DipBuy",
