@@ -350,6 +350,16 @@ resets_t = Table(
     Column("done_at", TS, nullable=True),
     Column("run", String(64), nullable=False, default=""),
 )
+# A pause or halt in force when a reset was asked for, carried onto the fresh run so a reset never lifts
+# the kill switch, a risk halt or the PM's pause (round 13, U13-4). A new table: CREATE TABLE.
+reset_holds_t = Table(
+    "strategy_reset_holds",
+    metadata,
+    Column("reset_id", Integer, primary_key=True),
+    Column("status", String(16), nullable=False),
+    Column("status_reason", Text, nullable=False, default=""),
+    Column("paused_until", TS, nullable=True),
+)
 # Tables whose rows are a strategy's own run: moved to the run's name on a reset. sleeve_accounts and
 # sleeve_venues are copied (both need them); feed_seen starts afresh; backtests are never strategies on a book.
 # A saved backtest: one row per run, its result as the backtest page shows it, and its journal (orders,
@@ -1045,8 +1055,12 @@ class Store:
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         with self.engine.begin() as c:
-            c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
-                                              restart=int(s.desired_state == "running"), run=""))
+            rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
+                                                    restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
+            # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
+            if s.status in ("paused", "halted"):
+                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
+                                                       paused_until=s.paused_until))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
@@ -1087,9 +1101,14 @@ class Store:
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
+            hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
+            # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
+            # process keeps a status it starts with until the PM resumes it.
+            kept = ({"status": hold.status, "status_reason": f"{hold.status_reason} (kept through a reset)".strip(),
+                     "paused_until": hold.paused_until} if hold else
+                    {"status": "stopped", "status_reason": "reset: starts afresh", "paused_until": None})
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(
-                status="stopped", status_reason="reset: starts afresh", paused_until=None, heartbeat_at=None,
-                created_at=now, updated_at=now))
+                **kept, heartbeat_at=None, created_at=now, updated_at=now))
             c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=now, run=run))
         return run
 
