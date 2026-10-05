@@ -995,10 +995,10 @@ def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
     assert _new(c, name="auto-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="20").status_code == 303
     assert store.sleeve("auto-warm").warmup_bars == 20  # the slow average's length
     assert not [e for e in store.events("auto-warm") if e["kind"] == "warmup_short"]
+    # Fewer than the model needs is raised to what it needs (PM, 5 Oct 2026: the bare minimum is required).
     _new(c, name="short-warm", warmup_bars="10", p_trend_filter__fast="5", p_trend_filter__slow="20")
-    assert store.sleeve("short-warm").warmup_bars == 10
-    (e,) = [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
-    assert e["level"] == "info" and "needs 20 bars of history but 10 load at start" in e["message"]
+    assert store.sleeve("short-warm").warmup_bars == 20
+    assert not [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
     # Past the most the history store loads, the shortfall is an alert.
     _new(c, name="long-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="60000")
     assert store.sleeve("long-warm").warmup_bars == 50_000
@@ -1187,7 +1187,7 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     # Missing history is said on the page at once, with the way to get it, and starts no job (R8-M6).
     r = c.post("/research/run", data={**form, "instrument": "SOL/USD"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 200 and "there is no stored Kraken spot history for SOL/USD yet" in r.text
-    assert 'name="instrument" value="SOL/USD"><button>Collect SOL/USD history</button>' in r.text
+    assert 'name="instrument" value="SOL/USD"><input type="hidden" name="venue" value="kraken"><button>Collect SOL/USD history</button>' in r.text
 
 
 def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypatch):
@@ -1818,3 +1818,46 @@ def test_the_audit_trail_books_a_turn_from_long_to_short_at_the_turning_price():
     rows, keys = audit_rows(s, fills, {}, "KRAKEN")
     assert [r["realised_pnl"] for r in rows] == pytest.approx([0.0, 10.0, 10.0]) and keys == []
     assert [r["position_after"] for r in rows] == pytest.approx([1.0, -2.0, 0.0])
+
+
+def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_path, monkeypatch):
+    """Binance as a venue on every page that picks one (PM, 5 Oct 2026): the research page shows the chosen
+    venue's stored history and asks its collector, the backtest page tests its perpetual, and a new strategy
+    keeps its venue. A perpetual venue has no spot, so spot there is refused with the reason."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard.app import _backtest_args
+    from sleeve_fund.venues import venue
+    from test_research import _stored_minutes
+
+    c, store = client
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    history.HistoryStore().append("KRAKEN", "ETH/USD", _stored_minutes(3), cursor="x")
+    history.HistoryStore().append("BINANCE", "SOL/USDT", _stored_minutes(3), cursor="y")
+    monkeypatch.setattr(venue("binance"), "check_listed", lambda pair: None)
+    page = c.get("/research?venue=binance", auth=AUTH).text
+    assert '<option value="binance" selected' in page and "data-reload" in page
+    assert '<td data-label="Instrument">SOL/USDT</td>' in page and '<td data-label="Instrument">ETH/USD</td>' not in page
+    assert "trade its perpetual, long only" in page and 'name="venue" value="binance"' in page
+    assert '<td data-label="Instrument">ETH/USD</td>' in c.get("/research", auth=AUTH).text
+    asked = c.post("/research/history", data={"instrument": "xrp/usdt", "venue": "binance"}, auth=AUTH, headers=SAME)
+    assert "Asked the collector for XRP/USDT" in asked.text and not store.history_requests("KRAKEN")
+    assert [r["instrument"] for r in store.history_requests("BINANCE")] == ["XRP/USDT"]
+    none = c.post("/research/run", data={"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance",
+                                         "minutes": "1440", "risk_profile": "balanced"}, auth=AUTH, headers=SAME)
+    assert "no stored Binance USD-M perpetuals history for BTC/USDT" in none.text
+
+    bt = c.get("/backtest?venue=binance", auth=AUTH).text
+    assert '<option value="binance" selected' in bt and '<option value="BTC/USDT">' in bt
+    q = {"strategy": "buy_and_hold", "instrument": "BTC/USDT", "venue": "binance", "bar_spec": "1-DAY-LAST-EXTERNAL"}
+    with pytest.raises(ValueError, match="perpetuals only"):
+        _backtest_args(q)
+    args = _backtest_args({**q, "market": "perp"})
+    assert args["venue"] == "BINANCE" and "(Binance USD-M perpetuals)" in args["title"]
+
+    spot = _new(c, name="bn-spot", instrument="BTC/USDT", venue="binance")
+    assert "perpetuals+only" in spot.headers["location"] and "venue=binance" in spot.headers["location"]
+    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp")
+    assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
+    assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
+    shown = c.get("/sleeves/bn-perp", auth=AUTH).text
+    assert "Trading BTC/USDT on Binance USD-M perpetuals" in shown and "venue=binance" in shown  # clone keeps it

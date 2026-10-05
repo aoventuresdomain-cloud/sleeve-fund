@@ -17,7 +17,7 @@ from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Sma
+from sleeve_fund.strategies.indicators import Sma, settle_bars
 
 SPEC = IdeaSpec(
     summary="Long while the {fast}-bar average is above the {slow}-bar average, otherwise flat in cash.",
@@ -91,9 +91,10 @@ class TrendFilter(LongFlatStrategy):
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
-        # Exponential averages settle over about two spans; volatility needs its whole window.
+        # An exponential average settles over ten spans (indicators.settle_bars), a simple one over its own
+        # length; volatility needs its whole window.
         slow = int(params.get("slow", 200))
-        need = 2 * slow if params.get("ema") else slow
+        need = settle_bars(slow) if params.get("ema") else slow
         if params.get("vol_target"):
             need = max(need, int(int(params.get("vol_lookback_days", 30)) * 1440 / bar_minutes) + 1)
         return need

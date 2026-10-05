@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import pytest
 
+from sleeve_fund.paper.config import from_store
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.supervisor import Proc, clear, decide, seed
 
@@ -60,12 +61,21 @@ def test_the_seeded_strategies_are_the_two_test_strategies(store):
     import glob
 
     assert sorted(seed(store, sorted(glob.glob("configs/sleeves/*.toml")))) == [
-        "ping-pong-ls-test", "ping-pong-test", "rsi-bands-ls-test", "rsi-bands-test"]
+        "ping-pong-ls-binance", "ping-pong-ls-test", "ping-pong-test", "rsi-bands-15m-ls-test", "rsi-bands-15m-test",
+        "rsi-bands-ls-binance", "rsi-bands-ls-test", "rsi-bands-test"]
+    # RSI(14) warms up on ten periods of history, whatever the file says (PM, 5 Oct 2026).
+    assert store.sleeve("rsi-bands-test").warmup_bars == 140
+    m15 = store.sleeve("rsi-bands-15m-ls-test")
+    assert (m15.bar_spec, m15.warmup_bars, m15.desired_state) == ("15-MINUTE-LAST-INTERNAL", 140, "stopped")
     assert store.sleeve("rsi-bands-test").bar_spec == "1-MINUTE-LAST-INTERNAL"
     # The long/short pair trade a perpetual and are added stopped, for the PM to start.
     ls = store.sleeve("ping-pong-ls-test")
     assert (ls.params["market"], ls.params["allow_short"], ls.desired_state, ls.status) == ("perp", True, "stopped", "stopped")
     assert store.sleeve("ping-pong-test").desired_state == "running"
+    # The Binance copies trade Binance's own perpetual, stopped until the PM starts them; the rest stay on Kraken.
+    bn = store.sleeve("rsi-bands-ls-binance")
+    assert (bn.venue, bn.instrument, bn.params["market"], bn.desired_state) == ("BINANCE", "BTC/USDT", "perp", "stopped")
+    assert from_store(bn).instrument_id == "BTCUSDT-PERP.BINANCE" and ls.venue is None
 
 
 def test_clear_puts_every_strategy_away_once_and_keeps_its_journal(store, sleeve, tmp_path):

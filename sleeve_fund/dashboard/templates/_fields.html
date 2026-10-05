@@ -1,7 +1,17 @@
 {# Form sections shared by the new-sleeve form and the backtest page, so a backtest's settings
    carry straight into a sleeve. `pre` holds values to prefill (from the query string). #}
 {% macro pair_field(instruments, pre) %}
-<div class="field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument', 'BTC/USD') }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist></div>
+<div class="field"><label for="instrument">Instrument</label><input id="instrument" name="instrument" list="pairs" value="{{ pre.get('instrument') or ('BTC/USD' if 'BTC/USD' in instruments or not instruments else instruments[0]) }}" required pattern="[A-Za-z0-9]{1,12}/[A-Za-z0-9]{2,6}" autocomplete="off"><datalist id="pairs">{% for i in instruments %}<option value="{{ i }}">{% endfor %}</datalist></div>
+{% endmacro %}
+
+{% macro venue_field(pre, reload=False) %}
+{# Where the strategy is researched, tested and paper traded. A perpetual venue has no spot, so picking one
+   sets the market to its perpetual (console.js venueField). `reload`: the page shows that venue's stored
+   history, so it reloads on a change. #}
+{% set chosen = (pre.get('venue') or '')|lower %}
+<div class="field"><label for="venue">Venue</label><select id="venue" name="venue"{% if reload %} data-reload{% endif %}>
+  {% for v in venue_choices() %}<option value="{{ v.key }}" {{ 'selected' if v.key == chosen or (not chosen and loop.first) }} data-perp="{{ '1' if v.perpetual }}" data-pairs="{{ v.pairs|join(',') }}">{{ v.label }}{{ ': perpetuals only' if v.perpetual else ': spot, or a simulated perpetual' }}</option>{% endfor %}
+</select></div>
 {% endmacro %}
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}

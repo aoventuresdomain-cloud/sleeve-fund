@@ -224,3 +224,21 @@ def test_a_quiet_instrument_is_valued_from_its_quotes_until_it_trades(monkeypatc
     assert s._price() == pytest.approx(1.18)
     last["px"] = Price(1.2, 4)
     assert s._price() == pytest.approx(1.2)  # a trade price wins once there is one
+
+
+def test_a_strategy_always_warms_up_on_what_its_indicators_need():
+    """PM, 5 Oct 2026: the warm-up is automatic, at least what the model's indicators need to settle (ten
+    lengths for Wilder's RSI and an EMA), whatever was asked for, within what can load."""
+    from sleeve_fund.paper.config import MAX_WARMUP_BARS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup
+
+    base = dict(name="x", instrument="BTC/USD", starting_balance=1000)
+    rsi = SleeveConfig(**base, strategy="rsi_bands", bar_spec="15-MINUTE-LAST-INTERNAL", warmup_bars=42)
+    assert rsi.warmup_bars == 140
+    more = SleeveConfig(**base, strategy="rsi_bands", bar_spec="15-MINUTE-LAST-INTERNAL", warmup_bars=500)
+    assert more.warmup_bars == 500  # more can be asked for
+    assert auto_warmup("trend_filter", {"slow": 200, "ema": True}, "1-MINUTE-LAST-INTERNAL") == 2000
+    assert auto_warmup("trend_filter", {"slow": 200}, "1-MINUTE-LAST-INTERNAL") == 200  # a simple average
+    assert auto_warmup("trend_filter", {"slow": 200, "ema": True}, "1-DAY-LAST-EXTERNAL") == VENUE_WARMUP_BARS
+    assert auto_warmup("rsi_pullback", {}, "1-MINUTE-LAST-INTERNAL") == 2000  # its EMA(200)
+    assert auto_warmup("ping_pong", {}, "1-MINUTE-LAST-INTERNAL") == 0
+    assert auto_warmup("trend_filter", {"slow": 20_000, "ema": True}, "1-MINUTE-LAST-INTERNAL") == MAX_WARMUP_BARS

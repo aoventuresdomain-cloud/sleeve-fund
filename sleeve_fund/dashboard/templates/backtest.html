@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import signed, money_signed, tag, why, why_toggle, price_chart, help %}
-{% from "_fields.html" import pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
+{% from "_fields.html" import venue_field, pair_field, strategy_fields, exit_fields, order_fields, market_fields %}
 {% block title %}Backtest · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -12,6 +12,7 @@
   <form class="panel span-4 bt-form{{ ' has-result' if result or error }}" method="get" action="/backtest" id="bt-form">
     <input type="hidden" name="run" value="1">
     <div class="panel-head"><h2>Settings</h2></div>
+    {{ venue_field(pre) }}
     {{ pair_field(instruments, pre) }}
     {{ strategy_fields(strategies, chosen, g1, pre) }}
     <div class="grid2">

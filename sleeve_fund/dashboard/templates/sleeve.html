@@ -20,7 +20,7 @@
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
-  <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }} on {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
+  <p class="lede">{{ idea or s.strategy|replace('_', ' ') }} Trading {{ s.instrument }}{% if s.venue %} on {{ venue_label(s.venue) }}{% endif %}, {{ bar_label(s.bar_spec) }}, {{ x.profile.name }} risk profile.</p>
 </div>
 
 <div data-live="banners">
@@ -213,7 +213,7 @@
     <div class="panel-head"><h2 id="set-h">Settings</h2></div>
     <table class="compact kv">
       <tr><th scope="row">Model</th><td>{{ s.strategy|replace('_', ' ') }}</td></tr>
-      <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</td></tr>
+      <tr><th scope="row">Instrument and bars</th><td>{{ s.instrument }}{% if s.venue %} on {{ venue_label(s.venue) }}{% endif %}, {{ bar_label(s.bar_spec) }}</td></tr>
       {% if not backtest_id %}{% set movable = not x.qty %}
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
         <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
