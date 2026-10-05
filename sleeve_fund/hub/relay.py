@@ -5,7 +5,8 @@ fan-out (sleeve_fund.hub.server); closed bars also go to `sink`, the storage sid
 which this module leaves to its owner.
 
 A minute the hub missed (the venue connection dropped, or the hub was down) is announced as a gap and refilled
-from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits."""
+from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits.
+Writes to the store run on a thread of their own too, in the order the bars were seen."""
 
 from __future__ import annotations
 
@@ -48,6 +49,25 @@ class Gaps:
         return None
 
 
+def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callable[[dict], None]:
+    """Hands each closed bar to the history store's write path, HistoryStore.append_bars(venue, instrument,
+    bars, source), which the storage side owns: bars as (open_time_ns, open, high, low, close, volume), source
+    "live" or "refill". A store without it yet (until that lands) is skipped, said once."""
+    append = getattr(history, "append_bars", None)
+    if append is None:
+        log(f"hub {venue}: the history store has no append_bars yet; bars are relayed but not stored")
+        return lambda msg: None
+
+    def sink(msg: dict) -> None:
+        pair = pairs.get(msg["id"])
+        if pair is None:
+            return
+        bar = (msg["ts"] - MINUTE_NS, *(float(msg[k]) for k in ("o", "h", "l", "c", "v")))
+        append(venue, pair, [bar], "refill" if msg["refilled"] else "live")
+
+    return sink
+
+
 def refill_bars(recent, pair: str, instrument_id: str, since_ns: int, until_ns: int, now_ns: int) -> list[dict]:
     """The venue's own closed 1-minute candles closing from since_ns to until_ns, as refilled bar messages.
     recent: the venue profile's ohlc_history ((pair, minutes) -> candles by open time, newest still forming)."""
@@ -71,24 +91,27 @@ class HubRelay(DataActor):
         super().__init__(config)
         self.fanout = None  # attach() before the node runs
         self.sink: Callable[[dict], None] = lambda bar: None
-        self.pairs: dict[str, str] = {}  # instrument id -> pair, for the REST refill
-        self.recent = None
+        self.pairs: dict[str, str] = {}  # instrument id -> pair, for the REST refill and the store
+        self.recent = self.discover = None
         self.relayed: set[str] = set()
         self.gaps = Gaps()
         self._wanted: set[str] = set()
         self._lock = threading.Lock()
         self._last_tick = 0.0
         self._refill = ThreadPoolExecutor(1, thread_name_prefix="hub-refill")
+        self._store = ThreadPoolExecutor(1, thread_name_prefix="hub-store")
         self._initial = tuple(config.instrument_ids)
         self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
-               last_close: dict[str, int] | None = None) -> "HubRelay":
-        """last_close: per instrument, the close of the last bar already stored, so the minutes the hub was
-        down are refilled from its first bar."""
-        self.fanout, self.recent = fanout, recent
+               last_close: dict[str, int] | None = None, discover=None) -> "HubRelay":
+        """pairs: {instrument id: pair}, kept up to date in place (the sink may hold the same dict). last_close:
+        per instrument, the close of the last bar already stored, so the minutes the hub was down are refilled
+        from its first bar. discover: () -> {instrument id: pair}, read every REFRESH_SECONDS, so a strategy
+        added while the hub runs is relayed and stored without a restart."""
+        self.fanout, self.recent, self.discover = fanout, recent, discover
         self.sink = sink or self.sink
-        self.pairs = dict(pairs or {})
+        self.pairs = pairs if pairs is not None else {}
         self.gaps.last.update(last_close or {})
         return self
 
@@ -114,6 +137,14 @@ class HubRelay(DataActor):
                              callback=self._refresh)
 
     def _refresh(self, _event=None) -> None:
+        if self.discover is not None:
+            try:
+                found = self.discover()
+            except Exception as exc:  # noqa: BLE001 - the database away for a moment: try again next pass
+                self.log.warning(f"hub: can't list instruments: {exc}")
+                found = {}
+            self.pairs.update(found)
+            self.want(set(found))
         with self._lock:
             wanted, self._wanted = self._wanted, set()
         for iid in sorted(wanted - self.relayed):
@@ -152,7 +183,7 @@ class HubRelay(DataActor):
             self._refill.submit(self._fill, iid, since, until)
         if not partial:
             self.fanout.publish(msg)
-            self.sink(msg)
+            self._store.submit(self._keep, msg)
 
     def _fill(self, iid: str, since_ns: int, until_ns: int) -> None:
         pair = self.pairs.get(iid)
@@ -165,4 +196,10 @@ class HubRelay(DataActor):
             return
         for b in bars:
             self.fanout.publish(b)
-            self.sink(b)
+            self._store.submit(self._keep, b)
+
+    def _keep(self, msg: dict) -> None:
+        try:
+            self.sink(msg)
+        except Exception as exc:  # noqa: BLE001 - a failed write mustn't stop the relay; the store's gap shows it
+            print(f"hub: storing {msg['id']} {msg['ts']} failed: {exc!r}")

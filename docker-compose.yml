@@ -77,6 +77,20 @@ services:
     volumes: [history:/data/history]
     command: python -m sleeve_fund.history run --venue binance
 
+  # The Binance market data hub (v2 P1-1, sleeve_fund/hub): one public websocket relaying trades, quotes and
+  # 1-minute bars to every client on port 7700 of this network, and handing closed bars to the history store.
+  # Public data only: it refuses to start with any venue credential. Nothing reads from it until the paper
+  # node's hub client lands; history-binance keeps the store until the store's append_bars write path does.
+  hub-binance:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy }, volume-init: { condition: service_completed_successfully } }
+    environment:
+      DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
+      HISTORY_DIR: /data/history
+    volumes: [history:/data/history]
+    command: python -m sleeve_fund.hub run --venue binance --port 7700
+
   # Copies the fills of strategies with demo_mirror = true to a demo account (sleeve_fund/mirror.py): Bybit
   # Demo Trading for strategies on Binance's USDT perpetuals, the Deribit TESTNET for the rest. The only
   # service given the demo keys, and it refuses any other host or credential; off quietly unless DEMO_MIRROR is on and a demo

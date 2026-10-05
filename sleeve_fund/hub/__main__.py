@@ -9,7 +9,7 @@ import sys
 
 import pandas as pd
 
-from sleeve_fund.hub.relay import HubRelay, HubRelayConfig
+from sleeve_fund.hub.relay import HubRelay, HubRelayConfig, store_sink
 from sleeve_fund.hub.server import Fanout
 from sleeve_fund.paper.safety import assert_keyless
 from sleeve_fund.venues import venue as venue_profile
@@ -49,7 +49,12 @@ def build(profile, port: int, sink=None):
     pairs = instruments(profile)
     relay = HubRelay(HubRelayConfig(instrument_ids=tuple(sorted(pairs))))
     fanout = Fanout(profile.name, known=relay.known, want=relay.want, venue_up=relay.venue_up)
-    relay.attach(fanout, sink=sink, pairs=pairs, recent=profile.ohlc_history, last_close=last_closes(profile, pairs))
+    if sink is None:
+        from sleeve_fund.history import HistoryStore
+
+        sink = store_sink(HistoryStore(), profile.name, pairs)  # the same dict the relay keeps up to date
+    relay.attach(fanout, sink=sink, pairs=pairs, recent=profile.ohlc_history, last_close=last_closes(profile, pairs),
+                 discover=lambda: instruments(profile))
     data_factory, data_config = profile.data_client()
     node = (
         LiveNode.builder(f"HUB-{profile.name}", TraderId.from_str(f"HUB-{profile.name}"), Environment.SANDBOX)
