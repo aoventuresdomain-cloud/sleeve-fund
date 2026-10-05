@@ -22,6 +22,7 @@ FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent a
 RECONCILE_EVERY = timedelta(hours=24)
 # How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
 SPREAD_EVERY = timedelta(hours=1)
+FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy page is at most this stale
 SPREAD_MIN_SAMPLES = 100
 
 
@@ -73,6 +74,7 @@ class SleeveRuntime:
         self._day = None
         self._day_open = None
         self._last_equity = None
+        self._feed_written = None
         self._spreads: list[float] = []
         self._spread_since = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
@@ -320,6 +322,14 @@ class SleeveRuntime:
         return False
 
     # --- quotes -------------------------------------------------------------------
+
+    def market_seen(self) -> None:
+        """A trade or quote arrived from the venue: kept for the price feed's age on the strategy page, at most
+        every FEED_WRITE_EVERY so a busy feed doesn't write on every tick."""
+        now = self.now()
+        if self._feed_written is None or now - self._feed_written >= FEED_WRITE_EVERY:
+            self.store.feed_seen(self.name, now)
+            self._feed_written = now
 
     def on_quote(self, bid: float, ask: float, venue: str) -> None:
         """Sample the half spread; once an hour record its median, which backtests then charge."""

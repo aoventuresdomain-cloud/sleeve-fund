@@ -96,6 +96,21 @@ def test_a_silent_feed_is_flagged_then_restarted(tmp_path):
     assert not [t for t in marks if dead["ts"] < t < back["ts"]]  # no marks, no heartbeat: the supervisor restarts it
 
 
+def test_paper_keeps_when_the_venue_last_sent_a_trade_or_quote(tmp_path):
+    """PM, 5 Oct 2026: the price feed's age on the strategy page. The strategy notes the time of the venue's
+    latest trade or quote, every few seconds at most, and a silent feed leaves it where the feed stopped."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.store import Store
+
+    path = _synthetic(tmp_path / "feed.jsonl.gz", minutes=12, silent=(10, 12))  # silent for the last two minutes
+    store = Store.in_memory()
+    replay(path, store=store)
+    seen = store.last_feed("replay-test")
+    stopped = datetime.fromtimestamp(START / 1e9, tz=timezone.utc) + timedelta(minutes=10)
+    assert seen is not None and stopped - timedelta(seconds=4) <= seen <= stopped
+
+
 @pytest.mark.usefixtures("maker_on")
 def test_fills_at_8_lot_decimals_are_journaled_as_the_account_holds_them(tmp_path):
     """A venue lists XRP at 8 lot decimals while the account keeps 6. Post-only entries fill in slices sized

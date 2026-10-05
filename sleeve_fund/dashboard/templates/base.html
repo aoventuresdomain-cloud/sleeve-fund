@@ -52,7 +52,7 @@
       <span class="wide">{{ 'Live trading locked until G2 is approved' if shell.live_locked else 'Live trading enabled' }}</span>
       <span class="sep"></span>
       <span data-live="health"><span class="{{ 'bad-dot' if shell.unhealthy or shell.attention else 'ok' }}">{% if shell.attention %}{{ shell.attention }} halted{% elif shell.unhealthy %}{{ shell.unhealthy }} not reporting{% else %}{{ shell.running }} of {{ shell.total }} strategies running{% endif %}</span></span>
-      <span class="wide">Prices: Kraken live feed</span>
+      {% block feed %}<span class="wide">Prices: live venue feeds</span>{% endblock %}
       <span class="live" id="live" hidden aria-live="polite"></span>
       <span class="clock" id="clock" data-now="{{ shell.now.isoformat() }}">{{ shell.now.strftime('%H:%M') }} UTC</span>
     </div>

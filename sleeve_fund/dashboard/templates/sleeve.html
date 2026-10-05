@@ -4,6 +4,7 @@
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% block title %}{{ s.name }} · Multi-Strategy Fund{% endblock %}
+{% block feed %}{% if price_feed %}<span data-live="feed" title="How long since {{ price_feed.label }} last sent this strategy a trade or quote. Past a minute the feed reads as stale; marks and guards then use the last price."><span class="{{ {'ok': 'ok', 'stale': 'bad-dot'}.get(price_feed.state, 'faint') }}">{{ price_feed.label }} prices: {{ price_feed.age }}</span></span>{% else %}{{ super() }}{% endif %}{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
   <h1>{{ s.name }}</h1> {% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}
