@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
+from sleeve_fund.accounts import KEYS_FILE
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
@@ -44,6 +45,7 @@ from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -1203,6 +1205,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 and abs(st().journal_book(s.name, s.starting_balance)["qty"]) > 1e-12}
         for r in rows:
             r["env"] = acc.env_names(r["name"], r["venue"]) if r["kind"] == "live" else None
+            r["venue_label"] = venue_profile(r["venue"]).label if r["kind"] == "live" else None
             r["running"] = [n for n in r["sleeves"] if n in running]
             r["held"] = [n for n in r["sleeves"] if n in held]  # stopped, still holding a position
         return rows
@@ -1215,8 +1218,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = str(form.get("reason", "")).strip()
             if not reason:
                 raise ValueError("a reason is required")
-            st().create_account(name, str(form.get("kind", "")), str(form.get("note", "")).strip()[:200])
-            st().decide(actor, "create_account", f"{form.get('kind')} account {name}: {reason}")
+            kind = str(form.get("kind", ""))
+            st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
+            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
             return RedirectResponse(f"/setup?{urlencode({'error': str(exc), **kept})}#add", status_code=303)
@@ -1273,7 +1278,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         here = setup_view.stage(frame, sleeves, mirror)
         accounts = _accounts_rows()
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
-                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
+                    tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts, keys_file=KEYS_FILE,
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
                     paper_count=sum(1 for x in sleeves if x.name not in st().archived()),

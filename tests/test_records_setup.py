@@ -62,7 +62,7 @@ def test_old_pages_redirect_with_their_query(client):
 
 def test_account_forms_land_on_setup_with_their_result(client):
     c, store = client
-    ok = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "reason": "first"}, auth=AUTH,
+    ok = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "venue": "kraken", "reason": "first"}, auth=AUTH,
                 headers=SAME, follow_redirects=False)
     assert ok.headers["location"] == "/setup?saved=kraken-trend#acct-kraken-trend"
     page = c.get(ok.headers["location"], auth=AUTH).text
@@ -209,7 +209,7 @@ def test_setup_cards_and_detail(client):
     assert "halt at 10%" in page and "halt at 20%" in page and "halt at 35%" in page
     assert "Kraken spot" in page and "0.8% taker" in page
     # Today's Accounts and Settings content, unchanged, as the detail.
-    assert "Connect a Kraken sub-account" in page and "How to connect" in page and "Never tick Withdraw Funds" in page
+    assert "Connect a live account" in page and "How to connect" in page and "Never allow withdrawals" in page
     assert "Live trading" in page and "Pause at daily loss" in page and "DASHBOARD_PASSWORD" in page
     assert 'id="tab-accounts"' in page and 'id="tab-settings"' in page and "test-pw" not in page
     store.event(None, "info", "alerts_config", "Alerts go to api.telegram.org; uptime pings go to hc-ping.com.")

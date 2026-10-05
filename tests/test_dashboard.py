@@ -629,8 +629,8 @@ def test_accounts_page_adds_live_accounts_and_shows_key_presence_only(client, mo
 
     c, store = client
     page = c.get("/accounts", auth=AUTH).text
-    assert "paper" in page and "Connect a Kraken sub-account" in page and "Never tick Withdraw Funds" in page
-    r = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "reason": "first live sub-account"},
+    assert "paper" in page and "Connect a live account" in page and "Never allow withdrawals" in page
+    r = c.post("/accounts/new", data={"name": "kraken-trend", "kind": "live", "venue": "kraken", "reason": "first live sub-account"},
                auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303
     assert "KRAKEN_API_KEY__KRAKEN_TREND=your-api-key" in c.get("/accounts", auth=AUTH).text
@@ -653,7 +653,7 @@ def test_account_rules(client):
     assert "error=" in bad.headers["location"] and "name=Bad+Name" in bad.headers["location"]
     assert c.post("/accounts/new", data={"name": "x1", "kind": "live", "reason": "x"}, auth=AUTH,
                   headers={"Origin": "https://evil.example"}).status_code == 403
-    store.create_account("kraken-live", "live")
+    store.create_account("kraken-live", "live", venue="kraken")
     store.create_account("research", "paper")
     form = c.get("/sleeves/new", auth=AUTH).text
     assert 'value="kraken-live" disabled' in form and "live, locked until G2" in form
@@ -863,10 +863,71 @@ def test_path_to_live_reports_g2_evidence_and_never_approves(client):
     store.event("btc-test", "error", "reconcile_mismatch", "engine 1 BTC, journal 0")
     rows = {r["label"]: r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow())}
     assert rows["Journal and engine always agreed"]["bad"] and not rows["Strategy passed G1"]["ok"]
-    store.create_account("kraken-live", "live")
+    store.create_account("kraken-live", "live", venue="kraken")
     store.report_keys({"kraken-live": True})
     rows = {r["label"]: r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow())}
-    assert rows["Live Kraken account with its key installed"]["detail"] == "kraken-live"
+    assert rows["Live Kraken spot account with its key installed"]["detail"] == "kraken-live"
+
+
+def test_g2_key_row_counts_only_a_key_on_the_strategys_own_venue(client):
+    """A Binance strategy with only a Kraken key installed has no live account it could trade on."""
+    import copy
+
+    from sleeve_fund.dashboard import gates
+    from sleeve_fund.dashboard.book import sleeve_extras
+    from sleeve_fund.dashboard.metrics import sleeve_summary
+    from sleeve_fund.store import utcnow
+
+    c, store = client
+    _new(c)
+    x = sleeve_extras(store, sleeve_summary(store, store.sleeve("btc-test")), __import__("pandas").DataFrame())
+    on_binance = copy.copy(x["sleeve"])
+    object.__setattr__(on_binance, "venue", "BINANCE")
+    store.create_account("kraken-live", "live", venue="kraken")
+    store.report_keys({"kraken-live": True})
+
+    def key_row(sleeve):
+        return next(r for r in gates.path_to_live(store, {**x, "sleeve": sleeve}, None, store.accounts(), utcnow())
+                    if r["label"].endswith("account with its key installed"))
+
+    row = key_row(on_binance)
+    assert row["label"] == "Live Binance USD-M perpetuals account with its key installed" and row["ok"] is False
+    assert row["detail"] == "add one on the Accounts page"
+    store.create_account("binance-live", "live", venue="binance")
+    store.report_keys({"kraken-live": True, "binance-live": True})
+    assert key_row(on_binance)["detail"] == "binance-live" and key_row(x["sleeve"])["detail"] == "kraken-live"
+
+
+def test_accounts_carry_a_registered_venue_and_paper_names_none(client):
+    c, store = client
+    with pytest.raises(ValueError, match="needs its venue"):
+        store.create_account("no-venue", "live")
+    with pytest.raises(ValueError, match="needs its venue"):
+        store.create_account("odd-venue", "live", venue="nowhere")
+    store.create_account("b-live", "live", venue="BINANCE")
+    store.create_account("desk-c", "paper", venue="binance")
+    by = {a["name"]: a for a in store.accounts()}
+    assert by["b-live"]["venue"] == "binance" and by["desk-c"]["venue"] == "" and by["paper"]["venue"] == ""
+    assert "kraken" not in by["paper"]["note"].lower()
+    r = c.post("/accounts/new", data={"name": "b-two", "kind": "live", "venue": "binance", "reason": "x"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and "error" not in r.headers["location"]
+    page = c.get("/setup", auth=AUTH).text
+    assert '<option value="binance"' in page and "Binance USD-M perpetuals" in page
+
+
+def test_the_old_paper_account_loses_its_venue_and_its_default_note_only(client):
+    from sleeve_fund.store import accounts_t, insert, utcnow
+
+    _, store = client
+
+    with store.engine.begin() as c:
+        c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
+                                            note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+    paper = next(a for a in store.accounts() if a["name"] == "paper")
+    assert paper["venue"] == "" and paper["note"] == "Simulated money at each strategy's own venue prices and fees"
+    store.set_account_note("paper", "the PM's own words")
+    assert next(a for a in store.accounts() if a["name"] == "paper")["note"] == "the PM's own words"
 
 
 def test_new_sleeve_form_is_one_step_at_a_time_with_javascript_and_whole_without(client):
@@ -1563,7 +1624,7 @@ def test_strategies_move_between_accounts_only_when_flat(client):
     c, store = client
     _new(c)
     store.create_account("desk-b", "paper")
-    store.create_account("kraken-live", "live")
+    store.create_account("kraken-live", "live", venue="kraken")
 
     def move(account, reason="reorganise"):
         return c.post("/sleeves/btc-test/account", data={"account": account, "reason": reason}, auth=AUTH, headers=SAME,

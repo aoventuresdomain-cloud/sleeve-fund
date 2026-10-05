@@ -10,10 +10,10 @@
 <section class="panel flush" aria-labelledby="acc-h">
   <div class="panel-head"><h2 id="acc-h">Your accounts</h2></div>
   <table class="responsive">
-    <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Kraken key on the server</th><th>Note</th><th></th></tr></thead>
+    <thead><tr><th>Account</th><th>Type</th><th>Strategies</th><th>Key on the server</th><th>Note</th><th></th></tr></thead>
     <tbody>{% for a in accounts %}
     <tr id="acct-{{ a.name }}" {% if a.retired_at %}class="muted"{% endif %}><td><strong>{{ a.name }}</strong>{% if a.retired_at %} <span class="chip">Retired</span>{% endif %}</td>
-      <td data-m="right"><span class="chip {{ a.kind }}">{{ 'Live' if a.kind == 'live' else 'Paper' }}</span></td>
+      <td data-m="right"><span class="chip {{ a.kind }}">{{ 'Live' if a.kind == 'live' else 'Paper' }}</span>{% if a.venue_label %} <span class="muted">{{ a.venue_label }}</span>{% endif %}</td>
       <td data-label="Strategies">{% for n in a.sleeves %}<a href="/sleeves/{{ n }}">{{ n }}</a>{{ ', ' if not loop.last }}{% else %}<span class="muted">None yet</span>{% endfor %}</td>
       <td data-m="right">{% if a.kind == 'paper' %}<span class="muted">Not needed</span>
         {% elif a.key_present %}<span class="gain">Installed</span> <span class="muted">checked {{ a.key_checked_at|ago }}</span>
@@ -56,20 +56,20 @@
 
 <div class="grid" style="align-items:start">
   <section class="panel span-7" aria-labelledby="how-h">
-    <div class="panel-head"><h2 id="how-h">Connect a Kraken sub-account</h2></div>
+    <div class="panel-head"><h2 id="how-h">Connect a live account</h2></div>
     <details class="more-fields"><summary>How to connect: five steps, about ten minutes</summary>
     <ol class="steps-list">
-      <li><strong>On Kraken:</strong> create the sub-account and move into it only the money that strategy may trade. Keeping each live strategy on its own sub-account limits what any one model can lose.</li>
-      <li><strong>Create an API key in that sub-account</strong> with these permissions only: Query Funds, Query Open Orders &amp; Trades, Query Closed Orders &amp; Trades, Create &amp; Modify Orders, and Cancel/Close Orders. <strong>Never tick Withdraw Funds.</strong></li>
-      <li><strong>Add it here</strong> as a live account (form below). Use a short name such as <code>kraken-trend</code>.</li>
-      <li><strong>Put the key on the server, nowhere else.</strong> Sign in to the server over SSH, open <code>/opt/sleeve-fund/kraken.env</code>, and add the two lines this page shows for the account. Then run <code>cd /opt/sleeve-fund &amp;&amp; sudo docker compose up -d supervisor</code>. Don't paste a key into GitHub, chat, or this dashboard.</li>
+      <li><strong>At the venue:</strong> create the sub-account and move into it only the money that strategy may trade. Keeping each live strategy on its own sub-account limits what any one model can lose.</li>
+      <li><strong>Create an API key in that sub-account</strong> that can only read balances, orders and trades, and place and cancel orders. <strong>Never allow withdrawals.</strong></li>
+      <li><strong>Add it here</strong> as a live account on its venue (form below). Use a short name such as <code>live-trend</code>.</li>
+      <li><strong>Put the key on the server, nowhere else.</strong> Sign in to the server over SSH, open <code>/opt/sleeve-fund/{{ keys_file }}</code>, and add the two lines this page shows for the account. Then run <code>cd /opt/sleeve-fund &amp;&amp; sudo docker compose up -d supervisor</code>. Don't paste a key into GitHub, chat, or this dashboard.</li>
       <li><strong>Check it here:</strong> within a minute the account shows the key as installed. Strategies can only use a live account once you've approved G2 and the server's live switch is on.</li>
     </ol>
     </details>
     {% set live = accounts|selectattr('kind', 'equalto', 'live')|list %}
     {% if live %}
-    <h3 style="margin:14px 0 6px;font-size:13px">Lines for kraken.env</h3>
-    <pre class="code">{% for a in live %}# {{ a.name }}
+    <h3 style="margin:14px 0 6px;font-size:13px">Lines for {{ keys_file }}</h3>
+    <pre class="code">{% for a in live %}# {{ a.name }} ({{ a.venue_label }})
 {{ a.env[0] }}=your-api-key
 {{ a.env[1] }}=your-private-key
 {% endfor %}</pre>
@@ -79,8 +79,9 @@
 
   <form class="panel span-5" method="post" action="/accounts/new" id="add" aria-labelledby="add-h">
     <div class="panel-head"><h2 id="add-h">Add an account</h2></div>
-    <div class="field"><label for="a-name">Name</label><input id="a-name" name="name" required pattern="[a-z0-9][a-z0-9\-]{1,40}" placeholder="kraken-trend" value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
-    <div class="field"><label for="a-kind">Type</label><select id="a-kind" name="kind"><option value="live" {{ 'selected' if pre.get('kind', 'live') == 'live' }}>Live: a Kraken account or sub-account</option><option value="paper" {{ 'selected' if pre.get('kind') == 'paper' }}>Paper: simulated money, for grouping strategies</option></select></div>
+    <div class="field"><label for="a-name">Name</label><input id="a-name" name="name" required pattern="[a-z0-9][a-z0-9\-]{1,40}" placeholder="live-trend" value="{{ pre.get('name', '') }}"><p class="hint">Lower-case letters, digits and dashes.</p></div>
+    <div class="field"><label for="a-kind">Type</label><select id="a-kind" name="kind"><option value="live" {{ 'selected' if pre.get('kind', 'live') == 'live' }}>Live: an account or sub-account on one venue</option><option value="paper" {{ 'selected' if pre.get('kind') == 'paper' }}>Paper: simulated money, for grouping strategies</option></select></div>
+    <div class="field"><label for="a-venue">Venue</label><select id="a-venue" name="venue">{% for v in venues %}<option value="{{ v.name|lower }}" {{ 'selected' if pre.get('venue') == v.name|lower }}>{{ v.label }}</option>{% endfor %}</select><p class="hint">For a live account. A paper account trades at each strategy's own venue.</p></div>
     <div class="field"><label for="a-note">Note (optional)</label><input id="a-note" name="note" maxlength="200" placeholder="What this account is for" value="{{ pre.get('note', '') }}"></div>
     <div class="field"><label for="a-reason">Why add it?</label><input id="a-reason" name="reason" required placeholder="Recorded in the decision log" value="{{ pre.get('reason', '') }}"></div>
     <button>Add account</button>

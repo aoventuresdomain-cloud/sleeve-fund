@@ -239,7 +239,7 @@ accounts_t = Table(
     metadata,
     Column("name", String(41), primary_key=True),
     Column("kind", String(8), nullable=False),  # paper | live
-    Column("venue", String(16), nullable=False, default="kraken"),
+    Column("venue", String(16), nullable=False, default=""),  # a live account's venue; "" for paper (any venue)
     Column("note", Text, nullable=False, default=""),
     Column("created_at", TS, nullable=False),
 )
@@ -672,22 +672,35 @@ class Store:
     # --- accounts ------------------------------------------------------------------
 
     def _ensure_paper_account(self, c) -> None:
-        if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == "paper")).first() is None:
-            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="kraken",
-                                                note="Simulated money at live Kraken prices and fees", created_at=utcnow()))
+        from sleeve_fund.accounts import PAPER_NOTE, PAPER_NOTES_BEFORE
 
-    def create_account(self, name: str, kind: str, note: str = "") -> None:
+        row = c.execute(select(accounts_t).where(accounts_t.c.name == "paper")).first()
+        if row is None:
+            c.execute(insert(accounts_t).values(name="paper", kind="paper", venue="", note=PAPER_NOTE,
+                                                created_at=utcnow()))
+        elif row.venue or row.note in PAPER_NOTES_BEFORE:
+            # Made when every account was on one venue: paper trades at each strategy's own venue. A note
+            # the PM wrote is kept; only the old default one is replaced.
+            note = PAPER_NOTE if row.note in PAPER_NOTES_BEFORE else row.note
+            c.execute(update(accounts_t).where(accounts_t.c.name == "paper").values(venue="", note=note))
+
+    def create_account(self, name: str, kind: str, note: str = "", venue: str | None = None) -> None:
+        """A live account is on one venue, picked from the registered profiles; a paper one serves any."""
         from sleeve_fund.accounts import KINDS, NAME_RE
+        from sleeve_fund.venues import VENUES
 
         if not NAME_RE.fullmatch(name):
             raise ValueError("account name: lower-case letters, digits and dashes, 2 to 41 characters")
         if kind not in KINDS:
             raise ValueError(f"account kind must be one of {KINDS}")
+        if kind == "live" and (venue or "").upper() not in VENUES:
+            raise ValueError(f"a live account needs its venue, one of {', '.join(p.label for p in VENUES.values())}")
+        venue = (venue or "").lower() if kind == "live" else ""
         with self.engine.begin() as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == name)).first():
                 raise ValueError(f"an account called {name} already exists")
-            c.execute(insert(accounts_t).values(name=name, kind=kind, venue="kraken", note=note, created_at=utcnow()))
+            c.execute(insert(accounts_t).values(name=name, kind=kind, venue=venue, note=note, created_at=utcnow()))
 
     def accounts(self) -> list[dict]:
         """Every account with its sleeves and, for live ones, whether the supervisor sees a key."""
