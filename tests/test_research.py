@@ -475,6 +475,43 @@ def test_checks_resting_on_missing_out_of_sample_are_not_failed_on_a_not_judged_
     assert "| FAIL |" not in render(r, ledger)
 
 
+def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path, instrument):
+    """PM, 5 Oct 2026: each idea is tested at 0, 0.02, 0.05, 0.1 and 0.8% per side, and the tear sheet says the fee
+    at which it stops making money. The rungs differ only in fees, so return falls as the fee rises, and the
+    ladder leaves the idea counter alone."""
+    from sleeve_fund.research.study import COST_LADDER
+
+    prices = synthetic_ohlcv(days=1500, seed=3)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, prices, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=100,
+                  train_days=730, test_days=365)
+    assert [x.fee for x in r.cost_ladder] == list(COST_LADDER)
+    assert r.cost_ladder[0].fees_paid == 0 and r.cost_ladder[-1].fees_paid > r.cost_ladder[1].fees_paid > 0
+    returns = [x.total_return for x in r.cost_ladder]
+    assert returns == sorted(returns, reverse=True) and returns[0] > returns[-1]
+    assert len({x.round_trips for x in r.cost_ladder[:3]}) == 1  # same trades; only the fee moves
+    sheet = render(r, ledger)
+    assert "## Cost ladder" in sheet and "**Break-even fee:**" in sheet and "| 0.80% |" in sheet
+    assert not any(e["stage"].startswith("ladder") for e in ledger.entries())
+    assert r.ladder_slippage == 0.0002 and "0.02% slippage" in sheet  # BTC: 2 basis points; 5 elsewhere
+    from sleeve_fund.research.study import ladder_slippage
+
+    assert (ladder_slippage("ETH/USDT"), ladder_slippage("SUI/USD")) == (0.0002, 0.0005)
+
+
+def test_the_break_even_fee_is_read_between_the_rungs_either_side_of_zero():
+    from sleeve_fund.research.study import LadderRung, breakeven_fee
+
+    def ladder(*rets):
+        return [LadderRung(fee=f, total_return=r, sharpe=0.0, round_trips=10, fees_paid=0.0)
+                for f, r in zip((0.0, 0.0002, 0.0005, 0.001, 0.008), rets)]
+
+    fee, words = breakeven_fee(ladder(0.10, 0.08, 0.05, -0.05, -0.9))
+    assert fee == pytest.approx(0.00075) and "about 0.075%" in words and "between 0.05% and 0.10%" in words
+    assert breakeven_fee(ladder(-0.01, -0.02, -0.03, -0.04, -0.5)) == (None, "loses money even at 0.00% fees")
+    assert breakeven_fee(ladder(0.5, 0.5, 0.4, 0.4, 0.1))[1] == "still makes money at 0.80% per side, the top of the ladder"
+
+
 def test_the_sensitivity_table_shows_grid_values_as_set():
     """Round 11 minor: int() of each grid value crashed the tear sheet on a word and showed 0.005 as 0."""
     from sleeve_fund.research.tearsheet import _param
