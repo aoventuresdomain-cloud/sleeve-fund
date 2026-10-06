@@ -2,7 +2,7 @@
 {% from "_macros.html" import chip, usage, help, stop_words %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
-{% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
+{% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
 {% macro tone_of(status) %}{{ {'running': 'ok', 'paused': 'warn', 'starting': 'warn', 'halted': 'bad', 'error': 'bad'}.get(status, 'off') }}{% endmacro %}
 {% macro flatten_button(cls) %}{% if kill.all %}<button type="button" class="ghost-danger {{ cls }}" data-open="dlg-kill">Flatten everything</button>{% elif kill.flattening %}<button type="button" class="ghost-danger {{ cls }}" disabled title="Every strategy is already selling">Selling to cash…</button>{% endif %}{% endmacro %}
 {% block title %}Risk &amp; health · Multi-Strategy Fund{% endblock %}

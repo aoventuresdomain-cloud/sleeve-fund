@@ -352,7 +352,7 @@ def test_risk_overview_lists_room_before_halt_and_stops(client):
     page = c.get("/risk", auth=AUTH).text
     overview = page.split('data-panel="overview"', 1)[1].split('data-panel="limits"', 1)[0]
     assert "Limits by strategy" not in overview and "Limits by strategy" in page  # the full table is on Limits
-    assert '<span class="rh-chip ok" title="2.0 simple ATR (14 bars) below entry">2 ATR</span>' in overview
+    assert '<span class="rh-chip ok" title="2.0 simple ATR (14 bars) below entry">2 simple ATR</span>' in overview
     assert '<span class="rh-chip warn">None</span>' in overview
     assert 'class="w" style="width:60.0%"' in overview and "8.0% left" in overview
     assert "If the market moved now" in overview and "Book drawdown, 30 days" in overview

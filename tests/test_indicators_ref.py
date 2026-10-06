@@ -220,10 +220,14 @@ def _true_range(bars):
     return np.maximum(bars["high"], prev.fillna(bars["high"])) - np.minimum(bars["low"], prev.fillna(bars["low"]))
 
 
-@pytest.mark.parametrize("n", [1, 3, 6])  # 20 lengths to settle (QA P1-A1): 13 outran the 137 recorded candles
+@pytest.mark.parametrize("n", [1, 3, 6, 14, 60])
 def test_atr_is_wilders(bars, n):
     """Pinned reference (P1-I4): `atr` is Wilder's ATR, seeded with the mean of the first n true ranges, the
-    first bar's range its high minus low."""
+    first bar's range its high minus low. It initializes after 20 lengths (QA P1-A1), so a set shorter than that
+    can't check this length; the 5,040 synthetic bars check every one."""
+    if 20 * n > len(bars):
+        which = "recorded" if bars is DATA["recorded"] else "synthetic"
+        pytest.skip(f"{len(bars)} {which} bars are fewer than the {20 * n} Atr({n}) needs to initialize")
     _check(*_stream(Atr(n), bars, _hlc), _wilder(_true_range(bars), n))
 
 

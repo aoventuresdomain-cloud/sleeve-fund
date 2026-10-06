@@ -20,7 +20,7 @@ SPEC = IdeaSpec(
     rules=(
         "Entry (all must hold at the bar close): RSI(rsi_period) < rsi_entry; close > EMA(ema_period); "
         "volume > vol_mult x SMA(volume, 20). Exit: close falls below the highest close since entry "
-        "minus atr_mult x ATR(atr_period). All of its capital in or out; market orders at the taker fee."
+        "minus atr_mult x the simple ATR(atr_period). All of its capital in or out; market orders at the taker fee."
     ),
     param_grid={"rsi_entry": [25, 30, 35], "atr_mult": [2.0, 3.0, 4.0]},
     default_params={"rsi_entry": 30, "atr_mult": 3.0},
@@ -100,4 +100,4 @@ class RsiPullback(LongFlatStrategy):
         stop = (self._peak or close) - c.atr_mult * self.atr.value
         values.update(peak=self._peak, trail_stop=stop)
         return (f"Trailing stop: close {close:,.6g} fell below {stop:,.6g} (peak {self._peak or close:,.6g} minus "
-                f"{c.atr_mult:g} x ATR {self.atr.value:,.4g})", values)
+                f"{c.atr_mult:g} x simple ATR {self.atr.value:,.4g})", values)

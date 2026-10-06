@@ -247,7 +247,7 @@ class LongFlatConfig(StrategyConfig):
         if len(stops) > 1:
             raise ValueError(f"choose one kind of stop-loss, not {' and '.join(stops)}")
         if stop_atr is not None and not 0 < stop_atr <= 20:
-            raise ValueError(f"stop_atr {stop_atr} outside (0, 20]; a multiple of the average true range, e.g. 2")
+            raise ValueError(f"stop_atr {stop_atr} outside (0, 20]; a multiple of the simple average true range, e.g. 2")
         for label, v in (("stop_swing_bars", stop_swing_bars), ("atr_bars", atr_bars)):
             if v is not None and (int(v) != v or not 2 <= v <= 500):
                 raise ValueError(f"{label} {v} must be a whole number of bars from 2 to 500")
