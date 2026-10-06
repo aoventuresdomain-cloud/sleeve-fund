@@ -58,8 +58,8 @@ def test_a_counting_failure_is_an_error_event_and_loses_neither_the_backtest_nor
         raise KeyError("from")
 
     c, store = client
-    monkeypatch.setattr(appmod, "_backtest_run", broken)
-    monkeypatch.setattr(appmod, "_strategy_run", broken)
+    monkeypatch.setattr(appmod, "_backtest_trial_metrics", broken)
+    monkeypatch.setattr(appmod, "_strategy_trial_metrics", broken)
     preview._history.clear()
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
     before = len(store.backtests())
@@ -86,10 +86,12 @@ def test_a_counting_failure_is_an_error_event_and_loses_neither_the_backtest_nor
     assert TrialsRegister(store).counts(idea)["variants"] == 2  # each still counts as a variant tried
     assert sorted(t["source"] for t in stand_ins) == ["backtest", "strategy"]  # its own source, not a new one
     assert all("KeyError" in t["error"] and set(json.loads(t["settings"])) == {"params"} for t in stand_ins)
-    assert all(t["data_start"] is None and t["data_end"] is None and t["sharpe"] is None and t["trades"] is None
-               for t in stand_ins)  # undated: the holdout's safe side
+    assert all(t["sharpe"] is None and t["trades"] is None for t in stand_ins)
+    by = {t["source"]: t for t in stand_ins}
+    assert by["backtest"]["data_start"] is None  # undated: the holdout's safe side
+    assert by["strategy"]["data_end"] is not None  # a strategy saw everything up to its creation, as when counted
     assert HoldoutLocks(store).undated(idea)
-    assert "recorded against its idea as a failed run" in failed[0]["message"]
+    assert "recorded against its idea as a failed run" in failed[0]["message"] and TrialsRegister(store).counts(idea)["n_uncertain"]
 
 
 def test_the_research_page_shows_the_registers_count(client):
@@ -402,7 +404,7 @@ def test_a_failed_count_then_a_good_one_is_one_variant(tmp_path, monkeypatch):
     idea, register = legacy_idea_hash("trend_filter"), trialsmod.TrialsRegister(store)
 
     def count():
-        row, exc = appmod._trial(appmod._backtest_run, store, args, result, "r1",
+        row, exc = appmod._trial(appmod._backtest_trial_metrics, store, args, result, "r1",
                                  fallback={"strategy": "trend_filter", "params": args["params"], "source": "backtest"})
         store.add_trials([row])
         return exc
@@ -503,7 +505,7 @@ def test_a_row_the_register_would_refuse_is_a_failed_count_not_a_refused_save(tm
             "minutes": 1440, "risk_profile": "balanced", "days": 365, "title": "t"}
     result = {"from": "2024-01-01", "to": "2025-01-01", "fee_schedule": {"taker": 0.004}, "spread": {"half": 0.0001},
               "strategy": {"sharpe": 1.0}, "trades": {"trades": 10}}
-    row, exc = appmod._trial(appmod._backtest_run, _store(tmp_path), args, result, "r1",
+    row, exc = appmod._trial(appmod._backtest_trial_metrics, _store(tmp_path), args, result, "r1",
                              fallback={"strategy": "trend_filter", "params": args["params"], "source": "backtest"})
     assert isinstance(exc, ValueError) and row["status"] == "failed" and "stage" in row["error"]
     store = _store(tmp_path)

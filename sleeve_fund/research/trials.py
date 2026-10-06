@@ -71,6 +71,8 @@ class TrialsRegister:
             "ideas": len({t["idea_hash"] for t in rows}),
             "variants": len({_variant(t) for t in rows}),
             "evaluations": len(rows),
+            # A run whose count failed is in N, but not its Sharpe: N is uncertain until it is re-counted (QA P1-T8).
+            "n_uncertain": any(t["status"] == "failed" for t in rows),
         }
 
     def failed(self, idea_hash: str | None = None) -> int:
@@ -181,12 +183,16 @@ def failed_row(*, strategy: str, params: dict, source: str, error: str, setup: d
     alone, so the same failing run retried is still one variant."""
     definition = (legacy_definition_hash(strategy, params, setup) if setup is not None else
                   content_hash({"unkeyed": strategy, "params": params}))
+    # A paper strategy was chosen having seen everything up to now, whatever failed (QA P1-T8, as model_run_row);
+    # a backtest's bars are unknown, which a holdout reads as overlapping.
+    data_start, data_end = (OPEN_START, datetime.now(timezone.utc)) if source == "strategy" else (None, None)
     return {
         "id": secrets.token_hex(8), "definition_hash": definition, "idea_hash": legacy_idea_hash(strategy),
         "code_version": code_version(), "definition_name": strategy, "family": _family(strategy),
         "settings": json.dumps({"params": params}, sort_keys=True), "dataset": dataset or "unknown",
         "stage": "in_sample", "source": source, "sharpe": None, "trades": None, "oos_trades": None,
-        "backtest_id": backtest_id, "status": "failed", "error": error, "created_at": datetime.now(timezone.utc),
+        "backtest_id": backtest_id, "data_start": data_start, "data_end": data_end, "status": "failed",
+        "error": error, "created_at": datetime.now(timezone.utc),
     }
 
 

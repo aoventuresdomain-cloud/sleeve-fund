@@ -76,6 +76,10 @@ class HoldoutLocks:
                     "can't be fresh")
         start, end = _ts(start), _ts(end)
         seen = [t for t in self.store.trials(idea_hash) if t["stage"] != "holdout"]
+        failed = sum(1 for t in seen if t["status"] == "failed")
+        if failed:  # Advisor, QA P1-T8: no look while the bar it would be judged by is unknown
+            return (f"no holdout yet: N uncertain: {failed} earlier run{'s' if failed != 1 else ''} of this idea "
+                    "couldn't be counted in full, so G1 couldn't judge it until they are re-counted")
         undated = [t for t in seen if t["data_start"] is None or t["data_end"] is None]
         if undated:
             after = self.undated_until(undated)

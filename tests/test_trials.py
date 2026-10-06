@@ -50,7 +50,7 @@ def test_counts_variants_ideas_and_evaluations(reg):
     _trial(reg, definition="d2", dataset="other")  # the same setting on other data
     _trial(reg, definition="d3", idea="i2")
     _trial(reg, definition="bh", idea="bh", family="benchmark")  # benchmarks are never counted
-    assert reg.counts() == {"ideas": 2, "variants": 4, "evaluations": 5}
+    assert reg.counts() == {"ideas": 2, "variants": 4, "evaluations": 5, "n_uncertain": False}
     assert sorted(reg.sharpes()) == [0.5] * 4  # one per variant, its latest (Advisor, 6 Oct 2026, P1-T2)
 
 
@@ -89,7 +89,7 @@ def test_the_idea_counter_is_imported_once_and_left_in_place(reg, tmp_path):
     assert path.read_text() == before
     rows = reg.store.trials()
     assert {r["source"] for r in rows} == {"ledger_import"} and {r["code_version"] for r in rows} == {LEGACY_CODE}
-    assert reg.counts() == {"ideas": 1, "variants": 2, "evaluations": 2}
+    assert reg.counts() == {"ideas": 1, "variants": 2, "evaluations": 2, "n_uncertain": False}
     ledger.record(idea="a", family="trend", params={"x": 3}, dataset="d", stage="holdout", sharpe=0.4)
     assert reg.import_ledger(path) == 1  # only the new line
     assert reg.counts()["variants"] == 3

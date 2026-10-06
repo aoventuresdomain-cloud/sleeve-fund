@@ -406,12 +406,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError(f"account: {account} is retired")
             if kinds[account] == "live":  # the shell's live lock: nothing trades real money before G2
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
-            trial, uncounted = _trial(_strategy_run, st(), cfg, strategy, params, cfg.risk_profile,
+            trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, strategy, params, cfg.risk_profile,
                                       fallback={"strategy": strategy, "params": params, "source": "strategy"})
-            st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
-                               starting_balance=cfg.starting_balance, params=params,
-                               risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars,
-                               venue=to_store_kwargs(cfg)["venue"], trial=trial)
+            _saved("strategy", st().create_sleeve, name=name, strategy=strategy, instrument=cfg.instrument,
+                   bar_spec=cfg.bar_spec, starting_balance=cfg.starting_balance, params=params,
+                   risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars, venue=to_store_kwargs(cfg)["venue"],
+                   trial=trial)
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
             _uncounted_event(st(), name, f"strategy {name}", uncounted)
@@ -751,9 +751,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("nothing changed")
             cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
             warmup = max(s.warmup_bars, min(cap, exit_warmup(params)))
-            trial, uncounted = _trial(_strategy_run, st(), cfg, s.strategy, params, profile,
+            trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, s.strategy, params, profile,
                                       fallback={"strategy": s.strategy, "params": params, "source": "strategy"})
-            restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup, trial=trial)
+            restart = _saved("settings change", st().change_settings, name, risk_profile=profile, params=params,
+                             warmup_bars=warmup, trial=trial)
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
             _uncounted_event(st(), name, f"strategy {name}", uncounted)
@@ -1471,11 +1472,12 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
-    trial, uncounted = _trial(_backtest_run, store, args, result, run_id,
-                              fallback={"strategy": args["strategy"], "params": args["params"], "source": "backtest"})
+    trial, uncounted = _trial(_backtest_trial_metrics, store, args, result, run_id,
+                              fallback={"strategy": args["strategy"], "params": args["params"], "source": "backtest",
+                                        "backtest_id": run_id})
     # One transaction: a backtest is never saved uncounted, nor counted unsaved (QA P1-T8).
-    store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
-                        bar_spec=args["bar_spec"], trial=trial)
+    _saved("backtest", store.save_backtest, keep["journal"], run_id=run_id, key=key, title=args["title"], query=query,
+           result=result, bar_spec=args["bar_spec"], trial=trial)
     _uncounted_event(store, None, f"backtest {args['title']!r}", uncounted)
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
@@ -1505,6 +1507,19 @@ def _trial(run, *args, fallback: dict) -> tuple[dict, Exception | None]:
                           backtest_id=keyed.get("backtest_id")), exc
 
 
+def _saved(what: str, save, *args, **kwargs):
+    """Run a save that writes its trial row on the same transaction. A database failure loses both, and says
+    so in words the page shows (QA P1-T8)."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        return save(*args, **kwargs)
+    except SQLAlchemyError as exc:
+        logging.getLogger(__name__).exception(f"couldn't save the {what} with its trial row")
+        raise ValueError(f"The {what} was not saved: writing it with its count in the trials register failed "
+                         f"({getattr(exc, 'orig', None) or exc}), so nothing was kept. Try again.") from exc
+
+
 def _uncounted_event(store: Store, sleeve: str | None, what: str, exc: Exception | None) -> None:
     """Show on the dashboard that a run went into the trials register as failed (QA P1-T8)."""
     if exc is not None:
@@ -1518,10 +1533,10 @@ def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None
     judged against all of them (QA P1-T1)."""
     from sleeve_fund.research.trials import record_model_run
 
-    record_model_run(store, **_backtest_run(store, args, result, run_id))
+    record_model_run(store, **_backtest_trial_metrics(store, args, result, run_id))
 
 
-def _backtest_run(store: Store, args: dict, result: dict, run_id: str) -> dict:
+def _backtest_trial_metrics(store: Store, args: dict, result: dict, run_id: str) -> dict:
     """A backtest as the register keys it: its variant, its dataset, and every bar from its first day to its last."""
     import pandas as pd
 
@@ -1540,7 +1555,7 @@ def _backtest_run(store: Store, args: dict, result: dict, run_id: str) -> dict:
                 trades=(result.get("trades") or {}).get("trades"))
 
 
-def _strategy_run(store: Store, cfg, strategy: str, params: dict, risk_profile: str) -> dict:
+def _strategy_trial_metrics(store: Store, cfg, strategy: str, params: dict, risk_profile: str) -> dict:
     """A paper strategy created, cloned or re-set, as the register keys it: a variant chosen to run, counted with
     no Sharpe yet. cfg is its paper config (venue, instrument, bars and fees)."""
     from sleeve_fund.research.run import dataset_name
