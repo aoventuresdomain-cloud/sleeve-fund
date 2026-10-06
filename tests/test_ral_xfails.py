@@ -16,6 +16,18 @@ Sources (every expectation below cites one):
   MTM equity just before the liquidation; X = margin + entry fee + liq fee. Retire = Stop + Archive until P2-6. Track
   record never reset (Sharpe, trials, G1/G2 evidence, fills-vs-model, trade log continuous). RAL only from a PM UI
   action (never replay/automation/API retry); repeat = no-op; journal who/when/incident id/equity before + after.
+- [R20:37] Advisor 6 Oct 20:37 (P1-D20; supersedes 18:17's "Y on MTM equity just before"): Y = X / the strategy's
+  equity when the liquidated position was OPENED (at its first entry fill); with partial reductions in between keep
+  that same entry-time equity. Show the true figure even above 100% (never cap). Halt text: "Position margin lost
+  (liquidated): X, Y% of strategy equity at entry". The incident also records the equity remaining after it.
+- [RAL7/8] Advisor 6 Oct 21:05 to QA ("RAL 7/8"): Y's denominator stays the equity at the FIRST entry fill even with
+  adds; X = the whole liquidated quantity; Y > 100% shown uncapped with "includes adds", flagged as a sizing finding
+  only if a cap check at entry or at an add was breached. The incident closes only when the RAL note is written AND
+  the PM acknowledges it; neither a reset nor a book reset closes it.
+- [CAP21:16] Advisor 6 Oct ~21:16 to QA ("Cap check at an add"): check the WHOLE position after the add, as the
+  isolated margin actually POSTED after it (existing posted margin + the add's margin), not the whole position
+  re-valued at the add's price. Tests use exactly the engine's own entry/add cap check; if it differs from posted
+  margin, that is its own finding.
 - [B63] (HoE) an incident is an error-severity event with kind "incident" plus an entry in the alerts inbox.
 
 ASSUMED INTERFACES (adapt the names, never the assertions):
@@ -36,7 +48,12 @@ ASSUMED INTERFACES (adapt the names, never the assertions):
   incident ("#<id>"), the note's author, the old and the new high-water mark,
   and the equity just before the liquidation and after it (each "{:,.2f}"). The decision row Store.command writes
   (action RAL, actor, ts, reason) names the incident ("#<id>").
-- The liquidation halt's status_reason contains the ruled text (a).
+- With adds [RAL7/8]: the halt text says "includes adds" after Y. At the liquidation the engine checks the entry and
+  each add against the risk profile's cap at its own time (the whole position's margin at that fill's price within
+  max_position_pct of the equity then), from the journal, and raises a sizing finding (an event of kind
+  "sizing_finding" for the strategy, naming the cap) only when one was breached.
+- The liquidation halt's status_reason contains the ruled text, as [R20:37] words it ("... of strategy equity at
+  entry"). The engine's incident message carries the equity remaining after the liquidation ("{:,.2f}").
 Liquidations are real: a recorded paper session (a short at about 60,629 with a 2% stop-loss, then a 60% gap up through
 the stop and the liquidation price) replayed through the paper runtime, as tests/test_long_short.py does. The stop is
 there so the setups also run under the stop-safety gate (stopless capped at 1x). Where a head books that gap close as a
@@ -59,6 +76,9 @@ from test_long_short import PERP, _meta, _record
 
 REASON = "QA RAL: not built yet (Advisor 17:57)"
 xf = pytest.mark.xfail(strict=True, reason=REASON)
+REASON78 = "QA RAL 7/8: not built yet (Advisor 21:05)"
+xf78 = pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON78)
+SIZING = "sizing_finding"  # [RAL7/8] the event a breached cap check at entry or at an add raises
 
 RAL = "reset_after_liquidation"
 # The journal kind RAL writes, the contract #164 and #155 read: sleeve_fund.store's constant (#164 60cb17d on), else
@@ -81,9 +101,9 @@ WHY_FIELD = "why the half-liquidation stop did not protect the position"
 WHY = ("The price gapped 60% in one trade, through the resting stop and the liquidation price, so the stop could only "
        "fill past bankruptcy")
 AUTHOR = "Head of Engineering"
-# [R17:57] (a), with X an amount (separators, an optional currency) and Y a percentage.
+# [R17:57] (a) as [R20:37] words it, with X an amount (separators, an optional currency) and Y a percentage.
 TEXT = re.compile(r"Position margin lost \(liquidated\): [^\d]*(\d[\d,]*(?:\.\d+)?)[^,]*, (\d+(?:\.\d+)?)% of "
-                  r"strategy equity")
+                  r"strategy equity at entry")
 AUTH = ("pm", "test-pw")  # the dashboard user
 SAME = {"origin": "http://testserver"}
 
@@ -164,6 +184,34 @@ def _gap_event(store, after_id=0):
     raise AssertionError("the gap left no liquidation or halt event")
 
 
+def _equity_at_entry(store, close_id):
+    """[R20:37] the strategy's equity at the first entry fill of the position the order `close_id` closed: the fill
+    that opened it from flat (or crossed through flat); later adds and partial reductions don't move it. Returns
+    (equity just after that fill, from the journal: cash + position at the fill's price; that fill's fee), so a
+    figure taken just before the fee is within reach too."""
+    from sleeve_fund.store import replay_book
+
+    fills = sorted(store.fills(NAME, limit=100_000), key=lambda x: (x["ts"], x["id"]))
+    fills = fills[:next(i for i, x in enumerate(fills) if x["order_id"] == close_id)]
+    held, first = 0.0, None
+    for i, x in enumerate(fills):
+        new = held + (x["qty"] if x["side"] == "BUY" else -x["qty"])
+        new = 0.0 if abs(new) < 1e-9 else new
+        if new and (not held or (new > 0) != (held > 0)):
+            first = i
+        held = new
+    assert first is not None and held, "setup: no open position before the close"
+    book = replay_book(fills[:first + 1], 10_000)
+    return book["cash"] + book["qty"] * fills[first]["price"], fills[first]["fee"]
+
+
+def _y_ok(y, x, at_entry, fee):
+    """Y as printed is X over the equity at entry to its printed rounding, uncapped ([R20:37] "never cap"); the
+    equity taken just after the opening fill or just before its fee."""
+    r = 0.5 * 10 ** -(len(y.split(".")[1]) if "." in y else 0) + 1e-9
+    return 100 * x / (at_entry + fee) - r <= float(y) <= 100 * x / at_entry + r
+
+
 def _liquidate(tmp_path, store):
     """A paper short at about 60,629 with a 2% stop, then a 60% gap up through the stop and the liquidation price:
     closed past bankruptcy and halted. On 3be572a (balanced, 33% margin cap) it keeps about 6,733 of 10,000. The
@@ -178,8 +226,10 @@ def _liquidate(tmp_path, store):
     assert book["qty"] == 0
     liq = _gap_event(store)
     before = store.equity_at_or_before(NAME, liq["ts"] - timedelta(seconds=1))["equity"]  # MTM just before
+    at_entry, entry_fee = _equity_at_entry(store, close["order_id"])
     return SimpleNamespace(rem=book["cash"], peak=store.peak_equity(NAME), liq=liq, before=before, close=close,
-                           entry=entry, orders=len(orders), reason=s.status_reason)
+                           entry=entry, orders=len(orders), reason=s.status_reason, at_entry=at_entry,
+                           entry_fee=entry_fee)
 
 
 def _restart(tmp_path, store, legs, hours, px=GAP_PX, tag="restart"):
@@ -319,10 +369,11 @@ def test_after_a_liquidation_a_plain_resume_leaves_it_halted_through_a_restart(s
 @xf
 @pytest.mark.parametrize("margin", ["capped", "full"])
 def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_path, request, margin):
-    """[R17:57] (a), [R18:17]: the halt reads "Position margin lost (liquidated): X, Y% of strategy equity", X = the
-    position's isolated margin + its entry fee + its liquidation fee (to the cent), Y = X over the mark-to-market
-    equity just before the liquidation (to its printed rounding). "capped": balanced's 33% margin cap (X about
-    3,328.7, Y about 33%); "full": the whole equity as margin."""
+    """[R17:57] (a), [R18:17], [R20:37]: the halt reads "Position margin lost (liquidated): X, Y% of strategy equity
+    at entry", X = the position's isolated margin + its entry fee + its liquidation fee (to the cent), Y = X over the
+    strategy's equity at the position's first entry fill (to its printed rounding, never capped). "capped": balanced's
+    33% margin cap (X about 3,328.7, Y about 33%); "full": the whole equity as margin (Y about 100%, above it if the
+    fees take it there)."""
     from sleeve_fund import markets, risk
 
     if margin == "full":
@@ -342,8 +393,57 @@ def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_
     assert m, s.status_reason
     x, y = float(m.group(1).replace(",", "")), m.group(2)
     assert x == pytest.approx(want, abs=0.02), (x, want, s.status_reason)
-    decimals = len(y.split(".")[1]) if "." in y else 0
-    assert abs(float(y) - 100 * x / f.before) <= 0.5 * 10 ** -decimals + 1e-9, (y, x, f.before)
+    assert _y_ok(y, x, f.at_entry, f.entry_fee), (y, x, f.at_entry, f.before)
+
+
+@xf
+def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(store, tmp_path):
+    """[R20:37] "with partial reductions in between keep that same entry-time equity": a 2x short of 0.11 opened at
+    60,600 on 10,000 of equity; the price falls 30% and half the short is bought back (a partial reduce, equity about
+    12,000); then the price gaps 120% up through the stop and the liquidation price. Y is X over the equity at the
+    opening fill (about 10,000), not at the reduce or just before the gap (both about 12,000). The journal is
+    written as the #146 outage case writes it: fills, then the process restarts on them."""
+    import test_replay
+    from sleeve_fund.store import replay_book
+
+    params = {**PARAMS, "dip": 0.4}  # the short leg's own take-profit is 40% down, so the 30% fall keeps it open
+    start = datetime.fromtimestamp(test_replay.START / 1e9, tz=timezone.utc)
+    opened, reduced, entry_px, low = start - timedelta(hours=2), start - timedelta(hours=1), 60_600.0, 42_420.0
+    store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params=params)
+    fills = [{"side": "SELL", "qty": 0.11, "price": entry_px, "fee": 3.33, "order_id": "opened", "trade_id": "opened",
+              "ts": opened},
+             {"side": "BUY", "qty": 0.055, "price": low, "fee": 1.17, "order_id": "reduced", "trade_id": "reduced",
+              "ts": reduced}]
+    store.record_equity(NAME, equity=10_000, cash=10_000, qty=0, price=entry_px, benchmark=10_000, ts=opened)
+    for i, x in enumerate(fills):
+        b = replay_book(fills[:i], 10_000)
+        if i:  # marked at the reduce's price just before it
+            store.record_equity(NAME, equity=b["cash"] + b["qty"] * x["price"], cash=b["cash"], qty=b["qty"],
+                                price=x["price"], benchmark=10_000, ts=x["ts"] - timedelta(seconds=1))
+        store.record_fill(NAME, **x)
+    book = replay_book(fills, 10_000)
+    at_reduce = book["cash"] + book["qty"] * low
+    assert at_reduce > 11_900, at_reduce  # setup: the reduce came at about 12,000 of equity
+    path = tmp_path / "reduced.jsonl.gz"
+    _record_at(path, _meta(book["cash"] + book["qty"] * book["entry_px"], params), [(5, 0.0), (0, 1.2), (5, 0.0)],
+               low, 0)
+    orders = _replay_into(store, path)
+    close = orders[-1]  # setup (passes on every head): the gap closed the rest past its liquidation price
+    assert close["intent"] in ("liquidation", "stop_loss") and close["side"] == "BUY", [(o["side"], o["intent"])
+                                                                                          for o in orders]
+    assert close["avg_px"] / entry_px - 1 > 0.5 and close["qty"] == pytest.approx(0.055), close
+    assert store.journal_book(NAME, 10_000)["qty"] == 0
+    at_entry, fee = _equity_at_entry(store, close["order_id"])
+    assert at_entry == pytest.approx(10_000 - 3.33) and fee == pytest.approx(3.33)  # setup: the opening fill's
+    before = store.equity_at_or_before(NAME, close["ts"] - timedelta(seconds=1))["equity"]
+    assert before > 11_000, before  # setup: just before the gap the equity is still about 12,000
+    s = store.sleeve(NAME)  # a liquidation halts it with the ruled text (on 3be572a: a daily-loss pause, see README)
+    assert s.status == "halted", (s.status, s.status_reason)
+    m = TEXT.search(s.status_reason)
+    assert m, s.status_reason
+    x, y = float(m.group(1).replace(",", "")), m.group(2)
+    assert _y_ok(y, x, at_entry, fee), (y, x, at_entry, at_reduce, before)
 
 
 @xf
@@ -414,6 +514,157 @@ def test_the_engine_opens_an_incident_on_every_liquidation(store, tmp_path, wher
     assert len(found) == 1, [(e["kind"], e["message"][:60]) for e in store.events(NAME, limit=50, min_level="error")]
     assert found[0]["level"] == "error" and "liquidat" in found[0]["message"].lower(), found[0]
     assert any(a["id"] == found[0]["id"] for a in store.alerts(limit=500))
+
+
+# The engine's own cap check, the one formula the adds cases judge by ([CAP21:16]: "tests must use exactly the formula
+# the engine's own entry/add cap check uses"). On 3be572a it is the perp opening order's sizing limit,
+# sleeve_fund/strategies/base.py:1279 (ba4f533 :1326, c998d08 :1290, e14acec :1174): the order's notional <=
+# SleeveRuntime.position_budget(equity), sleeve_fund/paper/runtime.py:172-173 (ba4f533 :189), = equity x
+# risk.position_cap(profile, params), sleeve_fund/risk.py:75-82 (margin cap x leverage cap on a perp), with equity
+# marked to market. A perp opens only from flat (base.py:1219-1242, `if side == current: return`), so there is no add
+# path, and the formula applied to an add sizes the add alone. Once the add cap is built (test_the_engines_add_cap_
+# check_is_on_the_margin_posted_after_the_add, "add-cap formula") position_budget takes the margin already posted and
+# _engine_cap_held passes it, so the same call judges by the posted margin after the add.
+def _engine_cap_held(store, equity, posted, qty, px):
+    """Whether the engine's own guard lets an order of qty at px through, at this equity, with this isolated margin
+    already posted: SleeveRuntime.position_budget, called as the engine calls it."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    rt = SleeveRuntime(store, NAME)
+    if "posted" in inspect.signature(rt.position_budget).parameters:
+        budget = rt.position_budget(equity, posted=posted)
+    else:
+        budget = rt.position_budget(equity)
+    return qty * px <= budget + 1e-6
+
+
+def _with_adds(store, tmp_path, last):
+    """[RAL7/8] a 3x short on the aggressive profile (50% margin cap: on balanced, 33% x 2x, margin posted within the
+    cap can never pass the first-fill equity), opened at 60,600 on 10,000 of equity. Twice the price halves, half the
+    short is bought back (realising the profit, so the wallet can post more) and the short is added to; then a gap up
+    through the stop and the liquidation price closes it. Each opening fill takes the posted isolated margin to 45% of
+    the equity just before it ([CAP21:16]: existing posted margin + the fill's own), the last to `last`; every
+    margin fits the wallet (cash + position at entry, less what is posted: markets.isolated_margin's balance). The
+    journal is written as the #146 outage case writes it; the process restarts on it. Returns the first fill's equity
+    and fee, the posted margin of the whole liquidated quantity, the fees paid, whether the engine's own guard held at
+    each opening fill (_engine_cap_held), and the halt."""
+    import test_replay
+    from sleeve_fund import markets, risk
+    from sleeve_fund.store import replay_book
+
+    lev = risk.profile("aggressive").max_leverage
+    params = {**PARAMS, "dip": 0.4}  # the short leg's own take-profit is 40% down: it holds through the halvings
+    start = datetime.fromtimestamp(test_replay.START / 1e9, tz=timezone.utc)
+    store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params=params, risk_profile="aggressive")
+    fills, px, held = [], 60_600.0, []
+    plan = [("open", 0.45), ("reduce", 0.5), ("open", 0.45), ("reduce", 0.5), ("open", last)]
+    for i, (what, x) in enumerate(plan):
+        b = replay_book(fills, 10_000)
+        equity, short = b["cash"] + b["qty"] * px, -b["qty"]
+        posted = markets.isolated_margin(short, b["entry_px"] or px, lev)
+        if what == "open":
+            qty = round((x * equity - posted) * lev / px, 6)
+            wallet = b["cash"] + b["qty"] * (b["entry_px"] or px) - posted
+            assert qty * px / lev <= wallet, (i, qty * px / lev, wallet)  # setup: the wallet can post it
+            held.append(_engine_cap_held(store, equity, posted, qty, px))
+        else:
+            qty = round(short * x, 6)
+        at = start - timedelta(hours=len(plan) - i)
+        store.record_equity(NAME, equity=equity, cash=b["cash"], qty=b["qty"], price=px, benchmark=10_000,
+                            ts=at - timedelta(seconds=1))
+        fill = {"side": "SELL" if what == "open" else "BUY", "qty": qty, "price": px, "fee": round(qty * px * 0.0005, 2),
+                "order_id": f"{what}-{i}", "trade_id": f"{what}-{i}", "ts": at}
+        store.record_fill(NAME, **fill)
+        fills.append(fill)
+        if what == "open" and i < len(plan) - 1:
+            px /= 2
+    book = replay_book(fills, 10_000)
+    liq_px = markets.isolated_liquidation(book["cash"], book["qty"], book["entry_px"], lev, 0.005)
+    assert px > book["entry_px"] * 0.61 and liq_px / px > 1.2, (px, book["entry_px"], liq_px)  # setup: it holds
+    meta = _meta(book["cash"] + book["qty"] * book["entry_px"], params)
+    meta["sleeve"]["risk_profile"] = "aggressive"
+    path = tmp_path / "adds.jsonl.gz"
+    _record_at(path, meta, [(5, 0.0), (0, liq_px / px * 1.1 - 1), (5, 0.0)], px, 0)
+    orders = _replay_into(store, path)
+    close = orders[-1]  # setup (passes on every head): the gap closed the whole position past its liquidation price
+    assert close["intent"] in ("liquidation", "stop_loss") and close["side"] == "BUY", [(o["side"], o["intent"])
+                                                                                          for o in orders]
+    assert close["avg_px"] > liq_px and close["qty"] == pytest.approx(-book["qty"]), (close, liq_px)
+    assert store.journal_book(NAME, 10_000)["qty"] == 0
+    first, fee = _equity_at_entry(store, close["order_id"])
+    assert first == pytest.approx(10_000 - fills[0]["fee"]) and fee == fills[0]["fee"]  # setup: the first fill's
+    closing = sum(x["fee"] for x in store.fills(NAME, limit=1000) if x["order_id"] == close["order_id"])
+    return SimpleNamespace(first=first, fee=fee, margin=markets.isolated_margin(-book["qty"], book["entry_px"], lev),
+                           fees=sum(f["fee"] for f in fills) + closing, held=held, s=store.sleeve(NAME))
+
+
+@xf78
+def test_y_with_adds_stays_on_the_first_entry_fill_uncapped_and_says_includes_adds(store, tmp_path):
+    """[RAL7/8] "Y denominator stays equity at FIRST entry fill even with adds; X = whole liquidated qty; Y>100% shown
+    uncapped with 'includes adds'": opened, reduced and added to twice, each opening fill through the engine's own cap
+    check at its time (_engine_cap_held, [CAP21:16]), then liquidated. X is the whole liquidated quantity's isolated
+    margin plus fees (at most every fee paid); Y = X over the equity at the first entry fill, about 120%, not capped;
+    the text says "includes adds"; no sizing finding is raised."""
+    f = _with_adds(store, tmp_path, 0.45)
+    assert all(f.held), f.held  # setup: the engine's own guard held at the entry and at each add
+    assert f.margin > f.first * 1.1, (f.margin, f.first)  # setup: so Y is above 100%
+    assert f.s.status == "halted", (f.s.status, f.s.status_reason)
+    m = TEXT.search(f.s.status_reason)
+    assert m, f.s.status_reason
+    x, y = float(m.group(1).replace(",", "")), m.group(2)
+    assert f.margin - 0.01 <= x <= f.margin + f.fees + 0.01, (x, f.margin, f.fees)
+    assert float(y) > 100 and _y_ok(y, x, f.first, f.fee), (y, x, f.first)
+    assert "includes adds" in f.s.status_reason[m.end():], f.s.status_reason
+    found = [e for e in store.events(NAME, limit=10_000) if e["kind"] == SIZING]
+    assert not found, [e["message"] for e in found]
+
+
+@xf78
+def test_an_add_that_breached_its_cap_check_raises_a_sizing_finding(store, tmp_path):
+    """[RAL7/8] "flagged as sizing finding only if a cap check at entry or an add was breached": the last add takes the
+    posted margin to 70% of the equity then, and is on its own more than the engine's position budget, so it breaches
+    the engine's own cap check whichever way it is measured (_engine_cap_held); after the liquidation there is a
+    sizing finding for the strategy, naming the cap."""
+    f = _with_adds(store, tmp_path, 0.70)
+    assert f.held == [True, True, False], f.held  # setup: only the last add breached the engine's own guard
+    found = [e for e in store.events(NAME, limit=10_000) if e["kind"] == SIZING]
+    assert found, f"not built: a sizing finding (an event of kind {SIZING!r}) for an add that breached its cap check"
+    assert any("cap" in e["message"].lower() for e in found), [e["message"] for e in found]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="add-cap formula")
+def test_the_engines_add_cap_check_is_on_the_margin_posted_after_the_add(store):
+    """[CAP21:16] "check the WHOLE position after the add ... the isolated margin actually POSTED after the add
+    (existing posted margin + the add's margin) ... if the engine's check differs from posted margin, that is its own
+    finding". The engine's only cap check sizes the order alone (3be572a sleeve_fund/strategies/base.py:1279:
+    notional <= SleeveRuntime.position_budget(equity), sleeve_fund/paper/runtime.py:172-173, = equity x
+    risk.position_cap, sleeve_fund/risk.py:75-82); a perp opens only from flat (base.py:1219-1242), so nothing checks
+    an add. Pinned: with margin already posted, the room the guard leaves is the margin cap less what is posted, times
+    the leverage; none once the posted margin is at the cap."""
+    from sleeve_fund import risk
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params=PARAMS)
+    rt = SleeveRuntime(store, NAME)
+    p = risk.profile("balanced")
+    assert "posted" in inspect.signature(rt.position_budget).parameters, (
+        "not built: SleeveRuntime.position_budget(equity, posted=...): the add cap on the margin already posted "
+        f"(today position_budget({10_000}) = {rt.position_budget(10_000):,.0f} of notional whatever is posted)")
+    assert rt.position_budget(10_000, posted=2_000) == pytest.approx((p.max_position_pct * 10_000 - 2_000)
+                                                                     * p.max_leverage)
+    assert rt.position_budget(10_000, posted=p.max_position_pct * 10_000) <= 1e-6
+
+
+@xf
+def test_the_engines_incident_records_the_equity_remaining_after_the_liquidation(store, tmp_path):
+    """[R20:37] "Incident also records the equity remaining after the liquidation": the engine's incident for this
+    liquidation (one, at or after it) names the strategy's equity once the position is gone ("{:,.2f}")."""
+    f = _liquidate(tmp_path, store)
+    found = _incidents_since(store, f.liq["ts"])
+    assert len(found) == 1, [(e["kind"], e["message"][:60]) for e in store.events(NAME, limit=50, min_level="error")]
+    assert f"{f.rem:,.2f}" in found[0]["message"], (found[0]["message"], f.rem)
 
 
 @xf
