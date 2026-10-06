@@ -313,6 +313,17 @@ def test_candles_built_while_no_trades_arrived_are_rebuilt_from_the_venue_before
     assert "No trades reached this process for 2 candles" in msg and "2 rebuilt from the venue's own candles" in msg
 
 
+def test_a_part_bar_replaced_by_the_venues_whole_candle_is_no_longer_degraded():
+    """CR minor on #155: the bar after held ones, seen here only in part (degraded), is decided on as the venue's
+    whole candle when the venue saw more of it, so its degraded mark goes with the part bar."""
+    s, bar, step, _ = _gap_strategy(lambda *a: [bar(2, 110.0, 5), bar(3, 131.0, 9)])
+    step(bar(1, 100.0, 1))
+    assert step(bar(2, 100.0, 0)) is None
+    s.mark_degraded({bar(3, 0, 0).ts_event: 40})
+    assert step(bar(3, 130.0, 1)).close.as_double() == 131.0
+    assert bar(3, 0, 0).ts_event not in s._degraded
+
+
 def test_a_quiet_market_is_used_flat_without_a_warning_and_an_unreachable_venue_says_so():
     s, bar, step, events = _gap_strategy(lambda *a: [bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 2)])
     for b in (bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 1)):

@@ -457,6 +457,24 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(
     assert "liquidation" in {e["kind"] for e in res.risk_events}
 
 
+def test_a_liquidation_halts_in_the_advisors_words_and_its_gap_fill_is_journaled_at_the_bar_open(prices, instrument,
+                                                                                                   full_margin):
+    """Independent Quant Advisor, 6 Oct 17:57: the halt reads "Position margin lost (liquidated): X, Y% of strategy
+    equity", X the position's isolated margin. QA P1-D12: a fill on a gap took the bar's open price, so the journal
+    stamps it at the open, not the bar's close."""
+    import re
+
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 160.0, 160.0, 160.0]
+    feed = _gapped(prices, closes)
+    res = run_backtest("ping_pong", feed, instrument, PERP, half_spread=0, risk_profile="aggressive")
+    (halt,) = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+    assert re.match(r"Position margin lost \(liquidated\): [\d,]+\.\d\d, \d+% of strategy equity[;$]", halt["message"]), \
+        halt["message"]
+    liq = next(f for f in res.journal.fills_ if res.decisions[f["order_id"]]["intent"] == "liquidation")
+    bar = feed.index[feed["close"] == 160.0][0]  # the bar it gapped in, stamped at its close
+    assert pd.Timestamp(liq["ts"]) == bar - pd.Timedelta(days=1)
+
+
 def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path, full_margin):
     """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
     as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
@@ -875,7 +893,8 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
-def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path, full_margin):
+def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stays_halted_through_a_restart(
+        tmp_path, full_margin):
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
     read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
     dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
@@ -892,7 +911,7 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     covered = store.insurance_total(name)
     assert covered > 0
     s = store.sleeve(name)
-    assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): "), s.status_reason
     assert "insurance fund covers the shortfall, about" in s.status_reason  # halted while open: an estimate (mF-1)
     last = store.equity_series(name)[-1]
     book = store.journal_book(name, 10_000)
@@ -902,7 +921,22 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     assert book["qty"] == 0
     assert "mark_unavailable" not in {e["kind"] for e in store.events(name, limit=500)}
 
-    # (Its resume and restart, still nothing to trade at zero, went with the zero: what is kept can trade again.)
+    # The PM resumes it and the process restarts: down about 99% from its peak, it halts again on drawdown, places
+    # nothing, and marks at what it kept.
+    store.command(name, "resume", "try again")
+    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+    seen = len(store.equity_series(name))
+    restart = tmp_path / "restart.jsonl.gz"
+    _record(restart, _meta(left, params), [(5, 0.0)], px=97_440.0)
+    assert len(replay(restart, store=store)) == len(orders)  # no new order
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
+    marks = store.equity_series(name)[seen:]
+    assert marks and all(m["qty"] == 0.0 and m["equity"] == pytest.approx(left, abs=0.01) for m in marks)
+    events = store.events(name, limit=500)
+    assert "mark_unavailable" not in {e["kind"] for e in events}
+    assert [e["kind"] for e in events].count("risk_halt") == 2
 
 
 def test_a_restart_holding_a_perp_settles_the_funding_it_was_down_for(tmp_path):

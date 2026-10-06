@@ -249,7 +249,10 @@ def decision_bars(exec_prices: pd.DataFrame, bar_minutes: int, exec_minutes: int
     idx = exec_prices.index
     period = pd.Timedelta(minutes=bar_minutes)
     close = (idx - pd.Timedelta(1, "ns")).floor(period) + period
-    present = pd.Series(exec_minutes, index=close).groupby(level=0).sum().clip(upper=bar_minutes)
+    # Each execution bar counts its own minutes: all of them, less any the store says it was built without (QA P1-D10).
+    have = exec_minutes - (exec_prices["missing"].fillna(0).astype("int64").to_numpy()
+                           if "missing" in exec_prices.columns else 0)
+    present = pd.Series(have, index=close).groupby(level=0).sum().clip(lower=0, upper=bar_minutes)
     out = pd.DataFrame({"missing": (bar_minutes - present).astype("int64")})
     out["degraded"] = [bar_rule.degraded(int(m), bar_minutes) for m in out["missing"]]
     return out

@@ -33,6 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
+from sleeve_fund.paper.runtime import WIPED_OUT
 from sleeve_fund.strategies.indicators import AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -412,6 +413,8 @@ class LongFlatStrategy(Strategy):
         # A bars-only backtest's resting fill, while its funding is settled: (the fill's bar open ns, its close ns,
         # whether it filled on a gap at the open). See _intrabar_fill.
         self._intrabar: tuple[int, int, bool] | None = None
+        # Liquidated in this process: the halt it stays in, "Position margin lost (liquidated): ..." (_margin_lost).
+        self._liquidated: str | None = None
         self._snap_ns: int | None = None
         self._settled = None  # backtest: the venue's settled rates, loaded once
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
@@ -482,6 +485,11 @@ class LongFlatStrategy(Strategy):
         # the venue's candles instead.
         self.history_loader = None
         self.gap_loader = None  # paper: (instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars
+        # Paper on its own feed: (instrument id, after ns, before ns) -> the 1-minute bars the history store holds
+        # closing strictly between, as (close ns, open, high, low, close, volume) (paper.node.stored_minutes).
+        self.minutes_loader = None
+        self._first_minute: int | None = None  # the first minute this process saw market data in
+        self._first_bar_due = True  # the bar under way at the start is still to be built from the store
         self._gap_bars: list[Bar] = []  # paper: candles built while no trades arrived, held until the feed is back
         # Degraded bars (board 5a): close time (ns) -> minutes missing, for bars built with more than
         # sleeve_fund.bars.DEGRADED_ABOVE of their minutes absent. Indicators update and exits run on them;
@@ -563,6 +571,37 @@ class LongFlatStrategy(Strategy):
         self._built = {int(t) for t in closes}
         return self
 
+    def _first_bar_from_store(self, bar: Bar) -> Bar:
+        """Paper on its own feed, the bar under way when the process started (a deploy or a restart mid-bar): built
+        from the minutes the history store holds for its part before the start, the same minutes research reads,
+        and from this process's own data after; degraded only for minutes still missing from both (_count_minutes).
+        Never the venue's candle (Independent Quant Advisor and HoE, 6 Oct, R1; QA C7). Without the store it is the
+        part this process saw, degraded as such."""
+        if (not self._first_bar_due or self._backtest or self.hub_fed or self.minutes_loader is None
+                or str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]
+                or not str(bar.bar_type).endswith("INTERNAL")):
+            return bar
+        self._first_bar_due = False
+        minutes, first = bar_minutes(self._cfg.bar_type), self._first_minute
+        end = bar.ts_event // MINUTE_NS
+        if minutes <= 1 or first is None or first <= end - minutes:
+            return bar  # the process saw the whole bar
+        try:  # minutes opening from the bar's start up to the first one seen here: closing (start, first]
+            rows = self.minutes_loader(str(self._cfg.instrument_id), (end - minutes) * MINUTE_NS,
+                                       first * MINUTE_NS + 1)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store: the part bar stands, degraded as such
+            self.log.warning(f"stored minutes for the first bar unavailable: {exc}")
+            return bar
+        rows = [r for r in rows if end - minutes < r[0] // MINUTE_NS <= first]
+        if not rows:
+            return bar
+        self._minutes_seen.update(r[0] // MINUTE_NS - 1 for r in rows)
+        inst = self.instrument
+        return Bar(bar.bar_type, inst.make_price(rows[0][1]),
+                   inst.make_price(max(bar.high.as_double(), *(r[2] for r in rows))),
+                   inst.make_price(min(bar.low.as_double(), *(r[3] for r in rows))), bar.close,
+                   inst.make_qty(bar.volume.as_double() + sum(r[5] for r in rows)), bar.ts_event, bar.ts_init)
+
     def _count_minutes(self, bar: Bar) -> bool:
         """Apply the store's bar rule (sleeve_fund.bars, board 5a) where this process builds its own decision bars.
         Paper on its own trade feed counts the minutes it saw market data in: too many missing marks the bar
@@ -610,6 +649,13 @@ class LongFlatStrategy(Strategy):
         self._note("degraded_bar", f"Entry held back: this {minutes}-minute bar is missing {missing} of its minutes "
                    "(over 10%), so no new position is opened on it; exits still run", level="info")
         return True
+
+    def attach_minutes(self, loader) -> "LongFlatStrategy":
+        """loader(instrument id, after_ns, before_ns) -> the history store's 1-minute bars closing strictly between,
+        oldest first, as (close ns, open, high, low, close, volume): the first bar after a start is built from them
+        (_first_bar_from_store)."""
+        self.minutes_loader = loader
+        return self
 
     def attach_gap_loader(self, loader) -> "LongFlatStrategy":
         """loader(instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars stamped in that span,
@@ -797,6 +843,7 @@ class LongFlatStrategy(Strategy):
         own = venue.get(bar.ts_event)
         if own is not None and own.volume.as_double() >= bar.volume.as_double():
             bar = own
+            self._degraded.pop(bar.ts_event, None)  # the venue's whole candle: no longer a part bar (CR minor)
         if (rebuilt or unchecked) and self.runtime is not None:
             step = bar_minutes(self._cfg.bar_type)
             first = datetime.fromtimestamp(held[0].ts_event / 1e9 - step * 60, tz=timezone.utc)
@@ -1330,6 +1377,7 @@ class LongFlatStrategy(Strategy):
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
             return
+        bar = self._first_bar_from_store(bar)
         if self._count_minutes(bar):
             return
         if self._hold_gap(bar):
@@ -2052,16 +2100,41 @@ class LongFlatStrategy(Strategy):
             amount = -qty * px * rate
             if inside and amount > 0:
                 continue  # a touch at an unknown time inside the bar: a credit it may not have been held for isn't booked
-            self._cash_adj += amount
-            self.funding_log.append((ts, amount))
-            if self.runtime is not None:
-                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
-                                                  amount=round(amount, 8), ts=ts)
-                self.runtime.store.event(self.runtime.name, "info", "funding",
-                                         f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
-                                         f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
-                                         f"{px:,.6g} ({rate:.4%})", ts=ts)
+            self._book_funding(ts, qty, px, rate, amount)
         self._funding_since = max(self._funding_since, self._rescan_from(now))
+
+    def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float) -> None:
+        self._cash_adj += amount
+        self.funding_log.append((ts, amount))
+        if self.runtime is not None:
+            self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
+                                              amount=round(amount, 8), ts=ts)
+            self.runtime.store.event(self.runtime.name, "info", "funding",
+                                     f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
+                                     f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
+                                     f"{px:,.6g} ({rate:.4%})", ts=ts)
+
+    def _fund_opened_in_bar(self, window: tuple[int, int, bool], qty: float, px: float) -> None:
+        """Rule (c) for a resting entry or add a bars-only backtest filled inside a bar (Independent Quant Advisor, 6 Oct
+        17:57): what it opened is charged the settlements inside the bar after its fill. Filled on a gap, it was held
+        from the bar's open, so it pays or receives each; touched at an unknown time inside, it takes the worse
+        outcome, paying those that cost it and booking no credit. (The settlements before the fill charged the
+        position held until then: _apply_funding.)"""
+        terms = self._cfg.perp
+        if terms is None or not qty:
+            return
+        lo, hi, gap = window
+        since, now = (datetime.fromtimestamp(t / 1e9, tz=timezone.utc) for t in (lo, hi))
+        times, settled = self._settlements(terms, since, now)
+        for ts in times:
+            if not lo < int(ts.timestamp()) * 1_000_000_000 <= hi:
+                continue
+            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
+            if rate is None:
+                continue
+            amount = -qty * px * rate
+            if gap or amount < 0:
+                self._book_funding(ts, qty, px, rate, amount)
 
     def _intrabar_fill(self, event) -> tuple[int, int, bool] | None:
         """A bars-only backtest fills a resting order somewhere inside the bar, stamped at its close, at an unknown
@@ -2280,15 +2353,24 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "position's margin", ts=self.runtime.now())
 
+    def _margin_lost(self, qty: float, entry: float) -> str:
+        """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57): "Position margin lost (liquidated): X,
+        Y% of strategy equity", X the position's isolated margin, Y its share of the equity marked before."""
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        lost = markets.isolated_margin(qty, entry, lev)
+        before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
+        share = f"{lost / before:.0%}" if before and before > 0 else "all"
+        return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity"
+
     def _wiped_out_why(self, shortfall: float = 0.0) -> str:
         """shortfall: an open position's equity below zero, which the insurance fund will cover once it closes, so
         the halt says how much before the close journals it (fix re-check, mF-1)."""
         covered = sum(a for _, a in self.insurance_log)
         if not covered and self.runtime is not None:  # since a restart: the journal has it
             covered = self.runtime.store.insurance_total(self.runtime.name)
-        why = "wiped out: a gap took the price past the bankruptcy price, so the position's margin is lost"
+        why = self._liquidated or (self.runtime.liquidated if self.runtime is not None else None) or WIPED_OUT
         if covered > 0:
-            return why + f" and the venue's insurance fund covered the {covered:,.2f} shortfall"
+            return why + f"; the venue's insurance fund covered the {covered:,.2f} shortfall"
         if shortfall > 0:
             return why + f"; the venue's insurance fund covers the shortfall, about {shortfall:,.2f} at this price"
         return why
@@ -2398,6 +2480,8 @@ class LongFlatStrategy(Strategy):
         self._last_market_ns = self.clock.timestamp_ns()
         if not self._backtest and not self.hub_fed:
             self._minutes_seen.add(self._last_market_ns // MINUTE_NS)
+            if self._first_minute is None:
+                self._first_minute = self._last_market_ns // MINUTE_NS
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
         if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:
@@ -2453,6 +2537,10 @@ class LongFlatStrategy(Strategy):
             # (review round 12, B12-1: it kept its last mark before the gap and stayed running).
             ruined = (self._margin and qty == 0 and price > 0 and equity <= 0
                       and self._account() is not None and self.instrument is not None)
+            # Flat after a wipe-out the PM resumed, with what wasn't margined kept (P1-D3): still a wipe-out, so it
+            # halts again, marked at what it kept (HoE and QA, 6 Oct).
+            kept = (self._margin and qty == 0 and price > 0 and equity > 0
+                    and (self.runtime.wiped_out or self._liquidated is not None))
             if price <= 0 or (equity <= 0 and not underwater and not ruined):
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
                 self.runtime.store.heartbeat(self.runtime.name)
@@ -2485,10 +2573,14 @@ class LongFlatStrategy(Strategy):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
+            if underwater and self._liquidated is None:
+                self._liquidated = self._margin_lost(abs(qty), self._entry_px or price)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
                 wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
                 equity = 0.0
                 cash = 0.0 if ruined else cash
+            elif kept and self.runtime.status != "halted":
+                wiped = self._wiped_out_why()
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
                                  busy=bool(self._working()), ruined=wiped) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
@@ -2615,6 +2707,7 @@ class LongFlatStrategy(Strategy):
         self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
+        intrabar = self._intrabar_fill(event)  # a bars-only backtest's resting order filled inside a bar, or None
         if self._margin:  # a fill just after the hour, with no trade, bar or tick between: held before it
             fill = float(event.last_qty) * (1 if event.is_buy else -1)
             self._snap_settlements(event.ts_event, qty=self._net_position()[0] - fill)
@@ -2622,7 +2715,7 @@ class LongFlatStrategy(Strategy):
                 # Settle funding owed up to the fill before booking it, on the position held until then: a stop or a
                 # liquidation filled on a gap pays the settlements it was held through, and the insurance fund's
                 # share is then reckoned on that cash.
-                self._intrabar = self._intrabar_fill(event)
+                self._intrabar = intrabar
                 try:
                     self._apply_funding(self._last_close or float(event.last_px))
                 finally:
@@ -2700,9 +2793,18 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             if coid == self._risk_stop_id and order is not None:
                 self._journal_risk_stop(order, px)
+            # A fill on a gap took the bar's open price, so its record carries the open's time (QA P1-D12).
+            at = (datetime.fromtimestamp(intrabar[0] / 1e9, tz=timezone.utc)
+                  if intrabar is not None and intrabar[2] else None)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
-                                 order_id=journal_id, trade_id=str(event.trade_id))
+                                 order_id=journal_id, trade_id=str(event.trade_id), ts=at)
+        if self._margin and opening and intrabar is not None and coid != self._restore_id:
+            self._fund_opened_in_bar(intrabar, sign * qty, px)
         if self._margin and self._entry_side == 0:
+            if self.decisions.get(coid, {}).get("intent") == "liquidation" and self._liquidated is None:
+                pos = self.cache.position(event.position_id) if event.position_id else None
+                if pos is not None and pos.peak_qty.as_double() > 0:
+                    self._liquidated = self._margin_lost(pos.peak_qty.as_double(), pos.avg_px_open)
             self._cover_shortfall(px, event)
         if coid == self._risk_stop_id:
             self._risk_stop_filled(done, sign, px)

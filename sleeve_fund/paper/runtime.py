@@ -26,6 +26,8 @@ FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy pa
 SPREAD_MIN_SAMPLES = 100
 
 
+WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
+
 class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and
     # rests its stop at the simulated venue instead of watching every trade.
@@ -65,6 +67,8 @@ class SleeveRuntime:
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
         self.peak = self._restored_peak(sleeve.starting_balance)
+        self.liquidated = self._last_liquidation()  # its halt, when the last one was a liquidation
+        self.wiped_out = self.liquidated is not None
         first = store.first_equity(sleeve_name)
         self.bench_base_price = first["price"] if first else None
         self.taker_fee = 0.008
@@ -85,6 +89,19 @@ class SleeveRuntime:
         # The smallest position the strategy can close (its lot or the venue's minimum, set at start): less
         # than this is dust a flatten can't sell, so it owes nothing (sanity, 4 Oct).
         self.close_floor = 0.0
+
+    def _last_liquidation(self) -> str | None:
+        """The head of its last halt when that was a liquidation (Independent Quant Advisor, 6 Oct 17:57): it stays
+        halted through a resume and a restart until the PM resets it after the liquidation. None otherwise."""
+        last = self.store.last_event(self.name, ("risk_halt",))
+        if last is None:
+            return None
+        msg = last["message"]
+        if msg.startswith(WIPED_OUT):
+            return msg.split(";")[0]
+        if msg.startswith(("wiped out", "position margin lost")):  # the older wordings
+            return WIPED_OUT
+        return None
 
     def _restored_peak(self, starting_balance: float) -> float:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
@@ -214,10 +231,11 @@ class SleeveRuntime:
         flatten = False
         self.flatten_why = None
         if ruined and self.status != "halted":
+            self.wiped_out, self.liquidated = True, ruined.split(";")[0]
             self._set("halted", ruined)
             held = abs(qty) >= max(self.close_floor, 1e-12)  # still open: past its liquidation price
             self.store.event(self.name, "error", "risk_halt",
-                             ruined + ("; flattened" if held else "; nothing left to trade") + ", PM must resume",
+                             ruined + ("; flattened" if held else "") + "; PM must reset it after the liquidation",
                              ts=self.now())
             if held:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
@@ -253,7 +271,13 @@ class SleeveRuntime:
                 continue
             elif cmd["command"] == "resume":
                 # Both resets are journaled (this tick's mark, and the events below) so a restart keeps them.
-                if self.status == "halted":
+                if self.status == "halted" and self.wiped_out:
+                    # A wipe-out is not reset by a resume: drawdown stays measured from the peak before the gap,
+                    # so it halts again on the next tick and places nothing (HoE and QA, 6 Oct). A reset starts it.
+                    self.store.event(self.name, "info", "drawdown_kept",
+                                     f"drawdown still measured from {self.peak:,.2f}: the halt was a liquidation, "
+                                     "which a resume doesn't clear", ts=self.now())
+                elif self.status == "halted":
                     self.peak = equity  # a resume after a halt resets the drawdown reference
                     self.store.event(self.name, "info", "drawdown_reset",
                                      f"drawdown measured from {equity:,.2f}, the equity when the PM resumed "
@@ -361,11 +385,14 @@ class SleeveRuntime:
         if status in ("rejected", "denied"):
             self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}", ts=self.now())
 
-    def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str) -> None:
+    def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str,
+                ts: datetime | None = None) -> None:
+        """ts: when it filled, when that isn't now (a backtest's fill on a gap, at the bar's open)."""
+        ts = ts or self.now()
         self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
-                               trade_id=trade_id, ts=self.now())
+                               trade_id=trade_id, ts=ts)
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
-        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=self.now())
+        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
 
     # --- display -------------------------------------------------------------------
 
