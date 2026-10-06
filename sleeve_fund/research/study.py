@@ -460,7 +460,7 @@ def run_study(
             f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
     if market:
-        result.notes.append(f"{profile.label} lists perpetuals only, so every run traded the perpetual, long only, "
+        result.notes.append("The venue lists perpetuals only, so every run traded the perpetual, long only, "
                             "paying the funding the venue settled.")
     if exits:
         result.notes.append(

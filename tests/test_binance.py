@@ -148,7 +148,7 @@ def test_a_study_on_the_venue_trades_its_perpetual_long_only(tmp_path, offline_b
     assert sheet.name.startswith("buy_and_hold_binance-btcusdt-store-240m_")
     assert "lists perpetuals only, so every run traded the perpetual, long only" in text
     assert "exits: the signal only" in text and "Exits on top of the signal" not in text
-    with pytest.raises(ValueError, match="no stored Binance USD-M perpetuals history for ETH/USDT"):
+    with pytest.raises(ValueError, match="no stored history for ETH/USDT on this venue"):
         run_store_study(StudyRequest(strategy="buy_and_hold", pair="ETH/USDT", venue="binance"), history=hist)
 
 

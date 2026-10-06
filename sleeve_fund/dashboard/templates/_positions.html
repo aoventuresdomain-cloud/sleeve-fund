@@ -30,9 +30,9 @@
 {% macro positions_table(positions, show_strategy=True, close_id=None, closable=True) %}
 {% set rows = positions.rows %}
 <table class="book-pos">
-  <thead><tr>{% if show_strategy %}<th>Strategy</th>{% endif %}<th>Instrument</th><th>Side</th><th class="num">Leverage</th><th class="num">Size</th><th class="num">Notional</th>
+  <thead><tr>{% if show_strategy %}<th>Strategy</th>{% endif %}<th>Instrument</th><th>Side</th><th class="num" title="Position value at entry ÷ the margin set aside for it (isolated)">Leverage</th><th class="num">Size</th><th class="num">Notional</th>
     <th class="num">Entry</th><th class="num">Mark</th><th class="num">SL</th><th class="num">TP</th><th class="num">Liq. price</th>
-    <th class="num">Unrealised</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th><th class="num">Fees</th><th><span class="sr-only">Close</span></th></tr></thead>
+    <th class="num">Unrealised</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th><th class="num" title="Fees on the fills since the position opened">Fees</th><th><span class="sr-only">Close</span></th></tr></thead>
   <tbody>{% for p in rows %}{% set base = p.pair.split('/')[0] %}
   <tr>{% if show_strategy %}<td class="cell-name"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a></td>{% endif %}
     <td>{{ p.pair }}{% if p.perp %} <span class="faint">perp</span>{% endif %}</td>
