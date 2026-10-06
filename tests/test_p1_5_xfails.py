@@ -786,7 +786,10 @@ def test_every_rules_order_carries_the_lineage_payload(tmp_path, instrument):
         for first, last in sig["bars"].values():
             assert pd.Timestamp(first) <= pd.Timestamp(last) <= pd.Timestamp(o["ts"])
         assert sig["data"]["source"] in ("hub", "store", "venue_rest")
-        assert sig["data"]["refilled_in_range"] is False
+        # DA-4 owner ruling (DA 21:54, CR minor 1 on #161): None (unknown) until the provenance read lands, never a
+        # hard-coded False claiming a clean range nobody checked. When provenance lands this pin moves to `is False`
+        # (this case refills nothing), with a refilled case pinned `is True`.
+        assert sig["data"]["refilled_in_range"] is None
 
 
 def test_a_rules_strategy_keeps_its_definition_identity_and_new_tables_key_on_an_immutable_id():

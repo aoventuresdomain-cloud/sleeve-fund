@@ -253,7 +253,7 @@ class Rules(LongFlatStrategy):
                 bars[timeframe_label(tf)] = span_of(s.last.end - tf * MINUTE_NS, tf, warmup.get(tf, 1))
         source = "hub" if self.hub_fed else "store" if self._backtest else "venue_rest"
         payload = {"v": 1, "definition": self.c.definition_hash, "rule": ", ".join(r for r, _ in fired),
-                   "blocks": blocks, "bars": bars, "data": {"source": source, "refilled_in_range": False}}
+                   "blocks": blocks, "bars": bars, "data": {"source": source, "refilled_in_range": None}}  # unknown until provenance is read (DA-4)
         if armed:
             payload["armed_at"] = _iso(max(armed))
         return payload
