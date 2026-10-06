@@ -11,7 +11,7 @@ D = Decimal
 
 
 def _in(**kw) -> SizingInputs:
-    base = dict(allocated_equity=10_000.0, price=100.0, side=1, leg_cost=0.001, risk_per_trade=0.01,
+    base = dict(allocated_equity=10_000.0, price=100.0, side=1, leg_cost=0.001, half_spread=0.0, risk_per_trade=0.01,
                 position_cap_pct=0.5, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02)
     return SizingInputs(**{**base, **kw})
 
@@ -85,14 +85,14 @@ def test_the_regime_weight_scales_the_budget():
 def test_volatility_targeting_matches_a_hand_calculation():
     """B2: notional = target vol x allocated equity / instrument vol = 0.01 x 10,000 / 0.02 = 5,000."""
     s = size_entry(_in(overlay="vol_target", vol_target=0.01, instrument_vol=0.02, perp=True, leverage=3.0,
-                       position_cap_pct=0.2))
+                       position_cap_pct=0.2, risk_per_trade=0.5))
     assert s.sized_by == "volatility target" and s.qty == D("50.00")
 
 
 def test_a_vol_sized_perp_entry_never_exceeds_the_margin_cap():
     """Regression for QA round 13: the vol target is on allocated equity, and the margin cap binds after it."""
     s = size_entry(_in(overlay="vol_target", vol_target=0.05, instrument_vol=0.005, perp=True, leverage=3.0,
-                       position_cap_pct=0.2))
+                       position_cap_pct=0.2, risk_per_trade=0.5))
     assert s.sized_by == "margin cap" and float(s.qty) * 100 <= 0.2 * 10_000 * 3
 
 
@@ -112,3 +112,33 @@ def test_bad_inputs_are_refused(bad):
 
 def test_no_allocated_equity_skips():
     assert "no allocated equity" in size_entry(_in(allocated_equity=0.0)).skipped
+
+
+def test_a_stop_fills_past_its_price_by_one_half_spread_unless_set():
+    """Advisor, 6 Oct 2026: the loss per unit carries a named stop slippage."""
+    plain = size_entry(_in(leg_cost=0.0015, half_spread=0.0005))
+    loss = loss_at_stop(0.02, 0.0015) + 0.98 * 0.0005
+    assert plain.qty == D(str(int(100 / loss / 100 * 100) / 100))  # 100 of risk over loss per unit, at 100
+    assert size_entry(_in(leg_cost=0.0015, half_spread=0.0005, stop_slippage=0.0)).qty > plain.qty
+
+
+def test_with_a_stop_and_a_volatility_target_the_smaller_size_wins():
+    """Advisor, 6 Oct 2026: both are worked out, never multiplied."""
+    s = size_entry(_in(overlay="vol_target", vol_target=0.01, instrument_vol=0.005))  # 20,000 by volatility
+    assert s.sized_by == "risk per trade" and s.qty == D("45.49")
+    s = size_entry(_in(overlay="vol_target", vol_target=0.01, instrument_vol=0.04))  # 2,500 by volatility
+    assert s.sized_by == "volatility target" and s.qty == D("25.00")
+
+
+def test_a_quiet_stretch_cannot_size_up_past_the_volatility_floor():
+    s = size_entry(_in(overlay="vol_target", vol_target=0.01, instrument_vol=0.001, vol_floor=0.04))
+    assert s.sized_by == "volatility target" and s.qty == D("25.00")
+
+
+def test_the_liquidation_rule_shrinks_the_size_and_names_itself():
+    """The PM's rule: the stop sits no further than half the way to liquidation; leverage is never widened."""
+    s = size_entry(_in(perp=True, leverage=3.0, position_cap_pct=1.0, stop_frac=0.2, risk_per_trade=0.9,
+                       stop_to_liquidation=0.5, maintenance_margin=0.005))
+    assert s.sized_by.startswith("liquidation rule") and s.qty == D("246.91")  # 10,000 / (0.2 / 0.5 + 0.005)
+    distance = 10_000 / (float(s.qty) * 100) - 0.005
+    assert 0.2 <= 0.5 * distance + 1e-9

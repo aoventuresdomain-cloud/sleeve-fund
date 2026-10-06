@@ -8,7 +8,15 @@ and still declares a stop. Then the caps, smallest first wins:
 - margin cap: margin ≤ the profile's position cap × allocated equity; on a perpetual, notional = margin × leverage
   (the PM's perp rule);
 - leverage cap: notional ≤ allocated equity × leverage, less room for the fee;
-- largest order cap, and a share of the bar's volume.
+- largest order cap, and a share of the bar's volume;
+- on a perpetual, the PM's liquidation rule: the stop sits no further than stop_to_liquidation of the way to the
+  liquidation price. The size shrinks until it does; the leverage is never widened to make it fit.
+
+With both a stop and a volatility target, both sizes are worked out and the smaller is taken, never their product.
+The instrument's volatility is floored (its trailing one-year 25th percentile, from the caller), so a quiet stretch
+doesn't size up into the caps. A stop fills as a market order, often past its price: the loss per unit carries a
+named stop slippage, one extra half spread until fills are measured against the model (Independent Quant Advisor,
+6 Oct 2026).
 
 Below the venue's smallest order, the entry rounds up to it only when the risk then stays within 1.5 × the budget
 and no cap is broken; otherwise it is skipped, saying why. There is no sizing without a stop: a definition that
@@ -24,6 +32,7 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 ATR_STOP_MULTIPLE = 2.5  # the fallback stop, in ATR(14)s, when a definition declares none (spec: 2-3x)
 ROUND_UP_RISK = 1.5  # the venue minimum may be bought only while its risk stays within this many budgets
+ROUND_UP_FLAG = 0.2  # a strategy rounding up on more than this share of its entries is too small for the instrument
 OVERLAYS = ("stop", "vol_target")
 
 
@@ -39,6 +48,7 @@ class SizingInputs:
     price: float  # the entry price the order is sized at (the bar's close)
     side: int  # 1 long, -1 short
     leg_cost: float  # taker fee + half the spread, as a share of a leg's notional
+    half_spread: float  # half the bid-ask spread, the stop slippage's default
     risk_per_trade: float  # share of allocated equity lost at the stop, both sides unless set per side below
     position_cap_pct: float  # the profile's cap, applied to the margin (on spot, to the notional)
     lot: Decimal  # the venue's quantity step
@@ -56,6 +66,10 @@ class SizingInputs:
     overlay: str = "stop"  # B2: "stop" (risk to the stop) or "vol_target"
     vol_target: float | None = None  # target volatility of the position, per bar, as a share of allocated equity
     instrument_vol: float | None = None  # the instrument's volatility per bar (ATR / price, or the std of returns)
+    vol_floor: float | None = None  # the floor under instrument_vol: its trailing one-year 25th percentile
+    stop_slippage: float | None = None  # past the stop price, as a share; None: one half spread
+    maintenance_margin: float = 0.0  # a perpetual's maintenance margin rate, for the liquidation rule
+    stop_to_liquidation: float | None = None  # the profile's share of the way to liquidation a stop may sit
 
 
 @dataclass
@@ -118,19 +132,24 @@ def size_entry(i: SizingInputs) -> Sizing:
                       "a stop")
     if equity <= 0:
         return Sizing(Decimal(0), "", stop, 0.0, 0.0, skipped="no allocated equity to size from")
-    loss = loss_at_stop(stop, i.leg_cost, i.side)  # per unit of notional
+    slip = i.half_spread if i.stop_slippage is None else i.stop_slippage
+    loss = loss_at_stop(stop, i.leg_cost, i.side) + (1 - i.side * stop) * slip  # per unit of notional
     budget = equity * risk_pct * i.regime_weight * i.fraction
-    limits: dict[str, float] = {}
+    limits: dict[str, float] = {risk_name: budget / loss if loss > 0 else float("inf")}
     if i.overlay == "vol_target":
-        if not i.vol_target or not i.instrument_vol or i.instrument_vol <= 0:
+        vol = max(i.instrument_vol or 0.0, i.vol_floor or 0.0)
+        if not i.vol_target or vol <= 0:
             return Sizing(Decimal(0), "", stop, budget, 0.0, skipped="volatility targeting needs a target and the "
                           "instrument's volatility")
-        limits["volatility target"] = i.vol_target * equity / i.instrument_vol * i.regime_weight * i.fraction
-    else:
-        limits[risk_name] = budget / loss if loss > 0 else float("inf")
+        limits["volatility target"] = i.vol_target * equity / vol * i.regime_weight * i.fraction
     limits["margin cap" if i.perp else "position cap"] = i.position_cap_pct * equity * i.leverage
     if i.perp:
         limits[f"{i.leverage:g}x leverage cap"] = equity * i.leverage * (1 - i.leg_cost)
+    if i.perp and i.stop_to_liquidation:
+        # The whole account margins the position: the price can move about equity / notional - maintenance
+        # margin before liquidation, so the stop fits within its share of that while notional stays under this.
+        limits[f"liquidation rule (stop within {i.stop_to_liquidation:.0%} of the way)"] = (
+            equity / (stop / i.stop_to_liquidation + i.maintenance_margin))
     if i.max_notional is not None:
         limits["largest order cap"] = i.max_notional
     if i.volume_notional is not None:
@@ -148,7 +167,7 @@ def size_entry(i: SizingInputs) -> Sizing:
     least = i.min_qty.quantize(i.lot, rounding=ROUND_UP) if i.min_qty > 0 else i.lot
     least_notional = float(least * price)
     least_risk = least_notional * loss
-    hard = {k: v for k, v in limits.items() if k not in ("volatility target", risk_name)}
+    hard = {k: v for k, v in limits.items() if k not in ("volatility target", risk_name)}  # caps, not sizes
     broken = [k for k, v in hard.items() if least_notional > v]
     if budget > 0 and least_risk <= ROUND_UP_RISK * budget and not broken:
         return Sizing(least, f"venue minimum (rounded up from {qty})", stop, budget, least_risk, limits,
