@@ -736,7 +736,7 @@ class LongFlatStrategy(Strategy):
             if not self._atr.initialized or close <= 0:
                 return None
             stop, basis = c.stop_atr * self._atr.value / close, (
-                f"{c.stop_atr:g} x the {c.atr_bars}-bar average true range ({self._atr.value:,.6g})")
+                f"{c.stop_atr:g} x the {c.atr_bars}-bar simple average true range ({self._atr.value:,.6g})")
         elif c.stop_swing_bars:
             if len(self._lows) < c.stop_swing_bars or close <= 0:
                 return None

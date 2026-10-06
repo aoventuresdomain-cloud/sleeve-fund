@@ -10,12 +10,12 @@ from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrate
 from sleeve_fund.strategies.indicators import AtrSma, Rsi, Sma, settle_bars
 
 SPEC = IdeaSpec(
-    summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} ATR trailing stop.",
+    summary="Buys when RSI is below {rsi_entry}, price is above its {ema_period}-bar EMA and volume is over {vol_mult}x normal; exits on a {atr_mult} simple-ATR trailing stop.",
     name="rsi_pullback",
     family="mean-reversion-in-trend",
     idea=(
         "Buy when RSI is below 30, price is above the 200 EMA and volume spikes; "
-        "get out on an ATR trailing stop."
+        "get out on a simple-ATR trailing stop."
     ),
     rules=(
         "Entry (all must hold at the bar close): RSI(rsi_period) < rsi_entry; close > EMA(ema_period); "

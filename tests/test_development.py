@@ -123,7 +123,7 @@ def test_rsi_cross_comes_with_research_recommended_settings(client):
                                                 "use_holdout": False, "risk_profile": "balanced", "stop_atr": 2,
                                                 "atr_bars": 14}
     assert dev.how_sentence(p["values"]) == "15-minute candles. Learn on 2 years, test on the next year. Latest year sealed."
-    assert dev.exits_sentence(p["values"]) == ("Stop 2 average true ranges below entry (14 bars). No target. "
+    assert dev.exits_sentence(p["values"]) == ("Stop 2 simple average true ranges below entry (14 bars). No target. "
                                                "Balanced profile.")
     page = c.get("/research?strategy=rsi_cross", auth=AUTH).text
     assert "15-minute candles. Learn on 2 years, test on the next year. Latest year sealed." in page

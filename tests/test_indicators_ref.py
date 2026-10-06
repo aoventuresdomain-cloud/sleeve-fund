@@ -220,7 +220,7 @@ def _true_range(bars):
     return np.maximum(bars["high"], prev.fillna(bars["high"])) - np.minimum(bars["low"], prev.fillna(bars["low"]))
 
 
-@pytest.mark.parametrize("n", [1, 5, 13])
+@pytest.mark.parametrize("n", [1, 3, 6])  # 20 lengths to settle (QA P1-A1): 13 outran the 137 recorded candles
 def test_atr_is_wilders(bars, n):
     """Pinned reference (P1-I4): `atr` is Wilder's ATR, seeded with the mean of the first n true ranges, the
     first bar's range its high minus low."""
@@ -394,9 +394,9 @@ def test_warmup_bars_from_settings():
     assert warmup_for([Sma(50), Ema(20), RelativeVolume(20)]) == settle_bars(20)
     assert Donchian(20).warmup_bars == 21
     assert RsiDivergence(14, 3, 3, 50).warmup_bars == settle_bars(14) + 56
-    assert Atr(14).warmup_bars == settle_bars(14)
+    assert Atr(14).warmup_bars == 20 * 14  # QA P1-A1: a range average settles over twenty lengths
     assert Stochastic(14, 3, 3).warmup_bars == 18
-    assert Keltner(20, 10).warmup_bars == settle_bars(20) and Keltner(2, 30).warmup_bars == settle_bars(30)
+    assert Keltner(20, 10).warmup_bars == settle_bars(20) and Keltner(2, 30).warmup_bars == 20 * 30
     assert warmup_for([]) == 0
 
 

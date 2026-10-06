@@ -17,7 +17,7 @@ DAY_NS = 86_400_000_000_000
 
 SPEC = IdeaSpec(
     summary="In a daily up-trend, buys when 4-hour RSI({rsi_period}) is at or below {rsi_entry:g} and the close is "
-            "{dip_atr:g} ATR below the day's high; sells at the {exit_sma}-bar average or after {time_stop_bars} "
+            "{dip_atr:g} simple ATR below the day's high; sells at the {exit_sma}-bar average or after {time_stop_bars} "
             "bars. Mirrored short in a down-trend (on a perpetual; held flat on spot).",
     name="dip_buy",
     family="pullback-in-trend",
@@ -28,7 +28,7 @@ SPEC = IdeaSpec(
     rules=(
         "Daily regime from the last closed day: up when the close is above its trend_sma_days simple average and "
         "the trend_ema_days exponential average rose that day; down when below and falling. On each decision bar "
-        "close (4 hours), with Wilder's RSI(rsi_period) and ATR(dip_atr_bars) of those bars. Flat, up-trend: long "
+        "close (4 hours), with Wilder's RSI(rsi_period) and the simple ATR(dip_atr_bars) of those bars. Flat, up-trend: long "
         "when RSI <= rsi_entry and the close is at least dip_atr ATR below the highest high of the last 24 hours. "
         "Flat, down-trend: short when RSI >= 100 - rsi_entry and the close is at least dip_atr ATR above the lowest "
         "low of the last 24 hours. A leg ends when the close reaches its exit_sma-bar simple average (at or above "
