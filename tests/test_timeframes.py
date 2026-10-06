@@ -116,7 +116,8 @@ def _strategy(tmp_path, n_minutes, sma):
     s = RsiCross(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
     events = []
     s.instrument = instrument
-    s.runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    # backtest: no m13-E3 hold-back of the last warm-up candle (#146), which this test isn't about
+    s.runtime = type("R", (), {"name": "s1", "backtest": True, "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
     return s, events
 
 

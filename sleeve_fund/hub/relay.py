@@ -72,14 +72,19 @@ def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callabl
     return sink
 
 
-def refill_bars(recent, pair: str, instrument_id: str, since_ns: int, until_ns: int, now_ns: int) -> list[dict]:
+def refill_bars(recent, pair: str, instrument_id: str, since_ns: int, until_ns: int, now_ns: int,
+                precision: tuple[int, int] | None = None) -> list[dict]:
     """The venue's own closed 1-minute candles closing from since_ns to until_ns, as refilled bar messages.
-    recent: the venue profile's ohlc_history ((pair, minutes) -> candles by open time, newest still forming)."""
+    recent: the venue profile's ohlc_history ((pair, minutes) -> candles by open time, newest still forming).
+    precision: the instrument's price and size decimals, so a refilled minute is written as a live one is
+    (60000.10, not 60000.1)."""
     r = recent(pair, 1).iloc[:-1]
     closes = (r.index + pd.Timedelta(minutes=1)).as_unit("ns").asi8
     keep = (closes >= since_ns) & (closes <= until_ns)
-    return [protocol.bar(instrument_id, row.open, row.high, row.low, row.close, row.volume, int(close), now_ns,
-                         refilled=True) for row, close in zip(r[keep].itertuples(), closes[keep])]
+    px, qty = (f".{precision[0]}f", f".{precision[1]}f") if precision else ("", "")
+    return [protocol.bar(instrument_id, *(format(x, px) for x in (row.open, row.high, row.low, row.close)),
+                         format(row.volume, qty), int(close), now_ns, refilled=True)
+            for row, close in zip(r[keep].itertuples(), closes[keep])]
 
 
 class HubRelayConfig(DataActorConfig):
@@ -223,7 +228,10 @@ class HubRelay(DataActor):
         if pair is None or self.recent is None:
             return
         try:
-            bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns())
+            with self._lock:
+                d = self.definitions.get(iid)
+            precision = (d["price_precision"], d["size_precision"]) if d else None
+            bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns(), precision)
         except Exception as exc:  # noqa: BLE001 - the venue's REST down too: the gap stays announced
             print(f"hub: refill of {iid} failed: {exc!r}")
             return

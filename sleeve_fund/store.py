@@ -14,7 +14,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     JSON,
@@ -213,6 +213,24 @@ orders_t = Table(
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
 )
+# When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
+# and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
+# the venue's own stamp on the last fill, which the clock check compares against. Backtests keep none.
+order_timings_t = Table(
+    "order_timings",
+    metadata,
+    Column("order_id", String(64), ForeignKey("orders.order_id"), primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("bar_close", TS),  # the decision bar's close; none when a tick or the risk guard decided
+    Column("bar_recv", TS),  # when the node had that bar
+    Column("decided", TS),
+    Column("sent", TS),  # none for an order held by the strategy until it can fill (a paper post-only)
+    Column("accepted", TS),
+    Column("first_fill", TS),
+    Column("last_fill", TS),
+    Column("venue_ts", TS),
+    Index("order_timings_sleeve_decided", "sleeve", "decided"),
+)
 # The stop and target an open position works to after the PM edited them, or after a restart set them
 # again from the market, as shares of its entry price (the entry order's signal holds the plan it was
 # entered with). The latest row per entry order is in force. A new table: CREATE TABLE.
@@ -390,6 +408,34 @@ signal_state_t = Table(
     Column("ts", TS, nullable=False),
     Column("payload", Text, nullable=False),
 )
+# Every variant ever tested, for the research guardrails (v2 P1-6): the count that deflates a result's Sharpe.
+# Append-only: nothing here is updated or deleted, and it has no strategy column, so a reset never touches it.
+# One row per evaluation; a variant is one (definition_hash, code_version, dataset). A new table: CREATE TABLE.
+trials_t = Table(
+    "trials",
+    metadata,
+    Column("id", String(16), primary_key=True),
+    Column("definition_hash", String(64), nullable=False),  # the whole definition, settings included
+    Column("idea_hash", String(64), nullable=False),  # the definition with its tunable settings left out
+    Column("code_version", String(40), nullable=False),  # the indicator library's version: changed code, new variant
+    Column("definition_name", Text, nullable=False),
+    Column("family", String(32), nullable=False),
+    Column("settings", Text, nullable=False),  # JSON text, sorted keys; display only, nothing filters on it
+    Column("dataset", String(128), nullable=False),
+    Column("stage", String(16), nullable=False),
+    Column("source", String(16), nullable=False),
+    Column("sharpe", Float),  # annualised; NULL where it is undefined, never NaN
+    Column("trades", Integer),
+    Column("oos_trades", Integer),
+    # Not a foreign key: saved backtests are pruned to the latest 50, and a trial outlives its run.
+    Column("backtest_id", String(16)),
+    Column("created_at", TS, nullable=False),
+    Index("trials_idea_hash", "idea_hash"),
+    Index("trials_definition_dataset", "definition_hash", "dataset"),
+)
+# Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
+TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
+TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -459,6 +505,14 @@ def _not_backtest(col):
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _from_ns(ns: int) -> datetime:
+    """UNIX nanoseconds -> an aware UTC datetime to the microsecond (utcnow() drops them)."""
+    return _EPOCH + timedelta(microseconds=ns // 1000)
 
 
 def _aware(ts: datetime | None) -> datetime | None:
@@ -636,7 +690,10 @@ class Store:
                                              fee=fee, order_id=order_id, trade_id=trade_id))
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:
+        """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
+        order_timings row in the same transaction, so that row never exists without its order (DA-8)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -645,6 +702,34 @@ class Store:
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
                                               message=""))
+            if timing:
+                c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
+                    k: _from_ns(v) for k, v in timing.items() if v is not None}))
+
+    def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
+        """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
+        acceptance, each fill) on the row record_order wrote with the decision; ignored for an order with no row
+        (a risk stop, a restore: nothing decided them on a bar). A call with `decided` for an order with no row
+        adds it. fill: our clock at a fill; the first is kept as first_fill, every one moves last_fill."""
+        values = {k: _from_ns(v) for k, v in stamps.items() if v is not None}
+        if fill is not None:
+            values["last_fill"] = _from_ns(fill)
+        with self.engine.begin() as c:
+            row = c.execute(select(order_timings_t.c.first_fill).where(order_timings_t.c.order_id == order_id)).first()
+            if row is None:
+                if "decided" in values:
+                    c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **values))
+            elif values:
+                if fill is not None and row.first_fill is None:
+                    values["first_fill"] = values["last_fill"]
+                c.execute(update(order_timings_t).where(order_timings_t.c.order_id == order_id).values(**values))
+
+    def timings(self, sleeve: str, limit: int = 500) -> list[dict]:
+        """The strategy's latest order timings, newest decision first."""
+        q = (select(order_timings_t).where(order_timings_t.c.sleeve == sleeve)
+             .order_by(order_timings_t.c.decided.desc()).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
@@ -1107,7 +1192,7 @@ class Store:
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
-                 insurance_t, orders_t, mirror_requests_t)
+                 insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
@@ -1385,6 +1470,33 @@ class Store:
              .order_by(backtests_t.c.created_at.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
+
+    # --- trials register (research guardrails) ----------------------------------------
+
+    def add_trials(self, rows: list[dict]) -> int:
+        """Append trials; a row whose id is already there is skipped, so replaying the same rows is a no-op.
+        Returns how many were added."""
+        if not rows:
+            return 0
+        for r in rows:
+            if r["source"] not in TRIAL_SOURCES:
+                raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
+            if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
+                raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
+            sharpe = r.get("sharpe")
+            if sharpe is not None and not math.isfinite(sharpe):
+                raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
+        with self.engine.begin() as c:
+            have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
+            new = [dict(r, created_at=r.get("created_at") or utcnow()) for r in rows if r["id"] not in have]
+            new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
+            if new:
+                c.execute(insert(trials_t), new)
+        return len(new)
+
+    def trials(self) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(trials_t).order_by(trials_t.c.created_at, trials_t.c.id)))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

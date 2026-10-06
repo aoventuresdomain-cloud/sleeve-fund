@@ -49,6 +49,20 @@ def auto_warmup(strategy: str, params: dict, bar_spec: str) -> int:
     return min(cap, max(cls.warmup_needed(p, spec_minutes(bar_spec)), exit_warmup(p)))
 
 
+def check_hub_bar_spec(venue: str, bar_spec: str) -> None:
+    """Raises ValueError for the venue's own candles on a venue a market data hub feeds (VenueProfile.hub): there
+    every bar is built from the hub's minutes, and slower ones only from P1-4 (QA P1-C7). Checked where a
+    strategy is created, so it is refused there rather than failing to start, and by the supervisor before
+    each start, for one saved before this check (QA P1-C10)."""
+    profile = venue_profile(venue)
+    if profile.hub and not bar_spec.endswith("-INTERNAL"):
+        size = "-".join(bar_spec.split("-")[:2]).lower()  # 1-DAY-LAST-EXTERNAL -> 1-day
+        # No venue name: this is shown on the dashboard when a strategy is created.
+        raise ValueError(f"bar_spec: strategies on this market decide on bars built from the market data hub's "
+                         f"minutes, so the venue's own {size} candles aren't available "
+                         "there; choose 1, 5 or 15-minute or 1-hour bars")
+
+
 @dataclass(frozen=True)
 class SleeveConfig:
     name: str
@@ -117,6 +131,7 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
     sleeve = raw.get("sleeve", {})
     if "fees" in raw:
         raise ValueError(f"{path}: fees come from the venue profile (sleeve_fund/venues.py); remove [fees]")
+    check_hub_bar_spec(sleeve.get("venue", DEFAULT_VENUE), sleeve["bar_spec"])
     return SleeveConfig(
         name=sleeve["name"],
         strategy=sleeve["strategy"],

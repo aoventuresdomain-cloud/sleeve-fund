@@ -1,0 +1,52 @@
+name: parity
+# Hub bar parity report (v2 P1-1): runs scripts/hub_parity.py inside the venue's hub container on the paper
+# server and prints the report. Read-only: no --out, so it writes nothing; it reads the history store and the
+# venue's public candles. Run it by hand from main; it uses the deploy workflow's secrets (DEPLOY_HOST,
+# DEPLOY_SSH_KEY) and variable DEPLOY_USER, like status. The script is sent from this checkout over ssh's stdin,
+# so the report always uses main's version. The run goes red when any instrument differs (exit 1) or the store
+# holds nothing for the venue (exit 2).
+on:
+  workflow_dispatch:
+    inputs:
+      venue:
+        description: Venue whose hub to check (lower-case letters only)
+        required: true
+        default: binance
+      hours:
+        description: Hours of closed 1-minute bars to compare, counting back from now
+        required: true
+        default: "24"
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          VENUE: ${{ inputs.venue }}
+          HOURS: ${{ inputs.hours }}
+        run: |
+          [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
+          [[ "$HOURS" =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ ]] || { echo "hours must be a number"; exit 1; }
+          awk -v h="$HOURS" 'BEGIN { exit !(h > 0 && h <= 720) }' || { echo "hours must be above 0 and at most 720"; exit 1; }
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Run the parity report
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          VENUE: ${{ inputs.venue }}
+          HOURS: ${{ inputs.hours }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python - --venue $VENUE --hours $HOURS" \
+            < scripts/hub_parity.py

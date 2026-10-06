@@ -68,9 +68,11 @@ class Sma(BlockBase):
         return peek(self, close)
 
 
-class Atr(BlockBase):
-    """Average true range: the simple average of each bar's range, stretched to the previous close
-    when the bar gapped (the engine's default settings)."""
+class AtrSma(BlockBase):
+    """Average true range as a simple average of each bar's range, stretched to the previous close when the
+    bar gapped (the engine's default settings), and the first bar's range is its high minus low. The hand-coded
+    models size their stops on this one; definitions name it `atr_sma`. Wilder's ATR, the usual meaning of ATR,
+    is `Atr` (averages.py) and the `atr` block."""
 
     SETTINGS = (Setting("period", int, 14, 1, PERIOD_MAX),)
 

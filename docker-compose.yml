@@ -31,14 +31,19 @@ services:
   supervisor:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully } }
+    # Binance strategies connect to the hub as they start: start it first (QA P1-C9).
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
+                  hub-binance: { condition: service_started } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history  # warm-up for sleeves on bars built from live trades
+      # Binance strategies read the hub's stream instead of each holding a venue connection (sleeve_fund/hub).
+      HUB_BINANCE: hub-binance:7700
       # Optional: where warnings and errors are sent, and an outside monitor's ping (sleeve_fund/alerts.py).
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       HEALTHCHECK_PING_URL: ${HEALTHCHECK_PING_URL:-}
       BACKUP_DIR: /data/backups  # read only: a late or failed backup raises an alert
+      CLOCK_SERVER: time.aws.com  # the server clock is checked against it; drift past 250 ms raises an alert
     volumes: [history:/data/history:ro, backups:/data/backups:ro]
     env_file:
       - path: kraken.env

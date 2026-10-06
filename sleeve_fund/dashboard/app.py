@@ -37,9 +37,17 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
+from sleeve_fund.paper.config import (
+    ALLOWED_BAR_SPECS,
+    VENUE_WARMUP_BARS,
+    SleeveConfig,
+    auto_warmup,
+    check_hub_bar_spec,
+    to_store_kwargs,
+)
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
+from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
@@ -92,6 +100,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         study_run.seed(LEDGER, TEARSHEETS)
     except OSError as exc:  # the pages still work; research shows what it has
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
+    try:  # the idea counter folded into the trials register; safe to repeat on every start
+        TrialsRegister(app.state.store).import_ledger(LEDGER)
+    except (OSError, ValueError, KeyError) as exc:
+        logging.getLogger(__name__).warning(f"couldn't fold the idea counter into the trials register: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
@@ -377,6 +389,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")),
                                venue=_venue_name(form.get("venue")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
+            check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
             for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
@@ -451,6 +464,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     positions=positions, working=working, fees_funding=fees_funding,
+                    timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
