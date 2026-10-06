@@ -114,7 +114,7 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
 
 
 def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = None,
-           insurance: list[dict] | None = None) -> list[dict]:
+           insurance: list[dict] | None = None, open_trip: bool = False) -> list[dict]:
     """Closed round trips (flat -> long -> flat, or flat -> short -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial fills are fine: a trip
@@ -131,6 +131,8 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
     open at its time, so a trip's P&L is after fees and funding; `funding` carries its share.
     insurance: shortfalls the venue's insurance fund took past the bankruptcy price (ts, amount), booked
     to the trip they closed, so its loss is capped at the margin as the strategy's equity is.
+    open_trip: also return a trip still open after the last row, last, with closed None and no P&L, so a
+    walk-forward window can count the trade it ends inside (QA P1-R1).
     """
     out, pos = [], ZERO
     trip: dict | None = None
@@ -165,6 +167,8 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
         _book_flows(out, funding, "funding")
     if insurance:
         _book_flows(out, insurance, "insurance")
+    if open_trip and trip is not None and pos != ZERO:
+        out.append({**_trip(trip, {}), "pnl": float("nan"), "ret": float("nan")})
     return out
 
 
