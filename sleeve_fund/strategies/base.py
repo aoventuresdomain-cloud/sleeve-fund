@@ -29,6 +29,7 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType,
                                    TriggerType)
 from nautilus_trader.trading import Strategy
 
+from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
@@ -181,6 +182,10 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
     liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
+
+
+def _utc(ns: int) -> datetime:
+    return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
 
 
 def _side_word(side: int) -> str:
@@ -481,6 +486,11 @@ class LongFlatStrategy(Strategy):
         self._degraded: dict[int, int] = {}
         self._no_entry_ts: int | None = None  # the close time of the degraded bar being decided on
         self._degraded_missing = 0
+        # Paper on its own trade feed builds its decision bars itself: the minutes (open time, in minutes since the
+        # epoch) it saw market data in, so each bar's missing minutes are counted by the store's rule (_count_minutes,
+        # QA P1-D2). A backtest fed shorter execution bars is told which decision bars they build (expect_bars, P1-D1).
+        self._minutes_seen: set[int] = set()
+        self._built: set[int] | None = None
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
@@ -544,10 +554,53 @@ class LongFlatStrategy(Strategy):
         builder each one as it closes, before handing the bar over."""
         self._degraded.update({int(ts): int(m) for ts, m in bars.items()})
 
+    def expect_bars(self, closes) -> "LongFlatStrategy":
+        """Backtest on execution bars: the close times (ns) of the decision bars they build. The engine makes up any
+        other one flat at the last price from nothing, and it is dropped (runner.decision_bars, QA P1-D1)."""
+        self._built = {int(t) for t in closes}
+        return self
+
+    def _count_minutes(self, bar: Bar) -> bool:
+        """Apply the store's bar rule (sleeve_fund.bars, board 5a) where this process builds its own decision bars.
+        Paper on its own trade feed counts the minutes it saw market data in: too many missing marks the bar
+        degraded, and a bar with none at all, which the engine makes up flat at the last price, is not decided on
+        (QA P1-D2); with a gap loader that bar is left to _hold_gap, which rebuilds it from the venue's own candles
+        (PM, 5 Oct 2026). A hub-fed node takes the hub client's count; a backtest on execution bars, the runner's
+        (expect_bars). True when the bar is to be dropped."""
+        if self.hub_status is not None and self.hub_status.degraded:
+            self._degraded.update(self.hub_status.degraded)
+            self.hub_status.degraded.clear()
+        if str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
+            return False
+        if self._backtest:
+            if self._built is None or bar.ts_event in self._built:
+                return False
+            self.log.info(f"bar {bar} dropped: none of its execution bars exist, so it isn't built (board 5a)")
+            return True
+        if self.hub_fed or not str(bar.bar_type).endswith("INTERNAL"):
+            return False
+        minutes = bar_minutes(self._cfg.bar_type)
+        if minutes <= 1:
+            return False
+        end = bar.ts_event // MINUTE_NS
+        seen = sum(1 for m in self._minutes_seen if end - minutes <= m < end)
+        self._minutes_seen = {m for m in self._minutes_seen if m >= end}
+        if seen == 0:
+            if not self._backtest and self.gap_loader is not None:
+                return False
+            self.log.info(f"bar {bar} dropped: no data in any of its minutes, so it isn't built (board 5a)")
+            return True
+        missing = minutes - seen
+        if bar_rule.degraded(missing, minutes):
+            self._degraded.setdefault(bar.ts_event, missing)
+        return False
+
     def _entry_blocked(self, bar: Bar) -> bool:
         """Whether no new entry may be decided on this bar because it is degraded; says why, once per bar."""
         if bar.ts_event != self._no_entry_ts:
             return False
+        if self.runtime is not None and not self.runtime.can_open():
+            return True  # halted or paused: nothing would open anyway, so nothing was held back (QA P1-D5)
         minutes = bar_minutes(self._cfg.bar_type)
         missing = self._degraded_missing
         self.log.info(f"entry held back on a degraded bar: {missing} of {minutes} minutes missing")
@@ -1030,8 +1083,19 @@ class LongFlatStrategy(Strategy):
                 short = want - len(bars)
                 msg += (f"; {short} short of what the model looks back over, so its indicators are unsettled "
                         f"until {short} more bar{'s' if short != 1 else ''} close")
-            # Bars between the last one loaded and the first live one are a hole the indicators skip.
             step = bar_minutes(self._cfg.bar_type) * 60_000_000_000
+            # Bars absent inside the window (minutes the store never got, so no bar was built): the indicators step
+            # across them, so the largest hole is named (QA P1-D8).
+            gaps = [(a.ts_event, b.ts_event) for a, b in zip(bars, bars[1:]) if b.ts_event - a.ts_event > step]
+            if gaps:
+                level = "warning"
+                a, b = max(gaps, key=lambda g: g[1] - g[0])
+                absent = sum((y - x) // step - 1 for x, y in gaps)
+                msg += (f"; {absent} bar{'s' if absent != 1 else ''} inside the window {'are' if absent != 1 else 'is'} "
+                        f"missing (no stored minutes), the largest the bars closing {_utc(a + step):%d %b %H:%M} to "
+                        f"{_utc(b - step):%d %b %H:%M} UTC, and the indicators step across "
+                        + ("them" if len(gaps) > 1 else "it"))
+            # Bars between the last one loaded and the first live one are a hole the indicators skip.
             missing = int((time.time_ns() - bars[-1].ts_event) // step)
             if missing > 0:
                 level = "warning"
@@ -1262,6 +1326,8 @@ class LongFlatStrategy(Strategy):
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
+            return
+        if self._count_minutes(bar):
             return
         if self._hold_gap(bar):
             return
@@ -2293,6 +2359,8 @@ class LongFlatStrategy(Strategy):
 
     def _market_seen(self) -> None:
         self._last_market_ns = self.clock.timestamp_ns()
+        if not self._backtest and not self.hub_fed:
+            self._minutes_seen.add(self._last_market_ns // MINUTE_NS)
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
         if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:

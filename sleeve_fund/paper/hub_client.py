@@ -34,6 +34,7 @@ from nautilus_trader.model import (
     Venue,
 )
 
+from sleeve_fund import bars as bar_rule
 from sleeve_fund.hub import protocol
 
 RECONNECT_SECONDS = (1, 2, 5)  # the hub is on the same host: back within seconds of it
@@ -67,6 +68,9 @@ class HubStatus:
     def __init__(self) -> None:
         self.heartbeat_ns = 0  # node clock, when the last heartbeat arrived
         self.venue_up = False
+        # Bars sent with too many minutes missing (sleeve_fund.bars), by close ns -> minutes missing: the strategy
+        # takes them before deciding on the bar, so no entry is opened on one, as in a backtest (board 5a, QA P1-D2).
+        self.degraded: dict[int, int] = {}
 
     def venue_down(self, now_ns: int) -> bool:
         """The hub is alive (a recent heartbeat) and says its venue connection is down."""
@@ -127,8 +131,10 @@ class Decoder:
     run's extent when the feed is current again), of bars sent with minutes missing, of minutes missed on
     1-minute bars, and of a bar under way at start that the store couldn't complete."""
 
-    def __init__(self, bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, recover=None) -> None:
+    def __init__(self, bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, recover=None,
+                 status: HubStatus | None = None) -> None:
         self.bar_spec = bar_spec
+        self.status = status
         self.period = int(BarType.from_str(f"X.Y-{bar_spec}").spec.timedelta.total_seconds()) * 1_000_000_000
         self.report = report or (lambda level, kind, message: None)
         self.recover = recover
@@ -259,6 +265,8 @@ class Decoder:
             self.report("warning", "bar_incomplete",
                         f"{iid}: the bar closing {_hhmm(b.end)} was sent missing {missing} of its "
                         f"{self.period // MINUTE_NS} minutes")
+            if self.status is not None and bar_rule.degraded(missing, self.period // MINUTE_NS):
+                self.status.degraded[b.end] = missing
         bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
         px, qty = self._digits(iid, b.minutes.values())
         *prices, v = b.ohlcv()
@@ -283,7 +291,7 @@ class HubDataClient(MarketDataClient):
         super().__init__(name=name, config=config, cache=cache, clock=clock, venue=Venue(config.venue))
         self.cfg = config
         self._report = config.report or self._log_report
-        self.decode = Decoder(config.bar_spec, self.report, config.recover)
+        self.decode = Decoder(config.bar_spec, self.report, config.recover, config.status)
         self.last_heartbeat_ns = 0
         self.venue_up = False
         self.connects = 0

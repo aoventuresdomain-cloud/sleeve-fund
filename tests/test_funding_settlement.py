@@ -137,8 +137,9 @@ def test_a_position_held_across_pays_rate_times_notional_once_longs_pay_shorts_r
 
 def test_paper_charges_a_long_held_at_settlement_and_stopped_out_five_seconds_later(tmp_path):
     """3-hour decision bars (08:00 is not a bar close), so only paper's 30-second tick settles funding. Long from the
-    06:00 bar, stop hit at 08:00:05. The recording starts at 05:59:13, so ticks fall at :13 and :43."""
-    start, minutes = "2025-10-03 05:59:13", 125
+    06:00 bar, stop hit at 08:00:05. The recording starts at 03:00:13, so the 06:00 bar is whole (a part bar is
+    degraded, board 5a) and ticks fall at :13 and :43."""
+    start, minutes = "2025-10-03 03:00:13", 304
     t = utc(start) + pd.to_timedelta(np.arange(minutes * 60), unit="s")
     prices = np.where(t < utc("2025-10-03 08:00:05"), 60_000 + np.arange(minutes * 60) * 0.01, 58_800.0)
     params = {"open_at": ns("2025-10-03 06:00"), "close_at": ns("2025-10-03 12:00"), "side": 1, "stop_loss": 0.005,

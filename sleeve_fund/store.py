@@ -438,6 +438,16 @@ def exact_sum(a: float, b: float) -> float:
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
+# A position worth less than this (in the quote currency) is below every venue's smallest order, so no flatten can
+# close it: a reset treats it as flat (QA P1-D6). Venues' minimums are a few units (5 on the perpetuals).
+DUST_NOTIONAL = 1.0
+
+
+def is_dust(book: dict) -> bool:
+    """A journal book (replay_book) holding a position too small for any venue to take an order for."""
+    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0.0) < DUST_NOTIONAL
+
+
 def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
@@ -1124,14 +1134,16 @@ class Store:
         with self.engine.connect() as c:
             return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
 
-    def split_run(self, request: dict, now: datetime | None = None) -> str:
+    def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
         journal (fills, marks, orders, events, decisions, mirror record) moves to the run, archived, and the
         strategy keeps its name and settings with an empty journal, so it replays to its starting capital.
-        Nothing is deleted. Returns the run's name."""
+        Nothing is deleted. Returns the run's name. dust_ok: a position too small for any order (is_dust) goes with
+        the run."""
         name, now = request["sleeve"], now or utcnow()
         s = self.sleeve(name)
-        if abs(self.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+        book = self.journal_book(name, s.starting_balance)
+        if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,

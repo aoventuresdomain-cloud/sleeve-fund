@@ -27,7 +27,7 @@ from sleeve_fund import accounts
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
-from sleeve_fund.store import Sleeve, Store, utcnow
+from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing
 
 POLL_SECONDS = 5
@@ -131,8 +131,10 @@ class Supervisor:
             name = req["sleeve"]
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
-            qty = self.store.journal_book(name, s.starting_balance)["qty"]
-            if abs(qty) > 1e-12:
+            book = self.store.journal_book(name, s.starting_balance)
+            qty = book["qty"]
+            dust = is_dust(book)
+            if abs(qty) > 1e-12 and not dust:
                 why = f"Reset strategy: {req['reason']}"
                 if not any(c["command"] == "flatten" for c in pending) and _flatten_again(self.store, name, why,
                                                                                          req["created_at"], qty):
@@ -140,9 +142,14 @@ class Supervisor:
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue
+            if dust:
+                self.store.event(name, "warning", "reset_dust",
+                                 f"The {qty:.12g} still held is worth under {DUST_NOTIONAL:g}, below any venue's smallest "
+                                 "order, so no flatten can close it: the reset treats it as flat and it stays with the "
+                                 "run put away")
             self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
             self.store.drop_pending(name, "lapsed: the strategy was reset")
-            run = self.store.split_run(req)
+            run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)

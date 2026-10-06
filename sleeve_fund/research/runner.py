@@ -16,6 +16,7 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
+from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
@@ -190,6 +191,11 @@ def run_backtest(
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
         engine.add_strategy(strategy)
+        if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
+            built = decision_bars(exec_prices, bar_minutes, exec_minutes)
+            strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
+            thin = built[built["degraded"]]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
         if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
             thin = prices[prices["degraded"].astype(bool)]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
@@ -234,6 +240,19 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def decision_bars(exec_prices: pd.DataFrame, bar_minutes: int, exec_minutes: int) -> pd.DataFrame:
+    """The decision bars the engine builds from execution bars stamped at their close, by close time: how many of
+    each one's minutes are missing and whether that makes it degraded (sleeve_fund.bars). A decision bar none of
+    whose execution bars exist isn't listed: the engine would make it up flat from nothing (QA P1-D1)."""
+    idx = exec_prices.index
+    period = pd.Timedelta(minutes=bar_minutes)
+    close = (idx - pd.Timedelta(1, "ns")).floor(period) + period
+    present = pd.Series(exec_minutes, index=close).groupby(level=0).sum().clip(upper=bar_minutes)
+    out = pd.DataFrame({"missing": (bar_minutes - present).astype("int64")})
+    out["degraded"] = [bar_rule.degraded(int(m), bar_minutes) for m in out["missing"]]
+    return out
 
 
 def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:

@@ -307,13 +307,14 @@ def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_cap
 
 
 def test_a_reset_that_cant_flatten_stops_asking_and_says_the_pm_must_close_it(store):
-    """Review round 13, m13-E1: a position the strategy can't close (less than the venue's smallest order) got a
-    fresh flatten every supervisor step, for ever. Now three, then one error event; the reset stays pending."""
+    """Review round 13, m13-E1: a position the strategy can't close got a fresh flatten every supervisor step, for
+    ever. Now three, then one error event; the reset stays pending. (Dust below any venue's smallest order is
+    treated as flat instead: test_degraded_155_qa.test_d6.)"""
     from sleeve_fund.supervisor import SYSTEM_FLATTENS, Supervisor
 
     store.create_sleeve(name="dust", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000)
-    store.record_fill("dust", side="BUY", qty=3e-8, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
+    store.record_fill("dust", side="BUY", qty=1e-4, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
     store.set_signal_state("dust", {"rows": []})
     store.request_reset("dust", "Test finished")
     sup = Supervisor(store, python="true")
@@ -323,10 +324,10 @@ def test_a_reset_that_cant_flatten_stops_asking_and_says_the_pm_must_close_it(st
             store.mark_applied(c["id"])
     assert len(store.decisions("dust", action="flatten")) == SYSTEM_FLATTENS
     gave_up = [e for e in store.events("dust", limit=50) if e["kind"] == "flatten_gave_up"]
-    assert len(gave_up) == 1 and "3e-08" in gave_up[0]["message"] and gave_up[0]["level"] == "error"
+    assert len(gave_up) == 1 and "0.0001" in gave_up[0]["message"] and gave_up[0]["level"] == "error"
     assert store.pending_reset("dust") is not None
     # Closed by the PM: the reset finishes, and the fresh run has no Signals left from the old one (m13-E2).
-    store.record_fill("dust", side="SELL", qty=3e-8, price=86_000.0, fee=0.0, order_id="o2", trade_id="t2")
+    store.record_fill("dust", side="SELL", qty=1e-4, price=86_000.0, fee=0.0, order_id="o2", trade_id="t2")
     sup.reset_pending()
     assert store.pending_reset("dust") is None and store.signal_state("dust") is None
 
