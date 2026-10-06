@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from decimal import Decimal
 from dataclasses import dataclass, field
 
@@ -60,6 +61,10 @@ class Fold:
     # it was in the training stretch the run traded through first. A halted fold is flat from then on.
     halted: str = ""
     halted_before_test: bool = False  # halted in the training stretch: the whole test window sat flat
+    # Every grid point's Sharpe and round trips on this fold's training stretch: the surface the choice
+    # was made on, so the nearby-settings check can centre on what this fold chose (P1-G2).
+    grid: pd.DataFrame = field(default_factory=pd.DataFrame)
+    unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
 
     @property
     def closed_in_window(self) -> int:
@@ -96,9 +101,13 @@ class StudyResult:
     errors: list = field(default_factory=list)
     error_count: int = 0
     holdout_withheld: str = ""  # why the holdout asked for was left closed
-    # The default params over the research period at each fee of COST_LADDER: what costs the idea survives.
+    # The chosen settings over the research period at each fee of COST_LADDER: what costs the idea survives.
     cost_ladder: list[LadderRung] = field(default_factory=list)
     ladder_slippage: float = 0.0  # charged on every rung on top of the half spread, on orders that take liquidity
+    # The settings tuning on the whole research period picks (best in-sample Sharpe on the grid): what the
+    # cost ladder and the final nearby-settings check centre on, never the defaults (P1-G2).
+    chosen_params: dict = field(default_factory=dict)
+    breakeven: str = ""  # the chosen settings' break-even fee in words, re-run to verify it (P1-G1)
     # Out-of-sample timing against random entry times, and for strategies that can go short, side against random
     # sides (v2 P1-7, C3 and C3b).
     random_entry: RandomEntryResult | None = None
@@ -155,11 +164,16 @@ class StudyResult:
 
 
 # Fee per side the cost ladder tests every idea at (PM, 5 Oct 2026): free, the low-fee perp venues' maker
-# and taker rates, a mid venue, and a high-fee spot venue's taker rate (the stress case).
-COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.008)
+# and taker rates, a mid venue, and a high-fee spot venue's taker rate (the stress case). The Independent
+# Quant Advisor (6 Oct 2026, P1-G1) added 0.15-0.40%, where most spot taker fees sit: return bends with the
+# fee, so a wide gap there misplaced the break-even.
+COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.008)
 # Slippage beyond the spread each rung also pays on orders that take liquidity (strategy sprint, PM approved
 # 5 Oct 2026): 2 basis points on the deepest books (BTC, ETH), 5 on the rest.
 DEEP_BOOKS = ("BTC", "ETH")
+# A re-run at the computed break-even confirms it when its net return is within this of zero (P1-G1).
+BREAKEVEN_TOLERANCE = 0.0001  # 0.01% of starting capital, QA's bar (m-G6)
+BREAKEVEN_RUNS = 6  # re-runs allowed to home in on it before the figure stays "interpolated"
 
 
 def ladder_slippage(pair: str) -> float:
@@ -175,20 +189,50 @@ class LadderRung:
     fees_paid: float
 
 
-def breakeven_fee(rungs: list[LadderRung]) -> tuple[float | None, str]:
+def _log_growth(total_return: float) -> float:
+    return math.log1p(max(total_return, -0.999999))
+
+
+def _between(lo_fee: float, lo_ret: float, hi_fee: float, hi_ret: float) -> float:
+    """Where log(1 + return) crosses zero between two fees. Fees compound with every trade, so return is
+    convex in the fee and a straight line through return overstates the break-even; log growth falls
+    about linearly with the fee (QA P1-G1: 0.291% reported against a true 0.163%)."""
+    a, b = _log_growth(lo_ret), _log_growth(hi_ret)
+    return lo_fee + (hi_fee - lo_fee) * a / (a - b)
+
+
+def breakeven_fee(rungs: list[LadderRung], run_at=None) -> tuple[float | None, str]:
     """The fee per side at which the idea stops making money over the period, and that in words. Found
-    between the ladder's two rungs either side of zero return, by straight-line interpolation (fees scale
-    with turnover, so return falls about linearly with the fee between rungs). None when it loses money even
-    at no fee, or still makes money at the top rung."""
+    between the ladder's two rungs either side of zero return, interpolating log(1 + return). With
+    `run_at(fee) -> total return`, the figure is re-run to confirm the net is about zero, homing in between
+    the rungs when it isn't, and called "verified"; without it, "interpolated". None when it made no trades,
+    loses money even at no fee, or still makes money at the top rung."""
     rungs = sorted(rungs, key=lambda r: r.fee)
     if not rungs:
         return None, "not tested"
+    if rungs[0].round_trips == 0 and rungs[-1].fees_paid == 0:  # never filled: no trades, not a loss (QA F6)
+        return None, "made no trades, so there is no fee to break even on"
     if rungs[0].total_return <= 0:
         return None, f"loses money even at {rungs[0].fee:.2%} fees"
     for lo, hi in zip(rungs, rungs[1:]):
         if hi.total_return <= 0:
-            fee = lo.fee + (hi.fee - lo.fee) * lo.total_return / (lo.total_return - hi.total_return)
-            return fee, f"stops making money at about {fee:.3%} per side (between {lo.fee:.2%} and {hi.fee:.2%})"
+            span = f"between {lo.fee:.2%} and {hi.fee:.2%}"
+            lo_fee, lo_ret, hi_fee, hi_ret = lo.fee, lo.total_return, hi.fee, hi.total_return
+            fee = _between(lo_fee, lo_ret, hi_fee, hi_ret)
+            if run_at is None:
+                return fee, f"stops making money at about {fee:.3%} per side (interpolated {span})"
+            for _ in range(BREAKEVEN_RUNS):
+                ret = run_at(fee)
+                if abs(ret) <= BREAKEVEN_TOLERANCE:
+                    return fee, (f"stops making money at about {fee:.3%} per side (verified: re-run at that fee, "
+                                 f"net return {ret:+.3%}, within {BREAKEVEN_TOLERANCE:.2%})")
+                if ret > 0:
+                    lo_fee, lo_ret = fee, ret
+                else:
+                    hi_fee, hi_ret = fee, ret
+                fee = _between(lo_fee, lo_ret, hi_fee, hi_ret)
+            return fee, (f"stops making money at about {fee:.3%} per side (interpolated {span}; "
+                         f"{BREAKEVEN_RUNS} re-runs did not settle within {BREAKEVEN_TOLERANCE:.2%})")
     return None, f"still makes money at {rungs[-1].fee:.2%} per side, the top of the ladder"
 
 
@@ -296,7 +340,7 @@ def run_study(
     errors: list = []
     error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
-    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 1 + folds_n * (len(combos) + 1) + len(COST_LADDER)
+    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 2 + folds_n * (len(combos) + 1) + len(COST_LADDER)
              + (2 if use_holdout and holdout_days else 0))
     done = [0]
 
@@ -348,23 +392,38 @@ def run_study(
                                     round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid))
         return rungs
 
-    rows = []
-    full_default, ladder = None, None
+    rows, ladders = [], []
+    full_default = None
     for params in combos:
         res = bt(spec.name, research, params)
         m = summary(daily_returns(res.equity))
         log(params, "sensitivity", m["sharpe"])
         rungs = cost_ladder(params)
+        ladders.append(rungs)
         fee, words = breakeven_fee(rungs)
         rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid,
                      "breakeven_fee": float("nan") if fee is None else fee, "breakeven": words})
         if params == default_params:
-            full_default, ladder = res, rungs
+            full_default = res
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
-    if ladder is None:
-        ladder = cost_ladder(default_params)
     sensitivity = pd.DataFrame(rows)
+    # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
+    sharpes = [r["sharpe"] if math.isfinite(r["sharpe"]) else -math.inf for r in rows]
+    if rows and max(sharpes) > -math.inf:
+        at = sharpes.index(max(sharpes))
+        chosen, ladder = combos[at], ladders[at]
+    else:
+        at, chosen, ladder = None, default_params, cost_ladder(default_params)
+
+    def run_at(fee: float) -> float:
+        eq = bt(spec.name, research, chosen, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
+                slippage=slip).equity
+        return float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0
+
+    fee, breakeven = breakeven_fee(ladder, run_at)
+    if at is not None:
+        sensitivity.loc[at, ["breakeven_fee", "breakeven"]] = [float("nan") if fee is None else fee, breakeven]
 
     # 2. Walk-forward.
     folds: list[Fold] = []
@@ -375,11 +434,27 @@ def run_study(
         through_test = research.iloc[start : start + train_bars + test_bars]
         test_idx = through_test.index[train_bars:]
         best, best_sharpe = None, float("-inf")
+        surface = []
         for params in combos:
-            m = summary(daily_returns(bt(spec.name, train, params).equity))
+            fit = bt(spec.name, train, params)
+            m = summary(daily_returns(fit.equity))
             log(params, "wf_train", m["sharpe"])
+            surface.append({**params, "sharpe": m["sharpe"], "round_trips": len(round_trips(fit.fills, fit.shorts))})
             if m["sharpe"] > best_sharpe:
                 best, best_sharpe = params, m["sharpe"]
+        if best is None:
+            # No setting scored a Sharpe on training (none traded, so every one was NaN): nothing was chosen. The
+            # fold sits flat through its test window and fails the nearby-settings check, saying why (CR, #156).
+            days = whole_days(bench_ret, test_idx[0], bar)
+            test_ret = pd.Series(0.0, index=days.index[days.index <= test_idx[-1]])
+            folds.append(Fold(train_start=train.index[0], train_end=train.index[-1], test_end=test_idx[-1], chosen={},
+                              train_sharpe=float("nan"), test=summary(test_ret),
+                              benchmark_test=summary(bench_ret.reindex(test_ret.index).dropna()),
+                              window_bars=len(test_idx), unscored=True, grid=pd.DataFrame(surface)))
+            oos_parts.append(test_ret)
+            bench_parts.append(bench_ret.reindex(test_ret.index).dropna())
+            start += test_bars
+            continue
         # Trade the chosen params continuously through the test window so the
         # position carried in from training is realistic, then score only the test days.
         run = bt(spec.name, through_test, best)
@@ -399,6 +474,7 @@ def run_study(
                 in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),
+                grid=pd.DataFrame(surface),
             )
         )
         oos_parts.append(test_ret)
@@ -430,6 +506,8 @@ def run_study(
         error_count=error_count[0],
         cost_ladder=ladder,
         ladder_slippage=slip,
+        chosen_params=chosen,
+        breakeven=breakeven,
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
@@ -479,6 +557,9 @@ def run_study(
     elif opened is not None:
         result.holdout_withheld = (f"left closed, though asked for: this model's holdout on {result.instrument} was "
                                    f"opened {opened_words(opened)}, and a second look can't be fresh")
+    elif use_holdout and holdout_days and folds[-1].unscored:
+        result.holdout_withheld = ("left closed, though asked for: no setting scored on the last fold's training "
+                                   "stretch, so there is no choice to test on it")
     elif use_holdout and holdout_days:
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)
