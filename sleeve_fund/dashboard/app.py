@@ -1609,8 +1609,8 @@ def _funding_health(venue: str, pair: str, root, log) -> dict:
     from sleeve_fund import funding
 
     try:
-        return {"funding_gaps": len(funding.gaps(venue, pair, root)),
-                "funding_maybe": len(funding.interval_changes(venue, pair, root))}
+        missed, maybe = funding.settled_holes(venue, pair, root)
+        return {"funding_gaps": len(missed), "funding_maybe": len(maybe)}
     except Exception as exc:  # noqa: BLE001 - the prices' badge stands without it
         log.warning(f"couldn't read the funding kept for {pair}: {exc!r}")
         return {}

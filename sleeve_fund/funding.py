@@ -137,3 +137,15 @@ def interval_changes(venue: str, pair: str, root: str | Path | None = None) -> l
             if span not in holes and span not in out:
                 out.append(span)
     return out
+
+
+def settled_holes(venue: str, pair: str, root: str | Path | None = None) -> tuple[list, list]:
+    """gaps() and interval_changes() for the spans a later settlement has been kept after. While a span is the newest
+    interval there is nothing after it to compare with, so the first long interval after a change to a longer
+    schedule would read as a missed settlement (QA P1-O18): it is judged once the next settlement is kept, and a
+    real hole is reported one interval later."""
+    t = rates(venue, pair, root).index
+    if not len(t):
+        return [], []
+    return ([g for g in gaps(venue, pair, root) if g[1] < t[-1]],
+            [g for g in interval_changes(venue, pair, root) if g[1] < t[-1]])

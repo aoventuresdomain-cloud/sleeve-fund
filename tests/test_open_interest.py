@@ -4,6 +4,7 @@ import json
 import time
 
 import pandas as pd
+import pytest
 
 from sleeve_fund import funding, open_interest
 from sleeve_fund.history import _refresh_funding
@@ -398,7 +399,8 @@ def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_each_and_th
     first, last = pd.Timestamp("2026-01-01", tz="UTC"), pd.Timestamp("2026-10-01", tz="UTC")
     chip = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": [], **health})
     assert chip["title"] == "2 missed funding settlements; 1 possible funding hole at an interval change"
-    assert chip["state"] == "stored" and chip["tone"] == "paused" and "no price gaps · 3 funding holes" in chip["text"]
+    assert chip["state"] == "stored" and chip["tone"] == "paused"
+    assert chip["text"].endswith("no price gaps · 2 funding holes · 1 possible funding hole")  # QA P1-O19
     clean = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": []})
     assert clean["tone"] == "running" and clean["text"].endswith("no gaps")
 
@@ -416,3 +418,85 @@ def test_a_null_funding_rate_is_refused_alone_and_left_as_a_hole(tmp_path):
     assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == [
         (pd.Timestamp(T0 + 8 * h, unit="ms", tz="UTC"), pd.Timestamp(T0 + 24 * h, unit="ms", tz="UTC"))]
     assert len(funding.fetch("BINANCE", "BTC/USDT", pd.Timestamp(T0, unit="ms", tz="UTC"), loader=loader)) == 5
+
+
+def _inbox(monkeypatch, check=None):
+    sent = []
+
+    class Inbox:
+        def event(self, sleeve, level, kind, message, ts=None):
+            if check is not None:
+                check()
+            sent.append((level, kind, message))
+    monkeypatch.setattr("sleeve_fund.store.Store", Inbox)
+    return sent
+
+
+def test_a_change_to_a_longer_interval_fed_one_settlement_a_pass_is_one_possible_hole(tmp_path, monkeypatch):
+    """QA P1-O18: as the hub gets them, 4-hourly settlements then 8-hourly: a span is judged only once a later
+    settlement is kept, so the change is one possible hole and nothing is called missed."""
+    from sleeve_fund import history
+
+    h = 3_600_000
+    every = [T0 + k * 4 * h for k in range(8)] + [T0 + 28 * h + k * 8 * h for k in range(1, 8)]
+    kept: list = []
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    sent = _inbox(monkeypatch)
+    for t in every:
+        kept.append(t)
+        _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+        history._warned.clear()
+    assert len(sent) == 1 and "possible hole at interval change" in sent[0][2] and "missed" not in sent[0][2], sent
+
+
+def _one_hole(tmp_path, monkeypatch):
+    h = 3_600_000
+    kept = [T0 + k * 8 * h for k in range(6) if k != 3]
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    return profile, funding._path("BINANCE", "BTC/USDT", tmp_path).with_name("funding.alerted.json")
+
+
+@pytest.mark.parametrize("content", ["null", "5", "[[1, 2]]"])
+def test_an_alerted_file_of_the_wrong_shape_is_read_as_empty_and_said(tmp_path, monkeypatch, capfd, content):
+    """QA P1-O20: the hole goes in once more and the file is rewritten, rather than the alerts stopping for good."""
+    profile, path = _one_hole(tmp_path, monkeypatch)
+    path.parent.mkdir(parents=True)
+    path.write_text(content)
+    sent = _inbox(monkeypatch)
+    for _ in range(3):
+        _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    out = capfd.readouterr().out
+    assert len(sent) == 1 and "reading it as empty" in out and "funding refresh failed" not in out
+    assert json.loads(path.read_text()) == ["missed between 2026-10-01 16:00 to 2026-10-02 08:00"]
+
+
+def test_an_alerted_file_that_cannot_be_saved_is_not_sent_again_and_leaves_no_temp_file(tmp_path, monkeypatch, capfd):
+    """QA P1-O20: the event went in; a failed save neither repeats it every pass nor leaves a .tmp behind."""
+    from sleeve_fund import history
+
+    profile, path = _one_hole(tmp_path, monkeypatch)
+    monkeypatch.setattr(history, "_sent_holes", {})
+
+    def refuse(tmp, dest):
+        raise PermissionError("read-only")
+    monkeypatch.setattr(history, "_durable_replace", refuse)
+    sent = _inbox(monkeypatch)
+    for _ in range(4):
+        _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert len(sent) == 1 and "could not keep the funding holes already raised" in capfd.readouterr().out
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_the_alert_is_sent_outside_the_stores_lock(tmp_path, monkeypatch):
+    """QA P1-O21: a slow or unreachable database never holds up the store's other writes."""
+    from sleeve_fund import history
+
+    profile, _ = _one_hole(tmp_path, monkeypatch)
+    held = []
+    sent = _inbox(monkeypatch, check=lambda: held.append(history._lock.locked()))
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert len(sent) == 1 and held == [False]

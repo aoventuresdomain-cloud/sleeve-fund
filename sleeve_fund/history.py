@@ -569,8 +569,7 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         try:
             kept = funding.refresh(profile.name, pair, root=root, since=since)
             funding_to = kept.index[-1] if len(kept) else None
-            missed = funding.gaps(profile.name, pair, root)
-            maybe = funding.interval_changes(profile.name, pair, root)
+            missed, maybe = funding.settled_holes(profile.name, pair, root)  # QA P1-O18
             if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
                 print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
@@ -587,28 +586,51 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
     """Each funding hole goes to the alerts inbox once, ever (QA P1-O11, P1-O16): the holes already raised are
     kept beside the rates, so a second new hole the same day still goes in, a restart repeats nothing, and holes
     stored before this check existed are raised on its first pass. Old holes never clear, so the daily cap of
-    _alert would either repeat them or hold new ones back."""
+    _alert would either repeat them or hold new ones back. The new holes are chosen under the store's lock and sent
+    outside it, so a slow database never holds up the store's writes (QA P1-O21)."""
     from sleeve_fund import funding
 
     path = funding._path(venue, pair, root).with_name("funding.alerted.json")
     with _writing(path.parent):
-        try:
-            raised = set(json.loads(path.read_text()))
-        except (FileNotFoundError, ValueError):
-            raised = set()
-        new = [h for h in holes if h not in raised]
-        if not new:
-            return
-        try:
-            from sleeve_fund.store import Store
+        new = [h for h in holes if h not in _raised(path)]
+    if not new:
+        return
+    try:
+        from sleeve_fund.store import Store
 
-            Store().event(None, "warning", "funding_gap", f"{venue} {pair}: funding: " + "; ".join(new))
-        except Exception as exc:  # noqa: BLE001 - no database (locally): the log line still says it; retried next pass
-            print(f"could not raise the funding_gap alert: {exc!r}")
-            return
+        Store().event(None, "warning", "funding_gap", f"{venue} {pair}: funding: " + "; ".join(new))
+    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line still says it; retried next pass
+        print(f"could not raise the funding_gap alert: {exc!r}")
+        return
+    with _writing(path.parent):
         tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(sorted(raised | set(new))))
-        _durable_replace(tmp, path)
+        try:
+            tmp.write_text(json.dumps(sorted(_raised(path) | set(new))))
+            _durable_replace(tmp, path)
+        except OSError as exc:  # sent, but not kept: not sent again by this process; a restart sends them once more
+            _sent_holes.setdefault(str(path), set()).update(new)
+            tmp.unlink(missing_ok=True)
+            print(f"{venue} {pair}: could not keep the funding holes already raised in {path}: {exc!r}")
+
+
+_sent_holes: dict[str, set[str]] = {}  # alerted file -> holes this process sent but couldn't keep in it
+
+
+def _raised(path: Path) -> set[str]:
+    """The holes already raised for the instrument. A file that can't be read, or isn't a list of hole words, is
+    read as empty and said (QA P1-O20): its holes go in once more, rather than its alerts stopping for good."""
+    raised = set(_sent_holes.get(str(path), ()))
+    try:
+        kept = json.loads(path.read_text())
+    except FileNotFoundError:
+        return raised
+    except (OSError, ValueError) as exc:
+        print(f"funding holes already raised: {path} unreadable ({exc!r}); reading it as empty")
+        return raised
+    if not isinstance(kept, list) or not all(isinstance(h, str) for h in kept):
+        print(f"funding holes already raised: {path} is not a list of holes; reading it as empty")
+        return raised
+    return raised | set(kept)
 
 
 def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
