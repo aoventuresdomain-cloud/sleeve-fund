@@ -867,7 +867,7 @@ def test_path_to_live_reports_g2_evidence_and_never_approves(client):
     store.create_account("kraken-live", "live", venue="kraken")
     store.report_keys({"kraken-live": True})
     rows = {r["label"]: r for r in gates.path_to_live(store, x, None, store.accounts(), utcnow())}
-    assert rows["Live Kraken spot account with its key installed"]["detail"] == "kraken-live"
+    assert rows["Live spot account with its key installed"]["detail"] == "kraken-live"
 
 
 def test_g2_key_row_counts_only_a_key_on_the_strategys_own_venue(client):
@@ -892,7 +892,7 @@ def test_g2_key_row_counts_only_a_key_on_the_strategys_own_venue(client):
                     if r["label"].endswith("account with its key installed"))
 
     row = key_row(on_binance)
-    assert row["label"] == "Live Binance USD-M perpetuals account with its key installed" and row["ok"] is False
+    assert row["label"] == "Live perpetual account with its key installed" and row["ok"] is False
     assert row["detail"] == "add one on the Accounts page"
     store.create_account("binance-live", "live", venue="binance")
     store.report_keys({"kraken-live": True, "binance-live": True})
