@@ -8,7 +8,7 @@ from nautilus_trader.model import BarType
 
 from sleeve_fund.strategies.indicators import Sma
 from sleeve_fund.strategies.timeframes import Candle, SlowerCandles
-from tests.test_dashboard import AUTH, SAME, client  # noqa: F401
+from test_dashboard import AUTH, SAME, client  # noqa: F401
 
 M = 60_000_000_000
 H4 = 240 * M
@@ -143,7 +143,7 @@ def test_a_strategy_whose_slower_warm_up_the_store_cant_meet_says_so_and_decides
 def test_a_strategy_with_a_slower_filter_trades_the_same_in_a_backtest_and_a_paper_replay(tmp_path):
     """Done when (P1-4): decisions on short candles with a filter on slower ones, here 1-minute RSI under a
     15-minute trend average to keep the recording short, make the same trades on both paths."""
-    from tests.test_tick_bar_parity import _both, _same_trades
+    from test_tick_bar_parity import _both, _same_trades
 
     s = np.arange(6 * 60 * 60)  # six hours, a trade a second: a slow trend under fast swings
     prices = 60_000 * (1 + 0.03 * np.sin(s / 4000) + 0.004 * np.sin(s / 110))
