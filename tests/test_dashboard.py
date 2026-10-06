@@ -2589,7 +2589,7 @@ def test_the_page_names_what_clears_each_kind_of_halt(client):
     store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
     store.set_status("btc-test", "halted", "Position margin lost (liquidated): 900.00, 110% of strategy equity at entry")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert "only a reset after liquidation clears that" in page and "Reset after liquidation needed" in page
+    assert "only a reset after liquidation clears that" in page and 'data-open="dlg-ral"' in page
     # A book reset (later, DA-6) clears the other two but never a liquidation, so the page promises no other way.
     assert "until you use Reset after liquidation, which asks for an incident note" in page
     assert 'data-open="dlg-resume">Resume<' not in page
@@ -2599,3 +2599,83 @@ def test_the_page_names_what_clears_each_kind_of_halt(client):
     store.set_status("btc-test", "paused", f"{EXITS_ONLY}: it was stopped while it still holds a position")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "Exits only:" in page and "What clears it:" not in page
+
+
+LIQUIDATED_HALT_TEXT = "Position margin lost (liquidated): 3,328.70, 112.4% of strategy equity at entry (includes adds)"
+
+
+def _liquidated_with_incident(store):
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    return next(e["id"] for e in store.events("btc-test", min_level="error") if e["kind"] == "incident")
+
+
+def test_a_liquidated_page_offers_reset_after_liquidation_with_its_note_and_figures(client):
+    """RAL (Advisor 17:57, 18:17): the dialog names X, Y% (with 'includes adds'), the equity left, and holds the
+    note form and the reset form, both on the engine's incident; an ordinary halt is offered neither."""
+    c, store = client
+    _new(c)
+    iid = _liquidated_with_incident(store)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    dialog = page.split('id="dlg-ral"')[1].split("</dialog>")[0]
+    assert "3,328.70" in dialog and "112.4% of its equity when the position was opened (includes adds)" in dialog
+    assert f'name="incident" value="{iid}"' in dialog
+    assert 'name="author"' in dialog and 'name="why_stop_did_not_protect"' in dialog
+    assert "why the half-liquidation stop did not protect the position" in dialog.lower()
+    assert 'value="reset_after_liquidation"' in dialog and "stays open until the note is written" in dialog
+    assert 'data-open="dlg-ral"' in page
+    store.set_status("btc-test", "halted", "drawdown 21.0% hit the 20% limit")
+    store.event("btc-test", "info", "liquidation_reset", "PM reset it after liquidation")
+    other = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'id="dlg-ral"' not in other and "reset_after_liquidation" not in other
+
+
+def test_the_reset_after_liquidation_post_hands_the_incident_to_the_store_and_shows_its_refusals(client, monkeypatch):
+    c, store = client
+    _new(c)
+    iid = _liquidated_with_incident(store)
+    sent = []
+
+    def command(name, command, reason, actor="PM", **kw):
+        if kw.get("incident") != iid:
+            raise ValueError("that incident is not about this liquidation")
+        sent.append((name, command, reason, actor, kw))
+
+    monkeypatch.setattr(store, "command", command)
+    form = {"command": "reset_after_liquidation", "reason": "Incident note written"}
+    r = c.post("/sleeves/btc-test/command", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" in r.headers["location"] and "incident" in r.headers["location"] and not sent
+    r = c.post("/sleeves/btc-test/command", data={**form, "incident": str(iid + 99)}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" in r.headers["location"] and "not+about+this+liquidation" in r.headers["location"]
+    r = c.post("/sleeves/btc-test/command", data={**form, "incident": str(iid)}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" not in r.headers["location"]
+    assert sent == [("btc-test", "reset_after_liquidation", "Incident note written", "pm", {"incident": iid})] or \
+        sent[0][:3] == ("btc-test", "reset_after_liquidation", "Incident note written")
+    cross = c.post("/sleeves/btc-test/command", data={**form, "incident": str(iid)}, auth=AUTH,
+                   headers={"origin": "http://elsewhere.example"}, follow_redirects=False)
+    assert cross.status_code in (400, 403) and len(sent) == 1
+
+
+def test_the_incident_note_post_writes_the_note_and_says_which_field_is_blank(client, monkeypatch):
+    c, store = client
+    _new(c)
+    iid = _liquidated_with_incident(store)
+    written = []
+
+    def write_incident_note(incident_id, *, author, why_stop_did_not_protect):
+        for field, value in (("author", author), ("why the half-liquidation stop did not protect", why_stop_did_not_protect)):
+            if not value.strip():
+                raise ValueError(f"the note needs {field}")
+        written.append((incident_id, author, why_stop_did_not_protect))
+
+    monkeypatch.setattr(store, "write_incident_note", write_incident_note, raising=False)
+    url = "/sleeves/btc-test/incident-note"
+    r = c.post(url, data={"incident": str(iid), "author": "PM", "why_stop_did_not_protect": " "}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert "command_error" in r.headers["location"] and "half-liquidation" in r.headers["location"] and not written
+    r = c.post(url, data={"incident": str(iid), "author": "PM", "why_stop_did_not_protect": "gap past the stop"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"] and written == [(iid, "PM", "gap past the stop")]

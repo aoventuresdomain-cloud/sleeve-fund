@@ -58,6 +58,7 @@ from sleeve_fund.strategies.base import EXITS_ONLY, exit_warmup, maker_orders_en
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
+RAL = "reset_after_liquidation"  # the PM's command that ends a liquidation halt (RAL)
 # Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
 LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
                       "again only after you use Reset after liquidation, which asks for an incident note")
@@ -447,7 +448,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         (stopped while holding; only a flatten or Start ends it). The words come from the engine's own gate, read
         for Start and Resume, so the page and the refusals never disagree. None when nothing needs clearing."""
         now = utcnow()
-        why = entry_blocked_in(st(), s.name, now, starting=True)[1]
+        why = entry_blocked(st(), s.name, now, starting=True)[1]
         if liquidated:
             return {"kind": "liquidated", "why": why, "action": "Reset after liquidation"}
         if s.status == "halted":
@@ -457,6 +458,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         if s.status == "paused" and (s.status_reason or "").startswith(EXITS_ONLY):
             return {"kind": "exits_only", "why": s.status_reason, "action": "Flatten"}
         return None
+
+    def _ral_view(s) -> dict:
+        """What the Reset after liquidation dialog shows (Advisor 17:57, 18:17, 20:37): the engine's open incident,
+        X and Y% read from the liquidation halt's own words ("... lost (liquidated): X, Y% of strategy equity at
+        entry", with "includes adds" when the position was added to), and the equity left, which is the journal's
+        cash once the position is gone. Whatever isn't there reads as None, and the dialog says so."""
+        incident = next((e for e in st().events(s.name, limit=400, min_level="error") if e["kind"] == "incident"), None)
+        m = re.search(r"\(liquidated\):\s*([\d,]+(?:\.\d+)?),\s*([\d,]+(?:\.\d+)?)%", s.status_reason or "")
+        return {"incident": incident["id"] if incident else None,
+                "x": m.group(1) if m else None, "y": m.group(2) if m else None,
+                "adds": "includes adds" in (s.status_reason or "").lower(),
+                "left": st().journal_book(s.name, s.starting_balance)["cash"]}
 
     @app.get("/sleeves/{name}", response_class=HTMLResponse)
     def sleeve_detail(request: Request, name: str, _: str = Depends(require_pm)):
@@ -483,6 +496,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.
         liquidated = not bt_id and _liquidated(name)
         clearing = None if bt_id else _clearing(s, liquidated)
+        ral = _ral_view(s) if liquidated else None
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -494,7 +508,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total, liquidated=liquidated, clearing=clearing,
+                    order_total=order_total, liquidated=liquidated, clearing=clearing, ral=ral,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -631,7 +645,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.post("/sleeves/{name}/command")
     def sleeve_command(name: str, command: str = Form(...), reason: str = Form(""),
                        reason_pick: str | None = Form(None), reason_note: str = Form(""), reason_for: str = Form(""),
-                       then: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+                       then: str = Form(""), incident: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """A PM command, with its reason: picked from the action's own list (reasons.py) or typed. Flatten with
         then=stop is the Stop dialog's "Flatten and stop": the flatten goes now, and the page asks to stop once
         the strategy is flat, as a stop sent now would drop the waiting flatten."""
@@ -677,6 +691,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
                 raise ValueError("it is already running, so there is nothing to resume")
+            elif command == RAL:
+                # Only from the PM's form, naming the incident whose note was written; the store refuses, in words,
+                # a missing or unwritten incident, one that isn't this liquidation's, and a retry (RAL, QA 18:17).
+                if not incident.strip().isdigit():
+                    raise ValueError("name the incident the note is on: Reset after liquidation needs it")
+                st().command(name, command, reason, actor=actor, incident=int(incident))
             elif command == "flatten" and any(c["command"] == "flatten" for c in st().pending_commands(name)):
                 # A second would sell again whatever the first left (review round 10, m5).
                 raise ValueError("a flatten is already waiting for the strategy to act on it")
@@ -698,11 +718,30 @@ def create_app(store: Store | None = None) -> FastAPI:
             # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         done = {"pause": "Pause sent", "resume": "Resume sent", "stop": "Stopped", "start": "Started",
+                RAL: "Reset after liquidation sent: it trades again once it has picked it up",
                 "flatten": "Close sent: it sells at market, then pauses" if reason_for == "close" else
                 "Flatten sent: it closes at market, then pauses"}.get(command, "Sent")
         # Flatten and stop keeps then_stop in the address (the page asks to stop once flat), so no one-off toast.
         q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
         return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
+
+    @app.post("/sleeves/{name}/incident-note")
+    def incident_note(name: str, incident: str = Form(""), author: str = Form(""),
+                      why_stop_did_not_protect: str = Form(""), actor: str = Depends(require_pm),
+                      _o: None = Depends(same_origin)):
+        """The cause written on a liquidation's incident, which Reset after liquidation needs first (Advisor 18:17):
+        who writes it, and why the half-liquidation stop did not protect the position. The store says, in words,
+        which field is blank; the page shows that where the PM typed it."""
+        try:
+            st().sleeve(name)
+            if not incident.strip().isdigit():
+                raise ValueError("name the incident the note is on")
+            st().write_incident_note(int(incident), author=author, why_stop_did_not_protect=why_stop_did_not_protect)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        except ValueError as exc:
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note written.'})}", status_code=303)
 
     def _liquidated(name: str) -> bool:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the

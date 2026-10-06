@@ -19,7 +19,8 @@
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
       {# Only a drawdown halt or a PM pause is cleared by Resume; a liquidation waits for its reset and a day's-loss pause for the 00:00 UTC roll (Advisor 18:17). #}
-      {% if clearing and clearing.kind in ['liquidated', 'daily'] %}<span class="chip paused" title="{{ clearing.why }}">{{ 'Reset after liquidation needed' if clearing.kind == 'liquidated' else 'Clears at 00:00 UTC' }}</span>
+      {% if clearing and clearing.kind == 'liquidated' %}<button type="button" data-open="dlg-ral" title="{{ clearing.why }}">Reset after liquidation</button>
+      {% elif clearing and clearing.kind == 'daily' %}<span class="chip paused" title="{{ clearing.why }}">Clears at 00:00 UTC</span>
       {% elif s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not x.qty %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
@@ -360,6 +361,32 @@
   </form>
 </dialog>
 {% endfor %}
+{% if ral and not archived %}<dialog id="dlg-ral" aria-labelledby="dlg-ral-h">
+  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name }}</h2>
+  <p>{% if ral.x %}Its position margin was lost: {{ ral.x }} {{ quote }}, {{ ral.y }}% of its equity when the position was opened{% if ral.adds %} (includes adds){% endif %}.{% else %}Its position margin was lost.{% endif %} It has {{ ral.left|money }} {{ quote }} left.</p>
+  {% if not ral.incident %}<div class="warnbox"><b>No incident is open for this liquidation yet.</b> The engine opens one; the reset needs it, and its note, before it will go ahead.</div>
+  {% else %}
+  <form method="post" action="/sleeves/{{ s.name }}/incident-note">
+    <input type="hidden" name="incident" value="{{ ral.incident }}">
+    <h3>1. The incident note</h3>
+    <label>Written by <input name="author" required maxlength="80"></label>
+    <label>Why the half-liquidation stop did not protect the position <textarea name="why_stop_did_not_protect" required maxlength="2000" rows="4"></textarea></label>
+    <div class="dlg-actions"><button>Save the note</button></div>
+  </form>
+  <form method="post" action="/sleeves/{{ s.name }}/command">
+    <input type="hidden" name="incident" value="{{ ral.incident }}">
+    <h3>2. Reset it</h3>
+    <ul class="reset-plan">
+      <li>Its drawdown reference and the day's loss baseline start again from the {{ ral.left|money }} {{ quote }} left, and it trades again.</li>
+      <li>Nothing else is reset: the book's limits, its track record, its trades and the old high-water mark stay as they are.</li>
+      <li>The incident stays open until the note is written and you acknowledge it.</li>
+    </ul>
+    <label>Reason <input name="reason" required maxlength="200" value="Incident note written"></label>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button>
+      <button name="command" value="reset_after_liquidation" class="danger">Reset after liquidation</button></div>
+  </form>{% endif %}
+  {% if ral.incident %}<div class="dlg-actions"><button type="button" class="secondary" data-close>Close</button></div>{% endif %}
+</dialog>{% endif %}
 {% if not archived %}<dialog id="dlg-reset" aria-labelledby="dlg-reset-h">
   <form method="post" action="/sleeves/{{ s.name }}/reset">
     <h2 id="dlg-reset-h">Reset {{ s.name }}</h2>
