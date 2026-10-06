@@ -728,3 +728,25 @@ def test_the_pms_commands_wait_while_a_liquidation_order_is_working(store):
     rt.tick(equity=9_900, price=9_900, liquidating=True, **mark)
     assert store.sleeve("s1").status == "paused" and not rt.can_open()
     assert [c["command"] for c in store.pending_commands("s1")] == ["resume"]  # still waiting
+
+
+@pytest.mark.parametrize("kind", ["store", "memory"])
+def test_orders_by_intent_and_funding_and_insurance_before_a_time_are_read_in_the_query(store, kind):
+    """Code Reviewer on 81e6d6f (minor 2): the liquidation figures read only the liquidation orders, and only the
+    funding and insurance booked before the position opened, not every row the strategy ever had."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.paper.journal import MemoryJournal
+
+    j = store if kind == "store" else MemoryJournal()
+    _sleeve(j)
+    t0 = datetime(2024, 3, 2, tzinfo=timezone.utc)
+    for i, intent in enumerate(("entry", "liquidation", "exit", "liquidation")):
+        j.record_order("s1", order_id=f"o{i}", side="BUY", qty=1.0, intent=intent, reason="", ts=t0 + timedelta(hours=i))
+    assert {o["order_id"] for o in j.orders("s1", intents=("liquidation",))} == {"o1", "o3"}
+    for h, amount in ((0, 1.5), (8, -0.5), (16, 2.0)):
+        j.record_funding("s1", qty=1.0, price=100.0, rate=0.0001, amount=amount, ts=t0 + timedelta(hours=h))
+        j.record_insurance("s1", price=100.0, amount=amount * 10, ts=t0 + timedelta(hours=h))
+    cut = t0 + timedelta(hours=16)
+    assert j.funding_total("s1", before=cut) == pytest.approx(1.0) and j.funding_total("s1") == pytest.approx(3.0)
+    assert j.insurance_total("s1", before=cut) == pytest.approx(10.0) and j.insurance_total("s1") == pytest.approx(30.0)

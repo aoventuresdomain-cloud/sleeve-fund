@@ -81,6 +81,7 @@ MAY_NAME_A_VENUE = {
     "mirror.py": "the demo mirror talks to named demo hosts only, by design (routing parked for v2, v13-2)",
     "safety.py": "lists venue credential prefixes so it can refuse every one of them",
     "accounts.py": "recognises the note older versions saved, so it can replace it on read",
+    "wording.py": "turns a venue name into what it is (\"the demo account\") in what the PM reads, so it names each one",
 }
 
 

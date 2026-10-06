@@ -16,7 +16,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from sleeve_fund import risk
-from sleeve_fund.store import OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
 
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
@@ -27,7 +27,7 @@ SPREAD_MIN_SAMPLES = 100
 
 
 WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
-RESET_AFTER_LIQUIDATION = "liquidation_reset"  # what a reset after liquidation journals (trading.LIQUIDATION_RESET, #164)
+RESET_AFTER_LIQUIDATION = LIQUIDATION_RESET  # what a reset after liquidation journals (#164)
 
 
 def liquidation_reason(head: str, covered: float) -> str:

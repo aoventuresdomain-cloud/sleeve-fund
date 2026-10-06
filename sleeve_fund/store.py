@@ -799,11 +799,14 @@ class Store:
                 values["message"] = message
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         if statuses:
             q = q.where(orders_t.c.status.in_(statuses))
+        if intents:
+            q = q.where(orders_t.c.intent.in_(intents))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
 
@@ -1149,10 +1152,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def funding_total(self, sleeve: str) -> float:
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
+        q = select(func.coalesce(func.sum(funding_t.c.amount), 0.0)).where(funding_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(funding_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
-                                   .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
@@ -1163,10 +1169,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def insurance_total(self, sleeve: str) -> float:
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
+        q = select(func.coalesce(func.sum(insurance_t.c.amount), 0.0)).where(insurance_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(insurance_t.c.amount), 0.0))
-                                   .where(insurance_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""

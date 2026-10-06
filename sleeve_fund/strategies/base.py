@@ -2377,7 +2377,7 @@ class LongFlatStrategy(Strategy):
             return 0.0, 0.0, None, True
         store, name = self.runtime.store, self.runtime.name
         fills = sorted(store.fills(name, limit=1_000_000), key=lambda f: (f["ts"], f["id"]))
-        liquidations = {o["order_id"] for o in store.orders(name, limit=100_000) if o["intent"] == "liquidation"}
+        liquidations = {o["order_id"] for o in store.orders(name, limit=100_000, intents=("liquidation",))}
         held, flat = Decimal(0), 0  # the fills since the position was last flat before now
         for i, f in enumerate(fills[:-1]):
             held += Decimal(repr(float(f["qty"]))) * (1 if f["side"] == "BUY" else -1)
@@ -2392,8 +2392,7 @@ class LongFlatStrategy(Strategy):
         if window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
             opened = window[0]["ts"]
             at_entry = replay_book(fills[:flat], self.runtime.starting_balance,
-                                   sum(float(f["amount"]) for f in store.funding(name, 1_000_000) if f["ts"] < opened),
-                                   sum(float(i["amount"]) for i in store.insurance(name, 1_000_000) if i["ts"] < opened)
+                                   store.funding_total(name, before=opened), store.insurance_total(name, before=opened)
                                    )["cash"]
         journaled = trade_id is None or any(str(f.get("trade_id")) == trade_id for f in liq)
         return fees, sum(float(f["qty"]) for f in liq), at_entry, journaled
