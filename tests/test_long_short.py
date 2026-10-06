@@ -662,7 +662,7 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
 
     c, store = client
     store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="ETH/USD", bar_spec="1-DAY-LAST-EXTERNAL",
-                        starting_balance=10_000,
+                        starting_balance=10_000, risk_profile="conservative",  # stopless perp: 1x (check_perp_stop)
                         params={"rise": 0.01, "dip": 0.005, **PERP, "demo_mirror": True})
     page = c.get("/sleeves/pp-ls", auth=AUTH).text
     href = next(p for p in page.split('"') if p.startswith("/sleeves/new?")).replace("&amp;", "&")

@@ -161,7 +161,8 @@ def test_path_to_live_follows_the_real_state(client, monkeypatch):
     page = c.get("/setup", auth=AUTH).text
     assert _here(page) == "Paper" and "Step 2 of 5" in page and "You are here" in page  # G2 not approved: Paper
     # A strategy asks for the mirror, but the mirror hasn't named a demo account: still Paper.
-    _new(c, name="eth-perp", instrument="ETH/USDT", venue="binance", market="perp", demo_mirror="1")
+    _new(c, name="eth-perp", instrument="ETH/USDT", venue="binance", market="perp", demo_mirror="1",
+         risk_profile="conservative")  # a stopless perp runs at 1x at most (check_perp_stop)
     assert store.sleeve("eth-perp").params.get("demo_mirror")
     store.event("eth-perp", "info", "mirror_start", "Demo mirror on: each new fill is copied to its demo account, "
                 "once that is set up (BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET), and the paper book stays the record")
@@ -192,7 +193,8 @@ def test_mirror_on_from_its_environment_switch(client, monkeypatch):
     from sleeve_fund.dashboard import setup_view
 
     c, store = client
-    _new(c, name="eth-perp", instrument="ETH/USDT", venue="binance", market="perp", demo_mirror="1")
+    _new(c, name="eth-perp", instrument="ETH/USDT", venue="binance", market="perp", demo_mirror="1",
+         risk_profile="conservative")  # a stopless perp runs at 1x at most (check_perp_stop)
     sleeves = store.sleeves()
     assert not setup_view.mirror_state(store, sleeves, environ={})["on"]
     assert setup_view.mirror_state(store, sleeves, environ={"DEMO_MIRROR": "on"})["on"]

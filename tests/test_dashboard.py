@@ -2141,7 +2141,8 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
 
     spot = _new(c, name="bn-spot", instrument="BTC/USDT", venue="binance")
     assert "perpetuals+only" in spot.headers["location"] and "venue=binance" in spot.headers["location"]
-    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp")
+    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp",
+              risk_profile="conservative")  # a stopless perp runs at 1x at most (check_perp_stop)
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text

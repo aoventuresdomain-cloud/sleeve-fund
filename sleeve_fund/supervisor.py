@@ -28,7 +28,7 @@ from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
-from sleeve_fund.strategies import check_perp_sizing
+from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -86,6 +86,7 @@ class Supervisor:
         s = self.store.sleeve(name)
         try:
             check_perp_sizing(s.strategy, s.params)
+            check_perp_stop(s.strategy, s.params, s.risk_profile)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
@@ -268,6 +269,8 @@ def seed(store: Store, paths: list[str]) -> list[str]:
                 store.decide("system", "mirror", f"demo mirror turned on from {path}", cfg.name)
             continue
         check_perp_sizing(cfg.strategy, cfg.params)
+        # A stopless perp above 1x is seeded as written and refused when started (_refused), with the reason: a
+        # shipped file must not stop the supervisor from coming up.
         with open(path, "rb") as fh:
             start = tomllib.load(fh).get("sleeve", {}).get("start", True)
         store.create_sleeve(**to_store_kwargs(cfg), desired_state="running" if start else "stopped")

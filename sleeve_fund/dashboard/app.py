@@ -52,7 +52,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
@@ -643,6 +643,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if command == "start":
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
+                    check_perp_stop(s.strategy, s.params, s.risk_profile)
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
@@ -2424,6 +2425,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     from nautilus_trader.model import BarType, InstrumentId
 
     check_perp_sizing(cfg.strategy, cfg.params)
+    check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)
