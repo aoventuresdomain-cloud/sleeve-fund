@@ -1,7 +1,12 @@
 {% macro chip(status) %}<span class="chip {{ status }}">{{ status|capitalize }}</span>{% endmacro %}
 {% macro signed(x) %}<span class="{{ 'gain' if x >= 0 else 'loss' }}">{{ x|pct }}</span>{% endmacro %}
 {% macro money_signed(x) %}<span class="{{ 'gain' if x > 0.005 else ('loss' if x < -0.005 else 'muted') }}">{{ x|smoney }}</span>{% endmacro %}
-{% macro usage(f) %}<span class="meter {{ 'high' if f >= 0.8 else ('mid' if f >= 0.5 else '') }}" role="img" aria-label="{{ (f * 100)|round(0)|int }}% of limit used"><i style="width: {{ (f * 100)|round(0) }}%"></i></span>{% endmacro %}
+{# drift: a cap the price can carry a position past after entry (exposure, margin share). The cap only limits new
+   entries, so that meter goes amber at most, never red, and says its true share (P1-U13, the Advisor's rule). #}
+{% macro usage(f, drift=False) %}<span class="meter {{ ('mid' if f >= 0.8 else '') if drift else ('high' if f >= 0.8 else ('mid' if f >= 0.5 else '')) }}" role="img" aria-label="{{ (f * 100)|round(0)|int }}% of {{ 'the entry cap' if drift else 'limit' }} used"><i style="width: {{ ([f, 1]|min * 100)|round(0) }}%"></i></span>{% endmacro %}
+{# Fees and funding against the P&L before them: a share of a gross gain, but a gross loss gets both figures, as a
+   share of a loss reads oddly (P1-U16). d: metrics.costs()'s keys. #}
+{% macro cost_share(d) %}{% if d.gross_pnl is defined and d.gross_pnl is not none %}{% if d.gross_pnl > 0 and d.cost_share is not none %} · {{ d.cost_share|pct0 }} of gross P&amp;L{% elif d.gross_pnl < 0 %} · costs {{ d.costs|money }} on a gross loss of {{ (0 - d.gross_pnl)|money }}{% endif %}{% endif %}{% endmacro %}
 {% macro spark(points, up) %}{% if points %}<svg class="spark {{ '' if up else 'down' }}" width="96" height="24" viewBox="0 0 96 24" aria-hidden="true"><polyline points="{{ points }}"/></svg>{% else %}<span class="faint">no history</span>{% endif %}{% endmacro %}
 {# A strategy's stop, whichever kind it is: a fixed %, average true ranges, or at a recent low. #}
 {% macro stop_words(p) %}{% set side = 'from' if p.allow_short else 'below' %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}% {{ side }} entry{% elif p.stop_atr %}{{ p.stop_atr }} ATR ({{ p.atr_bars or 14 }} bars) {{ side }} entry{% elif p.stop_swing_bars %}At the lowest low of {{ p.stop_swing_bars }} bars{% endif %}{% endmacro %}
@@ -21,7 +26,6 @@
   <p class="muted pc-other" hidden></p>
   <p class="muted pc-source" hidden>The venue couldn't be reached, so these candles are built from the strategy's own price marks.</p>
   <div class="why-grid pc-note" hidden aria-live="polite"></div>
-  <p class="pc-foot">Tap a buy or sell arrow to see why it traded. Charts by <a href="https://www.tradingview.com/" rel="noopener" target="_blank">TradingView Lightweight Charts™</a>.</p>
 </section>{% endmacro %}
 {% macro help(key) %}{% set t = glossary.get(key) %}{% if t %}<button type="button" class="help" data-help="{{ t }}" title="{{ t }}" aria-label="What does this mean?">?</button>{% endif %}{% endmacro %}
 {% macro book_tabs(active) %}<nav class="tabs desk-tabs" aria-label="Portfolio views">

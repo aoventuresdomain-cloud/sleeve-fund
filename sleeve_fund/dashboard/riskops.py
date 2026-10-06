@@ -42,10 +42,14 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "x": x,
             "dd_used": x["dd_used"],
             "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
-            "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
+            # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
+            "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
             "headroom": x["room"],
-            "has_stop": bool(s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
-            "position": positions.get(s.name),
+            # An open position's own stop (an exit-plan edit moves it), else the model's setting (P1-U14).
+            "has_stop": bool(pos["stop_px"]) if (pos := positions.get(s.name)) else bool(
+                s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
+            "stop_dist": abs(pos["stop_px"] / pos["entry_px"] - 1) if pos and pos["stop_px"] and pos["entry_px"] else None,
+            "position": pos,
             "shocks": shocks,
         })
     equity = book["equity"] or 1.0
@@ -204,10 +208,17 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
             continue  # already named, worse
-        used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss"), (r["cap_used"], "position cap")]
+        # The limits that halt or pause are judged on their own; drift past the entry cap gets its own line, so
+        # it never hides a drawdown or daily-loss warning (P1-U13, Code Reviewer on #152).
+        used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]
         share, which = max(used, key=lambda u: u[0])
         if share > NEAR_LIMIT:
             warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
+        if r["cap_used"] > 1:
+            # The cap limits new entries only: past it through price drift is information, not a call to act.
+            warn.append(f"{s.name}'s exposure is {r['cap_used']:.0%} of its entry cap because the price moved; no action")
+        elif r["cap_used"] > NEAR_LIMIT:
+            warn.append(f"{s.name} has used {r['cap_used']:.0%} of its position cap")
     warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:
         warn.append(health["backup_issue"])
@@ -230,26 +241,17 @@ def status_word(items: list[dict], running: int) -> dict:
     return {"word": "Needs a look", "tone": "warn", "issues": items, "line": line}
 
 
-def drawdown_chart(curve, days: int = 30, halt: float | None = None, w: float = 420, h: float = 110) -> dict:
-    """The book's drawdown over the last `days` daily closes as SVG geometry: the line and its area, the
-    current value and the worst in the window, and the y axis (0% at the top, deeper further down)."""
+def drawdown_chart(curve, days: int = 30, halt: float | None = None) -> dict:
+    """The book's drawdown over the last `days` daily closes for the Lightweight Charts area (QA U10): a UTC
+    timestamp per close and the drawdown in percent below the peak (negative), the current value and the worst
+    in the window as shares, and the halt line's level when the book shares one."""
     dd = curve["drawdown"] if len(curve) else []
     if len(dd):
         dd = dd[dd.index >= dd.index[-1] - pd.Timedelta(days=days - 1)]
     values = [max(float(v), 0.0) for v in dd]
-    worst = max(values) if values else 0.0
-    current = values[-1] if values else 0.0
-    left, top, bottom = 34.0, 10.0, h - 14
-    scale = max(worst * 1.25, halt or 0.0, 0.01)
-    y = lambda v: top + v / scale * (bottom - top)  # noqa: E731
-    step = (w - 6 - left) / (len(values) - 1) if len(values) > 1 else 0.0
-    pts = [(left + i * step, y(v)) for i, v in enumerate(values)]
-    line = " ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
-    area = (f"M{left:.1f},{top:.1f} " + " ".join(f"L{px:.1f},{py:.1f}" for px, py in pts)
-            + f" L{pts[-1][0]:.1f},{top:.1f} Z") if len(pts) > 1 else ""
-    ticks = [{"y": y(f * scale), "label": f"{f * scale:.0%}" if scale >= 0.05 else f"{f * scale:.1%}"} for f in (0.0, 0.5, 1.0)]
-    return {"line": line, "area": area, "dot": pts[-1] if pts else None, "ticks": ticks, "w": w, "h": h, "left": left,
-            "halt": halt, "halt_y": y(halt) if halt else None, "current": current, "worst": worst, "points": len(values)}
+    return {"t": [int(pd.Timestamp(t).timestamp()) for t in (dd.index if len(dd) else [])],
+            "dd": [round(-v * 100, 4) for v in values], "halt": halt,
+            "current": values[-1] if values else 0.0, "worst": max(values) if values else 0.0, "points": len(values)}
 
 
 def stress_bars(scenarios: list[dict]) -> dict:

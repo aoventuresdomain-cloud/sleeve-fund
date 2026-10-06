@@ -207,7 +207,7 @@ def run_backtest(
             engine.clear_data()
         engine.end()
 
-        fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
+        fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
@@ -342,10 +342,14 @@ def _mark_to_market(
     return equity.rename("equity"), exposure.rename("exposure")
 
 
-def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float]) -> pd.DataFrame:
+def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
+                        fee_paid: dict[str, float] | None = None) -> pd.DataFrame:
     """The engine charges the spread with the commission (bars have no bid or ask to fill on). Move
     it into each order's average price, so the report reads as a fill on the ask or bid would, and
-    leave the commissions as the venue's fee alone. Cash and equity are the same either way."""
+    leave the commissions as the venue's fee alone. Cash and equity are the same either way.
+    With fee_paid (each order's unrounded venue fee), the commission shows that fee to the cent and the
+    cent the charge's rounding left goes into the price with the spread: subtracting the exact spread
+    from a rounded charge showed a 0% fee as -0.01 (QA m-G7)."""
     if fills is None or fills.empty or not spread_paid:
         return fills
     fills = fills.copy()
@@ -355,11 +359,13 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float]) -> p
         qty = float(fills.at[coid, "filled_qty"])
         px = float(fills.at[coid, "avg_px"])
         buy = str(fills.at[coid, "side"]).endswith("BUY")
-        fills.at[coid, "avg_px"] = str(px + spread / qty if buy else px - spread / qty)
         entry = fills.at[coid, "commissions"]
         moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
         first, ccy = moneys[0].split()
-        fills.at[coid, "commissions"] = [f"{float(first) - spread:.2f} {ccy}", *moneys[1:]]
+        fee = round(fee_paid[coid], 2) if fee_paid and coid in fee_paid else round(float(first) - spread, 2)
+        moved = float(first) - fee  # the spread, and whatever rounding left in the charge
+        fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
+        fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
     return fills
 
 

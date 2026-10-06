@@ -29,10 +29,11 @@ class FeeQuote:
     def text(self) -> str:
         rates = f"{float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker"
         if self.source == "account":
-            return (f"{self.venue_label}: {rates}, from account {self.account}, "
+            # "Venue fees", never the venue's name: this text reaches activity and the backtest (QA U8 ruling).
+            return (f"Venue fees: {rates}, from account {self.account}, "
                     f"fetched {self.fetched_at:%d %b %Y %H:%M} UTC")
         basis = f" ({self.basis})" if self.basis else ""
-        return f"{self.venue_label}: {rates}, published schedule{basis}; no account on this venue is connected yet"
+        return f"Venue fees: {rates}, published schedule{basis}; no account on this venue is connected yet"
 
     @property
     def short(self) -> str:

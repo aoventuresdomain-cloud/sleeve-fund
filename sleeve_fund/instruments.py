@@ -162,6 +162,9 @@ class ScheduleFeeModel(FeeModel):
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
         self.spread_paid: dict[str, float] = {}
+        # The venue's own fee on those same orders, unrounded, so a report can show it alone to the cent and put
+        # what rounding left in the charged commission into the price with the spread (QA m-G7).
+        self.fee_paid: dict[str, float] = {}
         # Paper only: the market orders that carry a post-only order's maker fills, each with the order's
         # limit price and side (LongFlatStrategy._slice_maker). Paper's simulated venue would fill a
         # post-only order whole on the first trade through its price; a backtest fills BOOK_SHARE of
@@ -203,6 +206,7 @@ class ScheduleFeeModel(FeeModel):
             spread = notional * self.half_spread
             coid = str(order.client_order_id)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
             charge += spread
         return self._charge(charge, instrument.quote_currency)
 

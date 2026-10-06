@@ -373,8 +373,8 @@ def mirror_once(store, targets: dict) -> int:
         if mark is None:  # first sight: mirror from now on, not the strategy's history
             last = store.last_fill_id(s.name)
             store.record_mirror(s.name, fill_id=last, status="start", message="mirror started")
-            where = (f"{venue.label} ({venue.host}); demo money is not real" if venue is not None else
-                     f"its demo account, once that is set up ({' and '.join(ACCOUNTS[name])})")
+            where = ("its demo account; demo money is not real" if venue is not None else
+                     "its demo account, once that is set up on Setup, Accounts")  # no venue names in activity (QA U8)
             store.event(s.name, "info", "mirror_start",
                         f"Demo mirror on: each new fill is copied to {where}, and the paper book stays the record")
             continue
@@ -391,7 +391,7 @@ def mirror_once(store, targets: dict) -> int:
             if why:
                 store.record_mirror(s.name, fill_id=f["id"], status="skipped", instrument=instrument or "", message=why)
                 store.event(s.name, "warning", "mirror_skipped",
-                            f"Demo mirror didn't copy the {f['side'].lower()} of {f['qty']:.8g} to {venue.label}: "
+                            f"Demo mirror didn't copy the {f['side'].lower()} of {f['qty']:.8g} to the demo account: "
                             f"{why}. The paper book is unaffected.")
                 continue
             reset = "Reset strategy" in store.order_reason(f.get("order_id") or "")  # a PM reset's closing fill
@@ -403,7 +403,7 @@ def mirror_once(store, targets: dict) -> int:
                                     amount=sign * amount, message=str(e)[:500])
                 store.event(s.name, "warning", "mirror_failed",
                             f"Demo mirror couldn't copy the {f['side'].lower()} of {f['qty']:.8g} at {f['price']:,.2f} "
-                            f"to {venue.label}: {str(e)[:200]}. The paper book is unaffected.")
+                            f"to the demo account: {str(e)[:200]}. The paper book is unaffected.")
                 continue
             store.record_mirror(s.name, fill_id=f["id"], status="filled", instrument=instrument, amount=sign * amount,
                                 price=price, order_id=order_id, message="reset" if reset else "")
@@ -423,7 +423,7 @@ def check_drift(store, targets: dict, last: dict[str, float]) -> dict[str, float
         gap = held - expected
         if abs(gap) >= 1e-9 and last.get(instrument) != gap:
             store.event(None, "warning", "mirror_drift",
-                        f"Demo mirror: {venue.label} holds {held:+,.6g} {venue.unit} of {instrument}, the mirrored "
+                        f"Demo mirror: the demo account holds {held:+,.6g} {venue.unit} of {instrument}, the mirrored "
                         f"strategies {expected:+,.6g}. The paper book is unaffected.")
         out[instrument] = gap
     return out
@@ -476,7 +476,7 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
                 if _CATCH_UP_FAILED.get(name) != str(e):  # warned once per new reason, not every minute
                     _CATCH_UP_FAILED[name] = str(e)
                     store.event(name, "warning", "mirror_failed",
-                                f"Demo mirror couldn't catch {venue.label} up to the paper position ({side.lower()} "
+                                f"Demo mirror couldn't catch the demo account up to the paper position ({side.lower()} "
                                 f"{qty:g} {symbol}): {str(e)[:200]}. It tries again each minute; the paper book is "
                                 "unaffected.")
                 continue
@@ -485,7 +485,7 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
                                 amount=sign * qty, price=filled, order_id=order_id,
                                 message="catch-up to the paper position")
             store.event(name, "info", "mirror_catch_up",
-                        f"Demo mirror caught {venue.label} up to the paper position: {side.lower()} {qty:g} "
+                        f"Demo mirror caught the demo account up to the paper position: {side.lower()} {qty:g} "
                         f"{symbol}, a copy it had missed")
             account_gap -= sign * qty
             out.pop(name, None)
@@ -547,7 +547,7 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
                     _MARGIN_WARNED[symbol] = str(err)
                     for s in sleeves:
                         store.event(s.name, "warning", "mirror_margin",
-                                    f"Demo mirror couldn't set {venue.label} to isolated margin at {lev:g}x for "
+                                    f"Demo mirror couldn't set the demo account to isolated margin at {lev:g}x for "
                                     f"{symbol}: {str(err)[:200]}. Copies go on at the same quantity, so profit and "
                                     "loss match, but margin and liquidation price on the demo account differ.")
                 continue
@@ -555,7 +555,7 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
         _MARGIN_WARNED.pop(symbol, None)
         for s in sleeves:
             store.event(s.name, "info", "mirror_margin",
-                        f"Demo mirror set {venue.label} to the paper book's terms for {symbol}: {state} "
+                        f"Demo mirror set the demo account to the paper book's terms for {symbol}: {state} "
                         f"(the {s.risk_profile} profile's {lev:g}x cap)")
     return out
 
