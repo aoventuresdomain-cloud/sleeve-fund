@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 import pytest
 
 from sleeve_fund.store import Store
-from tests.test_dashboard import AUTH, client  # noqa: F401
-from tests.test_sleeve_runtime import store as _store_fixture
+from test_dashboard import AUTH, client  # noqa: F401
+from test_sleeve_runtime import store as _store_fixture
 
 journal = _store_fixture  # Postgres when TEST_DATABASE_URL is set
 
