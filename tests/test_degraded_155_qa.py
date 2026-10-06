@@ -79,6 +79,8 @@ def _guard_marks(monkeypatch, request):
         monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
     if request.node.get_closest_marker("no_open_risk_limit") is not None:
         monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if request.node.get_closest_marker("no_restart_safety_stop") is not None:
+        monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
 
 
 @pytest.fixture(autouse=True)
@@ -1059,6 +1061,8 @@ def test_p1_x_keeps_the_liquidation_fee_when_its_fill_row_is_late(tmp_path):
     assert x >= full - 0.005, (x, full)  # never smaller than what the liquidation lost
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_x_after_a_partial_reduce_and_a_restart_is_the_remainder_with_its_share_of_the_entry_fee(tmp_path):
     """CR case 1 (6047b50), through the engine: a 2x short of 0.3325 on full margin, a third bought back (journaled),
     a restart that restores the rest from the journal, then a +60% gap liquidates it. X = the remainder's margin, plus
@@ -1106,6 +1110,8 @@ def test_p1_x_after_a_partial_reduce_and_a_restart_is_the_remainder_with_its_sha
     assert _x_of(s.status_reason) == pytest.approx(want, abs=0.01), (s.status_reason, want)
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_x_after_a_restart_holding_the_position_keeps_the_stored_entry_fee(tmp_path):
     """CR case 2 (6047b50), through the engine: the short is opened in one process, the process restarts (the
     position restored from the journal by an unjournaled, free order), then the gap liquidates it. X includes the
@@ -1170,6 +1176,8 @@ def test_p1_nothing_opens_after_a_liquidation_on_a_gap_bar_with_a_resting_entry(
     assert not [f for f in fills if f["ts"] > max(x["ts"] for x in liq)]
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_y_after_a_partial_reduce_is_x_over_the_equity_when_the_position_was_opened(tmp_path):
     """P1-D20 pin (Advisor 20:37): the partial-reduce run above (a third of the 2x short bought back, a restart, a
     60% gap). Y = X over the strategy's equity at the short's first entry fill, the same base after the reduction,
