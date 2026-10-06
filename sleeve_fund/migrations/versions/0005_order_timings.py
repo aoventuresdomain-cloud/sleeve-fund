@@ -1,8 +1,8 @@
 """Add order_timings: each paper or live order's bar close, arrival, decision, send, acceptance and fills, to
 the microsecond (v2 P1-2). A new table, so nothing existing changes.
 
-Revision ID: 0003
-Revises: 0002
+Revision ID: 0005
+Revises: 0004
 Create Date: 2026-10-05
 """
 
@@ -10,8 +10,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '0003'
-down_revision = '0002'
+revision = '0005'
+down_revision = '0004'
 branch_labels = None
 depends_on = None
 

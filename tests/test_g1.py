@@ -6,12 +6,14 @@ import pandas as pd
 import pytest
 
 from sleeve_fund.dashboard import pipeline
+from sleeve_fund.research.guardrails import G1_RULES
 from sleeve_fund.research.metrics import sharpe_beats_probability
 from sleeve_fund.store import Sleeve
 
 
 def _sheet(path, strategy, verdict, instrument="BTC/USD", minutes=1440, dataset="kraken-btcusd-store"):
-    tested = f"Tested on `{instrument}` at {minutes}-minute bars\n\n" if instrument else ""
+    # Judged under today's G1 rules: a pass under older ones is an old bar (QA F3).
+    tested = (f"Tested on `{instrument}` at {minutes}-minute bars\n\n" if instrument else "") + f"G1 rules: {G1_RULES}\n\n"
     path.write_text(f"# Tear sheet: {strategy}\n\n{tested}Dataset `{dataset}` · research period x\n\n"
                     f"| Check | Result | Evidence |\n| --- | --- | --- |\n"
                     f"| G1 test: out-of-sample Sharpe clearly beats benchmark after fees | {verdict} | Sharpe 1.2 vs 0.8 |\n")
@@ -103,7 +105,7 @@ def test_the_bar_length_tested_is_read_from_the_prices(bars, minutes):
 
 def _checks_sheet(path, rows, dataset="kraken-btcusd-store"):
     body = "\n".join(f"| {label} | {verdict} | e |" for label, verdict in rows)
-    path.write_text(f"# Tear sheet: trend_filter\n\nTested on `BTC/USD` at 1440-minute bars on `KRAKEN`\n\n"
+    path.write_text(f"# Tear sheet: trend_filter\n\nTested on `BTC/USD` at 1440-minute bars on `KRAKEN`\n\nG1 rules: {G1_RULES}\n\n"
                     f"Dataset `{dataset}` · x\n\n| Check | Result | Evidence |\n| --- | --- | --- |\n{body}\n")
 
 
@@ -179,3 +181,24 @@ def test_a_spot_long_only_pass_never_counts_for_a_perp_or_long_short_strategy(tm
                   params={}, **_SLEEVE)
     row = next(r for r in pipeline.strategies(tmp_path, [perp, spot]) if r["name"] == "rsi_bands")
     assert [o["name"] for o in row["observing"]] == ["rsi-ls"]  # the spot one is backed by the pass
+
+
+def test_a_pass_under_older_g1_rules_is_an_old_bar_and_opens_nothing(tmp_path):
+    """QA F3: a sheet that passed under the 10-trade bar, with no nearby-settings check or one centred on the
+    defaults, kept reading PASS and ticked "Strategy passed G1" on the path to live. It is now not judged,
+    marked old bar, until the study is re-run; a fail stays a fail."""
+    from sleeve_fund.research.guardrails import G1_RULES
+
+    def sheet(verdict, rules):
+        _sheet(tmp_path / "a.md", "trend_filter", verdict)
+        text = (tmp_path / "a.md").read_text().replace(f"G1 rules: {G1_RULES}\n\n", "")
+        (tmp_path / "a.md").write_text(text.replace("Dataset", f"G1 rules: {rules}\n\nDataset") if rules else text)
+        return pipeline.sheet_facts(tmp_path / "a.md")
+
+    for rules in (None, "2026-10-05"):
+        facts = sheet("PASS", rules)
+        assert facts["g1"] == "NOT JUDGED" and facts["evidence"].startswith("Old bar:")
+        assert pipeline.g1_for(tmp_path, "trend_filter", "BTC/USD", 1440) != "PASS"
+    assert sheet("FAIL", None)["g1"] == "FAIL"
+    assert sheet("PASS", G1_RULES)["g1"] == "PASS"
+

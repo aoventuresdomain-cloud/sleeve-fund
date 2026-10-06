@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sleeve_fund.dashboard import development as dev
+from sleeve_fund.research.guardrails import G1_RULES
 from sleeve_fund.store import Store
 
 AUTH = ("pm", "test-pw")
@@ -32,6 +33,8 @@ def _sheet(strategy="rsi_cross", g1="FAIL", venue="BINANCE", pair="BTC/USDT", mi
 Tested on `{pair}` at {minutes}-minute bars on `{venue}`
 
 Settings: balanced risk profile · exits: the signal only · walk-forward 730 days training, 365 days testing
+
+G1 rules: {G1_RULES}
 
 Dataset `{venue.lower()}-{pair.replace('/', '').lower()}-store-{minutes}m` · research period 01 Oct 2021 to 05 Oct 2025 · holdout: last 365 days (untouched) · fees: Venue: 0.02% maker, {taker} taker, published schedule
 
@@ -103,8 +106,8 @@ def test_the_development_tab_lists_every_model_with_its_status(client):
                                   "dip_buy": "untested", "donchian": "untested"}
     # Ready first (and picked), then what passed; the meta line says where the last verdict came from.
     assert page.index('data-plan="rsi_cross"') < page.index('data-plan="trend_filter"') < page.index('data-plan="rsi_bands"')
-    assert "Kill on BTC/USDT, Binance USD-M perpetuals · break-even 0.03%" in page
-    assert "Pass on BTC/USD, Kraken spot" in page and "not tested yet" in page
+    assert "Kill on BTC/USDT perpetual · break-even 0.03%" in page
+    assert "Pass on BTC/USD spot" in page and "not tested yet" in page
     for word, n in (("Ready", 1), ("Passed G1", 1), ("Killed", 1)):
         assert re.search(rf'>{word} <span class="n">{n}</span></button>', page)
     assert '<button type="button" data-filter="all" aria-pressed="true">All <span class="n">8</span>' in page
@@ -123,7 +126,7 @@ def test_rsi_cross_comes_with_research_recommended_settings(client):
                                                 "use_holdout": False, "risk_profile": "balanced", "stop_atr": 2,
                                                 "atr_bars": 14}
     assert dev.how_sentence(p["values"]) == "15-minute candles. Learn on 2 years, test on the next year. Latest year sealed."
-    assert dev.exits_sentence(p["values"]) == ("Stop 2 average true ranges below entry (14 bars). No target. "
+    assert dev.exits_sentence(p["values"]) == ("Stop 2 simple average true ranges below entry (14 bars). No target. "
                                                "Balanced profile.")
     page = c.get("/research?strategy=rsi_cross", auth=AUTH).text
     assert "15-minute candles. Learn on 2 years, test on the next year. Latest year sealed." in page
@@ -205,7 +208,7 @@ def test_results_tab_gives_each_study_its_verdict_and_break_even(client):
                       r'<td class="num" data-m="hide">([^<]+)</td>', results, re.S)
     assert [(r[0][-15:], r[2], r[3]) for r in rows] == [("20261005-150000", "Not judged", "None"),
                                                          ("20261005-140000", "Kill", "0.03%")]  # newest first
-    assert "BTC/USDT · 15-minute · Binance USD-M perpetuals" in results
+    assert "BTC/USDT · 15-minute · perpetual" in results and "Binance" not in results
     assert 'href="/research/rsi_cross_binance-btcusdt-store-15m_20261005-140000/download"' in results
 
 
@@ -214,7 +217,7 @@ def test_the_result_page_leads_with_the_verdict_and_the_break_even_fee(client):
     (tmp / "kill.md").write_text(_sheet(means="Fees eat the small moves it finds."))
     page = c.get("/research/kill", auth=AUTH).text
     assert '<span class="big">Kill</span>' in page
-    assert ("Break-even fee is 0.03% per side. Binance USD-M perpetuals charges 0.05%, so fees eat the edge. "
+    assert ("Break-even fee is 0.03% per side. The venue charges 0.05%, so fees eat the edge. "
             "G1 failed on: G1 test: out-of-sample Sharpe clearly beats benchmark after fees; holds up when parameters "
             "move.") in page
     # Four figures: break-even vs the kill line, return out of sample, Sharpe vs buy-and-hold, trades a day.
@@ -233,7 +236,7 @@ def test_the_result_page_leads_with_the_verdict_and_the_break_even_fee(client):
     assert "What it means" not in ok  # not invented when the sheet has none
     (tmp / "kraken.md").write_text(_sheet(g1="PASS", venue="KRAKEN", pair="BTC/USD", taker="0.40%", ladder=(9, 8, 7, 6, -2)))
     kr = c.get("/research/kraken", auth=AUTH).text
-    assert "Kraken spot charges 0.40%, so fees eat the edge" in kr and 'class="marker"' in kr  # 0.40% sits between rungs
+    assert "The venue charges 0.40%, so fees eat the edge" in kr and 'class="marker"' in kr  # 0.40% sits between rungs
     (tmp / "unjudged.md").write_text(_sheet(g1="NOT JUDGED", ladder=(-1, -2, -3, -4, -9)))
     nj = c.get("/research/unjudged", auth=AUTH).text
     assert '<span class="big">Not judged</span>' in nj and "It loses money even with no fees" in nj
@@ -258,7 +261,19 @@ def test_a_real_tear_sheet_reads_back(tmp_path, instrument):
     path.write_text(render(r, IdeaLedger(tmp_path / "l.jsonl")))
     s = dev.read_sheet(path)
     assert [x["fee"] for x in s["rungs"]] == list(COST_LADDER) and s["fee"] == float(instrument.taker_fee)
-    assert s["venue_label"] == "Kraken spot" and s["minutes"] == 1440 and s["oos_trades"] == r.oos_trades
+    assert s["venue_label"] == "spot" and s["minutes"] == 1440 and s["oos_trades"] == r.oos_trades
     assert s["breakeven_kind"] in ("at", "none", "above") and s["oos_days"] > 0 and s["slippage"] == 0.0002
     assert s["when"].strftime("%Y%m%d-%H%M%S") == "20261005-120000"
     assert dev.banner(s) and dev.ladder_chart(s["rungs"], s["fee"])["bars"]
+
+
+def test_a_study_without_trades_reads_no_trades_not_a_loss(tmp_path):
+    # QA F6: no trades read as "loses money even with no fees".
+    from sleeve_fund.dashboard.development import banner, breakeven_text, read_sheet
+
+    text = _sheet().replace("**Break-even fee:** stops making money at about 0.031% per side (between 0.02% and 0.05%).",
+                            "**Break-even fee:** made no trades, so there is no fee to break even on.")
+    (tmp_path / "idle.md").write_text(text)
+    s = read_sheet(tmp_path / "idle.md")
+    assert s["breakeven_kind"] == "idle" and breakeven_text(s) == "No trades"
+    assert banner(s).startswith("It made no trades, so there is no fee to break even on.")

@@ -29,6 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
+from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
@@ -47,12 +48,12 @@ from sleeve_fund.paper.config import (
 )
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
+from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
-from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -62,6 +63,7 @@ LEDGER = study_run.LEDGER
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
+ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
 security = HTTPBasic(realm="Multi-Strategy Fund")
 
@@ -100,16 +102,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         study_run.seed(LEDGER, TEARSHEETS)
     except OSError as exc:  # the pages still work; research shows what it has
         logging.getLogger(__name__).warning(f"couldn't bring the repository's research into {TEARSHEETS}: {exc}")
-    try:  # the idea counter folded into the trials register; safe to repeat on every start
+    try:  # the idea counter folded into the trials register and the holdout locks; safe to repeat on every start
         TrialsRegister(app.state.store).import_ledger(LEDGER)
+        HoldoutLocks(app.state.store).import_ledger(LEDGER)
     except (OSError, ValueError, KeyError) as exc:
         logging.getLogger(__name__).warning(f"couldn't fold the idea counter into the trials register: {exc}")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
     templates.env.globals["venue_choices"] = venue_choices
-    templates.env.globals["venue_label"] = lambda name: _research_venue(name).label
+    templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
+    templates.env.filters["no_venues"] = dev.no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -404,12 +408,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError(f"account: {account} is retired")
             if kinds[account] == "live":  # the shell's live lock: nothing trades real money before G2
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
-            st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
-                               starting_balance=cfg.starting_balance, params=params,
-                               risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars,
-                               venue=to_store_kwargs(cfg)["venue"])
+            trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, strategy, params, cfg.risk_profile,
+                                      fallback={"strategy": strategy, "params": params, "source": "strategy"})
+            _saved("strategy", st().create_sleeve, name=name, strategy=strategy, instrument=cfg.instrument,
+                   bar_spec=cfg.bar_spec, starting_balance=cfg.starting_balance, params=params,
+                   risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars, venue=to_store_kwargs(cfg)["venue"],
+                   trial=trial)
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
+            _uncounted_event(st(), name, f"strategy {name}", uncounted)
             if needed > cfg.warmup_bars:
                 # A warning (an alert) when the most that can load falls short; a note when it was chosen.
                 st().event(name, "warning" if auto else "info", "warmup_short",
@@ -449,7 +456,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None,
                               st().insurance(name) if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
-        recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
+        order_total = sum(st().order_counts(name).values())
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
         q = request.query_params
@@ -463,6 +471,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    order_total=order_total,
                     positions=positions, working=working, fees_funding=fees_funding,
                     timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
@@ -745,9 +754,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("nothing changed")
             cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
             warmup = max(s.warmup_bars, min(cap, exit_warmup(params)))
-            restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup)
+            trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, s.strategy, params, profile,
+                                      fallback={"strategy": s.strategy, "params": params, "source": "strategy"})
+            restart = _saved("settings change", st().change_settings, name, risk_profile=profile, params=params,
+                             warmup_bars=warmup, trial=trial)
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
+            _uncounted_event(st(), name, f"strategy {name}", uncounted)
             exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
             # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
             st().event(name, "info", "exits_change" if exits_changed else "settings_change",
@@ -811,7 +824,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         pre = pre or {}
         sheets = [dev.read_sheet(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                     reverse=True)]
-        rows = pipeline.strategies(TEARSHEETS, st().sleeves())
+        put_away = st().archived()  # an archived strategy is not in paper any more (QA U6)
+        rows = pipeline.strategies(TEARSHEETS, [s for s in st().sleeves() if s.name not in put_away])
         cards = dev.plans(rows, sheets)
         chosen = next((c for c in cards if c["name"] == pre.get("strategy")), cards[0])
         values = dev.form_values(chosen, pre)
@@ -844,7 +858,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                       "plans": {c["name"]: {"values": c["values"], "variants": c["variants"]} for c in cards},
                       "venues": {v["key"]: {k: v[k] for k in ("label", "perpetual", "fee", "suggest", "held")}
                                  for v in venues}}
-        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
+        # The trials register's counts, which include single backtests and paper strategies (QA P1-T1).
+        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=TrialsRegister(st()).counts(), rows=rows, cards=cards,
                     chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
                     stages=pipeline.STAGES, job=job, error=error, notice=notice,
                     tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent, fit_text=fit_text,
@@ -893,7 +908,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
-        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({profile.label}), "
+        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({dev.venue_label(profile.name) or 'venue'}), "
                  f"{study_run._bars(req.minutes)} bars")
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
         return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
@@ -938,10 +953,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         if pair in (profile.core_pairs or CORE_PAIRS):
             # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
             # a request would change nothing, and its "from five years back" would misstate where it starts.
-            return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+            return (f"{pair} is on the collector's core list for the venue: it is stored from its listing and "
                     "kept current, and this list shows how far it has got.")
         if profile.minute_loader is None:
-            raise ValueError(f"{profile.label} has no history loader")
+            raise ValueError("this venue has no history loader")
         if profile.check_listed is not None:
             try:
                 profile.check_listed(pair)
@@ -951,7 +966,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
                 # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
                 logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
-                raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                raise ValueError(f"couldn't reach the venue to check it lists {pair}, so nothing was asked "
                                  "for; try again when the venue answers") from None
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
@@ -1174,7 +1189,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
         shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
         try:
-            label = markets.terms({"market": market}, venue).label if market != markets.SPOT else ""
+            t = markets.terms({"market": market}, venue) if market != markets.SPOT else None
+            label = "Perpetual" if t and t.funding_venue else (t.label if t else "")  # never the venue's name (QA U8)
         except ValueError:  # a spot market on a perpetual venue: the run itself is refused, with the reason
             label = markets.terms({"market": market}).label
         market_words = ("Spot, long only" if market == markets.SPOT else
@@ -1300,7 +1316,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("a reason is required")
             kind = str(form.get("kind", ""))
             st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
-            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            on = f" on the {dev.venue_label(str(form.get('venue')))} venue" if kind == "live" else ""
             st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
@@ -1346,7 +1362,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import setup_view
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "source": q.source, "taker": float(q.fees.taker),
+        # Named by market, not venue: venue names appear only where the PM sets up keys (QA U8 ruling).
+        fee_quotes = [{"venue_label": "Perpetual venue" if v.perpetual else "Spot venue", "source": q.source, "taker": float(q.fees.taker),
                        "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
@@ -1408,7 +1425,7 @@ def _backtest_args(q) -> dict:
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
     _check_gaps(venue, pair)
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
-             f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
+             f"{'' if venue == _venue_name(None) else ' (' + (dev.venue_label(venue) or 'venue') + ')'}, "
              f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
@@ -1458,10 +1475,100 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
-    store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
-                        bar_spec=args["bar_spec"])
+    trial, uncounted = _trial(_backtest_trial_metrics, store, args, result, run_id,
+                              fallback={"strategy": args["strategy"], "params": args["params"], "source": "backtest",
+                                        "backtest_id": run_id})
+    # One transaction: a backtest is never saved uncounted, nor counted unsaved (QA P1-T8).
+    _saved("backtest", store.save_backtest, keep["journal"], run_id=run_id, key=key, title=args["title"], query=query,
+           result=result, bar_spec=args["bar_spec"], trial=trial)
+    _uncounted_event(store, None, f"backtest {args['title']!r}", uncounted)
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
+
+
+def _trial(run, *args, fallback: dict) -> tuple[dict, Exception | None]:
+    """A run's row for the trials register, written by the caller in the same transaction as the run's own save
+    (QA P1-T8, Head of Engineering), so a failed write loses both and the request says so. run(*args) gives the
+    run's key and result. If working that out raises, or the row would be refused, the run is not lost for it (Data Architect): it gets a
+    failed row, which still counts as a variant tried and keeps G1 from judging its idea until it is re-counted
+    (Advisor), keyed as its variant where the key itself was worked out, else by `fallback` (strategy, params,
+    source). Returns the row and the error, if any."""
+    from sleeve_fund.research.trials import failed_row, model_run_row
+    from sleeve_fund.store import check_trial
+
+    key = None
+    try:
+        key = run(*args)
+        row = model_run_row(**key)
+        check_trial(row)  # a row the register would refuse is a failed count too, never a refused save
+        return row, None
+    except Exception as exc:  # noqa: BLE001 - any failure here must not lose the run
+        logging.getLogger(__name__).exception("couldn't work out a run's row for the trials register")
+        keyed = key or fallback
+        return failed_row(strategy=keyed["strategy"], params=keyed["params"], source=keyed["source"], error=repr(exc),
+                          setup=keyed.get("setup"), dataset=keyed.get("dataset"),
+                          backtest_id=keyed.get("backtest_id")), exc
+
+
+def _saved(what: str, save, *args, **kwargs):
+    """Run a save that writes its trial row on the same transaction. A database failure loses both, and says
+    so in words the page shows (QA P1-T8)."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        return save(*args, **kwargs)
+    except SQLAlchemyError as exc:
+        logging.getLogger(__name__).exception(f"couldn't save the {what} with its trial row")
+        raise ValueError(f"The {what} was not saved: writing it with its count in the trials register failed "
+                         f"({getattr(exc, 'orig', None) or exc}), so nothing was kept. Try again.") from exc
+
+
+def _uncounted_event(store: Store, sleeve: str | None, what: str, exc: Exception | None) -> None:
+    """Show on the dashboard that a run went into the trials register as failed (QA P1-T8)."""
+    if exc is not None:
+        store.event(sleeve, "error", "trials_count_failed",
+                    f"The {what} was saved, but its count in the trials register failed ({exc!r}), so it is recorded "
+                    "against its idea as a failed run: it still counts as a variant tried, and G1 won't judge the "
+                    "idea until it is re-counted")
+
+def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None:
+    """Every backtest is a variant tried: the trials register counts it, so a setting picked from many runs is
+    judged against all of them (QA P1-T1)."""
+    from sleeve_fund.research.trials import record_model_run
+
+    record_model_run(store, **_backtest_trial_metrics(store, args, result, run_id))
+
+
+def _backtest_trial_metrics(store: Store, args: dict, result: dict, run_id: str) -> dict:
+    """A backtest as the register keys it: its variant, its dataset, and every bar from its first day to its last."""
+    import pandas as pd
+
+    from sleeve_fund.research.run import dataset_name
+    from sleeve_fund.research.trials import backtest_period, run_setup
+
+    start = pd.Timestamp(result["from"], tz="UTC")
+    end = pd.Timestamp(result["to"], tz="UTC") + pd.Timedelta(days=1)
+    fees = result.get("fee_schedule") or {}
+    setup = run_setup(risk_profile=args["risk_profile"],
+                      fee=float(fees.get("taker", 0.0)) + float((result.get("spread") or {}).get("half", 0.0)),
+                      period=backtest_period(args.get("days")))
+    return dict(strategy=args["strategy"], params=args["params"], setup=setup,
+                dataset=dataset_name(_venue_name(args["venue"]), args["pair"], args["minutes"]), source="backtest",
+                sharpe=result["strategy"]["sharpe"], data_start=start, data_end=end, backtest_id=run_id,
+                trades=(result.get("trades") or {}).get("trades"))
+
+
+def _strategy_trial_metrics(store: Store, cfg, strategy: str, params: dict, risk_profile: str) -> dict:
+    """A paper strategy created, cloned or re-set, as the register keys it: a variant chosen to run, counted with
+    no Sharpe yet. cfg is its paper config (venue, instrument, bars and fees)."""
+    from sleeve_fund.research.run import dataset_name
+    from sleeve_fund.research.trials import run_setup
+
+    fee = float(cfg.fees.taker) + resolve_spread(cfg.venue, cfg.instrument, store).half_spread
+    return dict(strategy=strategy, params=params, source="strategy",
+                setup=run_setup(risk_profile=risk_profile, fee=fee),
+                dataset=dataset_name(_venue_name(cfg.venue), cfg.instrument, spec_minutes(cfg.bar_spec)))
+
 
 LOST_JOB = ("that run is no longer known, most likely because the server restarted while it ran; "
             "run it again (review round 10, m9)")
@@ -1597,18 +1704,32 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
             gaps = hist.gaps(v, pair)
             kinds = [e.get("kind") for e in hist.provenance(v, pair)]
+            funding_gaps = _funding_health(v, pair, hist.root, log)
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
         row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
                "state": "catching up" if behind else "current", "gaps": gaps,
-               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict")}
+               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict"), **funding_gaps}
         out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],
              "badge": dev.history_badge({"first": None})}
             for p, r in asked.items() if p not in held]
     return sorted(out, key=lambda h: h["pair"])
+
+
+def _funding_health(venue: str, pair: str, root, log) -> dict:
+    """Missed funding settlements and possible holes at a change of settlement interval (QA P1-O9/O11), for the
+    instrument's history chip. Empty where no funding is kept."""
+    from sleeve_fund import funding
+
+    try:
+        return {"funding_gaps": len(funding.gaps(venue, pair, root)),
+                "funding_maybe": len(funding.interval_changes(venue, pair, root))}
+    except Exception as exc:  # noqa: BLE001 - the prices' badge stands without it
+        log.warning(f"couldn't read the funding kept for {pair}: {exc!r}")
+        return {}
 
 
 def _study_request(form: dict) -> "study_run.StudyRequest":
@@ -1663,7 +1784,7 @@ def _demo_copy(store, s) -> dict | None:
     put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
-    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+    return {"label": "the demo account", "put_on": put_on, "last": last,
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
@@ -1726,12 +1847,13 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
+        # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
+        "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
         "margin": margin,
         "margin_cap": margin_cap,
-        "margin_used": min(margin / margin_cap, 1.0) if margin_cap > 0 else 0.0,
+        "margin_used": margin / margin_cap if margin_cap > 0 else 0.0,
     }
 
 
@@ -1827,11 +1949,9 @@ FEED_FRESH_SECONDS = riskops.FEED_FRESH_SECONDS  # past this the strategy page's
 
 
 def _price_feed(s, seen) -> dict:
-    """The strategy's price feed for the page header: its venue and how long since that venue last sent
-    it a trade or quote, to the second."""
-    from sleeve_fund.venues import venue
-
-    label = venue(s.venue).label
+    """The strategy's price feed for the page header: how long since its venue last sent it a trade or quote,
+    to the second. Labelled "Prices", never with the venue's name (QA U8)."""
+    label = "Prices"
     if s.desired_state != "running":
         return {"label": label, "state": "off", "age": "off while stopped"}
     if seen is None:
@@ -1912,7 +2032,7 @@ def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
     w = trading.exit_ways(params, side)
     held = " (short)" if side < 0 else ""
     if p.get("stop_atr"):
-        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
+        stop = f"{p['stop_atr']:g} simple average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
     elif p.get("stop_swing_bars"):
         stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):

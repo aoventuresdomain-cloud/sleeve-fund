@@ -138,7 +138,7 @@ def _num(x) -> str:
 def exits_sentence(v: dict) -> str:
     """Step 3 in one sentence: the stop, the target and the risk profile (twin: exitsSentence in research.html)."""
     if v.get("stop_atr"):
-        stop = (f"Stop {_num(v['stop_atr'])} average true ranges below entry "
+        stop = (f"Stop {_num(v['stop_atr'])} simple average true ranges below entry "
                 f"({_num(v.get('atr_bars') or 14)} bars).")
     elif v.get("stop_loss_pct"):
         stop = f"Stop {_num(v['stop_loss_pct'])}% below entry."
@@ -169,6 +169,13 @@ def history_chip(h: dict) -> dict:
     # where a later bar for a stored minute differed and was kept out.
     n, c = h.get("refills", 0), h.get("conflicts", 0)
     title = f"{n} refill{'s' if n != 1 else ''}, {c} conflict{'s' if c != 1 else ''} recorded" if n or c else ""
+    # Funding kept beside the prices: missed settlements, and possible holes where the settlement interval changed.
+    fg, fm = h.get("funding_gaps", 0), h.get("funding_maybe", 0)
+    if fg or fm:
+        funding_note = "; ".join(p for p in (f"{fg} missed funding settlement{'s' if fg != 1 else ''}" if fg else "",
+                                             f"{fm} possible funding hole{'s' if fm != 1 else ''} at an interval change"
+                                             if fm else "") if p)
+        title = f"{title}; {funding_note}" if title else funding_note
     return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
 
 
@@ -222,6 +229,34 @@ def _gap_words(n: int) -> str:
     return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
 
 
+# Venue names in text the PM reads (mirror reasons, alerts, the decision log), longest first so "Bybit Demo
+# Trading" goes whole. Case-sensitive on purpose: account names such as "kraken-live" and env names such as
+# BYBIT_DEMO_API_KEY are the PM's own labels and stay as they are. Only Setup, Accounts names venues (QA U8).
+_VENUE_WORDS = [
+    # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
+    (re.compile(r"(?<=\S)\.(?:BINANCE|KRAKEN|BYBIT|DERIBIT)\b"), ""),
+    (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b"), "the demo account isn't set up"),
+    (re.compile(r"\b(?:Bybit|Deribit)(?: [Dd]emo(?: Trading| account)?| [Tt]estnet)?(?:'s)?\b"), "the demo account"),
+    (re.compile(r"\bBinance(?:'s)?(?: USD-M perpetuals)?\b"), "the perpetual venue"),
+    (re.compile(r"\bKraken(?:'s)?(?: spot)?\b"), "the spot venue"),
+    (re.compile(r"\b(?:BYBIT|DERIBIT)\b(?!_)"), "the demo account"),
+    (re.compile(r"\bBINANCE\b(?!_)"), "the perpetual venue"),
+    (re.compile(r"\bKRAKEN\b(?!_)"), "the spot venue"),
+    (re.compile(r"\b(?:[Tt]he|[Aa]n?) the\b"), lambda m: "The" if m.group(0)[0].isupper() else "the"),
+]
+
+
+def no_venues(text) -> str:
+    """Text the PM reads with any venue name swapped for what it is ("the demo account", "the perpetual venue",
+    "the spot venue"). For messages stored before the wording changed, and anything a venue sends back."""
+    if not text:
+        return text
+    out = str(text)
+    for pattern, words in _VENUE_WORDS:
+        out = pattern.sub(words, out)
+    return out
+
+
 def blocked_by_gaps(pair: str, gaps: list) -> str | None:
     """Why a backtest or study on this instrument has to wait, or None: only gaps in what is stored hold it
     back. A collector still catching up doesn't; the study says where its history ends."""
@@ -235,14 +270,16 @@ def variants(spec) -> int:
 
 
 def venue_label(code: str | None) -> str | None:
+    """The market a venue code trades, in a word ("perpetual" or "spot"): pages never name the venue itself
+    (PM decision, QA U8). None when there is no code or it isn't a known venue."""
     if not code:
         return None
     from sleeve_fund.venues import venue
 
     try:
-        return venue(code).label
+        return "perpetual" if venue(code).perpetual else "spot"
     except ValueError:
-        return code
+        return None
 
 
 # --- a tear sheet read back ------------------------------------------------------------------------
@@ -320,6 +357,8 @@ def read_sheet(path: Path) -> dict:
             out.update(breakeven=0.0, breakeven_kind="none")
         elif words.startswith("still makes money"):
             out.update(breakeven=rungs[-1]["fee"] if rungs else None, breakeven_kind="above")
+        elif words.startswith("made no trades"):  # QA F6: not a loss
+            out.update(breakeven_kind="idle")
     if oos:
         out.update(oos_days=int(oos.group(2)), oos_cagr=oos.group(3).strip(), bench_cagr=oos.group(4).strip(),
                    oos_sharpe=oos.group(5).strip(), bench_sharpe=oos.group(6).strip())
@@ -339,12 +378,14 @@ def breakeven_text(s: dict) -> str:
         return "None"
     if s["breakeven_kind"] == "above":
         return f"Over {_p(s['breakeven'])}"
+    if s["breakeven_kind"] == "idle":
+        return "No trades"
     return "–"
 
 
 def banner(s: dict) -> str:
     """The verdict's one plain sentence, break-even first, built from the sheet's own words."""
-    fee, who = s.get("fee"), s.get("venue_label") or "The venue"
+    fee, who = s.get("fee"), "The venue"
     kind = s["breakeven_kind"]
     charges = f"{who} charges {_p(fee)}" if fee is not None else None
     if kind == "at":
@@ -354,6 +395,8 @@ def banner(s: dict) -> str:
                      else f" {charges}, so the edge survives its fee.")
     elif kind == "none":
         lead = "It loses money even with no fees, so there is no edge for fees to eat."
+    elif kind == "idle":
+        lead = "It made no trades, so there is no fee to break even on."
     elif kind == "above":
         lead = f"It still makes money at {_p(s['breakeven'])} per side, the top of the cost ladder."
         if charges:
@@ -435,7 +478,7 @@ def plans(rows: list[dict], sheets: list[dict]) -> list[dict]:
                 and "synthetic" not in s["dataset"] and s["g1"]]
         last = real[0] if real else None
         if last:
-            where = ", ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
+            where = " ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
             meta = f"{last['word']}{' on ' + where if where else ''}"
             if last.get("breakeven_kind") == "at":
                 meta += f" · break-even {_p(last['breakeven'])}"

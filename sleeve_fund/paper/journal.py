@@ -119,12 +119,16 @@ class MemoryJournal:
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         row = self.orders_.get(order_id)
         if row is None:
             return
+        if intent is not None:
+            row["intent"] = intent
         if qty is not None:
             row["qty"] = qty
         if fill_qty:

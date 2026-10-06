@@ -114,7 +114,7 @@ def fills_to_rows(fills: pd.DataFrame) -> list[dict]:
 
 
 def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = None,
-           insurance: list[dict] | None = None) -> list[dict]:
+           insurance: list[dict] | None = None, open_trip: bool = False) -> list[dict]:
     """Closed round trips (flat -> long -> flat, or flat -> short -> flat) with P&L after fees, oldest first.
 
     rows: fills in time order with side, qty, price, fee (quote currency). Partial fills are fine: a trip
@@ -131,6 +131,8 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
     open at its time, so a trip's P&L is after fees and funding; `funding` carries its share.
     insurance: shortfalls the venue's insurance fund took past the bankruptcy price (ts, amount), booked
     to the trip they closed, so its loss is capped at the margin as the strategy's equity is.
+    open_trip: also return a trip still open after the last row, last, with closed None and no P&L, so a
+    walk-forward window can count the trade it ends inside (QA P1-R1).
     """
     out, pos = [], ZERO
     trip: dict | None = None
@@ -165,6 +167,8 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
         _book_flows(out, funding, "funding")
     if insurance:
         _book_flows(out, insurance, "insurance")
+    if open_trip and trip is not None and pos != ZERO:
+        out.append({**_trip(trip, {}), "pnl": float("nan"), "ret": float("nan")})
     return out
 
 
@@ -262,19 +266,18 @@ def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
 def deflated_sharpe_probability(returns: pd.Series, n_trials: int, trial_sharpes: list[float] | None = None) -> float:
     """Probability the true Sharpe beats the best-of-n luck hurdle (daily units internally).
 
-    With trial_sharpes None, the spread of trial Sharpes is the no-skill sampling error 1/sqrt(T).
-    Use that when the tried variants include fee-destroyed ones (Sharpe -10 and worse), whose
-    spread would make any hurdle absurd; the lab found this in its first round."""
+    The expected best of n_trials is spread by the trial Sharpes given (one per variant, annualised as the
+    result is), floored at the no-skill sampling error 1/sqrt(T): whichever is larger (Independent Quant
+    Advisor, 6 Oct 2026). With trial_sharpes None, the floor alone."""
     r = returns.dropna()
     n = len(r)
     if n < 30 or r.std(ddof=1) == 0:
         return float("nan")
     sr = r.mean() / r.std(ddof=1)
-    if trial_sharpes is None:
-        sr_std = 1 / math.sqrt(n - 1)
-    else:
+    sr_std = 1 / math.sqrt(n - 1)
+    if trial_sharpes is not None and len(trial_sharpes) > 1:
         daily_trials = np.asarray(trial_sharpes, dtype=float) / math.sqrt(PERIODS_PER_YEAR)
-        sr_std = float(daily_trials.std(ddof=1)) if len(daily_trials) > 1 else 0.0
+        sr_std = max(sr_std, float(daily_trials.std(ddof=1)))
     hurdle = expected_max_sharpe(n_trials, sr_std)
     skew = float(r.skew())
     kurt = float(r.kurt()) + 3
@@ -338,7 +341,7 @@ def independent_days(x: np.ndarray) -> float:
 
 
 def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials: int, *, block: int | None = None,
-                             n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
+                             n_boot: int = 2000, seed: int = 0, trial_spread: float | None = None) -> tuple[float, float]:
     """How sure we can be that the strategy's Sharpe truly beats the benchmark's, out of sample, once
     the variants tried are allowed for. Returns (probability, hurdle), Sharpes annualised.
 
@@ -348,7 +351,11 @@ def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials
     hurdle is the difference the best of `n_trials` skill-less variants would show by luck alone
     (expected_max_sharpe, with the resamples' spread as the no-skill error). The probability is the
     share of resamples above it. Fixed seed, so a tear sheet reads the same every time. Under 60 days,
-    or under MIN_INDEPENDENT_DAYS independent observations, it returns NaN: not enough to judge."""
+    or under MIN_INDEPENDENT_DAYS independent observations, it returns NaN: not enough to judge.
+
+    trial_spread: the spread of the idea's variants' Sharpes (annualised, one per variant). Wherever N raises the
+    bar, the larger of it and the resamples' spread is used, so G1 and the deflated Sharpe never judge by
+    different bars (Independent Quant Advisor, 6 Oct 2026, QA P1-T5)."""
     pair = pd.concat([strategy, benchmark], axis=1, join="inner").dropna()
     n = len(pair)
     if n < 60:
@@ -368,5 +375,8 @@ def sharpe_beats_probability(strategy: pd.Series, benchmark: pd.Series, n_trials
     with np.errstate(divide="ignore", invalid="ignore"):
         sharpe = np.where(std > 0, mean / std, 0.0) * math.sqrt(PERIODS_PER_YEAR)
     diff = sharpe[:, 0] - sharpe[:, 1]
-    hurdle = expected_max_sharpe(n_trials, float(diff.std(ddof=1)))
+    spread = float(diff.std(ddof=1))
+    if trial_spread is not None and math.isfinite(trial_spread):
+        spread = max(spread, trial_spread)
+    hurdle = expected_max_sharpe(n_trials, spread)
     return float((diff > hurdle).mean()), hurdle

@@ -110,8 +110,14 @@ def main(argv: list[str] | None = None) -> int:
         dataset = Path(args.data).stem
     from sleeve_fund.fees import resolve
 
-    quote = resolve(args.venue, _journal())
+    store = _journal()
+    quote = resolve(args.venue, store)
     print(f"fees: {quote.text}")
+    # A real data file's study counts in the trials register like any other run, is judged on its idea family's
+    # N and passes the holdout lock (QA P1-T3). Synthetic runs prove plumbing and stay out of it.
+    from sleeve_fund.research.trials import TrialsRegister
+
+    register = TrialsRegister(store) if store is not None and not args.synthetic else None
     instrument = venue(args.venue).instrument(args.base, args.quote, fees=quote.fees,
                                               price_precision=history_price_decimals(prices["close"]))
     result = run_study(
@@ -129,10 +135,11 @@ def main(argv: list[str] | None = None) -> int:
                "stop_atr": args.stop_atr, "stop_swing_bars": args.stop_swing_bars, "take_profit_r": args.take_profit_r,
                **({"atr_bars": args.atr_bars} if args.stop_atr and args.atr_bars else {})},
         risk_profile=profile_name,
+        register=register,
     )
     out = Path(args.out) if args.out else TEARSHEETS / f"{spec.name}_{dataset}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(result, ledger), encoding="utf-8")
+    out.write_text(render(result, ledger, register), encoding="utf-8")
     print(f"tear sheet: {out}")
     return 0
 

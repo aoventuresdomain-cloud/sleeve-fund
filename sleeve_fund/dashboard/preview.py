@@ -74,7 +74,7 @@ def _intraday(pair: str, profile, minutes: int, days: int | None) -> pd.DataFram
     cov = store.coverage(profile.name, pair)
     if cov is None or pd.Timestamp.now(tz="UTC") - cov.last >= pd.Timedelta("2D"):
         have = ", ".join(r["pair"] for r in stored(profile.name)) or "none yet"
-        raise ValueError(f"interval: {profile.label}'s minute-by-minute history for {pair} isn't stored here, so it "
+        raise ValueError(f"interval: the minute-by-minute history for {pair} isn't stored here, so it "
                          f"can only be backtested on daily bars. Instruments with stored minutes: {have}.")
     start = cov.last - pd.Timedelta(days=days) if days else None
     key = (profile.name, pair, minutes, days)
@@ -259,7 +259,7 @@ def _fee_view(params: dict, inst, quote_fees) -> dict:
     t = markets.terms(params, str(inst.id.venue))
     if t is not None and t.fees is not None:
         text = f"{t.label}: {t.fees.maker:.2%} maker, {t.fees.taker:.2%} taker"
-        return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": t.label,
+        return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": text,
                 "source": "market"}
     fees = markets.fees_for(params, FeeSchedule(Decimal(str(inst.maker_fee)), Decimal(str(inst.taker_fee))), str(inst.id.venue))
     return {"maker": float(fees.maker), "taker": float(fees.taker), "text": quote_fees.text,
@@ -287,7 +287,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     if days and len(prices):
         prices = prices[prices.index > prices.index[-1] - pd.Timedelta(days=days)]
     if len(prices) < 60:
-        raise ValueError(f"only {len(prices)} bars of {profile.label} history for {pair}; need at least 60")
+        raise ValueError(f"only {len(prices)} bars of history for {pair}; need at least 60")
     spread = spread_quote or spreads.resolve(profile.name, pair)
     base, quote = pair.split("/")
     inst = profile.instrument(base, quote, price_precision=history_price_decimals(prices["close"]),

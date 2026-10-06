@@ -322,10 +322,36 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
     # A perp's 33% cap on balanced is its margin, so at 2x leverage a notional of 66% (PM, 5 Oct 2026).
-    assert "of 66%" in html and "over the cap" not in html
+    assert "of 0.66× cap" in html and "above entry cap" not in html
+    # QA U2, the Advisor's wording: leverage is notional at entry over isolated margin (3,030 / 1,515), exposure
+    # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
+    assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
+    assert "Side and leverage" not in html
+    assert "Tap a buy or sell arrow" not in html and "TradingView Lightweight Charts" in html  # QA U9: attribution in the rail
+    # QA U12: the strategy's Fees and funding hover gives the costs' share of gross P&L, as the Portfolio's does.
+    kpi = re.search(r'<div class="kpi" title="([^"]*)"><div class="k">Fees and funding', html)
+    assert kpi and re.search(r"· \d+% of gross P&amp;L$", kpi.group(1)), kpi and kpi.group(1)
+    # QA U3: Risk & health and Trades give the same margin and Risk to stop as Portfolio (1,515 put up; the
+    # stop at 61,812 is 1,672 above the 60,140 mark, so 83.60 at risk on 0.05).
+    for path in ("/risk", "/trades"):
+        other = c.get(path, auth=AUTH).text
+        assert ">Margin used</div><div class=\"v\">1,515.00" in other and ">83.60</td>" in other, path
+    # P1-U14: an exit-plan edit moves the open short's stop from 2% to 1% (61,206): Risk & health's stop columns
+    # read the position's stop, as its Risk to stop does (0.05 x 1,066 = 53.30), not the model's 2%.
+    store.set_exit_plan("pp-ls", "o3", kind="edit", stop_frac=0.01, tp_frac=None)
+    risk = c.get("/risk", auth=AUTH).text
+    assert "from its entry\">1.0%</span>" in risk and ">53.30</td>" in risk and ">2.0%<" not in risk
+    assert '<span class="rh-chip ok" title="The position\'s stop at 61,206' in risk
     # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
-    assert "over the cap" in c.get("/sleeves/pp-ls", auth=AUTH).text
+    drift = c.get("/sleeves/pp-ls", auth=AUTH).text
+    assert "above entry cap because the price moved" in drift
+    # P1-U16: on a gross loss the cost hover gives both figures, not a share (P&L -8,000 before 4.50 of fees).
+    assert "· costs 4.50 on a gross loss of 7,995.50" in drift and "of gross P&amp;L" not in drift
+    # P1-U13: the drift meter is amber (mid), never red (high), and says its true share: 2.30x of 0.66x is 348%.
+    assert 'class="meter mid" role="img" aria-label="348% of the entry cap used"' in drift
+    assert 'aria-label="348% of the entry cap used"' in (risk := c.get("/risk", auth=AUTH).text)
+    assert "pp-ls&#39;s exposure is 348% of its entry cap because the price moved; no action" in risk
     # The 2% stop sits above the entry; the open short gains as the price falls.
     assert "61,812" in html
     trades_page = c.get("/trades", auth=AUTH).text
@@ -665,7 +691,8 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     lev = __import__("sleeve_fund.risk", fromlist=["profile"]).profile(store.sleeve("pp-fund").risk_profile).max_leverage
     liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
-    assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.2f}" in html and "above" in html
+    # QA U2: leverage is the position's own (notional at entry over its margin); exposure is at the mark over equity.
+    assert "Margin" in html and f">Leverage</dt><dd>{lev:.2f}×" in html and "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
     # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once
@@ -802,14 +829,15 @@ def test_an_entry_whose_stop_sits_past_half_way_to_liquidation_is_refused(prices
 
 
 def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
-    # Short at 101.5, then a fall: the 2% target buys back at 101.5 x 0.98, not above the entry.
+    # Short at 101.5, then a fall: the 2% target buys back at 101.5 x 0.98 plus the taker's 0.05% slippage (Advisor
+    # L12 FINAL), not above the entry.
     closes = [100.0, 100.5, 100.8, 101.5, 101.0, 100.0, 99.0, 98.0, 98.0]
     res = run_backtest("ping_pong", _path(prices, closes), instrument,
                        {**PERP, "take_profit": 0.02, "dip": 0.05}, half_spread=0)
     fills = res.fills.sort_values("ts_last")
     got = [(res.decisions[o]["intent"], fills.loc[o, "side"]) for o in fills.index]
     assert got == [("entry", "BUY"), ("exit", "SELL"), ("entry", "SELL"), ("take_profit", "BUY")], got
-    assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
+    assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98 * 1.0005, rel=1e-4)
 
 
 def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path, full_margin):
@@ -1074,3 +1102,20 @@ def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F81
     # BTC: a 3,000 short and a 1,200 long, 4,200 gross (14% of 30,000), -1,800 net (-6%); ETH: a 3,000 short.
     tile = c.get("/risk", auth=AUTH).text.split("Largest asset")[1].split("</div></div>")[0]
     assert "BTC 14%" in tile and "net" in tile and "6%" in tile, tile
+
+
+def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
+    # Code Reviewer on #152: with cap_used uncapped, a max() over the three limits let a 104% drift line replace
+    # a drawdown at 90%. Each is judged on its own now.
+    from types import SimpleNamespace
+
+    from sleeve_fund.dashboard import riskops
+
+    s = SimpleNamespace(name="btc-rsi-long", status="running", status_reason=None)
+    row = {"x": {"sleeve": s}, "dd_used": 0.9, "day_used": 0.1, "cap_used": 1.04}
+    health = {"down": [], "mismatched": [], "stale_feeds": [], "backup_issue": None}
+    texts = [i["text"] for i in riskops.status_items([row], health)]
+    assert texts == ["btc-rsi-long has used 90% of its drawdown limit",
+                     "btc-rsi-long's exposure is 104% of its entry cap because the price moved; no action"]
+    texts = [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2, "cap_used": 0.85}], health)]
+    assert texts == ["btc-rsi-long has used 85% of its position cap"]
