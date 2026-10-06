@@ -229,3 +229,13 @@ def test_minutes_that_miss_part_of_the_first_or_last_decision_candle_are_refused
     with pytest.raises(ValueError, match="1-minute bars of every decision candle"):
         run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
                      exec_prices=minutes, exec_minutes=1)
+
+
+def test_levels_equal_by_arithmetic_order_are_refused_as_the_same_level():
+    """QA R2 round 1 F1: close + 1 and 1 + close are one level; neither can come first."""
+    rule = {"first_touch": {"reach": {"add": ["close", 1]}, "before": {"add": [1, "close"]}}}
+    with pytest.raises(ValueError, match="same level"):
+        check_definition({**DEFN, "long": {"entry": rule}}, bar_spec="15-MINUTE-LAST-INTERNAL")
+    check_definition({**DEFN, "long": {"entry": {"first_touch": {"reach": {"sub": ["close", 1]},
+                                                                  "before": {"sub": [1, "close"]}}}}},
+                     bar_spec="15-MINUTE-LAST-INTERNAL")  # subtraction doesn't commute: two levels

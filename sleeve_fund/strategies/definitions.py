@@ -123,6 +123,20 @@ def timeframe_label(minutes: int) -> str:
             f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m")
 
 
+def _level_form(x):
+    """An operand as first_touch compares its two levels: canonical, with add and mul in one operand order, so
+    {add = ["close", 1]} and {add = [1, "close"]} are the same level (QA R2 round 1, F1). Not for the hash."""
+    x = _canonical(x)
+    if isinstance(x, dict) and len(x) == 1:
+        (k, v), = x.items()
+        if isinstance(v, list):
+            v = [_level_form(a) for a in v]
+            if k in ("add", "mul"):
+                v = sorted(v, key=lambda a: json.dumps(a, sort_keys=True))
+        return {k: v}
+    return x
+
+
 def _canonical(x):
     """The definition as hashed: tables in key order (TOML tables are unordered maps), every number as a float
     (30 and 30.0 are the same setting)."""
@@ -387,7 +401,7 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
                              "inside the candle, e.g. {reach = {add = [\"lvl\", \"atr\"]}, before = {sub = [\"lvl\", "
                              f"\"atr\"]}}}}{odd}")
         uses_prev.append(where)  # its levels are read at the candle before's close
-        if _canonical(ft["reach"]) == _canonical(ft["before"]):
+        if _level_form(ft["reach"]) == _level_form(ft["before"]):
             raise ValueError(f"{where}: first_touch's reach and before are the same level, so neither can come first")
         _check_operand(ft["reach"], f"{where}.first_touch.reach", blocks, uses_prev)
         _check_operand(ft["before"], f"{where}.first_touch.before", blocks, uses_prev)
