@@ -567,14 +567,19 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         from sleeve_fund import funding
 
         try:
+            _keep_funding_caps(profile, pair, root)
+            before = funding.rates(profile.name, pair, root).index
             refused: list = []
             kept = funding.refresh(profile.name, pair, root=root, since=since, refused=refused)
             funding_to = kept.index[-1] if len(kept) else None
-            if refused:  # never kept as real rates: charged as missing, and said once a day for these settlements
-                at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} ({r!r})" for t, r in refused)
+            if refused:  # never kept as real rates: quarantined raw, charged as missing, said once a day for these
+                at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} (raw {r!r}, cap {cap:.2%})"
+                               for t, r, cap in refused)
                 _alert(f"{profile.name} {pair}: funding invalid {refused[0][0]}-{refused[-1][0]}", "warning",
                        "funding_invalid", f"{profile.name.upper()} {pair}: {len(refused)} settled funding rate(s) refused "
-                       f"as not a number within the {funding.cap_of(profile.name, pair):.2%} cap, kept as missing: {at}")
+                       f"as not a number within the cap that applied, quarantined for review and charged as missing: "
+                       f"{at}")
+            _alert_missing_cap(profile, pair, root, kept.index.difference(before))
             missed, maybe = funding.settled_holes(profile.name, pair, root)  # QA P1-O18
             if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
@@ -714,6 +719,39 @@ def _warn_at_risk(problem: str | None, store=None) -> None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
     _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _keep_funding_caps(profile, pair: str, root) -> None:
+    """Keep the instrument's cap as the venue publishes it now, from now, and the venue's widest for a linear
+    perpetual (Advisor, 6 Oct 2026, O17a-4). A venue that can't be asked leaves the kept ones in force."""
+    from sleeve_fund import funding
+
+    own, widest = getattr(profile, "funding_cap", None), getattr(profile, "funding_cap_widest", None)
+    try:
+        cap = own(pair) if callable(own) else None
+        if cap is not None:
+            funding.keep_cap(profile.name, pair, cap, pd.Timestamp.now(tz="UTC"), root)
+        cap = widest("perp") if callable(widest) else None
+        if cap is not None:
+            funding.keep_widest(profile.name, cap, root)
+    except Exception as exc:  # noqa: BLE001 - the kept caps still apply
+        print(f"{profile.name} {pair}: funding cap unavailable: {exc!r}")
+
+
+def _alert_missing_cap(profile, pair: str, root, new: pd.DatetimeIndex) -> None:
+    """Alert when settlements this pass kept were judged without the instrument's own cap (the venue's widest stood
+    in for it): once for a backfill from before caps were kept, and on every pass while the venue publishes none."""
+    from sleeve_fund import funding
+
+    without = [t for t in new if funding.cap_for(profile.name, pair, t, root)[1]]
+    if not without:
+        return
+    stand_in = funding.widest(profile.name, root)
+    _alert(f"{profile.name} {pair}: funding cap missing {without[-1]:%Y%m%d%H%M}", "warning", "funding_cap_missing",
+           f"{profile.name.upper()} {pair}: the instrument's own funding cap is missing for {len(without)} settlement(s) "
+           f"from {without[0]:%Y-%m-%d %H:%M} UTC" + (f" to {without[-1]:%Y-%m-%d %H:%M} UTC" if len(without) > 1 else "")
+           + (f"; judged against the venue's widest cap, {stand_in:.2%}" if stand_in else
+              f"; the venue's widest cap isn't known either, so the {funding.CAP:.0%} sanity bound applies"))
 
 
 def _inbox():

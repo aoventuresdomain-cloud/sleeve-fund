@@ -5,9 +5,21 @@ longer than 7 days, G1 doesn't judge the study."""
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from sleeve_fund.research import tearsheet
 from sleeve_fund.research.study import Fold, StudyResult, _window_funding
+
+
+@pytest.fixture(autouse=True)
+def _caps_known(monkeypatch):
+    """These pin the hole and staleness alerts: the instrument's funding cap is taken as kept, so its own
+    funding_cap_missing alert (pinned in test_funding_caps and QA's O17a file) doesn't join them, and the venue
+    isn't asked for its caps."""
+    from sleeve_fund import history
+
+    monkeypatch.setattr(history, "_keep_funding_caps", lambda *a, **k: None)
+    monkeypatch.setattr(history, "_alert_missing_cap", lambda *a, **k: None)
 
 T0 = pd.Timestamp("2026-01-01", tz="UTC")
 H8 = pd.Timedelta(hours=8)

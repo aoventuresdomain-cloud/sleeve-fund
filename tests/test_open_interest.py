@@ -10,6 +10,17 @@ from sleeve_fund import funding, open_interest
 from sleeve_fund.history import _refresh_funding
 from sleeve_fund.venues import binance_open_interest, venue
 
+
+@pytest.fixture(autouse=True)
+def _caps_known(monkeypatch):
+    """These pin the hole and staleness alerts: the instrument's funding cap is taken as kept, so its own
+    funding_cap_missing alert (pinned in test_funding_caps and QA's O17a file) doesn't join them, and the venue
+    isn't asked for its caps."""
+    from sleeve_fund import history
+
+    monkeypatch.setattr(history, "_keep_funding_caps", lambda *a, **k: None)
+    monkeypatch.setattr(history, "_alert_missing_cap", lambda *a, **k: None)
+
 T0 = int(pd.Timestamp("2026-10-01", tz="UTC").timestamp() * 1000)
 STEP = 300_000  # five minutes
 
