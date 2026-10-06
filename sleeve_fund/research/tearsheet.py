@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import math
 
+import pandas as pd
 
-from sleeve_fund.research.guardrails import MIN_OOS_TRADES, nearby_settings
+from sleeve_fund.research.guardrails import G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -73,7 +74,9 @@ def _row(label: str, s: dict, b: dict) -> str:
 def _breakeven_words(r: StudyResult) -> str:
     from sleeve_fund.research.study import breakeven_fee
 
-    return breakeven_fee(r.cost_ladder)[1] if r.cost_ladder else "not tested: no cost ladder was run"
+    if not r.cost_ladder:
+        return "not tested: no cost ladder was run"
+    return getattr(r, "breakeven", "") or breakeven_fee(r.cost_ladder)[1]
 
 
 def _breakeven_cell(row) -> str:
@@ -84,7 +87,28 @@ def _breakeven_cell(row) -> str:
     words = row.get("breakeven")
     if not isinstance(words, str):
         return "–"
+    if words.startswith("made no trades"):
+        return "no trades"
     return "loses at no fee" if words.startswith("loses") else "above the ladder" if words.startswith("still") else "–"
+
+
+def _nearby(r: StudyResult) -> tuple[str, str]:
+    """Holds at nearby settings, around what tuning chose, never the defaults (Independent Quant Advisor,
+    6 Oct 2026, P1-G2): each walk-forward fold's choice on that fold's training grid, reporting the worst
+    fold, and the whole period's choice on the full grid. Any failure fails the check."""
+    params = [c for c in r.spec.param_grid if c in r.sensitivity.columns]
+    chosen = getattr(r, "chosen_params", None) or r.default_params
+    final = nearby_scored(r.sensitivity, chosen, params)
+    words = f"whole period's choice: {final[1]}"
+    folds = [(f, nearby_scored(f.grid, f.chosen, params)) for f in r.folds
+             if isinstance(getattr(f, "grid", None), pd.DataFrame) and not f.grid.empty]
+    if not folds:
+        return final[0], words
+    failed = [x for x in folds if x[1][0] == "FAIL"]
+    f, (_, worst, _) = min(folds, key=lambda x: x[1][2])
+    words += (f"; {len(folds) - len(failed)} of {len(folds)} folds' choices hold; worst, the fold testing to "
+              f"{f.test_end:%b %Y} ({json.dumps(f.chosen)}): {worst}")
+    return ("FAIL" if final[0] == "FAIL" or failed else "PASS"), words
 
 
 def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
@@ -122,8 +146,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
         ),
         # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
-        (NEARBY_CHECK, *nearby_settings(r.sensitivity, r.default_params,
-                                        [c for c in r.spec.param_grid if c in r.sensitivity.columns])),
+        (NEARBY_CHECK, *_nearby(r)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         (
             "Holdout not used for tuning",
@@ -230,6 +253,8 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     if r.settings:
         out.append(f"Settings: {r.settings}")
         out.append("")
+    out.append(f"G1 rules: {G1_RULES}")
+    out.append("")
     out.append(
         f"Dataset `{r.dataset}` · research period {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y} · "
         f"holdout: last {r.holdout_days} days {'(opened)' if r.holdout else '(untouched)'} · "
@@ -305,12 +330,10 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append("")
     if r.cost_ladder:
-        from sleeve_fund.research.study import breakeven_fee
-
-        _, words = breakeven_fee(r.cost_ladder)
-        out.append("## Cost ladder (full research period, default params)")
+        chosen = getattr(r, "chosen_params", None) or r.default_params
+        out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
         out.append("")
-        out.append(f"**Break-even fee:** {words}.")
+        out.append(f"**Break-even fee:** {_breakeven_words(r)}.")
         out.append("")
         out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid |")
         out.append("| --- | --- | --- | --- | --- |")
@@ -318,9 +341,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
             out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
                        f"| {rung.fees_paid:,.0f} |")
         out.append("")
-        out.append("The same strategy and settings at each fee, maker and taker alike. Every rung also pays half the "
+        out.append("The settings tuning on the whole research period picks (best in-sample Sharpe on the grid), at "
+                   "each fee, charged per side on maker and taker fills alike, so for a post-only strategy it mixes "
+                   "the two. Every rung also pays half the "
                    f"bid-ask spread as above plus {r.ladder_slippage:.2%} slippage on orders that take liquidity. 0.02% and "
-                   "0.05% are a low-fee perpetual venue's maker and taker rates, 0.80% a high-fee spot venue's taker rate.")
+                   "0.05% are a low-fee perpetual venue's maker and taker rates, 0.10-0.40% typical spot taker rates, "
+                   "0.80% a high-fee spot venue's taker rate. The break-even interpolates log(1 + return) between "
+                   "rungs, then re-runs at that fee to verify it.")
         out.append("")
     out.append("## Walk-forward folds")
     out.append("")
@@ -336,7 +363,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("## Parameter sensitivity (full research period, in-sample)")
     out.append("")
     cols = [c for c in r.sensitivity.columns if c in spec.param_grid]
-    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee |")
+    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee per side, on top of spread and slippage |")
     out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- | --- |")
     for _, row in r.sensitivity.iterrows():
         out.append(
@@ -344,7 +371,9 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
             + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} "
             f"| {_breakeven_cell(row)} |"
         )
-    out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}.")
+    out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}. "
+               "Break-even fees in this table are interpolated between the cost ladder's rungs; the chosen "
+               "settings' is re-run to verify it, as the cost ladder says.")
     out.append("")
     out.append("## Idea counter")
     out.append("")

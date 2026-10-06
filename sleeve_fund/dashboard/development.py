@@ -320,6 +320,8 @@ def read_sheet(path: Path) -> dict:
             out.update(breakeven=0.0, breakeven_kind="none")
         elif words.startswith("still makes money"):
             out.update(breakeven=rungs[-1]["fee"] if rungs else None, breakeven_kind="above")
+        elif words.startswith("made no trades"):  # QA F6: not a loss
+            out.update(breakeven_kind="idle")
     if oos:
         out.update(oos_days=int(oos.group(2)), oos_cagr=oos.group(3).strip(), bench_cagr=oos.group(4).strip(),
                    oos_sharpe=oos.group(5).strip(), bench_sharpe=oos.group(6).strip())
@@ -339,6 +341,8 @@ def breakeven_text(s: dict) -> str:
         return "None"
     if s["breakeven_kind"] == "above":
         return f"Over {_p(s['breakeven'])}"
+    if s["breakeven_kind"] == "idle":
+        return "No trades"
     return "–"
 
 
@@ -354,6 +358,8 @@ def banner(s: dict) -> str:
                      else f" {charges}, so the edge survives its fee.")
     elif kind == "none":
         lead = "It loses money even with no fees, so there is no edge for fees to eat."
+    elif kind == "idle":
+        lead = "It made no trades, so there is no fee to break even on."
     elif kind == "above":
         lead = f"It still makes money at {_p(s['breakeven'])} per side, the top of the cost ladder."
         if charges:

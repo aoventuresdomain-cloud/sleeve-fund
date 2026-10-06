@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sleeve_fund.dashboard import development as dev
+from sleeve_fund.research.guardrails import G1_RULES
 from sleeve_fund.store import Store
 
 AUTH = ("pm", "test-pw")
@@ -32,6 +33,8 @@ def _sheet(strategy="rsi_cross", g1="FAIL", venue="BINANCE", pair="BTC/USDT", mi
 Tested on `{pair}` at {minutes}-minute bars on `{venue}`
 
 Settings: balanced risk profile · exits: the signal only · walk-forward 730 days training, 365 days testing
+
+G1 rules: {G1_RULES}
 
 Dataset `{venue.lower()}-{pair.replace('/', '').lower()}-store-{minutes}m` · research period 01 Oct 2021 to 05 Oct 2025 · holdout: last 365 days (untouched) · fees: Venue: 0.02% maker, {taker} taker, published schedule
 
@@ -262,3 +265,15 @@ def test_a_real_tear_sheet_reads_back(tmp_path, instrument):
     assert s["breakeven_kind"] in ("at", "none", "above") and s["oos_days"] > 0 and s["slippage"] == 0.0002
     assert s["when"].strftime("%Y%m%d-%H%M%S") == "20261005-120000"
     assert dev.banner(s) and dev.ladder_chart(s["rungs"], s["fee"])["bars"]
+
+
+def test_a_study_without_trades_reads_no_trades_not_a_loss(tmp_path):
+    # QA F6: no trades read as "loses money even with no fees".
+    from sleeve_fund.dashboard.development import banner, breakeven_text, read_sheet
+
+    text = _sheet().replace("**Break-even fee:** stops making money at about 0.031% per side (between 0.02% and 0.05%).",
+                            "**Break-even fee:** made no trades, so there is no fee to break even on.")
+    (tmp_path / "idle.md").write_text(text)
+    s = read_sheet(tmp_path / "idle.md")
+    assert s["breakeven_kind"] == "idle" and breakeven_text(s) == "No trades"
+    assert banner(s).startswith("It made no trades, so there is no fee to break even on.")
