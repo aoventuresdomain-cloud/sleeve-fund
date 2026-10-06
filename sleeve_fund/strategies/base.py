@@ -1968,6 +1968,13 @@ class LongFlatStrategy(Strategy):
         self._funding_recheck = now
         pair = pair_of(self.instrument)
         arrived = {when for when in sorted(self._funding_missing) if self._venue_rate(terms, pair, when) is not None}
+        if self._funding_missing - arrived:
+            # Still charging the baseline: an episode closed meanwhile (the collector, its store caught up to the
+            # settlement the episode opened on) is opened again, so the inbox never reads clear while one is missing.
+            first = min(self._funding_missing - arrived)
+            self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
+                                  f"{first:%d %b %Y %H:%M} UTC yet; charging the baseline, whichever side is held, "
+                                  "until it arrives")
         if not arrived:
             return
         self._funding_missing -= arrived

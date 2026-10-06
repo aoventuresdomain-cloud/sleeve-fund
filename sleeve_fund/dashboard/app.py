@@ -1179,10 +1179,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         pair = q.get("instrument", "").strip().upper()
-        g1_here = (pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec),
-                                   {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
-                                    "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")})
-                   if pair else None)
+        studied = {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
+                   "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")}
+        g1_here = pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec), studied) if pair else None
+        # A G1 pass whose holdout is not judged does not back paper evaluation (QA P1-O17a-7).
+        held = pipeline.promotion_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec), studied) if pair else None
+        held_back = held[1] if held and not held[0] and g1_here == "PASS" else ""
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
@@ -1200,7 +1202,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
                     market_words=market_words,
                     chosen=strategy, strategies=_strategy_choices(), instruments=_hints(venue), g1=g1, g1_here=g1_here,
-                    period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
+                    held_back=held_back, period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(venue),
                     runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs(backtest=True))

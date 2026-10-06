@@ -241,11 +241,28 @@ def stale_open(store, tag: str) -> bool | None:
     days late still logs its recovery (QA P1-O17a-1). None when the journal can't be read: the caller then alerts,
     since alerting twice beats never."""
     try:
-        last = next((e for e in store.events_of(("funding_stale", "funding_stale_cleared"), limit=500)
-                     if e["message"].startswith(tag)), None)
+        last = _last_episode_event(store, tag)
     except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
         return None
     return last is not None and last["kind"] == "funding_stale"
+
+
+def stale_since(store, tag: str) -> pd.Timestamp | None:
+    """When the instrument's open staleness episode was opened (its funding_stale's time, UTC), or None when none is
+    open or the journal can't be read."""
+    try:
+        last = _last_episode_event(store, tag)
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return None
+    if last is None or last["kind"] != "funding_stale" or last.get("ts") is None:
+        return None
+    ts = pd.Timestamp(last["ts"])
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _last_episode_event(store, tag: str) -> dict | None:
+    return next((e for e in store.events_of(("funding_stale", "funding_stale_cleared"), limit=500)
+                 if e["message"].startswith(tag)), None)
 
 
 # Funding charged at the baseline for a missing rate (Advisor, 6 Oct 2026, QA P1-O17): from BASELINE_WARN of the held

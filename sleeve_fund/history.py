@@ -603,17 +603,33 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
                 # The gap gets a clear end in the journal (Advisor, 6 Oct 2026), and so does one whose opener (a
                 # strategy, or this process before a restart) is gone: the rates are keeping up, so an episode still
                 # open under the tag is over, and left open it would hold back the next outage's alert (CR, #163).
-                was = key in _stale
-                _stale.discard(key)
+                # Not stale only means the newest rate is under two intervals old, so one late settlement still
+                # reads as clean: an episode is closed only once the store holds a rate at or after the settlement
+                # it was opened on, and stays open while that settlement is missing (QA P1-O17a-8).
                 open_ = funding.stale_open(inbox, tag)
-                if open_ is True or (open_ is None and was):
-                    kept = funding.rates(profile.name, pair, root).index
-                    _warned.pop(f"{key}: cleared", None)
-                    _alert(f"{key}: cleared", "info", "funding_stale_cleared",
-                           f"{tag} funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC", inbox)
+                kept = funding.rates(profile.name, pair, root).index
+                if open_ is not True or _caught_up(kept, funding.stale_since(inbox, tag)):
+                    was = key in _stale
+                    _stale.discard(key)
+                    if open_ is True or (open_ is None and was):
+                        _warned.pop(f"{key}: cleared", None)
+                        _alert(f"{key}: cleared", "info", "funding_stale_cleared",
+                               f"{tag} funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC", inbox)
         except Exception as exc:  # noqa: BLE001 - an unreadable store is reported by the refresh itself
             print(f"{profile.name} {pair}: funding staleness check failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
+
+
+def _caught_up(kept, since) -> bool:
+    """Whether the kept rates reach the settlement due when a staleness episode opened (`since`): the opener raises
+    it after that settlement was due, so its interval boundary at or before `since` is the settlement it waited on.
+    An unknown opening time is taken as caught up, as before (the rates keep up)."""
+    from sleeve_fund import funding
+
+    if since is None or not len(kept):
+        return since is None
+    step = kept[-1] - kept[-2] if len(kept) > 1 else pd.Timedelta(hours=8)
+    return kept[-1] >= since.floor(step) - funding.MATCH
 
 
 def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
@@ -629,13 +645,13 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
     with _alerting(path):
         raised, problem = _raised(path)
         if problem:  # an incident in the alerts inbox, once a day (QA P1-O20)
-            _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", problem)
+            _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", f"{pair}: {problem}")  # no venue
         new = [h for h in holes if h not in raised]
         if new:
             try:
                 from sleeve_fund.store import Store
 
-                Store().event(None, "warning", "funding_gap", f"{venue} {pair}: funding: " + "; ".join(new))
+                Store().event(None, "warning", "funding_gap", f"{pair}: funding: " + "; ".join(new))  # no venue
             except Exception as exc:  # noqa: BLE001 - no database (locally): the log line says it; retried next pass
                 print(f"could not raise the funding_gap alert: {exc!r}")
                 return
@@ -679,12 +695,12 @@ def _raised(path: Path) -> tuple[set[str], str | None]:
     except FileNotFoundError:
         return raised, None
     except (OSError, ValueError) as exc:
-        problem = f"{path}: the funding holes already raised can't be read ({exc!r}); reading it as empty"
+        problem = f"the funding holes already raised can't be read ({exc!r}); reading it as empty"
     else:
         if isinstance(kept, list) and all(isinstance(h, str) for h in kept):
             return raised | set(kept), None
-        problem = f"{path}: the funding holes already raised are not a list of holes; reading it as empty"
-    print(problem)
+        problem = "the funding holes already raised are not a list of holes; reading it as empty"
+    print(f"{path}: {problem}")
     return raised, problem
 
 

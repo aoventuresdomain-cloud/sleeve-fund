@@ -153,3 +153,59 @@ def test_an_episode_left_open_by_a_restart_is_closed_once_the_rates_keep_up_and_
     history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
     history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
     assert [k for _, k, _ in inbox.sent] == ["funding_stale_cleared", "funding_stale"]
+
+
+def test_the_collector_keeps_an_episode_open_until_the_settlement_it_opened_on_is_kept(tmp_path, monkeypatch):
+    """Paper opened the episode at 08:15 for 08:00. The hub's store, newest 00:00, is not stale (one interval old),
+    but 08:00 is still missing: no clear. Once 08:00 is kept, the next pass closes it (QA P1-O17a-8)."""
+    from sleeve_fund import funding, history
+    from sleeve_fund.venues import venue
+
+    t8 = pd.Timestamp("2025-10-03 08:00", tz="UTC")
+    kept = {t8 - 2 * pd.Timedelta(hours=8): 0.0001, t8 - pd.Timedelta(hours=8): 0.0001}
+    tag = funding.stale_tag("BINANCE", "BTC/USDT")
+    inbox = _Journal(events=[{"kind": "funding_stale", "message": f"{tag} No settled funding rate from the venue",
+                              "ts": t8 + pd.Timedelta(minutes=15)}])
+    monkeypatch.setattr("sleeve_fund.store.Store", lambda *a, **k: inbox)
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [
+        (int(t.timestamp() * 1000), r) for t, r in kept.items() if int(t.timestamp() * 1000) >= start])
+    real_stale = funding.stale
+    history._warned.clear()
+    monkeypatch.setattr(history, "_stale", set())
+    for at in ("2025-10-03 08:30", "2025-10-03 11:30"):
+        monkeypatch.setattr(funding, "stale", lambda v, p, root=None, now=None, at=at:
+                            real_stale(v, p, root, now=pd.Timestamp(at, tz="UTC")))
+        history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert inbox.sent == []  # 08:00 still missing: the episode stays open
+    kept[t8] = 0.0002
+    monkeypatch.setattr(funding, "stale", lambda v, p, root=None, now=None:
+                        real_stale(v, p, root, now=pd.Timestamp("2025-10-03 12:30", tz="UTC")))
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [(k, m.split("newest rate ")[-1]) for _, k, m in inbox.sent] == [
+        ("funding_stale_cleared", "2025-10-03 08:00 UTC")]
+
+
+def test_a_strategy_still_missing_a_settlement_reopens_an_episode_closed_meanwhile(monkeypatch):
+    """The collector closed the episode once the settlement it opened on was kept, but this strategy still waits on a
+    later one (16:00): the strategy opens it again, once, so the inbox never reads clear while a charge is on the
+    baseline (QA P1-O17a-8)."""
+    from types import MethodType, SimpleNamespace
+
+    from sleeve_fund import funding
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    tag = funding.stale_tag("", PAIR)
+    t16 = pd.Timestamp("2025-10-03 16:00", tz="UTC")
+    inbox = _Journal(events=[{"kind": "funding_stale_cleared", "message": f"{tag} funding kept up again",
+                              "ts": t16 + pd.Timedelta(minutes=30)}])
+    s = SimpleNamespace(_funding_recheck=None, _funding_missing={t16}, instrument=None, FUNDING_RECHECK=pd.Timedelta(0),
+                        _venue_rate=lambda terms, pair, when: None,
+                        runtime=SimpleNamespace(store=inbox, now=lambda: t16 + pd.Timedelta(minutes=31)))
+    s._funding_episode = MethodType(LongFlatStrategy._funding_episode, s)
+    monkeypatch.setattr("sleeve_fund.strategies.base.pair_of", lambda instrument: PAIR)
+    for minute in (31, 32):
+        LongFlatStrategy._watch_funding_recovery(s, None, t16 + pd.Timedelta(minutes=minute))
+    assert [k for _, k, _ in inbox.sent] == ["funding_stale"]
+    assert "16:00" in inbox.sent[0][2] and inbox.sent[0][2].startswith(tag)
