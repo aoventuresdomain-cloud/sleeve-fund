@@ -135,6 +135,44 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
     return liquidation_price(margin - qty * entry, qty, maintenance)
 
 
+@dataclass(frozen=True)
+class LiquidationBooking:
+    """What an isolated-margin liquidation books (GAP-LIQ-CAP, Independent Quant Advisor 6 Oct 23:42).
+
+    loss: X, the posted margin plus the entry and liquidation fees, the one figure the strategy books, gapped or not
+    (the same X as the RAL halt's). fill_loss: what the fills alone come to (the price move plus both fees).
+    insurance: how far the fills went past the bankruptcy price (fill_loss - X when positive), which the venue's
+    insurance fund covers: a diagnostic, never P&L. forfeited: the margin left when it closed short of bankruptcy
+    (X - fill_loss when positive), which the venue keeps, so the loss is X either way."""
+
+    loss: float
+    fill_loss: float
+    insurance: float
+    forfeited: float
+
+    @property
+    def adjustment(self) -> float:
+        """Cash to add to what the fills booked so the books show exactly X: + the insurance fund's cover, - the
+        margin forfeited."""
+        return self.insurance - self.forfeited
+
+
+def liquidation_booking(qty: float, entry: float, exit_px: float, leverage: float, entry_fee: float,
+                        liquidation_fee: float, balance: float | None = None) -> LiquidationBooking:
+    """The booking for a position of signed qty at average entry `entry`, liquidated at an average exit_px, on
+    isolated margin at this leverage (balance: what there was to put up, as isolated_margin). The fees are the
+    money charged (entry: on the whole liquidated qty, adds included; liquidation: on its fills)."""
+    if qty == 0 or entry <= 0 or exit_px <= 0 or leverage <= 0:
+        raise ValueError("a liquidation needs a position, positive prices and a positive leverage")
+    if entry_fee < 0 or liquidation_fee < 0:
+        raise ValueError("fees are money charged, never negative")
+    fees = entry_fee + liquidation_fee
+    x = isolated_margin(qty, entry, leverage, balance) + fees
+    fill_loss = -qty * (exit_px - entry) + fees
+    return LiquidationBooking(loss=x, fill_loss=fill_loss, insurance=max(fill_loss - x, 0.0),
+                              forfeited=max(x - fill_loss, 0.0))
+
+
 def liquidation_price(cash: float, qty: float, maintenance: float) -> float | None:
     """The price at which a position's equity (cash + qty x price) falls to the maintenance margin on
     its value, cash being the margin backing it less qty x entry (isolated_liquidation). None when flat,
