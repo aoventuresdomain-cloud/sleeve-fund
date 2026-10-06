@@ -190,6 +190,9 @@ def run_backtest(
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
         engine.add_strategy(strategy)
+        if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
+            thin = prices[prices["degraded"].astype(bool)]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):

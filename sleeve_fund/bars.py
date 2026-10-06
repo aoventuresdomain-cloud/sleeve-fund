@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+COLUMNS = ["open", "high", "low", "close", "volume", "missing", "degraded"]  # every frame build_bars returns
 DEGRADED_ABOVE = 0.10  # the Independent Quant Advisor's threshold: the share of minutes missing past which a bar is degraded
 
 
@@ -57,8 +58,10 @@ def build_bars(minutes: pd.DataFrame, length: int, first: pd.Timestamp | None = 
     DEGRADED_ABOVE of them missing: no new entries on it). A bar only partly inside [first, end) is left out (a
     part-day isn't a daily bar), and so is a bar with no minutes at all. The bounds default to the frame's own.
     Pure: no I/O, no clock."""
-    if length <= 1 or minutes.empty:
-        return minutes
+    if minutes.empty:
+        return pd.DataFrame(columns=COLUMNS, index=minutes.index[:0])
+    if length <= 1:  # 1-minute bars are themselves: none of their minutes absent
+        return minutes.assign(missing=0, degraded=False)
     first = minutes.index[0] if first is None else first
     end = minutes.index[-1] + pd.Timedelta(minutes=1) if end is None else end
     g = minutes.resample(f"{length}min", origin="epoch", label="left", closed="left")

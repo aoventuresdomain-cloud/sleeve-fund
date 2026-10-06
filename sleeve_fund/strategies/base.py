@@ -465,6 +465,12 @@ class LongFlatStrategy(Strategy):
         self.history_loader = None
         self.gap_loader = None  # paper: (instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars
         self._gap_bars: list[Bar] = []  # paper: candles built while no trades arrived, held until the feed is back
+        # Degraded bars (board 5a): close time (ns) -> minutes missing, for bars built with more than
+        # sleeve_fund.bars.DEGRADED_ABOVE of their minutes absent. Indicators update and exits run on them;
+        # no new entry is decided on one. Given by mark_degraded(); each is dropped once its bar is seen.
+        self._degraded: dict[int, int] = {}
+        self._no_entry_ts: int | None = None  # the close time of the degraded bar being decided on
+        self._degraded_missing = 0
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
@@ -521,6 +527,23 @@ class LongFlatStrategy(Strategy):
         """loader(instrument, bar_type, limit) -> the latest `limit` complete bars, oldest first."""
         self.history_loader = loader
         return self
+
+    def mark_degraded(self, bars: dict[int, int]) -> None:
+        """Bars, by close time in ns, built with too many minutes missing to enter on (sleeve_fund.bars, board
+        5a), with how many: the backtest passes the store's flagged bars before the run, and a live bar
+        builder each one as it closes, before handing the bar over."""
+        self._degraded.update({int(ts): int(m) for ts, m in bars.items()})
+
+    def _entry_blocked(self, bar: Bar) -> bool:
+        """Whether no new entry may be decided on this bar because it is degraded; says why, once per bar."""
+        if bar.ts_event != self._no_entry_ts:
+            return False
+        minutes = bar_minutes(self._cfg.bar_type)
+        missing = self._degraded_missing
+        self.log.info(f"entry held back on a degraded bar: {missing} of {minutes} minutes missing")
+        self._note("degraded_bar", f"Entry held back: this {minutes}-minute bar is missing {missing} of its minutes "
+                   "(over 10%), so no new position is opened on it; exits still run", level="info")
+        return True
 
     def attach_gap_loader(self, loader) -> "LongFlatStrategy":
         """loader(instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars stamped in that span,
@@ -1145,6 +1168,8 @@ class LongFlatStrategy(Strategy):
         trade and the bar's volume; refused when its stop would sit too near the liquidation price."""
         if self._exit_lock == side:
             return
+        if self._entry_blocked(bar):
+            return
         if self.runtime is not None and not self.runtime.can_open():
             return
         close = bar.close.as_double()
@@ -1230,6 +1255,11 @@ class LongFlatStrategy(Strategy):
         bar = self._fill_gap(bar)
         if not self._accept(bar):
             return
+        missing = self._degraded.pop(bar.ts_event, None)
+        if missing is None:
+            self._noted.discard("degraded_bar")
+        else:
+            self._no_entry_ts, self._degraded_missing = bar.ts_event, missing
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         if self._margin and self._backtest and self._exec_type is None:
@@ -1262,7 +1292,7 @@ class LongFlatStrategy(Strategy):
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
-            if self._exit_lock:
+            if self._exit_lock or self._entry_blocked(bar):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
@@ -1298,6 +1328,8 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
+                if w > self._held_w and self._entry_blocked(bar):
+                    return  # adding to the position is an entry; trimming it still runs
                 reason, values = self.explain(bar, True)
                 if self._rebalance(bar, w, reason, {**values, "target_weight": round(float(raw), 6), "close": close}):
                     self._held_w = w
