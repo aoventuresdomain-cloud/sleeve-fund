@@ -575,7 +575,7 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
             if refused:  # never kept as real rates: charged as missing, and said once a day for these settlements
                 at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} ({r!r})" for t, r in refused)
                 _alert(f"{profile.name} {pair}: funding invalid {refused[0][0]}-{refused[-1][0]}", "warning",
-                       "funding_invalid", f"{profile.name.upper()} {pair}: {len(refused)} settled funding rate(s) refused "
+                       "funding_invalid", f"{pair}: {len(refused)} settled funding rate(s) refused "
                        f"as not a number within the {funding.cap_of(profile.name, pair):.2%} cap, kept as missing: {at}")
             missed, maybe = funding.settled_holes(profile.name, pair, root)  # QA P1-O18
             if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
@@ -591,21 +591,26 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
             problem, key = funding.stale(profile.name, pair, root), f"{profile.name} {pair}: funding stale"
             # One episode per instrument, whoever notices first: a paper strategy on it may have opened (or closed)
             # it already, under the same tag (Advisor, 6 Oct 2026; CR, #163).
-            tag = funding.stale_tag(profile.name, pair)
+            tag, inbox = funding.stale_tag(profile.name, pair), _inbox()
             if problem:
                 print(f"FUNDING STALE: {problem}")
                 if key not in _stale:  # once per episode (Advisor, 6 Oct 2026)
                     _stale.add(key)
-                    if funding.stale_open(_inbox(), tag) is not True:
+                    if funding.stale_open(inbox, tag) is not True:
                         _warned.pop(key, None)
-                        _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}")
-            elif key in _stale:  # the gap gets a clear end in the journal (Advisor, 6 Oct 2026)
+                        _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}", inbox)
+            else:
+                # The gap gets a clear end in the journal (Advisor, 6 Oct 2026), and so does one whose opener (a
+                # strategy, or this process before a restart) is gone: the rates are keeping up, so an episode still
+                # open under the tag is over, and left open it would hold back the next outage's alert (CR, #163).
+                was = key in _stale
                 _stale.discard(key)
-                if funding.stale_open(_inbox(), tag) is not False:
+                open_ = funding.stale_open(inbox, tag)
+                if open_ is True or (open_ is None and was):
                     kept = funding.rates(profile.name, pair, root).index
                     _warned.pop(f"{key}: cleared", None)
                     _alert(f"{key}: cleared", "info", "funding_stale_cleared",
-                           f"{tag} funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC")
+                           f"{tag} funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC", inbox)
         except Exception as exc:  # noqa: BLE001 - an unreadable store is reported by the refresh itself
             print(f"{profile.name} {pair}: funding staleness check failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
@@ -728,18 +733,23 @@ def _alert_over_published_cap(profile, pair: str, new: pd.Series) -> None:
         return
     at = ", ".join(f"{t:%Y-%m-%d %H:%M} ({r:.4%})" for t, r in over.items())
     _alert(f"{profile.name} {pair}: funding over the published cap {over.index[-1]:%Y%m%d%H%M}", "warning",
-           "funding_over_cap", f"{profile.name.upper()} {pair}: {len(over)} settled funding rate(s) beyond the "
+           "funding_over_cap", f"{pair}: {len(over)} settled funding rate(s) beyond the "
            f"instrument's published {cap:.2%} cap, kept and charged as the venue settled them: {at}")
 
 
-def _inbox():
-    """The journal the alerts go to, or None without a database (locally)."""
-    try:
-        from sleeve_fund.store import Store
+_inbox_of: list = [None, None]  # (the Store class it was built from, the Store): one per process, not one per pass
 
-        return Store()
-    except Exception:  # noqa: BLE001
-        return None
+
+def _inbox():
+    """The journal the alerts go to, built once, or None without a database (locally)."""
+    from sleeve_fund import store as store_mod
+
+    if _inbox_of[0] is not store_mod.Store:  # built again only if the class changed (tests swap it)
+        try:
+            _inbox_of[:] = [store_mod.Store, store_mod.Store()]
+        except Exception:  # noqa: BLE001
+            return None
+    return _inbox_of[1]
 
 
 def _alert(key: str, level: str, kind: str, message: str, store=None) -> None:

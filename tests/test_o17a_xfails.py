@@ -34,10 +34,13 @@ ASSUMED INTERFACES (adapt the names, never the assertions):
   HELD time inside one unbroken stretch of missing rates; pd.Timedelta(0) when none).
 - funding.baseline_check(at_baseline, held, longest_held) -> (verdict, words): "PASS" | "WARN" | tearsheet.NOT_JUDGED;
   words carry "N of M"; constants BASELINE_WARN = 0.01, BASELINE_LIMIT = 0.05, BASELINE_RUN_LIMIT = 7 days.
-- VenueProfile.funding_cap(pair) -> float | None: the instrument's own cap on |rate| per settlement as the venue
-  publishes it now (None: it publishes none). VenueProfile.funding_cap_widest(contract_type) -> float: the widest
-  cap the venue publishes for that contract type ("perp"). funding.keep_cap(venue, pair, cap, effective_from) keeps
-  a cap in the contract data with its effective-from; funding.cap_at(venue, pair, ts) -> the cap that applied at ts.
+- VenueProfile.funding_cap(pair) -> float: O17a's own validity cap on |rate| per settlement (built on O17a: a sanity
+  default of 5%). The invalid-rate tests set it to 0.3%; the cap pins in section 7 never touch it.
+- VenueProfile.published_funding_caps: pair -> cap, the caps the venue publishes now (the DA's interim static table on
+  O17a, 0.3% for BTC); a rate beyond it raises "funding_over_cap" and is still kept and charged until DA-11.
+- DA-11: funding.keep_cap(venue, pair, cap, effective_from) keeps a cap in the contract data with its effective-from;
+  funding.cap_at(venue, pair, ts) -> the cap that applied at ts. With no cap for the instrument, the widest the venue
+  publishes for that contract type applies, with a "funding_cap_missing" alert.
 - funding.quarantined(venue, pair) -> pd.Series: each rejected settlement's raw value (NaN and inf included), held
   until the DA reviews it; the settlement is charged the baseline meanwhile.
 - Tear sheet: tearsheet.FUNDING_CHECK, the G1 row judged on the OOS test windows, its line carrying "N of M",
@@ -46,7 +49,8 @@ ASSUMED INTERFACES (adapt the names, never the assertions):
   tearsheet.g1_verdict treats "WARN" as not failing.
 - Events: "funding_stale" (warning, per instrument, once per episode; no "funding_fallback" any more),
   "funding_stale_cleared" (recovery), "funding_invalid" (warning, in the alerts inbox, from the collector's refresh,
-  carrying the raw value), "funding_cap_missing" (warning, naming the instrument whose cap is missing).
+  carrying the raw value), "funding_cap_missing" (warning, naming the instrument whose cap is missing),
+  "funding_over_cap" (the DA's interim guard, naming the instrument).
 """
 
 from __future__ import annotations
@@ -245,20 +249,6 @@ def test_each_charge_says_whether_it_was_the_venue_rate_or_the_baseline(binance)
             assert x["amount"] == pytest.approx(-abs(x["qty"]) * x["price"] * BASELINE, rel=1e-6)
 
 
-def _caps(binance, monkeypatch, published, caps=None, widest=None):
-    """The instrument's cap as the venue publishes it now (None: it publishes none), the caps that applied before
-    (effective-from -> cap, kept in the contract data), and the venue's widest cap for the contract type. At c7a73f1
-    none of these exist (set with raising=False, kept only once built): rename here if the DA names them differently,
-    never the assertions."""
-    monkeypatch.setattr(binance, "funding_cap", lambda pair: published, raising=False)
-    if widest is not None:
-        monkeypatch.setattr(binance, "funding_cap_widest", lambda contract_type="perp": widest, raising=False)
-    keep = getattr(funding, "keep_cap", None)  # not built: funding.keep_cap(venue, pair, cap, effective_from)
-    for t, c in (caps or {}).items():
-        if keep is not None:
-            keep("BINANCE", PAIR, c, utc(t))
-
-
 INVALID = [("nan", float("nan")), ("inf", float("inf")), ("minus-inf", float("-inf")),
            ("over-the-cap", 0.05), ("under-minus-the-cap", -0.05)]
 
@@ -270,7 +260,7 @@ def test_an_invalid_kept_rate_is_missing_charged_the_baseline_to_both_sides_and_
     """NaN, +-inf, or |rate| over the venue's cap (0.3% here) kept in the store (a hand-written file or a bad backfill)
     is a missing rate: the baseline, never the bad number, and counted at baseline (18:18)."""
     if np.isfinite(bad):
-        _caps(binance, monkeypatch, 0.003, {"2025-01-01": 0.003})  # point-in-time (20:44): the cap applied then too
+        monkeypatch.setattr(binance, "funding_cap", lambda pair: 0.003, raising=False)  # O17a's own validity cap
     write_rates({utc("2025-10-03 08:00"): 0.0003, utc("2025-10-03 16:00"): bad, utc("2025-10-04 00:00"): 0.0001})
     r = backtest(binance, hourly_bars("2025-10-03 00:00", "2025-10-04 04:00"),
                  win(("2025-10-03 01:00", "2026-01-01", side)))
@@ -290,7 +280,7 @@ def test_the_collector_never_stores_an_invalid_rate_and_alerts_it(tmp_path, bina
     import sleeve_fund.store as store_mod
     from sleeve_fund import history
 
-    _caps(binance, monkeypatch, 0.003, {"2025-01-01": 0.003})
+    monkeypatch.setattr(binance, "funding_cap", lambda pair: 0.003, raising=False)  # O17a's own validity cap
     times = settlements("2025-10-02 23:00", "2025-10-05 00:00")  # 7 settlements
     bad = {times[1]: float("nan"), times[2]: float("inf"), times[3]: float("-inf"), times[4]: 0.05, times[5]: -0.004}
     rows = [(int(t.timestamp() * 1000), bad.get(t, 0.0001)) for t in times]
@@ -593,23 +583,45 @@ def test_a_holdout_not_judged_for_funding_blocks_promotion_but_not_g1(tmp_path, 
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 7. The validity cap (O17a-4, Advisor 20:44): each instrument's own published cap, point-in-time; a missing cap uses
-#    the venue's widest for that contract type, with an alert; a rejected rate is quarantined raw, alerted, charged
-#    the baseline until reviewed; simulated perps keep the flat fallback.
+# 7. The validity cap (O17a-4, Advisor 20:44; the pins close with DA-11): each instrument's own published cap, point-
+#    in-time; a missing cap uses the venue's widest for that contract type, with an alert; a rejected rate is
+#    quarantined raw, alerted, charged the baseline until reviewed; simulated perps keep the flat fallback. Plus the
+#    DA's interim guard (O17a): a rate beyond the static published cap is alerted, and still kept and charged.
+#    These tests NEVER patch the production validity cap (VenueProfile.funding_cap): every cap they need comes from
+#    the venue's published caps, fed through the test-only sources below.
 # ---------------------------------------------------------------------------------------------------------------
 
 REASON_CAP = "DA-11"  # the cap pins close with DA-11, not O17a (HoE, pending the Advisor's confirmation)
 CAP_TIMES = settlements("2025-10-02 23:00", "2025-10-04 09:00")  # 3 Oct 00/08/16, 4 Oct 00/08
+ETH = "ETH/USDT"
 
 
-def _collect(binance, monkeypatch, rates: dict) -> list:
-    """One collector pass (history._refresh_funding, as the hub runs it) over the venue's settled `rates`; returns
-    what reached the alerts inbox as (level, kind, message)."""
+def _published_now(binance, monkeypatch, caps: dict) -> None:
+    """The caps the venue publishes now, pair -> cap on |rate|: the DA's interim static table
+    (VenueProfile.published_funding_caps). A pair left out has no published cap. Set with raising=False, so it is
+    inert where that table is not built (c7a73f1)."""
+    monkeypatch.setattr(binance, "published_funding_caps", dict(caps), raising=False)
+
+
+def _cap_table(rows) -> None:
+    """DA-11's point-in-time cap table: (pair, effective-from, cap) rows kept in the contract data. Not built at
+    c7a73f1 or on O17a: the test fails here, on an assertion, as "not built". Rename here if the DA names it
+    differently, never the assertions."""
+    keep = getattr(funding, "keep_cap", None)
+    assert callable(keep), "not built (DA-11): funding.keep_cap(venue, pair, cap, effective_from), the point-in-time " \
+                           "cap table in the contract data"
+    for pair, t, cap in rows:
+        keep("BINANCE", pair, cap, utc(t))
+
+
+def _collect(binance, monkeypatch, rates: dict, pair: str = PAIR) -> list:
+    """One collector pass (history._refresh_funding, as the hub runs it) over the venue's settled `rates` for `pair`;
+    returns what reached the alerts inbox as (level, kind, message)."""
     import sleeve_fund.store as store_mod
     from sleeve_fund import history
 
     rows = [(ms(t), r) for t, r in sorted((utc(k), v) for k, v in rates.items())]
-    monkeypatch.setattr(binance, "funding_loader", lambda pair, start: [x for x in rows if x[0] >= start])
+    monkeypatch.setattr(binance, "funding_loader", lambda p, start: [x for x in rows if x[0] >= start])
     monkeypatch.setattr(binance, "stats_loaders", {})
     sent = []
 
@@ -623,7 +635,7 @@ def _collect(binance, monkeypatch, rates: dict) -> list:
     with monkeypatch.context() as m:
         m.setattr(store_mod, "Store", Inbox)
         history._warned.clear()
-        history._refresh_funding(binance, PAIR, funding.DEFAULT_ROOT, None)
+        history._refresh_funding(binance, pair, funding.DEFAULT_ROOT, None)
         history._warned.clear()
     funding._cache.clear()
     return sent
@@ -636,6 +648,15 @@ def _held_backtest(binance):
     return r, {utc(x["ts"]): x for x in r.journal.funding_}
 
 
+def _charged_as_settled(row, rate):
+    assert row["rate"] == pytest.approx(rate)
+    assert row["amount"] == pytest.approx(-row["qty"] * row["price"] * rate, rel=1e-6)
+
+
+def _names(message: str, pair: str) -> bool:
+    return pair in message or pair.replace("/", "") in message
+
+
 def _shows(text: str, raw: float) -> bool:
     """`text` carries the raw value as the venue sent it (as a number or a percentage)."""
     if isnan(raw):
@@ -645,94 +666,109 @@ def _shows(text: str, raw: float) -> bool:
     return any(f in text for f in forms)
 
 
-# Each case: the venue's cap now, the caps that applied before, the widest, and a rate settled at 3 Oct 16:00 that is
-# within the cap that applies to it.
-WITHIN = {
-    "own-cap": dict(published=0.0075, caps={"2025-09-01": 0.0075}, widest=None, rate=0.005),
-    "cap-that-applied-then": dict(published=0.0075, caps={"2025-09-01": 0.03, "2025-10-04 00:00": 0.0075},
-                                  widest=None, rate=0.02),
-    "missing-cap-widest": dict(published=None, caps={}, widest=0.03, rate=0.02),
-}
-
-
-@pytest.mark.parametrize("case", [c if c == "own-cap" else pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="DA-11"))
-                                  for c in WITHIN])
-def test_a_rate_within_the_cap_that_applies_is_kept_and_charged_as_settled(binance, monkeypatch, case):
-    """Plain (holds today, must keep holding once caps are built). Within its own cap (0.5% under 0.75%); above today's
-    cap but within the cap that applied at that settlement (2% at 3 Oct 16:00, when the cap was 3%; 0.75% from 4 Oct);
-    the instrument's cap missing, within the venue's widest (2% under 3%): kept as real and charged as settled. Lean
-    to accepting: a false reject flatters results, since a rejected rate is charged the baseline."""
-    c = WITHIN[case]
-    _caps(binance, monkeypatch, c["published"], c["caps"], c["widest"])
+def test_a_rate_within_the_instruments_own_published_cap_is_kept_and_charged_as_settled(binance, monkeypatch):
+    """Plain (holds at c7a73f1 and on O17a; must keep holding under DA-11). BTC/USDT publishes a 0.75% cap: 0.5% at
+    3 Oct 16:00 is kept as real, charged as settled, and raises no funding_over_cap alert."""
+    _published_now(binance, monkeypatch, {PAIR: 0.0075})
     at = utc("2025-10-03 16:00")
-    _collect(binance, monkeypatch, {t: (c["rate"] if t == at else 0.0001) for t in CAP_TIMES})
+    sent = _collect(binance, monkeypatch, {t: (0.005 if t == at else 0.0001) for t in CAP_TIMES})
+    assert not [m for _, k, m in sent if k == "funding_over_cap"], sent
     kept = funding.rates("BINANCE", PAIR)
-    assert kept.get(at) == pytest.approx(c["rate"]), f"not kept: {kept.to_dict()}"
+    assert kept.get(at) == pytest.approx(0.005), f"not kept: {kept.to_dict()}"
     _, rows = _held_backtest(binance)
-    x = rows[at]
-    assert x["rate"] == pytest.approx(c["rate"])
-    assert x["amount"] == pytest.approx(-x["qty"] * x["price"] * c["rate"], rel=1e-6)
+    _charged_as_settled(rows[at], 0.005)
 
 
-def test_a_rate_above_the_instruments_own_cap_is_rejected(binance, monkeypatch):
-    """Cap 0.75% (tighter than 5%, so a fixed 5% cap would wrongly accept it): 3% at 3 Oct 16:00 is rejected by the
-    collector and, kept in the store by hand, charged the baseline in the backtest. 0.5% in the same pass is kept.
-    Today any finite rate is kept and charged as it is."""
-    _caps(binance, monkeypatch, 0.0075, {"2025-09-01": 0.0075})
-    over, ok = utc("2025-10-03 16:00"), utc("2025-10-03 08:00")
-    _collect(binance, monkeypatch, {t: {over: 0.03, ok: 0.005}.get(t, 0.0001) for t in CAP_TIMES})
+def test_the_interim_guard_alerts_a_btc_rate_over_the_published_cap_but_keeps_and_charges_it(binance, monkeypatch):
+    """Plain, for the DA's interim guard on O17a (not in c7a73f1, so it fails there): with the static published cap as
+    shipped (VenueProfile.published_funding_caps: 0.3% for BTC; not patched here), 0.5% at 3 Oct 16:00 raises one
+    funding_over_cap alert naming BTC/USDT, and is still kept as real and charged as settled. Until DA-11 nothing
+    over a published cap is refused on that cap alone."""
+    at = utc("2025-10-03 16:00")
+    sent = _collect(binance, monkeypatch, {t: (0.005 if t == at else 0.0001) for t in CAP_TIMES})
+    over = [m for _, k, m in sent if k == "funding_over_cap"]
+    assert len(over) == 1 and _names(over[0], PAIR), f"one funding_over_cap alert naming {PAIR}; sent {sent}"
     kept = funding.rates("BINANCE", PAIR)
-    assert kept.get(ok) == pytest.approx(0.005), "control: a rate within the cap is kept"
-    assert over not in kept.index, f"3% kept as a real rate over a 0.75% cap: {kept.get(over)}"
-    write_rates({t: {over: 0.03, ok: 0.005}.get(t, 0.0001) for t in CAP_TIMES})  # a hand-written file or a bad backfill
+    assert kept.get(at) == pytest.approx(0.005), f"not kept: {kept.to_dict()}"
+    _, rows = _held_backtest(binance)
+    _charged_as_settled(rows[at], 0.005)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_CAP)
+def test_a_rate_above_the_instruments_own_cap_is_rejected_where_a_flat_cap_would_keep_it(binance, monkeypatch):
+    """Two instruments, one rate. BTC/USDT's own cap is 0.75%; ETH/USDT's is 3% (the venue's widest here). 2% at
+    3 Oct 16:00 is rejected on BTC and kept on ETH: no flat cap does both (one at or above 2% keeps both, one below
+    rejects both). And 2% kept on BTC by hand is charged the baseline, 1 of 3. Today 2% is kept and charged on both."""
+    caps = {PAIR: 0.0075, ETH: 0.03}
+    _published_now(binance, monkeypatch, caps)
+    _cap_table([(p, "2025-09-01", c) for p, c in caps.items()])
+    at, ok = utc("2025-10-03 16:00"), utc("2025-10-03 08:00")
+    btc = {t: {at: 0.02, ok: 0.005}.get(t, 0.0001) for t in CAP_TIMES}
+    _collect(binance, monkeypatch, btc, PAIR)
+    _collect(binance, monkeypatch, {t: (0.02 if t == at else 0.0001) for t in CAP_TIMES}, ETH)
+    kept_btc, kept_eth = funding.rates("BINANCE", PAIR), funding.rates("BINANCE", ETH)
+    assert kept_eth.get(at) == pytest.approx(0.02), "control: 2% within ETH's own 3% cap is kept"
+    assert kept_btc.get(ok) == pytest.approx(0.005), "control: 0.5% within BTC's own cap is kept"
+    assert at not in kept_btc.index, f"2% kept on BTC over its own 0.75% cap: {kept_btc.get(at)}"
+    write_rates(btc)  # a hand-written file or a bad backfill
     r, rows = _held_backtest(binance)
-    _paid_baseline([rows[over]])
+    _paid_baseline([rows[at]])
     assert (r.funding_at_baseline, r.funding_held) == (1, 3)
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_CAP)
 def test_the_cap_is_point_in_time(binance, monkeypatch):
-    """The cap that applied at the settlement, from the contract data with its effective-from: 3% until 4 Oct 00:00,
-    0.75% from then. 2% at 3 Oct 16:00 is kept; 2% at 4 Oct 08:00 is rejected. Today both are kept."""
-    _caps(binance, monkeypatch, 0.0075, {"2025-09-01": 0.03, "2025-10-04 00:00": 0.0075})
+    """BTC/USDT's cap was 3% until 4 Oct 00:00 and is 0.75% from then (published now: 0.75%). 2% at 3 Oct 16:00 is
+    within the cap that applied then: kept and charged as settled. 2% at 4 Oct 08:00 is rejected. funding.cap_at
+    gives 3% then and 0.75% now. Today both are kept."""
+    _published_now(binance, monkeypatch, {PAIR: 0.0075, ETH: 0.03})
+    _cap_table([(PAIR, "2025-09-01", 0.03), (PAIR, "2025-10-04 00:00", 0.0075), (ETH, "2025-09-01", 0.03)])
     then, now = utc("2025-10-03 16:00"), utc("2025-10-04 08:00")
     _collect(binance, monkeypatch, {t: 0.02 if t in (then, now) else 0.0001 for t in CAP_TIMES})
     kept = funding.rates("BINANCE", PAIR)
-    assert kept.get(then) == pytest.approx(0.02), "control: within the cap that applied then"
     assert now not in kept.index, "2% kept at 4 Oct 08:00, over the 0.75% cap in force from 4 Oct 00:00"
+    assert kept.get(then) == pytest.approx(0.02), "2% at 3 Oct 16:00 refused, though within the 3% that applied then"
     cap_at = getattr(funding, "cap_at", None)
-    assert callable(cap_at), "not built: funding.cap_at(venue, pair, ts) -> the cap that applied at ts"
+    assert callable(cap_at), "not built (DA-11): funding.cap_at(venue, pair, ts) -> the cap that applied at ts"
     assert cap_at("BINANCE", PAIR, then) == pytest.approx(0.03)
     assert cap_at("BINANCE", PAIR, now) == pytest.approx(0.0075)
+    _, rows = _held_backtest(binance)
+    _charged_as_settled(rows[then], 0.02)
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_CAP)
 def test_a_missing_cap_uses_the_venues_widest_and_alerts(binance, monkeypatch):
-    """The venue publishes no cap for the instrument and none is kept: the WIDEST cap the venue publishes for a linear
-    perpetual applies (3% here), and one alert names the instrument's missing cap. 2% is kept; 4% is rejected."""
-    _caps(binance, monkeypatch, None, widest=0.03)
+    """The venue publishes caps for ETH/USDT (3%) and SOL/USDT (2%) but none for BTC/USDT, and none is kept for it:
+    the WIDEST cap the venue publishes for a linear perpetual applies (3%), and one funding_cap_missing alert names
+    BTC/USDT. 2% is kept and charged as settled (lean to accepting); 4% is rejected. Never a TypeError: the cap
+    lookup for an instrument with no cap is the thing being built."""
+    _published_now(binance, monkeypatch, {ETH: 0.03, "SOL/USDT": 0.02})
+    _cap_table([(ETH, "2025-09-01", 0.03), ("SOL/USDT", "2025-09-01", 0.02)])
     within, over = utc("2025-10-03 08:00"), utc("2025-10-03 16:00")
     sent = _collect(binance, monkeypatch, {t: {within: 0.02, over: 0.04}.get(t, 0.0001) for t in CAP_TIMES})
     missing = [(lv, m) for lv, k, m in sent if k == "funding_cap_missing"]
-    assert missing, f"not built: no funding_cap_missing alert for the instrument (sent {sent})"
-    assert all(lv == "warning" and "cap" in m.lower() and ("BTC/USDT" in m or "BTCUSDT" in m) for lv, m in missing)
+    assert missing, f"no funding_cap_missing alert for {PAIR} (sent {sent})"
+    assert all(lv == "warning" and "cap" in m.lower() and _names(m, PAIR) for lv, m in missing), missing
     kept = funding.rates("BINANCE", PAIR)
-    assert kept.get(within) == pytest.approx(0.02), "lean to accepting: within the venue's widest cap"
+    assert kept.get(within) == pytest.approx(0.02), "lean to accepting: 2% is within the venue's widest cap"
     assert over not in kept.index, "4% kept, over the venue's widest cap (3%)"
+    _, rows = _held_backtest(binance)
+    _charged_as_settled(rows[within], 0.02)
 
 
 @pytest.mark.strategy_errors
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_CAP)
 def test_a_rejected_rate_is_quarantined_raw_alerted_and_charged_the_baseline(binance, monkeypatch):
-    """Never silently dropped: the raw value (3% over a 0.75% cap, NaN, -2%) is quarantined for the DA's review with a
-    funding_invalid alert carrying it, and until reviewed the settlement is charged the baseline and counted at
-    baseline. Today NaN is dropped with a printed line only, and 3% and -2% are kept and charged as real."""
-    _caps(binance, monkeypatch, 0.0075, {"2025-09-01": 0.0075})
-    bad = {utc("2025-10-03 08:00"): 0.03, utc("2025-10-03 16:00"): float("nan"), utc("2025-10-04 00:00"): -0.02}
-    sent = _collect(binance, monkeypatch, {t: bad.get(t, 0.0001) for t in CAP_TIMES})
+    """Never silently dropped: the raw value (2% over BTC's own 0.75% cap, NaN, -2%) is quarantined for the DA's
+    review with a funding_invalid alert carrying it, and until reviewed the settlement is charged the baseline and
+    counted at baseline. Today NaN is dropped with a printed line only, and 2% and -2% are kept and charged as real."""
+    _published_now(binance, monkeypatch, {PAIR: 0.0075, ETH: 0.03})
+    bad = {utc("2025-10-03 08:00"): 0.02, utc("2025-10-03 16:00"): float("nan"), utc("2025-10-04 00:00"): -0.02}
     quarantined = getattr(funding, "quarantined", None)
-    assert callable(quarantined), ("not built: funding.quarantined(venue, pair) -> the rejected settlements and "
-                                   "their raw values, held for review")
+    assert callable(quarantined), ("not built (DA-11): funding.quarantined(venue, pair) -> the rejected settlements "
+                                   "and their raw values, held for review")
+    _cap_table([(PAIR, "2025-09-01", 0.0075), (ETH, "2025-09-01", 0.03)])
+    sent = _collect(binance, monkeypatch, {t: bad.get(t, 0.0001) for t in CAP_TIMES})
     q = quarantined("BINANCE", PAIR)
     for t, raw in bad.items():
         assert t in q.index, f"{t:%d %b %H:%M} ({raw}) dropped, not quarantined"
@@ -750,20 +786,13 @@ def test_a_rejected_rate_is_quarantined_raw_alerted_and_charged_the_baseline(bin
     assert (r.funding_at_baseline, r.funding_held) == (3, 3)
 
 
-def test_a_simulated_perp_keeps_the_flat_fallback_and_asks_for_no_cap(monkeypatch):
-    """Plain. Kraken has no perpetual of its own and no venue rates to check: every settlement stays the flat 0.01%
-    fallback, and no cap is asked for (a call fails the test here, or in the engine through the handler guard). The
-    short side is pinned by test_a_simulated_perp_charges_the_baseline_to_both_sides."""
+def test_a_simulated_perp_keeps_the_flat_fallback():
+    """Plain. Kraken has no perpetual of its own and no venue rates to check against any cap: every settlement stays
+    the flat 0.01% fallback. The short side is pinned by test_a_simulated_perp_charges_the_baseline_to_both_sides."""
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.venues import venue
 
     k = venue("KRAKEN")
-
-    def no_cap(*a, **kw):
-        raise AssertionError("a simulated perp asked for a funding cap")
-
-    monkeypatch.setattr(k, "funding_cap", no_cap, raising=False)
-    monkeypatch.setattr(k, "funding_cap_widest", no_cap, raising=False)
     r = run_backtest("o17win", hourly_bars("2025-10-03 00:00", "2025-10-05 00:00"), k.instrument("BTC", "USD"),
                      win(("2025-10-03 01:00", "2026-01-01", 1)), starting_capital=10_000,
                      risk_profile="balanced", bar_minutes=60, half_spread=0)

@@ -91,10 +91,10 @@ def test_the_collector_does_not_alert_an_episode_a_strategy_already_opened(tmp_p
     assert inbox.sent[0][2].startswith(tag)
 
 
-def test_paper_and_collector_share_the_instrument_tag():
+def test_paper_and_collector_share_the_instrument_tag_without_the_venue():
     from sleeve_fund import funding
 
-    assert funding.stale_tag("binance", PAIR) == f"[BINANCE {PAIR}]"
+    assert funding.stale_tag("binance", PAIR) == funding.stale_tag("", PAIR) == f"[{PAIR}]"  # no venue name shown
 
 
 def test_a_rate_beyond_the_published_cap_is_alerted_and_still_kept(tmp_path, monkeypatch):
@@ -121,3 +121,35 @@ def test_a_rate_beyond_the_published_cap_is_alerted_and_still_kept(tmp_path, mon
     history._warned.clear()
     history._refresh_funding(profile, "BTC/USDT", tmp_path, None)  # nothing new: nothing said again
     assert not [k for _, k, _ in inbox.sent if k == "funding_over_cap"]
+
+
+def test_an_episode_left_open_by_a_restart_is_closed_once_the_rates_keep_up_and_the_next_outage_alerts(
+        tmp_path, monkeypatch):
+    """The opener (a strategy, or the collector before a deploy) restarted before the rate came: nobody holds the
+    episode in memory. The collector, seeing the rates keep up, writes its one clear; a later outage then alerts
+    again rather than being held back by the old episode (CR on #163)."""
+    from sleeve_fund import funding, history
+    from sleeve_fund.venues import venue
+
+    H8 = pd.Timedelta(hours=8)
+    now = pd.Timestamp.now(tz="UTC").floor("8h")
+    tag = funding.stale_tag("BINANCE", "BTC/USDT")
+    inbox = _Journal(events=[{"kind": "funding_stale", "message": f"{tag} No settled funding rate from the venue",
+                              "ts": now - 3 * H8}])
+    monkeypatch.setattr("sleeve_fund.store.Store", lambda *a, **k: inbox)
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    fresh = [int(t.timestamp() * 1000) for t in pd.date_range(now - 4 * H8, now, freq="8h")]
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in fresh if t >= start])
+    history._warned.clear()
+    monkeypatch.setattr(history, "_stale", set())  # a new collector process
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [k for _, k, _ in inbox.sent] == ["funding_stale_cleared"]
+    assert inbox.sent[0][2].startswith(tag) and "BINANCE" not in inbox.sent[0][2].upper().replace(tag, "")
+    # The venue stops publishing: the next outage is alerted, once.
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [])
+    monkeypatch.setattr(funding.pd.Timestamp, "now", classmethod(lambda cls, tz=None: now + 5 * H8))
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [k for _, k, _ in inbox.sent] == ["funding_stale_cleared", "funding_stale"]

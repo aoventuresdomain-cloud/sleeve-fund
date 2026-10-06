@@ -230,8 +230,9 @@ def stale(venue: str, pair: str, root: str | Path | None = None, now: pd.Timesta
 
 def stale_tag(venue: str, pair: str) -> str:
     """The prefix of an instrument's funding_stale / funding_stale_cleared messages, the same whether the collector
-    or a paper strategy raises it, so one episode per instrument is alerted once, whoever notices first (CR, #163)."""
-    return f"[{venue.upper()} {pair}]" if venue else f"[{pair}]"
+    or a paper strategy raises it, so one episode per instrument is alerted once, whoever notices first (CR, #163).
+    The venue stays out of it: the alerts are read by the PM, and each instrument is followed on one venue."""
+    return f"[{pair.upper()}]"
 
 
 def stale_open(store, tag: str) -> bool | None:
