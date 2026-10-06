@@ -130,6 +130,7 @@ def _paper(inst, m1x, params, spec="15-MINUTE-LAST-INTERNAL", profile="aggressiv
     return st
 
 
+@pytest.mark.no_open_risk_limit  # a stopless model above 1x in paper: a mechanics test (open_risk)
 def test_d2_paper_and_backtest_take_the_same_decision_on_a_holed_slower_candle(tmp_path):
     inst = binance_inst()
     m1 = synth_1m(days=1, seed=8, vol_day=0.01)
@@ -173,6 +174,7 @@ def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tm
 
 # P1-D4 BLOCKER on d70ee9f (paper charged a phantom 12:00 settlement at the baseline rate when the venue lengthened its
 # interval 4h -> 8h); fixed in aa7c2c6 (markets.settlement_wait). Kept as a regression test.
+@pytest.mark.no_open_risk_limit  # a stopless model above 1x in paper: a mechanics test (open_risk)
 def test_d4_paper_charges_no_settlement_the_venue_never_made(tmp_path):
     inst = binance_inst()
     put_rates(pd.date_range("2025-10-03 00:00", "2025-10-03 08:00", freq="4h", tz="UTC"))  # then 8-hourly: next 16:00
@@ -354,6 +356,7 @@ def _paper_from(inst, m1x, params, hs, hub, spec_minutes=15, profile="aggressive
 # R1 own feed fixed at ba4f533 (paper.node attaches the stored minutes): strict marks removed, full re-run.
 
 
+@pytest.mark.no_open_risk_limit  # a stopless model above 1x in paper: a mechanics test (open_risk)
 @pytest.mark.parametrize("hub,stored_holes", [
     pytest.param(True, 0, id="hub-fed-all-stored"),
     pytest.param(True, 1, id="hub-fed-one-missing"),
