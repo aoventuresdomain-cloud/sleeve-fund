@@ -29,7 +29,7 @@ from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
-from sleeve_fund.paper.runtime import entry_blocked_in
+from sleeve_fund.paper.runtime import entry_blocked
 from sleeve_fund.strategies.base import EXITS_ONLY
 
 POLL_SECONDS = 5
@@ -245,7 +245,7 @@ class Supervisor:
                     self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
             elif action == "stop":
                 self._stop(sleeve.name, proc, "stopped by PM")
-                if not entry_blocked_in(self.store, sleeve.name, starting=True)[0]:  # a halt stays through a stop (HC)
+                if not entry_blocked(self.store, sleeve.name, starting=True)[0]:  # a halt stays through a stop (HC)
                     self.store.set_status(sleeve.name, "stopped", "stopped by PM")
             elif action == "restart_stale":
                 self.store.event(sleeve.name, "error", "heartbeat_stale", "no heartbeat for 3 minutes; restarting")

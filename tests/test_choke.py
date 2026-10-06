@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sleeve_fund.paper.journal import MemoryJournal
-from sleeve_fund.paper.runtime import WIPED_OUT, SleeveRuntime, entry_blocked, entry_blocked_in
+from sleeve_fund.paper.runtime import WIPED_OUT, SleeveRuntime, blocked_state, entry_blocked
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import Store
 from sleeve_fund.strategies.base import LongFlatStrategy
@@ -36,8 +36,8 @@ def _state(status="running", reason="", paused_until=None, desired="running"):
     (_state("stopped", desired="stopped"), {"starting": True}, None),  # Start is what clears a stop
     (_state(), {"holds": {"funding": "no funding rate for the next settlement"}}, "no funding rate"),
 ])
-def test_entry_blocked_names_what_alone_clears_each_state(state, kw, why):
-    blocked, said = entry_blocked(state, NOW, **kw)
+def test_blocked_state_names_what_alone_clears_each_state(state, kw, why):
+    blocked, said = blocked_state(state, NOW, **kw)
     assert blocked == (why is not None) and (said is None if why is None else why in said), said
 
 
@@ -110,7 +110,7 @@ def test_start_reads_the_journal_so_a_liquidation_overwritten_by_a_stop_is_still
     c, store = client
     store.event("s1", "error", "risk_halt", f"{WIPED_OUT}: 3,328.70, 33% of strategy equity at entry")
     store.set_status("s1", "stopped", "stopped by PM")  # an older supervisor wrote over the halt
-    assert entry_blocked_in(store, "s1", starting=True) == (
+    assert entry_blocked(store, "s1", starting=True) == (
         True, "it was liquidated, and only a reset after liquidation clears that")
     assert "command_error" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
 
@@ -146,7 +146,7 @@ def test_a_stopped_strategy_still_holding_runs_for_its_exits_only_with_one_incid
     s = store.sleeve("s1")
     assert started == [1] and s.desired_state == "stopped"
     assert (s.status, s.status_reason) == ("paused", f"{EXITS_ONLY}: {sup.STOPPED_HOLDING}")
-    assert entry_blocked_in(store, "s1")[0]  # nothing opens
+    assert entry_blocked(store, "s1")[0]  # nothing opens
     sv.step()
     sv.step()
     (inc,) = [e for e in store.events("s1", limit=100) if e["kind"] == "incident"]

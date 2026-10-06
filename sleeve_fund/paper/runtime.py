@@ -52,7 +52,7 @@ def clearing_action(sleeve, now: datetime | None = None) -> str | None:
     return None
 
 
-def entry_blocked(sleeve, now: datetime | None = None, *, liquidated: str | None = None,
+def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None,
                   holds: dict[str, str] | None = None, starting: bool = False) -> tuple[bool, str | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why in words). Blocked: liquidated
     until a reset after liquidation (`liquidated`, from the journal: liquidation_head), a drawdown halt, the daily-loss
@@ -95,9 +95,10 @@ def liquidation_head(store, name: str) -> str | None:
     return None
 
 
-def entry_blocked_in(store, name: str, now: datetime | None = None, *, starting: bool = False) -> tuple[bool, str | None]:
-    """entry_blocked for a strategy as its journal has it, for the supervisor and the dashboard (no engine holds)."""
-    return entry_blocked(store.sleeve(name), now, liquidated=liquidation_head(store, name), starting=starting)
+def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bool = False) -> tuple[bool, str | None]:
+    """The gate for a strategy as its journal has it (blocked_state), for the supervisor, the dashboard and QA's
+    exposure-gate set: no process needed, so no engine holds (stale data, missing funding) are seen here."""
+    return blocked_state(store.sleeve(name), now, liquidated=liquidation_head(store, name), starting=starting)
 
 
 class SleeveRuntime:
@@ -247,13 +248,13 @@ class SleeveRuntime:
     # --- gates ----------------------------------------------------------------
 
     def entry_blocked(self) -> tuple[bool, str | None]:
-        """CHOKE: whether nothing may open or add now, and why (module entry_blocked on this runtime's own state).
+        """CHOKE: whether nothing may open or add now, and why (blocked_state on this runtime's own state).
         An expired daily-loss pause is rolled first; a backtest has no PM, so it is never stopped."""
         self.can_open()
         desired = "running" if self.backtest else self.store.sleeve(self.name).desired_state
         state = SimpleNamespace(status=self.status, status_reason=self.liquidated or "", paused_until=self.paused_until,
                                 desired_state=desired)
-        return entry_blocked(state, self.now(), liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
+        return blocked_state(state, self.now(), liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                              holds=self.holds)
 
     def can_open(self) -> bool:
