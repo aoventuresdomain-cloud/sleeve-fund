@@ -10,6 +10,9 @@
 {% macro spark(points, up) %}{% if points %}<svg class="spark {{ '' if up else 'down' }}" width="96" height="24" viewBox="0 0 96 24" aria-hidden="true"><polyline points="{{ points }}"/></svg>{% else %}<span class="faint">no history</span>{% endif %}{% endmacro %}
 {# A strategy's stop, whichever kind it is: a fixed %, average true ranges, or at a recent low. #}
 {% macro stop_words(p) %}{% set side = 'from' if p.allow_short else 'below' %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}% {{ side }} entry{% elif p.stop_atr %}{{ p.stop_atr }} simple ATR ({{ p.atr_bars or 14 }} bars) {{ side }} entry{% elif p.stop_swing_bars %}At the lowest low of {{ p.stop_swing_bars }} bars{% endif %}{% endmacro %}
+{# A model that trails its own stop (rsi_pullback): its level isn't journaled yet, so no line or price is shown
+   for it rather than an estimate (Advisor, atr-149 A2; the journal is board item A2-T). #}
+{% macro trail_words(s) %}{% if s.strategy == 'rsi_pullback' %}Trailing stop, {{ '%g'|format(s.params.get('atr_mult', 3.0)) }} simple ATR below the highest close since entry{% endif %}{% endmacro %}
 {% macro tag(text, kind='') %}<span class="tag {{ kind }}">{{ text }}</span>{% endmacro %}
 {% macro why(label, text, items) %}<div class="why-block"><div class="k">{{ label }}</div>{% if text %}<p>{{ text }}</p>{% if items %}<dl class="sig">{% for k, v in items %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}</dl>{% endif %}{% else %}<p class="muted">Not recorded. This trade predates the order journal, which logs the reason when the order is sent.</p>{% endif %}</div>{% endmacro %}
 {% macro why_toggle(id) %}<button type="button" class="why-btn" aria-expanded="false" aria-controls="{{ id }}" data-why="{{ id }}">Why</button>{% endmacro %}
