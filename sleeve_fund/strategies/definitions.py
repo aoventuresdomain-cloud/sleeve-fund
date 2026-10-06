@@ -42,7 +42,7 @@ import math
 import re
 import tomllib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sleeve_fund.strategies.indicators import BLOCKS, Donchian
@@ -373,6 +373,15 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
             raise ValueError(f"{where}: within is a whole number of candles, 1 to 1,000")
         _check_rule(rule["event"], f"{where}.event", blocks, bar_minutes, uses_prev)
         _check_rule(rule["confirm"], f"{where}.confirm", blocks, bar_minutes, uses_prev)
+    elif keys == {"first_touch"}:
+        ft = rule["first_touch"]
+        if not isinstance(ft, dict) or set(ft) != {"reach", "before"}:
+            raise ValueError(f"{where}: first_touch is {{reach, before}}: the price reaches one level before the other "
+                             "inside the candle, e.g. {reach = {add = [\"lvl\", \"atr\"]}, before = {sub = [\"lvl\", "
+                             "\"atr\"]}}")
+        uses_prev.append(where)  # its levels are read at the candle before's close
+        _check_operand(ft["reach"], f"{where}.first_touch.reach", blocks, uses_prev)
+        _check_operand(ft["before"], f"{where}.first_touch.before", blocks, uses_prev)
     elif {"setup", "trigger", "expire_after"} <= keys <= {"setup", "trigger", "expire_after", "cancel"}:
         if not entry:
             raise ValueError(f"{where}: a setup and trigger arms an entry, so it belongs in an entry rule")
@@ -507,6 +516,15 @@ def _check_costs(costs: dict, defn: dict) -> None:
 
 # --- evaluating a checked definition -------------------------------------------------------------------------------
 
+def uses_first_touch(defn) -> bool:
+    """Whether a definition has a first_touch rule anywhere, which needs the 1-minute bars inside each candle."""
+    if isinstance(defn, dict):
+        return "first_touch" in defn or any(uses_first_touch(v) for v in defn.values())
+    if isinstance(defn, list):
+        return any(uses_first_touch(v) for v in defn)
+    return False
+
+
 @dataclass
 class Env:
     """What the rules read on one decision candle."""
@@ -518,6 +536,10 @@ class Env:
     since: dict = field(default_factory=dict)  # operand key -> its max or min since the leg's entry candle
     closed: set = field(default_factory=set)  # slower timeframes (minutes) whose candle closed on this one
     bar: int = 0  # decision candles seen
+    # The candle's 1-minute bars, (close ns, open, high, low, close), oldest first, for first_touch: None when no
+    # minutes are to hand; minutes_due is how many the candle has.
+    minutes: list | None = None
+    minutes_due: int = 1
 
 
 def block_value(block, output: str | None):
@@ -538,6 +560,7 @@ class Compiled:
         self.tracked: dict[str, object] = {}  # key -> fn, recorded after every candle for prev and crosses
         self.since: dict[str, tuple] = {}  # key -> (fn, max or min)
         self.setups: list[Setup] = []
+        self.touches: list[FirstTouch] = []
         defn = checked.definition
         self.sides = {}
         for sign, name in ((1, "long"), (-1, "short")):
@@ -613,6 +636,13 @@ class Compiled:
             return Group([self.rule(r["only_when"]), self.rule(r["then"])], True)
         if "event" in r:
             return Confirm(self.rule(r["event"]), self.rule(r["confirm"]), r["within"])
+        if "first_touch" in r:
+            (fx, kx, tx), (fy, ky, ty) = self.operand(r["first_touch"]["reach"]), self.operand(r["first_touch"]["before"])
+            fc, kc, _ = self.operand("close")
+            self.tracked.update({kx: fx, ky: fy, kc: fc})  # the levels and the reference, as the candle before closed
+            node = FirstTouch(kx, ky, kc, _slowest(tx, ty))
+            self.touches.append(node)
+            return node
         setup = Setup(self.rule(r["setup"]), self.rule(r["trigger"]),
                       self.rule(r["cancel"]) if "cancel" in r else None, r["expire_after"]["bars"],
                       timeframe_minutes(r["expire_after"]["timeframe"]))
@@ -756,3 +786,76 @@ class Setup(Node):
 
     def leaves(self) -> list:
         return self.setup.leaves() + self.trigger.leaves() + (self.cancel.leaves() if self.cancel else [])
+
+
+@dataclass(frozen=True)
+class Touch:
+    """How one candle's minutes reached two levels. holds: `reach` came first. reach_at, before_at: the close (ns) of
+    the first minute that reached each, or None. same_minute: both first reached in one minute, so the adverse level,
+    `before`, is taken as first (Independent Quant Advisor, 6 Oct 14:05). unknown: minutes missing, so not judged."""
+
+    holds: bool
+    reach_at: int | None = None
+    before_at: int | None = None
+    same_minute: bool = False
+    unknown: bool = False
+
+
+def first_touch(minutes, reach: float, before: float, ref: float) -> Touch:
+    """Whether the price reached `reach` before `before` over `minutes`, (close ns, open, high, low, close) oldest
+    first. A level at or above `ref` (the candle before's close) is reached when a minute's high gets to it, one
+    below when a minute's low does."""
+    def reached(level, high, low):
+        return high >= level if level >= ref else low <= level
+
+    for ts, _o, high, low, _c in minutes:
+        x, y = reached(reach, high, low), reached(before, high, low)
+        if x and y:
+            return Touch(False, ts, ts, same_minute=True)
+        if y:
+            return Touch(False, None, ts)
+        if x:
+            return Touch(True, ts, None)
+    return Touch(False)
+
+
+class FirstTouch(Node):
+    """first_touch {reach, before}: within this candle's own minutes the price reached `reach` before `before`, both
+    levels as they stood at the candle before's close, so nothing from the path being judged sets them. A candle with
+    minutes missing is not judged (false). Counts what it judged, for the report."""
+
+    def __init__(self, kx: str, ky: str, kc: str, timeframe) -> None:
+        self.kx, self.ky, self.kc, self.timeframe = kx, ky, kc, timeframe
+        self.text = f"first_touch(reach {kx}, before {ky})"
+        self.judged_ts: int | None = None
+        self.last: Touch | None = None
+        self.stats = {"candles": 0, "held": 0, "either_reached": 0, "same_minute": 0, "unknown": 0}
+
+    def test(self, env: Env) -> bool:
+        if self.judged_ts != env.ts:
+            self.judged_ts, self.last = env.ts, self._judge(env)
+            st = self.stats
+            st["candles"] += 1
+            st["held"] += self.last.holds
+            st["either_reached"] += self.last.reach_at is not None or self.last.before_at is not None
+            st["same_minute"] += self.last.same_minute
+            st["unknown"] += self.last.unknown
+        return self.last.holds
+
+    def _judge(self, env: Env) -> Touch:
+        x, y, ref = env.prev.get(self.kx), env.prev.get(self.ky), env.prev.get(self.kc)
+        if x is None or y is None or ref is None:
+            return Touch(False)  # a level not settled at the candle before: nothing to judge
+        if env.minutes is None or len(env.minutes) < env.minutes_due:
+            return Touch(False, unknown=True)
+        return first_touch(env.minutes, x, y, ref)
+
+    def lineage(self) -> dict:
+        t = self.last
+        return {"reach_at": _iso(t.reach_at) if t.reach_at else None,
+                "before_at": _iso(t.before_at) if t.before_at else None,
+                "same_minute": t.same_minute, "unknown": t.unknown}
+
+
+def _iso(ns: int) -> str:
+    return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).isoformat()

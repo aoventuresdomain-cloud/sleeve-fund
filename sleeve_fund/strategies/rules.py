@@ -112,6 +112,9 @@ class Rules(LongFlatStrategy):
         self._held_before: dict[int, bool] = {}  # whether each side's entry rule held on the candle before
         self._levels: dict | None = None  # the open position's level exits, by kind, set when it opened
         self._why: tuple[str, dict] | None = None  # why the leg changed on this candle, with the lineage payload
+        # first_touch: (after ns, until ns) -> the 1-minute bars closing in (after, until], as (close ns, open, high,
+        # low, close): the backtest's own minutes (research.runner), the hub's in paper (paper.node)
+        self.minute_source = None
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
@@ -148,12 +151,37 @@ class Rules(LongFlatStrategy):
                           bar.volume.as_double())
         self._feed.update_ohlcv(o, h, lo, c, v, bar.ts_event)
         env.ohlcv, env.ts, env.bar = (o, h, lo, c, v), int(bar.ts_event), env.bar + 1
+        if self.rules.touches:
+            env.minutes, env.minutes_due = self._minutes_of(bar), bar_minutes(self._cfg.bar_type)
         env.closed = {tf for tf, s in self._slow.items() if s.count != self._counts[tf]}
         self._counts = {tf: s.count for tf, s in self._slow.items()}
         for side in self.rules.sides.values():  # setups arm and confirmations count on every candle
             side["entry"].tick(env)
             if side["exit"] is not None:
                 side["exit"].tick(env)
+
+    def _minutes_of(self, bar: Bar) -> list | None:
+        """The candle's own 1-minute bars, oldest first, for first_touch: never one closing after it (look-ahead) or
+        at or before the candle before's close. None, or fewer than the candle has, when they aren't to hand: the
+        path is then unknown and the rule doesn't hold on it."""
+        step, end = bar_minutes(self._cfg.bar_type), int(bar.ts_event)
+        if step == 1:
+            return [(end, bar.open.as_double(), bar.high.as_double(), bar.low.as_double(), bar.close.as_double())]
+        start = end - step * MINUTE_NS
+        got = self.minute_source(start, end) if self.minute_source is not None else None
+        got = sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
+        if len(got) < step:
+            self._note("first_touch_unknown", f"First-touch not judged on the candle to {_iso(end)}: "
+                       f"{step - len(got)} of its {step} minutes aren't to hand, so the rule doesn't hold on it",
+                       level="info")
+        else:
+            self._noted.discard("first_touch_unknown")
+        return got
+
+    def first_touch_stats(self) -> dict:
+        """For the report, per first_touch rule: candles judged, held, either level reached, both first reached in one
+        minute (the adverse level taken as first), and not judged for minutes missing."""
+        return {n.text: dict(n.stats) for n in self.rules.touches}
 
     # --- the leg ----------------------------------------------------------------------------------------------
 
@@ -256,6 +284,9 @@ class Rules(LongFlatStrategy):
                    "blocks": blocks, "bars": bars, "data": {"source": source, "refilled_in_range": None}}  # unknown until provenance is read (DA-4)
         if armed:
             payload["armed_at"] = _iso(max(armed))
+        touched = {n.text: n.lineage() for n in self.rules.touches if n.judged_ts == self.env.ts}
+        if touched:
+            payload["first_touch"] = touched
         return payload
 
     # --- level exits ------------------------------------------------------------------------------------------

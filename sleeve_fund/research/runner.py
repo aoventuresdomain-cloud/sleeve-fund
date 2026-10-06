@@ -11,6 +11,7 @@ import math
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import LoggerConfig, LogLevel
@@ -22,6 +23,7 @@ from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.strategies.definitions import uses_first_touch
 
 
 @dataclass
@@ -52,6 +54,9 @@ class BacktestResult:
     # Filled orders decided before the model's indicators had settled (its warmup_needed), each flagged
     # "unsettled" in its decision; kept as the model trades them (Independent Quant Advisor, 6 Oct, 5.1).
     unsettled_fills: int = 0
+    # Rule-builder first_touch rules (R2): per rule, candles judged, held, either level reached, both first reached
+    # in one minute (the adverse level taken as first) and not judged for missing minutes.
+    first_touch: dict = field(default_factory=dict)
 
     @property
     def shorts(self) -> bool:
@@ -128,6 +133,10 @@ def run_backtest(
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
+    if touches and bar_minutes > 1 and (exec_prices is None or exec_prices.empty or exec_minutes != 1):
+        raise ValueError("the definition has a first_touch rule, judged on the 1-minute bars inside each candle: run "
+                         "it with those minutes (exec_prices, exec_minutes = 1)")
     perp = markets.is_perp(params)
     if fees is None:
         fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
@@ -199,6 +208,8 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
+        if touches and bar_minutes > 1:
+            strategy.minute_source = minutes_from(exec_prices)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
         spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
@@ -246,6 +257,7 @@ def run_backtest(
             unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
                                 if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
+            first_touch=strategy.first_touch_stats() if touches else {},
         )
     finally:
         if runtime is not None:
@@ -253,6 +265,19 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def minutes_from(df: pd.DataFrame):
+    """A first_touch minute source over 1-minute bars indexed by close time: (after ns, until ns) -> the bars closing in
+    (after, until] as (close ns, open, high, low, close)."""
+    ts = df.index.as_unit("ns").asi8  # UTC nanoseconds, as data.to_bars stamps the bars
+    ohlc = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+
+    def source(after: int, until: int) -> list:
+        i, j = np.searchsorted(ts, after, side="right"), np.searchsorted(ts, until, side="right")
+        return [(int(ts[k]), *map(float, ohlc[k])) for k in range(i, j)]
+
+    return source
 
 
 def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:
