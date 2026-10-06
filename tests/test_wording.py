@@ -48,6 +48,10 @@ VENUE = re.compile(r"bybit|binance|kraken|deribit", re.IGNORECASE)
      "[BTC/USDT] funding kept up again, newest rate 2026-10-06 08:00 UTC"),
     ("[KRAKEN BTC/USD] the feed went stale", "[BTC/USD] the feed went stale"),
     ("FUNDING STALE: BINANCE BTC/USDT", "FUNDING STALE: BTC/USDT"),
+    # Code review on #168: a websocket URL is a URL; a number pair isn't a tag; "Binance.US" isn't a file name.
+    ("wss://fstream.binance.com/ws closed", "the perpetual venue closed"),
+    ("binance 12/24 bars", "the perpetual venue 12/24 bars"),
+    ("Binance.US account", "the perpetual venue.US account"),
 ])
 def test_no_venue_name_in_any_case_host_or_identifier(text, reads):
     assert no_venues(text) == reads

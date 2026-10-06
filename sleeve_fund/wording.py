@@ -28,7 +28,7 @@ def _as(words: str | None = None):
 _VENUE_WORDS = [
     # A URL or host on a venue's domain is the venue: "https://api.Binance.com/x" reads "the perpetual venue".
     # The host may run the name on ("testnet.binancefuture.com"), carry a port, and end a URL in "<…>".
-    (re.compile(rf"(?:https?://)?[\w.-]*\b(?:{_NAMES})[a-z]*\.(?:com|io|exchange)\b(?::\d+)?"
+    (re.compile(rf"(?:(?:https?|wss?)://)?[\w.-]*\b(?:{_NAMES})[a-z]*\.(?:com|io|exchange)\b(?::\d+)?"
                 rf"(?:/[^\s,;)\]<>'\"]*[^\s,;)\]<>'\".:])?", _I),
      _as()),
     # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
@@ -39,9 +39,9 @@ _VENUE_WORDS = [
     (re.compile(rf"(?<!\S)\.(?:{_NAMES})\b", _I), _as()),
     # An alert's tag names the venue and the pair ("[BINANCE BTC/USDT] funding stale"): the pair is what it is
     # about, so the tag reads "[BTC/USDT] funding stale".
-    (re.compile(rf"\b(?:{_NAMES})\s+(?=(?-i:[A-Z0-9]{{2,}}/[A-Z0-9]{{2,}})\b)", _I), ""),
+    (re.compile(rf"\b(?:{_NAMES})\s+(?=(?-i:[A-Z][A-Z0-9]+/[A-Z0-9]{{2,}})\b)", _I), ""),
     # A venue's name at the start of a file name: "binance.py:42" reads "venue.py:42", "kraken.env" "venue.env".
-    (re.compile(rf"\b(?:{_NAMES})(?=\.\w)", _I), "venue"),
+    (re.compile(rf"\b(?:{_NAMES})(?=\.(?-i:[a-z]))", _I), "venue"),
     (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b", _I), "the demo account isn't set up"),
     (re.compile(r"\bno (?:Bybit|Deribit) demo perpetual set up for\b", _I), "the demo account has no perpetual set up for"),
     # "…to the demo account: Bybit Demo Trading /v5/order/create: …" said the account twice.
