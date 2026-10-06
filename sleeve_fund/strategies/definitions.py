@@ -229,6 +229,9 @@ def check_definition(defn: dict, bar_spec: str | None = None, bar_minutes: int |
             _check_side(defn[side], side, blocks, bar_minutes, uses_prev)
     if "long" not in defn and "short" not in defn:
         raise ValueError("a definition needs a long or a short side, each with its entry rule")
+    for side, other in (("long", "short"), ("short", "long")):
+        if (defn.get(side) or {}).get("reverse") and other not in defn:
+            raise ValueError(f"{side}.reverse opens the {side} on the candle the {other} ends, so it needs a {other} side")
     _check_exits(defn.get("exits") or {}, blocks, bar_minutes, uses_prev,
                  sides=[side for side in ("long", "short") if side in defn])
     _check_costs(defn.get("costs") or {}, defn)
@@ -338,11 +341,12 @@ def _feed_order(blocks: dict) -> list:
 def _check_side(side: dict, name: str, blocks: dict, bar_minutes, uses_prev: list) -> None:
     if not isinstance(side, dict) or "entry" not in side:
         raise ValueError(f"the {name} side needs its entry rule")
-    unknown = set(side) - {"entry", "exit", "breakout"}
+    unknown = set(side) - {"entry", "exit", "breakout", "reverse"}
     if unknown:
-        raise ValueError(f"the {name} side has no {', '.join(sorted(unknown))}; it takes entry, exit, breakout")
-    if not isinstance(side.get("breakout", False), bool):
-        raise ValueError(f"{name}.breakout is true or false")
+        raise ValueError(f"the {name} side has no {', '.join(sorted(unknown))}; it takes entry, exit, breakout, reverse")
+    for key in ("breakout", "reverse"):
+        if not isinstance(side.get(key, False), bool):
+            raise ValueError(f"{name}.{key} is true or false")
     _check_rule(side["entry"], f"{name}.entry", blocks, bar_minutes, uses_prev, entry=True)
     if "exit" in side:
         _check_rule(side["exit"], f"{name}.exit", blocks, bar_minutes, uses_prev)
@@ -581,7 +585,8 @@ class Compiled:
                 s = defn[name]
                 self.sides[sign] = {"entry": self.rule(s["entry"], path=f"{name}.entry"),
                                     "exit": self.rule(s["exit"], True, f"{name}.exit") if "exit" in s else None,
-                                    "breakout": bool(s.get("breakout", False))}
+                                    "breakout": bool(s.get("breakout", False)),
+                                    "reverse": bool(s.get("reverse", False))}
         exits = defn.get("exits") or {}
         ts = exits.get("time_stop") or {}
         # ("minutes", n) wall-clock, ("bars", n) n candles of wall-clock time, ("count", n) the candles that came

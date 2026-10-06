@@ -470,6 +470,8 @@ class LongFlatStrategy(Strategy):
     """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
     want_long() for all-or-nothing, or target_weight() for anything in between."""
 
+    REENTER_AFTER_EXIT_LEG = False  # True: a stop or target ends the model's leg, not locks its side (_lock_exit_leg)
+
     def __init__(self, config: LongFlatConfig) -> None:
         super().__init__(config)
         self._cfg = config
@@ -1138,6 +1140,18 @@ class LongFlatStrategy(Strategy):
                 self._exit_lock = False
         r["on"] = True
 
+    def _lock_exit_leg(self, lock) -> None:
+        """A stop or target closed the position inside a candle: the side it closed waits for its signal to move
+        off it (_exit_lock), unless the model ends its leg there instead (exit_leg_closed), as the rule builder
+        does: it may then enter again at the candle's close (Advisor 22:30), and a backtest counts that."""
+        if self.REENTER_AFTER_EXIT_LEG:
+            self.exit_leg_closed()
+        else:
+            self._exit_lock = lock
+
+    def exit_leg_closed(self) -> None:
+        """For a model with REENTER_AFTER_EXIT_LEG: its stop or target closed the position."""
+
     def _lock_resumed(self, r: dict) -> None:
         self._exit_lock = r["side"] if self._margin else True
         r["lock_ns"] = None
@@ -1788,7 +1802,7 @@ class LongFlatStrategy(Strategy):
             self._funding_skip = (datetime.fromtimestamp(at / 1e9, tz=timezone.utc), False)
         try:
             if intent in EXIT_LEGS:
-                self._exit_lock = side if self._margin else True
+                self._lock_exit_leg(side if self._margin else True)
                 self._entry_px = None  # don't fire again while the order is in flight
                 self._sell_all(intent, reason, {"entry_px": entry, intent: self._stop_frac if intent == "stop_loss"
                                                 else self._tp_frac})
@@ -2001,7 +2015,7 @@ class LongFlatStrategy(Strategy):
                   f"target less the taker's {float(taker_slippage(spread)):.2%} slippage (a bar that also reached "
                   "the stop takes the stop first)")
         values = {"entry_px": self._entry_px, "take_profit": tp, "target_px": level}
-        self._exit_lock = side if self._margin else True
+        self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None
         self._outage_book = {"book_px": book}
         try:
@@ -2076,7 +2090,7 @@ class LongFlatStrategy(Strategy):
         values = {"entry_px": self._entry_px, "move": move, hit: level}
         if hit == "take_profit":  # the level beside the real fill, for fills-against-model (Advisor L12)
             values["target_px"] = round(self._entry_px * (1 + side * tp), 8)
-        self._exit_lock = side if self._margin else True
+        self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None  # don't fire again while the sell is in flight
         self._sell_all(hit, reason, values)
         return True
@@ -3065,7 +3079,7 @@ class LongFlatStrategy(Strategy):
         self.log.info(reason)
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "stop_rejected", reason, ts=self.runtime.now())
-        self._exit_lock = self._pos_side() if self._margin else True
+        self._lock_exit_leg(self._pos_side() if self._margin else True)
         self._sell_all("stop_loss", reason, {**signal, "price": price})
 
     def _drop_kept(self, earn: bool = False) -> None:
@@ -3195,7 +3209,7 @@ class LongFlatStrategy(Strategy):
                 self._rest_risk_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 # As in paper: no re-entry until the signal has moved off the side that was closed.
-                self._exit_lock = -sign if self._margin else True
+                self._lock_exit_leg(-sign if self._margin else True)
                 # Paper's stop sells the whole position and cancels an entry still working (_sell_all); so does
                 # this. A slice that filled after the stop last grew is sold at market with what is left.
                 intent = self.decisions[str(event.client_order_id)]["intent"]

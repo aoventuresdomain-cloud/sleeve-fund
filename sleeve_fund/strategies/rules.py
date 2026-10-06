@@ -96,6 +96,8 @@ def _iso(ns: int) -> str:
 
 
 class Rules(LongFlatStrategy):
+    REENTER_AFTER_EXIT_LEG = True
+
     def __init__(self, config: RulesConfig) -> None:
         super().__init__(config)
         self.c = config
@@ -219,15 +221,17 @@ class Rules(LongFlatStrategy):
             if not fired:
                 self._why = None  # nothing fired: if the position still has to follow the leg, explain() says so
                 return self._leg
-            why = fired[0][0].split(".")[1]
-            if why != "exit" and not (why == "time_stop" and self.rules.time_stop[0] == "count"):
-                # A time stop or a level ends the hold: the same side opens again only on a later candle, or the
-                # position would simply be held on. Counting candles keeps rsi_cross's way, which re-enters at once.
-                ended = self._leg
+            # A leg ended at this close (exit rule, time stop or level) opens nothing on the same candle: the same
+            # side again only from the next close, the other side only where it declares `reverse` (Advisor 22:30,
+            # #161 MAJOR: closing and reopening at one price is fee bleed). A stop or target that filled inside the
+            # candle never reaches here: the position's exit lock decides.
+            ended = self._leg
             self._leg = 0
         for sign in (1, -1):
             side = self.rules.sides.get(sign)
-            if side is not None and sign != ended and side["entry"].test(env):
+            if side is not None and ended and (sign == ended or not side["reverse"]):
+                continue
+            if side is not None and side["entry"].test(env):
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts
@@ -241,6 +245,12 @@ class Rules(LongFlatStrategy):
                 return self._leg
         self._why = ("; ".join(w for _, w in fired), self._lineage(fired)) if fired else None
         return self._leg
+
+    def exit_leg_closed(self) -> None:
+        """A stop or target closed the position inside the candle: the leg ends with it, and the entry rules are
+        read afresh at the close, so the same side may open again there (Advisor 22:30; counted by a backtest as
+        reentries_on_exit_candle). A leg ended at the close never reopens on that candle (want_side)."""
+        self._leg, self._held, self._leg_ts = 0, 0, None
 
     def _time_up(self, step: int) -> bool:
         """The time stop: wall-clock by default, so missing candles never lengthen a hold; it ends the leg on the

@@ -183,3 +183,78 @@ def test_a_restarted_leg_times_its_stop_from_the_journals_entry_candle(instrumen
     assert s._leg_ts == entry
     s.env.ts = entry + 60 * M
     assert s._time_up(15 * M)
+
+
+def _flat(n=30, spike=10, at=106.0):
+    """1-minute bars flat at 100 but one closing at `at`."""
+    idx = pd.date_range("2025-10-03 00:01", periods=n, freq="1min", tz="UTC")
+    c = np.full(n, 100.0)
+    c[spike] = at
+    return pd.DataFrame({"open": 100.0, "high": np.maximum(c, 100.0), "low": np.minimum(c, 100.0), "close": c,
+                         "volume": 1e3}, index=idx)
+
+
+def _trades(res):
+    f = res.fills.sort_values("ts_last")
+    return [(res.decisions[o]["intent"] == "entry", f.loc[o, "side"].name if hasattr(f.loc[o, "side"], "name")
+             else str(f.loc[o, "side"]), f.loc[o, "ts_last"]) for o in f.index]
+
+
+@pytest.mark.parametrize("exits", [{}, {"time_stop": {"bars": 10, "count": "bars"}}])
+def test_a_leg_ended_at_the_close_reopens_its_side_no_sooner_than_the_next_close(exits, instrument):
+    """Advisor 22:30 (#161 MAJOR): an always-true entry whose exit fires on one candle's close makes one round trip
+    and opens again on the next close, never closing and reopening at one price on the exit candle. The same for a
+    time stop counted in candles (rsi_cross's port)."""
+    df = _flat()
+    exit_rule = {"exit": {"left": "close", "op": ">", "right": 105}} if not exits else {}
+    defn = _with(blocks={}, long={"entry": {"left": "close", "op": ">", "right": 0}, **exit_rule}, exits=exits)
+    res = run_backtest("rules", df, instrument, params=to_params(defn), bar_minutes=1, half_spread=0)
+    trades = [(entry, ts) for entry, _, ts in _trades(res)]
+    assert trades[:3] == [(True, df.index[0]), (False, df.index[10]), (True, df.index[11])]
+    assert res.reentries_on_exit_candle == 0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_the_other_side_opens_on_the_exit_candle_only_where_it_declares_reverse(reverse, instrument):
+    df = _flat()
+    defn = _with(blocks={}, long={"entry": {"left": "close", "op": "<", "right": 105},
+                                  "exit": {"left": "close", "op": ">", "right": 105}},
+                 short={"entry": {"left": "close", "op": ">", "right": 105}, "reverse": reverse})
+    res = run_backtest("rules", df, instrument, params={**to_params(defn), "market": "perp", "allow_short": True},
+                       bar_minutes=1, half_spread=0)
+    sells = [ts for _, side, ts in _trades(res) if "SELL" in side]
+    assert (sells[0], len(sells)) == (df.index[10], 2 if reverse else 1)  # with reverse: the long's exit, then the short
+
+
+@pytest.mark.parametrize("defn, words", [
+    (_with(long={"entry": {"left": "rsi", "op": "<", "right": 30}, "reverse": True}), "needs a short side"),
+    (_with(long={"entry": {"left": "rsi", "op": "<", "right": 30}, "reverse": "yes"}), "reverse is true or false"),
+])
+def test_reverse_is_refused_without_the_side_it_reverses_from(defn, words):
+    with pytest.raises(ValueError, match=words):
+        check_definition(defn, bar_spec="15-MINUTE-LAST-INTERNAL")
+
+
+def test_re_entries_on_an_exit_candle_count_entries_in_a_candle_where_an_exit_filled():
+    from sleeve_fund.research.runner import reentries_on_exit_candle
+
+    t = pd.Timestamp("2025-10-03 00:15", tz="UTC")
+    fills = pd.DataFrame({"ts_last": [t, t + pd.Timedelta(minutes=7), t + pd.Timedelta(minutes=15),
+                                      t + pd.Timedelta(minutes=45)]}, index=["e1", "stop", "e2", "e3"])
+    decisions = {"e1": {"intent": "entry"}, "stop": {"intent": "stop_loss"}, "e2": {"intent": "entry"},
+                 "e3": {"intent": "entry"}}
+    assert reentries_on_exit_candle(fills, decisions, 15) == 1  # e2: the stop filled inside its candle
+    assert reentries_on_exit_candle(fills, decisions, 5) == 0
+    assert reentries_on_exit_candle(None, {}, 15) == 0
+
+
+def test_after_a_stop_inside_a_candle_the_rules_may_enter_again_at_its_close_and_it_is_counted(instrument):
+    """Advisor 22:30 (QA P1-5-X2): a stop or target filled inside the candle ends the leg; the entry rules are read
+    afresh at that candle's close and may open the same side there. The backtest counts it."""
+    df = _flat(n=30, spike=10, at=100.0)
+    df.iloc[10, df.columns.get_loc("low")] = 98.0  # through the 1 % stop inside the minute, back to 100 at its close
+    defn = _with(blocks={}, long={"entry": {"left": "close", "op": ">", "right": 0}})
+    res = run_backtest("rules", df, instrument, params={**to_params(defn), "stop_loss": 0.01}, bar_minutes=1,
+                       half_spread=0)
+    entries = [ts for entry, _, ts in _trades(res) if entry]
+    assert entries[:2] == [df.index[0], df.index[10]] and res.reentries_on_exit_candle == 1
