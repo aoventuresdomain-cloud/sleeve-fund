@@ -185,3 +185,14 @@ def test_a_stopped_holder_that_is_halted_or_paused_keeps_its_process_and_status_
     s = store.sleeve("s1")
     assert started == [] and sv.procs["s1"].popen is not None and (s.status, s.status_reason) == (status, reason)
     assert len([e for e in store.events("s1", limit=100) if e["kind"] == "incident"]) == 1
+
+
+def test_a_deploy_before_the_stopped_holder_is_flat_restarts_it_without_a_second_incident(store, monkeypatch):
+    from sleeve_fund import supervisor as sup
+
+    sv, started, FakePopen = _stopped_holder(store, "stopped", "stopped by PM")
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: started.append(1) or FakePopen())
+    sv.step()
+    sup.Supervisor(store).step()  # a deploy: a new supervisor, its process gone with the old one
+    assert started == [1, 1]
+    assert len([e for e in store.events("s1", limit=100) if e["kind"] == "incident"]) == 1

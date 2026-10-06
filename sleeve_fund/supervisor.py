@@ -145,10 +145,15 @@ class Supervisor:
         proc.watched = True
         if s.status not in ("halted", "paused"):
             self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
+        head = f"Incident, {s.name}: stopped, but it still holds "
+        last = self.store.fills(s.name, limit=1)
+        if any(e["message"].startswith(head) and (not last or e["ts"] >= last[0]["ts"])
+               for e in self.store.sleeve_events_since(s.name, ("incident",))):
+            return  # already said for this position: a deploy or a crash restarts it without a second incident
         self.store.event(s.name, "error", "incident",
-                         f"Incident, {s.name}: stopped, but it still holds {book['qty']:.12g}, so it runs for its exits "
-                         "only: its stop (or a safety stop from the current price) still closes it, and nothing new "
-                         "opens. Flatten closes it; once it is flat it stops.")
+                         f"{head}{book['qty']:.12g}, so it runs for its exits only: its stop (or a safety stop from the "
+                         "current price) still closes it, and nothing new opens. Flatten closes it; once it is flat it "
+                         "stops.")
 
     def _start(self, name: str, proc: Proc) -> None:
         s = self.store.sleeve(name)
