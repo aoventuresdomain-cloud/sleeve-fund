@@ -94,3 +94,26 @@ def test_without_stored_history_the_chart_still_draws_and_says_why(tmp_path, mon
                          index=pd.DatetimeIndex([START]))
     lines, why = charts.indicators(s, chart, 60)
     assert lines == [] and "No stored history for SOL/USD" in why
+
+
+def test_the_first_visible_point_is_the_models_own_after_its_warm_up_is_read_in_front_of_the_window(stored):
+    """A Wilder RSI carries a trace of where it started. The chart reads twice the model's warm-up of the strategy's
+    own candles before its window and trims them, so from the first visible candle each point is what the model read
+    on the store's whole history (what a backtest over it journals), to well under the journal's last digit."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.series import indicator_series
+
+    params = {"rsi_period": 14}
+    s = SimpleNamespace(name="r", strategy="rsi_bands", params=params, bar_spec="1-HOUR-LAST-INTERNAL", venue=None,
+                        instrument="SOL/USD")
+    chart = stored.iloc[400:520]  # starts well inside the history: 400 hours of candles before the window
+    lines, why = charts.indicators(s, chart, 60)
+    assert why is None
+    shown = dict(map(tuple, lines[0]["points"]))
+    assert min(shown) == int(chart.index[0].timestamp()) + 3600  # the window's first candle, at its close
+    assert lines[0]["settled_from"] <= min(shown)  # settled before the window opens: nothing in it is warm-up
+    df = HistoryStore().read(KRAKEN.name, "SOL/USD", 60)
+    inst = KRAKEN.instrument("SOL", "USD", price_precision=8)
+    whole = dict(map(tuple, indicator_series("rsi_bands", df, inst, params, 60)[0]["points"]))
+    assert all(abs(v - whole[t]) < 1e-6 for t, v in shown.items())  # RSI points: far under the journal's 4 decimals

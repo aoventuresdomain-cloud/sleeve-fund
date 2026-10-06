@@ -3,6 +3,7 @@ position's entry, stop and target as lines. Drawn by TradingView Lightweight Cha
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -155,8 +156,9 @@ def indicators(sleeve, chart: pd.DataFrame, minutes: int, store=None) -> tuple[l
         cov = hs.coverage(profile.name, sleeve.instrument)
         if cov is None:
             return [], f"No stored history for {sleeve.instrument} yet, so the strategy's indicators can't be drawn."
-        # Twice the warm-up: an exponential or Wilder average still carries a trace of where it started, about
-        # 3e-5 of its value after its own warm-up; from twice as far back that trace is below 1e-9.
+        # Twice the warm-up: an exponential or Wilder average still carries a trace of where it started. After its own
+        # warm-up the trace is near the journal's last digit; from twice as far back it is far below it (an RSI(14)
+        # read 282 candles in differs from one read on years of history by about 3e-8).
         need = warmup(sleeve.strategy, sleeve.params, minutes)
         df = hs.read(profile.name, sleeve.instrument, minutes,
                      start=first_close - pd.Timedelta(minutes=minutes * (2 * need + 2)))
@@ -170,6 +172,9 @@ def indicators(sleeve, chart: pd.DataFrame, minutes: int, store=None) -> tuple[l
         lines = indicator_series(sleeve.strategy, df, inst, sleeve.params, minutes)
     except (LookupError, ValueError, OSError) as exc:
         return [], f"The strategy's indicators can't be drawn: {exc}"
+    except Exception:  # noqa: BLE001 - an overlay must never take the chart down
+        logging.getLogger(__name__).exception("chart indicators for %s", sleeve.name)
+        return [], "The strategy's indicators can't be drawn just now."
     start = _secs(first_close)
     for line in lines:
         line["points"] = [p for p in line["points"] if p[0] >= start]
