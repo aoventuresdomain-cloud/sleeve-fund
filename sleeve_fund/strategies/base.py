@@ -2559,14 +2559,10 @@ class LongFlatStrategy(Strategy):
         return True
 
     def _liquidation_events(self, reason: str, price: float, liq: float) -> None:
-        """Every liquidation the engine books: the error event, and an incident for the PM (Advisor 18:17: the engine
-        opens one on every liquidation; a reset after liquidation needs its note)."""
+        """Every liquidation the engine books journals its error event; the incident (Advisor 18:17: one on every
+        liquidation) is opened once the liquidation's fill is in, with X, Y and the equity left (_liquidation_incident)."""
         rt = self.runtime
         rt.store.event(rt.name, "error", "liquidation", reason, ts=rt.now())
-        rt.store.event(rt.name, "error", "incident",
-                       f"Incident, {rt.name}: liquidated at {price:,.6g} (liquidation price {liq:,.6g}); the position's "
-                       "margin is lost and the strategy stays halted until you reset it after liquidation, with a "
-                       "note on why the half-liquidation stop did not protect the position.", ts=rt.now())
 
     def _cover_shortfall(self, price: float, event=None) -> None:
         """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)

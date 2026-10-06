@@ -58,8 +58,8 @@ def _carried_then(tmp_path, legs):
         orders = replay(s2, store=store)[before:]
     finally:
         test_replay.START = start0
-    (incident,) = [e for e in store.events(NAME, limit=1000) if e["kind"] == "incident"]
-    assert "safety stop" in incident["message"], incident  # the restart set the safety stop, with an incident
+    incidents = [e["message"] for e in store.events(NAME, limit=1000) if e["kind"] == "incident"]
+    assert len([m for m in incidents if "safety stop" in m]) == 1, incidents  # the restart set it, with an incident
     return store, orders
 
 
@@ -67,14 +67,21 @@ LIFT = pytest.mark.no_open_risk_limit(reason="guards off: liquidation mechanics 
 
 
 @LIFT
-def test_with_the_safety_stop_on_the_cases_gap_is_closed_by_the_safety_stop(tmp_path, whole_equity):
-    """The cases' own +60% gap, safety stop on: the order that closes the short is the safety stop's stop-loss, not
-    the engine's own liquidation of a stopless position. (GAP-LIQ, the next PR, re-books a stop filled past the
-    liquidation price as a liquidation.)"""
+def test_with_the_safety_stop_on_the_cases_gap_is_closed_by_the_safety_stop_rebooked_as_the_liquidation(tmp_path, whole_equity):
+    """The cases' own +60% gap, safety stop on: the order that closes the short is the safety stop, not the engine's
+    own liquidation of a stopless position; filled past the liquidation price, it is re-booked as the liquidation
+    (GAP-LIQ)."""
     store, orders = _carried_then(tmp_path, [(5, 0.0), (0, 0.6), (5, 0.0)])
     (closing,) = [o for o in orders if o["side"] == "BUY"]
-    # A stopless model has no stop of its own: the only stop there is to hit is the restart's safety stop.
-    assert closing["intent"] == "stop_loss" and "past the stop" in closing["reason"], closing["reason"]
+    # A stopless model has no stop of its own: the only stop there is to hit is the restart's safety stop. It filled
+    # on the gap past the liquidation price, so GAP-LIQ re-books it as the liquidation.
+    rebooked = [e for e in store.events(NAME, limit=1000) if e["kind"] == "order_rebooked"]
+    assert closing["intent"] == "liquidation" and closing["reason"].startswith("Liquidated: the stop filled at"), (
+        closing["intent"], closing["reason"])
+    assert [e["message"].split(" re-booked")[0] for e in rebooked] == [f"Order {closing['order_id']}"]
+    liquidation_incidents = [e for e in store.events(NAME, limit=1000)
+                             if e["kind"] == "incident" and "safety stop" not in e["message"]]
+    assert len(liquidation_incidents) == 1, liquidation_incidents  # one incident per liquidation
     assert store.journal_book(NAME, 10_000)["qty"] == 0
 
 

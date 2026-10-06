@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 from test_degraded_155_qa import PERP, Store, _record_session, _reg, _session_meta, risk  # noqa: E402,F401
+from test_degraded_155_qa import _equity_at_entry  # noqa: E402  (Y's base, Advisor 20:37)
 
 GAP_LIQ = pytest.mark.xfail(strict=True, raises=AssertionError, reason="GAP-LIQ")
 STOP = 0.10
@@ -65,7 +66,9 @@ def _gap_through_stop(tmp_path, *, side, profile, after=()):
     close_ts = min(pd.Timestamp(f["ts"]) for f in closed) if closed else None
     held = [m for m in store.equity_series(NAME)
             if close_ts is not None and pd.Timestamp(m["ts"]) <= close_ts and m["qty"] != 0 and m["equity"] > 0]
-    out["equity_before"] = held[-1]["equity"] if held else None  # Y's base: MTM equity just before
+    out["equity_before"] = held[-1]["equity"] if held else None  # MTM equity just before (18:17's Y base, superseded)
+    # Y's base (Advisor 20:37, P1-D20): the strategy's equity when the position was opened, at its first entry fill
+    out["equity_at_entry"] = _equity_at_entry(store, NAME, close_ts) if close_ts is not None else None
     left = store.journal_book(NAME, 10_000.0)["cash"]
     store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
     start0, steps = test_replay.START, []
@@ -138,19 +141,23 @@ def _set_up_holds(out, side):
 
 
 def _x_y(reason):
-    m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", reason)
-    return (float(m.group(1).replace(",", "")), m.group(2)) if m else (None, None)
+    """X and Y from the ruled text (Advisor 17:57, 20:37): "...: X, Y% of strategy equity at entry"; Y is None
+    without "at entry"."""
+    m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity"
+                  r"( at entry)?", reason)
+    return (float(m.group(1).replace(",", "")), m.group(2) if m.group(3) else None) if m else (None, None)
 
 
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side, profile):
     """X = margin + entry fee + liquidation fee over the whole position (grouped by order_id), to the cent; Y = X over
-    the mark-to-market equity just before, to the figures shown; booked as a liquidation and halted."""
+    the strategy's equity when the position was opened (Advisor 20:37), "Y% of strategy equity at entry", to the
+    figures shown; booked as a liquidation and halted."""
     out = _gap_through_stop(tmp_path, side=side, profile=profile)
     _set_up_holds(out, side)
     x, y = _x_y(out["reason"])
-    y_ok = (y is not None and out["equity_before"] is not None and float(y) > 0 and abs(
-        float(y) - 100 * x / out["equity_before"]) <= 0.5 * 10 ** -len(y.partition(".")[2]) + 1e-9)
+    y_ok = (y is not None and out["equity_at_entry"] is not None and float(y) > 0 and abs(
+        float(y) - 100 * x / out["equity_at_entry"]) <= 0.5 * 10 ** -len(y.partition(".")[2]) + 1e-9)
     got = {"booked_as": [o["intent"] for o in out["closing"]], "status": out["status"],
            "x": None if x is None else round(x, 2), "y_matches": y_ok}
     want = {"booked_as": ["liquidation"] * len(out["closing"]), "status": "halted", "x": round(out["x"], 2),

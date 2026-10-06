@@ -394,7 +394,6 @@ def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_
     assert _y_ok(y, x, f.at_entry, f.entry_fee), (y, x, f.at_entry, f.before)
 
 
-@xf
 def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(store, tmp_path):
     """[R20:37] "with partial reductions in between keep that same entry-time equity": a 2x short of 0.11 opened at
     60,600 on 10,000 of equity; the price falls 30% and half the short is bought back (a partial reduce, equity about
