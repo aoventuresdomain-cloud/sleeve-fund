@@ -41,7 +41,7 @@ import json
 import math
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -376,9 +376,12 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
     elif keys == {"first_touch"}:
         ft = rule["first_touch"]
         if not isinstance(ft, dict) or set(ft) != {"reach", "before"}:
+            odd = "" if not isinstance(ft, dict) else "; " + "; ".join(
+                [f"{k} is missing" for k in ("reach", "before") if k not in ft]
+                + [f"{k} isn't one of its keys" for k in sorted(map(str, set(ft) - {"reach", "before"}))])
             raise ValueError(f"{where}: first_touch is {{reach, before}}: the price reaches one level before the other "
                              "inside the candle, e.g. {reach = {add = [\"lvl\", \"atr\"]}, before = {sub = [\"lvl\", "
-                             "\"atr\"]}}")
+                             f"\"atr\"]}}}}{odd}")
         uses_prev.append(where)  # its levels are read at the candle before's close
         if _canonical(ft["reach"]) == _canonical(ft["before"]):
             raise ValueError(f"{where}: first_touch's reach and before are the same level, so neither can come first")
@@ -397,6 +400,10 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
         _check_rule(rule["trigger"], f"{where}.trigger", blocks, bar_minutes, uses_prev)
         if "cancel" in rule:
             _check_rule(rule["cancel"], f"{where}.cancel", blocks, bar_minutes, uses_prev)
+    elif keys == {"not"}:
+        raise ValueError(f"{where}: a rule can't be negated with not: write the opposite comparison. A first_touch "
+                         "negated would turn its safe side around (Advisor 22:11); with reach and before swapped it asks whether the other "
+                         "level came first")
     else:
         raise ValueError(f"{where}: not a rule: {', '.join(sorted(map(str, keys)))}")
 
@@ -542,6 +549,9 @@ class Env:
     # minutes are to hand; minutes_due is how many the candle has.
     minutes: list | None = None
     minutes_due: int = 1
+    # The venue's own high and low for the candle, when the decision candle was built from minutes that may lack
+    # one (a backtest on exec_prices); None: the candle's own (ohlcv) is the venue's.
+    span: tuple | None = None
     note: object = None  # note(kind, message): the strategy's own notes, for what a rule couldn't judge
 
 
@@ -569,8 +579,8 @@ class Compiled:
         for sign, name in ((1, "long"), (-1, "short")):
             if name in defn:
                 s = defn[name]
-                self.sides[sign] = {"entry": self.rule(s["entry"]),
-                                    "exit": self.rule(s["exit"], exit_rule=True) if "exit" in s else None,
+                self.sides[sign] = {"entry": self.rule(s["entry"], path=f"{name}.entry"),
+                                    "exit": self.rule(s["exit"], True, f"{name}.exit") if "exit" in s else None,
                                     "breakout": bool(s.get("breakout", False))}
         exits = defn.get("exits") or {}
         ts = exits.get("time_stop") or {}
@@ -626,29 +636,32 @@ class Compiled:
         self.since[k] = (fn, SINCE_ENTRY[key])
         return (lambda env: env.since.get(k)), k, tf
 
-    def rule(self, r, exit_rule: bool = False) -> "Node":
-        """A rule as a node. exit_rule: it ends a leg, so an ambiguous first_touch in it resolves to true."""
+    def rule(self, r, exit_rule: bool = False, path: str = "") -> "Node":
+        """A rule as a node. exit_rule: it ends a leg, so an ambiguous first_touch in it resolves to true. path: where
+        it sits, as the checker names it (long.entry, long.entry[1], long.entry.setup, long.exit), for the report."""
         if "op" in r:
             (fl, kl, tl), (fr, kr, tr) = self.operand(r["left"]), self.operand(r["right"])
             if r["op"] in CROSSES:
                 self.tracked[kl], self.tracked[kr] = fl, fr
             return Cond(r, fl, fr, kl, kr, _slowest(tl, tr))
         if "all" in r or "any" in r:
-            items = [self.rule(x, exit_rule) for x in (r["all"] if "all" in r else r["any"])]
+            items = [self.rule(x, exit_rule, f"{path}[{i}]") for i, x in enumerate(r["all"] if "all" in r else r["any"])]
             return Group(items, "all" in r)
         if "only_when" in r:
-            return Group([self.rule(r["only_when"], exit_rule), self.rule(r["then"], exit_rule)], True)
+            return Group([self.rule(r["only_when"], exit_rule, f"{path}.only_when"),
+                          self.rule(r["then"], exit_rule, f"{path}.then")], True)
         if "event" in r:
-            return Confirm(self.rule(r["event"], exit_rule), self.rule(r["confirm"], exit_rule), r["within"])
+            return Confirm(self.rule(r["event"], exit_rule, f"{path}.event"),
+                           self.rule(r["confirm"], exit_rule, f"{path}.confirm"), r["within"])
         if "first_touch" in r:
             (fx, kx, tx), (fy, ky, ty) = self.operand(r["first_touch"]["reach"]), self.operand(r["first_touch"]["before"])
             fc, kc, _ = self.operand("close")
             self.tracked.update({kx: fx, ky: fy, kc: fc})  # the levels and the reference, as the candle before closed
-            node = FirstTouch(kx, ky, kc, _slowest(tx, ty), exit_rule)
+            node = FirstTouch(kx, ky, kc, _slowest(tx, ty), exit_rule, path)
             self.touches.append(node)
             return node
-        setup = Setup(self.rule(r["setup"]), self.rule(r["trigger"]),
-                      self.rule(r["cancel"]) if "cancel" in r else None, r["expire_after"]["bars"],
+        setup = Setup(self.rule(r["setup"], path=f"{path}.setup"), self.rule(r["trigger"], path=f"{path}.trigger"),
+                      self.rule(r["cancel"], path=f"{path}.cancel") if "cancel" in r else None, r["expire_after"]["bars"],
                       timeframe_minutes(r["expire_after"]["timeframe"]))
         self.setups.append(setup)
         return setup
@@ -795,14 +808,14 @@ class Setup(Node):
 @dataclass(frozen=True)
 class Touch:
     """How one candle reached two levels. holds: `reach` came first. reach_at, before_at: the close (ns) of the first
-    minute that reached each, when minutes were read. by: "range" when the candle's own high and low settled it (at
+    minute to hand that reached each (lineage only). by: "range" when the candle's own high and low settled it (at
     most one level inside it), "minutes" when its minutes did. same_minute: both first reached in one minute.
     unknown: why the order couldn't be told ("missing": a minute before the first reach isn't to hand; "inconsistent":
     the range says a level was reached and no minute did). An ambiguous candle (same_minute or unknown) resolves to
     the safe side of where the rule is used (FirstTouch)."""
 
     holds: bool
-    reach_at: int | None = None
+    reach_at: int | None = None  # the close (ns) of the first minute to hand that reached `reach`
     before_at: int | None = None
     by: str = "range"
     same_minute: bool = False
@@ -821,18 +834,29 @@ def _reached(level: float, high: float, low: float, ref: float) -> bool:
 
 def first_touch(minutes, reach: float, before: float, ref: float, *, high: float | None = None,
                 low: float | None = None, start: int | None = None, step: int = 0) -> Touch:
-    """Whether the price reached `reach` before `before` (Independent Quant Advisor, 6 Oct ~22:07).
+    """Whether the price reached `reach` before `before` (Independent Quant Advisor, 6 Oct ~22:07), with the first
+    minute to hand that reached each (for the lineage; they never change the result).
 
     With the candle's high and low: if at most one level lies inside its range, that settles it without minutes.
     Otherwise (or without them) its minutes, (close ns, open, high, low, close) oldest first, are walked: the first
     that reaches a level decides; one reaching both is a same-minute case. With `start` (the candle before's close,
     ns) and `step` (minutes in the candle), a minute missing before the first reach makes it unknown, and so does a
     full set of minutes reaching neither level the range says was reached."""
+    have = {m[0]: m for m in minutes}
+    firsts = {}
+    for ts in sorted(have):
+        for level in (reach, before):
+            if level not in firsts and _reached(level, have[ts][2], have[ts][3], ref):
+                firsts[level] = ts
+    return replace(_order(have, reach, before, ref, high, low, start, step),
+                   reach_at=firsts.get(reach), before_at=firsts.get(before))
+
+
+def _order(have: dict, reach: float, before: float, ref: float, high, low, start, step) -> Touch:
     if high is not None and low is not None:
         x, y = _reached(reach, high, low, ref), _reached(before, high, low, ref)
         if not (x and y):
             return Touch(x, reached=x or y)
-    have = {m[0]: m for m in minutes}
     due = [start + k * MINUTE_NS for k in range(1, step + 1)] if start is not None else sorted(have)
     for ts in due:
         m = have.get(ts)
@@ -840,11 +864,11 @@ def first_touch(minutes, reach: float, before: float, ref: float, *, high: float
             return Touch(False, by="minutes", unknown="missing", reached=True)
         x, y = _reached(reach, m[2], m[3], ref), _reached(before, m[2], m[3], ref)
         if x and y:
-            return Touch(False, ts, ts, by="minutes", same_minute=True, reached=True)
+            return Touch(False, by="minutes", same_minute=True, reached=True)
         if y:
-            return Touch(False, None, ts, by="minutes", reached=True)
+            return Touch(False, by="minutes", reached=True)
         if x:
-            return Touch(True, ts, None, by="minutes", reached=True)
+            return Touch(True, by="minutes", reached=True)
     if high is None:
         return Touch(False, by="minutes")
     return Touch(False, by="minutes", unknown="inconsistent", reached=True)
@@ -855,50 +879,57 @@ class FirstTouch(Node):
     stood at the candle before's close, so nothing from the path being judged sets them. An ambiguous candle (both
     reached in one minute, or the order unknown) resolves to the safe side (Advisor ~22:07): false where the rule
     opens or arms an entry, true in an exit rule, so it never blocks an exit. `flip` resolves the other way, for the
-    G1 check on the worse of the two. Counts what it judged, for the report."""
+    G1 check on the worse of the two. Judged on every candle its levels are settled, in tick(), even where another
+    condition decides the group (Advisor 22:11), and counted for the report."""
 
-    def __init__(self, kx: str, ky: str, kc: str, timeframe, exit_rule: bool = False) -> None:
+    def __init__(self, kx: str, ky: str, kc: str, timeframe, exit_rule: bool = False, path: str = "") -> None:
         self.kx, self.ky, self.kc, self.timeframe, self.exit_rule = kx, ky, kc, timeframe, exit_rule
-        self.text = f"first_touch(reach {kx}, before {ky})"
+        self.path = path or f"first_touch(reach {kx}, before {ky})"
         self.flip = False
         self.judged_ts: int | None = None
-        self.last: Touch | None = None
+        self.last: Touch | None = None  # None: this candle's levels weren't settled, so it wasn't judged
+        self.levels: tuple[float, float] | None = None
         self.result = False
-        self.stats = {"candles": 0, "held": 0, "either_reached": 0, "by_minutes": 0, "same_minute": 0,
-                      "unknown_missing": 0, "unknown_inconsistent": 0}
+        # judged; true: resolved true; reached: either level in the candle; unknown: missing + inconsistent
+        self.stats = {"judged": 0, "true": 0, "reached": 0, "by_minutes": 0, "same_minute": 0, "unknown": 0,
+                      "missing": 0, "inconsistent": 0}
 
-    def test(self, env: Env) -> bool:
-        if self.judged_ts != env.ts:
-            self.judged_ts, self.last = env.ts, self._judge(env)
-            t, st = self.last, self.stats
-            self.result = (self.exit_rule != self.flip) if t.ambiguous else t.holds
-            st["candles"] += 1
-            st["held"] += self.result
-            st["either_reached"] += t.reached
-            st["by_minutes"] += t.by == "minutes"
-            st["same_minute"] += t.same_minute
-            st["unknown_missing"] += t.unknown == "missing"
-            st["unknown_inconsistent"] += t.unknown == "inconsistent"
-            if t.unknown and env.note is not None:
-                why = ("a minute before the first reach isn't to hand" if t.unknown == "missing"
-                       else "its minutes reach neither level, though its high and low do")
-                env.note("first_touch_unknown", f"{self.text}: both levels are inside the candle to {_iso(env.ts)} "
-                         f"and the order can't be told ({why}); taken as {str(self.result).lower()}, the safe side")
-        return self.result
-
-    def _judge(self, env: Env) -> Touch:
+    def tick(self, env: Env) -> None:
+        if self.judged_ts == env.ts:
+            return
+        self.judged_ts, self.last, self.result = env.ts, None, False
         x, y, ref = env.prev.get(self.kx), env.prev.get(self.ky), env.prev.get(self.kc)
         if x is None or y is None or ref is None:
-            return Touch(False)  # a level not settled at the candle before: nothing to judge
-        _, high, low, _, _ = env.ohlcv
-        return first_touch(env.minutes or (), x, y, ref, high=high, low=low,
-                           start=env.ts - env.minutes_due * MINUTE_NS, step=env.minutes_due)
+            return  # a level not settled at the candle before: nothing to judge
+        high, low = env.span or env.ohlcv[1:3]
+        t = self.last = first_touch(env.minutes or (), x, y, ref, high=high, low=low,
+                                    start=env.ts - env.minutes_due * MINUTE_NS, step=env.minutes_due)
+        self.levels = (x, y)
+        self.result = (self.exit_rule != self.flip) if t.ambiguous else t.holds
+        st = self.stats
+        st["judged"] += 1
+        st["true"] += self.result
+        st["reached"] += t.reached
+        st["by_minutes"] += t.by == "minutes"
+        st["same_minute"] += t.same_minute
+        st["unknown"] += t.unknown is not None
+        st["missing"] += t.unknown == "missing"
+        st["inconsistent"] += t.unknown == "inconsistent"
+        if t.unknown and env.note is not None:
+            why = ("a minute before the first reach isn't to hand" if t.unknown == "missing"
+                   else "its minutes reach neither level, though its high and low do")
+            env.note("first_touch_unknown", f"{self.path}: both levels are inside the candle to {_iso(env.ts)} "
+                     f"and the order can't be told ({why}); taken as {str(self.result).lower()}, the safe side")
+
+    def test(self, env: Env) -> bool:
+        self.tick(env)  # already judged on this candle unless read before its tick
+        return self.result
 
     def lineage(self) -> dict:
-        t = self.last
-        return {"held": self.result, "by": t.by, "reach_at": _iso(t.reach_at) if t.reach_at else None,
-                "before_at": _iso(t.before_at) if t.before_at else None, "same_minute": t.same_minute,
-                "unknown": t.unknown}
+        t, (x, y) = self.last, self.levels
+        return {"x": x, "y": y, "x_minute": _iso(t.reach_at) if t.reach_at else None,
+                "y_minute": _iso(t.before_at) if t.before_at else None, "same_minute": t.same_minute,
+                "held": self.result, "by": t.by, "unknown": t.unknown}
 
 
 def _iso(ns: int) -> str:

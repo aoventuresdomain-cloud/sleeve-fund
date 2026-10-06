@@ -54,8 +54,8 @@ class BacktestResult:
     # Filled orders decided before the model's indicators had settled (its warmup_needed), each flagged
     # "unsettled" in its decision; kept as the model trades them (Independent Quant Advisor, 6 Oct, 5.1).
     unsettled_fills: int = 0
-    # Rule-builder first_touch rules (R2): per rule, candles judged, held, either level reached, both first reached
-    # in one minute (the adverse level taken as first) and not judged for missing minutes.
+    # Rule-builder first_touch rules (R2), by rule path ("long.entry", "long.entry[1]", "long.exit"): judged, true,
+    # reached, same_minute, unknown, ambiguous_share and the rest (Rules.first_touch_stats).
     first_touch: dict = field(default_factory=dict)
 
     @property
@@ -140,6 +140,11 @@ def run_backtest(
     touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
     minutes_in = touches and bar_minutes > 1 and exec_prices is not None and not exec_prices.empty \
         and exec_minutes == 1
+    if minutes_in and (exec_prices.index[0] > prices.index[0] or exec_prices.index[-1] < prices.index[-1]):
+        # the engine decides on candles built from these minutes: one they don't reach is never judged at all
+        raise ValueError(f"the first_touch rule needs the 1-minute bars of every decision candle: they run "
+                         f"{exec_prices.index[0]} to {exec_prices.index[-1]}, the decision candles {prices.index[0]} "
+                         f"to {prices.index[-1]}")
     perp = markets.is_perp(params)
     if fees is None:
         fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
@@ -212,7 +217,7 @@ def run_backtest(
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
         if minutes_in:
-            strategy.minute_source = minutes_from(exec_prices)
+            strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
         for node in getattr(getattr(strategy, "rules", None), "touches", ()):
             node.flip = first_touch_flip
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
@@ -244,9 +249,9 @@ def run_backtest(
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
         touched = strategy.first_touch_stats() if touches else {}
-        if touches and bar_minutes > 1 and not minutes_in and any(st["unknown_missing"] for st in touched.values()):
+        if touches and bar_minutes > 1 and not minutes_in and any(st["missing"] for st in touched.values()):
             raise ValueError(
-                f"the first_touch rule needed the 1-minute bars of {sum(st['unknown_missing'] for st in touched.values())}"
+                f"the first_touch rule needed the 1-minute bars of {sum(st['missing'] for st in touched.values())}"
                 " candles that reached both its levels, and the run had none: run it with those minutes (exec_prices, "
                 "exec_minutes = 1)")
         return BacktestResult(
@@ -276,6 +281,19 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def ranges_from(df: pd.DataFrame):
+    """A first_touch range source over the decision candles indexed by close time: close ns -> (high, low), or None
+    for a candle not among them. Their range is the venue's, so a minute missing from exec_prices is still in it."""
+    ts = df.index.as_unit("ns").asi8
+    hl = df[["high", "low"]].to_numpy(dtype=float)
+
+    def source(until: int):
+        i = np.searchsorted(ts, until)
+        return (float(hl[i, 0]), float(hl[i, 1])) if i < len(ts) and ts[i] == until else None
+
+    return source
 
 
 def minutes_from(df: pd.DataFrame):
