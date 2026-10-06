@@ -2590,6 +2590,8 @@ def test_the_page_names_what_clears_each_kind_of_halt(client):
     store.set_status("btc-test", "halted", "Position margin lost (liquidated): 900.00, 110% of strategy equity at entry")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "only a reset after liquidation clears that" in page and "Reset after liquidation needed" in page
+    # A book reset (later, DA-6) clears the other two but never a liquidation, so the page promises no other way.
+    assert "until you use Reset after liquidation, which asks for an incident note" in page
     assert 'data-open="dlg-resume">Resume<' not in page
 
     from sleeve_fund.store import LIQUIDATION_RESET
