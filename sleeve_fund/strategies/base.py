@@ -413,6 +413,7 @@ class LongFlatStrategy(Strategy):
         # A bars-only backtest's resting fill, while its funding is settled: (the fill's bar open ns, its close ns,
         # whether it filled on a gap at the open). See _intrabar_fill.
         self._intrabar: tuple[int, int, bool] | None = None
+        self._opened_in_bar: list[tuple[tuple[int, int, bool], float]] = []  # _fund_opened_in_bar, once the bar is in
         # Liquidated in this process: the halt it stays in, "Position margin lost (liquidated): ..." (_margin_lost).
         self._liquidated: str | None = None
         self._snap_ns: int | None = None
@@ -1377,6 +1378,11 @@ class LongFlatStrategy(Strategy):
         if self._exec_type is not None and bar.bar_type == self._exec_type:
             self._on_exec_bar(bar)
             return
+        if self._opened_in_bar and str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
+            due = [o for o in self._opened_in_bar if o[0][1] <= bar.ts_event]
+            self._opened_in_bar = [o for o in self._opened_in_bar if o[0][1] > bar.ts_event]
+            for window, qty in due:
+                self._fund_opened_in_bar(window, qty, bar.low.as_double(), bar.high.as_double())
         bar = self._first_bar_from_store(bar)
         if self._count_minutes(bar):
             return
@@ -2114,12 +2120,13 @@ class LongFlatStrategy(Strategy):
                                      f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
                                      f"{px:,.6g} ({rate:.4%})", ts=ts)
 
-    def _fund_opened_in_bar(self, window: tuple[int, int, bool], qty: float, px: float) -> None:
+    def _fund_opened_in_bar(self, window: tuple[int, int, bool], qty: float, low: float, high: float) -> None:
         """Rule (c) for a resting entry or add a bars-only backtest filled inside a bar (Independent Quant Advisor, 6 Oct
         17:57): what it opened is charged the settlements inside the bar after its fill. Filled on a gap, it was held
         from the bar's open, so it pays or receives each; touched at an unknown time inside, it takes the worse
-        outcome, paying those that cost it and booking no credit. (The settlements before the fill charged the
-        position held until then: _apply_funding.)"""
+        outcome, paying those that cost it and booking no credit. The price at each is unknown inside the bar, so it
+        takes the worse of the bar's low and high. Called with the bar, once it has closed. (The settlements before
+        the fill charged the position held until then: _apply_funding.)"""
         terms = self._cfg.perp
         if terms is None or not qty:
             return
@@ -2132,6 +2139,7 @@ class LongFlatStrategy(Strategy):
             rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
             if rate is None:
                 continue
+            px = high if qty * rate > 0 else low  # the price at which it costs most, or credits least
             amount = -qty * px * rate
             if gap or amount < 0:
                 self._book_funding(ts, qty, px, rate, amount)
@@ -2708,6 +2716,7 @@ class LongFlatStrategy(Strategy):
 
     def on_order_filled(self, event) -> None:
         intrabar = self._intrabar_fill(event)  # a bars-only backtest's resting order filled inside a bar, or None
+        held = (self._entry_qty, self._entry_px)  # the position before this fill
         if self._margin:  # a fill just after the hour, with no trade, bar or tick between: held before it
             fill = float(event.last_qty) * (1 if event.is_buy else -1)
             self._snap_settlements(event.ts_event, qty=self._net_position()[0] - fill)
@@ -2799,12 +2808,11 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
-            self._fund_opened_in_bar(intrabar, sign * qty, px)
+            self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
-            if self.decisions.get(coid, {}).get("intent") == "liquidation" and self._liquidated is None:
-                pos = self.cache.position(event.position_id) if event.position_id else None
-                if pos is not None and pos.peak_qty.as_double() > 0:
-                    self._liquidated = self._margin_lost(pos.peak_qty.as_double(), pos.avg_px_open)
+            if (self.decisions.get(coid, {}).get("intent") == "liquidation" and self._liquidated is None
+                    and held[0] and held[1]):
+                self._liquidated = self._margin_lost(held[0], held[1])
             self._cover_shortfall(px, event)
         if coid == self._risk_stop_id:
             self._risk_stop_filled(done, sign, px)

@@ -413,3 +413,206 @@ def test_d11_hub_fed_paper_exits_on_a_holed_bar_whose_closing_minutes_are_missin
     st, told = quiet(lambda: _paper_from(inst, m1x, params, hs, hub=True))
     sells = sorted(pd.Timestamp(f["ts"]) for f in st.fills("P", limit=100) if f["side"] == "SELL")
     assert sells and sells[0].floor("min") == close
+
+
+@pytest.fixture
+def _full_margin(monkeypatch):
+    """tests/conftest.py::full_margin: every profile puts the whole equity up as margin, so liquidation is in reach."""
+    import dataclasses
+    for name, p in list(risk.PROFILES.items()):
+        monkeypatch.setitem(risk.PROFILES, name, dataclasses.replace(p, max_position_pct=1.0))
+
+
+def _record_session(path, meta, legs, px=60_000.0, size=1.0):
+    """tests/test_long_short.py::_record (73d3908): a recorded paper session, quotes and trades every second, the
+    price moving by each leg's share over its minutes; a leg of 0 minutes is a gap."""
+    from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
+    from sleeve_fund.paper.recorder import Recorder
+    from test_replay import START
+    inst = venues.venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
+    rec = Recorder(path)
+    rec.meta = meta
+    rec.start(inst)
+    s = 0
+    for minutes, move in legs:
+        step = (1 + move) ** (1 / (minutes * 60)) if minutes else 1 + move
+        for _ in range(minutes * 60 or 1):
+            px *= step
+            t = START + s * 1_000_000_000
+            rec.quote(QuoteTick(inst.id, Price(px - 0.5, 1), Price(px + 0.5, 1), Quantity(size, 8), Quantity(size, 8),
+                                t, t + 1000))
+            rec.trade(TradeTick(inst.id, Price(px, 1), Quantity(0.05, 8),
+                                AggressorSide.BUY if s % 2 else AggressorSide.SELL, TradeId(str(s)), t + 2000, t + 3000))
+            s += 1
+    rec.close()
+
+
+def _session_meta(balance, params):
+    return {"balances": [f"{balance:.2f} USD"],
+            "sleeve": {"name": "ping-pong-test", "strategy": "ping_pong", "instrument": "BTC/USD",
+                       "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000,
+                       "risk_profile": "balanced", "params": params,
+                       "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="P1-D15 MAJOR (Advisor 17:57 (a)) on 3be572a: after a liquidation the PM's resume "
+                   "resets the drawdown from the 80.71 kept and the strategy trades again (a new 2x long entry on the "
+                   "restart), with no 'reset after liquidation'; risk_halt is counted once, not twice; and the halt text "
+                   "lacks 'Position margin lost (liquidated): X, Y% of strategy equity'. Marks after the restart do read "
+                   "the kept equity")
+def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
+    """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
+    a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
+    short at 2x on full margin is gapped +60% through its liquidation price. It stays halted through a PM resume and a
+    restart until an explicit reset after liquidation; no new order; every mark after the restart is the equity kept
+    (isolated margin: only the position's margin is lost), not zero and not the last mark before the gap; risk_halt
+    twice; and the halt text says "Position margin lost (liquidated): X, Y% of strategy equity", X the margin lost
+    to the cent and Y = X over the strategy's equity before the gap, both as the journal has them."""
+    import re
+    from sleeve_fund.research.replay import replay
+    name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    store = Store.in_memory()
+    gap = tmp_path / "gap.jsonl.gz"
+    _record_session(gap, _session_meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, +60%
+    orders = replay(gap, store=store)
+    assert orders[-1]["intent"] == "liquidation" and orders[-1]["side"] == "BUY"
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    fills = sorted(store.fills(name, limit=100), key=lambda f: f["ts"])
+    liq = fills[-1]
+    opened = [f for f in fills[:-1] if f["side"] == "SELL"][-1]  # the short the gap liquidated
+    assert liq["side"] == "BUY" and liq["qty"] == pytest.approx(opened["qty"])
+    margin_lost = round(opened["qty"] * opened["price"] / risk.profile("balanced").max_leverage, 2)
+    marks = store.equity_series(name)
+    eq_before = [m for m in marks if pd.Timestamp(m["ts"]) < pd.Timestamp(liq["ts"])][-1]["equity"]
+    book = store.journal_book(name, 10_000)
+    left = book["cash"]
+    assert book["qty"] == 0 and left > 0  # isolated margin: what wasn't margined is kept
+
+    def says_margin_lost(text):
+        m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
+        assert m, text
+        x, y = float(m.group(1).replace(",", "")), m.group(2)
+        assert x == pytest.approx(margin_lost, abs=0.005), (x, margin_lost)
+        dp = len(y.partition(".")[2])
+        assert float(y) == pytest.approx(100 * x / eq_before, abs=0.5 * 10 ** -dp + 1e-9), (y, 100 * x / eq_before)
+
+    # The PM resumes it and the process restarts: it stays halted, with nothing new traded.
+    store.command(name, "resume", "try again")
+    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+    seen = len(store.equity_series(name))
+    restart = tmp_path / "restart.jsonl.gz"
+    _record_session(restart, _session_meta(left, params), [(5, 0.0)], px=97_440.0)
+    assert len(replay(restart, store=store)) == len(orders)  # no new order
+    assert not [c for c in store.pending_commands(name) if c["command"] == "resume"]  # the resume was taken up
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)  # after the resume and the restart
+    after = store.equity_series(name)[seen:]
+    assert after and all(m["qty"] == 0.0 and m["equity"] == pytest.approx(left, abs=0.01) for m in after), after[:3]
+    assert all(abs(m["equity"] - eq_before) > 1.0 for m in after)  # not the last mark before the gap
+    events = store.events(name, limit=500)
+    assert [e["kind"] for e in events].count("risk_halt") == 2
+    assert "mark_unavailable" not in {e["kind"] for e in events}
+    says_margin_lost(s.status_reason)
+
+
+class EConfig(TConfig):
+    def __init__(self, *, place_at: int = 0, trigger: float = 0.0, qty: float = 0.1, **kw):
+        super().__init__(**kw)
+        self.place_at, self.trigger, self.qty = place_at, trigger, qty
+
+
+class E(T):
+    """T, plus a resting stop ENTRY (STOP_MARKET, side `side`) placed at the close of the bar at `place_at`."""
+
+    def on_bar(self, bar):
+        super().on_bar(bar)
+        c = self._cfg
+        if bar.ts_event == c.place_at and str(bar.bar_type) == str(c.bar_type).split("@")[0]:
+            from nautilus_trader.model import OrderSide, TimeInForce
+            side = OrderSide.BUY if c.side > 0 else OrderSide.SELL
+            order = self.order_factory.stop_market(instrument_id=c.instrument_id, order_side=side,
+                                                   quantity=self.instrument.make_qty(c.qty),
+                                                   trigger_price=self.instrument.make_price(c.trigger),
+                                                   time_in_force=TimeInForce.GTC)
+            self.decisions[str(order.client_order_id)] = {"intent": "entry", "reason": "QA resting stop entry",
+                                                          "signal": {}}
+            self.submit_order(order)
+
+
+@pytest.mark.parametrize("side", [
+    pytest.param(1, id="long-in-bar-costs"),
+    pytest.param(-1, id="short-in-bar-credits"),
+])
+def test_p1_rule_c_applies_to_a_resting_entry_touched_inside_a_bar(tmp_path, monkeypatch, side):
+    """Advisor 6 Oct 17:57 (b): the worse-of funding rule (c) applies to resting ENTRIES touched inside a bar too.
+    Daily bars only, a resting stop entry placed at the 4 Oct 00:00 close and touched at about 10:04 on 4 Oct (the
+    price ramps through it, so the fill price is the trigger in both runs and only funding can differ). Settlements
+    8h, then 4h from 3 Oct 20:00, all rates positive: in-bar settlements after the touch (12:00, 16:00, 20:00 and
+    5 Oct 00:00) cost a long and would credit a short. Rule (c): each in-bar one after the touch is charged if it
+    costs the new position, never credited; the 1-minute execution-bar backtest is the reference; bars-only is
+    never better than it."""
+    monkeypatch.setitem(REGISTRY, "qa_e", (E, EConfig))
+    times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
+             .append(pd.date_range("2025-10-03 20:00", "2025-10-06 00:00", freq="4h", tz="UTC")))
+    put_rates(times)
+    sec = pd.date_range("2025-10-01 00:00:01", "2025-10-05 23:59:46", freq="15s", tz="UTC")
+    px = 60_000.0 + (np.arange(len(sec)) % 40) * 0.5  # 60,000 to 60,019.5
+    ramp_at = pd.Timestamp("2025-10-04 10:00:01", tz="UTC")
+    j = np.clip(((sec - ramp_at) / pd.Timedelta(seconds=15)).astype(int), 0, 40)
+    up, down = 60_020.0 + j, 60_000.0 - (j + 1)
+    px = np.where(sec >= ramp_at, up if side > 0 else down, px)
+    trigger = 60_039.0 if side > 0 else 59_980.0  # touched at the last trade of the 10:04 minute, never gapped
+    tape = pd.Series(np.round(px, 1), index=sec)
+    day = tape.resample("1D", closed="left", label="right").ohlc()
+    day["volume"] = 1e9
+    one = tape.resample("1min", closed="left", label="right").ohlc()
+    one["volume"] = 1e9
+    params = {**PERP, "at": ns("2025-10-05 00:00"), "side": side, "tag": "e", "place_at": ns("2025-10-04 00:00"),
+              "trigger": trigger}
+    bo = backtest(binance_inst(), day, strategy="qa_e", params=params, minutes=1440, profile="balanced", half_spread=0.0)
+    rf = backtest(binance_inst(), day, strategy="qa_e", params=params, minutes=1440, profile="balanced",
+                  half_spread=0.0, exec_prices=one, exec_minutes=1)
+    fb, fr = (sorted(r.journal.fills_, key=lambda f: f["ts"]) for r in (bo, rf))
+    assert len(fb) == len(fr) == 1 and fb[0]["price"] == pytest.approx(trigger) and fr[0]["price"] == pytest.approx(trigger)  # the same entry, at the trigger
+    paid = {pd.Timestamp(x["ts"]): x["amount"] for x in bo.journal.funding_}
+    ref = {pd.Timestamp(x["ts"]): x["amount"] for x in rf.journal.funding_}
+    bar_open, bar_close = pd.Timestamp("2025-10-04 00:00", tz="UTC"), pd.Timestamp("2025-10-05 00:00", tz="UTC")
+    touch = pd.Timestamp("2025-10-04 10:05", tz="UTC")
+    in_bar_after = [t for t in times if touch <= t <= bar_close]
+    assert list(ref) == [t for t in times if t > touch]  # the reference pays every settlement it held through
+    assert all((ref[t] < 0) == (side > 0) for t in ref)  # positive rates: a long pays, a short receives
+    # After the bar, both runs book the same settlements alike.
+    assert {t: a for t, a in paid.items() if t > bar_close} == pytest.approx({t: a for t, a in ref.items() if t > bar_close})
+    inside = {t: a for t, a in paid.items() if bar_open < t <= bar_close}
+    assert all(a < 0 for a in inside.values()), inside  # never a credit inside the bar
+    if side > 0:  # costs: every in-bar settlement after the touch is charged, as the reference charges it
+        assert all(t in inside and inside[t] == pytest.approx(ref[t]) for t in in_bar_after), (inside, in_bar_after)
+    else:  # credits: none is booked
+        assert not [t for t in in_bar_after if t in paid], paid
+    assert sum(paid.values()) <= sum(ref.values()) + 1e-9  # bars-only never better on funding
+    assert float(bo.equity.iloc[-1]) <= float(rf.equity.iloc[-1]) + 0.01  # nor on equity
+
+
+@pytest.mark.xfail(strict=True, reason="P1-D13 MAJOR, pre-existing (outside rule (c), which covers funding): on daily bars "
+                   "only, a 2% stop touched inside the day by a 5% gap at 10:00:01 fills at its trigger (58,819.1), "
+                   "while the market traded through to 57,000 and the 1-minute reference fills there: bars-only ends "
+                   "about 193 (1.9% of capital) better than the reference. Needs an Advisor call on the bars-only fill")
+def test_d13_a_bars_only_stop_gapped_through_inside_the_bar_is_never_better_than_the_1_minute_run(tmp_path):
+    times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
+             .append(pd.date_range("2025-10-03 20:00", "2025-10-06 00:00", freq="4h", tz="UTC")))
+    put_rates(times)
+    sec = pd.date_range("2025-10-01 00:00:01", "2025-10-05 23:59:46", freq="15s", tz="UTC")
+    px = np.round(60_000.0 + (np.arange(len(sec)) % 40) * 0.5, 1)
+    gap = pd.Timestamp("2025-10-04 10:00:01", tz="UTC")
+    px = np.where(sec >= gap, np.round(px * 0.95, 1), px)
+    tape = pd.Series(px, index=sec)
+    day = tape.resample("1D", closed="left", label="right").ohlc()
+    day["volume"] = 1e9
+    one = tape.resample("1min", closed="left", label="right").ohlc()
+    one["volume"] = 1e9
+    params = {**PERP, "at": ns("2025-10-02 00:00"), "side": 1, "stop_loss": 0.02, "tag": "d13"}
+    bo = backtest(binance_inst(), day, strategy="qa_t", params=params, minutes=1440, profile="balanced", half_spread=0.0)
+    rf = backtest(binance_inst(), day, strategy="qa_t", params=params, minutes=1440, profile="balanced",
+                  half_spread=0.0, exec_prices=one, exec_minutes=1)
+    assert float(bo.equity.iloc[-1]) <= float(rf.equity.iloc[-1]) + 0.01
