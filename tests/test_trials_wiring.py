@@ -355,3 +355,33 @@ def test_each_paper_edit_moves_the_holdout_start_forward(tmp_path):
     assert pd.Timestamp(rows[-1]["data_end"]) > pd.Timestamp(rows[0]["data_end"])
     # A holdout starting between the two edits now overlaps the second edit's seen data.
     assert HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", first, first + pd.Timedelta(days=60)) != ""
+
+
+def test_a_failed_count_leaves_g1_not_judged_and_the_holdout_closed(tmp_path, instrument):
+    """Advisor, QA P1-T8: a failed row counts in N, but its Sharpe is missing from the spread the bar is set by,
+    so G1 reads "not judged (N uncertain)" until it is re-counted, and the holdout stays unspent."""
+    import numpy as np
+    import pandas as pd
+
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.tearsheet import render
+    from sleeve_fund.strategies.trend_filter import SPEC
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    register = TrialsRegister(store)
+    register.record_failed(strategy=SPEC.name, params={"fast": 20}, source="backtest", error="KeyError('from')")
+    idx = pd.date_range("2024-01-01", periods=150, freq="1D", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.003 * 38, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    bars = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 1e6},
+                        index=idx)
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    result = run_study(SPEC, bars, instrument, dataset="kraken-btcusd-store", ledger=ledger, synthetic=True,
+                       holdout_days=30, train_days=60, test_days=30, default_params={"fast": 20, "slow": 100},
+                       use_holdout=True, register=register, locks=HoldoutLocks(store))
+    assert result.failed_counts == 1 and result.not_judged.startswith("N uncertain: 1 earlier run")
+    assert result.holdout is None and "G1 can't judge this study (N uncertain" in result.holdout_withheld
+    assert not store.holdout_locks()
+    assert "**G1: NOT JUDGED** (N uncertain" in render(result, ledger, register)

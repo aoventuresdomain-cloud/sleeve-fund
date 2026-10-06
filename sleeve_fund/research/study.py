@@ -116,6 +116,9 @@ class StudyResult:
     # sides (v2 P1-7, C3 and C3b).
     random_entry: RandomEntryResult | None = None
     random_side: RandomSideResult | None = None
+    # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
+    # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
+    failed_counts: int = 0
 
     @property
     def not_judged(self) -> str:
@@ -132,6 +135,10 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
+        if self.failed_counts:
+            k = self.failed_counts
+            return (f"N uncertain: {k} earlier run{'s' if k != 1 else ''} of this idea ran but couldn't be counted in "
+                    "full, so the bar is missing their Sharpes until they are re-counted")
         blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.closed_in_window == 0)]
         # Half blind is not judged either: the other half then holds the halted windows' stubs too, so the
         # verdict would rest on a window or two (review round 10, M10-1).
@@ -567,6 +574,11 @@ def run_study(
             "through it), the target at its level, and within a bar the extreme nearer the open trades first. "
             "Paper watches both on every trade."
         )
+
+    if register is not None:
+        from sleeve_fund.research.trials import legacy_idea_hash
+
+        result.failed_counts = register.failed(legacy_idea_hash(spec.name))
 
     # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
     # closed: opening it would spend it on no information (review round 8, M8-4).
