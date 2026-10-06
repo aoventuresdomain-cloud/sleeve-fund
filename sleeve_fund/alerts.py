@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from sleeve_fund import backups
 from sleeve_fund.store import Store, utcnow
+from sleeve_fund.wording import no_venues
 
 MAX_LINES = 10  # alerts listed in one message; the rest are counted
 TIMEOUT = 8  # per socket read
@@ -83,7 +84,7 @@ def where(url: str | None) -> str:
 def message(events: list[dict]) -> str:
     lines = [f"Multi-Strategy Fund: {len(events)} alert{'s' if len(events) != 1 else ''}"]
     for e in events[:MAX_LINES]:
-        lines.append(f"[{e['level']}] {e['sleeve'] or 'system'}: {e['message']}")
+        lines.append(f"[{e['level']}] {e['sleeve'] or 'system'}: {no_venues(e['message'])}")
     if len(events) > MAX_LINES:
         lines.append(f"and {len(events) - MAX_LINES} more on the Alerts page")
     return "\n".join(lines)

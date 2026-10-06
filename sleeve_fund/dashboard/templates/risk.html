@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, usage, help, stop_words %}
+{% from "_macros.html" import chip, usage, help, stop_words, trail_words %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
@@ -71,7 +71,7 @@
         <div class="rh-bar"><i class="{{ 'b' if r.dd_used > 0.8 else ('w' if r.dd_used > 0.5) }}" style="width:{{ (r.dd_used * 100)|round(1) }}%"></i></div>
         <span>{% if s.status == 'halted' %}Halted{% else %}{{ left|pct1 }} left<span class="rh-wide"> before halt</span>{% endif %}</span>
       </div>
-      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
+      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span class="rh-chip" title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
     </div>{% else %}<p class="empty" style="padding:4px 18px 16px">No strategies in the book yet.</p>{% endfor %}
   </section>
 
@@ -113,7 +113,7 @@
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
-      <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="warn">None</span>{% endif %}</td>
+      <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="warn">None</span>{% endif %}</td>
       {% set pos = r.position %}
       <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
       <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>

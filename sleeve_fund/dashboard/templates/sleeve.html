@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
+{% from "_macros.html" import stop_words, trail_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
 {% from "_signals.html" import signals_tab, signals_panel, signals_side %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
@@ -179,7 +179,7 @@
       <div><dt>Move</dt><dd>{% if position %}{{ signed(position.price / position.entry_px - 1) }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>Exits</h3><dl>
-      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away{% if position and position.stop_basis %} · {{ position.stop_basis }}{% endif %}</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away{% if position and position.stop_basis %} · {{ position.stop_basis }}{% endif %}</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% elif trail_words(s)|trim %}<span class="muted trail-stop" title="{{ trail_words(s) }}">Trailing stop · Trail level not shown</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
       <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% {{ "below" if position and position.side < 0 else "above" }} entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
       <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
@@ -211,7 +211,7 @@
     </dl></div>
     <div class="pos-card"><h3>Last sync</h3><dl>
       <div><dt>When</dt><dd>{% if demo.last %}{% if demo.last.done_at %}{{ demo.last.done_at|ago }}{% else %}<span class="faint">waiting for the mirror</span>{% endif %}{% else %}<span class="muted">Never</span>{% endif %}</dd></div>
-      {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result }}</dd></div>{% endif %}
+      {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result|no_venues }}</dd></div>{% endif %}
     </dl></div>
   </div>{% endif %}
   {% if position %}<details class="why-fold">
@@ -330,7 +330,7 @@
 {% set dialogs = {
   'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
-  'resume': ('Resume ' ~ s.name, ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
+  'resume': ('Resume ' ~ s.name, ('Its position margin was lost (liquidated), so it stays halted: resuming doesn\'t restart it. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else '')), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),

@@ -2234,7 +2234,7 @@ def test_the_pm_pages_name_no_venue_even_in_old_messages(client):
         assert not VENUE_NAME.findall(text), (path, VENUE_NAME.findall(text))
     alerts = _visible(c.get("/alerts", auth=AUTH).text)
     assert "under the smallest order the demo account takes" in alerts
-    assert "the demo account /v5/order/create: insufficient balance" in alerts
+    assert "to the demo account: refused (/v5/order/create): insufficient balance" in alerts
     records = _visible(c.get("/records", auth=AUTH).text)
     assert "live account qa-live on the spot venue" in records
     assert "live account qa-perp on the perpetual venue" in records
@@ -2243,13 +2243,19 @@ def test_the_pm_pages_name_no_venue_even_in_old_messages(client):
 
 
 def test_no_venues_keeps_account_and_key_names():
-    from sleeve_fund.dashboard.development import no_venues
+    from sleeve_fund.wording import no_venues
 
     assert no_venues("kraken-live: BYBIT_DEMO_API_KEY missing") == "kraken-live: BYBIT_DEMO_API_KEY missing"
     assert no_venues("no Bybit demo account set up") == "the demo account isn't set up"
-    assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue book"
+    assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue's book"
     assert no_venues("BTCUSDT-PERP.BINANCE: the feed missed 2 minutes") == "BTCUSDT-PERP: the feed missed 2 minutes"
     assert no_venues("BTC/USD.KRAKEN warm-up ready.") == "BTC/USD warm-up ready."
+    # P1-U21: old sentences read naturally once filtered.
+    assert (no_venues("didn't copy the buy: no Bybit demo perpetual set up for BTC/USDT.")
+            == "didn't copy the buy: the demo account has no perpetual set up for BTC/USDT.")
+    assert (no_venues("to the demo account: Deribit testnet private/buy: not_enough_funds ().")
+            == "to the demo account: refused (private/buy): not_enough_funds ().")
+    assert no_venues("Bybit's API said position exists") == "the demo account's API said position exists"
     assert no_venues(None) is None and no_venues("") == ""
 
 
@@ -2300,3 +2306,48 @@ def test_a_fixed_stop_has_no_atr_label_and_the_stress_note_names_3x_gap_loss(cli
     lines = c.get("/api/sleeves/btc-test/candles", auth=AUTH).json()["lines"]
     assert {"price": 58_200.0, "title": "SL", "kind": "stop"} in lines
     assert "at 3x, a gap through liquidation loses the whole position margin" in c.get("/risk", auth=AUTH).text
+
+
+def test_the_last_demo_resync_result_names_no_venue(client):
+    """P1-U19: a resync result stored before #160 reads "demo account", not the venue, on the Demo copy card."""
+    c, store = client
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "demo_mirror": True}, venue="binance")
+    store.request_resync("bn-ls", "PM asked")
+    store.finish_resync(store.pending_resyncs()[0]["id"],
+                        "BTCUSDT: paper +0.1 at 2x isolated; Bybit Demo before +0, cross 10x; after +0.1")
+    page = c.get("/sleeves/bn-ls", auth=AUTH).text
+    assert "the demo account before +0, cross 10x" in page and "Bybit" not in page
+
+
+def test_a_trailing_stop_says_its_level_is_not_shown_rather_than_guess_it(client):
+    """atr-149 A2 (HoE/Advisor ruling): rsi_pullback trails its stop inside the model and doesn't journal the
+    level yet, so the pages say so and the chart draws no stop line, never an estimate."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    page = c.get("/sleeves/rp", auth=AUTH).text
+    assert "Trailing stop · Trail level not shown" in page
+    assert 'title="Trailing stop, 2.5 simple ATR below the highest close since entry"' in page
+    risk = c.get("/risk", auth=AUTH).text
+    assert ">Trailing</span>" in risk and "trail level not shown" in risk
+    lines = c.get("/api/sleeves/rp/candles", auth=AUTH).json()["lines"]
+    assert [ln["kind"] for ln in lines] == ["entry"]
+
+
+def test_resuming_after_a_liquidation_says_it_stays_halted(client):
+    """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
+    resume until the PM resets it after liquidation; other halts keep their wording."""
+    c, store = client
+    _new(c)
+    store.set_status("btc-test", "halted", "drawdown 21% hit the 20% limit")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "The strategy trades again on its next signal." in page and "Reset after liquidation" not in page
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert ("Its position margin was lost (liquidated), so it stays halted: resuming doesn&#39;t restart it. It "
+            "trades again only after you use Reset after liquidation, which asks for an incident note.") in page
+    assert "The strategy trades again on its next signal." not in page

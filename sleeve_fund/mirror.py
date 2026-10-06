@@ -140,7 +140,7 @@ class Testnet:
         out = self._get(f"{self.url}/api/v2/{method}?{urllib.parse.urlencode(params)}", headers)
         if "error" in out:
             err = out["error"]
-            raise RuntimeError(f"the demo account {method}: {err.get('message', err)} ({err.get('data', '')})")
+            raise RuntimeError(f"refused ({method}): {err.get('message', err)} ({err.get('data', '')})")
         return out["result"]
 
     def _auth(self) -> str:
@@ -233,7 +233,7 @@ class BybitDemo:
         if not isinstance(out, dict) or out.get("retCode") != 0:
             msg = out.get("retMsg", out) if isinstance(out, dict) else out
             code = out.get("retCode", "") if isinstance(out, dict) else ""
-            raise RuntimeError(f"the demo account {path}: {msg} ({code})")
+            raise RuntimeError(f"refused ({path}): {msg} ({code})")
         return out.get("result") or {}
 
     @staticmethod
