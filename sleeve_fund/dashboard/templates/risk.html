@@ -3,6 +3,8 @@
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
+{# The stop a row shows: an open position's own, as Risk to stop prices it (P1-U14); else the model's setting. #}
+{% macro live_stop_title(r) %}{% if r.stop_dist is not none %}The position's stop at {{ r.position.stop_px|px }}, {{ r.stop_dist|pct1 }} from its entry{% else %}{{ stop_words(r.x.sleeve.params) }}{% endif %}{% endmacro %}
 {% macro tone_of(status) %}{{ {'running': 'ok', 'paused': 'warn', 'starting': 'warn', 'halted': 'bad', 'error': 'bad'}.get(status, 'off') }}{% endmacro %}
 {% macro flatten_button(cls) %}{% if kill.all %}<button type="button" class="ghost-danger {{ cls }}" data-open="dlg-kill">Flatten everything</button>{% elif kill.flattening %}<button type="button" class="ghost-danger {{ cls }}" disabled title="Every strategy is already selling">Selling to cash…</button>{% endif %}{% endmacro %}
 {% block title %}Risk &amp; health · Multi-Strategy Fund{% endblock %}
@@ -51,14 +53,7 @@
     <div class="rh-chart-top"><h2 id="dd-h"><span class="rh-wide">Book drawdown, 30 days</span><span class="rh-phone">Drawdown</span></h2>
       <span><span class="rh-big">{{ chart.current|pct1 }}</span> <span class="faint">worst {{ chart.worst|pct1 }}</span></span></div>
     {% set c = chart %}
-    <svg viewBox="0 0 {{ c.w }} {{ c.h }}" role="img" aria-label="Book drawdown over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}">
-      {% for t in c.ticks %}<line x1="{{ c.left }}" y1="{{ '%.1f'|format(t.y) }}" x2="{{ c.w }}" y2="{{ '%.1f'|format(t.y) }}" class="{{ 'base' if loop.first else 'grid' }}"/>
-      <text x="{{ c.left - 4 }}" y="{{ '%.1f'|format(t.y + 3) }}" text-anchor="end" class="tick">{{ t.label }}</text>{% endfor %}
-      {% if c.halt_y %}<line x1="{{ c.left }}" y1="{{ '%.1f'|format(c.halt_y) }}" x2="{{ c.w }}" y2="{{ '%.1f'|format(c.halt_y) }}" class="halt"/>
-      <text x="{{ c.w - 4 }}" y="{{ '%.1f'|format(c.halt_y - 4) }}" text-anchor="end" class="halt-label">{{ halt_name }} halt</text>{% endif %}
-      {% if c.area %}<path d="{{ c.area }}" class="area"/><polyline points="{{ c.line }}" class="line"/>{% endif %}
-      {% if c.dot %}<circle cx="{{ '%.1f'|format(c.dot[0]) }}" cy="{{ '%.1f'|format(c.dot[1]) }}" r="3.5" class="dot"/>{% endif %}
-    </svg>
+    <div class="lw-line rh-dd" data-kind="drawdown" data-halt-name="{{ halt_name or '' }}" data-chart="{{ c|tojson|forceescape }}" role="img" aria-label="Book drawdown over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}"></div>
     {% if c.points < 2 %}<p class="faint rh-note">The chart fills in as the book's daily closes come in.</p>{% endif %}
   </section>
 </div>
@@ -70,13 +65,13 @@
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
       <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span>{{ s.instrument }} · {{ s.status|capitalize }}</span></div></div>
-      <span class="num r ex">{{ x.exposure|abs|pct0 }}{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
+      <span class="num r ex" title="Position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
       <span class="num r td {{ 'gain' if x.day_ret > 0.00005 else ('loss' if x.day_ret < -0.00005 else 'muted') }}">{{ x.day_ret|pct1s }}</span>
       <div class="room" role="img" aria-label="{{ (r.dd_used * 100)|round(0)|int }}% of the drawdown limit used, {{ left|pct1 }} left before halt">
         <div class="rh-bar"><i class="{{ 'b' if r.dd_used > 0.8 else ('w' if r.dd_used > 0.5) }}" style="width:{{ (r.dd_used * 100)|round(1) }}%"></i></div>
         <span>{% if s.status == 'halted' %}Halted{% else %}{{ left|pct1 }} left<span class="rh-wide"> before halt</span>{% endif %}</span>
       </div>
-      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ stop_words(s.params) }}">{{ stop_short(s.params) }}</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
+      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
     </div>{% else %}<p class="empty" style="padding:4px 18px 16px">No strategies in the book yet.</p>{% endfor %}
   </section>
 
@@ -100,22 +95,29 @@
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}gross of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
+  {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
+  <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ risk.margin|money }}</div></div>
+  <div{% if risk.unbounded %} title="{{ risk.unbounded|join(', ') }}: no stop, so unbounded"{% else %} title="Money lost if every stop is hit"{% endif %}><div class="k">Open risk</div><div class="v{{ ' warn' if risk.unbounded }}">{{ risk.open_risk|money }}{{ '+' if risk.unbounded }}</div></div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
 
 <section class="panel flush" style="margin:14px 0" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>
-  <table class="responsive" data-hide-md="2 5 7">
-    <thead><tr><th>Strategy</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop-loss</th></tr></thead>
+  {# Nine columns fit the 1,142 px panel at 1440 (QA U3): the profile is on the name's hover, the stop in short. #}
+  <table class="responsive tight" data-hide-md="4 6">
+    <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th title="Position value at the current price ÷ the strategy's equity, against the cap that applies when a position is opened">Exposure</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>
-      <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
-      <td data-m="right">{{ x.profile.name|capitalize }}</td>
+      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
-      <td data-m="hide">{{ usage(r.cap_used) }} <span class="muted">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span></td>
+      <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
-      <td data-m="hide">{% if r.has_stop %}{{ stop_words(s.params) }}{% else %}<span class="warn">None</span>{% endif %}</td>
+      <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="warn">None</span>{% endif %}</td>
+      {% set pos = r.position %}
+      <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="num" data-m="hide">{% if not pos %}<span class="faint">–</span>{% elif not pos.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ pos.risk_to_stop|money }}{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table>
 </section>
@@ -177,9 +179,10 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
 <script>
-Console.tabs(); Console.dialogs(); Console.reasons();
+Console.tabs(); Console.dialogs(); Console.reasons(); Console.lineCharts();
 // "Live · 4s ago": seconds since the page last heard from the server (live.js says each time it does).
 (() => {
   const el = document.getElementById("rh-live");

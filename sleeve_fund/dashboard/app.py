@@ -29,6 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
+from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
@@ -37,7 +38,14 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
+from sleeve_fund.paper.config import (
+    ALLOWED_BAR_SPECS,
+    VENUE_WARMUP_BARS,
+    SleeveConfig,
+    auto_warmup,
+    check_hub_bar_spec,
+    to_store_kwargs,
+)
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.trials import TrialsRegister
@@ -55,6 +63,7 @@ LEDGER = study_run.LEDGER
 INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
+ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
 security = HTTPBasic(realm="Multi-Strategy Fund")
 
@@ -101,7 +110,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
     templates.env.globals["venue_choices"] = venue_choices
-    templates.env.globals["venue_label"] = lambda name: _research_venue(name).label
+    templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
@@ -382,6 +391,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")),
                                venue=_venue_name(form.get("venue")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
+            check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
             if any(s.name == name for s in st().sleeves()):
@@ -439,7 +449,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None,
                               st().insurance(name) if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
-        recent = [trading.order_view(o) for o in st().orders(name, limit=15)]
+        recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
+        order_total = sum(st().order_counts(name).values())
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
         q = request.query_params
@@ -453,6 +464,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+                    order_total=order_total,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -800,7 +812,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         pre = pre or {}
         sheets = [dev.read_sheet(p) for p in sorted(TEARSHEETS.glob("*.md"), key=lambda p: p.stat().st_mtime,
                                                     reverse=True)]
-        rows = pipeline.strategies(TEARSHEETS, st().sleeves())
+        put_away = st().archived()  # an archived strategy is not in paper any more (QA U6)
+        rows = pipeline.strategies(TEARSHEETS, [s for s in st().sleeves() if s.name not in put_away])
         cards = dev.plans(rows, sheets)
         chosen = next((c for c in cards if c["name"] == pre.get("strategy")), cards[0])
         values = dev.form_values(chosen, pre)
@@ -882,7 +895,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
-        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({profile.label}), "
+        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({dev.venue_label(profile.name) or 'venue'}), "
                  f"{study_run._bars(req.minutes)} bars")
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
         return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
@@ -927,10 +940,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         if pair in (profile.core_pairs or CORE_PAIRS):
             # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
             # a request would change nothing, and its "from five years back" would misstate where it starts.
-            return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+            return (f"{pair} is on the collector's core list for the venue: it is stored from its listing and "
                     "kept current, and this list shows how far it has got.")
         if profile.minute_loader is None:
-            raise ValueError(f"{profile.label} has no history loader")
+            raise ValueError("this venue has no history loader")
         if profile.check_listed is not None:
             try:
                 profile.check_listed(pair)
@@ -940,7 +953,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
                 # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
                 logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
-                raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                raise ValueError(f"couldn't reach the venue to check it lists {pair}, so nothing was asked "
                                  "for; try again when the venue answers") from None
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
@@ -1163,7 +1176,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
         shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
         try:
-            label = markets.terms({"market": market}, venue).label if market != markets.SPOT else ""
+            t = markets.terms({"market": market}, venue) if market != markets.SPOT else None
+            label = "Perpetual" if t and t.funding_venue else (t.label if t else "")  # never the venue's name (QA U8)
         except ValueError:  # a spot market on a perpetual venue: the run itself is refused, with the reason
             label = markets.terms({"market": market}).label
         market_words = ("Spot, long only" if market == markets.SPOT else
@@ -1335,7 +1349,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import setup_view
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "source": q.source, "taker": float(q.fees.taker),
+        # Named by market, not venue: venue names appear only where the PM sets up keys (QA U8 ruling).
+        fee_quotes = [{"venue_label": "Perpetual venue" if v.perpetual else "Spot venue", "source": q.source, "taker": float(q.fees.taker),
                        "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
@@ -1397,7 +1412,7 @@ def _backtest_args(q) -> dict:
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
     _check_gaps(venue, pair)
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
-             f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
+             f"{'' if venue == _venue_name(None) else ' (' + (dev.venue_label(venue) or 'venue') + ')'}, "
              f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
@@ -1639,7 +1654,7 @@ def _demo_copy(store, s) -> dict | None:
     put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
-    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+    return {"label": "the demo account", "put_on": put_on, "last": last,
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
@@ -1702,12 +1717,13 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
+        # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
+        "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
         "margin": margin,
         "margin_cap": margin_cap,
-        "margin_used": min(margin / margin_cap, 1.0) if margin_cap > 0 else 0.0,
+        "margin_used": margin / margin_cap if margin_cap > 0 else 0.0,
     }
 
 
@@ -1803,11 +1819,9 @@ FEED_FRESH_SECONDS = riskops.FEED_FRESH_SECONDS  # past this the strategy page's
 
 
 def _price_feed(s, seen) -> dict:
-    """The strategy's price feed for the page header: its venue and how long since that venue last sent
-    it a trade or quote, to the second."""
-    from sleeve_fund.venues import venue
-
-    label = venue(s.venue).label
+    """The strategy's price feed for the page header: how long since its venue last sent it a trade or quote,
+    to the second. Labelled "Prices", never with the venue's name (QA U8)."""
+    label = "Prices"
     if s.desired_state != "running":
         return {"label": label, "state": "off", "age": "off while stopped"}
     if seen is None:

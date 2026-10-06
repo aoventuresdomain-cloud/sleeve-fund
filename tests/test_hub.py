@@ -136,6 +136,13 @@ def test_a_gap_is_refilled_from_the_venues_closed_candles_only():
     assert all(b["refilled"] and b["id"] == BTC for b in bars) and bars[0]["o"] == "110.0"
 
 
+def test_a_refilled_minute_is_written_at_the_instruments_decimals_as_a_live_one_is():
+    """Code review on #140: 110.0 from the venue's candle is 110.00 on a 2-dp instrument, as a live minute."""
+    recent = lambda pair, minutes: _candles("2026-10-05 11:50", 15)  # noqa: E731
+    (b, *_) = refill_bars(recent, "BTC/USDT", BTC, T0 + MINUTE_NS, T0 + 10 * MINUTE_NS, T0 + 11 * MINUTE_NS, (2, 3))
+    assert (b["o"], b["h"], b["l"], b["c"], b["v"]) == ("110.00", "111.00", "109.00", "110.00", "2.000")
+
+
 class _Fan:
     def __init__(self):
         self.sent = []
@@ -172,6 +179,14 @@ def test_bars_go_to_clients_and_the_store_and_a_missed_stretch_is_refilled_and_f
     assert [m["ts"] for m in refilled] == [T0 - 2 * MINUTE_NS, T0 - MINUTE_NS]
     live = [m for m in stored if not m["refilled"]]
     assert [m["ts"] for m in live] == [T0] and live[0] in r.fanout.sent
+
+
+def test_the_relay_refills_at_the_instruments_decimals_once_it_has_the_definition():
+    r, stored = _relay(last_close={BTC: T0 - 3 * MINUTE_NS})
+    r.definitions[BTC] = {"price_precision": 2, "size_precision": 3}
+    r.on_bar(_bar(BTC, T0))
+    refilled = [m for m in stored if m["refilled"]]
+    assert refilled and all(m["o"].endswith(".00") and m["v"] == "2.000" for m in refilled)
 
 
 def test_the_first_bar_after_subscribing_is_a_part_bar_and_the_venues_candle_stands_in():

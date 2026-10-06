@@ -40,7 +40,7 @@
       {% for c in cards %}
       <li data-status="{{ c.status }}" data-search="{{ (c.label ~ ' ' ~ c.family ~ ' ' ~ c.name)|lower|replace('-', ' ')|replace('_', ' ') }}"><a class="plan-row" href="/research?strategy={{ c.name }}#development" data-plan="{{ c.name }}"{% if c.name == chosen.name %} aria-current="true"{% endif %} title="{{ c.question }} · {{ c.meta }}">
         <b>{{ c.label }}</b>
-        <span class="pr-meta">{{ c.family|replace('-', ' ')|capitalize }}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% endif %}</span>
+        <span class="pr-meta">{{ c.family|replace('-', ' ')|capitalize }}{% set live = c.row.sleeves|selectattr('desired_state', 'equalto', 'running')|list %}{% if live %} · {{ live|length }} running{% endif %}</span>
         <span class="chip {{ c.tone }}">{{ c.status_word }}</span>
       </a></li>
       {% endfor %}
@@ -61,7 +61,7 @@
       <p class="answers"><b>Answers:</b> {{ c.answers }} <span class="kill">Kill</span> {{ c.kill_rule }}</p>
       <div class="study-stage">
         {{ stepper(c.row.stage, stages, c.row.observation) }}
-        <span class="muted">{{ stages[c.row.stage] }}{% if c.row.g1 == 'PASS' %}: passed on {{ c.row.passed_where|join(', ') }}{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} running{% if c.row.observation %} <span class="warn" title="No G1 pass for: {{ c.row.observing|map(attribute='name')|join(', ') }}">· {{ c.row.observing|length }} of {{ c.row.sleeves|length }} on observation</span>{% endif %}{% endif %}</span>
+        <span class="muted">{{ stages[c.row.stage] }}{% if c.row.g1 == 'PASS' %}: passed on {{ c.row.passed_where|join(', ') }}{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} in paper{% if c.row.observation %} <span class="warn" title="No G1 pass for: {{ c.row.observing|map(attribute='name')|join(', ') }}">· {{ c.row.observing|length }} of {{ c.row.sleeves|length }} on observation</span>{% endif %}{% endif %}</span>
         <span class="stage-links"><a href="/backtest?strategy={{ c.name }}">Backtest</a> · <a href="/sleeves/new?strategy={{ c.name }}">New strategy</a></span>
       </div>
     </div>

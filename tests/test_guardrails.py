@@ -48,12 +48,56 @@ def test_a_losing_centre_or_nan_neighbour_fails():
     assert nearby_settings(nan, {"fast": 10, "slow": 100}, PARAMS)[0] == "FAIL"
 
 
-def test_nothing_nearby_is_not_applicable():
+def test_nothing_tunable_passes_flagged_and_an_unchecked_choice_fails():
+    # Independent Quant Advisor (6 Oct 2026, P1-G3): N/A let an untested choice through G1. Only a grid
+    # that varies no setting passes, flagged; a choice off the grid, or with no value, fails with why.
     one = pd.DataFrame([{"fast": 10, "slow": 100, "sharpe": 1.0}])
-    assert nearby_settings(one, {"fast": 10, "slow": 100}, PARAMS)[0] == "N/A"
-    assert nearby_settings(_grid(lambda f, s: 1.0), {"fast": 7, "slow": 100}, PARAMS)[0] == "N/A"
-    assert nearby_settings(pd.DataFrame(), {}, [])[0] == "N/A"
+    verdict, words = nearby_settings(one, {"fast": 10, "slow": 100}, PARAMS)
+    assert verdict == "PASS" and words.startswith("flag:")
+    assert nearby_settings(pd.DataFrame(), {}, [])[0] == "PASS"
+    verdict, words = nearby_settings(_grid(lambda f, s: 1.0), {"fast": 7, "slow": 100}, PARAMS)
+    assert verdict == "FAIL" and "not on the grid" in words
+    verdict, words = nearby_settings(_grid(lambda f, s: 1.0), {"slow": 100}, PARAMS)
+    assert verdict == "FAIL" and "no chosen value for fast" in words
+
+
+def test_a_choice_at_the_grid_edge_fails():
+    # P1-G4: an edge point has a neighbour on one side only, and the best value may lie past the grid.
+    verdict, words = nearby_settings(_grid(lambda f, s: 1.0), {"fast": 5, "slow": 100}, PARAMS)
+    assert verdict == "FAIL" and words == "chosen at grid edge (fast 5), extend the grid"
+    verdict, words = nearby_settings(_grid(lambda f, s: 1.0), {"fast": 40, "slow": 200}, PARAMS)
+    assert verdict == "FAIL" and "fast 40, slow 200" in words
+
+
+def test_a_setting_the_grid_does_not_vary_has_no_edge():
+    flat_slow = pd.DataFrame([{"fast": f, "slow": 100, "sharpe": 1.0} for f in (5, 10, 20)])
+    assert nearby_settings(flat_slow, {"fast": 10, "slow": 100}, PARAMS)[0] == "PASS"
+
+
+def test_a_grid_mixing_words_numbers_and_none_is_checked_not_crashed():
+    # QA F5: sorted() raised on mixed values, and a None default never equalled itself in pandas.
+    rows = [{"mode": m, "fast": f, "sharpe": 1.0} for m in (None, 3, "close") for f in (5, 10, 20)]
+    grid = pd.DataFrame(rows, dtype=object)
+    assert nearby_settings(grid, {"mode": 3, "fast": 10}, ["mode", "fast"])[0] == "PASS"
+    verdict, words = nearby_settings(grid, {"mode": None, "fast": 10}, ["mode", "fast"])
+    assert verdict == "FAIL" and "grid edge (mode None)" in words
+
+
+def test_the_evidence_gives_the_neighbours_trades():
+    grid = _grid(lambda f, s: 2.0 if (f, s) == (10, 100) else (-0.2 if f == 20 else 1.8))
+    grid["round_trips"] = [0 if f == 20 else 30 for f in grid["fast"]]
+    verdict, words = nearby_settings(grid, {"fast": 10, "slow": 100}, PARAMS)
+    assert verdict == "FAIL" and "1 of them made no trades" in words and "at -0.20, 0 trades" in words
 
 
 def test_the_trade_bar_is_the_specs_hundred():
     assert MIN_OOS_TRADES == 100
+
+
+def test_a_tunable_setting_with_nothing_tried_next_to_the_choice_fails():
+    # QA P1-G5: `a` is tuned (1, 2, 3 at b=1), but at the chosen b=2 only a=2 was tried, so a's nearness was
+    # never checked and the check passed on b alone.
+    rows = [{"a": a, "b": 1} for a in (1, 3)] + [{"a": 2, "b": b} for b in (1, 2, 3)]
+    grid = pd.DataFrame([{**r, "sharpe": 1.0, "round_trips": 50} for r in rows])
+    verdict, words = nearby_settings(grid, {"a": 2, "b": 2}, ["a", "b"])
+    assert verdict == "FAIL" and words.startswith("no nearby value tried for a")
