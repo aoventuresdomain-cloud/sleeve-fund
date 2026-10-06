@@ -32,6 +32,7 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
+from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, ROUND_UP_FLAG, Sizing, SizingInputs, size_entry
 from sleeve_fund.strategies.indicators import AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -110,6 +111,9 @@ def _condition_json(c: Condition) -> dict:
 MIN_STOP, MAX_STOP = 0.002, 0.5
 # The most of a bar's traded volume one buy may take (see LongFlatConfig.max_participation).
 MAX_PARTICIPATION = 0.25
+# P2-1 (Head of Engineering, 6 Oct 2026): a definition that sets no risk per trade risks this much of its
+# equity on each entry, to its stop; one with no stop gets the fallback ATR_STOP_MULTIPLE x ATR, placed.
+DEFAULT_RISK_PER_TRADE = 0.01
 # Paper's price watchdog: minutes without a trade or a quote before it warns, and before it treats the
 # feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
 STALE_PRICE_WARN_MINUTES = 5
@@ -188,13 +192,18 @@ def _side_word(side: int) -> str:
 
 
 def exit_warmup(params: dict) -> int:
-    """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop."""
-    if params.get("stop_atr"):
+    """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop. A model with no
+    stop declared (and no target weight) trades with the fallback ATR stop (P2-1), so it warms that too."""
+    fallback = not any(params.get(k) for k in ("stop_loss", "stop_atr", "stop_swing_bars")) \
+        and params.get("rebalance_band") is None
+    if params.get("stop_atr") or fallback:
         return int(params.get("atr_bars") or 14) + 1
     return int(params.get("stop_swing_bars") or 0)
 
 
 class LongFlatConfig(StrategyConfig):
+    BENCHMARK = False  # the buy-and-hold benchmark: never sized by risk, never stopped (P2-1)
+
     def __init__(
         self,
         *,
@@ -280,6 +289,15 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
+        # P2-1: every entry is sized by what it loses at a placed stop (sizing.size_entry). A definition with no
+        # stop gets the fallback, placed like any other, and no risk per trade means DEFAULT_RISK_PER_TRADE.
+        # Weight models (rebalance_band) and the buy-and-hold benchmark size their own way.
+        stop_fallback = False
+        if rebalance_band is None and not self.BENCHMARK:
+            if not stops:
+                stop_atr, stop_fallback, stops = ATR_STOP_MULTIPLE, True, ["stop_atr"]
+            if risk_per_trade is None:
+                risk_per_trade = DEFAULT_RISK_PER_TRADE
         if market not in markets.MARKETS:
             raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
         if allow_short and market == markets.SPOT:
@@ -317,6 +335,7 @@ class LongFlatConfig(StrategyConfig):
         # Or a stop set from the market at each entry: this many average true ranges (over atr_bars
         # bars) below the close, or at the lowest low of the last stop_swing_bars bars.
         self.stop_atr = stop_atr
+        self.stop_fallback = stop_fallback  # the stop is the P2-1 fallback, not one the definition declared
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)
         # Or a take-profit that makes this many times what the stop loses, both after costs (r_target).
@@ -416,6 +435,8 @@ class LongFlatStrategy(Strategy):
         self._stop_frac: float | None = None
         self._tp_frac: float | None = None
         self._stop_basis = ""  # how the stop was set, in words, for the journal
+        self._entries = 0  # centrally sized entries, and how many the venue's minimum rounded up (P2-1)
+        self._rounded_up = 0
         # After a restart: a new ATR or swing-low stop to set from the market on the next bar, with the old
         # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
         self._replan_pending: tuple[str, int] | None = None
@@ -1162,37 +1183,43 @@ class LongFlatStrategy(Strategy):
         if equity <= 0:
             self.log.warning("no equity to size from yet; skipping entry")
             return
-        fee = Decimal(str(self._cfg.assumed_taker_fee))
-        room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-        limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
-        if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
-        elif self._cfg.position_cap_pct is not None:
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
-        if self._cfg.max_notional is not None:
-            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
-        if self._cfg.risk_per_trade and self._stop_frac:
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
-        if (cap := self._volume_cap(bar)) is not None:
-            limits["share of the bar's volume"] = cap
-        size_by = min(limits, key=limits.get)
-        budget = limits[size_by]
-        qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
-        if qty <= 0 or qty < self._min_qty():
-            self._note("buy_skipped", f"Entry skipped: the {size_by} limit ({float(budget):,.2f}) comes to {qty}, "
-                       f"below the smallest order the venue takes ({self._min_qty()})")
-            return
+        share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+        if self._stop_frac:
+            sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share)
+            if not sizing.ok:
+                self._note("buy_skipped", sizing.skipped[0].upper() + sizing.skipped[1:])
+                return
+            qty, size_by, budget = sizing.qty, sizing.sized_by, Decimal(str(min(sizing.limits.values())))
+        else:
+            sizing = None
+            fee = Decimal(str(self._cfg.assumed_taker_fee))
+            room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
+            limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
+            if self.runtime is not None:
+                limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
+            elif self._cfg.position_cap_pct is not None:
+                limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            if self._cfg.max_notional is not None:
+                limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+            if (cap := self._volume_cap(bar)) is not None:
+                limits["share of the bar's volume"] = cap
+            size_by = min(limits, key=limits.get)
+            budget = limits[size_by]
+            qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
+            if qty <= 0 or qty < self._min_qty():
+                self._note("buy_skipped", f"Entry skipped: the {size_by} limit ({float(budget):,.2f}) comes to {qty}, "
+                           f"below the smallest order the venue takes ({self._min_qty()})")
+                return
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2), **self._sizing_words(sizing)}
         notional = float(qty) * close
         liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / equity, 4)
-            share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
             if self._stop_frac and self._stop_frac > share * distance:
                 self._note("entry_refused_liquidation",
                            f"Entry refused: its {self._stop_frac:.2%} stop is more than {share:.0%} of the way to the "
@@ -1416,23 +1443,31 @@ class LongFlatStrategy(Strategy):
         limits = {"free cash": free.as_decimal() * room}
         if weight < 1:
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
-        if self._cfg.max_notional is not None:
-            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
-        if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
-                str(self.runtime.position_budget(self._mark()[0])))
-        elif self._cfg.position_cap_pct is not None:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
-        if self._cfg.risk_per_trade:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop()))
-        if (cap := self._volume_cap(bar)) is not None:
-            limits["share of the bar's volume"] = cap
+        sizing = None
+        if self._stop_frac:
+            # P2-1: what it loses at the stop sizes it, with the caps, in sizing.size_entry; free cash and a
+            # target weight still bound it here, since only the account knows them.
+            sizing = self._size(bar, 1, self._mark()[0] or float(free.as_decimal()), lev=1.0, perp=False, share=None)
+            if not sizing.ok:
+                self._note("buy_skipped", sizing.skipped[0].upper() + sizing.skipped[1:])
+                return
+            limits[sizing.sized_by] = sizing.qty * bar.close.as_decimal()
+        else:
+            if self._cfg.max_notional is not None:
+                limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+            if self.runtime is not None:
+                limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
+                    str(self.runtime.position_budget(self._mark()[0])))
+            elif self._cfg.position_cap_pct is not None:
+                equity = self._mark()[0] or float(free.as_decimal())
+                limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            if (cap := self._volume_cap(bar)) is not None:
+                limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         step = self._lot()
-        qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
+        qty = (sizing.qty if sizing is not None and size_by == sizing.sized_by else
+               (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN))
         min_qty = self._min_qty()
         if qty <= 0 or qty < min_qty:
             self._note("buy_skipped", f"Buy skipped: the {size_by} limit ({float(budget):,.2f}) buys {qty}, below "
@@ -1440,7 +1475,8 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2),
+                  **self._sizing_words(sizing if sizing is not None and size_by == sizing.sized_by else None)}
         if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
@@ -1457,6 +1493,40 @@ class LongFlatStrategy(Strategy):
         if self._has_exits:
             signal["stop_cfg"] = self._stop_cfg()
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
+
+    def _size(self, bar: Bar, side: int, equity: float, *, lev: float, perp: bool, share: float | None) -> Sizing:
+        """This entry's size from sizing.size_entry, the one rule backtest and paper share (P2-1): its risk to
+        the planned stop, then the profile's cap (on the margin), leverage, the largest order, the bar's volume
+        and, on a perpetual, the liquidation rule. Allocated equity is the strategy's own account equity."""
+        cap = self._volume_cap(bar)
+        return size_entry(SizingInputs(
+            allocated_equity=equity, price=bar.close.as_double(), side=side, leg_cost=self._round_trip_cost(),
+            half_spread=self._half_spread(), risk_per_trade=self._cfg.risk_per_trade or DEFAULT_RISK_PER_TRADE,
+            position_cap_pct=self._cap_pct(), lot=self._lot(), min_qty=self._min_qty(), stop_frac=self._stop_frac,
+            leverage=lev if perp else 1.0, perp=perp, max_notional=self._cfg.max_notional,
+            volume_notional=float(cap) if cap is not None else None,
+            maintenance_margin=float(self._cfg.perp.maintenance_margin) if perp else 0.0,
+            stop_to_liquidation=share if perp else None))
+
+    def _sizing_words(self, sizing: Sizing | None) -> dict:
+        """What the journal keeps of a central sizing: the budget at risk, every limit, and whether the
+        venue's minimum rounded it up. A strategy rounding up on more than ROUND_UP_FLAG of its entries is
+        too small for the instrument, and says so once."""
+        if sizing is None:
+            return {}
+        self._entries += 1
+        self._rounded_up += sizing.rounded_up
+        if self._entries >= 5 and self._rounded_up / self._entries > ROUND_UP_FLAG:
+            self._note("rounding_up", f"{self._rounded_up} of {self._entries} entries were rounded up to the venue's "
+                       f"smallest order, over {ROUND_UP_FLAG:.0%}: the strategy's allocation is too small for this "
+                       "instrument at its risk per trade")
+        out = {"risk_budget": round(sizing.risk_budget, 2),
+               "limits": {k: round(v, 2) for k, v in sizing.limits.items()}}
+        if sizing.rounded_up:
+            out["rounded_up"] = True
+        if self._cfg.stop_fallback:
+            out["stop_fallback"] = f"{ATR_STOP_MULTIPLE:g} x ATR({self._cfg.atr_bars}), none declared"
+        return out
 
     def _loss_at_stop(self, side: int = 1) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee

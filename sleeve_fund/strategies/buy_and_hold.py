@@ -16,7 +16,7 @@ SPEC = IdeaSpec(
 
 
 class BuyAndHoldConfig(LongFlatConfig):
-    pass
+    BENCHMARK = True  # holds all of its capital, as the benchmark; central sizing passes it by (P2-1)
 
 
 class BuyAndHold(LongFlatStrategy):

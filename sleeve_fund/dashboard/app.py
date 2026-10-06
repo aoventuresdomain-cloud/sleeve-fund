@@ -41,10 +41,11 @@ from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, Sleev
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.trials import TrialsRegister
+from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
-from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.strategies.base import DEFAULT_RISK_PER_TRADE, exit_warmup, maker_orders_enabled
 from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
@@ -1893,12 +1894,16 @@ def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
         stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):
         stop = f"{p['stop_loss'] * 100:g}% {w['stop']} the entry{held}"
+    elif p.get("rebalance_band") is None:  # P2-1: no stop declared means the fallback, placed
+        stop = (f"{ATR_STOP_MULTIPLE:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the "
+                f"entry{held}, the default when none is set")
     else:
         stop = "none"
     target = (f"{p['take_profit_r']:g}R after costs" if p.get("take_profit_r")
               else f"{p['take_profit'] * 100:g}% {w['tp']} the entry{held}" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
-            "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else "none",
+            "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else
+            f"{DEFAULT_RISK_PER_TRADE * 100:g}%, the default" if p.get("rebalance_band") is None else "none",
             "Largest order": f"{p['max_notional']:,.2f}" if p.get("max_notional") else "no cap"}
 
 
