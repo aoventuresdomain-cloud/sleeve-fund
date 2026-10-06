@@ -143,13 +143,14 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
 
 def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
     """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
-    `wait`, plus one of the venue's latest intervals for a settlement foreseen past its newest record. If the venue
-    has lengthened its interval, the newer record that skips the foreseen time lands within that, and the time is
-    then no settlement at all (settlement_times), so it is never charged (no phantom baseline charge)."""
+    `wait`; for a settlement foreseen past its newest record, one of the venue's latest intervals more, plus `wait`
+    again for the store's refresh to bring in the next record. If the venue has lengthened its interval, the newer
+    record that skips the foreseen time lands within that, and the time is then no settlement at all
+    (settlement_times), so it is never charged (no phantom baseline charge)."""
     step = latest_interval(settled)
     if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
         return wait
-    return wait + step
+    return 2 * wait + step
 
 
 def latest_interval(settled) -> timedelta | None:

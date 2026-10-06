@@ -236,7 +236,7 @@ def test_paper_waits_a_foreseen_settlement_until_a_newer_record_could_drop_it():
     t = lambda s: utc(s).to_pydatetime()  # noqa: E731
     four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
     wait = timedelta(minutes=15)
-    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == timedelta(hours=4, minutes=15)
+    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == timedelta(hours=4, minutes=30)  # and the store's refresh after the 08:00 record
     assert markets.settlement_wait(t("2025-10-05 00:00"), four, wait) == wait  # a recorded time: the usual wait
     assert markets.settlement_wait(t("2025-10-05 04:00"), None, wait) == wait  # no records: the fixed hours'
 
