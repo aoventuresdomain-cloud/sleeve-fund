@@ -2354,6 +2354,32 @@ def test_a_trailing_stop_says_its_level_is_not_shown_rather_than_guess_it(client
     assert [ln["kind"] for ln in lines] == ["entry"]
 
 
+def test_a_trailing_stop_is_not_unbounded_and_open_risk_says_what_it_leaves_out(client):
+    """P1-U24: a trailing stop bounds the loss, so its risk to stop reads "trailing · level not shown", never
+    "unbounded"; "unbounded" is for a position with no stop of any kind. Open risk says which it leaves out."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    trailing = "trailing · level not shown"
+    for url in ("/risk", "/trades", "/"):
+        page = c.get(url, auth=AUTH).text
+        assert "unbounded" not in page.replace("so unbounded", ""), url
+    assert trailing in c.get("/risk", auth=AUTH).text and trailing in c.get("/trades", auth=AUTH).text
+    assert "rp: trailing stop, level not shown, not counted" in c.get("/risk", auth=AUTH).text
+    assert "1 with a trailing stop, level not shown, not counted" in c.get("/", auth=AUTH).text
+    # A position with no stop of any kind is still unbounded, and the hover lists both.
+    store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={})
+    store.record_order("nostop", order_id="E-2", side="BUY", qty=0.05, intent="entry", reason="start")
+    store.record_fill("nostop", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-2", trade_id="t2")
+    store.record_equity("nostop", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    risk = c.get("/risk", auth=AUTH).text
+    assert "nostop: no stop, so unbounded · rp: trailing stop, level not shown, not counted" in risk
+
+
 def test_resuming_after_a_liquidation_says_it_stays_halted(client):
     """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
     resume until the PM resets it after liquidation; other halts keep their wording. Read from the journal,

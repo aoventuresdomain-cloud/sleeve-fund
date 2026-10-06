@@ -13,6 +13,10 @@
 {# A model that trails its own stop (rsi_pullback): its level isn't journaled yet, so no line or price is shown
    for it rather than an estimate (Advisor, atr-149 A2; the journal is board item A2-T). #}
 {% macro trail_words(s) %}{% if s.strategy == 'rsi_pullback' %}Trailing stop, {{ '%g'|format(s.params.get('atr_mult', 3.0)) }} simple ATR below the highest close since entry{% endif %}{% endmacro %}
+{# What a position's Risk to stop reads when its stop trails and its level isn't journaled yet (P1-U24). #}
+{% macro trailing_risk() %}<span class="faint" title="Its stop trails the highest close since entry, and the level isn't journaled yet, so its risk to the stop isn't shown or counted in Open risk">trailing · level not shown</span>{% endmacro %}
+{# The hover on an Open risk figure: the unbounded and trailing positions it leaves out of the sum. #}
+{% macro open_risk_hint(unbounded, trailing) %}{% if unbounded %}{{ unbounded|join(', ') }}: no stop, so unbounded{% endif %}{% if unbounded and trailing %} · {% endif %}{% if trailing %}{{ trailing|join(', ') }}: trailing stop, level not shown, not counted{% endif %}{% if not unbounded and not trailing %}Money lost if every stop is hit{% endif %}{% endmacro %}
 {% macro tag(text, kind='') %}<span class="tag {{ kind }}">{{ text }}</span>{% endmacro %}
 {% macro why(label, text, items) %}<div class="why-block"><div class="k">{{ label }}</div>{% if text %}<p>{{ text }}</p>{% if items %}<dl class="sig">{% for k, v in items %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}</dl>{% endif %}{% else %}<p class="muted">Not recorded. This trade predates the order journal, which logs the reason when the order is sent.</p>{% endif %}</div>{% endmacro %}
 {% macro why_toggle(id) %}<button type="button" class="why-btn" aria-expanded="false" aria-controls="{{ id }}" data-why="{{ id }}">Why</button>{% endmacro %}

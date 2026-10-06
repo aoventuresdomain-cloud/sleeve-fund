@@ -259,13 +259,20 @@ def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | Non
     return abs(qty) * max(side * (price - stop_px), 0.0)
 
 
+# Strategies whose stop trails the market inside the strategy and isn't journaled (A2-T will journal it).
+TRAILING_STOP = {"rsi_pullback"}
+
+
 def open_risk(positions: list[dict]) -> dict:
     """Margin and open risk across positions (open_position's dicts): margin put up, the sum of their Risk to
-    stop, and the strategies whose position has no stop, which leave open risk unbounded."""
+    stop, the strategies whose position has no stop of any kind, which leave open risk unbounded, and those
+    with a trailing stop, whose level isn't shown yet: they are bounded, but not counted until the engine
+    gives their risk (UI v2 P1-U24)."""
     return {
         "margin": sum(p["margin"] for p in positions),
         "open_risk": sum(p["risk_to_stop"] for p in positions if p["risk_to_stop"] is not None),
-        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None],
+        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None and not p.get("trailing")],
+        "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
     }
 
 
@@ -306,6 +313,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "liq_px": liq,
         "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
         "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
+        "trailing": stop_px is None and x["sleeve"].strategy in TRAILING_STOP,
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),

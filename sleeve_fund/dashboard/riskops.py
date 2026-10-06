@@ -61,6 +61,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
             "margin": held["margin"], "open_risk": held["open_risk"], "unbounded": held["unbounded"],
+            "trailing": held["trailing"],
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
