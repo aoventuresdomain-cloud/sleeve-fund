@@ -36,9 +36,10 @@ def test_opens_once_per_idea_and_underlying_at_any_venue(store):
     _trial(store, T("2022-01-01", tz="UTC"), T("2024-12-31", tz="UTC"))
     assert locks.refusal(IDEA, "BTC", start, end) == ""
     assert locks.open(IDEA, "btc", start, end)
-    locks.link_trial(IDEA, "BTC", "t1")
-    locks.link_trial(IDEA, "BTC", "t2")  # the first link stands
-    assert store.holdout_locks(IDEA)[0]["trial_id"] == "t1"
+    assert store.holdout_locks(IDEA)[0]["status"] == "claimed"
+    locks.settle(IDEA, "BTC", "t1")
+    locks.settle(IDEA, "BTC", "t2")  # a settled lock is never rewritten
+    assert (store.holdout_locks(IDEA)[0]["trial_id"], store.holdout_locks(IDEA)[0]["status"]) == ("t1", "opened")
     assert not locks.open(IDEA, "BTC", start, end)  # the database refuses the second opening
     assert "was opened on" in locks.refusal(IDEA, "BTC", start, end)
     assert locks.refusal(IDEA, "ETH", start, end) == ""  # another underlying has its own holdout
@@ -191,3 +192,44 @@ def test_an_undated_idea_keeps_its_holdout_closed_until_it_holds_enough_trades(s
                        register=TrialsRegister(store), locks=HoldoutLocks(store))
     assert result.holdout is None and "trades, and 20 are needed" in result.holdout_withheld
     assert store.holdout_locks() == []
+
+
+def test_a_crash_after_the_claim_is_recorded_as_spent_not_failed(store):
+    """Advisor and Head of Engineering, 6 Oct 2026: the record says the look crashed; it is spent, not a fail."""
+    locks = HoldoutLocks(store)
+    start, end = T("2025-01-01", tz="UTC"), T("2025-12-31", tz="UTC")
+    assert locks.open(IDEA, "BTC", start, end)
+    locks.crashed(IDEA, "BTC")
+    locks.settle(IDEA, "BTC", "t1")  # too late: the crash stands
+    lock = store.holdout_locks(IDEA)[0]
+    assert (lock["status"], lock["trial_id"]) == ("crashed", None)
+    assert "spent by a crash" in locks.refusal(IDEA, "BTC", start, end)
+
+
+def test_a_crashing_look_in_a_study_spends_the_holdout(store, tmp_path, instrument, monkeypatch):
+    import numpy as np
+
+    from sleeve_fund.research import study as study_mod
+    from sleeve_fund.strategies.trend_filter import SPEC
+
+    idx = pd.date_range("2024-01-01", periods=150, freq="1D", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.003 * 38, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    bars = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 1e6},
+                        index=idx)
+    real = study_mod.whole_days
+    calls = {"n": 0}
+
+    def whole_days(*a, **k):  # the holdout's own returns are the last call: fail there
+        if len(a) > 1 and a[1] == idx[-30]:
+            raise RuntimeError("disk full")
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(study_mod, "whole_days", whole_days)
+    with pytest.raises(RuntimeError, match="disk full"):
+        study_mod.run_study(SPEC, bars, instrument, dataset="kraken-btcusd-store",
+                            ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True, holdout_days=30, train_days=60,
+                            test_days=30, default_params={"fast": 20, "slow": 100}, use_holdout=True,
+                            register=TrialsRegister(store), locks=HoldoutLocks(store))
+    assert calls["n"] and store.holdout_locks()[0]["status"] == "crashed"

@@ -67,7 +67,9 @@ class HoldoutLocks:
         held = self.lock(idea_hash, underlying)
         if held is not None:
             when = _ts(held["opened_at"])
-            return (f"this idea's holdout on {underlying.upper()} was opened on {when:%d %b %Y}, and a second look "
+            how = {"crashed": "spent by a crash", "claimed": "claimed by a study still running"}.get(
+                held.get("status"), "opened")
+            return (f"this idea's holdout on {underlying.upper()} was {how} on {when:%d %b %Y}, and a second look "
                     "can't be fresh")
         start, end = _ts(start), _ts(end)
         seen = [t for t in self.store.trials(idea_hash) if t["stage"] != "holdout"]
@@ -102,12 +104,16 @@ class HoldoutLocks:
         one must not look. A look that fails after the claim has still spent the holdout."""
         return self.store.add_holdout_lock({
             "id": lock_id(idea_hash, underlying), "idea_hash": idea_hash, "underlying": underlying,
-            "period_start": _ts(start), "period_end": _ts(end), "source": "study",
+            "period_start": _ts(start), "period_end": _ts(end), "source": "study", "status": "claimed",
         })
 
-    def link_trial(self, idea_hash: str, underlying: str, trial_id: str) -> None:
-        """Name the trial the look produced, once it exists."""
-        self.store.link_holdout_trial(lock_id(idea_hash, underlying), trial_id)
+    def settle(self, idea_hash: str, underlying: str, trial_id: str | None) -> None:
+        """The look produced a result: the lock is opened, naming its trial."""
+        self.store.settle_holdout_lock(lock_id(idea_hash, underlying), "opened", trial_id)
+
+    def crashed(self, idea_hash: str, underlying: str) -> None:
+        """The look failed after the claim: the holdout is spent, and the record says it crashed, not failed."""
+        self.store.settle_holdout_lock(lock_id(idea_hash, underlying), "crashed")
 
     def import_ledger(self, path: str | Path) -> int:
         """Lock every holdout the old idea counter records as opened. Dates were not kept, so the period is

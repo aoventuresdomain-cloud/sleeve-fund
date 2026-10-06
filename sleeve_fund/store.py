@@ -435,9 +435,13 @@ holdout_locks_t = Table(
     # Not a foreign key, as trials.backtest_id: the opening is kept even when its trial row is not there.
     Column("trial_id", String(16)),
     Column("source", String(16), nullable=False),
+    # claimed before the look, opened once it produced a result, crashed when the look failed after the claim:
+    # spent either way, but a crash is not a failed result (Advisor and Head of Engineering, 6 Oct 2026).
+    Column("status", String(16), nullable=False, server_default="opened"),
     UniqueConstraint("idea_hash", "underlying", name="holdout_locks_idea_underlying"),
 )
 HOLDOUT_SOURCES = ("study", "ledger_import")
+HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
 TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
@@ -1473,7 +1477,9 @@ class Store:
         underlying: the first opening is the only one."""
         if row["source"] not in HOLDOUT_SOURCES:
             raise ValueError(f"a holdout lock's source is one of {HOLDOUT_SOURCES}, got {row['source']!r}")
-        row = {"period_start": None, "period_end": None, "trial_id": None, **row,
+        if row.get("status", "opened") not in HOLDOUT_STATUSES:
+            raise ValueError(f"a holdout lock's status is one of {HOLDOUT_STATUSES}, got {row['status']!r}")
+        row = {"period_start": None, "period_end": None, "trial_id": None, "status": "opened", **row,
                "underlying": row["underlying"].upper(), "opened_at": row.get("opened_at") or utcnow()}
         try:
             with self.engine.begin() as c:
@@ -1489,12 +1495,15 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(holdout_locks_t.c.opened_at)))
 
-    def link_holdout_trial(self, lock_id: str, trial_id: str) -> None:
-        """Name the trial a holdout lock's one look produced. The lock is claimed before the look, so the trial
-        is named after; a link already made is never changed."""
+    def settle_holdout_lock(self, lock_id: str, status: str, trial_id: str | None = None) -> None:
+        """Record how a claimed look ended: opened, naming the trial it produced, or crashed. Only a claimed lock
+        changes, so a settled one is never rewritten."""
+        if status not in ("opened", "crashed"):
+            raise ValueError(f"a claimed holdout settles as opened or crashed, got {status!r}")
         with self.engine.begin() as c:
             c.execute(update(holdout_locks_t).where(holdout_locks_t.c.id == lock_id,
-                                                    holdout_locks_t.c.trial_id.is_(None)).values(trial_id=trial_id))
+                                                    holdout_locks_t.c.status == "claimed")
+                      .values(status=status, trial_id=trial_id))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

@@ -25,6 +25,7 @@ def upgrade() -> None:
     sa.Column('opened_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('trial_id', sa.String(length=16), nullable=True),
     sa.Column('source', sa.String(length=16), nullable=False),
+    sa.Column('status', sa.String(length=16), server_default='opened', nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('idea_hash', 'underlying', name='holdout_locks_idea_underlying')
     )

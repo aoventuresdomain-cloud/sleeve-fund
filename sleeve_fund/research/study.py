@@ -493,13 +493,14 @@ def run_study(
             result.holdout_benchmark = summary(hb_ret)
         except Exception:
             if locks is not None:
-                # The lock was claimed before the look, so the holdout is spent: say it was a crash, not a result.
+                # The lock was claimed before the look, so the holdout is spent: recorded as a crash, not a result.
+                locks.crashed(idea_hash, underlying)
                 log_.error("holdout of %s on %s spent by a crash, not a failed result: the lock stays", spec.name,
                            underlying)
             raise
         trial = log(chosen, "holdout", result.holdout["sharpe"], prices.iloc[-holdout_bars:])
-        if locks is not None and trial:
-            locks.link_trial(idea_hash, underlying, trial)
+        if locks is not None:
+            locks.settle(idea_hash, underlying, trial)
     return result
 
 
