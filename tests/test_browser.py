@@ -331,7 +331,7 @@ def test_the_strategys_recorded_indicators_are_drawn_with_warm_up_marked_and_not
     assert "EMA(10)" in legend
     assert page.locator(".pc-sub").count() == 1 and "RSI(14)" in page.inner_text(".pc-sub-legend")
     note = page.inner_text(".pc-strat-note")
-    assert "Shaded: warming up, the model can't trade here" in note
+    assert "Shaded: the model's indicators were still warming up; any trade here is marked unsettled" in note
     assert errors == []
     ctx.close()
 
@@ -459,4 +459,23 @@ def test_recorded_decisions_are_drawn_once_each_on_closed_candles_and_never_ahea
     drawn = json.loads(page.get_attribute(".pc-canvas", "data-decisions"))
     assert drawn == {"fills": 1, "missed": 2}
     assert errors == []
+    ctx.close()
+
+
+def test_the_warm_up_shading_follows_the_models_own_lines_not_ones_the_pm_adds(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    t = [c["time"] for c in fixture["candles"]]
+    fixture["indicators"][0]["shown"] = True
+    fixture["indicators"][1]["shown"] = False
+    fixture["indicators"][1]["settled_from"] = t[30] + 86400  # a slow line the PM has not turned on
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert page.get_attribute(".pc-canvas", "data-warm") == "10"
     ctx.close()

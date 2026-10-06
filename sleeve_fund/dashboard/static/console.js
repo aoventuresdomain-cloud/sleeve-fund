@@ -486,10 +486,11 @@ window.Console = (() => {
         });
         build();
       }
-      // The span before every drawn line has settled: the model can't trade there, so it is shaded and said so.
-      const iv = d.interval * 60, settled = list.map((i) => i.settled_from).filter(Number.isFinite);
+      // The span before the model's own lines (not ones the PM added) have settled is shaded; trades there are marked unsettled.
+      const iv = d.interval * 60, settled = list.filter((i) => i.shown !== false).map((i) => i.settled_from).filter(Number.isFinite);
       const until = settled.length ? Math.max(...settled) : null;
-      warmBand.setData(until == null ? [] : d.candles.filter((c) => c.time + iv < until).map((c) => ({time: c.time, value: 1})));
+      const shaded = until == null ? [] : d.candles.filter((c) => c.time + iv < until).map((c) => ({time: c.time, value: 1}));
+      warmBand.setData(shaded); $(".pc-canvas").dataset.warm = String(shaded.length);
       // Plain words about what is drawn: warm-up, a candle size the points don't sit on, and the lines left off.
       const note = $(".pc-strat-note"), offered = $(".pc-strat-more");
       if (!note) return;
@@ -500,7 +501,7 @@ window.Console = (() => {
         const gap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
         if (gap && !i.tf && gap !== d.interval * 60) said.push(`${i.label} is recorded on ${Math.round(gap / 60)}-minute candles, so it shows only on that interval.`);
       });
-      if (until != null && d.candles.some((c) => c.time + iv < until)) said.push("Shaded: warming up, the model can't trade here. Dashed lines were not settled.");
+      if (until != null && d.candles.some((c) => c.time + iv < until)) said.push("Shaded: the model's indicators were still warming up; any trade here is marked unsettled. Dashed lines were not settled.");
       if (d.indicators_note) said.unshift(d.indicators_note);  // the platform's own sentence when it has nothing to draw
       note.textContent = said.join(" "); note.hidden = !said.length;
       if (offered) {
