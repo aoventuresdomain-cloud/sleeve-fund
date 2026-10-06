@@ -406,15 +406,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError(f"account: {account} is retired")
             if kinds[account] == "live":  # the shell's live lock: nothing trades real money before G2
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
+            trial, uncounted = _trial(_strategy_run, st(), cfg, strategy, params, cfg.risk_profile,
+                                      fallback={"strategy": strategy, "params": params, "source": "strategy"})
             st().create_sleeve(name=name, strategy=strategy, instrument=cfg.instrument, bar_spec=cfg.bar_spec,
                                starting_balance=cfg.starting_balance, params=params,
                                risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars,
-                               venue=to_store_kwargs(cfg)["venue"])
+                               venue=to_store_kwargs(cfg)["venue"], trial=trial)
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
-            made = st().sleeve(name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, _strategy_run, st(), made, source="strategy",
-                     strategy=made.strategy, params=made.params)
+            _uncounted_event(st(), name, f"strategy {name}", uncounted)
             if needed > cfg.warmup_bars:
                 # A warning (an alert) when the most that can load falls short; a note when it was chosen.
                 st().event(name, "warning" if auto else "info", "warmup_short",
@@ -751,12 +751,12 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("nothing changed")
             cap = MAX_STORED_WARMUP_BARS if s.bar_spec.endswith("INTERNAL") else MAX_WARMUP_BARS
             warmup = max(s.warmup_bars, min(cap, exit_warmup(params)))
-            restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup)
+            trial, uncounted = _trial(_strategy_run, st(), cfg, s.strategy, params, profile,
+                                      fallback={"strategy": s.strategy, "params": params, "source": "strategy"})
+            restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup, trial=trial)
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
-            made = st().sleeve(name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, _strategy_run, st(), made, source="strategy",
-                     strategy=made.strategy, params=made.params)
+            _uncounted_event(st(), name, f"strategy {name}", uncounted)
             exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
             # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
             st().event(name, "info", "exits_change" if exits_changed else "settings_change",
@@ -1471,40 +1471,44 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
+    trial, uncounted = _trial(_backtest_run, store, args, result, run_id,
+                              fallback={"strategy": args["strategy"], "params": args["params"], "source": "backtest"})
+    # One transaction: a backtest is never saved uncounted, nor counted unsaved (QA P1-T8).
     store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
-                        bar_spec=args["bar_spec"])
-    _counted(store, None, f"backtest {args['title']!r}", _count_backtest, _backtest_run, store, args, result, run_id,
-             source="backtest", strategy=args["strategy"], params=args["params"])
+                        bar_spec=args["bar_spec"], trial=trial)
+    _uncounted_event(store, None, f"backtest {args['title']!r}", uncounted)
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
 
 
-def _counted(store: Store, sleeve: str | None, what: str, count, run, *args, source: str, strategy: str,
-             params: dict) -> None:
-    """Count a run in the trials register without letting a failure undo or fail the work being counted: the
-    backtest is already saved, the strategy already created (Code Reviewer, #154). The run is then recorded
-    against its idea as a failed row, which still counts as a variant tried, so the idea's count never goes
-    silently low (QA P1-T8); an error event shows the gap on the dashboard. run(*args) gives the run's variant
-    and dataset, so the failed row joins its variant (Data Architect); the strategy, params and source stand in
-    when even that fails."""
+def _trial(run, *args, fallback: dict) -> tuple[dict, Exception | None]:
+    """A run's row for the trials register, written by the caller in the same transaction as the run's own save
+    (QA P1-T8, Head of Engineering), so a failed write loses both and the request says so. run(*args) gives the
+    run's key and result. If working that out raises, the run is not lost for it (Data Architect): it gets a
+    failed row, which still counts as a variant tried and keeps G1 from judging its idea until it is re-counted
+    (Advisor), keyed as its variant where the key itself was worked out, else by `fallback` (strategy, params,
+    source). Returns the row and the error, if any."""
+    from sleeve_fund.research.trials import failed_row, model_run_row
+
+    key = None
     try:
-        count(*args)
-    except Exception as exc:  # noqa: BLE001 - any failure here must not reach the caller
-        logging.getLogger(__name__).exception(f"couldn't count {what} in the trials register")
-        try:
-            try:
-                key = run(*args)
-            except Exception:  # noqa: BLE001 - the variant can't be worked out: recorded by its settings alone
-                key = {"strategy": strategy, "params": params, "source": source}
-            TrialsRegister(store).record_failed(
-                strategy=key["strategy"], params=key["params"], source=key["source"], error=repr(exc),
-                setup=key.get("setup"), dataset=key.get("dataset"), backtest_id=key.get("backtest_id"))
-            kept = "it is recorded against its idea as a failed run, which still counts as a variant tried"
-        except Exception as again:  # noqa: BLE001
-            logging.getLogger(__name__).exception(f"couldn't record {what} as a failed run either")
-            kept = f"recording it as a failed run failed too ({again!r}), so its idea's count is short by one"
+        key = run(*args)
+        return model_run_row(**key), None
+    except Exception as exc:  # noqa: BLE001 - any failure here must not lose the run
+        logging.getLogger(__name__).exception("couldn't work out a run's row for the trials register")
+        keyed = key or fallback
+        return failed_row(strategy=keyed["strategy"], params=keyed["params"], source=keyed["source"], error=repr(exc),
+                          setup=keyed.get("setup"), dataset=keyed.get("dataset"),
+                          backtest_id=keyed.get("backtest_id")), exc
+
+
+def _uncounted_event(store: Store, sleeve: str | None, what: str, exc: Exception | None) -> None:
+    """Show on the dashboard that a run went into the trials register as failed (QA P1-T8)."""
+    if exc is not None:
         store.event(sleeve, "error", "trials_count_failed",
-                    f"The {what} ran but wasn't counted in the trials register ({exc!r}); {kept}")
+                    f"The {what} was saved, but its count in the trials register failed ({exc!r}), so it is recorded "
+                    "against its idea as a failed run: it still counts as a variant tried, and G1 won't judge the "
+                    "idea until it is re-counted")
 
 def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None:
     """Every backtest is a variant tried: the trials register counts it, so a setting picked from many runs is
@@ -1533,24 +1537,16 @@ def _backtest_run(store: Store, args: dict, result: dict, run_id: str) -> dict:
                 trades=(result.get("trades") or {}).get("trades"))
 
 
-def _count_strategy(store: Store, s) -> None:
-    """A paper strategy created, cloned or re-set is a variant chosen to run: counted, with no Sharpe yet."""
-    from sleeve_fund.research.trials import record_model_run
-
-    record_model_run(store, **_strategy_run(store, s))
-
-
-def _strategy_run(store: Store, s) -> dict:
-    """A paper strategy as the register keys it: its variant and its dataset."""
-    from sleeve_fund.paper.config import from_store
+def _strategy_run(store: Store, cfg, strategy: str, params: dict, risk_profile: str) -> dict:
+    """A paper strategy created, cloned or re-set, as the register keys it: a variant chosen to run, counted with
+    no Sharpe yet. cfg is its paper config (venue, instrument, bars and fees)."""
     from sleeve_fund.research.run import dataset_name
     from sleeve_fund.research.trials import run_setup
 
-    cfg = from_store(s)
     fee = float(cfg.fees.taker) + resolve_spread(cfg.venue, cfg.instrument, store).half_spread
-    return dict(strategy=s.strategy, params=s.params, source="strategy",
-                setup=run_setup(risk_profile=s.risk_profile, fee=fee),
-                dataset=dataset_name(_venue_name(s.venue), s.instrument, spec_minutes(s.bar_spec)))
+    return dict(strategy=strategy, params=params, source="strategy",
+                setup=run_setup(risk_profile=risk_profile, fee=fee),
+                dataset=dataset_name(_venue_name(cfg.venue), cfg.instrument, spec_minutes(cfg.bar_spec)))
 
 
 LOST_JOB = ("that run is no longer known, most likely because the server restarted while it ran; "

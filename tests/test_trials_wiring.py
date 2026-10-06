@@ -58,8 +58,8 @@ def test_a_counting_failure_is_an_error_event_and_loses_neither_the_backtest_nor
         raise KeyError("from")
 
     c, store = client
-    monkeypatch.setattr(appmod, "_count_backtest", broken)
-    monkeypatch.setattr(appmod, "_count_strategy", broken)
+    monkeypatch.setattr(appmod, "_backtest_run", broken)
+    monkeypatch.setattr(appmod, "_strategy_run", broken)
     preview._history.clear()
     monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
     before = len(store.backtests())
@@ -401,18 +401,69 @@ def test_a_failed_count_then_a_good_one_is_one_variant(tmp_path, monkeypatch):
               "strategy": {"sharpe": 1.0}, "trades": {"trades": 10}}
     idea, register = legacy_idea_hash("trend_filter"), trialsmod.TrialsRegister(store)
 
-    def count(*a):
-        appmod._counted(store, None, "backtest 't'", appmod._count_backtest, appmod._backtest_run, store, args,
-                        result, "r1", source="backtest", strategy="trend_filter", params=args["params"])
+    def count():
+        row, exc = appmod._trial(appmod._backtest_run, store, args, result, "r1",
+                                 fallback={"strategy": "trend_filter", "params": args["params"], "source": "backtest"})
+        store.add_trials([row])
+        return exc
 
-    good = trialsmod.TrialsRegister.record
-    monkeypatch.setattr(trialsmod.TrialsRegister, "record", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
-    count()
-    count()  # the same run failing again
+    good = trialsmod.model_run_row
+    monkeypatch.setattr(trialsmod, "model_run_row", lambda **k: (_ for _ in ()).throw(ValueError("metrics")))
+    assert count() is not None and count() is not None  # the same run failing twice
     assert register.failed(idea) == 2 and register.counts(idea)["variants"] == 1
-    monkeypatch.setattr(trialsmod.TrialsRegister, "record", good)
-    count()
+    monkeypatch.setattr(trialsmod, "model_run_row", good)
+    assert count() is None
     rows = store.trials(idea)
     assert [r["status"] for r in rows].count("ok") == 1 and register.counts(idea)["variants"] == 1
     assert len({(r["definition_hash"], r["dataset"]) for r in rows}) == 1  # the failures join their twin
     assert {r["backtest_id"] for r in rows} == {"r1"}
+
+
+def _journal():
+    from sleeve_fund.paper.journal import MemoryJournal
+
+    j = MemoryJournal()
+    j.create_sleeve(name="bt", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                    starting_balance=10_000)
+    return j
+
+
+def _row(source="backtest"):
+    from sleeve_fund.research.trials import model_run_row, run_setup
+
+    return model_run_row(strategy="trend_filter", params={"fast": 5}, dataset="d", source=source,
+                         setup=run_setup(risk_profile="balanced", fee=0.001))
+
+
+def test_a_trial_write_failure_loses_the_save_too_and_says_so(tmp_path, monkeypatch, client):
+    """Head of Engineering, QA P1-T8: the save and its trial row are one transaction, so a failed write leaves
+    neither, and the request reports an error rather than a run that silently went uncounted."""
+    from sleeve_fund import store as storemod
+
+    store = _store(tmp_path)
+
+    def broken(c, rows):
+        raise OSError("trials write failed")
+
+    monkeypatch.setattr(storemod, "_put_trials", broken)
+    with pytest.raises(OSError):
+        store.save_backtest(_journal(), run_id="a1", key="k", title="t", query="", result={}, trial=_row())
+    with pytest.raises(OSError):
+        store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                            starting_balance=1000, trial=_row("strategy"))
+    assert not store.backtests() and not store.trials() and not store.sleeves(include_backtests=True)
+    c, live = client
+    with pytest.raises(OSError):  # the request fails as a server error: nothing made, nothing counted
+        _new(c)
+    assert not [s for s in live.sleeves() if s.name == "btc-test"] and not live.trials()
+
+
+def test_a_failed_save_writes_no_trial_row(tmp_path):
+    """Head of Engineering, QA P1-T8: a backtest whose save fails leaves no trial behind."""
+    from sqlalchemy.exc import IntegrityError
+
+    store = _store(tmp_path)
+    store.save_backtest(_journal(), run_id="a1", key="k", title="t", query="", result={}, trial=_row())
+    with pytest.raises(IntegrityError):  # the same run id again: the save itself fails
+        store.save_backtest(_journal(), run_id="a1", key="k", title="t", query="", result={}, trial=_row())
+    assert len(store.backtests()) == 1 and len(store.trials()) == 1

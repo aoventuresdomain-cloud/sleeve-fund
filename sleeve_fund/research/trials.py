@@ -50,22 +50,11 @@ class TrialsRegister:
     def __init__(self, store: Store) -> None:
         self.store = store
 
-    def record(self, *, definition_hash: str, idea_hash: str, name: str, family: str, settings: dict, dataset: str,
-               stage: str, source: str, sharpe: float | None, trades: int | None = None,
-               oos_trades: int | None = None, backtest_id: str | None = None, row_id: str | None = None,
-               data_start=None, data_end=None) -> str:
-        """Add one evaluation, over the bars from data_start to data_end. Returns its id. row_id, when given, is
-        kept, so a row recorded twice (a study that also writes the idea counter) counts once."""
-        row_id = row_id or secrets.token_hex(8)
-        self.store.add_trials([{
-            "id": row_id, "definition_hash": definition_hash, "idea_hash": idea_hash, "code_version": code_version(),
-            "definition_name": name, "family": family, "settings": json.dumps(settings, sort_keys=True),
-            "dataset": dataset, "stage": stage, "source": source, "sharpe": _finite(sharpe), "trades": trades,
-            "oos_trades": oos_trades, "backtest_id": backtest_id, "data_start": data_start, "data_end": data_end,
-            # To the microsecond, so a variant's latest evaluation is known even within a second (sharpes()).
-            "created_at": datetime.now(timezone.utc),
-        }])
-        return row_id
+    def record(self, **kwargs) -> str:
+        """Add one evaluation (see trial_row). Returns its id."""
+        row = trial_row(**kwargs)
+        self.store.add_trials([row])
+        return row["id"]
 
     def _counted(self, idea_hash: str | None = None) -> list[dict]:
         """Every evaluation that counts: not benchmarks, and not runs deliberately marked as engineering
@@ -89,31 +78,11 @@ class TrialsRegister:
         says how far that count rests on rows with no result."""
         return sum(1 for t in self._counted(idea_hash) if t["status"] == "failed")
 
-    def record_failed(self, *, strategy: str, params: dict, source: str, error: str, setup: dict | None = None,
-                      dataset: str | None = None, backtest_id: str | None = None) -> str:
-        """Record, against its idea, a run whose count failed (QA P1-T8): its own source, its settings and the
-        error. It has no Sharpe, trades or dates, so it counts as a variant tried and a holdout treats the idea as
-        having read undated data: the safe side on both. With the run's setup and dataset it is keyed as its
-        variant, so a retry that counts joins it rather than adding one (Data Architect); without them, by its
-        strategy and settings alone, so the same failing run retried is still one variant."""
-        try:
-            from sleeve_fund.research.run import spec_of
-
-            family = spec_of(strategy).family
-        except ValueError:
-            family = "unknown"
-        definition = (legacy_definition_hash(strategy, params, setup) if setup is not None else
-                      content_hash({"unkeyed": strategy, "params": params}))
-        row_id = secrets.token_hex(8)
-        self.store.add_trials([{
-            "id": row_id, "definition_hash": definition, "idea_hash": legacy_idea_hash(strategy),
-            "code_version": code_version(), "definition_name": strategy, "family": family,
-            "settings": json.dumps({"params": params}, sort_keys=True), "dataset": dataset or "unknown",
-            "stage": "in_sample", "source": source, "sharpe": None, "trades": None, "oos_trades": None,
-            "backtest_id": backtest_id, "status": "failed", "error": error,
-            "created_at": datetime.now(timezone.utc),
-        }])
-        return row_id
+    def record_failed(self, **kwargs) -> str:
+        """Add a run whose count failed (see failed_row). Returns its id."""
+        row = failed_row(**kwargs)
+        self.store.add_trials([row])
+        return row["id"]
 
     def ideas_by_family(self) -> dict[str, int]:
         """How many ideas each family (trend, breakout...) holds, project-wide."""
@@ -164,28 +133,71 @@ class TrialsRegister:
         return self.store.add_trials(rows)
 
 
-def record_model_run(store: Store, *, strategy: str, params: dict, dataset: str, source: str, setup: dict,
-                     sharpe: float | None = None, data_start=None, data_end=None, backtest_id: str | None = None,
-                     trades: int | None = None) -> str:
-    """Count one run of a hand-coded model outside a study: a backtest, or a paper strategy created, cloned or
-    re-set (QA P1-T1). Each is a variant tried, so the deflated Sharpe's N counts it. The whole run reads every
-    bar it was given, so it is in-sample."""
+def record_model_run(store: Store, **kwargs) -> str:
+    """Count one run of a hand-coded model outside a study (see model_run_row). Returns its id."""
+    row = model_run_row(**kwargs)
+    store.add_trials([row])
+    return row["id"]
+
+
+def model_run_row(*, strategy: str, params: dict, dataset: str, source: str, setup: dict,
+                  sharpe: float | None = None, data_start=None, data_end=None, backtest_id: str | None = None,
+                  trades: int | None = None) -> dict:
+    """One run of a hand-coded model outside a study, as a trials row: a backtest, or a paper strategy created,
+    cloned or re-set (QA P1-T1). Each is a variant tried, so the deflated Sharpe's N counts it. The whole run
+    reads every bar it was given, so it is in-sample."""
     if source == "strategy" and data_end is None:
         # Chosen having seen everything up to the moment it was made or edited (Advisor, 6 Oct 2026, QA P1-T4 and
         # P1-T7): it read from the open start to then, so no holdout before that is unseen. Watching it trade
         # afterwards reads nothing new into the choice; each edit is a new row, dated again.
         data_start, data_end = OPEN_START, datetime.now(timezone.utc)
+    return trial_row(
+        definition_hash=legacy_definition_hash(strategy, params, setup), idea_hash=legacy_idea_hash(strategy),
+        name=strategy, family=_family(strategy), settings=params, dataset=dataset, stage="in_sample", source=source,
+        sharpe=sharpe, trades=trades, backtest_id=backtest_id, data_start=data_start, data_end=data_end)
+
+def trial_row(*, definition_hash: str, idea_hash: str, name: str, family: str, settings: dict, dataset: str,
+              stage: str, source: str, sharpe: float | None, trades: int | None = None, oos_trades: int | None = None,
+              backtest_id: str | None = None, row_id: str | None = None, data_start=None, data_end=None) -> dict:
+    """One evaluation, over the bars from data_start to data_end, as a trials row. row_id, when given, is kept, so
+    a row recorded twice (a study that also writes the idea counter) counts once."""
+    return {
+        "id": row_id or secrets.token_hex(8), "definition_hash": definition_hash, "idea_hash": idea_hash,
+        "code_version": code_version(), "definition_name": name, "family": family,
+        "settings": json.dumps(settings, sort_keys=True), "dataset": dataset, "stage": stage, "source": source,
+        "sharpe": _finite(sharpe), "trades": trades, "oos_trades": oos_trades, "backtest_id": backtest_id,
+        "data_start": data_start, "data_end": data_end,
+        # To the microsecond, so a variant's latest evaluation is known even within a second (sharpes()).
+        "created_at": datetime.now(timezone.utc),
+    }
+
+
+def failed_row(*, strategy: str, params: dict, source: str, error: str, setup: dict | None = None,
+               dataset: str | None = None, backtest_id: str | None = None) -> dict:
+    """A run whose count failed (QA P1-T8), as a trials row: its own source, its settings and the error. It has
+    no Sharpe, trades or dates, so it counts as a variant tried and a holdout treats the idea as having read
+    undated data: the safe side on both. With the run's setup and dataset it is keyed as its variant, so a retry
+    that counts joins it rather than adding one (Data Architect); without them, by its strategy and settings
+    alone, so the same failing run retried is still one variant."""
+    definition = (legacy_definition_hash(strategy, params, setup) if setup is not None else
+                  content_hash({"unkeyed": strategy, "params": params}))
+    return {
+        "id": secrets.token_hex(8), "definition_hash": definition, "idea_hash": legacy_idea_hash(strategy),
+        "code_version": code_version(), "definition_name": strategy, "family": _family(strategy),
+        "settings": json.dumps({"params": params}, sort_keys=True), "dataset": dataset or "unknown",
+        "stage": "in_sample", "source": source, "sharpe": None, "trades": None, "oos_trades": None,
+        "backtest_id": backtest_id, "status": "failed", "error": error, "created_at": datetime.now(timezone.utc),
+    }
+
+
+def _family(strategy: str) -> str:
     try:
         from sleeve_fund.research.run import spec_of
 
-        family = spec_of(strategy).family
+        return spec_of(strategy).family
     except ValueError:
-        family = "unknown"
-    return TrialsRegister(store).record(
-        definition_hash=legacy_definition_hash(strategy, params, setup), idea_hash=legacy_idea_hash(strategy),
-        name=strategy,
-        family=family, settings=params, dataset=dataset, stage="in_sample", source=source, sharpe=sharpe,
-        trades=trades, backtest_id=backtest_id, data_start=data_start, data_end=data_end)
+        return "unknown"
+
 
 
 def _variant(t: dict) -> tuple:
