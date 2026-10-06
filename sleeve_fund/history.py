@@ -567,16 +567,26 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         from sleeve_fund import funding
 
         try:
+            flags = lambda: (funding.gaps(profile.name, pair, root),  # noqa: E731
+                             funding.interval_changes(profile.name, pair, root))
+            was_missed, was_maybe = flags()
             kept = funding.refresh(profile.name, pair, root=root, since=since)
             funding_to = kept.index[-1] if len(kept) else None
-            missed, maybe = funding.gaps(profile.name, pair, root), funding.interval_changes(profile.name, pair, root)
-            if missed or maybe:  # in the hub's log (the status workflow) and, once a day, the alerts inbox (QA P1-O11)
+            missed, maybe = flags()
+            if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
-                problem = (f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
-                           + "".join(f"; missed between {span(g)}" for g in missed)
-                           + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
-                print(problem)
-                _alert(f"{profile.name} {pair}: funding", "warning", "funding_gap", problem)
+                print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
+                      + "".join(f"; missed between {span(g)}" for g in missed)
+                      + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
+                # The alerts inbox only what this pass found new (QA P1-O11, Code Reviewer): old holes never clear,
+                # so alerting on the whole history would repeat it every day and on every restart.
+                new_missed = [g for g in missed if g not in was_missed]
+                new_maybe = [g for g in maybe if g not in was_maybe]
+                if new_missed or new_maybe:
+                    _alert(f"{profile.name} {pair}: funding", "warning", "funding_gap",
+                           f"{profile.name} {pair}: funding: new since the last pass"
+                           + "".join(f"; missed between {span(g)}" for g in new_missed)
+                           + "".join(f"; possible hole at interval change {span(g)}" for g in new_maybe))
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)

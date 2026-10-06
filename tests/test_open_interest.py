@@ -379,10 +379,12 @@ def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_a_day_and_t
             sent.append((level, kind, message))
     monkeypatch.setattr("sleeve_fund.store.Store", Inbox)
     history._warned.clear()
-    for _ in range(2):
-        _refresh_funding(profile, "BTC/USDT", tmp_path, None)
-    assert [(level, kind) for level, kind, _ in sent] == [("warning", "funding_gap")]  # once a day
-    assert "1 missed settlement" in sent[0][2] and "possible hole at interval change" in sent[0][2]
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [(level, kind) for level, kind, _ in sent] == [("warning", "funding_gap")]
+    assert "missed between 2026-10-01 16:00" in sent[0][2] and "possible hole at interval change" in sent[0][2]
+    history._warned.clear()  # as after a restart: a pass that finds nothing new raises nothing (Code Reviewer)
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert len(sent) == 1
 
     from sleeve_fund.dashboard.app import _funding_health
     health = _funding_health("BINANCE", "BTC/USDT", tmp_path, None)
