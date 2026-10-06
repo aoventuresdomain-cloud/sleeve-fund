@@ -991,7 +991,8 @@ def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_th
     rate = efill["fee"] / (efill["qty"] * efill["price"])  # the taker fee and the half spread, as the entry paid
     assert fill["fee"] == pytest.approx(qty * level * rate, abs=CENT)  # the fee alone, on the target's price
     report = res.fills.loc[tp["order_id"]]
-    assert float(report["avg_px"]) == pytest.approx(level * (1 - side * HALF), abs=0.01)  # the spread moved in
+    # The spread moved into the price, with the cent the fee's rounding left (QA m-G7).
+    assert float(report["avg_px"]) == pytest.approx(level * (1 - side * HALF), abs=CENT / qty)
     pnl = side * qty * (level - efill["price"]) - efill["fee"] - fill["fee"]
     assert float(res.equity.iloc[-1]) == pytest.approx(10_000 + pnl, abs=2 * CENT)
 
