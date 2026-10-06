@@ -116,6 +116,29 @@ def funding_times(after: datetime, until: datetime, hours: tuple[int, ...]) -> l
     return out
 
 
+def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], settled=None) -> list[datetime]:
+    """The funding settlements in (after, until], oldest first, to the minute. With the venue's settled rates
+    (`settled`, indexed by settlement time), its own times: a symbol moved from 8-hourly to 4- or 1-hourly
+    settlements pays every one (QA P1-O1). Past the newest record, the venue's latest interval carries on from
+    it (paper, before the venue publishes the next rate); before the first record, and with no records, the
+    venue profile's fixed `hours`."""
+    if settled is None or len(settled) == 0:
+        return funding_times(after, until, hours)
+    idx = settled.index.round("min")
+    first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
+    out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
+    out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
+    if until > last and len(idx) > 1:
+        step = (idx[-1] - idx[-2]).to_pytimedelta()
+        if step > timedelta(0):
+            t = last + step
+            while t <= until:
+                if t > after:
+                    out.append(t)
+                t += step
+    return sorted(set(out))
+
+
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
     """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
     opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the

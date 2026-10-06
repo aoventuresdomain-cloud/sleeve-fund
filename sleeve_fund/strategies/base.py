@@ -400,6 +400,12 @@ class LongFlatStrategy(Strategy):
         self._restore_id: str | None = None
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
+        # Perp: the position and the last trade price held at each hour's start, as the first event past it
+        # found them (_snap_settlements), so funding charges the position held at the settlement instant, not
+        # at the tick that charges it (QA P1-O2). Settlements fall on the hour; the last few days are kept.
+        self._held_at: dict[int, tuple[float, float]] = {}
+        self._snap_ns: int | None = None
+        self._settled = None  # backtest: the venue's settled rates, loaded once
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
         self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
         # (time, amount) for every shortfall the venue's insurance fund took past the bankruptcy price
@@ -624,6 +630,7 @@ class LongFlatStrategy(Strategy):
     def on_trade(self, tick) -> None:
         if self.recorder is not None:
             self.recorder.trade(tick)
+        self._snap_settlements(tick.ts_event)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
         if self._restore is not None:
@@ -657,6 +664,7 @@ class LongFlatStrategy(Strategy):
     def _on_exec_bar(self, bar: Bar) -> None:
         """Backtest: value the book and run the risk guard on every execution bar, so a halt or a
         daily-loss pause fires within the decision bar, as paper's 30-second ticks would."""
+        self._snap_settlements(bar.ts_event, bar.close.as_double())
         self._last_close = bar.close.as_double()
         if self._margin:
             self._intrabar_guard(bar)
@@ -1245,6 +1253,7 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
+        self._snap_settlements(bar.ts_event, bar.close.as_double())
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
@@ -1889,35 +1898,99 @@ class LongFlatStrategy(Strategy):
                                      ts=self.runtime.now())
         self.submit_order(order)
 
+    HOUR_NS = 3_600_000_000_000
+    HELD_KEPT = 72  # hours of positions at settlement kept: a paper restart settles longer gaps at the tick
+
+    def _snap_settlements(self, event_ns: int, event_close: float | None = None) -> None:
+        """Perp: before an event (a trade, a bar or a tick) changes anything, note the position and price held at
+        each hour's start since the last event: nothing traded or filled in between, so they are what was held
+        at that instant. The price is the last trade before the hour: a bar closing on the hour carries it as its
+        close; a trade at or after the hour leaves the one before it (so paper and backtest mark alike)."""
+        if not self._margin:
+            return
+        last, self._snap_ns = self._snap_ns, max(event_ns, self._snap_ns or 0)
+        if last is None or event_ns <= last:
+            return
+        hour = (last // self.HOUR_NS + 1) * self.HOUR_NS
+        if hour > event_ns:
+            return
+        qty, prev = self._net_position()[0], (self._last_close or self._price())
+        while hour <= event_ns:
+            px = event_close if (hour == event_ns and event_close is not None) else prev
+            self._held_at[hour] = (qty, px)
+            hour += self.HOUR_NS
+        if len(self._held_at) > self.HELD_KEPT:
+            for k in sorted(self._held_at)[:-self.HELD_KEPT]:
+                del self._held_at[k]
+
+    def _settlements(self, terms, since: datetime, now: datetime) -> list[datetime]:
+        """The settlements in (since, now]: the venue's own times where its terms name a venue with settled
+        rates, else the profile's fixed hours (markets.settlement_times)."""
+        settled = None
+        if terms.funding_venue is not None:
+            from sleeve_fund import funding
+
+            if self._backtest:
+                if self._settled is None:
+                    self._settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
+                settled = self._settled
+            else:
+                settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
+        return markets.settlement_times(since, now, terms.funding_hours, settled)
+
+    # Paper rescans this far back, so a settlement the venue publishes late, at a time the schedule didn't
+    # foresee (a change of interval), is still charged when its record arrives.
+    FUNDING_LOOKBACK = timedelta(hours=1)
+
     def _apply_funding(self, price: float) -> None:
-        """Exchange the perp's funding for every funding time since the last settlement while a position
-        is held: a long pays position x price x rate, a short receives it (negative rates the other way).
-        Booked to cash and journaled, so equity, the journal and reconciliation all carry it."""
+        """Exchange the perp's funding for every settlement since the last one charged: a long pays position x
+        price x rate, a short receives it (negative rates the other way). The settlements are the venue's own
+        (QA P1-O1), and each charges the position held at that instant and the last trade price before it
+        (_held_at, QA P1-O2), in paper as in backtest. Booked to cash and journaled, so equity, the journal and
+        reconciliation all carry it."""
         terms = self._cfg.perp
         if terms is None or price <= 0:
             return
         now = self.clock.utc_now()
-        since, self._funding_since = self._funding_since, now
+        since = self._funding_since
         if since is None:
+            self._funding_since = now
             return
-        qty = self._net_position()[0]
-        if qty == 0:
+        if int(now.timestamp()) // 3600 * 3600 <= since.timestamp():
+            return  # no hour's start in (since, now]: settlements fall on the hour
+        times = self._settlements(terms, since, now)
+        held = [(ts, *self._held_at.get(int(ts.timestamp()) * 1_000_000_000, (self._net_position()[0], price)))
+                for ts in times]
+        if not any(q for _, q, _ in held):
+            self._funding_since = self._rescan_from(now)
             return
-        for ts in markets.funding_times(since, now, terms.funding_hours):
+        for ts, qty, px in held:
+            if qty == 0:
+                self._funding_since = ts
+                continue
             rate = self._funding_rate(terms, ts, now)
             if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
-                self._funding_since = ts - timedelta(seconds=1)
                 return
-            amount = -qty * price * rate
+            self._funding_since = ts
+            amount = -qty * px * rate
             self._cash_adj += amount
             self.funding_log.append((ts, amount))
             if self.runtime is not None:
-                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=price, rate=rate,
+                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
                                                   amount=round(amount, 8), ts=ts)
                 self.runtime.store.event(self.runtime.name, "info", "funding",
                                          f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
-                                         f"{price:,.6g} ({rate:.4%})", ts=ts)
+                                         f"{px:,.6g} ({rate:.4%})", ts=ts)
+        self._funding_since = max(self._funding_since, self._rescan_from(now))
+
+    def _rescan_from(self, now: datetime) -> datetime:
+        """Where the next charge looks from once everything up to `now` is settled: `now`, except in paper on a
+        venue's settled rates, which looks back FUNDING_LOOKBACK for a settlement published late."""
+        terms = self._cfg.perp
+        if self._backtest or terms is None or terms.funding_venue is None:
+            return now
+        return max(self._funding_since, now - self.FUNDING_LOOKBACK)
 
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
@@ -2240,6 +2313,7 @@ class LongFlatStrategy(Strategy):
 
     def _on_tick(self, _event=None) -> None:
         self._last_tick_ns = self.clock.timestamp_ns()
+        self._snap_settlements(self._last_tick_ns)
         if self._feed_dead():
             return  # no heartbeat, so the supervisor restarts the process
         self._publish_signals()  # a quiet market still shows the lights (display only)
