@@ -468,4 +468,11 @@ def test_a_strategy_saved_on_the_venues_own_candles_is_refused_at_start_not_cras
     assert started == ["hourly"] and s.desired_state == "stopped"
     assert s.status_reason.startswith("not started: bar_spec: strategies on this market decide on bars built")
     (said,) = [e["message"] for e in store.events("daily", limit=10) if e["kind"] == "start_refused"]
-    assert "venue's own 1-day candles aren't available there" in said
+    assert "venue's own 1-day candles aren't available there" in said and "still holds" not in said
+    # Holding a position it can't close itself: said plainly (code review on #146).
+    store.record_fill("daily", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    store.set_desired_state("daily", "running")
+    supervisor.Supervisor(store).step()
+    said = [e["message"] for e in store.events("daily", limit=10) if e["kind"] == "start_refused"][0]
+    assert said.endswith("It still holds a position (0.01), which a flatten can't close while it can't start: an "
+                         "engineer needs to close it")
