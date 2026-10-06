@@ -106,6 +106,7 @@ def _ramp(minutes):
 
 
 @pytest.mark.parametrize("side", [1, -1])
+@pytest.mark.no_open_risk_limit
 def test_a_position_closed_before_settlement_pays_nothing_in_paper_or_backtest(tmp_path, side):
     params = {"open_at": ns("2025-10-03 07:52"), "close_at": ns("2025-10-03 07:59"), "side": side, **PERP}
     pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)
@@ -114,6 +115,7 @@ def test_a_position_closed_before_settlement_pays_nothing_in_paper_or_backtest(t
 
 
 @pytest.mark.parametrize("side", [1, -1])
+@pytest.mark.no_open_risk_limit
 def test_a_position_opened_at_or_after_settlement_pays_nothing_in_paper_or_backtest(tmp_path, side):
     params = {"open_at": ns("2025-10-03 08:00"), "close_at": ns("2025-10-03 08:05"), "side": side, **PERP}
     pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)
@@ -123,6 +125,7 @@ def test_a_position_opened_at_or_after_settlement_pays_nothing_in_paper_or_backt
 
 @pytest.mark.parametrize("side", [1, -1])
 @pytest.mark.parametrize("close_at", ["2025-10-03 08:00", "2025-10-03 08:05"])  # exit on the settlement bar, or later
+@pytest.mark.no_open_risk_limit
 def test_a_position_held_across_pays_rate_times_notional_once_longs_pay_shorts_receive(tmp_path, side, close_at):
     params = {"open_at": ns("2025-10-03 07:52"), "close_at": ns(close_at), "side": side, **PERP}
     pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)

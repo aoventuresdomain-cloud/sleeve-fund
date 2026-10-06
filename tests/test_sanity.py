@@ -685,6 +685,7 @@ LS_CASES = {
 
 
 @pytest.mark.parametrize("strategy", list(LS_CASES))
+@pytest.mark.no_open_risk_limit
 def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
     """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
     replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
@@ -718,6 +719,7 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
 
 
+@pytest.mark.no_open_risk_limit
 def test_paper_sells_short_at_the_bid_and_buys_it_back_at_the_ask(tmp_path):
     """A short sale takes the bid and its cover takes the ask, like any market order: never the other side
     of the book, which would hand the short the spread. (The recording quotes $6 either side of each trade.)"""

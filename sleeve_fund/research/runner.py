@@ -17,7 +17,7 @@ from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets
+from sleeve_fund import markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
@@ -49,6 +49,9 @@ class BacktestResult:
     funding: list = field(default_factory=list)
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
+    # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
+    # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
+    open_risk_binds: int = 0
 
     @property
     def shorts(self) -> bool:
@@ -199,6 +202,8 @@ def run_backtest(
         if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
             thin = prices[prices["degraded"].astype(bool)]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+        if perp:
+            strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):
@@ -233,6 +238,7 @@ def run_backtest(
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
+            open_risk_binds=strategy.open_risk_binds,
         )
     finally:
         if runtime is not None:

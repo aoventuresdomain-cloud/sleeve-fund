@@ -30,7 +30,7 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType,
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets, risk
+from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
 from sleeve_fund.paper.runtime import WIPED_OUT, liquidation_reason
@@ -45,6 +45,8 @@ EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps t
 # Exits after which the side they closed isn't entered again until the signal has moved off it (_exit_lock).
 LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 MINUTE_NS = 60_000_000_000
+DAY_NS = 86_400_000_000_000
+SAFETY_STOP_SHARE = 0.5  # of the way from entry to the liquidation price (_safety_stop_on_restore)
 
 
 @dataclass(frozen=True)
@@ -475,6 +477,13 @@ class LongFlatStrategy(Strategy):
         # so warm-up comes from the history store the hub feeds, never from the venue (set by the node).
         self.hub_fed = False
         self.hub_status = None  # the hub's own word on its venue connection (hub_client.HubStatus), when hub-fed
+        # The interim open-risk limit (sleeve_fund.open_risk): a backtest's daily ATR shares by day (set by the runner),
+        # and how many of its entries the limit would have refused; a backtest doesn't gate on it.
+        self._daily_atr: dict[int, float] = {}
+        self.open_risk_binds = 0
+        # After a restart, a perp position whose stop couldn't be restored works to a safety stop, and no new entry
+        # opens, until the model's own stop is set again (_safety_stop_on_restore).
+        self._safety_stop = False
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
@@ -708,6 +717,7 @@ class LongFlatStrategy(Strategy):
                 self._entry_px, self._entry_qty = book["entry_px"], abs(book["qty"])
                 self._entry_side = 1 if book["qty"] > 0 else -1
                 self._restore_plan()
+                self._safety_stop_on_restore(book)
                 if self._margin and not self.runtime.backtest:
                     self._restore = {"qty": book["qty"], "entry": book["entry_px"]}
             if self._margin:
@@ -995,6 +1005,68 @@ class LongFlatStrategy(Strategy):
             stop = self._stop_frac
         self._set_plan(stop, self._target_for(stop) if (stop > 0 or not self._cfg.take_profit_r) else self._tp_frac,
                        basis, kind, event_id)
+        if self._safety_stop:
+            self._safety_stop = False
+            self.runtime.store.event(self.runtime.name, "info", "stop_restored", "The model's own stop is set again "
+                                     "for the open position, so new entries can open again.", ts=self.runtime.now())
+
+    def _safety_stop_on_restore(self, book: dict) -> None:
+        """After a restart: a perp position whose model sets a stop, but whose stop couldn't be restored (none was
+        journaled, and an ATR or swing stop needs more bars than there are yet), gets a safety stop at once, half the
+        distance from its entry to its isolated liquidation price (a long with none, fully paid for: half way to zero).
+        No new entry opens until the model's own stop is set again (_replan), which replaces the safety stop only
+        if it is tighter. It alerts, and never closes the position itself."""
+        if not self._margin or self._stop_frac is not None or not self._has_exits:
+            return
+        c = self._cfg
+        if not (c.stop_loss or c.stop_atr or c.stop_swing_bars):
+            return  # a target only: the model sets no stop to restore
+        side, entry = self._entry_side or 1, self._entry_px
+        lev = self.runtime.profile.max_leverage
+        liq = markets.isolated_liquidation(book["cash"], book["qty"], entry, lev, c.perp.maintenance_margin)
+        distance = abs(1 - (liq or 0.0) / entry)
+        stop = SAFETY_STOP_SHARE * distance
+        self._stop_frac, self._stop_basis, self._safety_stop = stop, (
+            f"safety stop, {SAFETY_STOP_SHARE:.0%} of the way to the liquidation price"), True
+        if self._replan_pending is None and (c.stop_atr or c.stop_swing_bars):
+            last = self.runtime.store.last_event(self.runtime.name, ("exits_change",))
+            self._replan_pending = ("restart", last["id"] if last else 0)  # the model's stop, once there are bars
+        self.runtime.store.event(
+            self.runtime.name, "error", "stop_not_restored",
+            f"After the restart the open {_side_word(side)} position's stop couldn't be restored, so it works to a "
+            f"safety stop at {entry * (1 - side * stop):,.6g} ({stop:.2%} from the entry {entry:,.6g}, half way to the "
+            + (f"liquidation price {liq:,.6g}" if liq else "zero price") + "). No new entries open until the "
+            "model's own stop is set again; the position is not closed.", ts=self.runtime.now())
+
+    def _open_risk_refusal(self, side: int, qty: float, close: float, equity: float, ts_ns: int) -> str | None:
+        """Why the interim open-risk limit refuses this entry (sleeve_fund.open_risk), or None. Paper gates on the
+        account's book; a backtest only counts the entries it would have refused, against its own equity."""
+        stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
+        if self._backtest:
+            atr = self._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
+            if stop is not None or atr is not None:
+                if open_risk.check_entry(equity, 0.0, open_risk.position_risk(side * qty, close, stop, atr)):
+                    self.open_risk_binds += 1
+            return None
+        from sleeve_fund.venues import venue as venue_profile
+
+        now = self.runtime.now()
+
+        def atr(s):
+            return open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, now)
+
+        store, name = self.runtime.store, self.runtime.name
+        try:
+            book, others = open_risk.account_book(store, name, equity, atr)
+            mine = open_risk.position_risk(side * qty, close, stop, None if stop is not None else atr(store.sleeve(name)))
+        except ValueError as exc:
+            return f"its open risk can't be measured: {exc}"
+        return open_risk.check_entry(book, others, mine)
+
+    def set_daily_atr(self, lookup: dict[int, float]) -> "LongFlatStrategy":
+        """Backtest: the daily ATR share known at each UTC day's start (open_risk.daily_atr_lookup)."""
+        self._daily_atr = dict(lookup)
+        return self
 
     def _set_plan(self, stop: float | None, tp: float | None, basis: str, kind: str, event_id: int) -> None:
         """Put a plan set after entry in force, journal it with the trade's R from now on, and say so."""
@@ -1303,6 +1375,12 @@ class LongFlatStrategy(Strategy):
             return
         if self.runtime is not None and not self.runtime.can_open():
             return
+        if self._safety_stop:
+            if self._entry_px is not None:
+                self._note("entry_held_safety_stop", "Entry held back: the open position works to a safety stop "
+                           "until the model's own stop is set again after the restart", level="info")
+                return
+            self._safety_stop = False  # the position it guarded has closed
         close = bar.close.as_double()
         if self._has_exits:
             plan = self._plan_exits(close, side)
@@ -1373,6 +1451,10 @@ class LongFlatStrategy(Strategy):
             signal["tp_frac"] = round(self._tp_frac, 6)
         if self._has_exits:
             signal["stop_cfg"] = self._stop_cfg()
+        if (why := self._open_risk_refusal(side, float(qty), close, equity, bar.ts_event)) is not None:
+            self._note("entry_refused_open_risk", f"Entry refused: {why}")
+            return
+        self._noted.discard("entry_refused_open_risk")
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:

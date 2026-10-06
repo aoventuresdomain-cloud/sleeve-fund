@@ -38,4 +38,6 @@ testpaths = ["tests"]
 markers = [
     "strategy_errors: the test makes a strategy raise on purpose, to check the errors are reported",
     "sanity: fast arithmetic checks on fees, sizing, the books, R and paper-backtest parity (pytest -m sanity)",
+    "no_open_risk_limit: a paper mechanics test with a stopless perp above 1x; lifts the open-risk limit (open_risk.LIMIT)",
+    "real_daily_atr: the test reads the daily ATR from the history store itself (open_risk.history_atr_pct)",
 ]

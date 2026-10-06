@@ -257,6 +257,7 @@ def _meta(balance, params):
                        "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
 
 
+@pytest.mark.no_open_risk_limit
 def test_ping_pong_shorts_in_the_paper_runtime(tmp_path):
     from sleeve_fund.research.replay import replay
 
@@ -476,6 +477,7 @@ def test_a_liquidation_halts_in_the_advisors_words_and_its_gap_fill_is_journaled
     assert pd.Timestamp(liq["ts"]) == bar - pd.Timedelta(days=1)
 
 
+@pytest.mark.no_open_risk_limit
 def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path, full_margin):
     """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
     as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
@@ -966,6 +968,7 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
+@pytest.mark.no_open_risk_limit
 def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stays_halted_through_a_restart(
         tmp_path, full_margin):
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
