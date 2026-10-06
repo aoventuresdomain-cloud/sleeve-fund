@@ -37,7 +37,14 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
+from sleeve_fund.paper.config import (
+    ALLOWED_BAR_SPECS,
+    VENUE_WARMUP_BARS,
+    SleeveConfig,
+    auto_warmup,
+    check_hub_bar_spec,
+    to_store_kwargs,
+)
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.trials import TrialsRegister
@@ -383,6 +390,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")),
                                venue=_venue_name(form.get("venue")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
+            check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
             if any(s.name == name for s in st().sleeves()):
