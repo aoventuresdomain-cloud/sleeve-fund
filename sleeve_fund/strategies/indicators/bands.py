@@ -8,8 +8,7 @@ from collections import deque
 from sleeve_fund.strategies.indicators._common import (
     PERIOD_MAX, Block, Setting, peek, peek_values, warmup, whole,
 )
-from sleeve_fund.strategies.indicators.averages import Ema
-from sleeve_fund.strategies.indicators.classic import Atr
+from sleeve_fund.strategies.indicators.averages import Atr, Ema
 
 # A deviation under a billionth of the price is rounding left by the sliding sums, not a band.
 FLAT_BAND = 1e-9
@@ -32,7 +31,11 @@ class Bollinger(Block):
 
     def reset(self) -> None:
         self._window: deque[float] = deque(maxlen=self.period)
-        self._mean = self._m2 = 0.0  # Welford's mean and sum of squared deviations, slid with the window
+        # Sums of each close's distance from an anchor near the prices, not of the prices themselves: on a
+        # near-flat window (a deviation of a millionth of the price) sums of squared prices keep too few digits
+        # for %B and the width (QA, F3). The anchor moves to the mean at each exact recompute, once a window.
+        self._anchor: float | None = None
+        self._s1 = self._s2 = 0.0
         self._since_exact = 0
         self.count = 0
         self._value = 0.0
@@ -41,33 +44,38 @@ class Bollinger(Block):
     def update_raw(self, close: float) -> None:
         x = float(close)
         w = self._window
+        if self._anchor is None:
+            self._anchor = x
+        a = self._anchor
         if len(w) == self.period:
-            y = w[0]
-            w.append(x)
-            old_mean = self._mean
-            self._mean += (x - y) / self.period
-            self._m2 += (x - y) * (x - self._mean + y - old_mean)
-        else:
-            w.append(x)
-            delta = x - self._mean
-            self._mean += delta / len(w)
-            self._m2 += delta * (x - self._mean)
+            d = w[0] - a
+            self._s1 -= d
+            self._s2 -= d * d
+        w.append(x)
+        d = x - a
+        self._s1 += d
+        self._s2 += d * d
         self.count += 1
         self._since_exact += 1
-        if self._since_exact >= self.period:  # sliding sums drift; recompute them once a window
-            self._mean = sum(w) / len(w)
-            self._m2 = sum((v - self._mean) ** 2 for v in w)
+        if self._since_exact >= self.period:  # sliding sums drift; recompute them exactly once a window
+            a = self._anchor = math.fsum(w) / len(w)
+            self._s1 = math.fsum(v - a for v in w)
+            self._s2 = math.fsum((v - a) ** 2 for v in w)
             self._since_exact = 0
-        sd = math.sqrt(max(self._m2, 0.0) / len(w))
-        if sd <= FLAT_BAND * abs(self._mean):
+        n = len(w)
+        m = self._s1 / n
+        mid = a + m
+        sd = math.sqrt(max(self._s2 / n - m * m, 0.0))
+        if sd <= FLAT_BAND * abs(mid):
             sd = 0.0
-        mid, half = self._mean, self.k * sd
+        half = self.k * sd
         upper, lower = mid + half, mid - half
         self._value = mid
         self._vals = {
             "mid": mid, "upper": upper, "lower": lower,
-            "width": (upper - lower) / mid if mid else 0.0,
-            "pct_b": (x - lower) / (upper - lower) if upper > lower else 0.5,
+            "width": 2 * half / mid if mid else 0.0,
+            # From the close's distance to the mid, never upper minus lower: those are two near-equal prices.
+            "pct_b": 0.5 + ((x - a) - m) / (2 * half) if half > 0 else 0.5,
         }
 
     def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
@@ -151,8 +159,8 @@ class Donchian(Block):
 
 class Keltner(Block):
     """Keltner channel: an exponential average of the close over `period` bars (mid), k average true ranges
-    over `atr_period` bars either side (upper, lower). The range is the library Atr, a simple average of true
-    ranges. `value` is mid. Initialized when the average and the range both are."""
+    over `atr_period` bars either side (upper, lower). The range is Wilder's ATR (P1-I4). `value` is mid.
+    Initialized when the average and the range both are."""
 
     SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX), Setting("atr_period", int, 10, 1, PERIOD_MAX),
                 Setting("k", float, 2.0, 0.1, 10.0))
@@ -175,7 +183,7 @@ class Keltner(Block):
     def update_raw(self, high: float, low: float, close: float) -> None:
         self._mid.update_raw(float(close))
         self._range.update_raw(float(high), float(low), float(close))
-        mid, half = self._mid._value, self.k * self._range.value
+        mid, half = self._mid._value, self.k * self._range._value
         self._value = mid
         self._vals = {"mid": mid, "upper": mid + half, "lower": mid - half}
 

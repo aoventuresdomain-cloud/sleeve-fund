@@ -26,6 +26,8 @@ class RelativeVolume(Block):
 
     def update_raw(self, volume: float) -> None:
         volume = float(volume)
+        if volume < 0:
+            raise ValueError(f"volume can't be negative, got {volume}")
         prev = self._avg.value if self._avg.initialized else None
         self._avg.update_raw(volume)
         if prev is None:
