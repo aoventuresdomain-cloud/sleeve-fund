@@ -416,6 +416,9 @@ class LongFlatStrategy(Strategy):
         self._opened_in_bar: list[tuple[tuple[int, int, bool], float]] = []  # _fund_opened_in_bar, once the bar is in
         # Liquidated in this process: the halt it stays in, "Position margin lost (liquidated): ..." (_margin_lost).
         self._liquidated: str | None = None
+        # Fees on the position now held and on its liquidation's fills: part of what a liquidation loses (Advisor
+        # 18:17 point 4, as the D3 gap-loss cap counts them).
+        self._held_fees = self._liq_fees = 0.0
         self._snap_ns: int | None = None
         self._settled = None  # backtest: the venue's settled rates, loaded once
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
@@ -2361,11 +2364,12 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "position's margin", ts=self.runtime.now())
 
-    def _margin_lost(self, qty: float, entry: float) -> str:
+    def _margin_lost(self, qty: float, entry: float, fees: float = 0.0) -> str:
         """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57): "Position margin lost (liquidated): X,
-        Y% of strategy equity", X the position's isolated margin, Y its share of the equity marked before."""
+        Y% of strategy equity", X the position's isolated margin plus its entry and liquidation fees (18:17 point 4),
+        Y its share of the equity marked before."""
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-        lost = markets.isolated_margin(qty, entry, lev)
+        lost = markets.isolated_margin(qty, entry, lev) + fees
         before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
         share = f"{lost / before:.0%}" if before and before > 0 else "all"
         return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity"
@@ -2582,7 +2586,9 @@ class LongFlatStrategy(Strategy):
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
             if underwater and self._liquidated is None:
-                self._liquidated = self._margin_lost(abs(qty), self._entry_px or price)
+                # Its liquidation fee at the taker rate on this mark, until the fill gives the fee charged.
+                self._liquidated = self._margin_lost(abs(qty), self._entry_px or price,
+                                                     self._held_fees + abs(qty) * price * self.runtime.taker_fee)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
                 wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
                 equity = 0.0
@@ -2762,6 +2768,10 @@ class LongFlatStrategy(Strategy):
         sign = 1 if event.is_buy else -1
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
+            if opening:
+                self._held_fees += fee
+            elif self.decisions.get(coid, {}).get("intent") == "liquidation":
+                self._liq_fees += fee
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
@@ -2810,9 +2820,17 @@ class LongFlatStrategy(Strategy):
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
-            if (self.decisions.get(coid, {}).get("intent") == "liquidation" and self._liquidated is None
-                    and held[0] and held[1]):
-                self._liquidated = self._margin_lost(held[0], held[1])
+            if self.decisions.get(coid, {}).get("intent") == "liquidation" and held[0] and held[1]:
+                margin = self._margin_lost(held[0], held[1], self._held_fees + self._liq_fees)
+                if self._liquidated is not None and margin != self._liquidated and self.runtime is not None:
+                    # Halted on the mark with the fee estimated: the halt now says what the fill charged.
+                    old, self._liquidated = self._liquidated, margin
+                    reason = self.runtime.store.sleeve(self.runtime.name).status_reason or ""
+                    if self.runtime.status == "halted" and reason.startswith(old):
+                        self.runtime.liquidated = margin
+                        self.runtime._set("halted", reason.replace(old, margin, 1))
+                self._liquidated = margin
+            self._held_fees = self._liq_fees = 0.0
             self._cover_shortfall(px, event)
         if coid == self._risk_stop_id:
             self._risk_stop_filled(done, sign, px)

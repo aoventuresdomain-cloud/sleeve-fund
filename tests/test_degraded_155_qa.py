@@ -455,11 +455,6 @@ def _session_meta(balance, params):
                        "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="P1-D15 MAJOR (Advisor 17:57 (a)) on 3be572a: after a liquidation the PM's resume "
-                   "resets the drawdown from the 80.71 kept and the strategy trades again (a new 2x long entry on the "
-                   "restart), with no 'reset after liquidation'; risk_halt is counted once, not twice; and the halt text "
-                   "lacks 'Position margin lost (liquidated): X, Y% of strategy equity'. Marks after the restart do read "
-                   "the kept equity")
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
     a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
@@ -479,10 +474,18 @@ def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a
     s = store.sleeve(name)
     assert s.status == "halted", (s.status, s.status_reason)
     fills = sorted(store.fills(name, limit=100), key=lambda f: f["ts"])
-    liq = fills[-1]
-    opened = [f for f in fills[:-1] if f["side"] == "SELL"][-1]  # the short the gap liquidated
-    assert liq["side"] == "BUY" and liq["qty"] == pytest.approx(opened["qty"])
-    margin_lost = round(opened["qty"] * opened["price"] / risk.profile("balanced").max_leverage, 2)
+    # The short and its liquidation fill in slices (QA correction 18:35, PE2's dispute checked on e7ee497): X is the
+    # whole position's margin plus its entry fee and the liquidation fee (Advisor 18:17 point 4, as in D3).
+    by_order = {}
+    for f in fills:
+        by_order.setdefault(f["order_id"], []).append(f)
+    liq_fills = by_order[orders[-1]["order_id"]]
+    open_fills = by_order[orders[-2]["order_id"]]  # the short the gap liquidated
+    assert orders[-2]["intent"] == "entry" and orders[-2]["side"] == "SELL"
+    liq = max(liq_fills, key=lambda f: f["ts"])
+    assert sum(f["qty"] for f in liq_fills) == pytest.approx(sum(f["qty"] for f in open_fills))
+    margin_lost = round(sum(f["qty"] * f["price"] for f in open_fills) / risk.profile("balanced").max_leverage
+                        + sum(f["fee"] for f in open_fills) + sum(f["fee"] for f in liq_fills), 2)
     marks = store.equity_series(name)
     eq_before = [m for m in marks if pd.Timestamp(m["ts"]) < pd.Timestamp(liq["ts"])][-1]["equity"]
     book = store.journal_book(name, 10_000)
