@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
+{% from "_macros.html" import stop_words, trail_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
 {% from "_signals.html" import signals_tab, signals_panel, signals_side %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
@@ -25,7 +25,7 @@
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
-    {% if not backtest_id and not archived %}<button type="button" class="secondary" data-open="dlg-reset" {% if resetting %}disabled title="A reset is under way"{% endif %}>{{ "Resetting…" if resetting else "Reset" }}</button>{% endif %}
+    {% if not backtest_id and not archived %}<button type="button" class="secondary" data-open="dlg-reset" {% if resetting %}disabled title="A reset is under way"{% elif liquidated %}disabled title="Its position margin was lost (liquidated): use Reset after liquidation, which asks for an incident note"{% endif %}>{{ "Resetting…" if resetting else "Reset" }}</button>{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede sub-line">{{ s.strategy|replace('_', ' ')|capitalize }} · {{ s.instrument }}{% if s.venue and venue_label(s.venue) %} {{ venue_label(s.venue) }}{% elif perp %} perpetual{% endif %} · {{ bar_label(s.bar_spec).split(',')[0] }} · {{ x.profile.name }} profile</p>
@@ -35,10 +35,11 @@
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
 {% if strategy_errors %}<div class="banner loss" role="alert">The strategy's code raised an error {{ strategy_errors }} time{{ 's' if strategy_errors != 1 }}{% if backtest_id %} during this run, so its results after that can't be relied on{% else %} since it last started; its orders after that may be wrong{% endif %}. The Activity tab has the details.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived.</div>{% endif %}
+{% if liquidated and s.status != 'halted' %}<div class="banner loss" role="alert"><strong>Liquidated:</strong> its position margin was lost, so it can't start, resume or be reset until you use Reset after liquidation, which asks for an incident note.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
-  {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
+  {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
@@ -179,7 +180,7 @@
       <div><dt>Move</dt><dd>{% if position %}{{ signed(position.price / position.entry_px - 1) }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>Exits</h3><dl>
-      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away{% if position and position.stop_basis %} · {{ position.stop_basis }}{% endif %}</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% elif trail_words(s)|trim %}<span class="muted trail-stop" title="{{ trail_words(s) }}">Trailing stop · Trail level not shown</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
       <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% {{ "below" if position and position.side < 0 else "above" }} entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
       <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
@@ -211,7 +212,7 @@
     </dl></div>
     <div class="pos-card"><h3>Last sync</h3><dl>
       <div><dt>When</dt><dd>{% if demo.last %}{% if demo.last.done_at %}{{ demo.last.done_at|ago }}{% else %}<span class="faint">waiting for the mirror</span>{% endif %}{% else %}<span class="muted">Never</span>{% endif %}</dd></div>
-      {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result }}</dd></div>{% endif %}
+      {% if demo.last and demo.last.result %}<div><dt>Result</dt><dd class="faint">{{ demo.last.result|no_venues }}</dd></div>{% endif %}
     </dl></div>
   </div>{% endif %}
   {% if position %}<details class="why-fold">
@@ -236,7 +237,8 @@
     <div class="pos-card"><h3>Record</h3><dl>
       <div><dt>Worst drawdown</dt><dd>{{ x.max_drawdown|pct1 }}</dd></div>
       {% if not backtest_id %}<div><dt>Reconciled</dt><dd>{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches' }}</span> <span class="faint">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</dd></div>
-      <div><dt>Heartbeat</dt><dd>{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</dd></div>{% endif %}
+      <div><dt>Heartbeat</dt><dd>{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</dd></div>
+      <div><dt>Candle close to fill</dt><dd title="From the close of the candle an order was decided on to its first fill, over the latest {{ timing.n if timing else 0 }} such orders; the part before the order left this server in brackets">{% if timing %}{{ '%.0f'|format(timing.median) }} ms median, {{ '%.0f'|format(timing.p95) }} ms p95 <span class="faint">({{ '%.0f'|format(timing.ours) if timing.ours is not none else '–' }} ms to send, {{ timing.n }} orders)</span>{% else %}<span class="muted">No fills yet</span>{% endif %}</dd></div>{% endif %}
     </dl></div>
   </div>
 </section>
@@ -330,12 +332,12 @@
 {% set dialogs = {
   'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
-  'resume': ('Resume ' ~ s.name, ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''), 'Resume trading', ''),
+  'resume': ('Resume ' ~ s.name, ('Its position margin was lost (liquidated), so it stays halted: resuming doesn\'t restart it. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else '')), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
-  'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
+  'start': ('Start ' ~ s.name, 'Its position margin was lost (liquidated), so it can\'t start. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 {% if not backtest_id %}<div data-live="dialogs" data-live-forms>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
@@ -347,10 +349,11 @@
     {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now would drop it, so Stop is off until the strategy is flat.</div>{% endif %}
     {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
     {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
-    {{ reason_picker(cmd, 'r-' ~ cmd) }}
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button>
+    {% set refused = cmd in ['resume', 'start'] and liquidated %}{# nothing to offer: the server refuses it (QA P1-U25, U31) #}
+    {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>{{ 'Close' if refused else 'Cancel' }}</button>
       {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
-      <button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button></div>
+      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button>{% endif %}</div>
   </form>
 </dialog>
 {% endfor %}

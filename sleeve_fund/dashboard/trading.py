@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
-from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
@@ -177,6 +177,50 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
+def liquidated_since_reset(store: Store, sleeve: str, halt_words: str) -> bool:
+    """Whether the strategy's position margin was lost (a liquidation event or order, or a halt whose message
+    starts with halt_words) with no reset after liquidation since. Read from the journal, not the latest halt:
+    a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). The halt words
+    match in any case and spacing (P1-U28a)."""
+    reset = store.last_event(sleeve, (LIQUIDATION_RESET,))
+    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
+    words = _fold(halt_words)
+    if any(e["kind"] == "liquidation" or _fold(e["message"]).startswith(words)
+           for e in store.sleeve_events_since(sleeve, ("liquidation", "risk_halt"), after_id=since_id)):
+        return True
+    order = store.last_order(sleeve, ("liquidation",))
+    if order is None:
+        return False
+    if since_ts is None or order["ts"] > since_ts:
+        return True
+    if order["ts"] < since_ts:
+        return False
+    # A liquidation order in the same instant as the reset: orders and events share no id, so the liquidation
+    # wins the tie (P1-U28b) unless the reset answered a liquidation event of that same instant.
+    answered = store.last_event(sleeve, ("liquidation",))
+    return not (answered is not None and answered["id"] < since_id and answered["ts"] == order["ts"])
+
+
+def _fold(text: str) -> str:
+    """Text for a loose match: one plain space between words, in any case (a no-break space counts as one)."""
+    return " ".join((text or "").split()).casefold()
+
+
+def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
+    """How the open position's stop was set, in a few words, when it came from the market at entry: an ATR
+    stop is the simple ATR the models use, not the chart's Wilder ATR (Advisor, atr-149 A2), so it says so.
+    None for a fixed % stop or none. Reads the stop settings the entry, or a later plan, journaled."""
+    cfg = (plan or {}).get("stop_cfg") if plan is not None else (signal or {}).get("stop_cfg")
+    if cfg is None and plan is None and not (signal or {}).get("stop_frac"):
+        cfg = params  # an entry from before stop settings were journaled: the strategy's own
+    cfg = cfg or {}
+    if cfg.get("stop_atr"):
+        return f"{float(cfg['stop_atr']):g} simple ATR ({int(cfg.get('atr_bars') or 14)} bars) at entry"
+    if cfg.get("stop_swing_bars"):
+        return f"swing {'high' if side < 0 else 'low'} of {int(cfg['stop_swing_bars'])} bars at entry"
+    return None
+
+
 def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> tuple[float | None, float | None]:
     """The open position's stop and target as shares of its entry price: the plan set since entry, if
     any, else what its entry journaled (an ATR or swing-low stop is set at entry), else the strategy's
@@ -254,6 +298,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
         "stop_px": stop_px,
+        "stop_basis": stop_basis(x["sleeve"].params, entry["signal"] if entry else None, plan, side) if stop_px else None,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "notional": abs(x["qty"]) * x["price"],
         "margin": margin,
@@ -440,3 +485,21 @@ def audit_rows(sleeve, fills: list[dict], orders: dict[str, dict], venue: str) -
                      "order_id": f.get("order_id"), "trade_id": f.get("trade_id"),
                      **{k: v if not isinstance(v, (dict, list)) else str(v) for k, v in signal.items()}})
     return rows, keys
+
+
+def timing_view(timings: list[dict]) -> dict | None:
+    """Close to fill for the strategy's latest orders decided on a bar (Store.timings, v2 P1-2): median and 95th
+    percentile in milliseconds, and the median of how much of it was ours (bar close to order sent). None
+    before any such order has filled."""
+    done = [t for t in timings if t["bar_close"] and t["first_fill"]]
+    if not done:
+        return None
+
+    def ms(rows, a, b):
+        return sorted((r[b] - r[a]).total_seconds() * 1000 for r in rows if r[a] and r[b])
+
+    def pick(v, q):
+        return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+    fill, ours = ms(done, "bar_close", "first_fill"), ms(done, "bar_close", "sent")
+    return {"n": len(fill), "median": pick(fill, 0.5), "p95": pick(fill, 0.95), "ours": pick(ours, 0.5)}

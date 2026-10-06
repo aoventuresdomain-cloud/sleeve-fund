@@ -1910,6 +1910,22 @@ def test_sub_dollar_numbers_read_in_full(client):
     assert "0.076500" in page  # the average price at the decimals the Why text uses
 
 
+def test_the_home_page_opens_after_a_strategy_reset_with_no_clean_slate_ever(client):
+    """QA on #164 (pre-existing on main): the first per-strategy Reset, with no clean slate ever made, left the
+    home page a 500, as the Previous book list named the new book's start date and there was none."""
+    from sleeve_fund.supervisor import Supervisor
+
+    c, store = client
+    _new(c)
+    store.request_reset("btc-test", "Test finished")
+    Supervisor(store, python="true").reset_pending()
+    assert store.book_start() is None and store.reset_runs()
+    r = c.get("/", auth=AUTH)
+    assert r.status_code == 200
+    assert "Previous book (1)" in r.text and "put away by a strategy reset;" in r.text
+    assert "new book began" not in r.text
+
+
 def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, tmp_path):
     """PM, 4 Oct 2026: the book's equity starts again from the new strategies; the strategies the clean
     slate put away keep their history, their pages and a "Previous book" list, and can be brought back."""
@@ -2244,7 +2260,7 @@ def test_the_pm_pages_name_no_venue_even_in_old_messages(client):
         assert not VENUE_NAME.findall(text), (path, VENUE_NAME.findall(text))
     alerts = _visible(c.get("/alerts", auth=AUTH).text)
     assert "under the smallest order the demo account takes" in alerts
-    assert "the demo account /v5/order/create: insufficient balance" in alerts
+    assert "to the demo account: refused (/v5/order/create): insufficient balance" in alerts
     records = _visible(c.get("/records", auth=AUTH).text)
     assert "live account qa-live on the spot venue" in records
     assert "live account qa-perp on the perpetual venue" in records
@@ -2253,13 +2269,19 @@ def test_the_pm_pages_name_no_venue_even_in_old_messages(client):
 
 
 def test_no_venues_keeps_account_and_key_names():
-    from sleeve_fund.dashboard.development import no_venues
+    from sleeve_fund.wording import no_venues
 
     assert no_venues("kraken-live: BYBIT_DEMO_API_KEY missing") == "kraken-live: BYBIT_DEMO_API_KEY missing"
     assert no_venues("no Bybit demo account set up") == "the demo account isn't set up"
-    assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue book"
+    assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue's book"
     assert no_venues("BTCUSDT-PERP.BINANCE: the feed missed 2 minutes") == "BTCUSDT-PERP: the feed missed 2 minutes"
     assert no_venues("BTC/USD.KRAKEN warm-up ready.") == "BTC/USD warm-up ready."
+    # P1-U21: old sentences read naturally once filtered.
+    assert (no_venues("didn't copy the buy: no Bybit demo perpetual set up for BTC/USDT.")
+            == "didn't copy the buy: the demo account has no perpetual set up for BTC/USDT.")
+    assert (no_venues("to the demo account: Deribit testnet private/buy: not_enough_funds ().")
+            == "to the demo account: refused (private/buy): not_enough_funds ().")
+    assert no_venues("Bybit's API said position exists") == "the demo account's API said position exists"
     assert no_venues(None) is None and no_venues("") == ""
 
 
@@ -2279,3 +2301,263 @@ def test_the_spot_cap_bar_reads_on_the_exposure_basis(client):
     assert f"Exposure {shown:.2f}× equity, against an entry cap of {cap:.2f}×" in bar.group(1)
     assert int(bar.group(2)) == round(3_600 / 5_600 / cap * 100)
     assert "Isolated margin of cap" not in page and "Position of cap" not in page
+
+
+def test_an_atr_stop_says_it_is_the_simple_atr_and_the_chart_draws_it(client):
+    """atr-149 A2: the models' ATR stops use the simple ATR, the chart's ATR is Wilder's, so wherever the
+    position's stop is shown its basis says "simple ATR", and the chart draws the stop level itself."""
+    c, store = client
+    _new(c, stop_atr="2", atr_bars="14")
+    store.record_order("btc-test", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="trend up",
+                       signal={"stop_frac": 0.04, "stop_basis": "2 x the 14-bar average true range (1,200)",
+                               "stop_cfg": {"stop_atr": 2.0, "atr_bars": 14}})
+    store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("btc-test", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "57,600" in page and "· 2 simple ATR (14 bars) at entry" in page
+    risk = c.get("/risk", auth=AUTH).text
+    assert "from its entry, 2 simple ATR (14 bars) at entry" in risk
+    lines = c.get("/api/sleeves/btc-test/candles", auth=AUTH).json()["lines"]
+    assert {"price": 57_600.0, "title": "SL · simple ATR", "kind": "stop"} in lines
+
+
+def test_a_fixed_stop_has_no_atr_label_and_the_stress_note_names_3x_gap_loss(client):
+    c, store = client
+    _new(c, stop_loss_pct="3")
+    store.record_order("btc-test", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="trend up",
+                       signal={"stop_frac": 0.03, "stop_cfg": {"stop_loss": 0.03}})
+    store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("btc-test", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    assert "simple ATR" not in c.get("/sleeves/btc-test", auth=AUTH).text
+    lines = c.get("/api/sleeves/btc-test/candles", auth=AUTH).json()["lines"]
+    assert {"price": 58_200.0, "title": "SL", "kind": "stop"} in lines
+    assert "at 3x, a gap through liquidation loses the whole position margin" in c.get("/risk", auth=AUTH).text
+
+
+def test_the_last_demo_resync_result_names_no_venue(client):
+    """P1-U19: a resync result stored before #160 reads "demo account", not the venue, on the Demo copy card."""
+    c, store = client
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "demo_mirror": True}, venue="binance")
+    store.request_resync("bn-ls", "PM asked")
+    store.finish_resync(store.pending_resyncs()[0]["id"],
+                        "BTCUSDT: paper +0.1 at 2x isolated; Bybit Demo before +0, cross 10x; after +0.1")
+    page = c.get("/sleeves/bn-ls", auth=AUTH).text
+    assert "the demo account before +0, cross 10x" in page and "Bybit" not in page
+
+
+def test_a_trailing_stop_says_its_level_is_not_shown_rather_than_guess_it(client):
+    """atr-149 A2 (HoE/Advisor ruling): rsi_pullback trails its stop inside the model and doesn't journal the
+    level yet, so the pages say so and the chart draws no stop line, never an estimate."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    page = c.get("/sleeves/rp", auth=AUTH).text
+    assert "Trailing stop · Trail level not shown" in page
+    assert 'title="Trailing stop, 2.5 simple ATR below the highest close since entry"' in page
+    risk = c.get("/risk", auth=AUTH).text
+    assert ">Trailing</span>" in risk and "trail level not shown" in risk
+    lines = c.get("/api/sleeves/rp/candles", auth=AUTH).json()["lines"]
+    assert [ln["kind"] for ln in lines] == ["entry"]
+
+
+def test_resuming_after_a_liquidation_says_it_stays_halted(client):
+    """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
+    resume until the PM resets it after liquidation; other halts keep their wording. Read from the journal,
+    so a Stop/Start that halts it again on drawdown doesn't hide the liquidation (QA P1-U22)."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    stays = ("Its position margin was lost (liquidated), so it stays halted: resuming doesn&#39;t restart it. It "
+             "trades again only after you use Reset after liquidation, which asks for an incident note.")
+    normal = "The strategy trades again on its next signal. Its drawdown reference resets to today"
+    store.set_status("btc-test", "halted", "drawdown 21% hit the 20% limit")
+    store.event("btc-test", "error", "risk_halt", "Drawdown 21% hit the 20% limit: flattened, PM must resume")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert normal in page and "Reset after liquidation" not in page
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", "Position margin lost (liquidated): 1,000.00, 20% of strategy equity")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert stays in page and normal not in page
+    # Stop, then Start: the new runtime halts it again with a fresh drawdown reason. Still liquidated.
+    store.set_status("btc-test", "stopped")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    store.event("btc-test", "error", "risk_halt", "drawdown 96.2% hit the 20% limit; flattened, PM must resume")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert stays in page and normal not in page
+    # Only a reset after liquidation ends it; a later ordinary halt then reads as one.
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it: the half-liquidation stop gapped")
+    store.event("btc-test", "error", "risk_halt", "Drawdown 22% hit the 20% limit: flattened, PM must resume")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert normal in page and "it stays halted" not in page
+
+
+def test_a_liquidation_order_alone_marks_the_halt_as_liquidated(client):
+    """The paper guard's liquidation journals an order with intent "liquidation"; that counts too."""
+    c, store = client
+    _new(c)
+    store.record_order("btc-test", order_id="L-1", side="SELL", qty=0.05, intent="liquidation",
+                       reason="Liquidated: gapped through the liquidation price")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_resume_is_refused_while_liquidated_and_the_page_points_to_the_reset(client):
+    """QA P1-U25 and U26: the server refuses a Resume while liquidated (a stale page or a direct post), the
+    dialog offers no Resume button, and the halted banner points to Reset after liquidation."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Nothing trades until you resume" not in page
+    assert "nothing trades until you use Reset after liquidation, which asks for an incident note" in page
+    dialog = page.split('id="dlg-resume"')[1].split("</dialog>")[0]
+    assert 'value="resume"' not in dialog and ">Resume trading<" not in dialog and ">Close<" in dialog
+    r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and "command_error" in r.headers["location"]
+    assert not any(cmd["command"] == "resume" for cmd in store.pending_commands("btc-test"))
+    assert "Reset after liquidation" in c.get(r.headers["location"], auth=AUTH).text
+    # After the reset, an ordinary halt resumes as before.
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Nothing trades until you resume" in page
+    assert 'value="resume"' in page.split('id="dlg-resume"')[1].split("</dialog>")[0]
+    r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"]
+    assert any(cmd["command"] == "resume" for cmd in store.pending_commands("btc-test"))
+
+
+def test_a_reset_is_refused_while_liquidated_and_points_to_the_reset_after_liquidation(client):
+    """Advisor 6 Oct 20:41 (QA P1-U27): an ordinary per-strategy Reset would put the liquidation away
+    unanswered, so it is refused, halted or not, and the Reset button is off, until Reset after liquidation."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "stopped")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    button = page.split('data-open="dlg-reset"')[1].split(">")[0]
+    assert "disabled" in button and "Reset after liquidation" in button
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and "command_error" in r.headers["location"]
+    assert store.pending_reset("btc-test") is None
+    assert "Reset after liquidation" in c.get(r.headers["location"], auth=AUTH).text
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    button = c.get("/sleeves/btc-test", auth=AUTH).text.split('data-open="dlg-reset"')[1].split(">")[0]
+    assert "disabled" not in button
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" not in r.headers["location"] and store.pending_reset("btc-test") is not None
+
+
+@pytest.mark.parametrize("status", ["stopped", "halted"])
+def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_status(client, status):
+    """QA P1-U31 and U27: one guard for the three restart routes. Stop then Start must not restart a liquidated
+    strategy, and the page says so for a stopped one too."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", status, "drawdown 96.2% hit the 20% limit" if status == "halted" else "")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "until you use Reset after liquidation" in page
+    dialog = page.split('id="dlg-start"')[1].split("</dialog>")[0]
+    assert 'value="start"' not in dialog and "can&#39;t start" in dialog
+    for command in ("start", "resume"):
+        r = c.post("/sleeves/btc-test/command", data={"command": command, "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "command_error" in r.headers["location"], command
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" in r.headers["location"]
+    s = store.sleeve("btc-test")
+    assert s.desired_state == "stopped" and store.pending_reset("btc-test") is None
+    assert not store.pending_commands("btc-test")
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "until you use Reset after liquidation" not in page
+    r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
+
+
+def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
+    """Code review on #164 (HoE): Setup's Reset book must not put a liquidation away unanswered either. The
+    liquidated strategy is left for Reset after liquidation and named; the others reset as before."""
+    c, store = client
+    _new(c)
+    _new(c, name="btc-other")
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "not_reset=btc-test" in r.headers["location"]
+    assert {x["sleeve"] for x in store.pending_resets()} == {"btc-other"}
+    setup = c.get(r.headers["location"], auth=AUTH).text
+    assert "Not reset: btc-test. Its position margin was lost (liquidated)" in setup
+    assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
+
+
+@pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
+                                   " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
+                                   "Position\u00a0margin lost (liquidated)"])
+def test_the_liquidated_halt_matches_in_any_case_and_spacing(client, words):
+    """QA P1-U28a."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "risk_halt", words)
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_liquidation_order_in_the_same_instant_as_the_reset_wins_the_tie(client):
+    """QA P1-U28b: orders and events share no id, so a liquidation order with the reset's timestamp counts,
+    unless the reset answered a liquidation event of that same instant."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    at = utcnow()
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation", ts=at)
+    store.record_order("btc-test", order_id="L-1", side="SELL", qty=0.05, intent="liquidation",
+                       reason="Liquidated", ts=at)
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_reset_answering_a_liquidation_of_the_same_instant_clears_it(client):
+    """The engine journals the event with the order; a reset of that instant, written after both, clears it."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    at = utcnow()
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    store.record_order("btc-test", order_id="L-1", side="SELL", qty=0.05, intent="liquidation",
+                       reason="Liquidated", ts=at)
+    store.event("btc-test", "error", "liquidation", "Liquidated: gapped through the liquidation price", ts=at)
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation", ts=at)
+    assert "it stays halted" not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
+    """Code review on #164: the liquidation is found however many events came after it."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "risk_halt", "Position margin lost (liquidated): 900.00, 18% of strategy equity")
+    for i in range(600):
+        store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
