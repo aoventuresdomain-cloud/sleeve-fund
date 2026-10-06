@@ -228,8 +228,9 @@ def first_touch_words(r: StudyResult) -> str:
     if not ft["flipped"]:
         return words + ": judged as ruled"
     ruled, opposite = ft["as_ruled"], ft["opposite"]
-    words += (f": re-run the opposite way. As ruled: Sharpe {_num(ruled['sharpe'])}, CAGR {_pct(ruled['cagr'])}; "
-              f"opposite: Sharpe {_num(opposite['sharpe'])}, CAGR {_pct(opposite['cagr'])}. "
+    words += (f": re-run the opposite way. As ruled ({ft['resolved']}): Sharpe {_num(ruled['sharpe'])}, CAGR "
+              f"{_pct(ruled['cagr'])}; opposite ({ft['opposite_resolved']}): Sharpe {_num(opposite['sharpe'])}, CAGR "
+              f"{_pct(opposite['cagr'])}. "
               f"Judged on the worse, {'the opposite' if ft['judged_on'] == 'opposite' else 'as ruled'}")
     if "holdout_judged_on" in ft:
         words += f"; the holdout on {'the opposite' if ft['holdout_judged_on'] == 'opposite' else 'as ruled'}"

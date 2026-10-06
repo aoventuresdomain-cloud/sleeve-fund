@@ -36,6 +36,7 @@ from sleeve_fund.research.metrics import (
 from sleeve_fund.research.runner import BacktestResult, run_backtest
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import IdeaSpec
+from sleeve_fund.strategies.rules import FIRST_TOUCH_RERUN
 
 
 log_ = logging.getLogger(__name__)
@@ -185,8 +186,8 @@ class StudyResult:
 # R2-G1 (Advisor 6 Oct ~22:07 and ~22:11): a first_touch rule's ambiguous candles (both levels first reached in one
 # minute, or a minute missing or inconsistent before the first reach) resolve by a fixed rule, not by what traded.
 # Over this share of the candles that reached either level, G1 re-runs with the opposite resolution and judges on the
-# worse of the two.
-FIRST_TOUCH_FLIP_SHARE = 0.05
+# worse of the two. The rule's own threshold, so the report's rerun_opposite_resolution and the study agree.
+FIRST_TOUCH_FLIP_SHARE = FIRST_TOUCH_RERUN
 
 
 def first_touch_share(runs) -> float | None:
@@ -197,11 +198,20 @@ def first_touch_share(runs) -> float | None:
     for run in runs:
         for st in (run.first_touch or {}).values():
             seen = True
-            ambiguous += st["same_minute"] + st["unknown_missing"] + st["unknown_inconsistent"]
-            reached += st["either_reached"]
+            ambiguous += st["same_minute"] + st["unknown"]
+            reached += st["reached"]
     if not seen:
         return None
     return ambiguous / reached if reached else 0.0
+
+
+def _resolved(runs) -> str:
+    """How the runs' first_touch rules resolved an ambiguous candle, by rule path: "long.entry false when ambiguous"."""
+    out = {}
+    for run in runs:
+        for path, st in (run.first_touch or {}).items():
+            out.setdefault(path, st.get("resolved", ""))
+    return "; ".join(f"{p} {r}" for p, r in sorted(out.items()))
 
 
 def needs_flip(share: float | None) -> bool:
@@ -562,12 +572,14 @@ def run_study(
     share = first_touch_share(run for _, _, run in windows)
     if share is not None:
         first_touch = {"share": share, "threshold": FIRST_TOUCH_FLIP_SHARE, "flipped": needs_flip(share),
-                       "judged_on": "as ruled"}
+                       "judged_on": "as ruled", "resolved": _resolved(run for _, _, run in windows)}
     if needs_flip(share):
         # Every window again with its ambiguous candles resolved the other way; G1 then judges the worse.
         alt_folds, alt_oos, alt_bench = list(folds), list(oos_parts), list(bench_parts)
         for k, window, _ in windows:
-            alt_folds[k], alt_oos[k], alt_bench[k], _ = scored(*window, bt(spec.name, window[1], window[3], flip=True))
+            alt_folds[k], alt_oos[k], alt_bench[k], flipped = scored(*window, bt(spec.name, window[1], window[3],
+                                                                                 flip=True))
+            first_touch["opposite_resolved"] = _resolved([flipped])
         ruled, opposite = pd.concat(oos_parts), pd.concat(alt_oos)
         first_touch["as_ruled"], first_touch["opposite"] = summary(ruled), summary(opposite)
         if _worse(opposite, ruled):

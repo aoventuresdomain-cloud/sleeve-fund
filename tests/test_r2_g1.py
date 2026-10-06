@@ -15,13 +15,13 @@ from sleeve_fund.research.study import FIRST_TOUCH_FLIP_SHARE, first_touch_share
 from sleeve_fund.research.tearsheet import FIRST_TOUCH_CHECK, g1_checks
 from sleeve_fund.strategies.trend_filter import SPEC
 
-RULE = "first_touch(reach close+1, before close-1)"
+RULE = "long.entry"
 
 
-def _stats(ambiguous: int, reached: int = 1000) -> dict:
-    """One rule's first_touch_stats, its ambiguous candles all same-minute ones."""
-    return {RULE: {"judged": 2 * reached, "held": reached // 2, "either_reached": reached, "same_minute": ambiguous,
-                   "unknown_missing": 0, "unknown_inconsistent": 0}}
+def _stats(ambiguous: int, reached: int = 1000, flip: bool = False) -> dict:
+    """One rule's first_touch_stats (rules.first_touch_stats' keys), its ambiguous candles all same-minute ones."""
+    return {RULE: {"judged": 2 * reached, "resolved_true": reached // 2, "reached": reached, "same_minute": ambiguous,
+                   "unknown": 0, "inconsistent": 0, "resolved": ("true" if flip else "false") + " when ambiguous"}}
 
 
 @pytest.mark.parametrize("ambiguous, flips", [(49, False), (50, False), (51, True)])
@@ -34,7 +34,7 @@ def test_g1_re_runs_only_when_ambiguous_candles_are_over_5_percent_of_those_reac
 
 
 def test_the_share_counts_every_kind_of_ambiguous_candle_across_every_window_and_rule():
-    a = {RULE: {**_stats(10)[RULE], "unknown_missing": 5, "unknown_inconsistent": 5}}  # 20 of 1000
+    a = {RULE: {**_stats(10)[RULE], "unknown": 10, "inconsistent": 5}}  # 20 of 1000: inconsistent is within unknown
     b = {"other": _stats(40, reached=500)[RULE]}  # 40 of 500
     assert first_touch_share([SimpleNamespace(first_touch=a), SimpleNamespace(first_touch=b)]) == pytest.approx(60 / 1500)
     assert first_touch_share([SimpleNamespace(first_touch={})]) is None  # no first_touch rule
@@ -50,7 +50,7 @@ def _patched(monkeypatch, ambiguous: int | None):
         flips.append(first_touch_flip)
         res = real(*a, **kw)
         if ambiguous is not None and a[0] != "buy_and_hold":
-            res.first_touch = _stats(ambiguous)
+            res.first_touch = _stats(ambiguous, flip=first_touch_flip)
             if first_touch_flip and len(res.equity):
                 res.equity = res.equity * pd.Series(0.9995, index=res.equity.index).cumprod()
         return res
@@ -76,14 +76,15 @@ def test_over_5_percent_g1_shows_both_results_and_judges_the_worse(tmp_path, ins
     assert sum(flips) == len([f for f in r.folds if not f.unscored])  # each window once more, flipped
     row = next(c for c in g1_checks(r, IdeaLedger(tmp_path / "l.jsonl")) if c[0] == FIRST_TOUCH_CHECK)
     assert row[1] == "INFO"
-    assert "As ruled: Sharpe" in row[2] and "opposite: Sharpe" in row[2] and "Judged on the worse, the opposite" in row[2]
+    assert "As ruled (long.entry false when ambiguous): Sharpe" in row[2]
+    assert "opposite (long.entry true when ambiguous): Sharpe" in row[2] and "Judged on the worse, the opposite" in row[2]
 
 
 def test_at_4_9_percent_g1_judges_as_ruled_and_never_re_runs(tmp_path, instrument, monkeypatch):
     flips = _patched(monkeypatch, 49)
     r = _study(tmp_path, instrument)
     assert r.first_touch == {"share": pytest.approx(0.049), "threshold": 0.05, "flipped": False,
-                             "judged_on": "as ruled"}
+                             "judged_on": "as ruled", "resolved": "long.entry false when ambiguous"}
     assert not any(flips)
     row = next(c for c in g1_checks(r, IdeaLedger(tmp_path / "l.jsonl")) if c[0] == FIRST_TOUCH_CHECK)
     assert row[2].endswith("judged as ruled")
