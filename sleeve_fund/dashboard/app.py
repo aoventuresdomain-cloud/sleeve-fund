@@ -56,6 +56,8 @@ from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
+# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
+LIQUIDATED_HALT = "Position margin lost (liquidated)"
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -455,10 +457,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
         # Halted after its position's margin was lost (liquidated): resuming keeps it halted until the PM resets
-        # it after liquidation with an incident note (Advisor 6 Oct 17:57; the reset button is item RAL, which
-        # also ends this test once it journals a reset).
-        liquidated = s.status == "halted" and (st().last_event(name, ("liquidation",)) is not None
-                                              or any(o["intent"] == "liquidation" for o in orders.values()))
+        # it after liquidation with an incident note (Advisor 6 Oct 17:57). Judged from the latest halt only, as
+        # the engine judges it (#155 runtime._last_liquidation), so a later ordinary halt reads as one.
+        last_halt = st().last_event(name, ("risk_halt",))
+        liquidated = s.status == "halted" and bool(last_halt) and last_halt["message"].startswith(LIQUIDATED_HALT)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}

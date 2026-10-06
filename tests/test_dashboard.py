@@ -2340,14 +2340,22 @@ def test_a_trailing_stop_says_its_level_is_not_shown_rather_than_guess_it(client
 
 def test_resuming_after_a_liquidation_says_it_stays_halted(client):
     """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
-    resume until the PM resets it after liquidation; other halts keep their wording."""
+    resume until the PM resets it after liquidation; other halts keep their wording. The latest halt decides,
+    as the engine's does, so a later ordinary halt reads as one again."""
     c, store = client
     _new(c)
     store.set_status("btc-test", "halted", "drawdown 21% hit the 20% limit")
+    store.event("btc-test", "error", "risk_halt", "Drawdown 21% hit the 20% limit: flattened, PM must resume")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "The strategy trades again on its next signal." in page and "Reset after liquidation" not in page
     store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", "Position margin lost (liquidated): 1,000.00, 20% of strategy equity")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert ("Its position margin was lost (liquidated), so it stays halted: resuming doesn&#39;t restart it. It "
             "trades again only after you use Reset after liquidation, which asks for an incident note.") in page
     assert "The strategy trades again on its next signal." not in page
+    # An old liquidation, then an ordinary drawdown halt: Resume restarts it and resets the drawdown reference.
+    store.event("btc-test", "error", "risk_halt", "Drawdown 22% hit the 20% limit: flattened, PM must resume")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "The strategy trades again on its next signal. Its drawdown reference resets to today" in page
+    assert "Reset after liquidation" not in page
