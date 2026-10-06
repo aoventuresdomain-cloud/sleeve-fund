@@ -95,6 +95,21 @@ def history_loader(venue: str, pair: str, store=None, recent=None):
     return load
 
 
+def stored_minutes(venue: str, pair: str, store=None):
+    """The hub client's recover (sleeve_fund.paper.hub_client.Decoder): the history store's 1-minute bars
+    closing strictly between two times (UNIX ns), as (close ns, open, high, low, close, volume), oldest first.
+    The hub writes every minute it relays there as it relays it, so minutes the client missed are there."""
+    from sleeve_fund.history import HistoryStore
+
+    def recover(_instrument_id: str, after_ns: int, before_ns: int) -> list[tuple]:
+        hs = store or HistoryStore()
+        df = hs.read(venue, pair, 1, start=pd.Timestamp(after_ns, tz="UTC"), end=pd.Timestamp(before_ns, tz="UTC"))
+        df = df[df.index < pd.Timestamp(before_ns, tz="UTC")]
+        return [(int(ts.value), r.open, r.high, r.low, r.close, r.volume) for ts, r in df.iterrows()]
+
+    return recover
+
+
 def _recent_closed(recent, pair: str, minutes: int, why: str) -> pd.DataFrame:
     """The venue's complete recent candles, stamped at their close as the store's bars are. Raises LookupError
     with both reasons when the venue can't serve them either."""
@@ -164,13 +179,15 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     if hub is not None:
         # The hub's trades, quotes and 1-minute bars, the same for every strategy on the instrument; longer bars
         # are built by the hub client from those minutes, as a backtest builds them from the store's.
-        from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, hub_bar_spec
+        from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, HubStatus, hub_bar_spec
 
         spec = hub_bar_spec(sleeve.bar_spec)
         bar_type = BarType.from_str(f"{sleeve.instrument_id}-{spec}")
         data_factory = HubDataClientFactory()
+        hub_status = HubStatus()
         data_config = HubDataClientConfig(venue=profile.name, instrument_ids=(sleeve.instrument_id,), host=hub[0],
-                                          port=hub[1], bar_spec=spec,
+                                          port=hub[1], bar_spec=spec, status=hub_status,
+                                          recover=stored_minutes(profile.name, sleeve.instrument),
                                           report=None if runtime is None else
                                           lambda level, kind, message: runtime.store.event(sleeve.name, level, kind,
                                                                                            message))
@@ -245,11 +262,15 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 **sleeve.params,
             )
         ).attach_runtime(runtime).attach_recorder(recorder)
-        .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
+        # A hub-fed node's history is the hub's own, in the store it writes: never the venue's candles, which
+        # could differ from the minutes it relayed (one hub, same data; QA P1-C8).
+        .attach_history(history or history_loader(profile.name, sleeve.instrument,
+                                                  recent=profile.ohlc_history if hub is None else None))
     )
-    if profile.ohlc_history is not None:
+    if profile.ohlc_history is not None and hub is None:
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
     strategy.hub_fed = hub is not None
+    strategy.hub_status = hub_status if hub is not None else None
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
     strategy.simulated_venue = True
     strategy.fee_model = fee_model

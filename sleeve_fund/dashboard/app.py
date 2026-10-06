@@ -37,7 +37,14 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
-from sleeve_fund.paper.config import ALLOWED_BAR_SPECS, VENUE_WARMUP_BARS, SleeveConfig, auto_warmup, to_store_kwargs
+from sleeve_fund.paper.config import (
+    ALLOWED_BAR_SPECS,
+    VENUE_WARMUP_BARS,
+    SleeveConfig,
+    auto_warmup,
+    check_hub_bar_spec,
+    to_store_kwargs,
+)
 from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.trials import TrialsRegister
@@ -374,6 +381,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError(f"interval: the backtest decided on {_bar_short(tested)}, so this strategy must "
                                  "too; backtest another interval before changing it")
             bar_spec = str(form.get("bar_spec", ""))
+            check_hub_bar_spec(_venue_name(form.get("venue")), bar_spec)
             # Blank means automatic: enough history for the model's longest look-back, as a backtest has.
             auto = strategy in REGISTRY and bar_spec in ALLOWED_BAR_SPECS and not str(form.get("warmup_bars", "")).strip()
             warmup = _warmup_for(strategy, form, bar_spec) if auto else int(form.get("warmup_bars", 0) or 0)

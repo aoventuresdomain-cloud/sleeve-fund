@@ -107,14 +107,27 @@ def test_minutes_refilled_in_order_after_an_outage_build_the_bar_and_a_late_bar_
     back = E + 8 * M
     for k in range(2, 8):  # 18:07 to 18:12 refilled late on its return
         assert d(_bar(E + k * M, refilled=True), back) is None
-    assert d.late == 1 and said == []  # the bar to 18:10, complete only at 18:13: not a signal
+    assert d.late == 1  # the bar to 18:10, complete only at 18:13: not a signal, and told as it is skipped
+    assert said == [("warning", "bar_skipped", f"{BTC}: skipped the bar closing 05 Oct 18:10 UTC: complete only 180 s "
+                     "after its close, over the 90 s limit (refilled after the feed was away), so not decided on")]
     assert d.building[BTC].minutes.keys() == {E + 6 * M, E + 7 * M}  # the next bar's refilled minutes kept
     d(_bar(E + 8 * M), back + 5)
     d(_bar(E + 9 * M), E + 9 * M + 5)
     b = d(_bar(E + 10 * M), E + 10 * M + 5)
     assert b.ts_event == E + 10 * M and str(b.volume) == "6.250"  # whole: two refilled minutes and three live
-    assert said == [("warning", "bar_skipped", f"{BTC}: skipped 1 bar closing 05 Oct 18:10 UTC: complete only over "
-                     "90 s after the close (refilled after the feed was away), so not decided on")]
+    assert len(said) == 1  # a run of one skipped bar: nothing more to say once the feed is current
+
+
+def test_a_run_of_skipped_bars_is_told_as_it_starts_and_its_extent_once_the_feed_is_current():
+    said = []
+    d = Decoder("1-MINUTE-LAST-EXTERNAL", lambda *a: said.append(a))
+    back = E + 10 * M
+    for k in range(0, 3):  # refilled 18:05 to 18:07, all over 90 s late
+        assert d(_bar(E + k * M, refilled=True), back) is None
+    assert [k for _, k, _ in said] == ["bar_skipped"] and "18:05" in said[0][2]  # on record even if nothing follows
+    assert d(_bar(E + 3 * M), E + 3 * M + 5) is not None  # 18:08, current
+    assert said[1] == ("warning", "bar_skipped", f"{BTC}: skipped 3 bars closing 05 Oct 18:05 UTC to 05 Oct 18:07 "
+                       "UTC in all, each complete only over 90 s after its close; the feed is current again")
 
 
 def test_a_bar_sent_with_minutes_missing_is_told():
@@ -135,6 +148,7 @@ def test_the_client_reconnects_whatever_broke_its_stream_and_says_so_once(monkey
     from sleeve_fund.paper import hub_client
 
     monkeypatch.setattr(hub_client, "RECONNECT_SECONDS", (0,))
+    monkeypatch.setattr(hub_client, "HEALTHY_SECONDS", 0)  # back as soon as it flows
 
     def stream(*lines):
         r = asyncio.StreamReader()

@@ -31,7 +31,9 @@ services:
   supervisor:
     build: .
     restart: unless-stopped
-    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully } }
+    # Binance strategies connect to the hub as they start: start it first (QA P1-C9).
+    depends_on: { db: { condition: service_healthy }, migrate: { condition: service_completed_successfully },
+                  hub-binance: { condition: service_started } }
     environment:
       DATABASE_URL: postgresql://sleeve:${POSTGRES_PASSWORD}@db:5432/sleeve_fund
       HISTORY_DIR: /data/history  # warm-up for sleeves on bars built from live trades

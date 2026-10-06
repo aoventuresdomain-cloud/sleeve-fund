@@ -63,6 +63,9 @@ class VenueProfile:
     contract: Callable[[str], dict] | None = None
     # Instruments the history store always keeps for this venue, before any strategy trades them
     core_pairs: tuple[str, ...] = ()
+    # A market data hub (sleeve_fund.hub) feeds paper here: every bar is built from its minutes, so the venue's
+    # own candles (EXTERNAL bar specs) aren't offered until slower bars are built from minutes (v2 P1-4)
+    hub: bool = False
 
     @property
     def venue(self) -> Venue:
@@ -449,4 +452,5 @@ BINANCE = register(VenueProfile(
     funding_loader=binance_funding,
     contract=binance_contract,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
+    hub=True,
 ))

@@ -7,7 +7,9 @@ from the hub's minutes, as a backtest builds them from the store's: a 15-minute 
 sent as the one closing at its end arrives and stamped at that close. Building them here rather than on the
 node's clock means a bar never closes before its last minute has arrived. A bar at or before the last one
 delivered (a refill landing after the live bars moved on) is not delivered again. When the hub goes away the
-client reconnects; until it does, nothing arrives, so no bar closes and the strategy decides nothing."""
+client reconnects; until it does, nothing arrives, so no bar closes and the strategy decides nothing. Minutes the
+client missed while the hub kept them (a blip on the client's side), and those of the bar already under way when
+the node starts, come from the history store the hub writes (QA P1-C2, P1-C5)."""
 
 from __future__ import annotations
 
@@ -37,6 +39,8 @@ from sleeve_fund.hub import protocol
 RECONNECT_SECONDS = (1, 2, 5)  # the hub is on the same host: back within seconds of it
 CONNECT_TIMEOUT = 90  # the hub picks up an instrument it doesn't relay yet within a minute
 LATE_BAR_SECONDS = 90  # a bar refilled this long after its close is history, not a signal
+HEALTHY_SECONDS = 30  # a stream back this long is reconnected: one that breaks sooner keeps the backoff growing
+HUB_ALIVE_SECONDS = 30  # a hub heartbeat this recent means the hub itself is up (heartbeats come every 5 s)
 
 
 MINUTE_NS = 60_000_000_000
@@ -45,7 +49,8 @@ MINUTE_NS = 60_000_000_000
 def hub_bar_spec(spec: str) -> str:
     """A strategy's bar spec as fed by the hub: 15-MINUTE-LAST-INTERNAL -> 15-MINUTE-LAST-EXTERNAL."""
     if not spec.endswith("-LAST-INTERNAL"):
-        raise ValueError(f"bar spec {spec!r} can't be built from the hub's 1-minute bars")
+        raise ValueError(f"bar spec {spec!r} is the venue's own candles, which the hub doesn't relay: a hub-fed "
+                         "strategy decides on 1, 5 or 15-minute or 1-hour bars built from its minutes")
     return spec.replace("-INTERNAL", "-EXTERNAL")
 
 
@@ -53,6 +58,19 @@ def instrument_from(defn: dict):
     from nautilus_trader import model
 
     return getattr(model, defn["type"]).from_dict(defn)
+
+
+class HubStatus:
+    """What the hub last said about itself, shared with the strategy's price watchdog: while the hub is up but
+    has lost its venue, restarting the node can't bring prices back (QA P1-C9)."""
+
+    def __init__(self) -> None:
+        self.heartbeat_ns = 0  # node clock, when the last heartbeat arrived
+        self.venue_up = False
+
+    def venue_down(self, now_ns: int) -> bool:
+        """The hub is alive (a recent heartbeat) and says its venue connection is down."""
+        return now_ns - self.heartbeat_ns <= HUB_ALIVE_SECONDS * 1_000_000_000 and not self.venue_up
 
 
 class _Building:
@@ -77,6 +95,16 @@ def _hhmm(ns: int) -> str:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).strftime("%d %b %H:%M UTC")
 
 
+def _span(closes: list[int]) -> str:
+    n = len(closes)
+    return (f"{n} minute{'s' * (n > 1)} closing {_hhmm(closes[0])}"
+            f"{f' to {_hhmm(closes[-1])}' if n > 1 else ''}")
+
+
+def _decimals(text: str) -> int:
+    return len(text.partition(".")[2])
+
+
 class Decoder:
     """Hub messages -> Nautilus data, delivering each instrument's bars in order, once, and only while current.
 
@@ -86,15 +114,24 @@ class Decoder:
     bar already sent is history only. A bar is sent when its last minute arrives, or with the first minute after it
     if that never comes, and only within LATE_BAR_SECONDS of its close: a bar complete only later (the hub
     refilling minutes it missed) is history for warm-ups, not a signal, as a strategy on its own feed never saw
-    those minutes either. The first bar, begun before the node started, is a part bar and is not sent.
+    those minutes either. The bar under way when the node starts is completed from the store (recover) and
+    sent; one the store can't complete is a part bar, not sent, and told.
 
-    report(level, kind, message): told of bars skipped as late (one event per run of them, when the next bar is
-    sent) and of bars sent with minutes missing."""
+    recover(instrument_id, after_ns, before_ns): the stored minutes closing strictly between the two, as (close
+    ns, open, high, low, close, volume) in time order: the history store the hub writes. Asked when minutes are
+    missing between two the client got (the client lost them while the hub kept them, QA P1-C2), and at start
+    for the minutes of the longer bar already under way (QA P1-C5). A recovered minute joins its bar as a live
+    one would; on 1-minute bars it is history (it wasn't seen in time to decide on) and the gap is told.
 
-    def __init__(self, bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None) -> None:
+    report(level, kind, message): told of bars skipped as late (when the first of a run is skipped, then the
+    run's extent when the feed is current again), of bars sent with minutes missing, of minutes missed on
+    1-minute bars, and of a bar under way at start that the store couldn't complete."""
+
+    def __init__(self, bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, recover=None) -> None:
         self.bar_spec = bar_spec
         self.period = int(BarType.from_str(f"X.Y-{bar_spec}").spec.timedelta.total_seconds()) * 1_000_000_000
         self.report = report or (lambda level, kind, message: None)
+        self.recover = recover
         self.last_bar: dict[str, int] = {}
         self.types: dict[str, BarType] = {}
         self.building: dict[str, _Building] = {}
@@ -118,12 +155,62 @@ class Decoder:
         iid, close = m["id"], m["ts"]
         end = -(-close // self.period) * self.period  # the close of the bar this minute is part of
         b = self.building.get(iid)
-        if close <= self.last_bar.get(iid, 0):
+        last = self.last_bar.get(iid)
+        if last is not None and close <= last:
             # Delivered before, or a refill landing after the live minutes moved on: it still joins the bar
             # being built if that bar lacks it.
             if b is not None and b.end == end:
                 b.minutes.setdefault(close, m)
             return None
+        if last is not None and close - last > MINUTE_NS:  # minutes missing between the last one and this
+            after = last
+        elif last is None and self.period > MINUTE_NS and close != end - self.period + MINUTE_NS:
+            after = end - self.period  # the bar under way at start: its minutes before this one
+        else:
+            return self._add(iid, m, now_ns)
+        out = None
+        for r in self._recovered(iid, after, close, m, now_ns, at_start=last is None):
+            got = self._add(iid, r, now_ns)
+            out = got if got is not None else out
+        got = self._add(iid, m, now_ns)
+        return got if got is not None else out
+
+    def _recovered(self, iid: str, after: int, before: int, like: dict, now_ns: int, at_start: bool) -> list[dict]:
+        """The minutes closing between `after` and `before` from the store, as hub messages priced like `like`;
+        on 1-minute bars none (they are history), with the gap told."""
+        rows = []
+        if self.recover is not None:
+            try:
+                rows = list(self.recover(iid, after, before))
+            except Exception as exc:  # noqa: BLE001 - no store to hand: the minutes stay missing, as before
+                self.report("warning", "hub_gap", f"{iid}: couldn't read the history store for the minutes the "
+                                                  f"feed missed ({type(exc).__name__}: {exc})")
+        px, qty = _decimals(like["c"]), _decimals(like["v"])
+        got = [{"t": "bar", "id": iid, "o": f"{o:.{px}f}", "h": f"{h:.{px}f}", "l": f"{lo:.{px}f}", "c": f"{c:.{px}f}",
+                "v": f"{v:.{qty}f}", "ts": int(ts), "recv": now_ns, "refilled": True, "recovered": True}
+               for ts, o, h, lo, c, v in rows if after < ts < before]
+        if self.period == MINUTE_NS:
+            missed = list(range(after + MINUTE_NS, before, MINUTE_NS))
+            have = {r["ts"] for r in got}
+            lost = [ts for ts in missed if ts not in have]
+            self.report("warning", "hub_gap",
+                        f"{iid}: the feed missed {_span(missed)}, so they weren't decided on; "
+                        + (f"{len(missed) - len(lost)} recovered from the history store for the record"
+                           + (f", {len(lost)} not there either" if lost else "")
+                           if self.recover is not None else "the history store wasn't consulted"))
+            return []
+        if at_start and not any(r["ts"] == after + MINUTE_NS for r in got):  # its first minute makes it whole
+            self.report("warning", "warmup",
+                        f"{iid}: the bar closing {_hhmm(after + self.period)}, under way when this node started, "
+                        f"lacks {(before - after) // MINUTE_NS - 1 - len(got)} of its minutes before the first "
+                        "one received, even from the history store: not sent, so the indicators skip it")
+        return got
+
+    def _add(self, iid: str, m: dict, now_ns: int):
+        """A minute newer than every one before it: into its bar, and the bar out if this closes it."""
+        close = m["ts"]
+        end = -(-close // self.period) * self.period
+        b = self.building.get(iid)
         self.last_bar[iid] = close
         out = None
         if b is not None and b.end != end:  # the last bar's closing minute never came (the hub was away)
@@ -143,15 +230,20 @@ class Decoder:
             return None
         if now_ns - b.end > LATE_BAR_SECONDS * 1_000_000_000:
             self.late += 1
-            self._skipped.setdefault(iid, []).append(b.end)
+            run = self._skipped.setdefault(iid, [])
+            run.append(b.end)
+            if len(run) == 1:  # told as it happens, so a skip is on record even if no bar follows (QA P1-C3)
+                self.report("warning", "bar_skipped",
+                            f"{iid}: skipped the bar closing {_hhmm(b.end)}: complete only "
+                            f"{(now_ns - b.end) / 1e9:.0f} s after its close, over the {LATE_BAR_SECONDS} s limit "
+                            "(refilled after the feed was away), so not decided on")
             return None
         self.sent.add(iid)
-        if skipped := self._skipped.pop(iid, None):
-            n = len(skipped)
+        if (skipped := self._skipped.pop(iid, None)) and len(skipped) > 1:
             self.report("warning", "bar_skipped",
-                        f"{iid}: skipped {n} bar{'s' * (n > 1)} closing {_hhmm(skipped[0])}"
-                        f"{f' to {_hhmm(skipped[-1])}' if n > 1 else ''}: complete only over {LATE_BAR_SECONDS} s "
-                        "after the close (refilled after the feed was away), so not decided on")
+                        f"{iid}: skipped {len(skipped)} bars closing {_hhmm(skipped[0])} to {_hhmm(skipped[-1])} "
+                        f"in all, each complete only over {LATE_BAR_SECONDS} s after its close; the feed is current "
+                        "again")
         if (missing := self.period // MINUTE_NS - len(b.minutes)) > 0:
             self.report("warning", "bar_incomplete",
                         f"{iid}: the bar closing {_hhmm(b.end)} was sent missing {missing} of its "
@@ -164,12 +256,14 @@ class Decoder:
 
 class HubDataClientConfig(DataClientConfig):
     def __init__(self, *, venue: str, instrument_ids: tuple[str, ...], host: str = "hub", port: int = 7700,
-                 bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, **kwargs) -> None:
+                 bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, recover=None,
+                 status: HubStatus | None = None, **kwargs) -> None:
         """report(level, kind, message): where skipped and incomplete bars and connection losses are told,
-        e.g. the strategy's journal events; by default the node's log."""
+        e.g. the strategy's journal events; by default the node's log. recover: the stored minutes, as
+        Decoder takes them. status: kept up to date with the hub's heartbeats, for the strategy's watchdog."""
         super().__init__(**kwargs)
         self.venue, self.instrument_ids, self.host, self.port = venue, tuple(instrument_ids), host, port
-        self.bar_spec, self.report = bar_spec, report
+        self.bar_spec, self.report, self.recover, self.status = bar_spec, report, recover, status
 
 
 class HubDataClient(MarketDataClient):
@@ -177,7 +271,7 @@ class HubDataClient(MarketDataClient):
         super().__init__(name=name, config=config, cache=cache, clock=clock, venue=Venue(config.venue))
         self.cfg = config
         self._report = config.report or self._log_report
-        self.decode = Decoder(config.bar_spec, self.report)
+        self.decode = Decoder(config.bar_spec, self.report, config.recover)
         self.last_heartbeat_ns = 0
         self.venue_up = False
         self.connects = 0
@@ -195,6 +289,9 @@ class HubDataClient(MarketDataClient):
         (self._log.warning if level != "info" else self._log.info)(f"{kind}: {message}")
 
     async def _open(self) -> tuple[asyncio.StreamReader, dict]:
+        if self._writer is not None:  # the last connection's socket, broken or not, is done with
+            self._writer.close()
+            self._writer = None
         reader, writer = await asyncio.open_connection(self.cfg.host, self.cfg.port, limit=16 * 1024 * 1024)
         writer.write(protocol.encode(protocol.subscription(list(self.cfg.instrument_ids))))
         await writer.drain()
@@ -208,10 +305,19 @@ class HubDataClient(MarketDataClient):
 
     async def _connect(self) -> None:
         """Waits until the hub serves every instrument asked for, with its definition, so the strategy finds it
-        in the cache when it starts."""
+        in the cache when it starts. A hub not listening yet (starting, or restarting) is retried with the
+        reconnect backoff for as long (QA P1-C9), not left to a restart of the node."""
         deadline = time.monotonic() + CONNECT_TIMEOUT
+        attempt = 0
         while True:
-            reader, hello = await self._open()
+            try:
+                reader, hello = await self._open()
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                await asyncio.sleep(RECONNECT_SECONDS[min(attempt, len(RECONNECT_SECONDS) - 1)])
+                attempt += 1
+                continue
             defs = {d["id"]: d for d in hello.get("instruments", [])}
             if set(self.cfg.instrument_ids) <= set(defs):
                 break
@@ -226,8 +332,11 @@ class HubDataClient(MarketDataClient):
 
     async def _read(self, reader: asyncio.StreamReader) -> None:
         """Until the node stops: hands the stream's data to the node, and on losing it for any reason (the hub
-        restarting, a message it can't read) reconnects, saying once when it went and when it came back."""
-        attempt, lost = 0, None
+        restarting, a message it can't read) reconnects, saying once when it went and when it came back. It is
+        back once the stream has flowed for HEALTHY_SECONDS: until then the backoff keeps growing, so a stream
+        that breaks after every message or two is retried every 5 s and told once, not every second (QA
+        P1-C6)."""
+        attempt, lost, opened = 0, None, time.monotonic()
         while not self._closing:
             try:
                 while line := await reader.readline():
@@ -235,14 +344,15 @@ class HubDataClient(MarketDataClient):
                     now = self.clock.timestamp_ns()
                     if m.get("t") == "hb":
                         self.last_heartbeat_ns, self.venue_up = now, bool(m.get("venue_up"))
-                        continue
-                    data = self.decode(m, now)
-                    if data is not None:
+                        if (status := getattr(self.cfg, "status", None)) is not None:
+                            status.heartbeat_ns, status.venue_up = now, self.venue_up
+                    elif (data := self.decode(m, now)) is not None:
                         self._handle_data(data)
-                    attempt = 0
-                    if lost is not None:  # said once the stream flows again, so a stream that breaks at once is quiet
+                    if attempt and time.monotonic() - opened >= HEALTHY_SECONDS:
+                        attempt = 0
+                    if lost is not None and not attempt:
                         self.report("info", "hub", f"Reconnected to the market data hub after "
-                                                   f"{time.monotonic() - lost:.0f} s")
+                                                   f"{opened - lost:.0f} s")
                         lost = None
                 reason = "the hub closed the connection"
             except Exception as exc:  # noqa: BLE001 - whatever broke the stream, the cure is to reconnect
@@ -259,6 +369,7 @@ class HubDataClient(MarketDataClient):
             except Exception:  # noqa: BLE001 - still away: try again
                 reader = asyncio.StreamReader()
                 reader.feed_eof()
+            opened = time.monotonic()
 
     async def _disconnect(self) -> None:
         self._closing = True
