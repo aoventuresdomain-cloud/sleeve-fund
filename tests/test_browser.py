@@ -429,3 +429,34 @@ def test_recorded_lines_are_steps_with_a_toggle_and_unshown_ones_wait_until_aske
     assert page.locator(".pc-legend span", has_text="EMA(10)").evaluate("e => e.style.opacity") == "0.4"
     assert errors == []
     ctx.close()
+
+
+def test_recorded_decisions_are_drawn_once_each_on_closed_candles_and_never_ahead(site, browser):
+    import json
+    import time
+
+    fixture = _fixture_candles()
+    day = 86400
+    t = [c["time"] for c in fixture["candles"]]
+    future = (int(time.time()) // day + 5) * day
+    fixture["decisions"] = [
+        {"kind": "fill", "side": "buy", "t": t[12] + 3600, "signal_t": t[11] + day, "price": 112.0, "reason": "ema cross", "code": ""},
+        {"kind": "missed", "side": "buy", "t": t[20] + day, "signal_t": t[20] + day, "price": None, "reason": "Halted: daily loss pause", "code": "blocked"},
+        {"kind": "missed", "side": "sell", "t": t[25] + day, "signal_t": t[25] + day, "price": None, "reason": "Stale data: no candle for 3 minutes", "code": "stale_data"},
+        {"kind": "missed", "side": "buy", "t": future, "signal_t": future, "price": None, "reason": "ahead of its candle", "code": "blocked"},
+        {"kind": "missed", "side": "buy", "t": 5, "signal_t": 5, "price": None, "reason": "no such candle", "code": "blocked"},
+    ]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    drawn = json.loads(page.get_attribute(".pc-canvas", "data-decisions"))
+    assert drawn == {"fills": 1, "missed": 2}
+    assert errors == []
+    ctx.close()

@@ -624,6 +624,50 @@ window.Console = (() => {
     document.addEventListener("click", (e) => pops.forEach((p) => { if (!p.pop.hidden && !p.pop.contains(e.target) && !p.btn.contains(e.target)) p.set(false); }));
     box.addEventListener("keydown", (e) => { if (e.key === "Escape") pops.forEach((p) => { if (!p.pop.hidden) { p.set(false); p.btn.focus(); } }); });
 
+    // Decisions the strategy recorded (P1-3m): a thin link from each fill back to the candle whose close made the
+    // decision, and a hollow circle where the conditions held but nothing was entered. Drawn only on candles that
+    // have closed, from the recorded rows, never inferred.
+    const decide = {rows: [], iv: 0, drawn: {fills: 0, missed: 0}};
+    const decisionView = (series) => ({
+      zOrder: () => "top",
+      renderer: () => ({draw: (target) => target.useMediaCoordinateSpace(({context: g}) => {
+        if (main !== series || !data) return;
+        const ts = chart.timeScale(), by = new Map(data.candles.map((c) => [c.time, c]));
+        const opens = data.candles.map((c) => c.time);
+        const x = (t) => ts.timeToCoordinate(t), y = (v) => series.priceToCoordinate(v);
+        g.save(); g.lineWidth = 1.5;
+        decide.rows.forEach((r) => {
+          const sig = by.get(r.signal_t - decide.iv); if (!sig) return;
+          const sx = x(sig.time), sy = y(sig.close);
+          if (sx == null || sy == null) return;
+          if (r.kind === "fill") {
+            const open = opens.filter((o) => o <= r.t).pop(), fx = open == null ? null : x(open), fy = y(r.price);
+            if (fx == null || fy == null) return;
+            g.strokeStyle = rgba(css("--muted"), 0.8); g.setLineDash([3, 3]);
+            g.beginPath(); g.moveTo(sx, sy); g.lineTo(fx, fy); g.stroke();
+          } else {
+            const up = r.side === "sell", py = up ? y(sig.high) - 12 : y(sig.low) + 12;
+            g.setLineDash([]); g.strokeStyle = css(up ? "--loss" : "--gain");
+            g.beginPath(); g.arc(sx, py, 5, 0, Math.PI * 2); g.stroke();
+          }
+        });
+        g.restore();
+      })}),
+    });
+    const decisionPrim = (series) => { const v = decisionView(series); let req = null;
+      return {attached: (p) => { req = p.requestUpdate; decide.redraw = () => req && req(); }, detached: () => {}, paneViews: () => [v], updateAllViews: () => {}}; };
+    candles.attachPrimitive(decisionPrim(candles)); area.attachPrimitive(decisionPrim(area));
+    const syncDecisions = (d) => {
+      const iv = d.interval * 60, last = d.candles.length ? d.candles[d.candles.length - 1].time : 0;
+      const opens = new Set(d.candles.map((c) => c.time)), now = Date.now() / 1000;
+      decide.iv = iv;
+      decide.rows = (d.decisions || []).filter((r) => r && Number.isFinite(r.signal_t) && r.signal_t <= now && opens.has(r.signal_t - iv)
+        && (r.kind === "missed" || (r.kind === "fill" && Number.isFinite(r.t) && Number.isFinite(r.price) && r.t <= now)));
+      decide.drawn = {fills: decide.rows.filter((r) => r.kind === "fill").length, missed: decide.rows.filter((r) => r.kind === "missed").length};
+      $(".pc-canvas").dataset.decisions = JSON.stringify(decide.drawn);
+      if (decide.redraw) decide.redraw();
+    };
+
     const showNote = (ids) => {
       const note = $(".pc-note");
       note.replaceChildren();
@@ -641,6 +685,18 @@ window.Console = (() => {
         note.append(block);
       });
       note.hidden = !note.childElementCount;
+    };
+    // The reason for each entry that did not happen on a candle, in the platform's words.
+    const showMissed = (rows) => {
+      const note = $(".pc-note");
+      note.replaceChildren();
+      rows.forEach((r) => {
+        const block = el("div", "why-block");
+        block.append(el("div", "k", `No ${r.side} entry · ${new Date(r.signal_t * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC`));
+        block.append(el("p", null, r.reason || "Not recorded."));
+        note.append(block);
+      });
+      note.hidden = !rows.length;
     };
     let current = "", pair = "";
     const marksNote = $(".pc-source").textContent;
@@ -678,6 +734,7 @@ window.Console = (() => {
       }});
       if (!keepView) chart.timeScale().fitContent();
       syncStrategy(d);
+      syncDecisions(d);
       fill();
       $(".pc-source").hidden = d.source !== "marks" && !d.note;
       $(".pc-source").textContent = d.note || marksNote;
@@ -771,7 +828,9 @@ window.Console = (() => {
       if (!data || !p.time) return;
       const ids = p.hoveredObjectId && data.notes[p.hoveredObjectId] ? [p.hoveredObjectId]
         : data.markers.filter((m) => m.time === p.time).map((m) => m.id);
-      if (ids.length) showNote(ids);
+      if (ids.length) { showNote(ids); return; }
+      const missed = decide.rows.filter((r) => r.kind === "missed" && r.signal_t - decide.iv === p.time);
+      if (missed.length) showMissed(missed);
     });
     build();
     load("");
