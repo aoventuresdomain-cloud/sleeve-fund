@@ -53,7 +53,8 @@ def test_create_sleeve_and_control_it(client):
     r = _new(c)
     assert r.status_code == 303 and r.headers["location"] == "/sleeves/btc-test"
     s = store.sleeve("btc-test")
-    assert s.params == {"fast": 10, "slow": 30} and s.desired_state == "running"
+    # P2-1: a strategy made from the form from now on is centrally sized.
+    assert s.params == {"fast": 10, "slow": 30, "sizing": "central"} and s.desired_state == "running"
     assert store.decisions("btc-test")[0]["reason"] == "first test"
 
     store.record_equity("btc-test", equity=5100, cash=3000, qty=0.02, price=105000, benchmark=5050)
@@ -353,7 +354,9 @@ def test_risk_overview_lists_room_before_halt_and_stops(client):
     overview = page.split('data-panel="overview"', 1)[1].split('data-panel="limits"', 1)[0]
     assert "Limits by strategy" not in overview and "Limits by strategy" in page  # the full table is on Limits
     assert '<span class="rh-chip ok" title="2.0 ATR (14 bars) below entry">2 ATR</span>' in overview
-    assert '<span class="rh-chip warn">None</span>' in overview
+    # P2-1: a new strategy with no stop declared trades with the placed default stop.
+    assert ('<span class="rh-chip ok" title="2.5 Wilder ATR (14 bars) below entry, the default as none is set">'
+            'Default 2.5 ATR</span>') in overview
     assert 'class="w" style="width:60.0%"' in overview and "8.0% left" in overview
     assert "If the market moved now" in overview and "Book drawdown, 30 days" in overview
 
@@ -567,10 +570,14 @@ def test_backtest_page_shows_every_trade_with_its_reason_and_hands_off_to_a_slee
     assert "Trend filter on ETH/USD" in page and "Every trade" in page and "Buy and hold" in page
     assert "5-bar average" in page and "above the 20-bar average" in page  # the entry reasons, from the strategy
     assert "365 days" in page
-    # The sleeve decides on the daily bars that were tested, warm from its first bar (the slow 20).
+    # The sleeve decides on the daily bars that were tested, warm from its first bar: P2-1's default stop, a
+    # settled Wilder ATR(14), needs more than the slow 20.
+    from sleeve_fund.strategies.indicators import Atr
+
     assert ('href="/sleeves/new?instrument=ETH%2FUSD&amp;strategy=trend_filter&amp;p_trend_filter__fast=5'
             '&amp;p_trend_filter__slow=20&amp;starting_balance=5000&amp;bar_spec=1-DAY-LAST-EXTERNAL'
-            '&amp;tested_bar_spec=1-DAY-LAST-EXTERNAL&amp;warmup_bars=20&amp;from=backtest"') in page
+            f'&amp;tested_bar_spec=1-DAY-LAST-EXTERNAL&amp;warmup_bars={Atr(14).warmup_bars + 1}&amp;from=backtest"'
+            ) in page
     assert "33% invested" in page  # the benchmark is held at the balanced profile's cap
     form = c.get("/sleeves/new?instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5&from=backtest"
                  "&bar_spec=1-DAY-LAST-EXTERNAL&warmup_bars=40", auth=AUTH).text
@@ -1188,11 +1195,14 @@ def test_a_new_strategy_warms_up_automatically_and_says_when_it_cannot(client):
     for the model's longest look-back; past the most that loads, the strategy says so."""
     c, store = client
     assert _new(c, name="auto-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="20").status_code == 303
-    assert store.sleeve("auto-warm").warmup_bars == 20  # the slow average's length
+    from sleeve_fund.strategies.indicators import Atr
+
+    # The longest look-back: P2-1's default stop, a settled Wilder ATR(14), past the slow average's 20.
+    assert store.sleeve("auto-warm").warmup_bars == Atr(14).warmup_bars + 1
     assert not [e for e in store.events("auto-warm") if e["kind"] == "warmup_short"]
     # Fewer than the model needs is raised to what it needs (PM, 5 Oct 2026: the bare minimum is required).
     _new(c, name="short-warm", warmup_bars="10", p_trend_filter__fast="5", p_trend_filter__slow="20")
-    assert store.sleeve("short-warm").warmup_bars == 20
+    assert store.sleeve("short-warm").warmup_bars == Atr(14).warmup_bars + 1
     assert not [e for e in store.events("short-warm") if e["kind"] == "warmup_short"]
     # Past the most the history store loads, the shortfall is an alert.
     _new(c, name="long-warm", warmup_bars="", p_trend_filter__fast="5", p_trend_filter__slow="60000")
@@ -1507,7 +1517,7 @@ def test_risk_settings_change_in_place_with_a_reason_and_restart(client):
     s = store.sleeve("btc-test")
     assert s.risk_profile == "conservative"
     assert s.params == {"fast": 10, "slow": 30, "maker_wait_minutes": 20, "stop_atr": 2.0, "atr_bars": 10,
-                        "take_profit_r": 3.0, "max_notional": 500.0}  # the model and order type untouched
+                        "take_profit_r": 3.0, "max_notional": 500.0, "sizing": "central"}  # the model and order type untouched
     assert s.warmup_bars >= 11  # enough bars for the new stop's average true range
     (d,) = store.decisions("btc-test", action="change_settings")
     assert "Risk profile balanced to conservative" in d["reason"] and "Stop-loss 8% below the entry to 2 average" \

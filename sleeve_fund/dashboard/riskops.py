@@ -11,6 +11,7 @@ import pandas as pd
 from sleeve_fund import backups
 from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store, utcnow
+from sleeve_fund.strategies.base import central_sizing
 
 FEED_FRESH_SECONDS = 60  # past this a strategy's price feed reads as stale, here and on its page
 
@@ -44,8 +45,8 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
             "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
             "headroom": x["room"],
-            # P2-1: a model with no stop declared trades with the placed fallback; only weight models have none.
-            "has_stop": s.params.get("rebalance_band") is None or bool(
+            # P2-1: a centrally sized model with no stop declared trades with the placed fallback.
+            "has_stop": central_sizing(s.params) or bool(
                 s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
             "position": positions.get(s.name),
             "shocks": shocks,

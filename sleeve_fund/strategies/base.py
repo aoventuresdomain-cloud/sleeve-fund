@@ -33,7 +33,7 @@ from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
 from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, ROUND_UP_FLAG, Sizing, SizingInputs, size_entry
-from sleeve_fund.strategies.indicators import AtrSma
+from sleeve_fund.strategies.indicators import Atr, AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -111,9 +111,17 @@ def _condition_json(c: Condition) -> dict:
 MIN_STOP, MAX_STOP = 0.002, 0.5
 # The most of a bar's traded volume one buy may take (see LongFlatConfig.max_participation).
 MAX_PARTICIPATION = 0.25
-# P2-1 (Head of Engineering, 6 Oct 2026): a definition that sets no risk per trade risks this much of its
-# equity on each entry, to its stop; one with no stop gets the fallback ATR_STOP_MULTIPLE x ATR, placed.
+# P2-1 (Head of Engineering, 6 Oct 2026): a centrally sized definition that sets no risk per trade risks this
+# much of its equity on each entry, to its stop; one with no stop gets the fallback ATR_STOP_MULTIPLE x Wilder's
+# ATR, placed. Opt-in: "central" for strategies made from now on, "legacy" (the default) keeps every existing model
+# and its recorded replays on the sizing they were tested with (Head of Engineering and Advisor, 6 Oct 2026).
 DEFAULT_RISK_PER_TRADE = 0.01
+SIZINGS = ("legacy", "central")
+
+
+def central_sizing(params: dict) -> bool:
+    """Whether these settings trade with central sizing (P2-1): opted in, and not a target-weight model."""
+    return params.get("sizing") == "central" and params.get("rebalance_band") is None
 # Paper's price watchdog: minutes without a trade or a quote before it warns, and before it treats the
 # feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
 STALE_PRICE_WARN_MINUTES = 5
@@ -192,11 +200,11 @@ def _side_word(side: int) -> str:
 
 
 def exit_warmup(params: dict) -> int:
-    """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop. A model with no
-    stop declared (and no target weight) trades with the fallback ATR stop (P2-1), so it warms that too."""
-    fallback = not any(params.get(k) for k in ("stop_loss", "stop_atr", "stop_swing_bars")) \
-        and params.get("rebalance_band") is None
-    if params.get("stop_atr") or fallback:
+    """Bars an ATR or swing-low stop looks back over: an entry waits until it can set its stop. A centrally sized
+    model with no stop declared trades with the fallback Wilder ATR stop (P2-1), so it warms that until settled."""
+    if central_sizing(params) and not any(params.get(k) for k in ("stop_loss", "stop_atr", "stop_swing_bars")):
+        return Atr(int(params.get("atr_bars") or 14)).warmup_bars + 1
+    if params.get("stop_atr"):
         return int(params.get("atr_bars") or 14) + 1
     return int(params.get("stop_swing_bars") or 0)
 
@@ -229,6 +237,7 @@ class LongFlatConfig(StrategyConfig):
         market: str = markets.SPOT,
         allow_short: bool = False,
         demo_mirror: bool = False,
+        sizing: str = "legacy",
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -289,11 +298,13 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        # P2-1: every entry is sized by what it loses at a placed stop (sizing.size_entry). A definition with no
-        # stop gets the fallback, placed like any other, and no risk per trade means DEFAULT_RISK_PER_TRADE.
-        # Weight models (rebalance_band) and the buy-and-hold benchmark size their own way.
+        # P2-1, central sizing only: every entry is sized by what it loses at a placed stop (sizing.size_entry).
+        # A definition with no stop gets the fallback, placed like any other, and no risk per trade means
+        # DEFAULT_RISK_PER_TRADE. Weight models (rebalance_band) and the buy-and-hold benchmark size their own way.
+        if sizing not in SIZINGS:
+            raise ValueError(f"sizing is one of {', '.join(SIZINGS)}, got {sizing!r}")
         stop_fallback = False
-        if rebalance_band is None and not self.BENCHMARK:
+        if sizing == "central" and rebalance_band is None and not self.BENCHMARK:
             if not stops:
                 stop_atr, stop_fallback, stops = ATR_STOP_MULTIPLE, True, ["stop_atr"]
             if risk_per_trade is None:
@@ -336,6 +347,7 @@ class LongFlatConfig(StrategyConfig):
         # bars) below the close, or at the lowest low of the last stop_swing_bars bars.
         self.stop_atr = stop_atr
         self.stop_fallback = stop_fallback  # the stop is the P2-1 fallback, not one the definition declared
+        self.sizing = "central" if sizing == "central" and rebalance_band is None and not self.BENCHMARK else "legacy"
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)
         # Or a take-profit that makes this many times what the stop loses, both after costs (r_target).
@@ -441,7 +453,8 @@ class LongFlatStrategy(Strategy):
         # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
         self._replan_pending: tuple[str, int] | None = None
         self._plan_entry: dict | None = None  # the open position's entry order, after a restart
-        self._atr = AtrSma(config.atr_bars) if config.stop_atr else None
+        # A declared ATR stop keeps the simple ATR its models were tested with; the P2-1 fallback is Wilder's.
+        self._atr = (Atr(config.atr_bars) if config.stop_fallback else AtrSma(config.atr_bars)) if config.stop_atr else None
         self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
@@ -761,6 +774,8 @@ class LongFlatStrategy(Strategy):
             if not self._atr.initialized or close <= 0:
                 return None
             stop, basis = c.stop_atr * self._atr.value / close, (
+                f"{c.stop_atr:g} x the {c.atr_bars}-bar Wilder average true range ({self._atr.value:,.6g}), the "
+                "default stop as none is set" if c.stop_fallback else
                 f"{c.stop_atr:g} x the {c.atr_bars}-bar average true range ({self._atr.value:,.6g})")
         elif c.stop_swing_bars:
             if len(self._lows) < c.stop_swing_bars or close <= 0:
@@ -1189,7 +1204,7 @@ class LongFlatStrategy(Strategy):
             return
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
         share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
-        if self._stop_frac:
+        if self._stop_frac and self._cfg.sizing == "central":
             sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share)
             if not sizing.ok:
                 self._note("buy_skipped", sizing.skipped[0].upper() + sizing.skipped[1:])
@@ -1206,6 +1221,8 @@ class LongFlatStrategy(Strategy):
                 limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
             if self._cfg.max_notional is not None:
                 limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+            if self._cfg.risk_per_trade and self._stop_frac:
+                limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
             if (cap := self._volume_cap(bar)) is not None:
                 limits["share of the bar's volume"] = cap
             size_by = min(limits, key=limits.get)
@@ -1448,7 +1465,7 @@ class LongFlatStrategy(Strategy):
         if weight < 1:
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         sizing = None
-        if self._stop_frac:
+        if self._stop_frac and self._cfg.sizing == "central":
             # P2-1: what it loses at the stop sizes it, with the caps, in sizing.size_entry; free cash and a
             # target weight still bound it here, since only the account knows them.
             sizing = self._size(bar, 1, self._mark()[0] or float(free.as_decimal()), lev=1.0, perp=False, share=None)
@@ -1465,6 +1482,9 @@ class LongFlatStrategy(Strategy):
             elif self._cfg.position_cap_pct is not None:
                 equity = self._mark()[0] or float(free.as_decimal())
                 limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            if self._cfg.risk_per_trade:
+                equity = self._mark()[0] or float(free.as_decimal())
+                limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop()))
             if (cap := self._volume_cap(bar)) is not None:
                 limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -1529,7 +1549,7 @@ class LongFlatStrategy(Strategy):
         if sizing.rounded_up:
             out["rounded_up"] = True
         if self._cfg.stop_fallback:
-            out["stop_fallback"] = f"{ATR_STOP_MULTIPLE:g} x ATR({self._cfg.atr_bars}), none declared"
+            out["stop_fallback"] = f"{ATR_STOP_MULTIPLE:g} x Wilder ATR({self._cfg.atr_bars}), none declared"
         return out
 
     def _loss_at_stop(self, side: int = 1) -> float:

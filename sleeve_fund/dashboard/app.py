@@ -52,7 +52,7 @@ from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
-from sleeve_fund.strategies.base import DEFAULT_RISK_PER_TRADE, exit_warmup, maker_orders_enabled
+from sleeve_fund.strategies.base import DEFAULT_RISK_PER_TRADE, central_sizing, exit_warmup, maker_orders_enabled
 from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
@@ -1902,8 +1902,8 @@ def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
         stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):
         stop = f"{p['stop_loss'] * 100:g}% {w['stop']} the entry{held}"
-    elif p.get("rebalance_band") is None:  # P2-1: no stop declared means the fallback, placed
-        stop = (f"{ATR_STOP_MULTIPLE:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the "
+    elif central_sizing(p):  # P2-1: no stop declared means the fallback, placed
+        stop = (f"{ATR_STOP_MULTIPLE:g} Wilder average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the "
                 f"entry{held}, the default when none is set")
     else:
         stop = "none"
@@ -1911,7 +1911,7 @@ def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
               else f"{p['take_profit'] * 100:g}% {w['tp']} the entry{held}" if p.get("take_profit") else "none")
     return {"Risk profile": profile, "Stop-loss": stop, "Take-profit": target,
             "Risk per trade": f"{p['risk_per_trade'] * 100:g}%" if p.get("risk_per_trade") else
-            f"{DEFAULT_RISK_PER_TRADE * 100:g}%, the default" if p.get("rebalance_band") is None else "none",
+            f"{DEFAULT_RISK_PER_TRADE * 100:g}%, the default" if central_sizing(p) else "none",
             "Largest order": f"{p['max_notional']:,.2f}" if p.get("max_notional") else "no cap"}
 
 
@@ -1943,7 +1943,8 @@ def _market_form(params: dict) -> dict:
 
 def _clone_qs(s) -> str:
     """The new-sleeve form filled in with this sleeve's settings, for "Clone with changes"."""
-    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS and k not in MARKET_KEYS}
+    # Sizing is not carried: a clone is a new strategy, so the form sizes it centrally (P2-1).
+    params = {k: v for k, v in s.params.items() if k not in RISK_KEYS and k not in MARKET_KEYS and k != "sizing"}
     q = {"strategy": s.strategy, "instrument": s.instrument, "bar_spec": s.bar_spec,
          "starting_balance": f"{s.starting_balance:g}", "risk_profile": s.risk_profile, "warmup_bars": s.warmup_bars,
          "name": f"{s.name[:38]}-v2", "from": "clone", "source": s.name, **_risk_form(s.params),
@@ -2031,6 +2032,11 @@ def _form_params(form, strategy: str) -> dict:
             params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
+    # P2-1 (Head of Engineering and Advisor, 6 Oct 2026): a strategy made, or a backtest run, from this form from now
+    # on is centrally sized, so a backtest sizes as the strategy made from it will. Strategies already running keep
+    # the sizing they were made with; the benchmark sizes its own way.
+    if strategy in REGISTRY and not REGISTRY[strategy][1].BENCHMARK and params.get("rebalance_band") is None:
+        params["sizing"] = "central"
     return params
 
 
