@@ -380,6 +380,8 @@ def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_each_and_th
         def event(self, sleeve, level, kind, message):
             sent.append((level, kind, message))
     monkeypatch.setattr("sleeve_fund.store.Store", Inbox)
+    monkeypatch.setattr("sleeve_fund.funding.stale", lambda *a, **k: None)  # fixed stamps, real clock
+    monkeypatch.setattr(history, "_stale", set())  # no staleness episode left open by another test
     history._warned.clear()
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     assert [(level, kind) for level, kind, _ in sent] == [("warning", "funding_gap")]

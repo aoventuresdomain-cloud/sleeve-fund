@@ -116,6 +116,10 @@ funding_t = Table(
     Column("price", Float, nullable=False),
     Column("rate", Float, nullable=False),
     Column("amount", Float, nullable=False),
+    # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
+    # correction to the venue's rate), QA P1-O17.
+    Column("kind", String(16), nullable=False, server_default="settled"),
+    CheckConstraint("kind IN ('settled', 'baseline', 'true_up')", name="funding_kind"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
 )
 
@@ -1113,10 +1117,10 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None) -> None:
+                       ts: datetime | None = None, kind: str = "settled") -> None:
         with self.engine.begin() as c:
             c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
-                                                amount=amount))
+                                                amount=amount, kind=kind))
 
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         q = select(funding_t).where(funding_t.c.sleeve == sleeve).order_by(funding_t.c.ts.desc()).limit(limit)

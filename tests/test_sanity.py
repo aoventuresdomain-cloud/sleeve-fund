@@ -755,8 +755,9 @@ def test_every_trip_long_or_short_makes_its_price_move_less_its_fees():
         assert (t["pnl"] + t["fees"] > 0) == (t["side"] * (t["exit_px"] - t["entry_px"]) > 0), t
 
 
-def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
-    """Funding every 8 hours at 0.01% of the position's value: a long pays it, a short receives it. Equity
+def test_funding_on_a_simulated_perp_a_long_and_a_short_both_pay_the_baseline_and_the_books_add_up():
+    """Funding every 8 hours at 0.01% of the position's value: a simulated perp has no venue rates, so it is the
+    labelled baseline and both sides pay it, never a credit (Advisor, O17; re-pinned with HoE approval 6 Oct). Equity
     is the opening cash, every fill's cash flow and fee, the funding, and the position at the close."""
     s = np.arange(0, 24 * 9 * 3600, 3600)
     c = 60_000 * (1 + 0.01 * np.sin(s / 50_000))
@@ -784,8 +785,8 @@ def test_funding_a_long_pays_and_a_short_receives_and_the_books_add_up():
     shorts = [r for r in rows if r["qty"] < 0]
     assert longs and shorts
     for r in rows:
-        assert r["amount"] == pytest.approx(-r["qty"] * r["price"] * float(PERP_FEES.funding_rate), rel=1e-6), r
-    assert all(r["amount"] < 0 for r in longs) and all(r["amount"] > 0 for r in shorts)
+        assert r["amount"] == pytest.approx(-abs(r["qty"]) * r["price"] * float(PERP_FEES.funding_rate), rel=1e-6), r
+    assert all(r["amount"] < 0 for r in longs) and all(r["amount"] < 0 for r in shorts)
     total = sum(r["amount"] for r in rows)
     assert res.equity.iloc[-1] == pytest.approx(cash + total + held * c[-1], abs=0.05)
 

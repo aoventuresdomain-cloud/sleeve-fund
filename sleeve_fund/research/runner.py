@@ -16,7 +16,7 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
-from sleeve_fund import markets
+from sleeve_fund import funding, markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
@@ -46,6 +46,16 @@ class BacktestResult:
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
+    # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
+    # settlements charged the baseline and the longest stretch of held time without the rate (QA P1-O17).
+    funding_marks: list = field(default_factory=list)
+    funding_at_baseline: int = 0
+    funding_held: int = 0
+    funding_baseline_longest: pd.Timedelta = pd.Timedelta(0)
+    # A simulated perp: no venue's rates at all, every settlement charged the baseline (Advisor, 6 Oct 2026)
+    funding_simulated: bool = False
+    # Why the venue's stored settlements don't fit the schedule charged, or "" (funding.schedule_mismatch)
+    funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
 
@@ -220,7 +230,12 @@ def run_backtest(
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
-            funding=[{"ts": ts, "amount": a} for ts, a in strategy.funding_log],
+            funding=[{"ts": ts, "amount": a, "kind": k} for ts, a, k in strategy.funding_log],
+            funding_marks=list(strategy.funding_marks),
+            funding_simulated=strategy._cfg.perp is not None and strategy._cfg.perp.funding_venue is None,
+            funding_schedule=_funding_schedule(strategy, instrument, prices),
+            **dict(zip(("funding_at_baseline", "funding_held", "funding_baseline_longest"),
+                       funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
@@ -242,6 +257,21 @@ def _opening_balances(starting_capital: float, quote: Currency, base: Currency, 
     if perp:
         return [Money(_opening_cash(starting_capital, runtime), quote)]
     return [Money(book["cash"], quote)] + ([Money(book["qty"], base)] if book["qty"] > 0 else [])
+
+
+def _funding_schedule(strategy, instrument, prices: pd.DataFrame) -> str:
+    """funding.schedule_mismatch over the run, for a perp charged the venue's own rates."""
+    terms = strategy._cfg.perp
+    if terms is None or terms.funding_venue is None or not len(prices):
+        return ""
+    return funding.schedule_mismatch(terms.funding_venue, pair_of(instrument), terms.funding_hours,
+                                     start=prices.index[0], end=prices.index[-1]) or ""
+
+
+def _funding_interval(strategy) -> pd.Timedelta:
+    """The time between the perpetual's settlements, for the held time a stretch without the venue's rate spans."""
+    terms = strategy._cfg.perp
+    return pd.Timedelta(markets.funding_interval(terms.funding_hours)) if terms is not None else pd.Timedelta(0)
 
 
 def _opening_cash(starting_capital: float, runtime) -> float:
@@ -272,7 +302,7 @@ def _perp_mark_to_market(
             fee = sum(float(str(m).split()[0]) for m in
                       (f["commissions"] if isinstance(f["commissions"], (list, tuple)) else [f["commissions"]]))
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
-    for ts, amount in funding:
+    for ts, amount, *_ in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
     for ts in sorted(pd.Timestamp(t) for t in insurance):
         before = [(c, q) for t, c, q in flows if t <= ts]

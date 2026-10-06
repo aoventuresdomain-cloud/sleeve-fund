@@ -75,6 +75,13 @@ class VenueProfile:
     def venue(self) -> Venue:
         return Venue(self.name)
 
+    def funding_cap(self, pair: str) -> float:
+        """The cap on |funding rate| per settlement for the instrument: a rate beyond it is refused, never charged
+        (QA P1-O17). The sanity default until each instrument's published cap is kept (DA-11)."""
+        from sleeve_fund.funding import CAP
+
+        return CAP
+
     def symbol_of(self, pair: str) -> str:
         """The venue's own symbol for a BASE/QUOTE pair: the instrument id paper subscribes to."""
         return self.symbol(pair) if self.symbol is not None else pair

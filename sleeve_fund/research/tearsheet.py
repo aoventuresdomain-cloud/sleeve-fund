@@ -17,6 +17,7 @@ from sleeve_fund.research.metrics import (
     summary,
     years_covered,
 )
+from sleeve_fund import funding
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -34,6 +35,9 @@ NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
 RANDOM_ENTRY_CHECK = "Beats random entry times"
 RANDOM_SIDE_CHECK = "Beats random long or short"
+# A perpetual's out-of-sample funding at the venue's own rates: WARN is shown, not a fail; past the limits the study
+# isn't judged (funding.baseline_check; Advisor, 6 Oct 2026, QA P1-O17).
+FUNDING_CHECK = "Funding charged at the venue's own rates"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
               RANDOM_ENTRY_CHECK, RANDOM_SIDE_CHECK)
 # More of the test windows' trades than this left out at the edges, and the trade count is flagged.
@@ -48,7 +52,7 @@ def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
     unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED]
     if unjudged:
         return NOT_JUDGED, unjudged
-    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "INFO", NOT_APPLICABLE)]
+    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "WARN", "INFO", NOT_APPLICABLE)]
     return ("FAIL" if failed else "PASS"), failed
 
 
@@ -186,10 +190,12 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
         (NEARBY_CHECK, *_nearby(r)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
+        *_funding_rows(r),
         (
             "Holdout not used for tuning",
             "PASS",
-            "opened once, for this read-out" if r.holdout else r.holdout_withheld or "untouched",
+            (f"opened once, for this read-out; holdout not judged: {r.holdout_not_judged}" if r.holdout_not_judged
+             else "opened once, for this read-out") if r.holdout else r.holdout_withheld or "untouched",
         ),
         (
             "Variants tried disclosed",
@@ -213,6 +219,24 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
                    f"not judged: {ev}" if verdict == "FAIL" and name in OOS_CHECKS else ev)
                   for name, verdict, ev in checks]
     return checks
+
+
+def _funding_rows(r: StudyResult) -> list[tuple[str, str, str]]:
+    """A perpetual's funding: the G1 check on out-of-sample, and, shown only, the opened holdout (not judged past the
+    same limits) and the full research period."""
+    rows = []
+    if r.funding_baseline[1]:
+        rows.append((FUNDING_CHECK, *r.funding_check))
+    if r.holdout and r.holdout_funding_baseline[1]:
+        verdict, words = funding.baseline_check(*r.holdout_funding_baseline, "holdout")
+        rows.append(("Holdout funding at the venue's own rates (shown, not a test)", "INFO",
+                     f"{'holdout not judged: ' if verdict == NOT_JUDGED else ''}{words}"))
+    full = r.full_period
+    if full.funding_held:
+        rows.append(("Full-period funding at the venue's own rates (shown, not a test)", "INFO",
+                     funding.baseline_check(full.funding_at_baseline, full.funding_held,
+                                            full.funding_baseline_longest, "full-period")[1]))
+    return rows
 
 
 def _random_entry_check(r: StudyResult) -> tuple[str, str, str]:
@@ -369,7 +393,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     out.append(_row(f"Walk-forward out-of-sample ({len(r.folds)} folds, {oos['days']} days)", oos, oos_b))
     out.append(_row(f"Full research period, params {json.dumps(r.default_params)} (in-sample)", full, full_b))
     if r.holdout:
-        out.append(_row("Holdout", r.holdout, r.holdout_benchmark))
+        out.append(_row("Holdout (not judged)" if r.holdout_not_judged else "Holdout", r.holdout, r.holdout_benchmark))
     out.append("")
     out.append(f"Out-of-sample Sortino {_num(oos['sortino'])} vs {_num(oos_b['sortino'])}; "
                f"Calmar {_num(oos['calmar'])} vs {_num(oos_b['calmar'])}; "

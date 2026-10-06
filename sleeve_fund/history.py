@@ -567,8 +567,14 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         from sleeve_fund import funding
 
         try:
-            kept = funding.refresh(profile.name, pair, root=root, since=since)
+            refused: list = []
+            kept = funding.refresh(profile.name, pair, root=root, since=since, refused=refused)
             funding_to = kept.index[-1] if len(kept) else None
+            if refused:  # never kept as real rates: charged as missing, and said once a day for these settlements
+                at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} ({r!r})" for t, r in refused)
+                _alert(f"{profile.name} {pair}: funding invalid {refused[0][0]}-{refused[-1][0]}", "warning",
+                       "funding_invalid", f"{profile.name.upper()} {pair}: {len(refused)} settled funding rate(s) refused "
+                       f"as not a number within the {funding.cap_of(profile.name, pair):.2%} cap, kept as missing: {at}")
             missed, maybe = funding.settled_holes(profile.name, pair, root)  # QA P1-O18
             if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
@@ -579,6 +585,22 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
                                      + [f"possible hole at interval change {span(g)}" for g in maybe])
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+        try:  # outside the refresh, so a feed failing on every pass is still raised
+            problem, key = funding.stale(profile.name, pair, root), f"{profile.name} {pair}: funding stale"
+            if problem:
+                print(f"FUNDING STALE: {problem}")
+                if key not in _stale:  # once per episode (Advisor, 6 Oct 2026)
+                    _warned.pop(key, None)
+                    _alert(key, "warning", "funding_stale", problem)
+                    _stale.add(key)
+            elif key in _stale:  # the gap gets a clear end in the journal (Advisor, 6 Oct 2026)
+                _stale.discard(key)
+                kept = funding.rates(profile.name, pair, root).index
+                _warned.pop(f"{key}: cleared", None)
+                _alert(f"{key}: cleared", "info", "funding_stale_cleared",
+                       f"{profile.name} {pair}: funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC")
+        except Exception as exc:  # noqa: BLE001 - an unreadable store is reported by the refresh itself
+            print(f"{profile.name} {pair}: funding staleness check failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
 
 
@@ -677,6 +699,7 @@ def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
     print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
 
 
+_stale: set[str] = set()  # instruments whose funding was last seen stale, for the recovery line
 _warned: dict[str, float] = {}  # message prefix -> when it last went to the alerts inbox
 
 

@@ -116,6 +116,18 @@ def funding_times(after: datetime, until: datetime, hours: tuple[int, ...]) -> l
     return out
 
 
+def funding_interval(hours: tuple[int, ...]) -> timedelta:
+    """The time between settlements on a schedule of UTC hours: the shortest step, wrapping past midnight."""
+    h = sorted(hours)
+    return timedelta(hours=min((b - a) % 24 or 24 for a, b in zip(h, h[1:] + h[:1])))
+
+
+def baseline_rate(terms: PerpTerms) -> float:
+    """The fixed rate charged for a settlement whose rate the venue's records lack: 0.01% is the 8-hour figure, so
+    it is scaled to the schedule's interval, a 1-hour settlement paying an eighth of it (Advisor, 6 Oct 2026)."""
+    return abs(terms.funding_rate) * (funding_interval(terms.funding_hours) / timedelta(hours=8))
+
+
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
     """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
     opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the

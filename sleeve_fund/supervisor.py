@@ -67,6 +67,20 @@ def decide(sleeve: Sleeve, proc: Proc, now: datetime) -> str:
     return "none"
 
 
+def check_funding_schedule(s: Sleeve) -> None:
+    """Raises ValueError when a perp's newest stored settlement step is shorter than the schedule funding is charged
+    on: the engine would skip settlements (funding.schedule_mismatch; Advisor, 6 Oct 2026), until DA-11."""
+    from sleeve_fund import funding, markets
+    from sleeve_fund.paper.config import from_store
+
+    terms = markets.terms(s.params, from_store(s).venue)
+    if terms is None or terms.funding_venue is None:
+        return
+    why = funding.schedule_mismatch(terms.funding_venue, s.instrument, terms.funding_hours, latest=True)
+    if why:
+        raise ValueError(why)
+
+
 class Supervisor:
     def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
         self.store = store
@@ -82,6 +96,7 @@ class Supervisor:
         s = self.store.sleeve(name)
         try:
             check_perp_sizing(s.strategy, s.params)
+            check_funding_schedule(s)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
