@@ -26,6 +26,9 @@ G1_CONFIDENCE = 0.95
 SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
 JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
+# Where N or the deflated Sharpe is shown while an idea has a run whose count failed (QA P1-T8, P1-T10).
+N_UNCERTAIN = ("N uncertain: a run of this idea couldn't be counted in full, so this N and the bar it sets read low "
+               "until it is re-counted.")
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
@@ -168,7 +171,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
             f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; " + (
                 "too few independent out-of-sample days to judge" if unjudged else
                 f"{_share(beats)} likely to beat it by more than the best of {counts['variants']} variants would by "
-                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}"),
+                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}") + (f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""),
         ),
         _random_entry_check(r),
         (RANDOM_SIDE_CHECK, *((NOT_APPLICABLE, "long only: there is no side to draw") if r.random_side is None else
@@ -435,20 +438,21 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     out.append("")
     out.append("## Idea counter")
     out.append("")
+    uncertain = f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""
     if register is not None:
         out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
                    f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
-                   "results are judged by.")
+                   f"results are judged by.{uncertain}")
     out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
                f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
                + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
     if math.isnan(dsr):
         out.append("- Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns "
                    "vary, and " + ("these test windows never traded." if r.oos_trades == 0 else
-                                   f"this one has {oos['days']} days."))
+                                   f"this one has {oos['days']} days.") + uncertain)
     else:
         out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
-                   "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
+                   f"is real rather than the best of many tries (higher is better; 95% is a strong bar).{uncertain}")
     out.append("")
     out.append("## Caveats")
     out.append("")

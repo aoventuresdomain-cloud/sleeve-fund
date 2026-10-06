@@ -210,3 +210,24 @@ def test_t8c_a_failed_row_makes_n_uncertain_everywhere(tmp_path, monkeypatch):
     assert _t8_signals(tmp_path, c, store) == {"flag": True, "g1": True, "holdout": True, "tearsheet": True,
                                                "research": True}
 # The re-count case (all three clear) is DA-13 follow-up: test_da13_recount_xfails.py (HoE scope, 17:31).
+
+
+# --- 36e5a97 re-test: unannounced probe F (Advisor 17:06: "N uncertain" wherever N or the deflated Sharpe appears) ---
+def test_t10_the_tear_sheets_deflated_sharpe_and_n_lines_say_n_uncertain(tmp_path):
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.tearsheet import render
+    from sleeve_fund.research.trials import TrialsRegister, failed_row
+    from sleeve_fund.strategies.trend_filter import SPEC
+    from sleeve_fund.venues import venue
+
+    store = _store(tmp_path)
+    store.add_trials([failed_row(strategy="trend_filter", params={"fast": 5}, source="backtest", error="qa")])
+    reg, ledger = TrialsRegister(store), IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), venue("KRAKEN").instrument("BTC", "USD"), dataset="syn",
+                  ledger=ledger, synthetic=True, holdout_days=0, train_days=365, test_days=180, register=reg)
+    lines = render(r, ledger, reg).splitlines()
+    dsr = [l for l in lines if "Deflated Sharpe" in l]
+    n = [l for l in lines if "results are judged by" in l]
+    assert dsr and all(T8_UNCERTAIN_TEXT in l for l in dsr), dsr
+    assert n and all(T8_UNCERTAIN_TEXT in l for l in n), n
