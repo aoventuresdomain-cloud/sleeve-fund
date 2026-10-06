@@ -362,8 +362,9 @@ def test_a_null_from_the_venue_loses_only_its_own_row_not_the_page(tmp_path):
     assert list(open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)["contracts"]) == [100.0, 102.0]
 
 
-def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_a_day_and_the_history_chip(tmp_path, monkeypatch):
-    """QA P1-O11: the funding flags reach the alerts inbox and the instrument's history chip, not only the log."""
+def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_each_and_the_history_chip(tmp_path, monkeypatch):
+    """QA P1-O11, P1-O15, P1-O16: each funding hole reaches the alerts inbox once, a second new hole the same day
+    included, and the instrument's history chip says so in its text and colour, not only the log or hover."""
     from sleeve_fund import history
     from sleeve_fund.dashboard import development as dev
 
@@ -385,13 +386,21 @@ def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_a_day_and_t
     history._warned.clear()  # as after a restart: a pass that finds nothing new raises nothing (Code Reviewer)
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     assert len(sent) == 1
+    # A second hole within the day still goes in, alone (QA P1-O16).
+    kept += [T0 + 72 * h + k * 4 * h for k in range(6) if k != 2]
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert len(sent) == 2 and sent[1][2].count("missed between") == 1 and "interval change" not in sent[1][2]
+    assert "2026-10-04 04:00" in sent[1][2]
 
     from sleeve_fund.dashboard.app import _funding_health
     health = _funding_health("BINANCE", "BTC/USDT", tmp_path, None)
-    assert health == {"funding_gaps": 1, "funding_maybe": 1}
+    assert health == {"funding_gaps": 2, "funding_maybe": 1}
     first, last = pd.Timestamp("2026-01-01", tz="UTC"), pd.Timestamp("2026-10-01", tz="UTC")
     chip = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": [], **health})
-    assert chip["title"] == "1 missed funding settlement; 1 possible funding hole at an interval change"
+    assert chip["title"] == "2 missed funding settlements; 1 possible funding hole at an interval change"
+    assert chip["state"] == "stored" and chip["tone"] == "paused" and "no price gaps · 3 funding holes" in chip["text"]
+    clean = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": []})
+    assert clean["tone"] == "running" and clean["text"].endswith("no gaps")
 
 
 def test_a_null_funding_rate_is_refused_alone_and_left_as_a_hole(tmp_path):

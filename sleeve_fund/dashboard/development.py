@@ -176,7 +176,14 @@ def history_chip(h: dict) -> dict:
                                              f"{fm} possible funding hole{'s' if fm != 1 else ''} at an interval change"
                                              if fm else "") if p)
         title = f"{title}; {funding_note}" if title else funding_note
-    return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
+    text, tone = b["text"], BADGE_TONE[b["state"]]
+    if (fg or fm) and b["state"] == "stored":
+        # Funding holes don't hold backtests back (state stays "stored"), but the chip says so, not only its hover
+        # (QA P1-O15): funding charged at the baseline where the venue's rate is missing.
+        holes = fg + fm
+        text = text.replace("no gaps", f"no price gaps · {holes} funding hole{'s' if holes != 1 else ''}")
+        tone = BADGE_TONE["filling"]
+    return {"text": text, "tone": tone, "state": b["state"], "days": days, "title": title}
 
 
 BADGE_TONE = {"stored": "running", "filling": "paused", "gaps": "halted", "none": ""}
