@@ -2,7 +2,8 @@
 
 Two checks a study result must pass beyond the Sharpe test:
 - at least MIN_OOS_TRADES round trips out of sample, since a Sharpe on fewer is mostly luck;
-- the result holds at the settings next to the chosen ones, not only at one best value.
+- the result holds at the settings next to the chosen ones, not only at one best value: every neighbour
+  keeps a positive Sharpe and the median neighbour at least half the chosen Sharpe.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import math
 import pandas as pd
 
 MIN_OOS_TRADES = 100  # the spec's "at least about 100 out-of-sample trades"
-# A neighbour holds when its Sharpe is positive and at least this share of the chosen settings' Sharpe:
-# a cliff next to the chosen value says the value was picked from noise.
+# Independent Quant Advisor (5 Oct 2026): every neighbour must keep a positive Sharpe, and the median neighbour
+# at least this share of the chosen settings' Sharpe. A cliff next to the chosen value says it was picked from
+# noise; one weak neighbour among several strong ones does not. Sharpe is net of fees and half the spread.
 NEIGHBOUR_SHARE = 0.5
 
 
@@ -57,10 +59,12 @@ def nearby_settings(sensitivity: pd.DataFrame, centre: dict, params: list[str]) 
     bar = NEIGHBOUR_SHARE * sharpe
     if not math.isfinite(sharpe) or sharpe <= 0:
         return "FAIL", f"the chosen settings' Sharpe is {sharpe:.2f}, so there is nothing to hold"
-    weak = near[~(near["sharpe"] > 0) | (near["sharpe"] < bar)]
-    words = (f"{len(near) - len(weak)} of {len(near)} nearby settings keep a Sharpe of at least {bar:.2f} "
-             f"({NEIGHBOUR_SHARE:.0%} of the chosen {sharpe:.2f})")
-    if not weak.empty:
-        worst = weak.loc[weak["sharpe"].fillna(-math.inf).idxmin()]
+    sharpes = near["sharpe"].astype(float).fillna(-math.inf)  # a neighbour with no Sharpe is a loser
+    losing = int((sharpes <= 0).sum())
+    median = float(sharpes.median())
+    words = (f"{len(near) - losing} of {len(near)} nearby settings keep a positive Sharpe; the median one "
+             f"{median:.2f} against a bar of {bar:.2f} ({NEIGHBOUR_SHARE:.0%} of the chosen {sharpe:.2f})")
+    if losing or median < bar:
+        worst = near.loc[sharpes.idxmin()]
         words += "; weakest " + ", ".join(f"{p} {_setting(worst[p])}" for p in params) + f" at {worst['sharpe']:.2f}"
-    return ("PASS" if weak.empty else "FAIL"), words
+    return ("PASS" if not losing and median >= bar else "FAIL"), words
