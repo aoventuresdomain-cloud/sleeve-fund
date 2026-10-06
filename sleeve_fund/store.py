@@ -847,7 +847,7 @@ class Store:
         """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
         are ignored, as in update_order."""
         with self.engine.begin() as c:
-            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id)).first()
+            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id).with_for_update()).first()
             if row is not None:
                 c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
                           .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))

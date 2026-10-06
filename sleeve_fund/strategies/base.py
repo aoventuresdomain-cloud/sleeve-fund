@@ -938,9 +938,14 @@ class LongFlatStrategy(Strategy):
                       if o.get("intent") == "entry" and o.get("side") == opened), None)
         self._plan_entry, self._replan_pending = entry, None
         if self._margin:  # the liquidation price set when it was entered or last added to (_set_liq), if journaled
-            self._liq_px = next((o["signal"]["position_liquidation_px"] for o in store.orders(name, limit=200)
-                                 if entry is not None and o["ts"] >= entry["ts"] and o.get("side") == opened
-                                 and o.get("intent") in OPENING_INTENTS
+            # Filled entries only: a later entry that never filled (an expired post-only) must not hide the held
+            # entry's price (CR #146).
+            recent, filled = store.orders(name, limit=200), {f["order_id"] for f in store.fills(name, limit=500)}
+            held = next((o for o in recent if o.get("intent") == "entry" and o.get("side") == opened
+                         and o["order_id"] in filled), None)
+            self._liq_px = next((o["signal"]["position_liquidation_px"] for o in recent
+                                 if held is not None and o["ts"] >= held["ts"] and o.get("side") == opened
+                                 and o.get("intent") in OPENING_INTENTS and o["order_id"] in filled
                                  and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
         if entry is None:
             if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
@@ -3101,7 +3106,7 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
-                self._set_liq(coid)
+                self._set_liq(journal_id)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
