@@ -15,7 +15,7 @@
   <div><div class="k">Models</div><div class="v lead">{{ rows|length }}</div><div class="s">in the library</div></div>
   <div><div class="k">Passed G1</div><div class="v lead">{{ rows|selectattr('g1', 'equalto', 'PASS')|list|length }}</div><div class="s">on real data</div></div>
   <div><div class="k">Ideas tested</div><div class="v lead">{{ counts.ideas }}</div><div class="s">by the research loop</div></div>
-  <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">parameter sets</div></div>
+  <div><div class="k">Variants tried</div><div class="v lead">{{ counts.variants }}</div><div class="s">{% if counts.n_uncertain %}N uncertain: some runs couldn't be counted in full{% else %}parameter sets{% endif %}</div></div>
 </section>
 
 <nav class="tabs desk-tabs research-tabs" role="tablist" aria-label="Research views" data-tabs{% if tab %} data-default="{{ tab }}"{% endif %}>

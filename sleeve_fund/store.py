@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -28,6 +29,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     create_engine,
     delete,
     event,
@@ -38,6 +40,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
@@ -412,12 +415,46 @@ trials_t = Table(
     # Not a foreign key: saved backtests are pruned to the latest 50, and a trial outlives its run.
     Column("backtest_id", String(16)),
     Column("created_at", TS, nullable=False),
+    # The bars the evaluation read. NULL is unknown (the old idea counter), which a holdout check counts as
+    # overlapping: the safe side.
+    Column("data_start", TS),
+    Column("data_end", TS),
+    Column("status", String(16), nullable=False, server_default="ok"),
+    Column("error", Text),  # why a failed row's count failed; NULL on an ok row
+    CheckConstraint("status IN ('ok', 'failed')", name="trials_status"),
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
+# venue, for ever. Append-only, and no strategy column, so a reset never touches it.
+holdout_locks_t = Table(
+    "holdout_locks",
+    metadata,
+    Column("id", String(16), primary_key=True),
+    Column("idea_hash", String(64), nullable=False),
+    Column("underlying", String(16), nullable=False),  # the base asset, upper-case: BTC covers every BTC pair
+    Column("period_start", TS),  # NULL when imported from the idea counter, which kept no dates
+    Column("period_end", TS),
+    Column("opened_at", TS, nullable=False),
+    # Not a foreign key, as trials.backtest_id: the opening is kept even when its trial row is not there.
+    Column("trial_id", String(16)),
+    Column("source", String(16), nullable=False),
+    # claimed before the look, opened once it produced a result, crashed when the look failed after the claim:
+    # spent either way, but a crash is not a failed result (Advisor and Head of Engineering, 6 Oct 2026).
+    Column("status", String(16), nullable=False, server_default="opened"),
+    UniqueConstraint("idea_hash", "underlying", name="holdout_locks_idea_underlying"),
+)
+HOLDOUT_SOURCES = ("study", "ledger_import")
+HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
-TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
+# "strategy": a paper strategy created, cloned or re-set: a variant chosen to run, counted though it has no
+# Sharpe yet (QA P1-T1). "engineering": a run deliberately marked as a fixture, the only kind not counted, and
+# never the default (Advisor, 6 Oct 2026).
+TRIAL_SOURCES = ("study", "backtest", "strategy", "optimiser", "engineering", "ledger_import")
+# "ok": a counted evaluation. "failed": a run whose count failed (QA P1-T8), recorded against its idea under its own
+# source with its settings and the error, and no Sharpe, trades or dates (Data Architect, 6 Oct 2026).
+TRIAL_STATUSES = ("ok", "failed")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -558,6 +595,43 @@ def make_engine(url: str | None = None) -> Engine:
     return engine
 
 
+
+def check_trial(r: dict) -> None:
+    """Raises ValueError for a trials row the register would refuse."""
+    if r["source"] not in TRIAL_SOURCES:
+        raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
+    if r.get("status", "ok") not in TRIAL_STATUSES:
+        raise ValueError(f"a trial's status is one of {TRIAL_STATUSES}, got {r['status']!r}")
+    if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
+        raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
+    sharpe = r.get("sharpe")
+    if sharpe is not None and not math.isfinite(sharpe):
+        raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
+
+
+def _put_trials(c, rows: list[dict]) -> int:
+    """Insert trials on an open transaction, skipping ids already there. Returns how many were added."""
+    have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
+    new = [{**r, "created_at": r.get("created_at") or utcnow(), "data_start": r.get("data_start"),
+            "data_end": r.get("data_end"), "status": r.get("status", "ok"), "error": r.get("error")}
+           for r in rows if r["id"] not in have]
+    new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
+    if new:
+        c.execute(insert(trials_t), new)
+    return len(new)
+
+
+def _put_trial_in(c, row: dict) -> None:
+    """Write a run's trial on the run's own save transaction. A SAVEPOINT holds the insert, so a row another
+    process wrote between the check and the insert is skipped without aborting the save's transaction, which
+    Postgres would otherwise do (Data Architect)."""
+    try:
+        with c.begin_nested():
+            _put_trials(c, [row])
+    except IntegrityError:
+        if not c.execute(select(trials_t.c.id).where(trials_t.c.id == row["id"])).first():
+            raise
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
         self.engine = engine or make_engine(url)
@@ -589,7 +663,12 @@ class Store:
         warmup_bars: int = 0,
         desired_state: str = "running",
         venue: str | None = None,
+        trial: dict | None = None,
     ) -> Sleeve:
+        """trial: the strategy's row in the trials register, written in the same transaction, so a strategy is
+        never made without being counted, nor counted without being made (QA P1-T8)."""
+        if trial is not None:
+            check_trial(trial)
         ts = utcnow()
         with self.engine.begin() as c:
             c.execute(insert(sleeves_t).values(
@@ -600,6 +679,8 @@ class Store:
             ))
             if venue:
                 c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
+            if trial is not None:
+                _put_trial_in(c, trial)
         return self.sleeve(name)
 
     def sleeve(self, name: str) -> Sleeve:
@@ -1348,10 +1429,13 @@ class Store:
     # --- saved backtests ------------------------------------------------------------
 
     def save_backtest(self, journal, *, run_id: str, key: str, title: str, query: str, result: dict,
-                      bar_spec: str | None = None) -> str:
+                      bar_spec: str | None = None, trial: dict | None = None) -> str:
         """Copy a backtest's in-memory journal (sleeve_fund.paper.journal) into these tables under its
         own name, with the result the backtest page shows. Returns the backtest's strategy name.
-        `bar_spec` is the interval the PM picked, where the run's own bars only match its length."""
+        `bar_spec` is the interval the PM picked, where the run's own bars only match its length. `trial` is its
+        row in the trials register, written in the same transaction (QA P1-T8)."""
+        if trial is not None:
+            check_trial(trial)
         name = BACKTEST_PREFIX + run_id
         src = journal.sleeve_row
         now = utcnow()
@@ -1394,6 +1478,8 @@ class Store:
             # To the microsecond, so runs saved in the same second still sort (and prune) in order.
             c.execute(insert(backtests_t).values(id=run_id, sleeve=name, key=key, title=title, query=query,
                                                  created_at=datetime.now(timezone.utc), result=json.dumps(result)))
+            if trial is not None:
+                _put_trial_in(c, trial)
         return name
 
     def strategy_errors(self, sleeve: str, since_start: bool = False) -> int:
@@ -1442,24 +1528,63 @@ class Store:
         if not rows:
             return 0
         for r in rows:
-            if r["source"] not in TRIAL_SOURCES:
-                raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
-            if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
-                raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
-            sharpe = r.get("sharpe")
-            if sharpe is not None and not math.isfinite(sharpe):
-                raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
-        with self.engine.begin() as c:
-            have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
-            new = [dict(r, created_at=r.get("created_at") or utcnow()) for r in rows if r["id"] not in have]
-            new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
-            if new:
-                c.execute(insert(trials_t), new)
-        return len(new)
+            check_trial(r)
+        try:
+            return self._insert_trials(rows)
+        except IntegrityError:
+            # Another process added some of the same rows between the check and the insert (two start-ups
+            # importing the idea counter at once, QA m3): add the rest one at a time, skipping those it has.
+            added = 0
+            for r in rows:
+                try:
+                    added += self._insert_trials([r])
+                except IntegrityError:
+                    pass
+            return added
 
-    def trials(self) -> list[dict]:
+    def _insert_trials(self, rows: list[dict]) -> int:
+        with self.engine.begin() as c:
+            return _put_trials(c, rows)
+
+    def trials(self, idea_hash: str | None = None) -> list[dict]:
+        q = select(trials_t)
+        if idea_hash is not None:
+            q = q.where(trials_t.c.idea_hash == idea_hash)
         with self.engine.connect() as c:
-            return _rows(c.execute(select(trials_t).order_by(trials_t.c.created_at, trials_t.c.id)))
+            return _rows(c.execute(q.order_by(trials_t.c.created_at, trials_t.c.id)))
+
+    def add_holdout_lock(self, row: dict) -> bool:
+        """Record a holdout opening. False, and nothing written, when this idea already holds a lock on this
+        underlying: the first opening is the only one."""
+        if row["source"] not in HOLDOUT_SOURCES:
+            raise ValueError(f"a holdout lock's source is one of {HOLDOUT_SOURCES}, got {row['source']!r}")
+        if row.get("status", "opened") not in HOLDOUT_STATUSES:
+            raise ValueError(f"a holdout lock's status is one of {HOLDOUT_STATUSES}, got {row['status']!r}")
+        row = {"period_start": None, "period_end": None, "trial_id": None, "status": "opened", **row,
+               "underlying": row["underlying"].upper(), "opened_at": row.get("opened_at") or utcnow()}
+        try:
+            with self.engine.begin() as c:
+                c.execute(insert(holdout_locks_t), [row])
+        except IntegrityError:
+            return False
+        return True
+
+    def holdout_locks(self, idea_hash: str | None = None) -> list[dict]:
+        q = select(holdout_locks_t)
+        if idea_hash is not None:
+            q = q.where(holdout_locks_t.c.idea_hash == idea_hash)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(holdout_locks_t.c.opened_at)))
+
+    def settle_holdout_lock(self, lock_id: str, status: str, trial_id: str | None = None) -> None:
+        """Record how a claimed look ended: opened, naming the trial it produced, or crashed. Only a claimed lock
+        changes, so a settled one is never rewritten."""
+        if status not in ("opened", "crashed"):
+            raise ValueError(f"a claimed holdout settles as opened or crashed, got {status!r}")
+        with self.engine.begin() as c:
+            c.execute(update(holdout_locks_t).where(holdout_locks_t.c.id == lock_id,
+                                                    holdout_locks_t.c.status == "claimed")
+                      .values(status=status, trial_id=trial_id))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""
@@ -1502,16 +1627,23 @@ class Store:
         self._update_sleeve(sleeve, params={**s.params, key: value})
         return True
 
-    def change_settings(self, sleeve: str, *, risk_profile: str, params: dict, warmup_bars: int) -> bool:
+    def change_settings(self, sleeve: str, *, risk_profile: str, params: dict, warmup_bars: int,
+                        trial: dict | None = None) -> bool:
         """Save new risk settings. A running strategy is restarted by the supervisor to trade under
-        them (True); a stopped one picks them up when it next starts (False)."""
+        them (True); a stopped one picks them up when it next starts (False). trial: the re-set strategy's row in
+        the trials register, written in the same transaction as the settings (QA P1-T8)."""
         s = self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
-        self._update_sleeve(sleeve, risk_profile=risk_profile, params=params, warmup_bars=warmup_bars)
-        if s.desired_state != "running":
-            return False
+        if trial is not None:
+            check_trial(trial)
         with self.engine.begin() as c:
+            c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
+                updated_at=utcnow(), risk_profile=risk_profile, params=params, warmup_bars=warmup_bars))
+            if trial is not None:
+                _put_trial_in(c, trial)
+            if s.desired_state != "running":
+                return False
             if not c.execute(select(commands_t.c.id).where(commands_t.c.sleeve == sleeve, commands_t.c.command == RELOAD,
                                                            commands_t.c.applied_at.is_(None))).first():
                 c.execute(insert(commands_t).values(sleeve=sleeve, command=RELOAD, reason="settings changed",
