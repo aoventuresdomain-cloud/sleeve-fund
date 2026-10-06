@@ -102,7 +102,8 @@ class Rules(LongFlatStrategy):
         super().__init__(config)
         self.c = config
         self.rules = Compiled(config.checked)
-        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"))
+        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"),
+                       journal=self._journal)
         by_tf: dict = {}
         for bid in config.checked.order:
             by_tf.setdefault(config.checked.blocks[bid]["timeframe"], []).append(bid)
@@ -177,6 +178,11 @@ class Rules(LongFlatStrategy):
         got = self.minute_source(start, end) if self.minute_source is not None else None
         return sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
 
+    def _journal(self, kind: str, msg: str) -> None:
+        """An info event every time (not once, as _note is): paper only, where the minutes come from the hub."""
+        if self.runtime is not None and not self._backtest:
+            self.runtime.store.event(self.runtime.name, "info", kind, msg, ts=self.runtime.now())
+
     def first_touch_stats(self) -> dict:
         """For the report, per first_touch rule by its path (long.entry, long.entry[1], long.exit): candles judged,
         resolved true, either level reached, settled by minutes, both first reached in one minute, and unknown (a
@@ -184,11 +190,13 @@ class Rules(LongFlatStrategy):
         latter). `ambiguous_share` is same minute + unknown over either reached, which the G1 check reads (Advisor
         ~22:07): above 5% (`rerun_opposite_resolution`) it is re-run with first_touch_flip and judged on the worse. On
         1-minute candles every candle reaching both is a same-minute case, so the share is the assumption's, and the
-        note says so."""
+        note says so. `incomplete` counts candles settled by minutes with one or more of them not to hand (paper
+        journals each, first_touch_incomplete); `incomplete_share` is that over judged, for fills-vs-model (R2-INC)."""
         out = {}
         for n in self.rules.touches:
             st = dict(n.stats)
             st["ambiguous_share"] = (st["same_minute"] + st["unknown"]) / st["reached"] if st["reached"] else 0.0
+            st["incomplete_share"] = st["incomplete"] / st["judged"] if st["judged"] else 0.0
             st["rerun_opposite_resolution"] = st["ambiguous_share"] > FIRST_TOUCH_RERUN
             st["resolved"] = ("true" if n.exit_rule != n.flip else "false") + " when ambiguous"
             if bar_minutes(self._cfg.bar_type) == 1:
