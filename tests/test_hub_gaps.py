@@ -172,3 +172,21 @@ def test_minutes_with_no_trades_are_never_held_as_lost(monkeypatch):
     run = paper(flat_prices(30), enter=11, leave=25, stop=0.01, holes=(7, 8))
     assert _entries(run) and _entries(run)[0][2] == minute(11), run.sequence()
     assert not any(status.lost.values())
+
+
+@pytest.mark.parametrize("path", ["reconnect", "restart"])
+def test_a_liquidation_found_by_the_replay_calls_the_liquidation_hook_once(path, monkeypatch):
+    """QA P1-L18: #155 hangs the liquidation incident and halt on _on_liquidation; the outage replay's liquidation
+    reaches it as a live one does, once, at the replayed price."""
+    from sleeve_fund.strategies import base
+
+    calls = []
+    monkeypatch.setattr(base.LongFlatStrategy, "_on_liquidation",
+                        lambda self, price, liq, reason: calls.append((price, liq, reason)))
+    setup = qa.LIQ_SETUPS[0]
+    p = qa.shape(flat_prices(30), 7.0, 8.0, qa.adverse(setup[3], qa.LIQ_DEPTH[setup[2]]))
+    run = qa._outage(path, p, side=setup[3], perp=setup[1], profile=setup[2], stop=0.10, qty=0.25)
+    assert qa.first_exit(run.sequence())[0] == "liquidation", run.sequence()
+    assert len(calls) == 1 and "Liquidated" in calls[0][2], calls
+    (price, liq, _), side = calls[0], setup[3]
+    assert (price <= liq if side > 0 else price >= liq), calls  # at the replayed price, at or past liquidation

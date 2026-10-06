@@ -482,14 +482,14 @@ def assert_na1_price(run: Run, p, what: str, side: int, back: float) -> None:
         assert ex[0] == "take_profit" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
         (o,) = [o for o in run.orders if o["intent"] == "take_profit"]
         assert is_modelled(o["signal"]), o["signal"]
-    elif what == "gap_through_stop":
+    elif what == "gap_through_stop":  # Advisor 20:39: a replayed stop books as the backtest: the gap open less TP_SLIP
         gap_open = price_at(p, 7.0)
-        assert ex[0] == "stop_loss" and abs(ex[3] / gap_open - 1) < 3e-4, (ex, gap_open)
-    else:
+        assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(gap_open, side) - 1) < 1e-4, (ex, tp_model(gap_open, side))
+    else:  # Advisor 20:39: the level less max(half spread, 0.05 %)
         level = entry * (1 - side * 0.01)
-        assert ex[0] == "stop_loss", ex
-        assert -level * 6e-4 <= side * (ex[3] - level) <= level * 3e-4, (ex, level)
+        assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
     (o,) = [o for o in run.orders if o["intent"] == ex[0]]
+    assert is_modelled(o["signal"]), o["signal"]  # Advisor 20:39: every replayed exit row is marked modelled
     found = {k: v for k, v in (o["signal"] or {}).items() if "return" in k.lower()}
     assert found and all(abs(float(v) / back - 1) < 2e-3 for v in found.values()), o["signal"]
 
@@ -997,12 +997,27 @@ def test_l6_na1_an_outage_stop_fills_at_its_level_like_the_backtest(path, label,
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02))
     run = _outage(path, p, side=side, perp=perp, profile=profile, tp=0.02)
     ex = first_exit(run.sequence())
-    level = _entry(run) * (1 - side * 0.01)
-    assert ex[0] == "stop_loss"
-    assert side * (ex[3] - level) <= level * 3e-4, (ex, level)  # at the level or worse (a few bp of spread)
-    assert side * (ex[3] - level) >= -level * 6e-4, (ex, level)  # and not a gap's worth worse: there was none
-    bt = _bt_exit(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25)
-    assert abs(ex[3] / bt[3] - 1) < 3e-4, (ex, bt)
+    level = _entry(run) * (1 - side * 0.01)  # Advisor 20:39: the level less TP_SLIP, the row marked modelled
+    assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
+    (o,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    assert is_modelled(o["signal"]), o["signal"]
+    # The backtest-side comparison moved to test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor
+    # (strict xfail until D13 lands), not a loosened tolerance here.
+
+
+_D13_STOP_XF = pytest.mark.xfail(strict=True, reason="NA-1 backtest side (Advisor 20:39): the backtest books a stop "
+                                 "at its level (or the gap open) less max(half spread, 0.05 %), as a replayed outage "
+                                 "stop; stop slippage lands with D13, which stacks on #146: not built yet")
+
+
+@_D13_STOP_XF
+@pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
+def test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
+    p = shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02))
+    seq = backtest(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25)
+    level = seq[0][3] * (1 - side * 0.01)
+    ex = first_exit(seq)
+    assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
 
 
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
@@ -1011,21 +1026,27 @@ def test_l6_na1_a_gap_through_the_stop_fills_at_the_open_of_the_crossing_minute(
     p = _gap_prices(side)
     run = _outage(path, p, side=side, perp=perp, profile=profile)
     ex = first_exit(run.sequence())
-    gap_open = price_at(p, 7.0)
-    assert ex[0] == "stop_loss" and abs(ex[3] / gap_open - 1) < 3e-4, (ex, gap_open)
+    gap_open = tp_model(price_at(p, 7.0), side)  # Advisor 20:39: the open less TP_SLIP, the row marked modelled
+    assert ex[0] == "stop_loss" and abs(ex[3] / gap_open - 1) < 1e-4, (ex, gap_open)
+    (o,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    assert is_modelled(o["signal"]), o["signal"]
 
 
+@_D13_STOP_XF
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_na1_the_backtest_fills_a_gapped_stop_at_the_crossing_minutes_open(label, perp, profile, side):
-    """Already true on ebe39c5 (a resting stop whose minute opens past it fills at that open): pinned as the
-    reference paper must match."""
+    """Was true on ebe39c5 at the bare open; Advisor 20:39 moves it to the open less TP_SLIP (D13, strict xfail)."""
     p = _gap_prices(side)
     ex = _bt_exit(p, side=side, perp=perp, profile=profile, leave=25)
-    assert ex[0] == "stop_loss" and abs(ex[3] / price_at(p, 7.0) - 1) < 3e-4, ex
+    gap = tp_model(price_at(p, 7.0), side)  # Advisor 20:39: the gap open less max(half spread, 0.05 %)
+    assert ex[0] == "stop_loss" and abs(ex[3] / gap - 1) < 1e-4, (ex, gap)
+
+
+_D13_ENTRY_XF = pytest.mark.xfail(strict=True, raises=AssertionError, reason="D13")  # Advisor 20:55: see below
 
 
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", [pytest.param("reconnect", marks=_D13_ENTRY_XF), "restart"])
 def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_backtest(path, label, perp, profile,
                                                                                      side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, favourable(side, 0.03))
@@ -1033,6 +1054,9 @@ def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_back
     ex = first_exit(run.sequence())
     level = _entry(run) * (1 + side * 0.02)  # L12 FINAL 19:30: the level less TP_SLIP in the replay and the backtest
     assert ex[0] == "take_profit" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
+    # [reconnect-*] xfail "D13" (Advisor 20:55): the backtest's entry fills at mid +- HALF spread with no floor and
+    # the levels derive from the fill, so paper's target (entry at the ask) sits half a spread off the backtest's;
+    # missed by ~6e-7 on 5f28360. D13 owns it; the 1e-4 tolerance stays.
     bt = _bt_exit(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25)
     assert abs(ex[3] / bt[3] - 1) < 1e-4, (ex, bt)
 
@@ -1172,6 +1196,8 @@ def _relay(monkeypatch, refill):
 def _raise(*a, **k):
     raise ConnectionError("qa: the venue's REST is down too")
 
+
+_L2_FIX = "P1-L2 fix not pushed yet (PE1 17:48): the relay sends no {'t': 'filled'}"
 
 
 @pytest.mark.parametrize("case", ["found", "nothing_found", "refill_raises", "instrument_not_relayed"])

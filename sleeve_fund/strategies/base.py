@@ -1673,13 +1673,18 @@ class LongFlatStrategy(Strategy):
         if hit is None:
             return False
         intent, px, level, at, worst = hit
+        if intent == "stop_loss":
+            # Advisor 20:42 (NA-1 replay slippage): a replayed stop is a modelled fill, as the backtest's: its level
+            # (or the price that gapped through it) less the taker's slippage, max(half spread, 0.05%), adverse.
+            px = float(Decimal(str(px)) * (1 - side * taker_slippage(self._half_spread())))
         now = self._price()
         words = {"stop_loss": "stop", "take_profit": "target", "liquidation": "liquidation price",
                  "liquidation_cut": "cut before liquidation", "risk_halt": "drawdown halt's level",
                  "risk_pause": "daily-loss pause's level"}[intent]
         gap = " (it opened past it)" if px != level and intent != "take_profit" else ""
-        filled = ("as a market order on touch would have, less the taker's slippage" if intent == "take_profit"
-                  else "as the venue would have filled it")
+        filled = {"take_profit": "as a market order on touch would have, less the taker's slippage",
+                  "stop_loss": "as the venue's stop would have filled it, less the taker's slippage"}.get(
+                      intent, "as the venue would have filled it")
         reason = (f"{intent.replace('_', '-').capitalize()} reached {while_}: the price passed the {level:,.6g} "
                   f"{words} in the minute to {_hhmm(at)}{gap}; booked at {px:,.6g}, {filled}, and closing now at "
                   f"about {now:,.6g}")

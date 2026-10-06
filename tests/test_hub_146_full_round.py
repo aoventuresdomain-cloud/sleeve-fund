@@ -171,18 +171,29 @@ def Price_level(res, side, tp=0.02):
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=IDS)
 def test_na2_a_minute_touching_stop_and_target_takes_the_stop_whichever_came_first(label, perp, profile, side):
     """Target first (3 % in favour 00:10:05-00:10:15), then the stop (2 % against 00:10:30-00:10:40), the open nearer
-    the target (+1.8 %): the stop, at its level. (The master file's L7 pins this too; here with the stop's price.)"""
+    the target (+1.8 %): the stop. (The master file's L7 pins this too.) Its price moved to the D13 pin below
+    (Advisor 20:39: the backtest books a stop at its level less max(half spread, 0.05 %))."""
+    seq = bt_seq(bt_res(_stop_after_target(side), side=side, perp=perp, profile=profile, leave=30)[0])
+    ex = first_exit(seq)
+    assert ex[0] == "stop_loss" and ex[2] == minute(11), seq
+    assert [r[0] for r in seq].count("take_profit") == 0
+
+
+def _stop_after_target(side):
     p = flat_prices(40).copy()
     p[600:660] = BASE * favourable(side, 0.018)
     p[605:615] = BASE * favourable(side, 0.03)
     p[630:640] = BASE * adverse(side, 0.02)
-    res, _ = bt_res(p, side=side, perp=perp, profile=profile, leave=30)
-    seq = bt_seq(res)
-    ex = first_exit(seq)
-    entry = seq[0][3]
-    assert ex[0] == "stop_loss" and ex[2] == minute(11), seq
-    assert abs(ex[3] / (entry * (1 - side * 0.01)) - 1) < 1e-4, (ex, entry)
-    assert [r[0] for r in seq].count("take_profit") == 0
+    return p
+
+
+@pytest.mark.xfail(strict=True, reason="NA-1/D13 (Advisor 20:39): the backtest books a stop at its level less "
+                   "max(half spread, 0.05 %); stop slippage lands with D13, which stacks on #146: not built yet")
+@pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=IDS)
+def test_d13_the_backtest_books_the_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
+    seq = bt_seq(bt_res(_stop_after_target(side), side=side, perp=perp, profile=profile, leave=30)[0])
+    ex, level = first_exit(seq), seq[0][3] * (1 - side * 0.01)
+    assert ex[0] == "stop_loss" and abs(ex[3] / qa.tp_model(level, side) - 1) < 1e-4, (ex, qa.tp_model(level, side))
 
 
 def _open_past_target_then_stop(side, k=10):
@@ -525,6 +536,52 @@ def _hb_decoder(monkeypatch):
     monkeypatch.setattr(hub_client, "Decoder", HbDecoder)
 
 
+def _hb_decoder_with_status(monkeypatch):
+    """_hb_decoder, plus a HubStatus shared by the decoder and the strategy, as paper.node wires it (HoQA harness
+    fix for the L16 condition, 5f28360; the same as tests/test_hub_gaps.py's TimelineStatus). The harness decodes
+    the whole feed before the run, so the status answers as the hub client's would have at the strategy's clock."""
+    from sleeve_fund.paper import hub_client
+    from sleeve_fund.strategies import base
+
+    class TimelineStatus(hub_client.HubStatus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.history: list[tuple[int, dict]] = []
+            self.strategy = None
+
+        def record(self, now_ns: int) -> None:
+            self.history.append((now_ns, {k: set(v) for k, v in self.lost.items()}))
+
+        def unfilled(self, iid: str) -> list[int]:
+            now, snap = self.strategy.clock.timestamp_ns(), {}
+            for at, lost in self.history:
+                if at > now:
+                    break
+                snap = lost
+            return sorted(snap.get(iid, ()))
+
+    status = TimelineStatus()
+
+    class HbDecoder(hub_client.Decoder):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k, status=status)
+
+        def __call__(self, m, now_ns):
+            out = (self.flush(now_ns) or None) if m.get("t") == "hb" else super().__call__(m, now_ns)
+            status.record(now_ns)
+            return out
+
+    attach = base.LongFlatStrategy.attach_runtime
+
+    def wired(self, runtime):
+        self.hub_status, status.strategy = status, self
+        return attach(self, runtime)
+
+    monkeypatch.setattr(hub_client, "Decoder", HbDecoder)
+    monkeypatch.setattr(base.LongFlatStrategy, "attach_runtime", wired)
+    return status
+
+
 def _with(schedule_fn, monkeypatch):
     monkeypatch.setattr(qa, "schedule", schedule_fn)
 
@@ -753,16 +810,13 @@ def _hub_events(run, minute_text):
             and minute_text in (e.get("message") or "")]
 
 
-@pytest.mark.xfail(strict=True, reason="P1-L16 condition (HoQA, for deferring L16 to the DA): after an unseeded hub "
-                   "restart that leaves an unrefilled gap, no new entry on that instrument until it is refilled; "
-                   "9be8f62 enters at 00:10 with 00:07-00:08 never refilled (the gap IS named: hub_gap)")
 @pytest.mark.parametrize("label, perp, profile, side", PROBE_SETUPS, ids=PROBE_IDS)
 def test_l16_condition_after_an_unseeded_hub_restart_no_entry_until_the_gap_is_refilled(label, perp, profile, side,
                                                                                          monkeypatch):
     """HoQA condition for deferring P1-L16 to the DA: an unseeded hub restart leaves 00:07-00:08 unrefilled (never
     refilled here). The strategy, flat and due to enter from 00:10, opens NOTHING on that instrument while the gap is
     unrefilled, and a warning, alert or incident names the gap."""
-    _hb_decoder(monkeypatch)
+    _hb_decoder_with_status(monkeypatch)  # HubStatus wired, as paper.node does (harness fix, 5f28360)
     _with(_hub_restart_schedule(False), monkeypatch)
     p = flat_prices(30)
     run = paper(p, side=side, perp=perp, profile=profile, enter=10, leave=25, gone=HUB_DOWN_GONE,
@@ -776,7 +830,7 @@ def test_l16_condition_after_an_unseeded_hub_restart_the_open_position_keeps_its
                                                                                     monkeypatch):
     """Same restart with a position open from 00:05 (the gap holds nothing adverse): the stop still works afterwards,
     2 % against 00:14:30-00:14:50 is stopped out by 00:15."""
-    _hb_decoder(monkeypatch)
+    _hb_decoder_with_status(monkeypatch)  # HubStatus wired, as paper.node does (harness fix, 5f28360)
     _with(_hub_restart_schedule(False), monkeypatch)
     p = shape(flat_prices(30), 14.5, 14 + 50 / 60, adverse(side, 0.02))
     run = paper(p, side=side, perp=perp, profile=profile, leave=25, gone=HUB_DOWN_GONE,
