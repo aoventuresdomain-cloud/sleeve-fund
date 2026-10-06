@@ -32,9 +32,13 @@ class Coverage:
     last: pd.Timestamp  # open time of the last stored minute (from the REST loader it may still be forming)
     cursor: str  # the loader's resume point, opaque to the store
     closed: pd.Timestamp | None = None  # open time of the newest minute known closed (append_bars), if any
+    # open time of the REST loader's newest stored minute, which may be a part bar, until a complete bar for it
+    # is stored (by the loader's next page or by the hub); None when no stored minute is still forming
+    forming: pd.Timestamp | None = None
 
     def as_dict(self) -> dict:
-        out = {"first": self.first.isoformat(), "last": self.last.isoformat(), "cursor": self.cursor}
+        out = {"first": self.first.isoformat(), "last": self.last.isoformat(), "cursor": self.cursor,
+               "forming": self.forming.isoformat() if self.forming is not None else None}
         if self.closed is not None:
             out["closed"] = self.closed.isoformat()
         return out
@@ -68,7 +72,12 @@ class HistoryStore:
             return None
         raw = json.loads(path.read_text())
         closed = pd.Timestamp(raw["closed"]) if raw.get("closed") else None
-        return Coverage(pd.Timestamp(raw["first"]), pd.Timestamp(raw["last"]), raw.get("cursor", ""), closed)
+        last = pd.Timestamp(raw["last"])
+        if "forming" in raw:
+            forming = pd.Timestamp(raw["forming"]) if raw["forming"] else None
+        else:  # written before the forming minute was recorded: the loader's newest, unless the hub has passed it
+            forming = last if closed is None or last > closed else None
+        return Coverage(pd.Timestamp(raw["first"]), last, raw.get("cursor", ""), closed, forming)
 
     def append(self, venue: str, pair: str, minutes: pd.DataFrame, cursor: str, merge: bool = False) -> Coverage:
         """Add 1-minute bars (indexed by open time, UTC) and move the loader's cursor.
@@ -77,7 +86,8 @@ class HistoryStore:
         resumes from its cursor), so minutes in between had no trades and are stored flat. An
         overlapping minute is replaced, or with merge=True (bars built from trades that continue
         exactly where the last page stopped) combined: first open, highest high, lowest low,
-        last close, volumes added. The last stored minute may still be forming; read() leaves it out."""
+        last close, volumes added. The last stored minute may still be forming; read() leaves it out.
+        Once the hub writes the series (append_bars), its closed minutes are never overwritten: see below."""
         if minutes.empty:
             raise ValueError("no bars to append")
         df = _check_minutes(minutes)
@@ -85,10 +95,29 @@ class HistoryStore:
         with _lock:
             d.mkdir(parents=True, exist_ok=True)
             cov = self.coverage(venue, pair)
-            if cov is not None and df.index[0] > cov.last:  # quiet minutes since the stored end
+            if cov is not None and cov.closed is not None:
+                # The hub writes this series too (append_bars). Minutes up to its newest closed one are
+                # first-wins, as in append_bars: the loader fills holes but never overwrites a closed bar, and
+                # the span to the hub's end is not the loader's to vouch for, so it is not filled flat.
+                done = df[df.index <= cov.closed]
+                stored = done.index[:0]
+                if not done.empty:
+                    stored = _write_first_wins(d, done, cov, "loader")[3]
+                # Past the hub's end the loader writes as before. Those minutes, apart from its newest (forming),
+                # are the venue's own closed candles, so they are first-wins too: a hub live bar arriving later for
+                # one of them is recorded as a conflict and the venue's candle kept. Intended: the REST candle is
+                # the venue's record of the minute, and the parity report counts such differences.
+                df = df[df.index > cov.closed]
+                if df.empty:
+                    # the page's newest minute is still the loader's own part bar only if it was stored here
+                    forming = done.index[-1] if done.index[-1] in stored else None
+                    new = Coverage(cov.first, cov.last, cursor, cov.closed, forming)
+                    _write_coverage(d, new)
+                    return new
+            elif cov is not None and df.index[0] > cov.last:  # quiet minutes since the stored end
                 prev = self._month(d, cov.last).loc[[cov.last]]
                 df = _fill_quiet(pd.concat([prev, df])).iloc[1:]
-            elif cov is not None and merge and df.index[0] == cov.last:
+            if cov is not None and merge and df.index[0] == cov.last and cov.closed is None:
                 old = self._month(d, cov.last).loc[cov.last]
                 first = df.iloc[0]
                 df.iloc[0] = [old["open"], max(old["high"], first["high"]), min(old["low"], first["low"]),
@@ -101,7 +130,7 @@ class HistoryStore:
                 _save(path, chunk)
             first = cov.first if cov is not None else df.index[0]
             new = Coverage(first, max(df.index[-1], cov.last if cov else df.index[-1]), cursor,
-                           cov.closed if cov else None)
+                           cov.closed if cov else None, df.index[-1])
             _write_coverage(d, new)
             return new
 
@@ -120,46 +149,23 @@ class HistoryStore:
         means the hub was not listening, so it stays a hole, gaps() reports it, and a refill closes it."""
         if source not in ("live", "refill"):
             raise ValueError(f"source must be 'live' or 'refill', not {source!r}")
-        rows = np.asarray(list(bars), dtype=float).reshape(-1, 6)
-        if not len(rows):
+        rows = list(bars)
+        if not rows:
             return AppendResult(0, 0, 0)
         df = _bars_frame(rows)
         d = self._dir(venue, pair)
-        written = unchanged = 0
-        log: list[dict] = []
-        now = pd.Timestamp.now(tz="UTC").isoformat()
         with _lock:
             d.mkdir(parents=True, exist_ok=True)
             cov = self.coverage(venue, pair)
-            for month, chunk in df.groupby(df.index.strftime("%Y-%m")):
-                path = d / f"{month}.npz"
-                old = _load(path) if path.exists() else df.iloc[:0]
-                old = old[~old.index.duplicated(keep="last")]
-                forming = _forming(old.index, cov)
-                held = chunk.index.isin(old.index[~forming])
-                for ts in chunk.index[held]:
-                    have, offer = old.loc[ts, OHLCV].to_numpy(float), chunk.loc[ts, OHLCV].to_numpy(float)
-                    if np.allclose(have, offer, rtol=1e-12, atol=0.0):
-                        unchanged += 1
-                    else:
-                        log.append({"kind": "conflict", "at": now, "source": source, "minute": ts.isoformat(),
-                                    "stored": have.tolist(), "offered": offer.tolist()})
-                new = chunk[~held]
-                if new.empty:
-                    continue
-                written += len(new)
-                _save(path, pd.concat([old[~old.index.isin(new.index)], new]).sort_index())
-            if source == "refill" and written:
-                log.append({"kind": "refill", "at": now, "first": df.index[0].isoformat(),
-                            "last": df.index[-1].isoformat(), "minutes": written})
-            if log:
-                with open(d / "provenance.jsonl", "a") as f:
-                    f.writelines(json.dumps(e) + "\n" for e in log)
+            written, unchanged, conflicts, _ = _write_first_wins(d, df, cov, source)
             lo, hi = df.index[0], df.index[-1]
+            # a complete bar for the loader's part bar replaces it (_forming), so it is no longer forming
+            forming = cov.forming if cov and cov.forming is not None and cov.forming not in df.index else None
             new_cov = Coverage(min(lo, cov.first) if cov else lo, max(hi, cov.last) if cov else hi,
-                               cov.cursor if cov else "", max(hi, cov.closed) if cov and cov.closed is not None else hi)
+                               cov.cursor if cov else "", max(hi, cov.closed) if cov and cov.closed is not None else hi,
+                               forming)
             _write_coverage(d, new_cov)
-        return AppendResult(written, unchanged, sum(e["kind"] == "conflict" for e in log))
+        return AppendResult(written, unchanged, conflicts)
 
     def provenance(self, venue: str, pair: str) -> list[dict]:
         """The hub's refill and conflict records for one series, oldest first."""
@@ -238,6 +244,11 @@ class HistoryStore:
             seen = max(seen, last)
         if hi > seen:
             runs.append((seen + 60, hi))
+        if cov.forming is not None and cov.closed is not None and cov.forming < cov.closed:
+            # the loader's part bar, which the hub has since passed without storing a complete one: a hole
+            # until a refill closes it
+            f = int(cov.forming.timestamp())
+            runs = sorted(runs + [(f, f)])
         clipped = [(max(a, lo), min(b, hi)) for a, b in runs if b >= lo and a <= hi]
         return [(pd.Timestamp(a, unit="s", tz="UTC"), pd.Timestamp(b, unit="s", tz="UTC")) for a, b in clipped]
 
@@ -315,29 +326,72 @@ def _check_minutes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _forming(index: pd.DatetimeIndex, cov: Coverage | None) -> np.ndarray:
-    """Stored minutes that may still be forming: the REST loader's newest minute, unless the hub has
-    since stored that minute (or a later one) as closed."""
-    if cov is None:
+    """Stored minutes that may still be forming: the REST loader's newest minute, until a complete bar for it
+    is stored. Recorded rather than inferred from the hub's progress: a hub bar for a LATER minute says nothing
+    about this one (its refill may have failed), so the part bar is never served as complete (QA P1-H1)."""
+    if cov is None or cov.forming is None:
         return np.zeros(len(index), dtype=bool)
-    closed = cov.closed if cov.closed is not None else cov.last - pd.Timedelta("1min")
-    return np.asarray((index >= cov.last) & (index > closed))
+    return np.asarray(index == cov.forming)
 
 
-def _bars_frame(rows: np.ndarray) -> pd.DataFrame:
-    """Hub bar rows -> a checked frame of closed minutes by open time. Not quiet-filled."""
-    t = rows[:, 0].astype(np.int64)
+def _bars_frame(rows: list) -> pd.DataFrame:
+    """Hub bar rows -> a checked frame of closed minutes by open time. Not quiet-filled. The open time is
+    checked as an integer: through a float, a stamp a few hundred ns off the minute would round onto it."""
+    if any(len(r) != 6 for r in rows):
+        raise ValueError("each bar is (open_time_ns, open, high, low, close, volume)")
+    if any(isinstance(r[0], float) and not r[0].is_integer() for r in rows):
+        raise ValueError("bars must be stamped on whole minutes (their open time, in ns)")
+    t = np.array([int(r[0]) for r in rows], dtype=np.int64)
     if (t % 60_000_000_000).any():
         raise ValueError("bars must be stamped on whole minutes (their open time, in ns)")
-    df = pd.DataFrame(rows[:, 1:], columns=OHLCV, index=pd.to_datetime(t, unit="ns", utc=True))
+    values = np.array([r[1:] for r in rows], dtype=float)
+    df = pd.DataFrame(values, columns=OHLCV, index=pd.to_datetime(t, unit="ns", utc=True))
     df.index.name = "timestamp"
     if df.index.duplicated().any():
         raise ValueError("the same minute twice in one batch")
-    if not np.isfinite(rows[:, 1:]).all():
+    if not np.isfinite(values).all():
         raise ValueError("bars with missing values")
     bad = (df["high"] < df[["open", "close"]].max(axis=1)) | (df["low"] > df[["open", "close"]].min(axis=1))
     if bad.any() or (df[["open", "high", "low", "close"]] <= 0).any().any() or (df["volume"] < 0).any():
         raise ValueError("bars with impossible prices or volume")
     return df.sort_index()
+
+
+def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None,
+                      source: str) -> tuple[int, int, int, pd.DatetimeIndex]:
+    """Write minutes nobody has stored yet (or that were still forming); keep every stored closed minute, and
+    record in provenance.jsonl each offered minute that differs from it and, for a refill, what was filled.
+    Returns (written, unchanged, conflicts, the minutes written). The caller holds _lock and writes the coverage."""
+    written = unchanged = 0
+    stored = []
+    log: list[dict] = []
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    for month, chunk in df.groupby(df.index.strftime("%Y-%m")):
+        path = d / f"{month}.npz"
+        old = _load(path) if path.exists() else df.iloc[:0]
+        old = old[~old.index.duplicated(keep="last")]
+        held = chunk.index.isin(old.index[~_forming(old.index, cov)])
+        for ts in chunk.index[held]:
+            have, offer = old.loc[ts, OHLCV].to_numpy(float), chunk.loc[ts, OHLCV].to_numpy(float)
+            if np.allclose(have, offer, rtol=1e-12, atol=0.0):
+                unchanged += 1
+            else:
+                log.append({"kind": "conflict", "at": now, "source": source, "minute": ts.isoformat(),
+                            "stored": have.tolist(), "offered": offer.tolist()})
+        new = chunk[~held]
+        if new.empty:
+            continue
+        written += len(new)
+        stored.append(new.index)
+        _save(path, pd.concat([old[~old.index.isin(new.index)], new]).sort_index())
+    if source != "live" and written:
+        log.append({"kind": "refill", "at": now, "source": source, "first": df.index[0].isoformat(),
+                    "last": df.index[-1].isoformat(), "minutes": written})
+    if log:
+        with open(d / "provenance.jsonl", "a") as f:
+            f.writelines(json.dumps(e) + "\n" for e in log)
+    return (written, unchanged, sum(e["kind"] == "conflict" for e in log),
+            stored[0].append(stored[1:]) if stored else df.index[:0])
 
 
 def _write_coverage(d: Path, cov: Coverage) -> None:
