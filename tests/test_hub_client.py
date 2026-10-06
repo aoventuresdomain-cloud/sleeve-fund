@@ -232,3 +232,20 @@ def test_the_live_minute_after_an_announced_gap_waits_for_the_refill_so_no_minut
     assert [b.ts_event for b in d.flush(T0 + 7 * M + 5 + HOLD_SECONDS * 10**9)] == [T0 + 7 * M]
     # Without a gap announced (a hole the hub never refills), nothing waits.
     assert d(_bar(T0 + 9 * M), T0 + 9 * M + 5).ts_event == T0 + 9 * M
+
+
+def test_a_refill_of_a_minute_passed_over_is_sent_late_once_so_its_stop_is_still_checked():
+    """QA P1-L14, L15: a refill landing after a later live minute (the hold flushed, a second gap's minute released
+    it, or the gap message was lost) was dropped on 1-minute bars, and a stop crossed in it with it. It is sent late,
+    as its own bar, once; the strategy replays it (LongFlatStrategy._hold_for_missing)."""
+    told = []
+    d = Decoder(report=lambda level, kind, message: told.append(kind))
+    assert d(_bar(T0), T0 + 5).ts_event == T0
+    assert d(_bar(T0 + 3 * M), T0 + 3 * M + 5).ts_event == T0 + 3 * M  # no gap announced: nothing waits
+    late = d(_bar(T0 + M, refilled=True, l="59000.00"), T0 + 3 * M + 45 * 10**9)
+    assert (late.ts_event, late.ts_init, str(late.low)) == (T0 + M, T0 + 3 * M + 45 * 10**9, "59000.00")
+    assert d(_bar(T0 + M, refilled=True), T0 + 3 * M + 46 * 10**9) is None  # once
+    assert d(_bar(T0 + 2 * M, refilled=True), T0 + 3 * M + 47 * 10**9).ts_event == T0 + 2 * M
+    assert d(_bar(T0 - M, refilled=True), T0 + 3 * M + 48 * 10**9) is None  # never passed over: not sent
+    assert d(_bar(T0 + 2 * M), T0 + 3 * M + 49 * 10**9) is None  # a live minute again: delivered before
+    assert told.count("hub_gap") == 2  # the gap as the live minute passed it, and the late refill once per run

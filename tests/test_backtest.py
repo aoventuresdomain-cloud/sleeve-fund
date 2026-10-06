@@ -154,48 +154,50 @@ def test_stop_wins_when_one_bar_touches_both(prices, instrument):
 
 @pytest.mark.parametrize("low", [90.0, 100.0], ids=["then-the-stop", "stop-never-reached"])
 def test_a_bar_that_opens_through_the_target_takes_the_target_at_its_level(prices, instrument, low):
-    """Advisor NA-2, condition 3: the open trades first. A bar that opens through the target fills it at its level,
-    even when the price falls through the stop later in the same bar; the stop wins only when the open isn't
-    through the target. Booked so in the fills report, the journal and the cash."""
+    """Advisor NA-2, condition 3: the open trades first. A bar that opens through the target takes the target, even
+    when the price falls through the stop later in the same bar; the stop wins only when the open isn't through
+    the target. Booked at the target less the taker's 0.05 % slippage, never the better open (L12), in the fills
+    report, the journal and the cash."""
     df = _path(prices, [100.0] * 10 + [100.0] * 5)
     df.iloc[10, df.columns.get_loc("open")] = df.iloc[10, df.columns.get_loc("high")] = 112.0
     df.iloc[10, df.columns.get_loc("low")] = low
     res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit": 0.10}, half_spread=0,
                        risk_profile="aggressive")
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0 * 0.9995)
     assert res.decisions[sells.index[0]]["intent"] == "take_profit"
     j = res.journal
     exits = [o for o in j.orders_.values() if o["intent"] in ("stop_loss", "take_profit") and o["filled_qty"]]
     assert [o["intent"] for o in exits] == ["take_profit"]
     (fill,) = [f for f in j.fills_ if f["order_id"] == exits[0]["order_id"]]
     (entry,) = [f for f in j.fills_ if f["side"] == "BUY"]
-    assert fill["price"] == pytest.approx(110.0)
+    assert fill["price"] == pytest.approx(110.0 * 0.9995)
     pnl = fill["qty"] * (fill["price"] - entry["price"]) - fill["fee"] - entry["fee"]
     assert float(res.equity.iloc[-1]) == pytest.approx(10_000 + pnl, abs=0.02)
 
 
 def test_take_profit_fills_at_its_level_not_the_close(prices, instrument):
     """Review R5-M1: the target used to trigger on the high and sell at the close, anywhere from -0.56R
-    to +2.80R against a planned +0.62R. It now rests as a limit and fills at its level."""
+    to +2.80R against a planned +0.62R. It now sells at market on touch, booked at its level less the taker's
+    slippage (Advisor L12: half the spread, at least 0.05 %)."""
     df = _path(prices, [100.0] * 10 + [104.0] * 5)
     df.iloc[10, df.columns.get_loc("high")] = 112.0
     res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0 * 0.9995)
     d = res.decisions[sells.index[0]]
-    assert d["intent"] == "take_profit" and "resting sell at 110" in d["reason"]
+    assert d["intent"] == "take_profit" and "the 110 target" in d["reason"] and "booked at 109.945" in d["reason"]
 
 
 def test_take_profit_is_never_credited_more_than_its_level(prices, instrument):
-    # Opens above the target: a resting limit would get the open, but bars can't show the queue, so
-    # the backtest gives only the level, and the linked stop is cancelled.
+    # Opens above the target: the target takes it, but never at the better open: at its level less the
+    # taker's slippage (Advisor L12).
     df = _path(prices, [100.0] * 10 + [120.0] * 5)
     df.iloc[10, df.columns.get_loc("open")] = 118.0
     df.iloc[10, df.columns.get_loc("low")] = 118.0
     res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.10, "stop_loss": 0.05}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(110.0 * 0.9995)
 
 
 def test_a_target_that_cannot_cover_its_costs_is_refused(prices, instrument):
@@ -273,12 +275,14 @@ def test_a_target_in_r_pays_that_r_after_costs(prices, instrument):
     df.iloc[10, df.columns.get_loc("high")] = 116.0
     res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit_r": 2.0}, half_spread=0)
     buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(114.839, abs=0.01)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(114.839 * 0.9995, abs=0.01)
     assert "2R after costs" in res.decisions[sells.index[0]]["reason"]
     entry, out = float(buys["avg_px"].iloc[0]), float(sells["avg_px"].iloc[0])
     net = out * (1 - 0.008) - entry * (1 + 0.008)
     loss = entry * (1 + 0.008) - entry * 0.95 * (1 - 0.008)
-    assert net / loss == pytest.approx(2.0, abs=0.01)
+    # About 1.99R: the target now books less the taker's 0.05% slippage (Advisor L12 FINAL), which the R sizing
+    # doesn't cost in yet. It waits on P2-1's slippage-floor cost model, which will put this back to 2R.
+    assert net / loss == pytest.approx(1.99, abs=0.01)
 
 
 def test_a_swing_low_counts_the_bar_the_entry_decides_on(prices, instrument):
