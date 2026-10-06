@@ -468,7 +468,8 @@ def test_a_liquidation_halts_in_the_advisors_words_and_its_gap_fill_is_journaled
     feed = _gapped(prices, closes)
     res = run_backtest("ping_pong", feed, instrument, PERP, half_spread=0, risk_profile="aggressive")
     (halt,) = [e for e in res.risk_events if e["kind"] == "risk_halt"]
-    assert re.match(r"Position margin lost \(liquidated\): [\d,]+\.\d\d, \d+% of strategy equity[;$]", halt["message"]), \
+    assert re.match(r"Position margin lost \(liquidated\): [\d,]+\.\d\d, \d+% of strategy equity at entry[;$]",
+                    halt["message"]), \
         halt["message"]
     liq = next(f for f in res.journal.fills_ if res.decisions[f["order_id"]]["intent"] == "liquidation")
     bar = feed.index[feed["close"] == 160.0][0]  # the bar it gapped in, stamped at its close
@@ -1254,7 +1255,8 @@ def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
 def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_last_flat():
     """Code Reviewer on 6047b50: a risk stop journaled as a liquidation can take part of the position and the guard's
     close the rest; X counts both (quantity and fees), the entry fee of what was held, and nothing from an earlier,
-    closed trade. A fill not yet in the journal is reported as such, so the halt keeps its estimate."""
+    closed trade. Y's base is the equity marked before the position opened (Advisor 20:37, P1-D20), not a mark
+    while it was held. A fill not yet in the journal is reported as such, so the halt keeps its estimate."""
     from types import SimpleNamespace
 
     from sleeve_fund.paper.journal import MemoryJournal
@@ -1271,12 +1273,14 @@ def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_las
         at = t0 + pd.Timedelta(minutes=i)
         j.record_order("s", order_id=oid, side=side, qty=qty, intent=intent, reason="", ts=at)
         j.record_fill("s", side=side, qty=qty, price=px, fee=fee, order_id=oid, trade_id=f"t-{oid}", ts=at)
+    j.record_equity("s", equity=10_088.0, cash=10_088.0, qty=0.0, price=60_500.0, benchmark=10_000.0,
+                    ts=t0 + pd.Timedelta(minutes=1, seconds=30))  # flat, before the short opened
     j.record_equity("s", equity=9_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
-                    ts=t0 + pd.Timedelta(minutes=2, seconds=30))
-    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005))
+                    ts=t0 + pd.Timedelta(minutes=2, seconds=30))  # holding it
+    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005, starting_balance=10_000.0))
     fees, taken, before, journaled = LongFlatStrategy._liquidation_figures(me, "t-guard")
     assert fees == pytest.approx(9.0 + 4.5 + 9.74) and taken == pytest.approx(0.3)
-    assert before == 9_000.0 and journaled
+    assert before == 10_088.0 and journaled
     assert LongFlatStrategy._liquidation_figures(me, "t-not-yet")[3] is False
 
 
@@ -1303,9 +1307,10 @@ def test_a_liquidation_fill_not_yet_journaled_still_counts_in_x():
     j.record_equity("s", equity=18_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
                     ts=t0 + pd.Timedelta(seconds=30))
     me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005, profile=risk.profile("balanced"),
-                                                 _last_equity=None, peak=10_000.0))
+                                                 _last_equity=None, peak=10_000.0, starting_balance=10_000.0))
     me._liquidation_figures = lambda *a, **k: LongFlatStrategy._liquidation_figures(me, *a, **k)
     me._margin_lost = lambda *a, **k: LongFlatStrategy._margin_lost(me, *a, **k)
     text, journaled = LongFlatStrategy._liquidation_margin(me, "t-guard", 0.2, 9.74, (0.2, 60_000.0))
     assert not journaled
-    assert text.startswith("Position margin lost (liquidated): 9,023.24, 50% of strategy equity"), text
+    # No mark before the short opened: Y's base is the cash the journal had then, the 10,000 it started with.
+    assert text.startswith("Position margin lost (liquidated): 9,023.24, 90% of strategy equity at entry"), text

@@ -63,7 +63,7 @@ def _reg(monkeypatch, tmp_path):
     monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
     monkeypatch.setattr(funding, "fetch", lambda *a, **k: (_ for _ in ()).throw(OSError("QA: no venue calls")))
     SEEN.clear()
-    profiles = dict(risk.PROFILES)  # harness (PE2): _liquidate_then edits the margin caps in place; put them back
+    profiles = dict(risk.PROFILES)  # harness (PE2, 6047b50): _liquidate_then edits the margin caps in place; put them back
     yield
     risk.PROFILES.clear()
     risk.PROFILES.update(profiles)
@@ -875,3 +875,243 @@ def test_p1_rule_c_a_resting_entry_filled_on_a_gap_at_the_open_pays_and_receives
     assert {t: paid.get(t) for t in in_bar} == pytest.approx({t: ref[t] for t in in_bar})  # credits too, for a short
     assert paid == pytest.approx(ref)  # nothing before the fill, the same after the bar
     assert float(bo.equity.iloc[-1]) == pytest.approx(float(rf.equity.iloc[-1]), abs=0.01)
+
+
+# ---- #155 full round on 6047b50 (QA, 6 Oct evening) -------------------------------------------------------------------
+
+def _x_as_the_fill_path_computes_it(store, name, order_id, held_qty, held_px, profile="balanced", last_equity=None,
+                                    trade_id=None, mark_px=None):
+    """LongFlatStrategy.on_order_filled's X for a liquidation, called on the real methods with a stand-in for the
+    strategy (they read only self.runtime and self._liquidated). held_qty, held_px: the position before this fill.
+    Tolerant of both heads' shapes:
+      6047b50 (base.py ~2843): fees, taken, before = _liquidation_figures(order_id); X = _margin_lost(max(taken, held),
+        ...), always replacing the mark's estimate;
+      eb737bd (base.py ~2854): fees, taken, before, journaled = _liquidation_figures(trade_id); the same X, but while
+        the fill `trade_id` is not journaled yet the mark's estimate (self._liquidated) is kept.
+    mark_px: the mark path ran first on that price, underwater (on_bar, ~2611 / ~2622), so self._liquidated holds its
+    estimate with the taker fee on what is still held, as each head computes it."""
+    import inspect
+    import types
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    rt = SleeveRuntime(store, name)
+    rt.taker_fee, rt._last_equity = 0.0005, last_equity
+    me = types.SimpleNamespace(runtime=rt, _liquidated=None)
+    figures, lost = LongFlatStrategy._liquidation_figures, LongFlatStrategy._margin_lost
+    by_trade = list(inspect.signature(figures).parameters)[1] == "trade_id"  # eb737bd keys the fill by its trade id
+    if by_trade and trade_id is None:
+        raise TypeError("this head's _liquidation_figures takes the fill's trade_id: pass trade_id=")
+    if mark_px is not None:
+        r = figures(me, None, held_qty * mark_px)
+        me._liquidated = lost(me, held_qty + (r[1] if by_trade else 0.0), held_px, r[0], r[2])
+    r = figures(me, trade_id if by_trade else order_id)
+    fees, taken, before = r[:3]
+    margin = lost(me, max(taken, held_qty), held_px, fees, before)
+    if len(r) > 3 and not r[3]:
+        margin = me._liquidated or margin  # its fill isn't in the journal yet: keep the estimate
+    return margin
+
+
+def _x_of(text):
+    m = re.search(r"\(liquidated\): ([\d,]+\.\d\d), ", text)
+    assert m, text
+    return float(m.group(1).replace(",", ""))
+
+
+def _seed_short(store, name, t0):
+    """A 2x short of 0.3 at 60,000 (two slices, 9.00 fees) on a 10,000 strategy, marked just before the gap."""
+    from datetime import timedelta
+    store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", venue="binance",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000, risk_profile="balanced",
+                        params={"rise": 0.01, "dip": 0.005, **PERP})
+    for i, q in enumerate((0.2, 0.1)):
+        store.record_fill(name, side="SELL", qty=q, price=60_000.0, fee=q * 60_000.0 * 0.0005, order_id="ENTRY",
+                          trade_id=f"E{i}", ts=t0)
+    store.record_equity(name, equity=9_991.0, cash=9_991.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
+                        ts=t0 + timedelta(minutes=5))
+
+
+def test_p1_x_covers_the_whole_position_when_two_liquidation_orders_close_it(tmp_path):
+    """Advisor 18:17 point 4: X = margin + entry fee + liquidation fee over the WHOLE position, grouped by order_id
+    (every liquidation order's fills). A risk stop journaled as a liquidation takes 0.2 of a 0.3 short at the gap, the
+    guard's liquidation order takes the last 0.1; X is the whole 0.3's margin and every fee."""
+    from datetime import timedelta
+    t0 = pd.Timestamp("2025-10-03 00:00", tz="UTC").to_pydatetime()
+    store, name = Store(f"sqlite:///{tmp_path}/x1.db"), "liq-x1"
+    _seed_short(store, name, t0)
+    gap = t0 + timedelta(minutes=10)
+    store.record_order(name, order_id="RISKSTOP", side="BUY", qty=0.2, intent="liquidation", reason="QA", order_type="STOP", ts=gap)
+    store.record_fill(name, side="BUY", qty=0.2, price=97_000.0, fee=0.2 * 97_000.0 * 0.0005, order_id="RISKSTOP",
+                      trade_id="R0", ts=gap)
+    store.record_order(name, order_id="GUARD", side="BUY", qty=0.1, intent="liquidation", reason="QA", ts=gap)
+    store.record_fill(name, side="BUY", qty=0.1, price=97_000.0, fee=0.1 * 97_000.0 * 0.0005, order_id="GUARD",
+                      trade_id="G0", ts=gap)
+    want = 0.3 * 60_000.0 / 2 + 9.0 + 0.3 * 97_000.0 * 0.0005  # 9,000 + 9.00 + 14.55
+    x = _x_of(_x_as_the_fill_path_computes_it(store, name, "GUARD", held_qty=0.1, held_px=60_000.0, trade_id="G0"))
+    assert x == pytest.approx(want, abs=0.005), (x, want)
+
+
+def test_p1_x_keeps_the_liquidation_fee_when_its_fill_row_is_late(tmp_path):
+    """Advisor 18:17 point 4. The liquidation of the whole 0.3 short filled at the venue, but its journal row is late:
+    X must not shrink (it keeps the liquidation fee, estimated at the taker rate, and says so) and, once the row lands,
+    the halt gives the journal's figure."""
+    from datetime import timedelta
+    t0 = pd.Timestamp("2025-10-03 00:00", tz="UTC").to_pydatetime()
+    store, name = Store(f"sqlite:///{tmp_path}/x2.db"), "liq-x2"
+    _seed_short(store, name, t0)
+    full = 0.3 * 60_000.0 / 2 + 9.0 + 0.3 * 97_000.0 * 0.0005
+    text = _x_as_the_fill_path_computes_it(store, name, "LIQ", held_qty=0.3, held_px=60_000.0, trade_id="L0",
+                                           mark_px=97_000.0)  # halted on the gap mark first; fill "L0" not journaled
+    x = _x_of(text)
+    assert x == pytest.approx(full, abs=0.005) or ("estimat" in text or "provisional" in text), (x, full, text)
+    assert x >= full - 0.005, (x, full)  # never smaller than what the liquidation lost
+
+
+def test_p1_x_after_a_partial_reduce_and_a_restart_is_the_remainder_with_its_share_of_the_entry_fee(tmp_path):
+    """CR case 1 (6047b50), through the engine: a 2x short of 0.3325 on full margin, a third bought back (journaled),
+    a restart that restores the rest from the journal, then a +60% gap liquidates it. X = the remainder's margin, plus
+    the entry fee pro-rated to the remainder, plus the liquidation fee (all its slices)."""
+    import dataclasses
+    import test_replay
+    from sleeve_fund.research.replay import replay
+    for nm, p in list(risk.PROFILES.items()):
+        risk.PROFILES[nm] = dataclasses.replace(p, max_position_pct=1.0)
+    name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    store = Store(f"sqlite:///{tmp_path}/b.db")
+    start0 = test_replay.START
+    try:
+        s1 = tmp_path / "s1.jsonl.gz"
+        _record_session(s1, _session_meta(10_000, params), [(5, 0.0), (20, 0.015), (2, 0.0)])
+        orders = replay(s1, store=store)
+        short = store.journal_book(name, 10_000)["qty"]
+        assert short < 0
+        red, px = round(abs(short) / 3, 8), 60_000.0 * 1.015
+        store.record_order(name, order_id="QA-REDUCE", side="BUY", qty=red, intent="exit", reason="QA partial reduce")
+        store.record_fill(name, side="BUY", qty=red, price=px, fee=round(red * px * 0.0005, 8), order_id="QA-REDUCE",
+                          trade_id="QA-REDUCE", ts=pd.Timestamp(start0 + 3600 * 10**9, tz="UTC").to_pydatetime())
+        store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+        book = store.journal_book(name, 10_000)
+        test_replay.START = start0 + 2 * 3600 * 10**9
+        s2 = tmp_path / "s2.jsonl.gz"
+        _record_session(s2, _session_meta(book["cash"] + book["qty"] * book["entry_px"], params),
+                        [(5, 0.0), (0, 0.6), (5, 0.0)], px=px)
+        orders = replay(s2, store=store)
+    finally:
+        test_replay.START = start0
+    liq = [o for o in orders if o["intent"] == "liquidation"]
+    assert liq
+    fills = store.fills(name, limit=200)
+    entry = [o for o in orders if o["intent"] == "entry"][-1]
+    ef = [f for f in fills if f["order_id"] == entry["order_id"]]
+    lf = [f for f in fills if f["order_id"] in {o["order_id"] for o in liq}]
+    q0 = sum(f["qty"] for f in ef)
+    left = q0 - red
+    assert sum(f["qty"] for f in lf) == pytest.approx(left)
+    avg = sum(f["qty"] * f["price"] for f in ef) / q0
+    want = left * avg / 2 + sum(f["fee"] for f in ef) * left / q0 + sum(f["fee"] for f in lf)
+    s = store.sleeve(name)
+    assert s.status == "halted"
+    assert _x_of(s.status_reason) == pytest.approx(want, abs=0.01), (s.status_reason, want)
+
+
+def test_p1_x_after_a_restart_holding_the_position_keeps_the_stored_entry_fee(tmp_path):
+    """CR case 2 (6047b50), through the engine: the short is opened in one process, the process restarts (the
+    position restored from the journal by an unjournaled, free order), then the gap liquidates it. X includes the
+    original entry fee from the stored fills and equals the in-process figure (10,106.69)."""
+    import dataclasses
+    import test_replay
+    from sleeve_fund.research.replay import replay
+    for nm, p in list(risk.PROFILES.items()):
+        risk.PROFILES[nm] = dataclasses.replace(p, max_position_pct=1.0)
+    name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    store = Store(f"sqlite:///{tmp_path}/a.db")
+    start0 = test_replay.START
+    try:
+        s1 = tmp_path / "s1.jsonl.gz"
+        _record_session(s1, _session_meta(10_000, params), [(5, 0.0), (20, 0.015), (2, 0.0)])
+        replay(s1, store=store)
+        store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+        book = store.journal_book(name, 10_000)
+        test_replay.START = start0 + 2 * 3600 * 10**9
+        s2 = tmp_path / "s2.jsonl.gz"
+        _record_session(s2, _session_meta(book["cash"] + book["qty"] * book["entry_px"], params),
+                        [(5, 0.0), (0, 0.6), (5, 0.0)], px=60_000.0 * 1.015)
+        orders = replay(s2, store=store)
+    finally:
+        test_replay.START = start0
+    liq = [o for o in orders if o["intent"] == "liquidation"]
+    fills = store.fills(name, limit=200)
+    entry = [o for o in orders if o["intent"] == "entry"][-1]
+    ef = [f for f in fills if f["order_id"] == entry["order_id"]]
+    lf = [f for f in fills if f["order_id"] in {o["order_id"] for o in liq}]
+    want = sum(f["qty"] * f["price"] for f in ef) / 2 + sum(f["fee"] for f in ef) + sum(f["fee"] for f in lf)
+    assert sum(f["fee"] for f in ef) > 0 and len(fills) == len(ef) + len(lf) + 4  # no restore row journaled
+    assert _x_of(store.sleeve(name).status_reason) == pytest.approx(want, abs=0.005)
+
+
+@pytest.mark.parametrize("exec1m", [False, True], ids=["bars-only", "1m"])
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_p1_nothing_opens_after_a_liquidation_on_a_gap_bar_with_a_resting_entry(tmp_path, _full_margin, monkeypatch,
+                                                                                exec1m, side):
+    """Advisor 17:57: liquidated, it stays halted and places nothing. A 3x position on full margin opens at the 2 Oct
+    close with a resting stop add (0.01) 1,000 beyond; the 3 Oct bar opens 50% against it (liquidated at the open);
+    on 4 Oct the price runs 5% the other way, through the add's trigger. Nothing may fill after the liquidation."""
+    monkeypatch.setitem(REGISTRY, "qa_e", (E, EConfig))
+    put_rates(pd.date_range("2025-10-01 00:00", "2025-10-06 00:00", freq="8h", tz="UTC"))
+    sec = pd.date_range("2025-10-01 00:00:01", "2025-10-05 23:59:46", freq="15s", tz="UTC")
+    base = 60_000.0 + (np.arange(len(sec)) % 40) * 0.5
+    px = np.where(sec >= pd.Timestamp("2025-10-03 00:00:01", tz="UTC"), base * (1 - 0.5 * side), base)
+    px = np.where(sec >= pd.Timestamp("2025-10-04 00:00:01", tz="UTC"), base * (1 + 0.05 * side), px)
+    tape = pd.Series(np.round(px, 1), index=sec)
+    day = tape.resample("1D", closed="left", label="right").ohlc()
+    day["volume"] = 1e9
+    one = tape.resample("1min", closed="left", label="right").ohlc()
+    one["volume"] = 1e9
+    params = {**PERP, "at": ns("2025-10-02 00:00"), "side": side, "tag": "ge", "place_at": ns("2025-10-02 00:00"),
+              "trigger": 61_000.0 if side > 0 else 59_000.0, "qty": 0.01}
+    kw = dict(exec_prices=one, exec_minutes=1) if exec1m else {}
+    r = backtest(binance_inst(), day, strategy="qa_e", params=params, minutes=1440, profile="aggressive",
+                 half_spread=0.0, **kw)
+    fills = sorted(r.journal.fills_, key=lambda f: f["ts"])
+    liq = [f for f in fills if r.decisions.get(f["order_id"], {}).get("intent") == "liquidation"]
+    assert liq and any(e["kind"] == "risk_halt" for e in r.risk_events)
+    assert not [f for f in fills if f["ts"] > max(x["ts"] for x in liq)]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="P1-D20 MINOR, needs an Advisor call (6047b50): Y divides by the "
+                   "last mark still holding the position up to the liquidation, which on a gap is the gap's own mark, after "
+                   "the loss: a remainder of 0.2217 short liquidated reads '6,737.79, 340% of strategy equity' (equity "
+                   "10,083.66 before the gap). 18:17 says 'MTM equity just before liquidation'; a share above 100% can't be "
+                   "what the PM is meant to read")
+def test_p1_y_is_never_above_100_percent_when_x_is_below_the_equity_before_the_gap(tmp_path):
+    """The partial-reduce run above: X (6,737.79) is below the equity marked before the gap (10,083.66), so Y, its
+    share of strategy equity, is at most 100%."""
+    import dataclasses
+    import test_replay
+    from sleeve_fund.research.replay import replay
+    for nm, p in list(risk.PROFILES.items()):
+        risk.PROFILES[nm] = dataclasses.replace(p, max_position_pct=1.0)
+    name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    store = Store(f"sqlite:///{tmp_path}/y.db")
+    start0 = test_replay.START
+    try:
+        s1 = tmp_path / "s1.jsonl.gz"
+        _record_session(s1, _session_meta(10_000, params), [(5, 0.0), (20, 0.015), (2, 0.0)])
+        replay(s1, store=store)
+        short = store.journal_book(name, 10_000)["qty"]
+        red, px = round(abs(short) / 3, 8), 60_000.0 * 1.015
+        store.record_order(name, order_id="QA-REDUCE", side="BUY", qty=red, intent="exit", reason="QA partial reduce")
+        store.record_fill(name, side="BUY", qty=red, price=px, fee=round(red * px * 0.0005, 8), order_id="QA-REDUCE",
+                          trade_id="QA-REDUCE", ts=pd.Timestamp(start0 + 3600 * 10**9, tz="UTC").to_pydatetime())
+        store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+        book = store.journal_book(name, 10_000)
+        test_replay.START = start0 + 2 * 3600 * 10**9
+        s2 = tmp_path / "s2.jsonl.gz"
+        _record_session(s2, _session_meta(book["cash"] + book["qty"] * book["entry_px"], params),
+                        [(5, 0.0), (0, 0.6), (5, 0.0)], px=px)
+        replay(s2, store=store)
+    finally:
+        test_replay.START = start0
+    text = store.sleeve(name).status_reason
+    m = re.search(r"\(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
+    assert m, text
+    assert float(m.group(2)) <= 100.0, text

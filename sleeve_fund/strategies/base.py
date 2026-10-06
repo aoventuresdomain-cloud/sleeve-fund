@@ -2371,9 +2371,8 @@ class LongFlatStrategy(Strategy):
         position was last flat: a risk stop journaled as one can take part and the guard's close the rest (Code
         Reviewer on 6047b50). The fees: the entry fees of the position held, so a restart and a partial reduce are
         counted right, plus the liquidation's own as journaled, plus the taker rate on `notional`, what is still to
-        close. The equity: the last mark still holding the position, up to its first fill."""
-        import pandas as pd
-
+        close. The equity: the strategy's when the position was opened, the last mark before its first fill (Advisor
+        20:37, P1-D20), fixed through partial reductions; or, with no mark before it, the cash the journal had then."""
         if self.runtime is None:
             return 0.0, 0.0, None, True
         store, name = self.runtime.store, self.runtime.name
@@ -2389,12 +2388,13 @@ class LongFlatStrategy(Strategy):
         rest = [f for f in window if f["order_id"] not in liquidations]
         fees = (replay_book(rest, 0.0)["entry_fees"] + sum(float(f["fee"]) for f in liq)
                 + notional * self.runtime.taker_fee)
-        at = min(pd.Timestamp(f["ts"]) for f in liq) if liq else None
-        marks = [m for m in store.equity_series(name, limit=500)
-                 if m["qty"] and m["equity"] > 0 and (at is None or pd.Timestamp(m["ts"]) <= at)]
+        at_entry = None
+        if window:
+            mark = store.equity_at_or_before(name, window[0]["ts"] - timedelta(microseconds=1))
+            at_entry = (float(mark["equity"]) if mark is not None and mark["equity"] > 0
+                        else replay_book(fills[:flat], self.runtime.starting_balance)["cash"])
         journaled = trade_id is None or any(str(f.get("trade_id")) == trade_id for f in liq)
-        return (fees, sum(float(f["qty"]) for f in liq), (float(marks[-1]["equity"]) if marks else None),
-                journaled)
+        return fees, sum(float(f["qty"]) for f in liq), at_entry, journaled
 
     def _liquidation_margin(self, trade_id: str, qty: float, fee: float, held: tuple) -> tuple[str, bool]:
         """The liquidation's halt once its last fill (trade_id, qty, fee) is in: X over every slice (not the last), and
@@ -2406,16 +2406,27 @@ class LongFlatStrategy(Strategy):
         return self._margin_lost(max(taken, held[0]), held[1], fees, before), journaled
 
     def _margin_lost(self, qty: float, entry: float, fees: float = 0.0, before: float | None = None) -> str:
-        """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57): "Position margin lost (liquidated): X,
-        Y% of strategy equity", X the position's isolated margin plus its entry and liquidation fees (18:17 point 4),
-        Y its share of the equity marked before, to one decimal under 10% so a small loss never reads 0% (QA P1-D17)."""
+        """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57, Y as of 20:37): "Position margin lost
+        (liquidated): X, Y% of strategy equity at entry", X the position's isolated margin plus its entry and
+        liquidation fees (18:17 point 4), Y its share of the strategy's equity when the position was opened, uncapped,
+        to one decimal under 10% so a small loss never reads 0% (QA P1-D17, P1-D20)."""
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
         lost = markets.isolated_margin(qty, entry, lev) + fees
         if before is None:
             before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
         share = (f"{lost / before:.1%}" if lost / before < 0.1 else f"{lost / before:.0%}") if before and before > 0 \
             else "all"
-        return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity"
+        return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity at entry"
+
+    def _liquidation_incident(self) -> None:
+        """The incident the engine opens on every liquidation, once the position is gone (Advisor 18:17; 20:37: with
+        the equity left). A reset after liquidation needs its note (RAL)."""
+        rt = self.runtime
+        left = self._mark()[0]
+        rt.store.event(rt.name, "error", "incident",
+                       f"Incident, {rt.name}: {self._liquidated or WIPED_OUT}; {max(left, 0.0):,.2f} of equity left. It "
+                       "stays halted until you reset it after liquidation, which needs a note on why the "
+                       "half-liquidation stop did not protect the position.", ts=rt.now())
 
     def _wiped_out_why(self, shortfall: float = 0.0) -> str:
         """shortfall: an open position's equity below zero, which the insurance fund will cover once it closes, so
@@ -2646,8 +2657,20 @@ class LongFlatStrategy(Strategy):
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
             elif self._margin:
                 self._liquidation_guard(cash, qty, worst or price)
+            if self.runtime.wiped_out:
+                self._cancel_resting_entries()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_tick", exc)
+
+    def _cancel_resting_entries(self) -> None:
+        """Liquidated, nothing opens again until the PM resets it after liquidation (Advisor 17:57, rule (c) on
+        resting entries; QA P1-D21): every entry still resting at the venue is cancelled. The halt flattens nothing,
+        the position being gone, so without this a resting entry filled later and opened a position on a halted
+        strategy. Closing orders (the liquidation itself, a resting exit) are left alone."""
+        for order in self.cache.orders_open(strategy_id=self.strategy_id):
+            if (self.decisions.get(str(order.client_order_id), {}).get("intent") in ("entry", "rebalance")
+                    and order.status != OrderStatus.PENDING_CANCEL):
+                self.cancel_order(order.client_order_id)
 
     # Order lifecycle into the journal; fills are journaled in on_order_filled.
     def _order_status(self, event, status: str) -> None:
@@ -2873,6 +2896,8 @@ class LongFlatStrategy(Strategy):
                         self.runtime._set("halted", reason.replace(old, margin, 1))
                 self._liquidated = margin
             self._cover_shortfall(px, event)
+            if self.decisions.get(coid, {}).get("intent") == "liquidation" and self.runtime is not None:
+                self._liquidation_incident()
         if coid == self._risk_stop_id:
             self._risk_stop_filled(done, sign, px)
         if kept_id is not None and done:
