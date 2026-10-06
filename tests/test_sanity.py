@@ -997,6 +997,51 @@ def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_th
     assert float(res.equity.iloc[-1]) == pytest.approx(10_000 + pnl, abs=2 * CENT)
 
 
+def test_a_perp_short_whose_bar_opens_through_the_target_takes_the_target_not_the_stop():
+    """Advisor NA-2, condition 3, on a short: the bar opens below the target and then rallies through the stop; the
+    open trades first, so the short is bought back at the target's level, journaled as the take-profit."""
+    df = _ls_bars(np.full(12, 60_000.0), minutes=60)
+    df.iloc[6, df.columns.get_loc("open")] = df.iloc[6, df.columns.get_loc("low")] = 56_000.0
+    df.iloc[6, df.columns.get_loc("high")] = 64_000.0
+    res = run_backtest("probe_short", df, TICK_INST, {"stop_loss": 0.05, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    exits = [o for o in j.orders_.values() if o["intent"] != "entry" and o["filled_qty"]]
+    assert [o["intent"] for o in exits] == ["take_profit"], exits
+    (fill,) = [f for f in j.fills_ if f["order_id"] == exits[0]["order_id"]]
+    assert fill["side"] == "BUY" and fill["price"] == pytest.approx(57_000.0)
+
+
+def test_the_target_and_a_reversal_on_one_bar_make_exactly_one_exit_and_never_an_accidental_short():
+    """Advisor NA-2, condition 1: the long's target trades through on the very bar the model turns short. The long
+    is closed once (the take-profit, at its level), nothing sells it a second time, and the short is the model's
+    own entry, of its own size, after the long is flat."""
+    from decimal import Decimal
+
+    df = _ls_bars(np.full(40, 60_000.0), minutes=60)
+    step, period = 3600 * 10**9, 3
+    side = [(1, -1, 0)[(int(ts.value) // step // period) % 3] for ts in df.index]
+    flip = next(i for i in range(2, len(side)) if side[i - 1] == 1 and side[i] == -1 and side[i - 2] == 1)
+    df.iloc[flip, df.columns.get_loc("high")] = 63_500.0  # through the 5 % target, on the bar that turns short
+    res = run_backtest("probe_ls", df, TICK_INST, {"period": period, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    at_flip = [o for o in orders if o["ts"] == df.index[flip]]
+    assert [(o["intent"], o["side"]) for o in at_flip] == [("take_profit", "SELL")], at_flip
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    held = Decimal(0)
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        before = held
+        held += Decimal(str(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] != "entry":
+            assert held == 0 and before != 0, (f, before, held)  # an exit closes exactly what was held
+        else:
+            assert before == 0, (f, before)  # an entry opens from flat: no exit ever carried through it
+    shorts = [o for o in orders if o["intent"] == "entry" and o["side"] == "SELL"]
+    assert any(o["ts"] > df.index[flip] for o in shorts)  # the turn to short still comes, from flat
+
+
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
 @pytest.mark.parametrize("profile", ["balanced", "aggressive"])
 def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no_more(profile, strategy, gap, full_margin):

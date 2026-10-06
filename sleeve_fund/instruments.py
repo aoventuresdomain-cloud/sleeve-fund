@@ -11,9 +11,10 @@ import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 
+from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.execution import FeeModel
-from nautilus_trader.model import (Currency, CryptoPerpetual, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol,
-                                   Venue)
+from nautilus_trader.model import (Bar, Currency, CryptoPerpetual, CurrencyPair, InstrumentId, Money, OrderSide, Price,
+                                   Quantity, Symbol, Venue)
 
 @dataclass(frozen=True)
 class FeeSchedule:
@@ -180,6 +181,13 @@ class ScheduleFeeModel(FeeModel):
         # The commission carries the difference from the price the market order filled at; fee_paid keeps the
         # venue's fee apart so the report can move the rest into the price, as it does the spread.
         self.booked: dict[str, tuple[Decimal, bool]] = {}
+        # Backtests: a resting stop's target level, by the stop's order id. A bar that opens through the target
+        # takes the target at its level before anything later in the bar can reach the stop (Advisor NA-2): if the
+        # venue fills the stop in such a bar, it is booked at the target (rebooked) instead. bar_open is the open
+        # of the bar the venue is matching, handed over before it matches (BarOpens).
+        self.open_targets: dict[str, Decimal] = {}
+        self.rebooked: dict[str, float] = {}
+        self.bar_open: Decimal | None = None
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -208,6 +216,12 @@ class ScheduleFeeModel(FeeModel):
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         shift = Decimal(0)
         booked = self.booked.get(str(order.client_order_id))
+        target = self.open_targets.get(str(order.client_order_id))
+        if booked is None and target is not None and self.bar_open is not None:
+            buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below
+            if (self.bar_open < target) if buy else (self.bar_open > target):
+                booked = (target, buy)
+                self.rebooked[str(order.client_order_id)] = float(target)
         if booked is not None:
             level, buy = booked
             qty = fill_quantity.as_decimal()
@@ -223,6 +237,21 @@ class ScheduleFeeModel(FeeModel):
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
         return self._charge(charge + shift, instrument.quote_currency)
+
+
+class BarOpens(SimulationModule):
+    """Backtests: hands the fee model the open of each bar before the simulated venue matches it, so a resting
+    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets)."""
+
+    def __init__(self, fee_model: ScheduleFeeModel) -> None:
+        self.fee_model = fee_model
+
+    def pre_process(self, data) -> None:
+        if isinstance(data, Bar):
+            self.fee_model.bar_open = data.open.as_decimal()
+
+    def process(self, ts_now, context):
+        return None
 
 
 def fill_model():

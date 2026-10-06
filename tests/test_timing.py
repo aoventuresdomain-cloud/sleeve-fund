@@ -1,6 +1,7 @@
 """v2 P1-2: every paper or live order's bar close, arrival, decision, send, acceptance and fills, to the
 microsecond, for close-to-fill times per strategy."""
 
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -141,10 +142,10 @@ def test_journal_writes_leave_the_decision_path_and_every_read_sees_them():
     assert [o["order_id"] for o in q.orders("pp")] == ["O-1"] and len(q.timings("pp")) == 1  # reads wait
     q.record_order("pp", order_id="O-2", side="BUY", qty=0.1, intent="nonsense", reason="test")
     with pytest.raises(RuntimeError, match="journal write failed"):
-        q.orders("pp")  # a failed write surfaces on the next read, after its retry
+        q.settle()  # a failed write surfaces on the next read once its retries (off the writer) are spent
     assert [o["order_id"] for o in q.orders("pp")] == ["O-1"]
-    (incident,) = [e for e in q.events("pp") if e["kind"] == "incident"]  # and was an alert at once
-    assert incident["level"] == "error" and "O-2" in incident["message"]
+    said = [e for e in q.events("pp") if e["kind"] == "incident"]  # an alert at once, and when it gave up
+    assert len(said) == 2 and all(e["level"] == "error" and "O-2" in e["message"] for e in said)
     t0 = time.monotonic()
     q.record_order("pp", order_id="O-3", side="BUY", qty=0.1, intent="entry", reason="test")
     assert time.monotonic() - t0 >= 0.2  # an opening order is on record before it goes (QA P1-L5)
@@ -171,9 +172,57 @@ def test_an_opening_order_whose_journal_row_fails_is_never_sent_an_exit_is_and_i
     with pytest.raises(RuntimeError, match="database gone"):
         q.record_order("q", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="t")
     q.record_order("q", order_id="O-2", side="SELL", qty=0.1, intent="stop_loss", reason="t")  # queued: no raise
-    q.flush()
+    q.settle()
     assert tries == ["O-1", "O-2", "O-2"] and [o["order_id"] for o in q.orders("q")] == ["O-2"]
     assert [e["kind"] for e in q.events("q")] == ["incident"]
+
+
+def _flaky_queue(fails: int, retry_seconds):
+    from sleeve_fund.paper.queued import QueuedStore
+
+    db = Store.in_memory()
+    db.create_sleeve(name="q", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                     starting_balance=1_000)
+    real, tries = db.record_order, []
+
+    def flaky(*a, **k):
+        tries.append(time.monotonic())
+        if len(tries) <= fails:
+            raise RuntimeError("database gone")
+        real(*a, **k)
+
+    db.record_order = flaky
+    return QueuedStore(db, retry_seconds=retry_seconds), tries
+
+
+def test_an_exit_rows_retry_never_holds_the_writer_and_its_own_fill_waits_for_it():
+    """CR on #146: the retry waits off the writer thread. Other writes (an event, a heartbeat) go straight on; the
+    exit's own fill, which needs its row, is held and written once the row is."""
+    q, tries = _flaky_queue(1, (0.5,))
+    q.record_order("q", order_id="O-1", side="SELL", qty=0.1, intent="exit", reason="t")
+    q.record_fill("q", side="SELL", qty=0.1, price=100.0, fee=0.01, order_id="O-1", trade_id="T-1")
+    q.event("q", "info", "other", "an unrelated write")
+    t0 = time.monotonic()
+    q.flush()
+    assert time.monotonic() - t0 < 0.3  # the writer didn't sleep through the retry's wait
+    assert sorted(e["kind"] for e in q.events("q")) == ["incident", "other"] and q.fills("q") == []
+    q.settle()
+    assert len(tries) == 2 and tries[1] - tries[0] >= 0.45
+    assert [o["order_id"] for o in q.orders("q")] == ["O-1"] and [f["order_id"] for f in q.fills("q")] == ["O-1"]
+
+
+def test_an_exit_row_that_never_lands_says_its_fill_may_be_missing_too():
+    """CR on #146: once the retries run out, the incident says the order's fill (held behind its row) isn't in the
+    journal either, so whoever reconciles knows to look for it."""
+    q, tries = _flaky_queue(99, (0.01, 0.01))
+    q.record_order("q", order_id="O-1", side="SELL", qty=0.1, intent="stop_loss", reason="t")
+    q.record_fill("q", side="SELL", qty=0.1, price=100.0, fee=0.01, order_id="O-1", trade_id="T-1")
+    with pytest.raises(RuntimeError, match="database gone"):
+        q.settle()
+    assert len(tries) == 3
+    said = [e["message"] for e in q.events("q") if e["kind"] == "incident"]
+    assert len(said) == 2 and q.fills("q") == []
+    assert any("fill may be missing" in m and "1 later row" in m for m in said)
 
 
 def test_a_run_journals_the_same_through_the_queue():

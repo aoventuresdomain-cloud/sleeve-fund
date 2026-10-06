@@ -1746,8 +1746,9 @@ class LongFlatStrategy(Strategy):
         """Backtests: the target, judged on a bar the venue has already matched. The stop rests at the venue
         (_rest_exits), so a bar that reached it has sold the position before this runs: within a bar the stop
         goes before the target (Advisor NA-2, as the outage replay does), whichever extreme was nearer the
-        open. A bar that traded through the target sells at market, booked at the target's level, as the
-        resting limit filled (the fee model carries the difference: ScheduleFeeModel.booked). True if sent."""
+        open, unless the bar opened through the target (_rebook_as_target). A bar that traded through the target
+        sells at market, booked at the target's level, as the resting limit filled, with the taker fee paper's
+        market exit pays (the fee model carries the difference: ScheduleFeeModel.booked). True if sent."""
         tp, side = self._tp_frac, self._entry_side or 1
         if (not self._backtest or not tp or self._entry_px is None or self._pending_exit is not None
                 or self._busy() or self._pos_side() == 0):
@@ -2853,6 +2854,8 @@ class LongFlatStrategy(Strategy):
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
         book = ((self.decisions.get(journal_id) or {}).get("signal") or {}).get("book_px")
+        if self._backtest and self.fee_model is not None and coid in self.fee_model.rebooked:
+            book = self._rebook_as_target(coid, self.fee_model.rebooked[coid], px)
         if book and kept_id is None and self._backtest:
             # A backtest's target (_bar_target): the fee model charged the difference from its level with the fee
             # (ScheduleFeeModel.booked), so the account already holds the target's cash. Journal the fee alone.
@@ -2958,7 +2961,8 @@ class LongFlatStrategy(Strategy):
         live watch every trade instead): a sell stop at its level, filling there, or at the open when the price
         gaps through it. A flatten cancels it first (_sell_all). The target doesn't rest: within a bar the adverse
         side trades first (Advisor NA-2), so the venue takes the stop on the bar and the target is judged after it,
-        on what the bar left (_bar_target)."""
+        on what the bar left (_bar_target). The open trades before either: a stop filled in a bar that opened through
+        the target is booked as the target (ScheduleFeeModel.open_targets, _rebook_as_target)."""
         cfg = self._cfg
         plan = {"stop_loss": self._stop_frac}
         if not any(plan.values()) or self._entry_px is None:
@@ -3004,8 +3008,34 @@ class LongFlatStrategy(Strategy):
                 self.runtime.on_order(order_id=str(order.client_order_id), side="SELL" if side > 0 else "BUY",
                                       qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind)
         for order, *_ in orders:
+            self._open_target(str(order.client_order_id))
             self._sent.append(order.client_order_id)
             self.submit_order(order)
+
+    def _rebook_as_target(self, coid: str, level: float, px: float) -> float:
+        """Backtests: the venue filled the resting stop in a bar that opened through the target. The open trades
+        first, so the target took it at its level (Advisor NA-2); the fee model charged it so, and the order is
+        journaled as the take-profit."""
+        decision = self.decisions.get(coid)
+        if decision is not None and decision.get("intent") == "stop_loss":
+            reason = (f"Take-profit: the bar opened through the {level:,.6g} target, so it filled there at the open, "
+                      f"before the price reached the stop at {px:,.6g} later in the bar (the open trades first)")
+            decision.update(intent="take_profit", reason=reason)
+            decision["signal"] = {**(decision.get("signal") or {}), "book_px": level}
+            if self.runtime is not None:
+                self.runtime.store.update_order(coid, intent="take_profit", message=reason)
+        return level
+
+    def _open_target(self, stop_id: str) -> None:
+        """Backtests: tell the fee model where this position's target is, so a stop the venue fills in a bar that
+        opened through the target is booked at the target instead (Advisor NA-2: the open trades first)."""
+        if self.fee_model is None:
+            return
+        if self._tp_frac and self._entry_px is not None:
+            level = self._entry_px * (1 + (self._entry_side or 1) * self._tp_frac)
+            self.fee_model.open_targets[stop_id] = Price(level, self.instrument.price_precision).as_decimal()
+        else:
+            self.fee_model.open_targets.pop(stop_id, None)
 
     def _resting_exits(self) -> dict:
         """The backtest's stop resting at the venue, by intent."""
@@ -3038,6 +3068,7 @@ class LongFlatStrategy(Strategy):
             if order.quantity == quantity and order.trigger_price == px:
                 continue
             self.modify_order(order.client_order_id, quantity=quantity, trigger_price=px)
+            self._open_target(str(order.client_order_id))  # the target moves with the average entry too
             self._resizing[str(order.client_order_id)] = (f"Stop-loss resized to {qty.normalize():f} at {level:,.6g} as "
                                                           f"more of the entry filled (average entry {self._entry_px:,.6g})")
 
