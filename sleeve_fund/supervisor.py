@@ -44,6 +44,8 @@ MAX_BACKOFF = 300
 # it: a position below the venue's smallest order can't be closed by an order, and asking again every step
 # only piled up commands (review round 13, m13-E1).
 SYSTEM_FLATTENS = 3
+# The exits-only reason of a stopped strategy that still holds a position (P1-U35): its process runs for its exits.
+STOPPED_HOLDING = "it was stopped while it still holds a position"
 
 
 @dataclass
@@ -51,6 +53,8 @@ class Proc:
     popen: subprocess.Popen | None = None
     started_at: datetime | None = None
     crashes: int = 0
+    holds: bool | None = None  # a stopped strategy's journal holds a position (not dust); None: not read yet
+    watched: bool = False  # the incident for a stopped strategy still holding is written (_watch_stopped_holder)
     next_start: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=utcnow().tzinfo))
 
     @property
@@ -58,9 +62,10 @@ class Proc:
         return self.popen is not None and self.popen.poll() is None
 
 
-def decide(sleeve: Sleeve, proc: Proc, now: datetime) -> str:
-    """One of: start, stop, restart_stale, crashed, wait, none."""
-    want = sleeve.desired_state == "running"
+def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> str:
+    """One of: start, stop, restart_stale, crashed, wait, none. A stopped strategy that still `holds` a position is
+    wanted running too, for its exits only (P1-U35)."""
+    want = sleeve.desired_state == "running" or holds
     if want and not proc.alive:
         if proc.popen is not None:
             return "crashed"
@@ -121,8 +126,35 @@ class Supervisor:
                              "runs for its exits only, with a safety stop from the current price and no new entries")
         return True
 
+    def _holds(self, s: Sleeve, proc: Proc) -> bool:
+        """Whether a stopped strategy still holds a position (not dust). Without a process its journal can't change,
+        so that is read once per stop; while its exits-only process runs, every step, so it stops once flat."""
+        if s.desired_state == "running":
+            return False
+        if proc.holds is None or proc.alive:
+            book = self.store.journal_book(s.name, s.starting_balance)
+            proc.holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
+        return proc.holds
+
+    def _watch_stopped_holder(self, s: Sleeve, proc: Proc) -> None:
+        """P1-U35 (Advisor 20:56, HoE): a stopped strategy still holding a position (the PM's Stop on a holder, or a
+        fill that raced the stop) is never left unwatched. It runs for its exits only: its own stop, or a safety stop
+        from the mark where it has none (_safety_stop_on_restore), and nothing opens, with an incident. A halt or a
+        pause keeps its own status, which already holds every entry and is cleared only by its own action (HC)."""
+        book = self.store.journal_book(s.name, s.starting_balance)
+        proc.watched = True
+        if s.status not in ("halted", "paused"):
+            self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
+        self.store.event(s.name, "error", "incident",
+                         f"Incident, {s.name}: stopped, but it still holds {book['qty']:.12g}, so it runs for its exits "
+                         "only: its stop (or a safety stop from the current price) still closes it, and nothing new "
+                         "opens. Flatten closes it; once it is flat it stops.")
+
     def _start(self, name: str, proc: Proc) -> None:
-        if self._refused(name):
+        s = self.store.sleeve(name)
+        if s.desired_state != "running":  # a stopped strategy still holding: its exits only (P1-U35)
+            self._watch_stopped_holder(s, proc)
+        elif self._refused(name):
             return
         # Paper processes never need a venue key, so they don't inherit one.
         env = {k: v for k, v in os.environ.items() if not credential_var(k)}
@@ -142,7 +174,7 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 proc.popen.kill()
                 proc.popen.wait()
-        proc.popen = None
+        proc.popen, proc.holds, proc.watched = None, None, False
         self.store.event(name, "info", "process_stop", why)
 
     def reset_pending(self) -> None:
@@ -187,7 +219,9 @@ class Supervisor:
         now = utcnow()
         for sleeve in self.store.sleeves():
             proc = self.procs.setdefault(sleeve.name, Proc())
-            action = decide(sleeve, proc, now)
+            holds = self._holds(sleeve, proc)
+            action = decide(sleeve, proc, now, holds)
+            exits_only = sleeve.status == "paused" and sleeve.status_reason == f"{EXITS_ONLY}: {STOPPED_HOLDING}"
             if action == "start":
                 self._start(sleeve.name, proc)
             elif action == "crashed":
@@ -211,6 +245,18 @@ class Supervisor:
             elif action == "restart_stale":
                 self.store.event(sleeve.name, "error", "heartbeat_stale", "no heartbeat for 3 minutes; restarting")
                 self._stop(sleeve.name, proc, "restart after stale heartbeat")
+                self._start(sleeve.name, proc)
+            elif action == "none" and holds and sleeve.status not in ("halted", "paused"):
+                # The PM's Stop on a strategy that still holds: restarted for its exits only (P1-U35)
+                self._stop(sleeve.name, proc, "stopped by PM: restarted for its exits only, as it still holds a position")
+                self._start(sleeve.name, proc)
+            elif action == "none" and holds and not proc.watched:
+                # Stopped while halted or paused and still holding: its process keeps running, as it is (P1-U35)
+                self._watch_stopped_holder(sleeve, proc)
+            elif action == "none" and exits_only and sleeve.desired_state == "running":
+                # Started again by the PM after a stop that left it running for its exits only: it trades again
+                self._stop(sleeve.name, proc, "started by PM: restarted to trade")
+                self.store.set_status(sleeve.name, "stopped", "started by PM")
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and self.store.pending_reload(sleeve.name):
                 self._stop(sleeve.name, proc, "restart for changed settings")

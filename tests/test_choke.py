@@ -113,3 +113,75 @@ def test_start_reads_the_journal_so_a_liquidation_overwritten_by_a_stop_is_still
     assert entry_blocked_in(store, "s1", starting=True) == (
         True, "it was liquidated, and only a reset after liquidation clears that")
     assert "command_error" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
+
+
+def _stopped_holder(store, status="running", reason=""):
+    from sleeve_fund import supervisor as sup
+
+    store.create_sleeve(name="s1", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, risk_profile="balanced")
+    store.record_fill("s1", side="BUY", qty=0.01, price=60_000.0, fee=0.3, order_id="raced", trade_id="raced")
+    store.set_desired_state("s1", "stopped")
+    store.set_status("s1", status, reason)
+    started = []
+
+    class FakePopen:
+        pid, returncode = 4242, None
+        poll = lambda self: None  # noqa: E731
+        send_signal = wait = kill = lambda self, *a, **k: 0  # noqa: E731
+    sv = sup.Supervisor(store)
+    return sv, started, FakePopen
+
+
+def test_a_stopped_strategy_still_holding_runs_for_its_exits_only_with_one_incident(store, monkeypatch):
+    """P1-U35 (Advisor 20:56, HoE): a raced remainder held by a STOPPED strategy is never left unwatched. The
+    supervisor starts it for its exits only (its stop, or a safety stop, still closes it; nothing opens) with one
+    incident; once flat it stops; the PM's Start then restarts it to trade."""
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.strategies.base import EXITS_ONLY
+
+    sv, started, FakePopen = _stopped_holder(store, "stopped", "stopped by PM")
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: started.append(1) or FakePopen())
+    sv.step()
+    s = store.sleeve("s1")
+    assert started == [1] and s.desired_state == "stopped"
+    assert (s.status, s.status_reason) == ("paused", f"{EXITS_ONLY}: {sup.STOPPED_HOLDING}")
+    assert entry_blocked_in(store, "s1")[0]  # nothing opens
+    sv.step()
+    sv.step()
+    (inc,) = [e for e in store.events("s1", limit=100) if e["kind"] == "incident"]
+    assert "stopped, but it still holds 0.01, so it runs for its exits only" in inc["message"]
+    assert started == [1]
+    store.record_fill("s1", side="SELL", qty=0.01, price=60_100.0, fee=0.3, order_id="stop", trade_id="stop")
+    sv.step()  # flat: stopped
+    assert sv.procs["s1"].popen is None and store.sleeve("s1").status == "stopped"
+    sv.step()
+    assert started == [1]
+
+
+def test_the_pms_stop_on_a_holder_restarts_it_for_its_exits_only_and_start_lets_it_trade_again(store, monkeypatch):
+    from sleeve_fund import supervisor as sup
+
+    sv, started, FakePopen = _stopped_holder(store)
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: started.append(1) or FakePopen())
+    sv.procs["s1"] = sup.Proc(popen=FakePopen(), started_at=sup.utcnow())  # running when the PM pressed Stop
+    sv.step()
+    assert started == [1] and store.sleeve("s1").status == "paused"
+    store.set_desired_state("s1", "running")  # the PM's Start
+    sv.step()
+    assert started == [1, 1] and store.sleeve("s1").status == "stopped"  # the new process's start sets it running
+
+
+@pytest.mark.parametrize("status,reason", [("halted", "drawdown 21% from peak"), ("paused", "paused by PM")])
+def test_a_stopped_holder_that_is_halted_or_paused_keeps_its_process_and_status_with_one_incident(
+        store, monkeypatch, status, reason):
+    from sleeve_fund import supervisor as sup
+
+    sv, started, FakePopen = _stopped_holder(store, status, reason)
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: started.append(1) or FakePopen())
+    sv.procs["s1"] = sup.Proc(popen=FakePopen(), started_at=sup.utcnow())
+    sv.step()
+    sv.step()
+    s = store.sleeve("s1")
+    assert started == [] and sv.procs["s1"].popen is not None and (s.status, s.status_reason) == (status, reason)
+    assert len([e for e in store.events("s1", limit=100) if e["kind"] == "incident"]) == 1
