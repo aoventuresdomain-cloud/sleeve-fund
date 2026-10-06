@@ -105,8 +105,10 @@ def _nearby(r: StudyResult) -> tuple[str, str]:
     chosen = getattr(r, "chosen_params", None) or r.default_params
     final = nearby_scored(r.sensitivity, chosen, params)
     words = f"whole period's choice: {final[1]}"
-    folds = [(f, nearby_scored(f.grid, f.chosen, params)) for f in r.folds
-             if isinstance(getattr(f, "grid", None), pd.DataFrame) and not f.grid.empty]
+    unscored = ("FAIL", "no setting scored a Sharpe on this fold's training stretch (none traded), so nothing was "
+                        "chosen", -math.inf)
+    folds = [(f, unscored if getattr(f, "unscored", False) else nearby_scored(f.grid, f.chosen, params))
+             for f in r.folds if isinstance(getattr(f, "grid", None), pd.DataFrame) and not f.grid.empty]
     if not folds:
         return final[0], words
     failed = [x for x in folds if x[1][0] == "FAIL"]

@@ -64,6 +64,7 @@ class Fold:
     # Every grid point's Sharpe and round trips on this fold's training stretch: the surface the choice
     # was made on, so the nearby-settings check can centre on what this fold chose (P1-G2).
     grid: pd.DataFrame = field(default_factory=pd.DataFrame)
+    unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
 
     @property
     def closed_in_window(self) -> int:
@@ -441,6 +442,19 @@ def run_study(
             surface.append({**params, "sharpe": m["sharpe"], "round_trips": len(round_trips(fit.fills, fit.shorts))})
             if m["sharpe"] > best_sharpe:
                 best, best_sharpe = params, m["sharpe"]
+        if best is None:
+            # No setting scored a Sharpe on training (none traded, so every one was NaN): nothing was chosen. The
+            # fold sits flat through its test window and fails the nearby-settings check, saying why (CR, #156).
+            days = whole_days(bench_ret, test_idx[0], bar)
+            test_ret = pd.Series(0.0, index=days.index[days.index <= test_idx[-1]])
+            folds.append(Fold(train_start=train.index[0], train_end=train.index[-1], test_end=test_idx[-1], chosen={},
+                              train_sharpe=float("nan"), test=summary(test_ret),
+                              benchmark_test=summary(bench_ret.reindex(test_ret.index).dropna()),
+                              window_bars=len(test_idx), unscored=True, grid=pd.DataFrame(surface)))
+            oos_parts.append(test_ret)
+            bench_parts.append(bench_ret.reindex(test_ret.index).dropna())
+            start += test_bars
+            continue
         # Trade the chosen params continuously through the test window so the
         # position carried in from training is realistic, then score only the test days.
         run = bt(spec.name, through_test, best)
@@ -543,6 +557,9 @@ def run_study(
     elif opened is not None:
         result.holdout_withheld = (f"left closed, though asked for: this model's holdout on {result.instrument} was "
                                    f"opened {opened_words(opened)}, and a second look can't be fresh")
+    elif use_holdout and holdout_days and folds[-1].unscored:
+        result.holdout_withheld = ("left closed, though asked for: no setting scored on the last fold's training "
+                                   "stretch, so there is no choice to test on it")
     elif use_holdout and holdout_days:
         chosen = folds[-1].chosen
         run = bt(spec.name, prices, chosen)

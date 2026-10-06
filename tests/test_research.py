@@ -646,3 +646,22 @@ def test_the_sensitivity_table_shows_grid_values_as_set():
     from sleeve_fund.research.tearsheet import _param
 
     assert [_param(v) for v in (20, 20.0, 0.005, 1.5, "ema")] == ["20", "20", "0.005", "1.5", "ema"]
+
+
+def test_a_fold_where_no_setting_scores_fails_with_a_reason_not_a_crash(tmp_path, instrument, monkeypatch):
+    """Code Reviewer on #156: when every training Sharpe in a fold is NaN, nothing is chosen. The study used to
+    raise; now the fold sits flat, the nearby-settings check fails it with the reason, and the holdout stays shut."""
+    from sleeve_fund.research import study
+    from sleeve_fund.research.tearsheet import NEARBY_CHECK, g1_checks
+
+    real = study.summary
+    monkeypatch.setattr(study, "summary", lambda r: {**real(r), "sharpe": float("nan")})
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, synthetic_ohlcv(days=1900, seed=3), instrument, dataset="syn", ledger=ledger, synthetic=True,
+                  holdout_days=200, train_days=730, test_days=365, use_holdout=True)
+    assert r.folds and all(f.unscored and f.chosen == {} for f in r.folds)
+    assert len(r.oos_returns) and (r.oos_returns == 0).all()  # sat flat through every test window
+    verdict, words = next(c[1:] for c in g1_checks(r, ledger) if c[0] == NEARBY_CHECK)
+    assert verdict == "FAIL" and "no setting scored a Sharpe on this fold's training stretch" in words
+    assert r.holdout is None and "no setting scored" in r.holdout_withheld
+    assert render(r, ledger)  # the sheet renders
