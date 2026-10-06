@@ -404,6 +404,27 @@ def test_a_time_stop_is_wall_clock_by_default_and_missing_bars_never_lengthen_a_
     assert spanned_a_hole, "the case needs a hold with missing bars inside it"
 
 
+def _exit_candle_reentries(fills):
+    """Indices of entries that open, in the exit's own direction, at the close time of the fill that flattened."""
+    pos, last_exit, out = 0.0, None, []
+    for i, (_intent, side, ts, qty, _px) in enumerate(fills):
+        before, pos = pos, pos + (qty if side == "BUY" else -qty)
+        if abs(pos) < 1e-12:
+            pos = 0.0
+        if before and not pos:
+            last_exit = (ts, before > 0)
+        elif not before and pos and last_exit == (ts, pos > 0):
+            out.append(i)
+    return out
+
+
+def _renewed_holds(fills, df, bars):
+    """Indices of exits more than `bars` decision bars after their entry: the time stop fired and the same side was
+    taken again on that candle, which nets to no trade, so the hold just carries on (PE1, 6 Oct 22:57)."""
+    return [i for i in range(1, len(fills)) if fills[i - 1][0] == "entry" and fills[i][0] != "entry"
+            and ((df.index > fills[i - 1][2]) & (df.index <= fills[i][2])).sum() > bars]
+
+
 def test_the_rsi_cross_port_counts_bars_and_matches_rsi_cross_exactly_across_missing_bars(instrument):
     """rsi_cross's rule [ENG]: on RSI crossing back above 30 (below 70 for the short), out at 55 (50) or after
     time_stop_bars decision bars. Rebuilt with the explicit count-bars time stop, it makes rsi_cross's trades on
@@ -425,8 +446,25 @@ def test_the_rsi_cross_port_counts_bars_and_matches_rsi_cross_exactly_across_mis
              long=SIDE(C("rsi", "crosses_above", 30), C("rsi", ">=", 55)),
              short=SIDE(C("rsi", "crosses_below", 70), C("rsi", "<=", 50)),
              exits={"time_stop": {"bars": 6, "count": "bars"}})
-    got = _fills(_run(defn, df, instrument, params=PERP))
-    assert [x[1:3] for x in got] == [x[1:3] for x in _fills(legacy)]
+    res = _run(defn, df, instrument, params=PERP)
+    got, leg = _fills(res), _fills(legacy)
+    # Amended 6 Oct 22:40 (HoE option (a), Head of QA confirmed), reworked 22:58 on PE1's finding: legacy rsi_cross,
+    # when its time stop fires on a candle where RSI crosses the same way again, takes the same side again with a
+    # fresh count. That nets to no fills, so legacy just holds past its time stop. The 22:30 ruling allows the same
+    # direction again at k+1 at the earliest, so exact parity holds only up to legacy's first renewed hold; after it
+    # the difference is legacy behaviour (LEG-RE fixes legacy; this precondition then flips), not a port fault.
+    renewed = _renewed_holds(leg, df, 6)
+    assert renewed, "the case needs legacy to renew a hold on its time-stop candle"
+    first = renewed[0]
+    assert [x[1:3] for x in got[:first]] == [x[1:3] for x in leg[:first]]
+    assert _renewed_holds(got, df, 6) == [], "the port never holds past its time stop"
+    assert _exit_candle_reentries(got) == [], [got[i] for i in _exit_candle_reentries(got)]
+    deadline = df.index[df.index > got[first - 1][2]][5]
+    assert got[first - 1][0] == "entry" and got[first][0] != "entry" and got[first][2] == deadline, (got[first],
+                                                                                                  deadline)
+    exits_at = {x[2] for x in got if x[0] != "entry"}
+    assert not [x for x in got if x[0] == "entry" and x[2] in exits_at], "no undeclared reversal on an exit candle"
+    assert getattr(res, "reentries_on_exit_candle", None) == 0, "not built: res.reentries_on_exit_candle"
 
 
 # ==== exit at an indicator level, gapped through [B6] =============================================================
