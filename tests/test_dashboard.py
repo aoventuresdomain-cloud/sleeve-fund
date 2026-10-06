@@ -2562,3 +2562,38 @@ def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
         store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
     store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_the_page_names_what_clears_each_kind_of_halt(client):
+    """Advisor 6 Oct 18:17 (HC): a drawdown halt shows Resume, a day's-loss pause says it clears at 00:00 UTC with
+    no Resume, a liquidation says only a reset after liquidation, and a stopped holder reads exits only."""
+    from datetime import timedelta
+
+    from sleeve_fund.paper.runtime import utcnow
+    from sleeve_fund.strategies.base import EXITS_ONLY
+
+    c, store = client
+    _new(c)
+    store.set_desired_state("btc-test", "running")
+
+    store.set_status("btc-test", "halted", "drawdown 21.0% hit the 20% limit")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "What clears it:" in page and "only a resume clears that" in page
+    assert 'data-open="dlg-resume">Resume<' in page
+
+    store.set_status("btc-test", "paused", "daily loss", utcnow() + timedelta(hours=3))
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "only the next 00:00 UTC roll clears that" in page and "Clears at 00:00 UTC" in page
+    assert 'data-open="dlg-resume">Resume<' not in page
+
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", "Position margin lost (liquidated): 900.00, 110% of strategy equity at entry")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "only a reset after liquidation clears that" in page and "Reset after liquidation needed" in page
+    assert 'data-open="dlg-resume">Resume<' not in page
+
+    from sleeve_fund.store import LIQUIDATION_RESET
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    store.set_status("btc-test", "paused", f"{EXITS_ONLY}: it was stopped while it still holds a position")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Exits only:" in page and "What clears it:" not in page

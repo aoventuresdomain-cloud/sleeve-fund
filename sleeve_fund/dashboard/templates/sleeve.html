@@ -18,7 +18,9 @@
     {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
-      {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
+      {# Only a drawdown halt or a PM pause is cleared by Resume; a liquidation waits for its reset and a day's-loss pause for the 00:00 UTC roll (Advisor 18:17). #}
+      {% if clearing and clearing.kind in ['liquidated', 'daily'] %}<span class="chip paused" title="{{ clearing.why }}">{{ 'Reset after liquidation needed' if clearing.kind == 'liquidated' else 'Clears at 00:00 UTC' }}</span>
+      {% elif s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not x.qty %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
@@ -42,6 +44,8 @@
   {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
+{% if clearing and clearing.kind == 'exits_only' %}<div class="banner warn" role="status"><strong>Exits only:</strong> it was stopped while it still holds a position, so nothing new opens and it stops once it is flat. Flatten ends it now.</div>{% endif %}
+{% if clearing and clearing.kind in ['liquidated', 'drawdown', 'daily'] %}<div class="banner" role="status"><strong>What clears it:</strong> {{ clearing.why }}.{% if clearing.kind == 'daily' %} Start and Resume don't lift it.{% endif %}</div>{% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
 {% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
 {% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}
