@@ -2396,6 +2396,15 @@ class LongFlatStrategy(Strategy):
         return (fees, sum(float(f["qty"]) for f in liq), (float(marks[-1]["equity"]) if marks else None),
                 journaled)
 
+    def _liquidation_margin(self, trade_id: str, qty: float, fee: float, held: tuple) -> tuple[str, bool]:
+        """The liquidation's halt once its last fill (trade_id, qty, fee) is in: X over every slice (not the last), and
+        whether that fill is journaled. One that isn't yet (a write still to retry) is added from the event itself,
+        so X is never short of it (Code Reviewer on eb737bd)."""
+        fees, taken, before, journaled = self._liquidation_figures(trade_id)
+        if not journaled:
+            fees, taken = fees + fee, taken + qty
+        return self._margin_lost(max(taken, held[0]), held[1], fees, before), journaled
+
     def _margin_lost(self, qty: float, entry: float, fees: float = 0.0, before: float | None = None) -> str:
         """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57): "Position margin lost (liquidated): X,
         Y% of strategy equity", X the position's isolated margin plus its entry and liquidation fees (18:17 point 4),
@@ -2851,8 +2860,7 @@ class LongFlatStrategy(Strategy):
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
             if self.decisions.get(coid, {}).get("intent") == "liquidation" and held[0] and held[1]:
-                fees, taken, before, journaled = self._liquidation_figures(str(event.trade_id))
-                margin = self._margin_lost(max(taken, held[0]), held[1], fees, before)  # every slice, not the last
+                margin, journaled = self._liquidation_margin(str(event.trade_id), qty, fee, held)
                 if not journaled:
                     margin = self._liquidated or margin  # its fill isn't in the journal yet: keep the estimate
                 elif self._liquidated is not None and margin != self._liquidated and self.runtime is not None:

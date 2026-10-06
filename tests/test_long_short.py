@@ -1278,3 +1278,34 @@ def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_las
     assert fees == pytest.approx(9.0 + 4.5 + 9.74) and taken == pytest.approx(0.3)
     assert before == 9_000.0 and journaled
     assert LongFlatStrategy._liquidation_figures(me, "t-not-yet")[3] is False
+
+
+def test_a_liquidation_fill_not_yet_journaled_still_counts_in_x():
+    """Code Reviewer on eb737bd: the guard's close whose fill row is still to be written (a retry) is counted from the
+    event itself, quantity and fee, so X covers the whole position and every fee all the same."""
+    from types import SimpleNamespace
+
+    from sleeve_fund import risk
+    from sleeve_fund.paper.journal import MemoryJournal
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    j = MemoryJournal()
+    j.create_sleeve(name="s", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                    starting_balance=10_000, risk_profile="balanced", params={})
+    t0 = datetime(2025, 10, 3, tzinfo=timezone.utc)
+    for i, (oid, intent, side, qty, px, fee) in enumerate([
+            ("in", "entry", "SELL", 0.3, 60_000.0, 9.0), ("stop", "liquidation", "BUY", 0.1, 90_000.0, 4.5)]):
+        at = t0 + pd.Timedelta(minutes=i)
+        j.record_order("s", order_id=oid, side=side, qty=qty, intent=intent, reason="", ts=at)
+        j.record_fill("s", side=side, qty=qty, price=px, fee=fee, order_id=oid, trade_id=f"t-{oid}", ts=at)
+    j.record_order("s", order_id="guard", side="BUY", qty=0.2, intent="liquidation", reason="",
+                   ts=t0 + pd.Timedelta(minutes=2))  # filled, but its fill row isn't written yet
+    j.record_equity("s", equity=18_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
+                    ts=t0 + pd.Timedelta(seconds=30))
+    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005, profile=risk.profile("balanced"),
+                                                 _last_equity=None, peak=10_000.0))
+    me._liquidation_figures = lambda *a, **k: LongFlatStrategy._liquidation_figures(me, *a, **k)
+    me._margin_lost = lambda *a, **k: LongFlatStrategy._margin_lost(me, *a, **k)
+    text, journaled = LongFlatStrategy._liquidation_margin(me, "t-guard", 0.2, 9.74, (0.2, 60_000.0))
+    assert not journaled
+    assert text.startswith("Position margin lost (liquidated): 9,023.24, 50% of strategy equity"), text
