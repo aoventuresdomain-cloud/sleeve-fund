@@ -2468,6 +2468,22 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
     assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
 
 
+def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
+    """Code review on #164 (HoE): Setup's Reset book must not put a liquidation away unanswered either. The
+    liquidated strategy is left for Reset after liquidation and named; the others reset as before."""
+    c, store = client
+    _new(c)
+    _new(c, name="btc-other")
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "not_reset=btc-test" in r.headers["location"]
+    assert {x["sleeve"] for x in store.pending_resets()} == {"btc-other"}
+    setup = c.get(r.headers["location"], auth=AUTH).text
+    assert "Not reset: btc-test. Its position margin was lost (liquidated)" in setup
+    assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
+
+
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
                                    " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
                                    "Position\u00a0margin lost (liquidated)"])

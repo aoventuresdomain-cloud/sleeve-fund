@@ -719,11 +719,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             error = "a reason is required"
         if not reason:
             return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        gone = set(st().archived())
+        gone, liquidated = set(st().archived()), []
         for s in st().sleeves():
-            if s.name not in gone and not st().pending_reset(s.name):
-                st().request_reset(s.name, reason, actor=actor)
-        return RedirectResponse("/setup?reset=1", status_code=303)
+            if s.name in gone or st().pending_reset(s.name):
+                continue
+            if _liquidated(s.name):  # put away unanswered otherwise; it waits for Reset after liquidation
+                liquidated.append(s.name)
+                continue
+            st().request_reset(s.name, reason, actor=actor)
+        q = {"reset": "1", **({"not_reset": ", ".join(liquidated)} if liquidated else {})}
+        return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
