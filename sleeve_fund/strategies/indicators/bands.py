@@ -8,6 +8,8 @@ from collections import deque
 from sleeve_fund.strategies.indicators._common import (
     PERIOD_MAX, Block, Setting, peek, peek_values, warmup, whole,
 )
+from sleeve_fund.strategies.indicators.averages import Ema
+from sleeve_fund.strategies.indicators.classic import Atr
 
 # A deviation under a billionth of the price is rounding left by the sliding sums, not a band.
 FLAT_BAND = 1e-9
@@ -145,3 +147,48 @@ class Donchian(Block):
     @warmup
     def warmup_bars(cls, s) -> int:
         return s["period"] + 1
+
+
+class Keltner(Block):
+    """Keltner channel: an exponential average of the close over `period` bars (mid), k average true ranges
+    over `atr_period` bars either side (upper, lower). The range is the library Atr, a simple average of true
+    ranges. `value` is mid. Initialized when the average and the range both are."""
+
+    SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX), Setting("atr_period", int, 10, 1, PERIOD_MAX),
+                Setting("k", float, 2.0, 0.1, 10.0))
+    OUTPUTS = ("mid", "upper", "lower")
+
+    def __init__(self, period: int = 20, atr_period: int = 10, k: float = 2.0) -> None:
+        self.period = whole("period", period, 1)
+        self.atr_period = whole("atr_period", atr_period, 1)
+        if isinstance(k, bool) or not (float(k) > 0 and math.isfinite(float(k))):
+            raise ValueError(f"k must be a positive number of average true ranges, got {k!r}")
+        self.k = float(k)
+        self.reset()
+
+    def reset(self) -> None:
+        self._mid = Ema(self.period)
+        self._range = Atr(self.atr_period)
+        self._value = 0.0
+        self._vals = dict.fromkeys(self.OUTPUTS, 0.0)
+
+    def update_raw(self, high: float, low: float, close: float) -> None:
+        self._mid.update_raw(float(close))
+        self._range.update_raw(float(high), float(low), float(close))
+        mid, half = self._mid._value, self.k * self._range.value
+        self._value = mid
+        self._vals = {"mid": mid, "upper": mid + half, "lower": mid - half}
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(high, low, close)
+
+    @property
+    def initialized(self) -> bool:
+        return self._mid.initialized and self._range.initialized
+
+    def _outputs(self) -> dict:
+        return dict(self._vals)
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return max(Ema.warmup_bars(period=s["period"]), Atr.warmup_bars(period=s["atr_period"]))
