@@ -23,14 +23,23 @@ def _m(*bars):
 
 
 @pytest.mark.parametrize("minutes, expect", [
-    (_m((100.5, 99.5), (101.0, 100.0), (100.2, 98.0)), Touch(True, 2 * M, None)),  # X at minute 2, Y later
-    (_m((100.5, 99.5), (100.2, 99.0), (101.5, 100.0)), Touch(False, None, 2 * M)),  # Y at minute 2 first
-    (_m((100.5, 99.5), (101.2, 98.9)), Touch(False, 2 * M, 2 * M, same_minute=True)),  # both in minute 2
-    (_m((100.9, 99.1), (100.5, 99.5)), Touch(False)),  # neither: 101 and 99 are never reached
+    (_m((100.5, 99.5), (101.0, 100.0), (100.2, 98.0)), Touch(True, 2 * M, None, "minutes", reached=True)),
+    (_m((100.5, 99.5), (100.2, 99.0), (101.5, 100.0)), Touch(False, None, 2 * M, "minutes", reached=True)),
+    (_m((100.5, 99.5), (101.2, 98.9)), Touch(False, 2 * M, 2 * M, "minutes", same_minute=True, reached=True)),
+    (_m((100.9, 99.1), (100.5, 99.5)), Touch(False, by="minutes")),  # neither: 101 and 99 are never reached
 ])
 def test_first_touch_follows_the_minutes_in_order_and_takes_the_adverse_level_first_within_one(minutes, expect):
     """Levels X 101 and Y 99 against the candle before's close of 100: X is reached by a high, Y by a low."""
     assert first_touch(minutes, 101.0, 99.0, 100.0) == expect
+
+
+def test_the_candles_range_settles_it_when_one_level_is_outside_and_minutes_must_agree_with_it():
+    assert first_touch((), 101.0, 99.0, 100.0, high=101.5, low=99.5) == Touch(True, reached=True)  # only X in range
+    assert first_touch((), 101.0, 99.0, 100.0, high=100.5, low=99.5) == Touch(False)  # neither
+    both = dict(high=101.5, low=98.5, start=0, step=2)
+    assert first_touch(_m((100.5, 99.5)), 101.0, 99.0, 100.0, **both).unknown == "missing"  # minute 2 not to hand
+    assert first_touch(_m((100.5, 99.5), (100.5, 99.5)), 101.0, 99.0, 100.0, **both).unknown == "inconsistent"
+    assert first_touch(_m((101.0, 99.5)), 101.0, 99.0, 100.0, **both).holds  # X in minute 1: a later gap can't matter
 
 
 def test_a_level_below_the_close_before_is_reached_by_a_low_and_one_above_by_a_high():
@@ -45,6 +54,7 @@ def test_a_level_below_the_close_before_is_reached_by_a_low_and_one_above_by_a_h
     ({"first_touch": {"reach": 101}}, "first_touch is {reach, before}"),
     ({"first_touch": {"reach": 101, "before": "nope"}}, "unknown reference 'nope'"),
     ({"first_touch": [101, 99]}, "first_touch is {reach, before}"),
+    ({"first_touch": {"reach": {"add": ["close", 1]}, "before": {"add": ["close", 1.0]}}}, "the same level"),
 ])
 def test_a_malformed_first_touch_is_refused_with_its_reason(rule, words):
     with pytest.raises(ValueError, match=words.replace("{", r"\{").replace("}", r"\}")):
@@ -100,7 +110,8 @@ def test_reached_x_first_inside_the_candle_enters_on_its_close_and_says_when(ins
     res = _run(instrument, b)
     entry = next(d for d in res.decisions.values() if d["intent"] == "entry")
     ft = entry["signal"]["first_touch"]["first_touch(reach add(close,1.0), before sub(close,1.0))"]
-    assert ft == {"reach_at": "2025-10-03T00:18:00+00:00", "before_at": None, "same_minute": False, "unknown": False}
+    assert ft == {"held": True, "by": "minutes", "reach_at": "2025-10-03T00:18:00+00:00", "before_at": None,
+                  "same_minute": False, "unknown": None}
     stats = res.first_touch["first_touch(reach add(close,1.0), before sub(close,1.0))"]
     assert stats["held"] == 1 and stats["same_minute"] == 0
 
@@ -121,37 +132,66 @@ def test_both_in_one_minute_takes_the_adverse_level_first_and_the_report_counts_
 
 def test_a_level_reached_only_after_the_decision_time_never_counts(instrument):
     """Look-ahead: inside candle B neither level is reached; the first minute after its close reaches X (101.3).
-    Judged at B's close, nothing held. Candle C then judges its own minutes from B's close."""
+    Judged at B's close, nothing held. Candle C then holds on its own range (only X inside it)."""
     b = FLAT * 15
     res = _run(instrument, b, after=[(101.3, 100.0)])
     stats = next(iter(res.first_touch.values()))
     entries = [d for d in res.decisions.values() if d["intent"] == "entry"]
-    # held once, on candle C (to 00:45), whose first minute reached 101.3: never on candle B (to 00:30)
     assert stats["held"] == 1 and len(entries) == 1
+    assert entries[0]["signal"]["first_touch"][next(iter(res.first_touch))]["by"] == "range"
     coid = next(o for o, d in res.decisions.items() if d["intent"] == "entry")
     assert res.fills.loc[coid, "ts_last"] == START + pd.Timedelta(minutes=45)  # decided at C's close, not B's
-    assert entries[0]["signal"]["first_touch"][next(iter(res.first_touch))]["reach_at"] == "2025-10-03T00:31:00+00:00"
 
 
-def test_a_candle_with_a_minute_missing_is_not_judged(instrument):
-    b = FLAT * 2 + [(101.2, 100.0)] + FLAT * 12
-    res = _run(instrument, b, drop=[22])
-    assert not _entered(res)
-    assert next(iter(res.first_touch.values()))["unknown"] >= 1
+def test_one_level_inside_the_candle_settles_it_without_minutes(instrument):
+    """Advisor ~22:07: only X inside candle B's range: true from its high and low alone, even with its minutes
+    missing; only Y inside: false."""
+    res = _run(instrument, FLAT * 2 + [(101.2, 100.0)] + FLAT * 12, drop=[22])
+    assert _entered(res) and next(iter(res.first_touch.values()))["by_minutes"] == 0
+    assert not _entered(_run(instrument, FLAT * 2 + [(100.0, 98.8)] + FLAT * 12))
 
 
-def test_a_first_touch_backtest_on_slower_candles_needs_the_minutes(instrument):
-    candles, _ = _frames(FLAT * 15)
-    with pytest.raises(ValueError, match="first_touch rule, judged on the 1-minute bars"):
+def test_with_both_inside_a_minute_missing_before_the_first_reach_leaves_it_unknown(instrument):
+    """X at B's 5th minute, Y at its 10th. Its 3rd minute missing: the order can't be told, so no entry (the entry
+    side's safe answer), counted. Its 7th missing instead: X already came first, so it holds."""
+    b = FLAT * 4 + [(101.2, 100.0)] + FLAT * 4 + [(100.0, 98.8)] + FLAT * 5
+    res = _run(instrument, b, drop=[18])
+    assert not _entered(res) and next(iter(res.first_touch.values()))["unknown_missing"] == 1
+    assert _entered(_run(instrument, b, drop=[22]))
+
+
+def test_an_ambiguous_candle_never_blocks_an_exit(instrument):
+    """In an exit rule a same-minute candle resolves to true (Advisor ~22:07: entry-skip, exit-never). Long from
+    candle A (close 100 <= 100.5); candle B reaches both levels in its 5th minute and closes at 100.8."""
+    exit_ft = {**DEFN, "long": {"entry": {"left": "close", "op": "<=", "right": 100.5}, "exit": FT}}
+    candles, minutes = _frames(FLAT * 4 + [(101.5, 98.5)] + [(100.8, 100.8)] * 10)
+    res = run_backtest("rules", candles, instrument, params=to_params(exit_ft), bar_minutes=15, half_spread=0,
+                       exec_prices=minutes, exec_minutes=1)
+    exits = [d for d in res.decisions.values() if d["intent"] == "exit"]
+    assert exits and next(iter(res.first_touch.values()))["resolved"] == "true when ambiguous"
+
+
+def test_the_g1_check_can_resolve_ambiguous_candles_the_other_way(instrument):
+    candles, minutes = _frames(FLAT * 4 + [(101.5, 98.5)] + FLAT * 10)
+    res = run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
+                       exec_prices=minutes, exec_minutes=1, first_touch_flip=True)
+    (stats,) = res.first_touch.values()
+    assert _entered(res) and stats["same_minute"] == 1 and stats["ambiguous_share"] == 1.0
+
+
+def test_a_slower_candle_backtest_without_minutes_runs_until_a_candle_needs_them(instrument):
+    candles, _ = _frames(FLAT * 2 + [(101.2, 100.0)] + FLAT * 12)  # only X inside: no minutes needed
+    run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0)
+    candles, _ = _frames(FLAT * 4 + [(101.5, 98.5)] + FLAT * 10)
+    with pytest.raises(ValueError, match="needed the 1-minute bars of 1 candles"):
         run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0)
 
 
-def test_the_levels_are_the_candle_befores_not_the_judged_candles_own(instrument):
-    """Candle B reaches 101.2 in its 3rd minute and ends at 102.5. From candle A's close (100) the levels are 101 and
-    99: X first, so it enters. From B's own close they would be 103.5 (never reached) and 101.5 (reached by the first
-    minute's low of 100): no entry. Reading B's close to judge B's own path would be look-ahead."""
-    b = FLAT * 2 + [(101.2, 100.0)] + [(102.5, 102.5)] * 12
-    assert _entered(_run(instrument, b))
+def test_on_one_minute_candles_the_report_says_the_share_is_the_assumptions(instrument):
+    _, minutes = _frames(FLAT * 4 + [(101.5, 98.5)] + FLAT * 10)
+    res = run_backtest("rules", minutes, instrument, params=to_params(DEFN), bar_minutes=1, half_spread=0)
+    (stats,) = res.first_touch.values()
+    assert stats["same_minute"] == 1 and "assumption" in stats["note"]
 
 
 def test_paper_judges_the_same_minutes_a_backtest_does():

@@ -101,6 +101,7 @@ def run_backtest(
     progress=None,
     fees: FeeSchedule | None = None,
     warmup_prices: pd.DataFrame | None = None,
+    first_touch_flip: bool = False,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -125,7 +126,10 @@ def run_backtest(
     fees: charge this schedule instead of the market's or the instrument's (the cost ladder).
 
     warmup_prices: bars of `bar_minutes` before `prices`, fed to the strategy first without trading, as a paper
-    strategy's warm-up from the history store is, so the window opens on settled indicators."""
+    strategy's warm-up from the history store is, so the window opens on settled indicators.
+
+    first_touch_flip: resolve a rule-builder first_touch the other way when a candle is ambiguous (true in an entry,
+    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07)."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -134,9 +138,8 @@ def run_backtest(
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
     touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
-    if touches and bar_minutes > 1 and (exec_prices is None or exec_prices.empty or exec_minutes != 1):
-        raise ValueError("the definition has a first_touch rule, judged on the 1-minute bars inside each candle: run "
-                         "it with those minutes (exec_prices, exec_minutes = 1)")
+    minutes_in = touches and bar_minutes > 1 and exec_prices is not None and not exec_prices.empty \
+        and exec_minutes == 1
     perp = markets.is_perp(params)
     if fees is None:
         fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
@@ -208,8 +211,10 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
-        if touches and bar_minutes > 1:
+        if minutes_in:
             strategy.minute_source = minutes_from(exec_prices)
+        for node in getattr(getattr(strategy, "rules", None), "touches", ()):
+            node.flip = first_touch_flip
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
         spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
@@ -238,6 +243,12 @@ def run_backtest(
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
+        touched = strategy.first_touch_stats() if touches else {}
+        if touches and bar_minutes > 1 and not minutes_in and any(st["unknown_missing"] for st in touched.values()):
+            raise ValueError(
+                f"the first_touch rule needed the 1-minute bars of {sum(st['unknown_missing'] for st in touched.values())}"
+                " candles that reached both its levels, and the run had none: run it with those minutes (exec_prices, "
+                "exec_minutes = 1)")
         return BacktestResult(
             strategy=strategy_name,
             params=params,
@@ -257,7 +268,7 @@ def run_backtest(
             unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
                                 if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
-            first_touch=strategy.first_touch_stats() if touches else {},
+            first_touch=touched,
         )
     finally:
         if runtime is not None:

@@ -99,7 +99,7 @@ class Rules(LongFlatStrategy):
         super().__init__(config)
         self.c = config
         self.rules = Compiled(config.checked)
-        self.env = Env(blocks=self.rules.blocks)
+        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"))
         by_tf: dict = {}
         for bid in config.checked.order:
             by_tf.setdefault(config.checked.blocks[bid]["timeframe"], []).append(bid)
@@ -162,26 +162,31 @@ class Rules(LongFlatStrategy):
 
     def _minutes_of(self, bar: Bar) -> list | None:
         """The candle's own 1-minute bars, oldest first, for first_touch: never one closing after it (look-ahead) or
-        at or before the candle before's close. None, or fewer than the candle has, when they aren't to hand: the
-        path is then unknown and the rule doesn't hold on it."""
+        at or before the candle before's close; those to hand (paper decides without waiting for a late one)."""
         step, end = bar_minutes(self._cfg.bar_type), int(bar.ts_event)
         if step == 1:
             return [(end, bar.open.as_double(), bar.high.as_double(), bar.low.as_double(), bar.close.as_double())]
         start = end - step * MINUTE_NS
         got = self.minute_source(start, end) if self.minute_source is not None else None
-        got = sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
-        if len(got) < step:
-            self._note("first_touch_unknown", f"First-touch not judged on the candle to {_iso(end)}: "
-                       f"{step - len(got)} of its {step} minutes aren't to hand, so the rule doesn't hold on it",
-                       level="info")
-        else:
-            self._noted.discard("first_touch_unknown")
-        return got
+        return sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
 
     def first_touch_stats(self) -> dict:
-        """For the report, per first_touch rule: candles judged, held, either level reached, both first reached in one
-        minute (the adverse level taken as first), and not judged for minutes missing."""
-        return {n.text: dict(n.stats) for n in self.rules.touches}
+        """For the report, per first_touch rule: candles judged, held, either level reached, settled by minutes,
+        both first reached in one minute, and unknown (a minute missing before the first reach, or minutes that
+        disagree with the candle's range); `ambiguous_share` is the last three over either reached, which the G1
+        check reads (Advisor ~22:07: over 5%, judged on the worse resolution too). On 1-minute candles every candle
+        reaching both is a same-minute case, so the share is the assumption's, and the note says so."""
+        out = {}
+        for n in self.rules.touches:
+            st = dict(n.stats)
+            amb = st["same_minute"] + st["unknown_missing"] + st["unknown_inconsistent"]
+            st["ambiguous_share"] = amb / st["either_reached"] if st["either_reached"] else 0.0
+            st["resolved"] = ("true" if n.exit_rule != n.flip else "false") + " when ambiguous"
+            if bar_minutes(self._cfg.bar_type) == 1:
+                st["note"] = ("on 1-minute candles the order inside a candle reaching both levels is never seen: "
+                              "every such candle is assumed, so the result rests on that assumption")
+            out[n.text] = st
+        return out
 
     # --- the leg ----------------------------------------------------------------------------------------------
 
