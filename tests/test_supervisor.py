@@ -299,6 +299,33 @@ def test_a_reset_asked_for_before_a_liquidation_is_not_carried_out(store):
     assert store.pending_reset("bn-ls") is None and len(store.reset_runs()) == 1
 
 
+def test_a_reset_refused_mid_flatten_leaves_a_stopped_strategy_stopped(store):
+    """Code review on #167: the first pass queues the reset's flatten and starts a stopped, holding strategy so
+    it can trade; if a liquidation lands before the second pass, the refusal takes both back."""
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    sup = Supervisor(store, python="true")
+    req = store.pending_reset("bn-ls")
+    sup.reset_pending()  # pass 1: flatten queued, started so it can trade
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["flatten"]
+    assert store.sleeve("bn-ls").desired_state == "running"
+    store.command("bn-ls", "pause", "PM paused it", actor="PM")  # not the reset's: stays
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup.reset_pending()  # pass 2: refused
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["pause"]
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    refusals = [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"]
+    assert len(refusals) == 1
+    store.refuse_reset(req, "again")  # a second close of the same request journals nothing
+    assert [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"] == refusals
+
+
 @pytest.mark.sanity
 def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_capital(store):
     """PM, 5 Oct 2026. Nothing is deleted: the run so far moves to its own archived name under Previous book."""

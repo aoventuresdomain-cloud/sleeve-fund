@@ -129,6 +129,7 @@ class Supervisor:
                 # Asked for before the liquidation landed: carried out (or flattened for) now, it would put the
                 # liquidation away unanswered (QA P1-U33). It waits for Reset after liquidation instead.
                 self.store.refuse_reset(req, liquidation.REFUSAL)
+                self._undo_reset_start(req)
                 continue
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
@@ -148,6 +149,19 @@ class Supervisor:
                              f"{run}; starting again at {s.starting_balance:,.0f}")
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
+
+    def _undo_reset_start(self, req: dict) -> None:
+        """A reset refused after its first pass has already queued its flatten and, for a strategy the PM had
+        stopped, started it so the flatten could trade. Take both back: the flatten lapses, and the Stop the
+        PM chose stands (Code review on #167)."""
+        name = req["sleeve"]
+        for cmd in self.store.pending_commands(name):
+            if cmd["command"] == "flatten" and cmd["reason"].startswith("Reset strategy:"):
+                self.store.mark_applied(cmd["id"])
+                self.store.decide("system", "drop flatten", "lapsed: the reset it was for was not carried out "
+                                  f"({cmd['reason']})", name)
+        if not req["restart"] and self.store.sleeve(name).desired_state == "running":
+            self.store.set_desired_state(name, "stopped")
 
     def step(self) -> None:
         self.reset_pending()
