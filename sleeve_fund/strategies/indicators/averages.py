@@ -13,9 +13,11 @@ DAY_OF_MINUTE_BARS = 1_440
 
 
 class Ema(Block):
-    """Exponential moving average, alpha 2 / (period + 1), started at the first value and initialized after
-    `period` values: the engine's ExponentialMovingAverage, which rsi_pullback trades today, to floating-point
-    precision (tests/test_indicators_ref.py), without its period limit."""
+    """Exponential moving average, alpha 2 / (period + 1), started at the first value: the engine's
+    ExponentialMovingAverage, which rsi_pullback trades today, to floating-point precision
+    (tests/test_indicators_ref.py), without its period limit. It is initialized only once it has settled, after
+    ten lengths (QA, F1): before that it still leans on its starting value, which the engine's version does not
+    wait out."""
 
     SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX),)
 
@@ -38,7 +40,7 @@ class Ema(Block):
 
     @property
     def initialized(self) -> bool:
-        return self.count >= self.period
+        return self.count >= settle_bars(self.period)
 
     def _outputs(self) -> dict:
         return {"value": self._value}
@@ -179,4 +181,57 @@ class Vwap(Block):
 
     @warmup
     def warmup_bars(cls, s) -> int:
-        return DAY_OF_MINUTE_BARS + 1 if s["anchor"] == "day" else s["period"]
+        if s["anchor"] == "day":
+            return DAY_OF_MINUTE_BARS + 1
+        if s["period"] is None:
+            raise ValueError("a rolling VWAP needs a period")
+        return s["period"]
+
+
+class Atr(Block):
+    """Wilder's average true range, the standard ATR (Independent Quant Advisor and QA, P1-I4): a bar's true range
+    is its high minus low, stretched to the previous close when the bar gapped, and the first bar's is its high
+    minus low. The first average is the mean of the first `period` ranges; each later one is (previous x
+    (period - 1) + this range) / period. Like RSI it never forgets its start, only discounts it, so it is
+    initialized after ten lengths. `atr_sma` is the simple average the hand-coded models use."""
+
+    SETTINGS = (Setting("period", int, 14, 1, PERIOD_MAX),)
+
+    def __init__(self, period: int = 14) -> None:
+        self.period = whole("period", period, 1)
+        self.reset()
+
+    def reset(self) -> None:
+        self._prev_close: float | None = None
+        self._seed: list[float] = []
+        self.count = 0
+        self._value = 0.0
+
+    def update_raw(self, high: float, low: float, close: float) -> None:
+        high, low, close = float(high), float(low), float(close)
+        prev = self._prev_close
+        tr = high - low if prev is None else max(high, prev) - min(low, prev)
+        self._prev_close = close
+        self.count += 1
+        n = self.period
+        if self.count <= n:
+            self._seed.append(tr)
+            self._value = sum(self._seed) / len(self._seed)
+            if self.count == n:
+                self._seed = []
+        else:
+            self._value = (self._value * (n - 1) + tr) / n
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(high, low, close)
+
+    @property
+    def initialized(self) -> bool:
+        return self.count >= settle_bars(self.period)
+
+    def _outputs(self) -> dict:
+        return {"value": self._value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return settle_bars(s["period"])
