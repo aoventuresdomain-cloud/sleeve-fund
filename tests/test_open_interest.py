@@ -463,14 +463,18 @@ def _one_hole(tmp_path, monkeypatch):
 @pytest.mark.parametrize("content", ["null", "5", "[[1, 2]]"])
 def test_an_alerted_file_of_the_wrong_shape_is_read_as_empty_and_said(tmp_path, monkeypatch, capfd, content):
     """QA P1-O20: the hole goes in once more and the file is rewritten, rather than the alerts stopping for good."""
+    from sleeve_fund import history
+
     profile, path = _one_hole(tmp_path, monkeypatch)
     path.parent.mkdir(parents=True)
     path.write_text(content)
+    history._warned.clear()
     sent = _inbox(monkeypatch)
     for _ in range(3):
         _refresh_funding(profile, "BTC/USDT", tmp_path, None)
     out = capfd.readouterr().out
-    assert len(sent) == 1 and "reading it as empty" in out and "funding refresh failed" not in out
+    assert [k for _, k, _ in sent] == ["funding_alerted_unreadable", "funding_gap"], sent  # an incident, then the hole
+    assert "reading it as empty" in out and "funding refresh failed" not in out
     assert json.loads(path.read_text()) == ["missed between 2026-10-01 16:00 to 2026-10-02 08:00"]
 
 
@@ -499,4 +503,8 @@ def test_the_alert_is_sent_outside_the_stores_lock(tmp_path, monkeypatch):
     held = []
     sent = _inbox(monkeypatch, check=lambda: held.append(history._lock.locked()))
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)
-    assert len(sent) == 1 and held == [False]
+    path = funding._path("BINANCE", "BTC/USDT", tmp_path).with_name("funding.alerted.json")
+    path.write_text("{not json")
+    history._warned.clear()
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)  # the incident and the hole sent again, outside it too
+    assert len(sent) == 3 and held == [False, False, False]

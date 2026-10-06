@@ -592,7 +592,10 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
 
     path = funding._path(venue, pair, root).with_name("funding.alerted.json")
     with _writing(path.parent):
-        new = [h for h in holes if h not in _raised(path)]
+        raised, problem = _raised(path)
+    if problem:  # an incident in the alerts inbox, once a day, outside the lock (QA P1-O20, O21)
+        _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", problem)
+    new = [h for h in holes if h not in raised]
     if not new:
         return
     try:
@@ -605,7 +608,7 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
     with _writing(path.parent):
         tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         try:
-            tmp.write_text(json.dumps(sorted(_raised(path) | set(new))))
+            tmp.write_text(json.dumps(sorted(_raised(path)[0] | set(new))))
             _durable_replace(tmp, path)
         except OSError as exc:  # sent, but not kept: not sent again by this process; a restart sends them once more
             _sent_holes.setdefault(str(path), set()).update(new)
@@ -616,21 +619,23 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
 _sent_holes: dict[str, set[str]] = {}  # alerted file -> holes this process sent but couldn't keep in it
 
 
-def _raised(path: Path) -> set[str]:
-    """The holes already raised for the instrument. A file that can't be read, or isn't a list of hole words, is
-    read as empty and said (QA P1-O20): its holes go in once more, rather than its alerts stopping for good."""
+def _raised(path: Path) -> tuple[set[str], str | None]:
+    """The holes already raised for the instrument, and what is wrong with the file if it can't be used. A file that
+    can't be read, or isn't a list of hole words, is read as empty and said (QA P1-O20): its holes go in once more,
+    and the file is rewritten, rather than the instrument's alerts stopping for good."""
     raised = set(_sent_holes.get(str(path), ()))
     try:
         kept = json.loads(path.read_text())
     except FileNotFoundError:
-        return raised
+        return raised, None
     except (OSError, ValueError) as exc:
-        print(f"funding holes already raised: {path} unreadable ({exc!r}); reading it as empty")
-        return raised
-    if not isinstance(kept, list) or not all(isinstance(h, str) for h in kept):
-        print(f"funding holes already raised: {path} is not a list of holes; reading it as empty")
-        return raised
-    return raised | set(kept)
+        problem = f"{path}: the funding holes already raised can't be read ({exc!r}); reading it as empty"
+    else:
+        if isinstance(kept, list) and all(isinstance(h, str) for h in kept):
+            return raised | set(kept), None
+        problem = f"{path}: the funding holes already raised are not a list of holes; reading it as empty"
+    print(problem)
+    return raised, problem
 
 
 def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
