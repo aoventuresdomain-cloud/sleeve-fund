@@ -56,6 +56,29 @@ def stub_contract(monkeypatch):
         "price_precision": 1, "size_precision": 3, "min_quantity": 0.001, "min_notional": 5.0})
 
 
+GUARDS_OFF = "guards off: liquidation mechanics only"
+
+
+def _guards_off(reason=GUARDS_OFF):
+    """The mark that lifts stop safety's 5% open-risk limit for one test or one parametrised case (HoE 20:04, option
+    (a); the GAP-LIQ ruling), saying why. Every other guard stays on: no case here needs the stopless-above-1x
+    refusal (strategies.check_perp_stop) lifted, so it and check_perp_sizing run live."""
+    return pytest.mark.no_open_risk_limit(reason=reason)
+
+
+@pytest.fixture(autouse=True)
+def _guard_marks(monkeypatch, request):
+    """The guard-lift mark, applied here so this file behaves the same in the repo and run from QA's shared folder,
+    where tests/conftest.py isn't loaded; as the repo's conftest does, open risk reads a calm 2% daily ATR unless
+    real_daily_atr."""
+    from sleeve_fund import open_risk
+
+    if request.node.get_closest_marker("real_daily_atr") is None:
+        monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
+    if request.node.get_closest_marker("no_open_risk_limit") is not None:
+        monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+
+
 @pytest.fixture(autouse=True)
 def _reg(monkeypatch, tmp_path):
     stub_contract(monkeypatch)  # harness, adopted from PE2's copy (26fd993): the lookup lib155 already stubs, per test
@@ -130,7 +153,7 @@ def _paper(inst, m1x, params, spec="15-MINUTE-LAST-INTERNAL", profile="aggressiv
     return st
 
 
-@pytest.mark.no_open_risk_limit  # guards off: paper/backtest mechanics only (a stopless model above 1x, open_risk)
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 def test_d2_paper_and_backtest_take_the_same_decision_on_a_holed_slower_candle(tmp_path):
     inst = binance_inst()
     m1 = synth_1m(days=1, seed=8, vol_day=0.01)
@@ -174,7 +197,7 @@ def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tm
 
 # P1-D4 BLOCKER on d70ee9f (paper charged a phantom 12:00 settlement at the baseline rate when the venue lengthened its
 # interval 4h -> 8h); fixed in aa7c2c6 (markets.settlement_wait). Kept as a regression test.
-@pytest.mark.no_open_risk_limit  # guards off: paper/backtest mechanics only (a stopless model above 1x, open_risk)
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 def test_d4_paper_charges_no_settlement_the_venue_never_made(tmp_path):
     inst = binance_inst()
     put_rates(pd.date_range("2025-10-03 00:00", "2025-10-03 08:00", freq="4h", tz="UTC"))  # then 8-hourly: next 16:00
@@ -356,7 +379,7 @@ def _paper_from(inst, m1x, params, hs, hub, spec_minutes=15, profile="aggressive
 # R1 own feed fixed at ba4f533 (paper.node attaches the stored minutes): strict marks removed, full re-run.
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only (a stopless model above 1x, open_risk)
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 @pytest.mark.parametrize("hub,stored_holes", [
     pytest.param(True, 0, id="hub-fed-all-stored"),
     pytest.param(True, 1, id="hub-fed-one-missing"),
@@ -542,8 +565,7 @@ def _says_y_at_entry(text, equity_at_entry):
 
 
 # P1-D15 full-margin case fixed at 26fd993 (X with both fees): mark removed. Shipped caps: see the pin further down.
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: stop safety refuses a stopless model above 1x; these test the liquidation
-@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
     a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
@@ -853,8 +875,7 @@ def _says_margin_lost(text, margin, equity_at_entry):
     _says_y_at_entry(text, equity_at_entry)
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: stop safety refuses a stopless model above 1x; these test the liquidation
-@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
 # P1-D15 shipped caps, P1-D17 and P1-D18 fixed on the next head after 26fd993 (PE2): marks removed.
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_halted(tmp_path, side, profile):
@@ -868,8 +889,6 @@ def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_ha
     _says_margin_lost(first["reason"], first["margin"], first["equity_at_entry"])  # last: Y at entry (P1-D20)
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: stop safety refuses a stopless model above 1x; these test the liquidation
-@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_path, side, profile):
     """Head of QA adversarial case (HC, owned by PE2's stop-safety PR; reported on #155): a liquidation that loses
@@ -886,13 +905,12 @@ def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_
         assert "drawdown" not in st["reason"], st  # not a fresh drawdown text
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: stop safety refuses a stopless model above 1x; these test the liquidation
-@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 @pytest.mark.parametrize("side,profile,pct,balance,size", [
     pytest.param("short", "balanced", 0.1, 10_000.0, 1.0, id="short-2x-10pct"),
     pytest.param("long", "aggressive", 0.1, 10_000.0, 1.0, id="long-3x-10pct"),
     pytest.param("short", "balanced", 0.1, 250_000.0, 25.0, id="short-2x-10pct-thousands"),
-    pytest.param("short", "balanced", 1.0, 10_000.0, 1.0, id="short-2x-full-margin-right-after"),
+    pytest.param("short", "balanced", 1.0, 10_000.0, 1.0, id="short-2x-full-margin-right-after",
+                 marks=_guards_off()),  # the only case over the 5% open-risk limit; the rest run guarded
     pytest.param("long", "aggressive", 0.004, 1_250_000.0, 50.0, id="long-3x-under-1pct-thousands"),
 ])
 def test_p1_the_liquidation_halt_gives_x_and_y_as_the_journal_has_them(tmp_path, side, profile, pct, balance, size):
