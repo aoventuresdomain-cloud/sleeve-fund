@@ -95,3 +95,29 @@ def test_paper_and_collector_share_the_instrument_tag():
     from sleeve_fund import funding
 
     assert funding.stale_tag("binance", PAIR) == f"[BINANCE {PAIR}]"
+
+
+def test_a_rate_beyond_the_published_cap_is_alerted_and_still_kept(tmp_path, monkeypatch):
+    """The Advisor's guard until DA-11: a BTC perp rate past the instrument's published cap (0.3%) is alerted, never
+    rejected or dropped; one within it says nothing."""
+    from sleeve_fund import funding, history
+    from sleeve_fund.venues import venue
+
+    profile = venue("BINANCE")
+    assert profile.published_funding_caps["BTC/USDT"] == 0.003
+    t0 = pd.Timestamp("2025-10-03", tz="UTC")
+    rows = [(int((t0 + i * pd.Timedelta(hours=8)).timestamp() * 1000), r) for i, r in enumerate((0.0001, 0.004, -0.0035))]
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [x for x in rows if x[0] >= start])
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    inbox = _Journal()
+    monkeypatch.setattr("sleeve_fund.store.Store", lambda *a, **k: inbox)
+    history._warned.clear()
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    kept = funding.rates("BINANCE", "BTC/USDT", tmp_path)
+    assert list(kept) == [0.0001, 0.004, -0.0035]  # kept and charged as settled
+    (over,) = [m for lv, k, m in inbox.sent if k == "funding_over_cap" and lv == "warning"]
+    assert "0.4000%" in over and "-0.3500%" in over and "0.30%" in over
+    inbox.sent.clear()
+    history._warned.clear()
+    history._refresh_funding(profile, "BTC/USDT", tmp_path, None)  # nothing new: nothing said again
+    assert not [k for _, k, _ in inbox.sent if k == "funding_over_cap"]

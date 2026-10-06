@@ -567,9 +567,11 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         from sleeve_fund import funding
 
         try:
+            before = funding.rates(profile.name, pair, root).index
             refused: list = []
             kept = funding.refresh(profile.name, pair, root=root, since=since, refused=refused)
             funding_to = kept.index[-1] if len(kept) else None
+            _alert_over_published_cap(profile, pair, kept[kept.index.difference(before)])
             if refused:  # never kept as real rates: charged as missing, and said once a day for these settlements
                 at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} ({r!r})" for t, r in refused)
                 _alert(f"{profile.name} {pair}: funding invalid {refused[0][0]}-{refused[-1][0]}", "warning",
@@ -714,6 +716,20 @@ def _warn_at_risk(problem: str | None, store=None) -> None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
     _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _alert_over_published_cap(profile, pair: str, new: pd.Series) -> None:
+    """A rate kept this pass beyond the instrument's published cap (VenueProfile.published_funding_caps) is alerted,
+    and still kept and charged as it is: the cheap guard until each settlement's own cap is kept (Advisor, 6 Oct
+    2026; DA-11)."""
+    cap = (getattr(profile, "published_funding_caps", None) or {}).get(pair)
+    over = new[new.abs() > cap] if cap and len(new) else new.iloc[:0]
+    if not len(over):
+        return
+    at = ", ".join(f"{t:%Y-%m-%d %H:%M} ({r:.4%})" for t, r in over.items())
+    _alert(f"{profile.name} {pair}: funding over the published cap {over.index[-1]:%Y%m%d%H%M}", "warning",
+           "funding_over_cap", f"{profile.name.upper()} {pair}: {len(over)} settled funding rate(s) beyond the "
+           f"instrument's published {cap:.2%} cap, kept and charged as the venue settled them: {at}")
 
 
 def _inbox():

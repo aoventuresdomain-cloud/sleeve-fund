@@ -59,6 +59,10 @@ class VenueProfile:
     # (pair, start in ms) -> up to a page of settled funding, [(time in ms, rate)], oldest first
     funding_loader: Callable[[str, int], list] | None = None
     funding_hours: tuple[int, ...] = (0, 8, 16)  # UTC hours the venue settles funding at
+    # pair -> the instrument's cap on |funding rate| per settlement as the venue publishes it, as a static value: a kept
+    # rate beyond it is alerted but still charged as it is (Advisor, 6 Oct 2026). The cap that applied at each
+    # settlement, kept from the venue, replaces this with DA-11.
+    published_funding_caps: dict[str, float] = field(default_factory=dict)
     # series -> (pair, start in ms) -> up to a page of the venue's snapshots, [(time in ms, *values)], oldest first,
     # one per `stats_minutes`: open interest and the positioning ratios (sleeve_fund.open_interest.SERIES)
     stats_loaders: dict[str, Callable[[str, int], list]] = field(default_factory=dict)
@@ -510,6 +514,9 @@ BINANCE = register(VenueProfile(
     funding_loader=binance_funding,
     stats_loaders=BINANCE_STATS,
     contract=binance_contract,
+    # 75% of the first-tier maintenance margin rate (0.4%), Binance's rule for its cap; confirmed against fundingInfo
+    # once caps are kept from the venue (DA-11).
+    published_funding_caps={"BTC/USDT": 0.003},
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))
