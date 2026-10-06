@@ -5,7 +5,7 @@
   <div>
     <p class="crumb"><a href="/research#results">Results</a> <span class="faint">›</span></p>
     <h1>{% if s.strategy %}{{ [s.label, s.instrument, candle_words(s.minutes)|lower ~ ' candles' if s.minutes else none]|select|join(' · ') }}{% else %}{{ title|replace('_', ' ') }}{% endif %}</h1>
-    <p class="lede">{{ [s.venue_label, s.when.strftime('%d %b %Y %H:%M') ~ ' UTC']|select|join(' · ') }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data: proves the pipeline, not the idea</span>{% endif %}</p>
+    <p class="lede">{{ [s.venue_label|capitalize if s.venue_label, s.when.strftime('%d %b %Y %H:%M') ~ ' UTC']|select|join(' · ') }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data: proves the pipeline, not the idea</span>{% endif %}</p>
   </div>
   <div class="actions"><a class="button secondary" href="/research/{{ title }}/download" download>Download tear sheet</a></div>
 </div>
@@ -44,7 +44,7 @@
       {% if chart.marker %}<line x1="{{ chart.marker }}" x2="{{ chart.marker }}" y1="{{ chart.marker_top }}" y2="{{ chart.base - 12 }}" class="marker"/>
       <text x="{{ chart.marker }}" y="{{ chart.marker_top - 2 }}" text-anchor="middle" class="fee here">★ {{ '%.2f'|format(s.fee * 100) }}%</text>{% endif %}
     </svg>
-    <p class="hint">★ {{ s.venue_label or "the venue" }}'s own fee{% if s.fee is not none %}, {{ '%.2f'|format(s.fee * 100) }}% per side{% endif %}.{% if s.slippage is not none %} Every rung also pays half the bid-ask spread plus {{ '%.2f'|format(s.slippage * 100) }}% slippage on orders that take liquidity.{% endif %}{% if chart.bars|selectattr('cut')|list %} A bar cut short runs off the scale; its label gives the full figure.{% endif %}</p>
+    <p class="hint">★ The venue's own fee{% if s.fee is not none %}, {{ '%.2f'|format(s.fee * 100) }}% per side{% endif %}.{% if s.slippage is not none %} Every rung also pays half the bid-ask spread plus {{ '%.2f'|format(s.slippage * 100) }}% slippage on orders that take liquidity.{% endif %}{% if chart.bars|selectattr('cut')|list %} A bar cut short runs off the scale; its label gives the full figure.{% endif %}</p>
     {% else %}<p class="muted">This tear sheet has no cost ladder: it was written before every study ran one.</p>{% endif %}
   </section>
   {% if s.means %}<section class="panel means" aria-labelledby="means-h"><div class="panel-head"><h2 id="means-h">What it means</h2></div>{{ s.means|safe }}</section>{% endif %}

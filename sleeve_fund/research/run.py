@@ -118,10 +118,10 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     try:
         prices = history.read(profile.name, req.pair, req.minutes)
     except KeyError:
-        raise ValueError(f"no stored {profile.label} history for {req.pair}; ask for it under Stored history on "
+        raise ValueError(f"no stored history for {req.pair} on this venue; ask for it under Stored history on "
                          "the Research page") from None
     if prices.empty:
-        raise ValueError(f"the {profile.label} history for {req.pair} has no {_bars(req.minutes)} bars yet")
+        raise ValueError(f"the stored history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
     spread = spreads.resolve(profile.name, req.pair, store)
     base, quote = req.pair.split("/")

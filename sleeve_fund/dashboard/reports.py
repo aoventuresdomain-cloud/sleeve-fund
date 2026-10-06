@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import io
-import math
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -163,49 +162,11 @@ def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: l
             "pnl": float(w["equity"].iloc[-1]) - base_eq, "chart": curve_chart(days, book, bmk)}
 
 
-def curve_chart(days: list, book: list[float], bench: list[float], width: int = 560, height: int = 170) -> dict:
-    """Book and benchmark returns as SVG polylines, with a zero line, three return ticks and month labels."""
-    left, right, top, bottom = 50.0, 8.0, 10.0, 24.0
-    lo, hi = min(0.0, *book, *bench), max(0.0, *book, *bench)
-    pad = (hi - lo) * 0.08 or 0.01
-    lo, hi = lo - pad, hi + pad
-    n = len(days)
-
-    def x(i):
-        return left + (width - left - right) * (i / (n - 1) if n > 1 else 1.0)
-
-    def y(v):
-        return top + (height - top - bottom) * (hi - v) / (hi - lo)
-
-    def line(vals):
-        return " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vals))
-
-    step = _nice_step(hi - lo)
-    first = math.ceil(lo / step)
-    vals = [k * step for k in range(first, math.floor(hi / step) + 1)]
-    ticks = [{"y": round(y(v), 1), "label": "0%" if abs(v) < 1e-12 else f"{v * 100:+.{0 if step >= 0.01 else 1}f}%"}
-             for v in vals]
-    months, seen = [], set()
-    for i, d in enumerate(days):
-        key = (d.year, d.month)
-        if i and key not in seen and d.day <= 7 and x(i) <= width - 34:  # room for the label before the edge
-            months.append({"x": round(x(i), 1), "label": d.strftime("%b")})
-        seen.add(key)
-    if len(months) > 8:  # a long range: every other month, so the labels never collide
-        months = months[::2]
-    end = len(book) - 1
-    return {"w": width, "h": height, "left": left, "bottom": height - bottom, "book": line(book), "bench": line(bench),
-            "area": f"{x(0):.1f},{y(0):.1f} " + line(book) + f" {x(end):.1f},{y(0):.1f}",
-            "zero": round(y(0), 1), "ticks": ticks, "months": months,
-            "end": {"x": round(x(end), 1), "y": round(y(book[-1]), 1), "by": round(y(bench[-1]), 1),
-                    "book": book[-1], "bench": bench[-1]}}
-
-
-def _nice_step(span: float) -> float:
-    """A round tick step (1, 2, 2.5 or 5 times a power of ten) giving two to four ticks over the span."""
-    raw = span / 3 if span > 0 else 0.01
-    mag = 10 ** math.floor(math.log10(raw))
-    return next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+def curve_chart(days: list, book: list[float], bench: list[float]) -> dict:
+    """Book and benchmark returns for the Lightweight Charts line (QA U10): a UTC timestamp per day and each
+    return in percent, rounded for the page."""
+    return {"t": [int(pd.Timestamp(d).timestamp()) for d in days],
+            "book": [round(v * 100, 4) for v in book], "bench": [round(v * 100, 4) for v in bench]}
 
 
 def in_window(month_key: str, w: dict, use_month: bool = False) -> bool:
