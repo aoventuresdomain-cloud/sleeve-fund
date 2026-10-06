@@ -47,6 +47,35 @@ def test_a_new_strategy_and_a_settings_change_are_counted(client):
     assert register.counts()["variants"] == 2
 
 
+def test_a_counting_failure_is_an_error_event_and_loses_neither_the_backtest_nor_the_strategy(client, monkeypatch):
+    """Code Reviewer on #154: counting ran before the backtest was saved and after the strategy was committed, so
+    a failure there lost the PM's result or reported an error for a strategy already made. Now each is kept and the
+    missed count is an error event."""
+    from sleeve_fund.dashboard import app as appmod, preview
+    from sleeve_fund.data import synthetic_ohlcv
+
+    def broken(*args, **kwargs):
+        raise KeyError("from")
+
+    c, store = client
+    monkeypatch.setattr(appmod, "_count_backtest", broken)
+    monkeypatch.setattr(appmod, "_count_strategy", broken)
+    preview._history.clear()
+    monkeypatch.setattr(KRAKEN, "daily_history", lambda pair: synthetic_ohlcv(days=400, seed=3, vol=0.03))
+    before = len(store.backtests())
+    q = ("/backtest?run=1&instrument=ETH/USD&strategy=trend_filter&p_trend_filter__fast=5"
+         "&p_trend_filter__slow=20&starting_balance=5000&period=365")
+    assert "Every trade" in c.get(q, auth=AUTH).text
+    assert len(store.backtests()) == before + 1  # saved, though not counted
+    r = _new(c)
+    assert r.status_code == 303 and "error" not in r.headers["location"] and store.sleeve("btc-test") is not None
+    failed = [e for e in store.events(min_level="error") if e["kind"] == "trials_count_failed" and e["sleeve"] is None]
+    assert len(failed) == 1 and "backtest" in failed[0]["message"] and "KeyError" in failed[0]["message"]
+    made = [e for e in store.events("btc-test", min_level="error") if e["kind"] == "trials_count_failed"]
+    assert len(made) == 1 and "strategy btc-test" in made[0]["message"]
+    assert not [t for t in store.trials() if t["source"] in ("backtest", "strategy")]
+
+
 def test_the_research_page_shows_the_registers_count(client):
     c, store = client
     TrialsRegister(store).record(definition_hash="d", idea_hash="i", name="x", family="trend", settings={},
