@@ -1,15 +1,24 @@
-"""QA round on PR #155 (heads 73d3908, delta c966f13; quant-review/v2-p1/degraded-155.md): every finding as a test,
-fixed per the Independent Quant Advisor's rulings (P1-D3 option (a), P1-D9 rule (c), R1 the first bar after a restart
-from the stored minutes) and P1-D10. Open: P1-D11, a strict xfail owned by #146. Synthetic data only, no venue called.
+"""QA round on PR #155 (heads 73d3908, delta c966f13): every finding as a test, the open ones as strict xfails. Each
+xfail must fail on the PR today; once fixed it XPASSes, which strict mode reports as an error, so the mark is then
+removed. Fixed at c966f13 (marks removed): P1-D1, D2, D5, D6, D8 (D4, D7 at aa7c2c6). Fixed at 3be572a: P1-D3, D9 (D9 rewritten
+to rule (c) by the Head of QA). Fixed at ba4f533/e7ee497/26fd993 (marks removed in the full re-run): R1 own feed, D10,
+D16, D15 (full-margin case). Open on 26fd993: D11 (#146), D13 (Advisor 18:16), D15 on the shipped margin caps, D17.
+Harness changes adopted from PE2's copy on 26fd993: _paper_from's own feed attaches stored_minutes as paper.node does
+(R1; the node half is test_r1_an_own_feed_node_...), and _reg stubs the Binance contract lookup per test (the same
+data lib155 sets at import). Synthetic data only, no venue called.
 
+  cd <scripts dir> && BACKTEST_ISOLATE=0 PYTHONPATH=/tmp/claude-0/p155h:/tmp/claude-0/p155h/tests \
+    /tmp/claude-0/v/bin/python -m pytest -q -p no:cacheprovider -c /tmp/claude-0/p155h/pyproject.toml \
+    --rootdir=/tmp/claude-0/p155h test_degraded_155_qa.py -rxX
 """
 import collections
+import re
 import json
 import os
 import shutil
 import sys
 
-from qa155_lib import *  # noqa: E402,F401,F403
+from qa155_lib import *  # noqa: E402,F401,F403  (lib155 in the repo)
 import pytest  # noqa: E402
 from sleeve_fund import funding, risk  # noqa: E402
 from sleeve_fund.store import Store  # noqa: E402
@@ -40,13 +49,24 @@ class T(LongFlatStrategy):
         return self._cfg.side if self._cfg.at <= bar.ts_event < self._cfg.until else 0
 
 
+def stub_contract(monkeypatch):
+    """tests/qa155_lib.py::stub_contract (PE2): Binance's BTCUSDT contract as lib155 stubs it at import (0.1 tick,
+    0.001 lot, 5 USDT min notional), set per test so the file runs offline on its own."""
+    monkeypatch.setattr(venues.VENUES["BINANCE"], "contract", lambda pair: {
+        "price_precision": 1, "size_precision": 3, "min_quantity": 0.001, "min_notional": 5.0})
+
+
 @pytest.fixture(autouse=True)
 def _reg(monkeypatch, tmp_path):
-    stub_contract(monkeypatch)  # noqa: F405
+    stub_contract(monkeypatch)  # harness, adopted from PE2's copy (26fd993): the lookup lib155 already stubs, per test
     monkeypatch.setitem(REGISTRY, "qa_t", (T, TConfig))
     monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
     monkeypatch.setattr(funding, "fetch", lambda *a, **k: (_ for _ in ()).throw(OSError("QA: no venue calls")))
     SEEN.clear()
+    profiles = dict(risk.PROFILES)  # harness (PE2): _liquidate_then edits the margin caps in place; put them back
+    yield
+    risk.PROFILES.clear()
+    risk.PROFILES.update(profiles)
 
 
 def ns(s):
@@ -127,6 +147,7 @@ def test_d2_paper_and_backtest_take_the_same_decision_on_a_holed_slower_candle(t
     assert paper[0].floor("min") == bt[0][0]
 
 
+# P1-D3 MAJOR fixed at 3be572a (Advisor ruling (a), margin cap): strict mark removed by QA, delta run 6 Oct.
 def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tmp_path):
     from sleeve_fund.dashboard.riskops import most_it_can_lose
     inst = binance_inst()
@@ -320,7 +341,7 @@ def _paper_from(inst, m1x, params, hs, hub, spec_minutes=15, profile="aggressive
         s.simulated_venue, s.fee_model = True, fm
         if hub:
             s.hub_fed, s.hub_status = True, status
-        else:  # as paper.node builds an own-feed node: its first bar from the store's minutes (R1)
+        else:  # as paper.node builds an own-feed node: its first bar from the store's minutes (R1; harness change, ba4f533)
             s.attach_minutes(stored_minutes("BINANCE", "BTC/USDT", store=hs))
         eng.add_strategy(s)
         eng.run()
@@ -328,6 +349,9 @@ def _paper_from(inst, m1x, params, hs, hub, spec_minutes=15, profile="aggressive
         rt.now = utcnow
         eng.dispose()
     return st, told
+
+
+# R1 own feed fixed at ba4f533 (paper.node attaches the stored minutes): strict marks removed, full re-run.
 
 
 @pytest.mark.parametrize("hub,stored_holes", [
@@ -378,6 +402,7 @@ def test_r1_a_restart_mid_bar_builds_its_first_bar_from_the_minutes_the_hub_stor
     assert len(held_back) == len(bt_held)  # degraded exactly where the store says so
 
 
+# P1-D10 MINOR fixed at ba4f533 (decision_bars subtracts each execution bar's stored missing minutes): mark removed.
 def test_d10_decision_bars_count_minutes_not_execution_bars(tmp_path):
     from sleeve_fund.research import runner
     m1 = synth_1m(days=1, seed=11, vol_day=0.01)
@@ -414,6 +439,8 @@ def test_d11_hub_fed_paper_exits_on_a_holed_bar_whose_closing_minutes_are_missin
     sells = sorted(pd.Timestamp(f["ts"]) for f in st.fills("P", limit=100) if f["side"] == "SELL")
     assert sells and sells[0].floor("min") == close
 
+
+# ---- Advisor 17:57 (#155 post-liquidation), pinned by QA at the Head of QA's request -------------------------------
 
 @pytest.fixture
 def _full_margin(monkeypatch):
@@ -455,6 +482,7 @@ def _session_meta(balance, params):
                        "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
 
 
+# P1-D15 full-margin case fixed at 26fd993 (X with both fees): mark removed. Shipped caps: see the pin further down.
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
     a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
@@ -544,7 +572,7 @@ class E(T):
 
 
 @pytest.mark.parametrize("side", [
-    pytest.param(1, id="long-in-bar-costs"),
+    pytest.param(1, id="long-in-bar-costs"),  # P1-D16 fixed at ba4f533/e7ee497: mark removed
     pytest.param(-1, id="short-in-bar-credits"),
 ])
 def test_p1_rule_c_applies_to_a_resting_entry_touched_inside_a_bar(tmp_path, monkeypatch, side):
@@ -600,7 +628,7 @@ def test_p1_rule_c_applies_to_a_resting_entry_touched_inside_a_bar(tmp_path, mon
 @pytest.mark.xfail(strict=True, reason="P1-D13 MAJOR, pre-existing (outside rule (c), which covers funding): on daily bars "
                    "only, a 2% stop touched inside the day by a 5% gap at 10:00:01 fills at its trigger (58,819.1), "
                    "while the market traded through to 57,000 and the 1-minute reference fills there: bars-only ends "
-                   "about 193 (1.9% of capital) better than the reference. Needs an Advisor call on the bars-only fill")
+                   "about 193 (1.9% of capital) better than the reference. Advisor ruled 18:16 (pessimistic bars-only stop fills, G1 never judges bars-only resting exits); not built in #155")
 def test_d13_a_bars_only_stop_gapped_through_inside_the_bar_is_never_better_than_the_1_minute_run(tmp_path):
     times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
              .append(pd.date_range("2025-10-03 20:00", "2025-10-06 00:00", freq="4h", tz="UTC")))
@@ -619,3 +647,231 @@ def test_d13_a_bars_only_stop_gapped_through_inside_the_bar_is_never_better_than
     rf = backtest(binance_inst(), day, strategy="qa_t", params=params, minutes=1440, profile="balanced",
                   half_spread=0.0, exec_prices=one, exec_minutes=1)
     assert float(bo.equity.iloc[-1]) <= float(rf.equity.iloc[-1]) + 0.01
+
+
+def test_r1_an_own_feed_node_attaches_the_stored_minutes_before_its_first_bar(tmp_path, monkeypatch):
+    """R1, the node half (Head of QA, re-run on ba4f533): _paper_from's own-feed branch attaches
+    stored_minutes("BINANCE", "BTC/USDT", store=hs) itself, so the R1 cases above prove the strategy side only. Here
+    paper.node.build_node builds an own-feed node (no HUB_BINANCE) as production does, and the strategy it adds already
+    carries a minutes loader when it is added (before the node can run, so before any bar); the loader reads the
+    history store (the same one the hub writes and research reads) for that venue and pair, the same rows as the
+    harness's loader, and it is the same function the hub-fed node uses as its recover (node.py builds both with
+    stored_minutes(profile.name, sleeve.instrument))."""
+    from sleeve_fund import history
+    from sleeve_fund.paper import node as node_mod
+    from sleeve_fund.paper.config import SleeveConfig
+    for k in list(os.environ):
+        if k.upper().startswith(("HUB_", "KRAKEN_", "BINANCE_")):
+            monkeypatch.delenv(k)
+    m1 = synth_1m(days=1, seed=8, vol_day=0.01)
+    hs = holed_store(tmp_path / "h", m1, [pd.Timestamp("2025-01-01 02:48", tz="UTC")])
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "h")
+    added = []
+    monkeypatch.setattr(node_mod.LiveNode, "add_strategy",
+                        lambda self, st: added.append((st, st.minutes_loader, st.hub_fed)), raising=False)
+    cfg = SleeveConfig(name="t", strategy="trend_filter", instrument="BTC/USDT", venue="binance",
+                       bar_spec="15-MINUTE-LAST-INTERNAL", starting_balance=1000.0, params={"market": "perp"})
+    n = node_mod.build_node(cfg, log_level="ERROR", asset_fetch=dict)
+    try:
+        ((s, loader, hub_fed),) = added
+        assert loader is not None and not hub_fed  # attached at build, before the strategy is added and any bar
+        after, before = ns("2025-01-01 02:45"), ns("2025-01-01 02:52") + 1
+        rows = loader(str(s._cfg.instrument_id) if hasattr(s, "_cfg") else "x", after, before)
+        ref = node_mod.stored_minutes("BINANCE", "BTC/USDT", store=hs)("x", after, before)
+        assert rows == ref and len(rows) == 6  # 02:45-02:51 opens, closing 02:46-02:52, less the 02:48 hole
+        assert [pd.Timestamp(r[0], tz="UTC") for r in rows][0] == pd.Timestamp("2025-01-01 02:46", tz="UTC")
+    finally:
+        n.dispose()
+        added.clear()
+
+
+def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0, after=("resume",)):
+    """s21_liq.py as a helper: ping_pong on a perp, recorded and replayed as paper, liquidated by a 60% gap against
+    it (pct: the profiles' margin cap, None keeps the shipped ones). Then each of `after` in turn ("resume": a PM
+    resume; "stopstart": the PM's Stop then Start through the dashboard's /sleeves/{name}/command and the supervisor's
+    step), each followed by a restarted process on a session that trades both ways (a dip, a rise, a dip), so a
+    strategy free to trade does. Each later session starts two hours after the one before."""
+    import dataclasses
+    import test_replay
+    from sleeve_fund.research.replay import replay
+    if pct is not None:
+        for nm, p in list(risk.PROFILES.items()):
+            risk.PROFILES[nm] = dataclasses.replace(p, max_position_pct=pct)
+    name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+
+    def meta(bal):
+        m = _session_meta(bal, params)
+        m["sleeve"].update(risk_profile=profile, starting_balance=balance)
+        return m
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    up = side == "short"
+    gap = tmp_path / "gap.jsonl.gz"
+    _record_session(gap, meta(balance), [(5, 0.0), (20, 0.015 if up else -0.012), (0, 0.6 if up else -0.6), (5, 0.0)],
+                    size=size)
+    orders = replay(gap, store=store)
+    first = {"orders": orders, "status": store.sleeve(name).status, "reason": store.sleeve(name).status_reason}
+    fills = store.fills(name, limit=200)
+    entry = [o for o in orders if o["intent"] == "entry"][-1]
+    opened = [f for f in fills if f["order_id"] == entry["order_id"]]
+    closed = [f for f in fills if f["order_id"] == orders[-1]["order_id"]]
+    lev = risk.profile(profile).max_leverage
+    # X (Advisor 18:17 point 4): the whole position's margin plus its entry fee and the liquidation fee
+    first["margin"] = (sum(f["qty"] * f["price"] for f in opened) / lev + sum(f["fee"] for f in opened)
+                       + sum(f["fee"] for f in closed))
+    liq_ts = min(pd.Timestamp(f["ts"]) for f in closed)
+    # Y (18:17): on the mark-to-market equity just before the liquidation: the last mark up to its fill still holding
+    # the position (the gap's own mark, when it was marked before the fill), else the last one before the gap
+    held = [m for m in store.equity_series(name) if pd.Timestamp(m["ts"]) <= liq_ts and m["qty"] != 0 and m["equity"] > 0]
+    first["equity_before"] = held[-1]["equity"]
+    left = store.journal_book(name, balance)["cash"]
+    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+    start0, steps = test_replay.START, []
+    px = 60_000.0 * (1.015 * 1.6 if up else 0.988 * 0.4)
+    try:
+        for i, step in enumerate(after):
+            if step == "resume":
+                store.command(name, "resume", "try again")
+            else:
+                from fastapi.testclient import TestClient
+                from sleeve_fund import supervisor as sup
+                from sleeve_fund.dashboard import app as app_mod
+                os.environ.setdefault("DASHBOARD_PASSWORD", "qa-pw")
+                os.environ.setdefault("TEARSHEET_DIR", str(tmp_path))
+
+                class FakePopen:
+                    pid, returncode = 4242, None
+                    poll = lambda self: None  # noqa: E731
+                    send_signal = wait = kill = lambda self, *a, **k: 0  # noqa: E731
+                c = TestClient(app_mod.create_app(store))
+                auth, same = ("pm", os.environ["DASHBOARD_PASSWORD"]), {"origin": "http://testserver"}
+                real_popen, sup.subprocess.Popen = sup.subprocess.Popen, lambda *a, **k: FakePopen()
+                try:
+                    sv = sup.Supervisor(store)
+                    sv.procs[name] = sup.Proc()
+                    sv.procs[name].popen, sv.procs[name].started_at = FakePopen(), sup.utcnow()
+                    assert c.post(f"/sleeves/{name}/command", data={"command": "stop", "reason": "QA stop"}, auth=auth,
+                                  headers=same, follow_redirects=False).status_code == 303
+                    sv.step()
+                    assert store.sleeve(name).status == "stopped"  # the supervisor writes "stopped" over the halt
+                    assert c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "QA start"}, auth=auth,
+                                  headers=same, follow_redirects=False).status_code == 303
+                    sv.procs[name].popen = None
+                    sv.step()
+                finally:
+                    sup.subprocess.Popen = real_popen
+            test_replay.START = start0 + (i + 1) * 2 * 3600 * 10**9
+            path = tmp_path / f"after{i}.jsonl.gz"
+            _record_session(path, meta(left), [(3, -0.02), (3, 0.03), (4, -0.02)], px=px)
+            got = replay(path, store=store)
+            s = store.sleeve(name)
+            steps.append({"step": step, "new_orders": got[len(orders):], "status": s.status, "reason": s.status_reason})
+            orders = got
+    finally:
+        test_replay.START = start0
+    events = store.events(name, limit=5000)
+    return first, steps, events, left
+
+
+def _says_margin_lost(text, margin, equity_before):
+    """The ruled halt text (Advisor 6 Oct 17:57 (a), 18:17 point 4): X the margin plus the entry and liquidation fees
+    to the cent, Y = X over the mark-to-market equity just before the liquidation, as the journal has them, to the
+    figures shown."""
+    import re
+    m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
+    assert m, text
+    x, y = float(m.group(1).replace(",", "")), m.group(2)
+    assert x == pytest.approx(margin, abs=0.005), (x, margin)
+    dp = len(y.partition(".")[2])
+    assert float(y) == pytest.approx(100 * x / equity_before, abs=0.5 * 10 ** -dp + 1e-9), (y, 100 * x / equity_before)
+    assert float(y) > 0, text  # a loss is never shown as 0%
+
+
+# P1-D15 shipped caps, P1-D17 and P1-D18 fixed on the next head after 26fd993 (PE2): marks removed.
+@pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
+def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_halted(tmp_path, side, profile):
+    """Advisor 6 Oct 17:57: halted through a resume and a restart until an explicit reset after liquidation, whatever
+    margin the profile puts up; the halt reads the ruled text throughout."""
+    first, steps, events, left = _liquidate_then(tmp_path, side=side, profile=profile, pct=None, after=("resume",))
+    assert first["orders"][-1]["intent"] == "liquidation"
+    _says_margin_lost(first["reason"], first["margin"], first["equity_before"])
+    (st,) = steps
+    assert not st["new_orders"], st
+    assert st["status"] == "halted" and st["reason"].startswith("Position margin lost (liquidated): "), st
+
+
+@pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
+def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_path, side, profile):
+    """Head of QA adversarial case (HC, owned by PE2's stop-safety PR; reported on #155): a liquidation that loses
+    about 10% of strategy equity, below the drawdown limit, so the old high-water mark can't re-halt it. The PM's Stop
+    and Start through the dashboard's command path (the supervisor writes "stopped" over "halted"), then a restart on
+    a session that trades: still halted with the liquidation's text, no new order; then a PM resume: the same."""
+    first, steps, events, left = _liquidate_then(tmp_path, side=side, profile=profile, pct=0.1,
+                                                 after=("stopstart", "resume"))
+    assert first["orders"][-1]["intent"] == "liquidation" and first["status"] == "halted"
+    assert 5 < 100 * first["margin"] / first["equity_before"] < 20  # under the drawdown limit (20% / 35%)
+    for st in steps:
+        assert not st["new_orders"], st
+        assert st["status"] == "halted" and st["reason"].startswith("Position margin lost (liquidated): "), st
+        assert "drawdown" not in st["reason"], st  # not a fresh drawdown text
+
+
+@pytest.mark.parametrize("side,profile,pct,balance,size", [
+    pytest.param("short", "balanced", 0.1, 10_000.0, 1.0, id="short-2x-10pct"),
+    pytest.param("long", "aggressive", 0.1, 10_000.0, 1.0, id="long-3x-10pct"),
+    pytest.param("short", "balanced", 0.1, 250_000.0, 25.0, id="short-2x-10pct-thousands"),
+    pytest.param("short", "balanced", 1.0, 10_000.0, 1.0, id="short-2x-full-margin-right-after"),
+    pytest.param("long", "aggressive", 0.004, 1_250_000.0, 50.0, id="long-3x-under-1pct-thousands"),
+])
+def test_p1_the_liquidation_halt_gives_x_and_y_as_the_journal_has_them(tmp_path, side, profile, pct, balance, size):
+    """Advisor 17:57 (a) and 18:17 point 4, adversarial: X with thousands separators and both fees, Y on the
+    mark-to-market equity just before the liquidation, on small liquidations (about 10% of equity, long and short,
+    2x and 3x) and one under 1% of equity in the millions."""
+    first, steps, events, left = _liquidate_then(tmp_path, side=side, profile=profile, pct=pct, balance=balance,
+                                                 size=size, after=())
+    assert first["orders"][-1]["intent"] == "liquidation" and first["status"] == "halted"
+    if first["margin"] >= 1000:
+        assert re.search(r"\(liquidated\): \d{1,3}(,\d{3})+\.\d\d, ", first["reason"]), first["reason"]  # commas
+    _says_margin_lost(first["reason"], first["margin"], first["equity_before"])
+
+
+@pytest.mark.parametrize("side", [pytest.param(1, id="long-pays"), pytest.param(-1, id="short-receives")])
+def test_p1_rule_c_a_resting_entry_filled_on_a_gap_at_the_open_pays_and_receives_the_in_bar_settlements(
+        tmp_path, monkeypatch, side):
+    """Rule (c) as PE2 reads it, Advisor 16:20 and 17:57 (b): an entry filled on a gap at the bar's OPEN has a known fill
+    time, so it is held through every settlement inside the bar after the open and both pays and receives them (only
+    an in-bar touch at an unknown time is costs-only). Daily bars only vs the 1-minute reference: a resting stop entry
+    placed at the 4 Oct 00:00 close; the 4 Oct bar opens gapped 1% through it and stays there, so the price at every
+    settlement is the fill price on both runs. Rates positive, 4h from 3 Oct 20:00: a long pays 04:00 to 5 Oct 00:00,
+    a short receives them. The gap fill is journaled at the bar's open (P1-D12)."""
+    monkeypatch.setitem(REGISTRY, "qa_e", (E, EConfig))
+    times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
+             .append(pd.date_range("2025-10-03 20:00", "2025-10-06 00:00", freq="4h", tz="UTC")))
+    put_rates(times)
+    sec = pd.date_range("2025-10-01 00:00:01", "2025-10-05 23:59:46", freq="15s", tz="UTC")
+    px = 60_000.0 + (np.arange(len(sec)) % 40) * 0.5
+    bar_open, bar_close = pd.Timestamp("2025-10-04 00:00", tz="UTC"), pd.Timestamp("2025-10-05 00:00", tz="UTC")
+    gapped = 60_600.0 if side > 0 else 59_400.0
+    px = np.where(sec > bar_open, gapped, px)
+    trigger = 60_300.0 if side > 0 else 59_700.0
+    tape = pd.Series(np.round(px, 1), index=sec)
+    day = tape.resample("1D", closed="left", label="right").ohlc()
+    day["volume"] = 1e9
+    one = tape.resample("1min", closed="left", label="right").ohlc()
+    one["volume"] = 1e9
+    assert day.loc[bar_close, "open"] == gapped  # the bar opens through the trigger
+    params = {**PERP, "at": ns("2025-10-05 00:00"), "side": side, "tag": "g", "place_at": ns("2025-10-04 00:00"),
+              "trigger": trigger}
+    bo = backtest(binance_inst(), day, strategy="qa_e", params=params, minutes=1440, profile="balanced", half_spread=0.0)
+    rf = backtest(binance_inst(), day, strategy="qa_e", params=params, minutes=1440, profile="balanced",
+                  half_spread=0.0, exec_prices=one, exec_minutes=1)
+    (fb,), (fr,) = bo.journal.fills_, rf.journal.fills_
+    assert fb["price"] == pytest.approx(gapped) and fr["price"] == pytest.approx(gapped)  # filled at the open
+    assert pd.Timestamp(fb["ts"]) == bar_open, fb["ts"]  # P1-D12: journaled at the open, not the bar's close
+    paid = {pd.Timestamp(x["ts"]): x["amount"] for x in bo.journal.funding_}
+    ref = {pd.Timestamp(x["ts"]): x["amount"] for x in rf.journal.funding_}
+    in_bar = [t for t in times if bar_open < t <= bar_close]
+    assert len(in_bar) == 6 and all(t in ref for t in in_bar)
+    assert all((ref[t] < 0) == (side > 0) for t in ref)  # a long pays, a short receives
+    assert {t: paid.get(t) for t in in_bar} == pytest.approx({t: ref[t] for t in in_bar})  # credits too, for a short
+    assert paid == pytest.approx(ref)  # nothing before the fill, the same after the bar
+    assert float(bo.equity.iloc[-1]) == pytest.approx(float(rf.equity.iloc[-1]), abs=0.01)

@@ -458,8 +458,9 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     fill that crosses through flat opens the remainder at its own price. The position is summed in
     Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
-    goes negative; if it does, the negative stays visible so reconciliation catches it."""
-    cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    goes negative; if it does, the negative stays visible so reconciliation catches it. entry_fees: the fees paid
+    to open the position still held, pro-rated to what is left of it after a reduction."""
+    cash, qty, entry, n, fees = float(starting_balance), Decimal(0), None, 0, 0.0
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
@@ -476,14 +477,18 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
             new = Decimal(0)
         if new == 0:
             legs = 0
-            entry = None
+            entry, fees = None, 0.0
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
+            fees += float(f["fee"])
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
+            fees = float(f["fee"]) * float(abs(new)) / float(q)
+        else:  # reducing
+            fees *= float(abs(new)) / float(abs(qty))
         qty = new
     return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding), "insurance": float(insurance)}
+            "funding": float(funding), "insurance": float(insurance), "entry_fees": fees}
 
 
 def is_backtest(name: str | None) -> bool:

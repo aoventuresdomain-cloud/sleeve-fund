@@ -1,6 +1,7 @@
 """The sleeve runtime (journal, PM controls, risk guard) driven through a real backtest."""
 
 import os
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -636,3 +637,71 @@ def test_reconcile_allows_the_float_step_at_a_large_position(store):
     assert drift - held > 2e-8  # more than two 8-decimal lots
     assert rt.reconcile(cash=cash, qty=drift, qty_tolerance=2e-8)
     assert not rt.reconcile(cash=cash, qty=held + 0.001, qty_tolerance=2e-8)
+
+
+def _liquidated(store, t):
+    """A strategy liquidated and halted in the ruled words, as the engine journals it: the liquidation, a drawdown
+    halt on the same tick, then the liquidation's own halt."""
+    _sleeve(store)
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.0005)
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+    store.event("s1", "error", "liquidation", "Liquidated: the price 97,440 reached the liquidation price 90,490.4")
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440,
+            ruined="Position margin lost (liquidated): 4,100.00, 41% of strategy equity")
+    assert store.sleeve("s1").status == "halted"
+    return rt
+
+
+def _after(store, t, minutes=1):
+    t[0] += timedelta(minutes=minutes)
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.0005)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    return rt
+
+
+def test_a_pm_resume_never_runs_a_liquidated_strategy_even_for_a_tick(store):
+    """QA on #164, HoE 6 Oct 19:11: after a liquidation the PM's resume leaves it halted in the liquidation's words,
+    with no drawdown reset, and nothing may open on the tick that takes the resume or after."""
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    rt = _liquidated(store, t)
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    s = store.sleeve("s1")
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): 4,100.00")
+    assert not rt.can_open() and not _after(store, t).can_open()
+    assert store.last_event("s1", ("drawdown_reset",)) is None
+    assert not [c for c in store.pending_commands("s1") if c["command"] == "resume"]  # taken up, not left waiting
+
+
+def test_a_liquidation_survives_a_stop_start_a_restart_while_halted_and_a_resume(store):
+    """QA on #164, HoE 6 Oct 19:11: the journal decides, not the latest reason. Liquidated, then Stop/Start (which
+    wrote "stopped" over the halt before HC), then a restart while halted that halts again on drawdown, then a
+    resume: still liquidated, halted in its words, in this process and in a fresh one."""
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    _liquidated(store, t)
+    store.set_status("s1", "stopped", "stopped by PM")
+    store.event("s1", "error", "risk_halt", "drawdown 41.0% hit the 20% limit; flattened, PM must resume")
+    store.set_status("s1", "halted", "drawdown 41.0% hit the 20% limit")
+    rt = _after(store, t)
+    assert rt.liquidated is not None and not rt.can_open()
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    s = store.sleeve("s1")
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): 4,100.00"), s
+    fresh = _after(store, t)
+    assert not fresh.can_open() and store.sleeve("s1").status == "halted"
+    assert store.last_event("s1", ("drawdown_reset",)) is None
+
+
+def test_a_reset_after_liquidation_in_the_journal_ends_the_liquidated_state(store):
+    """The journal rule's other half: a liquidation before the last reset after liquidation no longer counts."""
+    from sleeve_fund.paper.runtime import RESET_AFTER_LIQUIDATION
+
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    _liquidated(store, t)
+    store.event("s1", "info", RESET_AFTER_LIQUIDATION, "reset after the liquidation")
+    assert SleeveRuntime(store, "s1", now=lambda: t[0]).liquidated is None

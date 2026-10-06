@@ -26,7 +26,13 @@ FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy pa
 SPREAD_MIN_SAMPLES = 100
 
 
-WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
+WIPED_OUT = "Position margin lost (liquidated)"
+RESET_AFTER_LIQUIDATION = "liquidation_reset"  # what a reset after liquidation journals (trading.LIQUIDATION_RESET, #164)
+
+
+def liquidation_reason(head: str, covered: float) -> str:
+    """A liquidation's halt once flat: its head, and what the venue's insurance fund covered, if anything."""
+    return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
 
 class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and
@@ -91,15 +97,18 @@ class SleeveRuntime:
         self.close_floor = 0.0
 
     def _last_liquidation(self) -> str | None:
-        """The head of its last halt when that was a liquidation (Independent Quant Advisor, 6 Oct 17:57): it stays
-        halted through a resume and a restart until the PM resets it after the liquidation. None otherwise."""
-        last = self.store.last_event(self.name, ("risk_halt",))
-        if last is None:
-            return None
-        msg = last["message"]
-        if msg.startswith(WIPED_OUT):
-            return msg.split(";")[0]
-        if msg.startswith(("wiped out", "position margin lost")):  # the older wordings
+        """The head of its liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57): it stays
+        halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The journal
+        decides, not the latest halt's reason, which a later halt or stop can overwrite (QA on #164): liquidated is
+        a liquidation event, or a liquidation's halt, with no reset after liquidation since. None otherwise."""
+        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+        since = self.store.sleeve_events_since(self.name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
+        heads = [e["message"].split(";")[0] for e in since
+                 if e["kind"] == "risk_halt" and e["message"].startswith(WIPED_OUT)]
+        if heads:
+            return heads[-1]
+        if any(e["kind"] == "liquidation" or e["message"].startswith(("wiped out", "position margin lost"))
+               for e in since):  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
             return WIPED_OUT
         return None
 
@@ -181,6 +190,8 @@ class SleeveRuntime:
     # --- gates ----------------------------------------------------------------
 
     def can_open(self) -> bool:
+        if self.wiped_out:
+            return False  # liquidated: nothing opens until the PM resets it after the liquidation
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
             self._set("running", "daily-loss pause expired")
             self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
@@ -230,7 +241,7 @@ class SleeveRuntime:
 
         flatten = False
         self.flatten_why = None
-        if ruined and self.status != "halted":
+        if ruined and (self.status != "halted" or self.liquidated is None):  # a liquidation outranks a drawdown halt
             self.wiped_out, self.liquidated = True, ruined.split(";")[0]
             self._set("halted", ruined)
             held = abs(qty) >= max(self.close_floor, 1e-12)  # still open: past its liquidation price
@@ -271,12 +282,22 @@ class SleeveRuntime:
                 continue
             elif cmd["command"] == "resume":
                 # Both resets are journaled (this tick's mark, and the events below) so a restart keeps them.
-                if self.status == "halted" and self.wiped_out:
-                    # A wipe-out is not reset by a resume: drawdown stays measured from the peak before the gap,
-                    # so it halts again on the next tick and places nothing (HoE and QA, 6 Oct). A reset starts it.
+                if self.wiped_out:
+                    # A liquidation is not cleared by a resume (HoE and QA, 6 Oct; Advisor 18:17): it stays halted,
+                    # not running for even a tick, drawdown still measured from the peak before the gap, and the
+                    # halt is journaled again in its own words. Only a reset after liquidation starts it.
                     self.store.event(self.name, "info", "drawdown_kept",
                                      f"drawdown still measured from {self.peak:,.2f}: the halt was a liquidation, "
                                      "which a resume doesn't clear", ts=self.now())
+                    why = liquidation_reason(self.liquidated or WIPED_OUT, self.store.insurance_total(self.name))
+                    if self.status != "halted" or self.store.sleeve(self.name).status_reason != why:
+                        self._set("halted", why)
+                    self.store.event(self.name, "error", "risk_halt",
+                                     f"{why}; a resume doesn't clear it, PM must reset it after the liquidation",
+                                     ts=self.now())
+                    self.store.event(self.name, "info", "pm_resume", cmd["reason"], ts=self.now())
+                    self.store.mark_applied(cmd["id"])
+                    continue
                 elif self.status == "halted":
                     self.peak = equity  # a resume after a halt resets the drawdown reference
                     self.store.event(self.name, "info", "drawdown_reset",

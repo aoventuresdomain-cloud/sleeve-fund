@@ -491,6 +491,78 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp
     assert orders[-1] is liq
 
 
+def _liquidated_after_a_restart(tmp_path, carried):
+    """A paper restart carrying the short the `carried` fills (side, qty, price, fee) left, then a +60% gap through its
+    liquidation price. Returns the halt text, the open position's fills, the liquidation's fills and the equity
+    marked before the gap."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from test_replay import START
+
+    store = Store.in_memory()
+    create = store.create_sleeve
+    at = datetime.fromtimestamp(START / 1e9 - 60, tz=timezone.utc)
+
+    def create_with_a_short(**kw):
+        s = create(**kw)
+        for i, (side, qty, price, fee) in enumerate(carried):
+            store.record_fill(kw["name"], side=side, qty=qty, price=price, fee=fee, order_id=f"carried{i}",
+                              trade_id=f"carried{i}", ts=at)
+        return s
+
+    store.create_sleeve = create_with_a_short
+    book = replay_book([_fill(side, qty, price, fee) for side, qty, price, fee in carried], 10_000.0)
+    path = tmp_path / "restart.jsonl.gz"
+    _record(path, _meta(book["cash"] + book["qty"] * book["entry_px"], {"rise": 0.01, "dip": 0.005, **PERP}),
+            [(1, 0.0), (0, 0.6), (5, 0.0)])
+    orders = replay(path, store=store)
+    assert orders and orders[-1]["intent"] == "liquidation", [(o["side"], o["intent"]) for o in orders]
+    name = "ping-pong-test"
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    fills = store.fills(name, limit=1000)
+    liq = [f for f in fills if f["order_id"] == orders[-1]["order_id"]]
+    gap = min(f["ts"] for f in liq)
+    before = [m for m in store.equity_series(name) if pd.Timestamp(m["ts"]) < pd.Timestamp(gap)][-1]["equity"]
+    return s.status_reason, book, liq, before
+
+
+def _says_margin_lost(text, want, before):
+    m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+)% of strategy equity", text)
+    assert m, text
+    assert float(m.group(1).replace(",", "")) == pytest.approx(want, abs=0.005), (m.group(1), want)
+    assert int(m.group(2)) == round(100 * want / before), (m.group(2), 100 * want / before)
+
+
+def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp_path, full_margin):
+    """HoE and the Code Reviewer on #155 at 26fd993: X (Advisor 18:17 point 4: margin, entry fee and liquidation fee,
+    as QA's D15 computes it) for a position carried over a restart still counts the fee paid to open it, which the
+    process that paid it no longer holds."""
+    text, book, liq, before = _liquidated_after_a_restart(tmp_path, [("SELL", 0.3, 60_000.0, 9.0)])
+    want = round(0.3 * 60_000.0 / 2 + 9.0 + sum(f["fee"] for f in liq), 2)
+    _says_margin_lost(text, want, before)
+
+
+def test_a_liquidation_after_a_partial_reduce_counts_only_the_entry_fee_of_what_is_still_open(tmp_path, full_margin):
+    """HoE and the Code Reviewer on #155 at 26fd993: after a short of 0.4 is cut to 0.3, X counts three quarters of
+    its entry fees, the share of the position the liquidation took, not all of them."""
+    carried = [("SELL", 0.3, 60_000.0, 9.0), ("SELL", 0.1, 60_000.0, 3.0), ("BUY", 0.1, 60_000.0, 3.0)]
+    text, book, liq, before = _liquidated_after_a_restart(tmp_path, carried)
+    assert book["entry_fees"] == pytest.approx(9.0)
+    want = round(0.3 * 60_000.0 / 2 + (9.0 + 3.0) * 0.3 / 0.4 + sum(f["fee"] for f in liq), 2)
+    _says_margin_lost(text, want, before)
+
+
+def test_replay_book_pro_rates_the_entry_fees_of_what_is_still_open():
+    """The fees paid to open the position held: added on an add, cut in proportion on a reduce, gone when flat, and
+    only the remainder's share of a fill that crosses through flat."""
+    fills = [_fill("SELL", 2, 100.0, 0.2), _fill("SELL", 2, 100.0, 0.2)]
+    assert replay_book(fills, 1_000.0)["entry_fees"] == pytest.approx(0.4)
+    assert replay_book(fills + [_fill("BUY", 1, 100.0, 0.1)], 1_000.0)["entry_fees"] == pytest.approx(0.3)
+    assert replay_book(fills + [_fill("BUY", 4, 100.0, 0.4)], 1_000.0)["entry_fees"] == 0.0
+    assert replay_book(fills + [_fill("BUY", 5, 100.0, 0.5)], 1_000.0)["entry_fees"] == pytest.approx(0.1)
+
+
 def _ls_run(prices, instrument, seed, params, profile="balanced", n=600, volume=1.0):
     import numpy as np
 
