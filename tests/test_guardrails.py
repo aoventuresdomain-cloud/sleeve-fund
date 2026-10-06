@@ -21,7 +21,7 @@ def test_neighbours_are_one_grid_step_along_one_setting():
 
 def test_a_broad_plateau_holds():
     verdict, words = nearby_settings(_grid(lambda f, s: 1.0 + 0.01 * f), {"fast": 10, "slow": 100}, PARAMS)
-    assert verdict == "PASS" and words.startswith("4 of 4 nearby settings")
+    assert verdict == "PASS" and words.startswith("4 of 4 nearby settings keep a positive Sharpe")
 
 
 def test_a_lone_peak_fails_and_names_the_weakest_neighbour():
@@ -30,9 +30,16 @@ def test_a_lone_peak_fails_and_names_the_weakest_neighbour():
     assert verdict == "FAIL" and "3 of 4" in words and "fast 20, slow 100 at -0.30" in words
 
 
-def test_a_cliff_below_half_the_chosen_sharpe_fails():
-    cliff = _grid(lambda f, s: 2.0 if (f, s) == (10, 100) else (0.9 if f == 5 else 1.8))
-    assert nearby_settings(cliff, {"fast": 10, "slow": 100}, PARAMS)[0] == "FAIL"
+def test_one_weak_neighbour_passes_while_the_median_holds():
+    # Advisor's rule: half the chosen Sharpe at the median neighbour, not every one; positive at all of them.
+    one_weak = _grid(lambda f, s: 2.0 if (f, s) == (10, 100) else (0.3 if f == 5 else 1.8))
+    assert nearby_settings(one_weak, {"fast": 10, "slow": 100}, PARAMS)[0] == "PASS"
+
+
+def test_a_median_below_half_the_chosen_sharpe_fails():
+    cliff = _grid(lambda f, s: 2.0 if (f, s) == (10, 100) else (0.9 if f in (5, 20) or s == 50 else 1.8))
+    verdict, words = nearby_settings(cliff, {"fast": 10, "slow": 100}, PARAMS)
+    assert verdict == "FAIL" and "the median one 0.90 against a bar of 1.00" in words
 
 
 def test_a_losing_centre_or_nan_neighbour_fails():

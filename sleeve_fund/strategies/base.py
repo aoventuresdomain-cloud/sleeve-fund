@@ -32,7 +32,7 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
-from sleeve_fund.strategies.indicators import Atr
+from sleeve_fund.strategies.indicators import AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -420,7 +420,7 @@ class LongFlatStrategy(Strategy):
         # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
         self._replan_pending: tuple[str, int] | None = None
         self._plan_entry: dict | None = None  # the open position's entry order, after a restart
-        self._atr = Atr(config.atr_bars) if config.stop_atr else None
+        self._atr = AtrSma(config.atr_bars) if config.stop_atr else None
         self._lows: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
