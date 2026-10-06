@@ -2342,7 +2342,7 @@ def test_resuming_after_a_liquidation_says_it_stays_halted(client):
     """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
     resume until the PM resets it after liquidation; other halts keep their wording. Read from the journal,
     so a Stop/Start that halts it again on drawdown doesn't hide the liquidation (QA P1-U22)."""
-    from sleeve_fund.dashboard.trading import LIQUIDATION_RESET
+    from sleeve_fund.store import LIQUIDATION_RESET
 
     c, store = client
     _new(c)

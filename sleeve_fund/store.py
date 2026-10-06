@@ -421,6 +421,9 @@ TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
+# The event a PM's "Reset after liquidation" journals (item RAL): the one thing that ends a liquidation halt.
+# The engine (#155) and the dashboard both read it from here.
+LIQUIDATION_RESET = "liquidation_reset"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
