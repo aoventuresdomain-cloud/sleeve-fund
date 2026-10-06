@@ -7,8 +7,11 @@ model read when it decided on that candle. It is fed closed candles only, in ord
 candle closed. Nothing trades: the model's decision rules never run.
 
 Payload (v2/chart-indicators-shape.md, agreed with the Front-end Engineer 5 Oct, settled_from added 6 Oct):
-    {"key", "label", "pane": "price" | "lower", "kind": "line", "group", "levels", "tf",
+    {"key", "label", "pane": "price" | "lower", "kind": "line", "group", "levels", "tf", "shown",
      "settled_from": t | None, "points": [[t, v], ...]}
+shown: drawn when the chart opens (each line has its own toggle); a rule-builder strategy shows only the outputs its
+rules read. Draw each line as steps held from one candle close to the next, never joined straight: a straight join
+would show crosses between closes the model never saw (Independent Quant Advisor, 6 Oct 23:24).
 t is the candle's close, UTC seconds; v is None only where the indicator has no value yet. Points before
 settled_from are the model's warm-up: drawn as not settled (dashed, greyed), never as a normal line.
 """
@@ -45,7 +48,8 @@ def indicator_series(strategy_name: str, candles: pd.DataFrame, instrument, para
     params = dict(params or {})
     strategy = build(strategy_name, instrument, params, bar_minutes)
     meta = strategy.indicator_meta()
-    series = {k: {"key": k, "kind": "line", "group": None, "levels": None, "tf": None, **m, "settled_from": None,
+    series = {k: {"key": k, "kind": "line", "group": None, "levels": None, "tf": None, "shown": True, **m,
+                  "settled_from": None,
                   "points": []} for k, m in meta.items()}
     if not series:
         return []
