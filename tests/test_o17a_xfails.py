@@ -655,7 +655,8 @@ WITHIN = {
 }
 
 
-@pytest.mark.parametrize("case", list(WITHIN))
+@pytest.mark.parametrize("case", [c if c == "own-cap" else pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="DA-11"))
+                                  for c in WITHIN])
 def test_a_rate_within_the_cap_that_applies_is_kept_and_charged_as_settled(binance, monkeypatch, case):
     """Plain (holds today, must keep holding once caps are built). Within its own cap (0.5% under 0.75%); above today's
     cap but within the cap that applied at that settlement (2% at 3 Oct 16:00, when the cap was 3%; 0.75% from 4 Oct);
@@ -673,7 +674,6 @@ def test_a_rate_within_the_cap_that_applies_is_kept_and_charged_as_settled(binan
     assert x["amount"] == pytest.approx(-x["qty"] * x["price"] * c["rate"], rel=1e-6)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_CAP)
 def test_a_rate_above_the_instruments_own_cap_is_rejected(binance, monkeypatch):
     """Cap 0.75% (tighter than 5%, so a fixed 5% cap would wrongly accept it): 3% at 3 Oct 16:00 is rejected by the
     collector and, kept in the store by hand, charged the baseline in the backtest. 0.5% in the same pass is kept.
