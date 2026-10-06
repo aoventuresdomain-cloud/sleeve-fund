@@ -58,8 +58,6 @@ from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
-# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
-LIQUIDATED_HALT = "Position margin lost (liquidated)"
 # Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
 LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
                       "again only after you use Reset after liquidation, which asks for an incident note")
@@ -656,7 +654,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
-                  and "only a resume" not in why):
+                  and why.code != "halted"):
                 raise ValueError(f"a resume can't clear it: {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
@@ -693,7 +691,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
         strategy's position margin was lost with no Reset after liquidation since. The routes and the page
         both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
-        return trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
+        return trading.liquidated_since_reset(st(), name)
 
     def _flatten_waits(name: str) -> bool:
         """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would

@@ -170,3 +170,35 @@ def test_the_incident_closes_only_on_the_note_and_the_pm_acknowledgement(store, 
                 store.ack(iid, "PM")
     closes = done in ("note_then_pm_ack", "pm_ack_then_note")
     assert store.incident_is_open(iid) is (not closes), (done, store.incident_is_open(iid))
+
+
+# --- a reset pending from before a liquidation does not outlive the reset after liquidation (#167 round) -----------
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="RAL")
+def test_a_reset_pending_from_before_the_liquidation_does_not_run_after_the_reset_after_liquidation(store, tmp_path,
+                                                                                                   monkeypatch):
+    """Found in the #167 round (quant-review/v2-p1/ui-v2-152.md:601, on 5afb6a7): a reset pending from before a
+    liquidation, the liquidation and its liquidation_reset all before one supervisor pass let the older reset run with
+    no fresh confirmation. The reset after liquidation cancels or closes any reset pending from before it: after the
+    supervisor's passes the old one is no longer pending and has not run (nothing put away, the remainder still the
+    strategy's own). A reset asked for after the liquidation_reset runs normally."""
+    store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params=PARAMS)
+    store.request_reset(NAME, "testing: start it again", actor="PM")  # pending, before anything happened
+    f = _liquidate(tmp_path, store)
+    iid = _incident(store, f.liq)
+    _note(store, iid)
+    _ral(store, incident=iid)
+    _runtime(store, NEXT_DAY, f.rem)
+    assert _resets(store, NAME), "setup: the reset after liquidation applied"
+    sup = _supervised(store, monkeypatch)
+    for _ in range(2):
+        sup.step()
+    assert store.pending_reset(NAME) is None, store.pending_reset(NAME)
+    assert not [r for r in store.reset_runs() if r], store.reset_runs()  # the old reset put nothing away
+    assert store.journal_book(NAME, 10_000)["cash"] == pytest.approx(f.rem, abs=0.01)
+    store.request_reset(NAME, "testing: a fresh reset after the reset after liquidation", actor="PM")
+    for _ in range(3):
+        sup.step()
+    runs = [r for r in store.reset_runs() if r]
+    assert len(runs) == 1 and store.pending_reset(NAME) is None, (runs, store.pending_reset(NAME))

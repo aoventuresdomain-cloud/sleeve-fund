@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sleeve_fund import risk
-from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, replay_book, utcnow
 
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
@@ -35,7 +35,30 @@ def liquidation_reason(head: str, covered: float) -> str:
     """A liquidation's halt once flat: its head, and what the venue's insurance fund covered, if anything."""
     return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
 
-def clearing_action(sleeve, now: datetime | None = None) -> str | None:
+def fold(text: str | None) -> str:
+    """Text for a loose match: one plain space between words, in any case (a no-break space counts as one)."""
+    return " ".join((text or "").split()).casefold()
+
+
+LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a liquidation's halt, in any wording
+
+
+class Why(str):
+    """Why nothing opens, in words, with `code` saying which state it is, so callers key off the code and never the
+    words: liquidated, halted, daily_pause, retired, hold (the engine's own: stale data, missing funding), paused or
+    stopped. It compares and prints as its words."""
+    code: str
+
+    def __new__(cls, text: str, code: str) -> Why:
+        why = super().__new__(cls, text)
+        why.code = code
+        return why
+
+
+LIQUIDATED = Why("it was liquidated, and only a reset after liquidation clears that", "liquidated")
+
+
+def clearing_action(sleeve, now: datetime | None = None) -> Why | None:
     """What alone clears the halt a strategy is in, in words, or None when it isn't halted or paused for the day
     (Independent Quant Advisor, 6 Oct 18:17, HC): a liquidation only a reset after liquidation; a drawdown halt only a
     resume; a daily-loss pause only the next 00:00 UTC roll. Stop, Start and restarts never do. Without `now` a daily
@@ -43,62 +66,98 @@ def clearing_action(sleeve, now: datetime | None = None) -> str | None:
     across the roll can still be started (its first tick then lifts the pause)."""
     reason = sleeve.status_reason or ""
     if sleeve.status == "halted":
-        if reason.startswith((WIPED_OUT, "wiped out", "position margin lost")):
-            return "it was liquidated, and only a reset after liquidation clears that"
-        return "it is halted, and only a resume clears that"
+        if fold(reason).startswith(LIQUIDATED_WORDS):
+            return LIQUIDATED
+        return Why(f"it is halted ({reason or 'by its risk limits'}), and only a resume clears that", "halted")
     if sleeve.status == "paused" and sleeve.paused_until is not None and (now is None or sleeve.paused_until > now):
-        return (f"it is paused for the day's loss until {sleeve.paused_until:%d %b %H:%M} UTC, and only the next "
-                "00:00 UTC roll clears that")
+        return Why(f"it is paused for the day's loss until {sleeve.paused_until:%d %b %H:%M} UTC, and only the next "
+                   "00:00 UTC roll clears that", "daily_pause")
     return None
 
 
-def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None,
-                  holds: dict[str, str] | None = None, starting: bool = False) -> tuple[bool, str | None]:
+# A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
+# event when it ends, with how many orders it refused. Each refused order is its own decision row.
+BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_unblocked", "Nothing opens: "
+RETIRED = Why("it is retired (archived), and only Restore clears that", "retired")
+
+
+def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
+                  holds: dict[str, str] | None = None, starting: bool = False) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why in words). Blocked: liquidated
     until a reset after liquidation (`liquidated`, from the journal: liquidation_head), a drawdown halt, the daily-loss
     pause, then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) a pause with no end time, stopped, or a hold the engine has raised (`holds`, e.g. no funding rate or
     stale data). The engine checks every order that would make the position bigger,
     at submit and at fill; the supervisor and the dashboard's Start and Resume read the same answer. Stops,
-    reduce-only orders, the PM's close and a liquidation are never gated."""
+    reduce-only orders, the PM's close and a liquidation are never gated. The why carries a code (Why)."""
     if liquidated is not None:
-        return True, "it was liquidated, and only a reset after liquidation clears that"
+        return True, LIQUIDATED
     why = clearing_action(sleeve, now)
     if why is not None:
         return True, why
+    if archived:
+        return True, RETIRED
     if starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         return False, None
+    for why in (holds or {}).values():  # the engine's own (stale data, missing funding), ahead of pause and stop
+        return True, Why(why, "hold")
     if sleeve.status == "paused" and sleeve.paused_until is None:  # the PM's pause, a flatten, the kill switch, or
         # started for its exits only (a daily-loss pause past its roll is lifted by the runtime's next tick)
-        return True, "it is paused"
+        return True, Why("it is paused", "paused")
     if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
-        return True, "it is stopped, and only Start clears that"
-    for why in (holds or {}).values():
-        return True, why
+        return True, Why("it is stopped, and only Start clears that", "stopped")
     return False, None
 
 
 def liquidation_head(store, name: str) -> str | None:
-    """The head of a strategy's liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57): it
-    stays halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The journal
-    decides, not the latest halt's reason, which a later halt or stop can overwrite (QA on #164): liquidated is a
-    liquidation event, or a liquidation's halt, with no reset after liquidation since. None otherwise."""
+    """The head of a strategy's liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57), else
+    None: it stays halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The
+    one liquidated rule, for the engine, the gate and the dashboard (CR 7). The journal decides, not the latest halt's
+    reason, which a later halt or stop can overwrite (QA on #164): liquidated is a liquidation event or order, or a
+    liquidation's halt (in any case and spacing, P1-U28a), with no reset after liquidation since."""
     reset = store.last_event(name, (RESET_AFTER_LIQUIDATION,))
-    since = store.sleeve_events_since(name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
+    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
+    since = store.sleeve_events_since(name, ("liquidation", "risk_halt"), since_id)
     heads = [e["message"].split(";")[0] for e in since
-             if e["kind"] == "risk_halt" and e["message"].startswith(WIPED_OUT)]
+             if e["kind"] == "risk_halt" and fold(e["message"]).startswith(fold(WIPED_OUT))]
     if heads:
         return heads[-1]
-    if any(e["kind"] == "liquidation" or e["message"].startswith(("wiped out", "position margin lost"))
-           for e in since):  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
-        return WIPED_OUT
-    return None
+    if any(e["kind"] == "liquidation" or fold(e["message"]).startswith(LIQUIDATED_WORDS) for e in since):
+        return WIPED_OUT  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
+    order = store.last_order(name, ("liquidation",))
+    if order is None or (since_ts is not None and order["ts"] < since_ts):
+        return None
+    if since_ts is not None and order["ts"] == since_ts:
+        # A liquidation order in the same instant as the reset: orders and events share no id, so the liquidation
+        # wins the tie (P1-U28b) unless the reset answered a liquidation event of that same instant.
+        answered = store.last_event(name, ("liquidation",))
+        if answered is not None and answered["id"] < since_id and answered["ts"] == order["ts"]:
+            return None
+    return WIPED_OUT
+
+
+def said_since_last_fill(store, name: str, head: str) -> bool:
+    """Whether an incident starting with `head` was written since the position last changed (its last fill): one
+    incident per position, read only back to that fill (CR 13)."""
+    last = store.fills(name, limit=1)
+    return any(e["message"].startswith(head) for e in
+               store.sleeve_events_since(name, ("incident",), since=last[0]["ts"] if last else None))
+
+
+def open_block(store, name: str, now: datetime | None = None) -> str | None:
+    """Why nothing opens, as the engine last journaled it in a block episode it hadn't closed by `now`, else None."""
+    last = store.last_event(name, (BLOCK_STARTED, BLOCK_CLEARED), before=now)
+    return last["message"].removeprefix(BLOCK_PREFIX) if last and last["kind"] == BLOCK_STARTED else None
 
 
 def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bool = False) -> tuple[bool, str | None]:
     """The gate for a strategy as its journal has it (blocked_state), for the supervisor, the dashboard and QA's
-    exposure-gate set: no process needed, so no engine holds (stale data, missing funding) are seen here."""
-    return blocked_state(store.sleeve(name), now, liquidated=liquidation_head(store, name), starting=starting)
+    exposure-gate set, with no process needed: the engine's own holds (stale data, missing funding) are read from the
+    block episode it left open."""
+    held = None if starting else open_block(store, name, now)
+    return blocked_state(store.sleeve(name), now, liquidated=liquidation_head(store, name),
+                         archived=name in store.archived(), holds={"engine": held} if held else None,
+                         starting=starting)
 
 
 class SleeveRuntime:
@@ -165,6 +224,8 @@ class SleeveRuntime:
         # Why the engine holds new entries back for now, by what raised it (e.g. "funding", "data"): CHOKE's
         # entry_blocked reads them. Each holder sets and clears its own key.
         self.holds: dict[str, str] = {}
+        self._block = open_block(store, sleeve_name)  # the block episode open in the journal, by its reason
+        self._refused = 0
 
     def _last_liquidation(self) -> str | None:
         """The head of its liquidation halt while it is liquidated, else None (liquidation_head)."""
@@ -238,6 +299,13 @@ class SleeveRuntime:
             return None
         if last["kind"] == "risk_pause" and not (self.paused_until and self.paused_until > self.now()):
             return None
+        fills = self.store.fills(self.name, limit=100_000)
+        before = [f for f in fills if f["ts"] <= last["ts"]]
+        if len(before) < len(fills) and abs(replay_book(before[::-1], self.starting_balance)["qty"]) <= max(
+                self.close_floor, 1e-12):
+            # Flat when it fired, so nothing of it was left to sell: what is held now filled after it (an entry that
+            # raced the cancel), and is kept with its stop and an incident, never flattened (P1-U35, Advisor 20:56).
+            return None
         label = {"pm_flatten": "Flattened by PM", "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause"}
         return last["kind"], f"{label[last['kind']]}, sent again after a restart: {last['message']}"
 
@@ -248,14 +316,50 @@ class SleeveRuntime:
     # --- gates ----------------------------------------------------------------
 
     def entry_blocked(self) -> tuple[bool, str | None]:
-        """CHOKE: whether nothing may open or add now, and why (blocked_state on this runtime's own state).
-        An expired daily-loss pause is rolled first; a backtest has no PM, so it is never stopped."""
+        """CHOKE: whether nothing may open or add now, and why (blocked_state on this runtime's own state), keeping
+        the journal's block episode in step. An expired daily-loss pause is rolled first; a backtest has no PM, so it
+        is never stopped or retired."""
         self.can_open()
-        desired = "running" if self.backtest else self.store.sleeve(self.name).desired_state
-        state = SimpleNamespace(status=self.status, status_reason=self.liquidated or "", paused_until=self.paused_until,
-                                desired_state=desired)
-        return blocked_state(state, self.now(), liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
-                             holds=self.holds)
+        sleeve = None if self.backtest else self.store.sleeve(self.name)
+        state = SimpleNamespace(status=self.status, status_reason=sleeve.status_reason if sleeve else "",
+                                paused_until=self.paused_until,
+                                desired_state=sleeve.desired_state if sleeve else "running")
+        blocked, why = blocked_state(state, self.now(),
+                                     liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
+                                     archived=sleeve is not None and self.name in self.store.archived(),
+                                     holds=self.holds)
+        self._episode(why if blocked else None)
+        return blocked, why
+
+    def _episode(self, why: str | None) -> None:
+        """Journal a block episode's start and end (Advisor 22:29): one alert when nothing may open any more, and one
+        cleared event, with the orders it refused, when it ends or gives way to another reason."""
+        if why == self._block:
+            return
+        if self._block is not None:
+            self.store.event(self.name, "info", BLOCK_CLEARED,
+                             f"Opening no longer held by this: {self._block}. Orders refused while it held: "
+                             f"{self._refused}", ts=self.now())
+        if why is not None:
+            self.store.event(self.name, "warning", BLOCK_STARTED, BLOCK_PREFIX + why, ts=self.now())
+        self._block, self._refused = why, 0
+
+    def incident_once(self, head: str, message: str) -> None:
+        """An incident about the position held now, written once: a restart or a deploy doesn't repeat it while no
+        fill has changed the position since (one incident per position, QA on P1-U35)."""
+        if not said_since_last_fill(self.store, self.name, head):
+            self.store.event(self.name, "error", "incident", message, ts=self.now())
+
+    def position_incident(self) -> int | None:
+        """The id of the latest incident about the position held now (written since its last fill), else None."""
+        last = self.store.fills(self.name, limit=1)
+        found = self.store.sleeve_events_since(self.name, ("incident",), since=last[0]["ts"] if last else None)
+        return found[-1]["id"] if found else None
+
+    def refused(self, why: str, what: str) -> None:
+        """One decision row for an order the gate refused (Advisor 22:29); the episode's cleared event counts them."""
+        self._refused += 1
+        self.store.decide("system", "entry_refused", f"Order not sent: {what}, and {why}", self.name)
 
     def can_open(self) -> bool:
         if self.wiped_out:

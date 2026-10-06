@@ -225,3 +225,40 @@ def test_the_supervisor_starts_a_refused_strategy_still_holding_for_its_exits_on
     incidents = [e for e in store.events("pp", limit=50) if e["kind"] == "incident"]
     assert len(incidents) == 1 and incidents[0]["level"] == "error" and "places no stop" in incidents[0]["message"]
     assert s.risk_profile == "balanced"  # refused, not silently changed
+
+
+def _watched_rows(store, open_only=True):
+    from sleeve_fund.store import OPEN_ORDER_STATUSES
+
+    return [o for o in store.orders("s1", statuses=OPEN_ORDER_STATUSES if open_only else None, limit=100)
+            if (o.get("signal") or {}).get("watched")]
+
+
+def test_the_watched_stop_row_shows_the_safety_stop_once_with_its_incident_and_is_never_a_venue_order(store,
+                                                                                                    instrument):
+    """P1-U35 (HoE, QA): paper's stop is watched in the process, so the journal shows it as one open stop_loss row at
+    its level, linked to its incident. Asked again with nothing changed it is not placed twice; a restart cancels it
+    with the rest of the old process's orders and the new process places one, so one is open after a restart; replay
+    and a stop that fires closes it. (Replay leaves it out of the orders it reports sent.)"""
+    strat = _strategy(store, instrument, "balanced", {**PERP, "allow_short": True, "stop_atr": 2.0})
+    stop, _ = _restart_at(strat, 60_000.0, 0.2, 58_000.0, 2.0)
+    (row,) = _watched_rows(store)
+    assert (row["intent"], row["order_type"], row["side"], row["qty"]) == ("stop_loss", "STOP (watched)", "SELL", 0.2)
+    assert row["signal"]["stop_px"] == pytest.approx(stop) and row["signal"]["incident"] == _incident(store)["id"]
+    strat._sync_watched_stop()
+    strat._sync_watched_stop()
+    assert [r["order_id"] for r in _watched_rows(store)] == [row["order_id"]]  # never double-placed
+
+    SleeveRuntime(store, "s1").on_start(0.008)  # a restart: the old process's row goes with it
+    assert _watched_rows(store) == []
+    strat._watched = None  # the new process knows nothing of the old row, and places its own
+    strat._sync_watched_stop()
+    (row,) = _watched_rows(store)
+
+    sent = []
+    strat._busy, strat._mark = (lambda: False), (lambda: (0.0, 0.0, 0.0, 0.0))  # no venue in this harness
+    strat._sell_all = lambda *a, **k: sent.append(a[0])
+    assert strat._check_exits(stop * 0.99)  # through the stop: paper sends its market stop-loss
+    assert sent == ["stop_loss"] and _watched_rows(store) == []
+    (done,) = [r for r in _watched_rows(store, open_only=False) if r["order_id"] == row["order_id"]]
+    assert done["status"] == "canceled" and done["message"].startswith("stop fired at ")

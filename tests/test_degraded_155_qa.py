@@ -777,8 +777,8 @@ def test_r1_an_own_feed_node_attaches_the_stored_minutes_before_its_first_bar(tm
 def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0, after=("resume",)):
     """s21_liq.py as a helper: ping_pong on a perp, recorded and replayed as paper, liquidated by a 60% gap against
     it (pct: the profiles' margin cap, None keeps the shipped ones). Then each of `after` in turn ("resume": a PM
-    resume; "stopstart": the PM's Stop then Start through the dashboard's /sleeves/{name}/command and the supervisor's
-    step), each followed by a restarted process on a session that trades both ways (a dip, a rise, a dip), so a
+    resume; "stopstart": the PM's Stop through the dashboard's /sleeves/{name}/command and the supervisor's step, which
+    leaves it halted, then a Start the dashboard refuses, HC, HoE 20:03), each followed by a restarted process on a session that trades both ways (a dip, a rise, a dip), so a
     strategy free to trade does. Each later session starts two hours after the one before."""
     import dataclasses
     import test_replay

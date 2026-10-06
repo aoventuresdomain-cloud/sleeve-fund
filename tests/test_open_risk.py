@@ -12,6 +12,8 @@ from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import Store
 from test_long_short import PERP, _record
 
+_REAL_HISTORY_ATR = open_risk.history_atr_pct  # read at import, before conftest's 2% daily ATR replaces it
+
 
 def test_a_stopped_position_risks_from_the_mark_to_its_stop():
     assert open_risk.position_risk(2.0, 110.0, stop=100.0) == pytest.approx(20.0)  # long: from the mark, not entry
@@ -131,6 +133,19 @@ def test_paper_refuses_an_entry_that_takes_the_accounts_open_risk_over_5_percent
 @pytest.mark.real_daily_atr
 def test_paper_refuses_a_stopless_entry_whose_risk_cant_be_measured(tmp_path, monkeypatch):
     monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: None)
+    store = Store.in_memory()
+    path = tmp_path / "pp.jsonl.gz"
+    _record(path, _meta(), [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
+    orders, _ = replay(path, with_fills=True, store=store)
+    assert [o for o in orders if o["intent"] == "entry"] == []
+    assert any("can't be measured" in e["message"] for e in store.events("pp", limit=500))
+
+
+def test_the_unknown_atr_refusal_fires_without_the_opt_out_marker(tmp_path, monkeypatch):
+    """Code Reviewer 5: the 2% daily ATR the other tests read (conftest) must not hide the refusal. Unmarked, with the
+    real reader put back and no history for it to read, a stopless entry is still refused as unmeasurable."""
+    monkeypatch.setattr(open_risk, "history_atr_pct", _REAL_HISTORY_ATR)
+    monkeypatch.setattr(open_risk, "_ATR_CACHE", {})
     store = Store.in_memory()
     path = tmp_path / "pp.jsonl.gz"
     _record(path, _meta(), [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sleeve_fund.paper.journal import MemoryJournal
 from sleeve_fund.paper.runtime import WIPED_OUT, SleeveRuntime, blocked_state, entry_blocked
 from sleeve_fund.research.runner import run_backtest
-from sleeve_fund.store import Store
+from sleeve_fund.store import Store, utcnow
 from sleeve_fund.strategies.base import LongFlatStrategy
 from test_sleeve_runtime import store  # noqa: F401  (Postgres when TEST_DATABASE_URL is set)
 
@@ -26,7 +26,7 @@ def _state(status="running", reason="", paused_until=None, desired="running"):
     (_state(), {}, None),
     (_state(), {"liquidated": WIPED_OUT}, "only a reset after liquidation clears that"),
     (_state("halted", f"{WIPED_OUT}: 3,328.70, 33% of strategy equity at entry"), {}, "only a reset after liquidation"),
-    (_state("halted", "drawdown 21% from peak"), {}, "it is halted, and only a resume clears that"),
+    (_state("halted", "drawdown 21% from peak"), {}, "it is halted (drawdown 21% from peak), and only a resume clears"),
     (_state("paused", "daily loss", NOW + timedelta(hours=12)), {}, "only the next 00:00 UTC roll clears that"),
     (_state("paused", "daily loss", NOW - timedelta(minutes=1)), {}, None),  # past its roll: the runtime lifts it
     (_state("paused", "paused by PM"), {}, "it is paused"),
@@ -35,6 +35,9 @@ def _state(status="running", reason="", paused_until=None, desired="running"):
     (_state(desired="stopped"), {}, "it is stopped"),  # a Stop the supervisor hasn't acted on yet
     (_state("stopped", desired="stopped"), {"starting": True}, None),  # Start is what clears a stop
     (_state(), {"holds": {"funding": "no funding rate for the next settlement"}}, "no funding rate"),
+    (_state("paused", "paused by PM"), {"holds": {"data": "the latest candle is degraded"}}, "candle is degraded"),
+    (_state(), {"archived": True}, "it is retired (archived), and only Restore clears that"),
+    (_state("stopped", desired="stopped"), {"archived": True, "starting": True}, "retired"),
 ])
 def test_blocked_state_names_what_alone_clears_each_state(state, kw, why):
     blocked, said = blocked_state(state, NOW, **kw)
@@ -71,8 +74,9 @@ def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(pric
     before = [o for o in res.journal.orders_.values() if o["ts"] < cut]
     if before[-1]["intent"] == "entry":  # it held a position when the gate closed: its exit still went
         assert after and after[0]["intent"] != "entry"
-    (note,) = [e for e in res.journal.events_ if e["kind"] == "entry_gated"]
-    assert note["message"].startswith("Order not sent: it would open or add to the position, and held for the test")
+    refused = [d for d in res.journal.decisions_ if d["action"] == "entry_refused"]
+    assert refused and all(d["reason"].endswith("would open or add to the position, and held for the test")
+                           for d in refused), refused[:2]
 
 
 def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_incident():
@@ -80,10 +84,12 @@ def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_inciden
     j = MemoryJournal()
     rt = SimpleNamespace(store=j, name="s", now=lambda: NOW,
                          entry_blocked=lambda: (True, "it is halted, and only a resume clears that"))
-    me = SimpleNamespace(runtime=rt, _gated_fills=set(), decisions={"e1": {"intent": "entry"}, "x1": {"intent": "exit"}})
-    for coid in ("e1", "e1", "x1"):  # two slices of the entry, and an exit
+    me = SimpleNamespace(runtime=rt, _gated_fills=set(), _slices={"s1": "k1", "s2": "k1"},
+                         decisions={"e1": {"intent": "entry"}, "x1": {"intent": "exit"}, "s1": {"intent": "entry"},
+                                    "s2": {"intent": "entry"}})
+    for coid in ("e1", "e1", "x1", "s1", "s2"):  # two fills of an entry, an exit, two slices of one kept entry
         LongFlatStrategy._gated_fill(me, coid, 0.1, 60_000.0)
-    (inc,) = [e for e in j.events_ if e["kind"] == "incident"]
+    inc, kept = [e for e in j.events_ if e["kind"] == "incident"]  # one for the entry, one for the kept order
     assert inc["level"] == "error" and "filled while nothing may open (it is halted" in inc["message"]
     assert "kept with its stop, not closed" in inc["message"]
 
@@ -135,8 +141,9 @@ def _stopped_holder(store, status="running", reason=""):
 
 def test_a_stopped_strategy_still_holding_runs_for_its_exits_only_with_one_incident(store, monkeypatch):
     """P1-U35 (Advisor 20:56, HoE): a raced remainder held by a STOPPED strategy is never left unwatched. The
-    supervisor starts it for its exits only (its stop, or a safety stop, still closes it; nothing opens) with one
-    incident; once flat it stops; the PM's Start then restarts it to trade."""
+    supervisor starts it for its exits only (its stop, or a safety stop, still closes it; nothing opens); the process
+    it starts writes the one incident with its safety stop (test_restart_safety_stop), so the supervisor writes none;
+    once flat it stops; the PM's Start then restarts it to trade."""
     from sleeve_fund import supervisor as sup
     from sleeve_fund.strategies.base import EXITS_ONLY
 
@@ -149,8 +156,7 @@ def test_a_stopped_strategy_still_holding_runs_for_its_exits_only_with_one_incid
     assert entry_blocked(store, "s1")[0]  # nothing opens
     sv.step()
     sv.step()
-    (inc,) = [e for e in store.events("s1", limit=100) if e["kind"] == "incident"]
-    assert "stopped, but it still holds 0.01, so it runs for its exits only" in inc["message"]
+    assert not [e for e in store.events("s1", limit=100) if e["kind"] == "incident"]
     assert started == [1]
     store.record_fill("s1", side="SELL", qty=0.01, price=60_100.0, fee=0.3, order_id="stop", trade_id="stop")
     sv.step()  # flat: stopped
@@ -188,11 +194,68 @@ def test_a_stopped_holder_that_is_halted_or_paused_keeps_its_process_and_status_
 
 
 def test_a_deploy_before_the_stopped_holder_is_flat_restarts_it_without_a_second_incident(store, monkeypatch):
+    """A deploy restarts the exits-only process; the restarted process's safety-stop incident is written once per
+    position (runtime.incident_once), so a second process start adds none."""
     from sleeve_fund import supervisor as sup
 
     sv, started, FakePopen = _stopped_holder(store, "stopped", "stopped by PM")
     monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: started.append(1) or FakePopen())
     sv.step()
+    rt = SleeveRuntime(store, "s1", now=utcnow)  # the process it started writes its incident (after the fill)
+    rt.incident_once("Incident, s1: the open long", "Incident, s1: the open long position of 0.01 ...")
     sup.Supervisor(store).step()  # a deploy: a new supervisor, its process gone with the old one
+    SleeveRuntime(store, "s1", now=utcnow).incident_once("Incident, s1: the open long", "again")
     assert started == [1, 1]
     assert len([e for e in store.events("s1", limit=100) if e["kind"] == "incident"]) == 1
+
+
+def test_a_block_episode_is_one_alert_and_one_cleared_event_with_its_refusals_and_the_gate_reads_it(store):
+    """Advisor 22:29: one decision row per refused order, one alert when the block starts, one cleared event when it
+    ends carrying the refusal count, no alert per bar; the store-level gate sees the engine's open episode."""
+    from sleeve_fund.paper.runtime import BLOCK_CLEARED, BLOCK_STARTED
+
+    store.create_sleeve(name="s1", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, risk_profile="balanced")
+    rt = SleeveRuntime(store, "s1", now=lambda: NOW)
+    rt.on_start(0.008)
+    rt.holds["data"] = "the latest candle is degraded"
+    for _ in range(3):
+        rt.entry_blocked()
+    rt.refused("the latest candle is degraded", "entry buy 0.1 would open or add to the position")
+    rt.refused("the latest candle is degraded", "entry buy 0.1 would open or add to the position")
+    assert entry_blocked(store, "s1") == (True, "the latest candle is degraded")  # no process needed
+    assert entry_blocked(store, "s1", starting=True) == (False, None)
+    rt.holds.clear()
+    assert rt.entry_blocked() == (False, None)
+    kinds = [e["kind"] for e in store.events("s1", limit=50) if e["kind"] in (BLOCK_STARTED, BLOCK_CLEARED)]
+    assert kinds == [BLOCK_CLEARED, BLOCK_STARTED]  # newest first: one alert, one cleared
+    cleared = store.last_event("s1", (BLOCK_CLEARED,))
+    assert cleared["message"].endswith("Orders refused while it held: 2")
+    assert entry_blocked(store, "s1") == (False, None)
+
+
+def test_an_archived_strategy_refuses_start_and_resume_naming_it_retired(client):
+    c, store = client
+    store.archive("s1")
+    assert "retired" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
+    assert "retired" in _cmd(c, "resume")
+
+
+@pytest.mark.parametrize("status,reason,until", [
+    ("halted", "drawdown 21% from peak", None),
+    ("paused", "daily loss 3.1% hit the 3% limit", datetime(2099, 1, 1, tzinfo=timezone.utc)),
+])
+def test_a_strategys_own_reset_never_clears_its_halt_or_daily_pause(store, status, reason, until):
+    """Advisor 22:29: a per-strategy Reset never clears a halt or the daily pause (their own action does: a resume, or
+    the 00:00 UTC roll); the gate stays closed through it, naming that action."""
+    from sleeve_fund import supervisor as sup
+
+    store.create_sleeve(name="s1", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=10_000, risk_profile="balanced", desired_state="stopped")
+    store.set_status("s1", status, reason, until)
+    store.request_reset("s1", "testing finished", actor="PM")
+    sup.Supervisor(store).reset_pending()
+    s = store.sleeve("s1")
+    assert s.status == status and store.pending_reset("s1") is None
+    blocked, why = entry_blocked(store, "s1", starting=True)
+    assert blocked and ("only a resume" in why if status == "halted" else "00:00 UTC" in why), why

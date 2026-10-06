@@ -29,7 +29,7 @@ from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
-from sleeve_fund.paper.runtime import entry_blocked
+from sleeve_fund.paper.runtime import entry_blocked, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
 
 POLL_SECONDS = 5
@@ -136,7 +136,7 @@ class Supervisor:
             proc.holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
         return proc.holds
 
-    def _watch_stopped_holder(self, s: Sleeve, proc: Proc) -> None:
+    def _watch_stopped_holder(self, s: Sleeve, proc: Proc, starting: bool = False) -> None:
         """P1-U35 (Advisor 20:56, HoE): a stopped strategy still holding a position (the PM's Stop on a holder, or a
         fill that raced the stop) is never left unwatched. It runs for its exits only: its own stop, or a safety stop
         from the mark where it has none (_safety_stop_on_restore), and nothing opens, with an incident. A halt or a
@@ -145,10 +145,10 @@ class Supervisor:
         proc.watched = True
         if s.status not in ("halted", "paused"):
             self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
+        if starting:
+            return  # the process it starts sets the safety stop and writes the incident, once per position
         head = f"Incident, {s.name}: stopped, but it still holds "
-        last = self.store.fills(s.name, limit=1)
-        if any(e["message"].startswith(head) and (not last or e["ts"] >= last[0]["ts"])
-               for e in self.store.sleeve_events_since(s.name, ("incident",))):
+        if said_since_last_fill(self.store, s.name, head):
             return  # already said for this position: a deploy or a crash restarts it without a second incident
         self.store.event(s.name, "error", "incident",
                          f"{head}{book['qty']:.12g}, so it runs for its exits only: its stop (or a safety stop from the "
@@ -158,7 +158,7 @@ class Supervisor:
     def _start(self, name: str, proc: Proc) -> None:
         s = self.store.sleeve(name)
         if s.desired_state != "running":  # a stopped strategy still holding: its exits only (P1-U35)
-            self._watch_stopped_holder(s, proc)
+            self._watch_stopped_holder(s, proc, starting=True)
         elif self._refused(name):
             return
         # Paper processes never need a venue key, so they don't inherit one.

@@ -468,6 +468,10 @@ class LongFlatStrategy(Strategy):
         self._noted: set[str] = set()  # warnings already logged; each is said once until it clears
         self._journal_intents: dict[str, str] | None = None  # open orders' intents from before a restart
         self._gated_fills: set[str] = set()  # orders whose fill came in while nothing may open (CHOKE): one incident each
+        # Paper's stop as the journal shows it: (journal order id, (side, qty, level)) of the open stop_loss row that
+        # stands for the stop watched in the process (_sync_watched_stop), or None.
+        self._watched: tuple[str, tuple] | None = None
+        self._watched_n = 0  # watched-stop rows written by this process, for their order ids
         self._last_market_ns: int | None = None  # the latest trade or quote, for the price watchdog
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
@@ -490,12 +494,15 @@ class LongFlatStrategy(Strategy):
         self.hub_fed = False
         self.hub_status = None  # the hub's own word on its venue connection (hub_client.HubStatus), when hub-fed
         # The interim open-risk limit (sleeve_fund.open_risk): a backtest's daily ATR shares by day (set by the runner),
-        # and how many of its entries the limit would have refused; a backtest doesn't gate on it.
+        # how many of its entries the limit would have refused, and the largest share of equity one of them put at
+        # risk; a backtest doesn't gate on it.
         self._daily_atr: dict[int, float] = {}
         self.open_risk_binds = 0
+        self.open_risk_max = 0.0
         # After a restart, a position whose stop couldn't be restored, or one started for its exits only, works to a
         # safety stop, and no new entry opens (_safety_stop_on_restore).
         self._safety_stop = False
+        self._safety_why = ""  # why the safety stop was set, for its incident
         self._safety_pending: tuple[float, float] | None = None  # (cash, qty) at the restart, until the first price
         self._exits_only = False  # started only to run a held position's exits (EXITS_ONLY)
         self._exits_why: str | None = None  # why, when the strategy found it itself (_refused_to_trade)
@@ -1043,8 +1050,13 @@ class LongFlatStrategy(Strategy):
             # the same exits-only start as the supervisor gives one (QA P1-S7, R-S6).
             self._exits_only, self._exits_why = True, why
         unrestored = (self._stop_frac is None and bool(c.stop_loss or c.stop_atr or c.stop_swing_bars))
-        if not (unrestored or self._exits_only):
+        # Held while nothing may open (halted, paused, stopped, liquidated: a fill that raced the block's cancel):
+        # never left unwatched (P1-U35, Advisor 20:56), so it gets the safety stop and an incident too.
+        orphan, held = self.runtime.entry_blocked()
+        if not (unrestored or self._exits_only or orphan):
             return
+        self._safety_why = ("its stop couldn't be restored after the restart" if unrestored else
+                            f"is held while nothing may open ({held})")
         self._safety_stop, self._safety_pending = True, (book["cash"], book["qty"])
         if self._replan_pending is None and self._stop_frac is None and (c.stop_atr or c.stop_swing_bars):
             last = self.runtime.store.last_event(self.runtime.name, ("exits_change",))
@@ -1069,19 +1081,53 @@ class LongFlatStrategy(Strategy):
             self._stop_frac = side * (1 - level / entry)
             self._stop_basis = f"safety stop, half way from the {mark:,.6g} mark to " + (
                 f"the liquidation price {liq:,.6g}" if liq is not None else "zero")
-        why = (f"started for its exits only ({self._exits_reason()})" if self._exits_only else
-               "its stop couldn't be restored after the restart")
+        why = (f"started for its exits only ({self._exits_reason()})" if self._exits_only else self._safety_why)
         work = (f"it keeps its restored stop at {restored:,.6g}, tighter than a safety stop at {level:,.6g}" if kept
                 else f"it works to a safety stop at {level:,.6g}, half way from the {mark:,.6g} mark to "
                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
-        self.runtime.store.event(
-            self.runtime.name, "error", "incident",
-            f"Incident, {self.runtime.name}: the open {_side_word(side)} position of {abs(qty):.12g} (entry "
-            f"{entry:,.6g}) {why}; {work}. No new entries or adds open"
+        head = f"Incident, {self.runtime.name}: the open {_side_word(side)} position of {abs(qty):.12g} (entry "
+        self.runtime.incident_once(
+            head, f"{head}{entry:,.6g}) {why}; {work}. No new entries or adds open"
             + ("" if self._exits_only else " until the model's own stop is set again")
-            + "; the position is not closed.", ts=self.runtime.now())
+            + "; the position is not closed.")
+        self._sync_watched_stop()
         if self._backtest and not kept:
             self._rest_exits()  # a backtest's stop rests at the venue, so a gap through it fills at the open
+
+    def _sync_watched_stop(self) -> None:
+        """Paper watches its stop on every trade in the process (_check_exits), so no stop order rests at its venue.
+        The journal still shows it, as the resting stop_loss order it stands for (P1-U35: a position is never shown
+        unwatched): one open row while a position is held with a stop, replaced when the level or size changes, and
+        cancelled when the position closes (a stop that fires sends its own market stop-loss, journaled as usual). A
+        backtest's stop is a real resting order (_rest_exits)."""
+        if self._backtest or self.runtime is None:
+            return
+        want = None
+        if self._entry_px is not None and self._stop_frac is not None and self._entry_qty > 1e-12:
+            side = self._entry_side or 1
+            want = ("SELL" if side > 0 else "BUY", round(self._entry_qty, 12),
+                    round(self._entry_px * (1 - side * self._stop_frac), 8))
+        if (self._watched[1] if self._watched else None) == want:
+            return
+        store, name = self.runtime.store, self.runtime.name
+        if self._watched is not None:
+            store.update_order(self._watched[0], status="canceled",
+                               message="replaced by the stop as it is now" if want else "the position it guarded closed")
+        self._watched = None
+        if want is not None:
+            # Unique within the 64 characters an order id has, however often it is replaced in one instant.
+            self._watched_n += 1
+            oid = f"{name[:24]}-watched-stop-{time.time_ns() // 1000}-{self._watched_n}"
+            incident = self.runtime.position_incident()  # the safety stop's, or a raced fill's, when there is one
+            store.record_order(name, order_id=oid, side=want[0], qty=want[1], intent="stop_loss",
+                               reason=f"Stop at {want[2]:,.6g}, watched on every trade: paper keeps it in the process and "
+                               "sends a market stop-loss when the price reaches it",
+                               signal={"stop_px": want[2], "watched": True,
+                                       **({"incident": incident} if incident is not None else {})},
+                               order_type="STOP (watched)",
+                               ts=self.runtime.now())
+            store.update_order(oid, status="accepted")
+            self._watched = (oid, want)
 
     def _exits_reason(self) -> str:
         if self._exits_why:
@@ -1116,6 +1162,8 @@ class LongFlatStrategy(Strategy):
                         + open_risk.position_risk(held_qty, close, held_stop, atr))
             except ValueError:
                 return None
+            if equity > 0:
+                self.open_risk_max = max(self.open_risk_max, risk / equity)
             if open_risk.check_entry(equity, 0.0, risk):
                 self.open_risk_binds += 1
             return None
@@ -1207,7 +1255,8 @@ class LongFlatStrategy(Strategy):
                 or type(self).resume_leg is LongFlatStrategy.resume_leg):
             return
         step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
-        orders = self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
+        orders = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
+                  if not (o.get("signal") or {}).get("watched")]  # paper's watched stop is no venue order
         at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
         qty = self.runtime.book["qty"]
         held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False} if qty else None
@@ -1566,8 +1615,16 @@ class LongFlatStrategy(Strategy):
         missing = self._degraded.pop(bar.ts_event, None)
         if missing is None:
             self._noted.discard("degraded_bar")
+            if self.runtime is not None:
+                self.runtime.holds.pop("data", None)
         else:
             self._no_entry_ts, self._degraded_missing = bar.ts_event, missing
+            if self.runtime is not None:
+                # CHOKE (Advisor 22:29): while the latest candle is degraded nothing opens, and resting entries are
+                # cancelled at once, as for a halt; stops and exits still run on the last good data.
+                self.runtime.holds["data"] = (f"the latest {bar_minutes(self._cfg.bar_type)}-minute candle is degraded "
+                                              f"(missing {missing} of its minutes), and the next whole one clears that")
+                self._cancel_resting_entries()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         if self._margin and self._backtest and self._exec_type is None:
@@ -1745,6 +1802,12 @@ class LongFlatStrategy(Strategy):
                 values["liquidation_px"] = round(liq, 8)  # GAP-LIQ: judged on its fill (_gap_liquidation)
         self._exit_lock = side if self._margin else True
         self._entry_px = None  # don't fire again while the sell is in flight
+        if hit == "stop_loss" and self._watched is not None and self.runtime is not None:
+            # The journal's watched stop is done: the market stop-loss sent now stands in its place (P1-U35, QA).
+            self.runtime.store.update_order(self._watched[0], status="canceled",
+                                            message=f"stop fired at {price:,.6g}: the market stop-loss sent for it "
+                                                    "closes the position")
+            self._watched = None
         self._sell_all(hit, reason, values)
         return True
 
@@ -1830,11 +1893,8 @@ class LongFlatStrategy(Strategy):
         it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first. An order that would
         open or add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent."""
         if (why := self._gated(side, intent)) is not None:
-            self._note("entry_gated", f"Order not sent: it would open or add to the position, and {why}. Nothing "
-                       "opens until that clears; stops and closes still run")
+            self.runtime.refused(why, f"{intent} {side.name.lower()} {qty} would open or add to the position")
             return False
-        if intent in OPENING_INTENTS:
-            self._noted.discard("entry_gated")
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         wait = self._cfg.maker_wait_minutes
         last, tick = self._price(), self.instrument.price_increment.as_double()
@@ -2890,6 +2950,7 @@ class LongFlatStrategy(Strategy):
             elif self._margin:
                 self._liquidation_guard(cash, qty, worst or price)
             self._cancel_resting_entries()
+            self._sync_watched_stop()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_tick", exc)
 
@@ -2908,22 +2969,45 @@ class LongFlatStrategy(Strategy):
 
         def intent(coid: str):
             return self.decisions.get(coid, {}).get("intent") or (self._journal_intents or {}).get(coid)
-        resting = [o for o in open_ if intent(str(o.client_order_id)) in OPENING_INTENTS]
-        if resting and self.runtime.entry_blocked()[0]:
-            for order in resting:
-                self.cancel_order(order.client_order_id)
+        def opens(what, side) -> bool:  # an entry, or a rebalance that adds (as _gated reads it at submit)
+            return what == "entry" or (what == "rebalance" and self._adds(side))
+        resting = [o for o in open_ if opens(intent(str(o.client_order_id)), o.side)]
+        kept = [c for c, k in self._kept.items() if opens(k["info"].get("intent"), k["order"].side)]
+        blocked, why = self.runtime.entry_blocked()  # asked every tick, so the block episode is journaled
+        if not blocked:
+            return
+        for order in resting:
+            self._part_filled(str(order.client_order_id), order.filled_qty.as_double(), order.quantity.as_double(), why)
+            self.cancel_order(order.client_order_id)
+        for coid in kept:  # paper's kept post-only entry: no more slices of it go at market
+            k = self._kept[coid]
+            self._part_filled(coid, float(k["sent"]), k["order"].quantity.as_double(), why)
+            self._close_kept(coid, f"cancelled: nothing may open now, as {why}")
+
+    def _part_filled(self, coid: str, filled: float, qty: float, why: str) -> None:
+        """Advisor 20:56: an entry part filled when the block starts has its rest cancelled and keeps what filled, with
+        its stop, never flattened; an incident says so, once per order, for the PM to decide."""
+        if filled <= 0 or coid in self._gated_fills:
+            return
+        self._gated_fills.add(coid)
+        rt = self.runtime
+        rt.store.event(rt.name, "error", "incident",
+                       f"Incident, {rt.name}: an entry was part filled ({filled:g} of {qty:g}) when nothing could open "
+                       f"any more ({why}). Its rest is cancelled; what filled is kept with its stop, not closed; you "
+                       "decide what to do with it.", ts=rt.now())
 
     def _gated_fill(self, coid: str, qty: float, px: float) -> None:
         """CHOKE at fill: an entry or rebalance that fills while nothing may open (sent before the gate closed, its
         cancel too late) is kept, with its stop placed for what filled as on any entry, and never flattened; it opens
-        an incident, once per order, for the PM to decide."""
-        if (self.runtime is None or coid in self._gated_fills
+        an incident, once per order: a kept post-only order's slices count as that one order."""
+        order = self._slices.get(coid, coid)
+        if (self.runtime is None or order in self._gated_fills
                 or self.decisions.get(coid, {}).get("intent") not in OPENING_INTENTS):
             return
         blocked, why = self.runtime.entry_blocked()
         if not blocked:
             return
-        self._gated_fills.add(coid)
+        self._gated_fills.add(order)
         rt = self.runtime
         rt.store.event(rt.name, "error", "incident",
                        f"Incident, {rt.name}: an order that adds to the position filled while nothing may open ({why}): "

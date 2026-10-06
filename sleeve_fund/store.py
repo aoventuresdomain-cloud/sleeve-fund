@@ -1369,10 +1369,13 @@ class Store:
         with self.engine.connect() as c:
             return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
 
-    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
-        """One sleeve's events of these kinds newer than an id, oldest first."""
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0,
+                            since: datetime | None = None) -> list[dict]:
+        """One sleeve's events of these kinds newer than an id (and at or after `since`), oldest first."""
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds), events_t.c.id > after_id)
              .order_by(events_t.c.id))
+        if since is not None:
+            q = q.where(events_t.c.ts >= since)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
@@ -1400,9 +1403,12 @@ class Store:
         with self.engine.connect() as c:
             return {r["entry_order"]: r for r in _rows(c.execute(q))}
 
-    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
-        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
-             .order_by(events_t.c.id.desc()).limit(1))
+    def last_event(self, sleeve: str, kinds: tuple[str, ...], before: datetime | None = None) -> dict | None:
+        """The newest event of these kinds, or the newest at or before `before`."""
+        q = select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
+        if before is not None:
+            q = q.where(events_t.c.ts <= before)
+        q = q.order_by(events_t.c.id.desc()).limit(1)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None

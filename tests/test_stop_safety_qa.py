@@ -347,7 +347,8 @@ def test_a_single_backtest_reports_open_risk_and_is_not_gated(prices, instrument
     res = run_backtest("ping_pong", prices.iloc[:30], instrument, PING, risk_profile="conservative")
     first = res.fills.sort_values("ts_last").iloc[0]
     assert float(first.filled_qty) * float(first.avg_px) > 5_000  # same entry as today: not gated (~9,900 on main)
-    assert res.open_risk_binds >= 1  # reported: >= 10% of equity at that entry
+    assert res.open_risk_max > 0.05  # reported: >= 10% of equity at that entry
+    assert res.open_risk_binds >= 1  # and counted as an entry paper would refuse
 
 
 LABEL = "would be refused on paper (stopless above 1x)"

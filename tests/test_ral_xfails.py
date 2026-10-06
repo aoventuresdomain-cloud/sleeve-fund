@@ -28,6 +28,9 @@ Sources (every expectation below cites one):
   isolated margin actually POSTED after it (existing posted margin + the add's margin), not the whole position
   re-valued at the add's price. Tests use exactly the engine's own entry/add cap check; if it differs from posted
   margin, that is its own finding.
+- [ADDCAP22:23] Advisor 6 Oct ~22:23 to QA ("Add-cap finding"): latent MAJOR confirmed; allowed add notional <= (cap x
+  equity just before the add - the position's posted margin) x leverage. RAL 7: keep "includes adds" as it is; on
+  balanced, Y > 100% must coincide with a recorded cap breach (else a bug in Y or the cap check).
 - [B63] (HoE) an incident is an error-severity event with kind "incident" plus an entry in the alerts inbox.
 
 ASSUMED INTERFACES (adapt the names, never the assertions):
@@ -532,12 +535,13 @@ def _engine_cap_held(store, equity, posted, qty, px):
     return qty * px <= budget + 1e-6
 
 
-def _with_adds(store, tmp_path, last):
-    """[RAL7/8] a 3x short on the aggressive profile (50% margin cap: on balanced, 33% x 2x, margin posted within the
-    cap can never pass the first-fill equity), opened at 60,600 on 10,000 of equity. Twice the price halves, half the
-    short is bought back (realising the profit, so the wallet can post more) and the short is added to; then a gap up
-    through the stop and the liquidation price closes it. Each opening fill takes the posted isolated margin to 45% of
-    the equity just before it ([CAP21:16]: existing posted margin + the fill's own), the last to `last`; every
+def _with_adds(store, tmp_path, last, profile="aggressive", share=0.45, adds=2):
+    """[RAL7/8] a short at the profile's leverage (by default aggressive, 3x with a 50% margin cap: on balanced, 33% x
+    2x, margin posted within the cap can never pass the first-fill equity), opened at 60,600 on 10,000 of equity.
+    `adds` times the price halves, half the short is bought back (realising the profit, so the wallet can post more)
+    and the short is added to; then a gap up through the stop and the liquidation price closes it. Each opening fill
+    takes the posted isolated margin to 45% of
+    the equity just before it (`share`; [CAP21:16]: existing posted margin + the fill's own), the last to `last`; every
     margin fits the wallet (cash + position at entry, less what is posted: markets.isolated_margin's balance). The
     journal is written as the #146 outage case writes it; the process restarts on it. Returns the first fill's equity
     and fee, the posted margin of the whole liquidated quantity, the fees paid, whether the engine's own guard held at
@@ -546,13 +550,13 @@ def _with_adds(store, tmp_path, last):
     from sleeve_fund import markets, risk
     from sleeve_fund.store import replay_book
 
-    lev = risk.profile("aggressive").max_leverage
+    lev = risk.profile(profile).max_leverage
     params = {**PARAMS, "dip": 0.4}  # the short leg's own take-profit is 40% down: it holds through the halvings
     start = datetime.fromtimestamp(test_replay.START / 1e9, tz=timezone.utc)
     store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
-                        starting_balance=10_000, params=params, risk_profile="aggressive")
+                        starting_balance=10_000, params=params, risk_profile=profile)
     fills, px, held = [], 60_600.0, []
-    plan = [("open", 0.45), ("reduce", 0.5), ("open", 0.45), ("reduce", 0.5), ("open", last)]
+    plan = [("open", share)] + [("reduce", 0.5), ("open", share)] * (adds - 1) + [("reduce", 0.5), ("open", last)]
     for i, (what, x) in enumerate(plan):
         b = replay_book(fills, 10_000)
         equity, short = b["cash"] + b["qty"] * px, -b["qty"]
@@ -577,7 +581,7 @@ def _with_adds(store, tmp_path, last):
     liq_px = markets.isolated_liquidation(book["cash"], book["qty"], book["entry_px"], lev, 0.005)
     assert px > book["entry_px"] * 0.61 and liq_px / px > 1.2, (px, book["entry_px"], liq_px)  # setup: it holds
     meta = _meta(book["cash"] + book["qty"] * book["entry_px"], params)
-    meta["sleeve"]["risk_profile"] = "aggressive"
+    meta["sleeve"]["risk_profile"] = profile
     path = tmp_path / "adds.jsonl.gz"
     _record_at(path, meta, [(5, 0.0), (0, liq_px / px * 1.1 - 1), (5, 0.0)], px, 0)
     orders = _replay_into(store, path)
@@ -625,6 +629,31 @@ def test_an_add_that_breached_its_cap_check_raises_a_sizing_finding(store, tmp_p
     found = [e for e in store.events(NAME, limit=10_000) if e["kind"] == SIZING]
     assert found, f"not built: a sizing finding (an event of kind {SIZING!r}) for an add that breached its cap check"
     assert any("cap" in e["message"].lower() for e in found), [e["message"] for e in found]
+
+
+@pytest.mark.parametrize("case", [pytest.param("y_above_100_with_a_breached_add", marks=pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="QA RAL 7 cross-check: not built yet (Advisor 22:23)")),
+    "y_at_or_below_100_within_every_cap"])
+def test_on_balanced_y_above_100_coincides_with_a_recorded_cap_breach(store, tmp_path, case):
+    """[ADDCAP22:23] "on balanced, Y > 100% must coincide with a recorded cap breach (else bug in Y or cap check)",
+    both ways. On balanced (33% x 2x) a margin posted within the cap at every fill stays below the first-fill equity,
+    so: (1) a liquidation whose last add took the posted margin to 75% of equity (two adds, the engine's own check
+    breached at the second, _engine_cap_held) shows Y above 100% (about 121%) AND has a sizing finding recorded; a Y
+    above 100% with none recorded fails here; (2) a liquidation after three adds, every fill within the engine's
+    check, shows Y at or below 100% and records no sizing finding: nothing is flagged from Y alone. A strict xfail:
+    today's engine prints no Y and records no sizing finding, so neither direction holds yet. The "includes adds" note is pinned as it is
+    by test_y_with_adds_..."""
+    above = case == "y_above_100_with_a_breached_add"
+    f = _with_adds(store, tmp_path, 0.75 if above else 0.30, profile="balanced", share=0.30, adds=2 if above else 3)
+    assert f.held == [True] * (len(f.held) - 1) + [not above], f.held  # setup: only a breaching add failed the check
+    assert len(f.held) == (3 if above else 4)  # setup: the entry and its adds
+    assert f.s.status == "halted", (f.s.status, f.s.status_reason)
+    m = TEXT.search(f.s.status_reason)
+    assert m, f.s.status_reason
+    y = float(m.group(2))
+    found = [e for e in store.events(NAME, limit=10_000) if e["kind"] == SIZING]
+    assert (y > 100) == above, (y, f.s.status_reason)
+    assert bool(found) == (y > 100), (y, [e["message"] for e in found])
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason="add-cap formula")
