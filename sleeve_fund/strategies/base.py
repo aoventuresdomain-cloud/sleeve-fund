@@ -3089,12 +3089,13 @@ class LongFlatStrategy(Strategy):
             fee = fee * book / px if px else fee
             self._cash_adj += sign * qty * (px - book)
             px = book
-        queued = self.fee_model.exit_booked.get(coid) if self.fee_model is not None else None
+        queued = self.fee_model.booked_fills.get(coid) if self.fee_model is not None else None
         booked = queued.pop(0) if queued else None
         if booked is not None and not book:
-            # A backtest's resting stop, booked by the fee model (ScheduleFeeModel.exit_price): the journal keeps the
-            # price it was booked at and the rest of the charge as the fee (the venue's, with the rounding carried
-            # from earlier fees), as the fills report does (runner._spread_into_prices).
+            # A backtest's taker fill, booked by the fee model at the ask or bid, or a resting stop with its slippage
+            # (ScheduleFeeModel.exit_price): the journal keeps the price it was booked at and the rest of the charge as
+            # the fee (the venue's, with the rounding carried from earlier fees), as the fills report does
+            # (runner._spread_into_prices).
             px, fee = booked[0], fee - booked[1]
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:

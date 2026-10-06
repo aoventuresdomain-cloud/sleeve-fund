@@ -255,9 +255,9 @@ class ScheduleFeeModel(FeeModel):
         self.exit_info = None
         self.bars: ExecBars | None = None
         self.now = None
-        # Each stop fill's (price booked, the part of its charge moved into that price), in fill order: the venue can match several slices before the
-        # strategy hears of the first.
-        self.exit_booked: dict[str, list[tuple[float, float]]] = {}
+        # Each taker fill's (price booked, the part of its charge moved into that price), in fill order: the venue
+        # can match several slices before the strategy hears of the first.
+        self.booked_fills: dict[str, list[tuple[float, float]]] = {}
         self.intrabar: set[str] = set()  # "fill" / "liq": a booking relied on the order inside a bar (labels)
 
     def _charge(self, exact: Decimal, currency) -> Money:
@@ -298,15 +298,24 @@ class ScheduleFeeModel(FeeModel):
             info = self.exit_info(order) if self.exit_info is not None else None
             if info is not None:
                 return self._exit_commission(order, info, fill_quantity, fill_px, instrument)
-        charge = notional * self.rate_for(order)
         coid = str(order.client_order_id)
-        if booked is not None or (self.half_spread and not getattr(order, "is_post_only", False)):
-            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
-        if booked is None and self.half_spread and not getattr(order, "is_post_only", False):
-            # A booked target's price already carries its slippage (target_fill_px), half the spread included.
+        taker_spread = booked is None and self.half_spread and not getattr(order, "is_post_only", False)
+        if taker_spread:
+            # Filled at the ask or the bid, mid plus or minus half the spread, in the price (Advisor 20:55): the venue's
+            # fee is on that price, the journal and every level derived from the fill take it, and the spread is
+            # never charged again as a cost of its own.
+            filled, buy = float(fill_px.as_decimal()), order.side == OrderSide.BUY
+            half = float(self.half_spread)
+            px = filled * (1 + half) if buy else filled * (1 - half)
             spread = notional * self.half_spread
+            charge = (notional + spread) * self.rate_for(order) if buy else (notional - spread) * self.rate_for(order)
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
-            charge += spread
+            self.booked_fills.setdefault(coid, []).append((px, float(spread)))
+            return self._charge(charge + spread, instrument.quote_currency)
+        charge = notional * self.rate_for(order)
+        if booked is not None:
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
         return self._charge(charge + shift, instrument.quote_currency)
 
     def _exit_commission(self, order, info: dict, fill_quantity, fill_px, instrument) -> Money:
@@ -331,7 +340,7 @@ class ScheduleFeeModel(FeeModel):
         moved = qty * Decimal(str((filled - px) * side))  # paid on top of the venue's price, as the spread is
         self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(moved)
         self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(fee)
-        self.exit_booked.setdefault(coid, []).append((px, float(moved)))
+        self.booked_fills.setdefault(coid, []).append((px, float(moved)))
         return self._charge(fee + moved, instrument.quote_currency)
 
 

@@ -4,7 +4,7 @@ one-minute bars make the same trades: stops, take-profits, risk-per-trade sizing
 The tick path is the paper sleeve replayed (tests/test_replay.py proves it sends what paper sent);
 the bar path is what the backtest page and research run. Paper watches every trade, so its exits sell
 at market on the trade that crosses the level; a backtest only sees whole bars, so its exits rest at
-the venue and fill at the level. Each exit lands in the same minute, at a price a few basis points
+the venue and fill at the level. Each exit lands in the same minute or the next, at a price a few basis points
 apart, and sizes follow equity, so they drift by as much."""
 
 from datetime import datetime, timedelta, timezone
@@ -106,9 +106,14 @@ TOL_BP = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-6.5, 7.0), "
 
 
 def _same_trades(ticks, bar, tol_bp=None):
-    assert [f[:3] for f in ticks] == [f[:3] for f in bar]
+    assert [f[:2] for f in ticks] == [f[:2] for f in bar]
     tol = {**TOL_BP, **(tol_bp or {})}
     for t, b in zip(ticks, bar):
+        # Signal orders in the same minute; a stop or target in the same minute or the next. A trade on
+        # the minute boundary belongs to the next bar (closed left, labelled right), and since P1-D13 the
+        # backtest's entry carries the half spread like paper's, so its levels no longer sit 1 bp early.
+        late = (b[2] - t[2]).total_seconds()
+        assert late == 0 if t[1] in ("entry", "exit") else 0 <= late <= 60, (t, b)
         assert b[3] == pytest.approx(t[3], rel=2e-3), (t, b)  # sizes follow equity, a few bp apart
         lo, hi = tol[t[1]]
         assert lo <= (b[4] / t[4] - 1) * 1e4 <= hi, (t, b)

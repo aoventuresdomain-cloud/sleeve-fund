@@ -97,11 +97,9 @@ def _notional(fills):
 
 def _rate(order):
     """What the venue charges this order on its notional, as the journal books it: the maker fee on a
-    post-only order, the taker fee alone on a resting stop (its slippage is booked in its price, P1-D13), else
-    the taker fee plus the half spread (a backtest books the spread as a cost)."""
-    if order["order_type"] == "POST-ONLY LIMIT":
-        return MAKER
-    return TAKER if order["order_type"] == "STOP" else TAKER + HALF
+    post-only order, else the taker fee. A backtest's taker fill is booked at the ask or bid, half the spread
+    in its price (Advisor 6 Oct 20:55), and a stop's slippage likewise (P1-D13), so neither is in the fee."""
+    return MAKER if order["order_type"] == "POST-ONLY LIMIT" else TAKER
 
 
 def _assert_every_fee(j):
@@ -122,7 +120,8 @@ def test_every_fill_pays_its_rate_on_its_own_notional(name, capital):
     j = _run(_bars(px), inst, capital=capital).journal
     _assert_every_fee(j)
     total = sum(f["fee"] for f in j.fills_)
-    assert total == pytest.approx(_notional(j.fills_) * (TAKER + HALF), rel=1e-3, abs=CENT * len(j.fills_))
+    # The half spread is in each price, not the fee (Advisor 6 Oct 20:55).
+    assert total == pytest.approx(_notional(j.fills_) * TAKER, rel=1e-3, abs=CENT * len(j.fills_))
 
 
 # Each sizing knob, at two settings: the entry's notional must follow the knob by the expected ratio,
@@ -156,7 +155,7 @@ def test_fees_follow_the_size_whatever_sets_it(knob):
     traded = [_notional(j.fills_) for j in runs]
     assert fees[1] / fees[0] == pytest.approx(traded[1] / traded[0], rel=0.01), (fees, traded)
     for f, t in zip(fees, traded):
-        assert f / t == pytest.approx(TAKER + HALF, rel=1e-3), (f, t)
+        assert f / t == pytest.approx(TAKER, rel=1e-3), (f, t)  # the half spread is in the price (20:55)
 
 
 def _maker_run(px, inst, vol_per_minute, capital=10_000.0):
@@ -190,7 +189,11 @@ def test_post_only_orders_filled_in_slices_still_pay_the_maker_rate_overall(capi
     maker = [f for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT"]
     assert len(maker) > len({f["order_id"] for f in maker}), "expected slices"
     _assert_every_fee(j)
-    assert sum(f["fee"] for f in maker) / _notional(maker) == pytest.approx(MAKER, rel=0.01)
+    # Each fee is rounded to the cent with the remainder carried to the next, whichever order that is; a taker fill's
+    # journal fee keeps its exact spread out (the spread is in its price, Advisor 6 Oct 20:55), so up to a cent per
+    # taker fill can carry into the maker ones.
+    takers = len(j.fills_) - len(maker)
+    assert sum(f["fee"] for f in maker) == pytest.approx(_notional(maker) * MAKER, rel=0.01, abs=CENT * takers)
 
 
 # --- the books --------------------------------------------------------------------------------------
@@ -377,9 +380,8 @@ def test_paper_and_backtest_enter_and_exit_at_the_same_prices(tmp_path):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
         assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
     fee_p, fee_b = sum(r[5] for r in paper), sum(r[5] for r in bt)
-    # Paper's fee is the venue's alone (its price carries the spread); the backtest's includes the spread.
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert fee_b - spread_b == pytest.approx(fee_p, rel=0.005), (fee_p, fee_b, spread_b)
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert fee_b == pytest.approx(fee_p, rel=0.005), (fee_p, fee_b)
 
 
 def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
@@ -439,8 +441,8 @@ def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp
             assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     for side, intent, _, qty, px, fee in paper:  # paper's fee is the venue's taker fee alone
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * TAKER, abs=CENT)
 
@@ -729,8 +731,8 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
             assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     taker = float(PERP_FEES.fees.taker)
     for side, _, _, qty, px, fee in paper:
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
@@ -1007,15 +1009,17 @@ def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_th
     entry, tp = sorted(j.orders_.values(), key=lambda o: o["id"])
     assert (entry["intent"], tp["intent"]) == ("entry", "take_profit")
     level = tp["signal"]["book_px"]
-    assert tp["signal"]["target_px"] == pytest.approx(60_000.0 * (1 + side * 0.05))  # 5 % from the venue's fill
-    assert level == pytest.approx(60_000.0 * (1 + side * 0.05) * (1 - side * max(HALF, 0.0005)))
+    # 5 % from the entry's fill at the ask (a short's at the bid), half the spread in its price (Advisor 20:55).
+    filled = 60_000.0 * (1 + side * HALF)
+    assert tp["signal"]["target_px"] == pytest.approx(filled * (1 + side * 0.05))
+    assert level == pytest.approx(filled * (1 + side * 0.05) * (1 - side * max(HALF, 0.0005)))
     (fill,) = [f for f in j.fills_ if f["order_id"] == tp["order_id"]]
     (efill,) = [f for f in j.fills_ if f["order_id"] == entry["order_id"]]
     qty = fill["qty"]
     assert fill["price"] == level  # the target less its slippage, not the 60,000 close
-    # The entry paid the taker fee and the half spread; the target pays the taker fee alone, on its booked price,
-    # its slippage being in that price (Advisor L12).
-    taker = efill["fee"] / (efill["qty"] * efill["price"]) - HALF
+    # Each pays the taker fee alone, on its booked price: the entry's half spread and the target's slippage are in
+    # those prices (Advisor L12 and 20:55).
+    taker = efill["fee"] / (efill["qty"] * efill["price"])
     assert fill["fee"] == pytest.approx(qty * level * taker, abs=CENT)
     report = res.fills.loc[tp["order_id"]]
     # The slippage is in the booked price already, with the cent the fee's rounding left (QA m-G7).
