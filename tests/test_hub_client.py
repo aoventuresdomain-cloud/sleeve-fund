@@ -45,10 +45,13 @@ def test_messages_become_nautilus_data_and_each_bar_is_delivered_once_in_order()
     assert d({"t": "gap", "id": BTC, "since": T0, "until": T0}, T0) is None and d({"t": "new-kind"}, T0) is None
 
 
-def test_a_bar_refilled_long_after_its_close_is_not_traded_on():
-    """After a hub restart its refill of the missed minutes arrives late: history for the store, not a signal."""
+def test_a_bar_refilled_long_after_its_close_is_sent_stamped_late_for_the_strategys_late_rule():
+    """After a hub restart its refill of the missed minutes arrives late. Each is still sent, so indicators see
+    every bar a backtest's do and a stop breached in it runs; its receive stamp shows the lag, and the strategy
+    only exits on it (QA P1-C1, #146)."""
     d, minute = Decoder(), 60_000_000_000
-    assert d(_bar(T0, refilled=True), T0 + 91 * 1_000_000_000) is None and d.late == 1
+    b = d(_bar(T0, refilled=True), T0 + 91 * 1_000_000_000)
+    assert b.ts_event == T0 and b.ts_init - b.ts_event == 91 * 1_000_000_000 and d.late == 1
     assert d(_bar(T0 + minute, refilled=True), T0 + minute + 2_000_000_000) is not None  # the latest, just refilled
     assert d.late == 1
 
@@ -98,36 +101,37 @@ def test_a_minute_refilled_late_joins_the_bar_still_being_built():
     assert d.building[BTC].minutes.keys() == {E + 6 * M}
 
 
-def test_minutes_refilled_in_order_after_an_outage_build_the_bar_and_a_late_bar_is_skipped_and_told():
+def test_minutes_refilled_in_order_after_an_outage_build_the_bar_and_a_late_bar_is_sent_and_told():
     said = []
     d = Decoder("5-MINUTE-LAST-EXTERNAL", lambda *a: said.append(a))
     for k in range(1, 6):
         d(_bar(E - 5 * M + k * M), E - 5 * M + k * M + 5)
     d(_bar(E + M), E + M + 5)  # 18:06; then the hub is away until 18:13
     back = E + 8 * M
-    for k in range(2, 8):  # 18:07 to 18:12 refilled late on its return
-        assert d(_bar(E + k * M, refilled=True), back) is None
-    assert d.late == 1  # the bar to 18:10, complete only at 18:13: not a signal, and told as it is skipped
-    assert said == [("warning", "bar_skipped", f"{BTC}: skipped the bar closing 05 Oct 18:10 UTC: complete only 180 s "
-                     "after its close, over the 90 s limit (refilled after the feed was away), so not decided on")]
+    sent = [b for k in range(2, 8) if (b := d(_bar(E + k * M, refilled=True), back)) is not None]  # 18:07 to 18:12
+    assert [b.ts_event for b in sent] == [E + 5 * M] and str(sent[0].volume) == "6.250"  # the bar to 18:10, whole
+    assert d.late == 1  # complete only at 18:13: sent for exits only, and told as it is sent
+    assert said == [("warning", "bar_late", f"{BTC}: the bar closing 05 Oct 18:10 UTC was complete only 180 s after "
+                     "its close, over the 90 s limit (refilled after the feed was away): sent for exits only, no new "
+                     "entries")]
     assert d.building[BTC].minutes.keys() == {E + 6 * M, E + 7 * M}  # the next bar's refilled minutes kept
     d(_bar(E + 8 * M), back + 5)
     d(_bar(E + 9 * M), E + 9 * M + 5)
     b = d(_bar(E + 10 * M), E + 10 * M + 5)
     assert b.ts_event == E + 10 * M and str(b.volume) == "6.250"  # whole: two refilled minutes and three live
-    assert len(said) == 1  # a run of one skipped bar: nothing more to say once the feed is current
+    assert len(said) == 1  # a run of one late bar: nothing more to say once the feed is current
 
 
-def test_a_run_of_skipped_bars_is_told_as_it_starts_and_its_extent_once_the_feed_is_current():
+def test_a_run_of_late_bars_is_told_as_it_starts_and_its_extent_once_the_feed_is_current():
     said = []
     d = Decoder("1-MINUTE-LAST-EXTERNAL", lambda *a: said.append(a))
     back = E + 10 * M
     for k in range(0, 3):  # refilled 18:05 to 18:07, all over 90 s late
-        assert d(_bar(E + k * M, refilled=True), back) is None
-    assert [k for _, k, _ in said] == ["bar_skipped"] and "18:05" in said[0][2]  # on record even if nothing follows
+        assert d(_bar(E + k * M, refilled=True), back) is not None
+    assert [k for _, k, _ in said] == ["bar_late"] and "18:05" in said[0][2]  # on record even if nothing follows
     assert d(_bar(E + 3 * M), E + 3 * M + 5) is not None  # 18:08, current
-    assert said[1] == ("warning", "bar_skipped", f"{BTC}: skipped 3 bars closing 05 Oct 18:05 UTC to 05 Oct 18:07 "
-                       "UTC in all, each complete only over 90 s after its close; the feed is current again")
+    assert said[1] == ("warning", "bar_late", f"{BTC}: 3 bars closing 05 Oct 18:05 UTC to 05 Oct 18:07 UTC came over "
+                       "90 s after their close, exits only; the feed is current again")
 
 
 def test_a_bar_sent_with_minutes_missing_is_told():
@@ -202,3 +206,29 @@ def test_the_hub_is_found_from_its_variable_and_absent_means_a_venue_connection(
     assert hub_address("binance", {}) is None and hub_address("kraken", {"HUB_BINANCE": "x:1"}) is None
     with pytest.raises(ValueError, match="host:port"):
         hub_address("binance", {"HUB_BINANCE": "hub-binance"})
+
+
+def test_the_live_minute_after_an_announced_gap_waits_for_the_refill_so_no_minute_is_dropped():
+    """QA P1-L2: the hub publishes a gap's live minute before its refill. The live minute is held until the refill
+    is done, so every refilled minute reaches the bars in order; a hole the refill can't fill releases it on
+    "filled", and a refill that never says so on the heartbeat after HOLD_SECONDS."""
+    from sleeve_fund.paper.hub_client import HOLD_SECONDS
+
+    d = Decoder()
+    assert d(_bar(T0), T0 + 5).ts_event == T0
+    assert d({"t": "gap", "id": BTC, "since": T0 + M, "until": T0 + 2 * M}, T0 + 3 * M) is None
+    assert d(_bar(T0 + 3 * M), T0 + 3 * M + 5) is None  # held: the refill of 2 minutes is on its way
+    sent = [d(_bar(T0 + k * M, refilled=True), T0 + 3 * M + 9) for k in (1, 2)]
+    assert sent[0].ts_event == T0 + M and [b.ts_event for b in sent[1]] == [T0 + 2 * M, T0 + 3 * M]
+    assert d({"t": "filled", "id": BTC, "since": T0 + M, "until": T0 + 2 * M}, T0 + 3 * M + 10) is None
+    # A hole: the refill finds nothing, and "filled" releases the live minute.
+    assert d({"t": "gap", "id": BTC, "since": T0 + 4 * M, "until": T0 + 4 * M}, T0 + 5 * M) is None
+    assert d(_bar(T0 + 5 * M), T0 + 5 * M + 5) is None
+    assert d({"t": "filled", "id": BTC, "since": T0 + 4 * M, "until": T0 + 4 * M}, T0 + 5 * M + 7).ts_event == T0 + 5 * M
+    # No "filled" at all: the heartbeat's flush lets it go once it has waited HOLD_SECONDS.
+    d({"t": "gap", "id": BTC, "since": T0 + 6 * M, "until": T0 + 6 * M}, T0 + 7 * M)
+    assert d(_bar(T0 + 7 * M), T0 + 7 * M + 5) is None
+    assert d.flush(T0 + 7 * M + 6) == []
+    assert [b.ts_event for b in d.flush(T0 + 7 * M + 5 + HOLD_SECONDS * 10**9)] == [T0 + 7 * M]
+    # Without a gap announced (a hole the hub never refills), nothing waits.
+    assert d(_bar(T0 + 9 * M), T0 + 9 * M + 5).ts_event == T0 + 9 * M

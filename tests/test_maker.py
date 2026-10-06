@@ -117,7 +117,7 @@ def test_the_wait_must_fit_inside_a_bar(prices, instrument, wait, match):
 
 def test_a_stop_the_price_is_already_through_sells_at_market(instrument):
     """A post-only buy fills at its limit as the price gaps down through it; the stop would rest
-    above the price, so the venue refuses it and its linked target with it. The position must not
+    above the price, so the venue refuses it (the target doesn't rest, Advisor NA-2). The position must not
     be left unprotected until the next decision: it is sold at market on the spot, as paper would."""
     k = 1440 + 5  # five minutes after the first decision's post-only buy
     m = _minutes([10_000.0] * k + [9_000.0] * (2 * 1440))
@@ -126,8 +126,7 @@ def test_a_stop_the_price_is_already_through_sells_at_market(instrument):
                risk_profile="aggressive")
     orders = sorted(res.journal.orders_.values(), key=lambda o: (o["ts"], o["id"]))
     assert [(o["intent"], o["order_type"], o["status"]) for o in orders] == [
-        ("entry", "POST-ONLY LIMIT", "filled"), ("stop_loss", "STOP", "rejected"),
-        ("take_profit", "LIMIT", "rejected"), ("stop_loss", "MARKET", "filled")]
+        ("entry", "POST-ONLY LIMIT", "filled"), ("stop_loss", "STOP", "rejected"), ("stop_loss", "MARKET", "filled")]
     sell = orders[-1]
     assert sell["ts"] == orders[1]["ts"]  # the same minute, not the next decision
     assert "already through the 9,599.99 stop" in sell["reason"]
@@ -223,3 +222,49 @@ def test_a_paper_maker_slice_is_charged_as_filled_at_its_limit():
     assert buy == pytest.approx(0.1 * 10_000 * 0.004 + 1.0) and sell == pytest.approx(0.1 * 10_000 * 0.004 + 1.0)
     assert 0.1 * 9_990 + buy == pytest.approx(0.1 * 10_000 * 1.004)
     assert 0.1 * 10_010 - sell == pytest.approx(0.1 * 10_000 * 0.996)
+
+
+def test_a_stop_set_inside_a_bar_is_never_rebooked_as_the_target_from_that_bars_open():
+    """CR on #146 (6fc758a): a bar that opens through the target takes the target, but only for a position that
+    existed at that open. A stop rested mid-bar (a maker entry filling on the way down a bar that opened above
+    the would-be target) counts the target from the next bar's open, never its own bar's."""
+    from decimal import Decimal
+
+    from nautilus_trader.model import OrderSide, Price, Quantity
+
+    from sleeve_fund.data import bar_type_for, to_bars
+    from sleeve_fund.instruments import BarOpens, FeeSchedule, ScheduleFeeModel
+    from sleeve_fund.venues import venue
+
+    fm = ScheduleFeeModel(FeeSchedule(Decimal("0.004"), Decimal("0.008")))
+    inst = venue("KRAKEN").instrument("BTC", "USD")
+    m = _minutes([10_000.0, 9_900.0, 9_900.0])
+    m["open"] = 10_300.0  # each bar opens above the 10,200 target
+    m["high"] = 10_300.0
+    first, second = to_bars(m.iloc[1:], inst, bar_type_for(inst, 1))
+    opens = BarOpens(fm)
+    stop = type("O", (), {"client_order_id": "S", "is_post_only": False, "side": OrderSide.SELL})()
+    taker = 0.1 * 9_900 * 0.008
+    opens.pre_process(first)  # the entry fills later in this bar and its stop rests
+    fm.open_targets["S"] = (Decimal("10200"), fm.bar_seq)
+    assert fm.get_commission(stop, Quantity(0.1, 8), Price(9_900, 2), inst).as_double() == pytest.approx(taker)
+    assert fm.rebooked == {}  # a stop, at the stop
+    opens.pre_process(second)  # the next bar opens through the target with the position held
+    got = fm.get_commission(stop, Quantity(0.1, 8), Price(9_900, 2), inst).as_double()
+    assert fm.rebooked == {"S": 10_200.0}
+    assert 0.1 * 9_900 - got == pytest.approx(0.1 * 10_200 * (1 - 0.008))  # booked at the target, taker fee
+
+
+def test_a_maker_entry_inside_a_bar_that_traded_through_its_target_is_judged_from_the_next_bar(instrument):
+    """The post-only buy fills on the way down a bar that opened above the would-be target and then traded
+    above it again. Which came first inside the bar isn't known, so the target is judged from the next bar:
+    the position is held with its stop resting, not booked as a take-profit on its own entry bar."""
+    k = 1440 + 3  # three minutes into the wait of the first decision's post-only buy at 9,999.99
+    m = _minutes([10_000.0] * k + [9_950.0] * 1440)
+    for col, v in (("open", 10_300.0), ("high", 10_700.0), ("low", 9_950.0)):
+        m.iloc[k, m.columns.get_loc(col)] = v
+    res = _run(m, {"maker_wait_minutes": 15, "stop_loss": 0.01, "take_profit": 0.02}, instrument=instrument,
+               risk_profile="aggressive")
+    j = res.journal
+    assert [(f["side"], f["price"]) for f in j.fills_] == [("BUY", pytest.approx(9_999.99))]
+    assert [o["intent"] for o in j.orders_.values() if o["status"] == "accepted"] == ["stop_loss"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 
+import numpy as np
 import pandas as pd
 
 from sleeve_fund.research.guardrails import G1_RULES, MIN_OOS_TRADES, nearby_scored
@@ -25,6 +26,9 @@ G1_CONFIDENCE = 0.95
 SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
 JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
+# Where N or the deflated Sharpe is shown while an idea has a run whose count failed (QA P1-T8, P1-T10).
+N_UNCERTAIN = ("N uncertain: a run of this idea couldn't be counted in full, so this N and the bar it sets read low "
+               "until it is re-counted.")
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
@@ -76,6 +80,26 @@ def _row(label: str, s: dict, b: dict) -> str:
     )
 
 
+def _idea(r: StudyResult) -> str:
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    return legacy_idea_hash(r.spec.name)
+
+
+def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
+    """The counts a result is judged by: with the trials register, its idea family's (Advisor, 6 Oct 2026);
+    without one, the idea counter's, as before."""
+    return register.counts(_idea(r)) if register is not None else ledger.counts()
+
+
+def _trial_spread(r: StudyResult, register) -> float | None:
+    """The spread of the idea family's variant Sharpes, one per variant, for G1's best-of-N hurdle (QA P1-T5)."""
+    if register is None:
+        return None
+    sharpes = [x for x in register.sharpes(_idea(r)) if x is not None and math.isfinite(x)]
+    return float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else None
+
+
 def _breakeven_words(r: StudyResult) -> str:
     from sleeve_fund.research.study import breakeven_fee
 
@@ -118,14 +142,17 @@ def _nearby(r: StudyResult) -> tuple[str, str]:
     return ("FAIL" if final[0] == "FAIL" or failed else "PASS"), words
 
 
-def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
+def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
+    """register: the trials register, when the study ran against the database. Its count of variants, which
+    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
     oos = summary(r.oos_returns)
     bench = summary(r.oos_benchmark_returns)
     bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = r.oos_trades
-    counts = ledger.counts()
-    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
+    counts = _counts(r, ledger, register)
+    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"],
+                                             trial_spread=_trial_spread(r, register))
     unjudged = math.isnan(beats)
     if unjudged:
         beats = 0.0  # too short, or too few independent days, to judge
@@ -144,7 +171,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; " + (
                 "too few independent out-of-sample days to judge" if unjudged else
                 f"{_share(beats)} likely to beat it by more than the best of {counts['variants']} variants would by "
-                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}"),
+                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}") + (f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""),
         ),
         _random_entry_check(r),
         (RANDOM_SIDE_CHECK, *((NOT_APPLICABLE, "long only: there is no side to draw") if r.random_side is None else
@@ -236,8 +263,8 @@ def oos_gaps(r: StudyResult) -> str:
         words.append(
             f"{who[0].upper()}{who[1:]} halted the strategy in {len(halted)} of {n} folds: {' and '.join(split)}. "
             + "; ".join(f"The fold testing to {f.test_end:%b %Y} halted on {f.halted}" for f in halted)
-            + ". A halted run stays flat, as paper does until you resume it. Each fold's run trades through its "
-            "training stretch first, so the position carried into the test is realistic.")
+            + ". A halted run stays flat, as paper does until you resume it. Each test window starts flat "
+            "and trades from its own first bar, so no position or halt is carried in from training.")
     quiet = [f for f in idle if not f.halted]
     if quiet:
         words.append(f"In {len(quiet)} of the windows without a trade no halt was involved: the signal never "
@@ -259,15 +286,17 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = summary(r.oos_benchmark_returns)
     full = summary(daily_returns(r.full_period.equity))
     full_b = summary(daily_returns(r.full_period_benchmark.equity))
-    counts = ledger.counts()
-    trial_sharpes = ledger.sharpes()
-    dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
+    counts = _counts(r, ledger, register)
+    project = ({**register.counts(), "ideas_by_family": register.ideas_by_family()} if register is not None else
+               counts)
+    dsr = (register.deflated_sharpe(r.oos_returns, _idea(r)) if register is not None else
+           deflated_sharpe_probability(r.oos_returns, counts["variants"], ledger.sharpes()))
     years_full = years_covered(r.full_period.equity)
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
     ts = r.trade_stats
@@ -310,7 +339,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
-    checks = g1_checks(r, ledger)
+    checks = g1_checks(r, ledger, register)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
@@ -419,16 +448,21 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## Idea counter")
     out.append("")
-    out.append(f"- {_n(counts['ideas'], 'idea')} and {_n(counts['variants'], 'distinct variant')} tested so far "
-               f"({counts['evaluations']} evaluations including walk-forward refits). By family: "
-               + ", ".join(f"{k} {v}" for k, v in counts["ideas_by_family"].items()))
+    uncertain = f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""
+    if register is not None:
+        out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
+                   f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
+                   f"results are judged by.{uncertain}")
+    out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
+               f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
+               + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
     if math.isnan(dsr):
         out.append("- Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns "
                    "vary, and " + ("these test windows never traded." if r.oos_trades == 0 else
-                                   f"this one has {oos['days']} days."))
+                                   f"this one has {oos['days']} days.") + uncertain)
     else:
         out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
-                   "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
+                   f"is real rather than the best of many tries (higher is better; 95% is a strong bar).{uncertain}")
     out.append("")
     out.append("## Caveats")
     out.append("")

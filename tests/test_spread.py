@@ -24,7 +24,10 @@ def test_a_market_buy_pays_half_the_spread_in_its_price(prices, instrument):
 def test_a_sell_takes_the_bid(prices, instrument):
     closes = [100.0] * 10 + [100.0 * 0.99**i for i in range(1, 30)]
     res = run_backtest("buy_and_hold", _path(prices, closes), instrument, {"stop_loss": 0.05}, half_spread=0.001)
-    assert float(res.fills["avg_px"].iloc[1]) == pytest.approx(95.0 * 0.999, rel=1e-4)
+    # A stop pays max(half spread, 0.05%) in place of the half spread: here the 0.1% half spread, from the bar's low
+    # it is booked at on bars alone (P1-D13).
+    low = float(_path(prices, closes)["low"].loc[res.fills["ts_last"].iloc[1]])
+    assert float(res.fills["avg_px"].iloc[1]) == pytest.approx(low * 0.999, rel=1e-6)
 
 
 @pytest.mark.usefixtures("maker_on")

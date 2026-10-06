@@ -97,8 +97,11 @@ def _notional(fills):
 
 def _rate(order):
     """What the venue charges this order on its notional, as the journal books it: the maker fee on a
-    post-only order, else the taker fee plus the half spread (a backtest books the spread as a cost)."""
-    return MAKER if order["order_type"] == "POST-ONLY LIMIT" else TAKER + HALF
+    post-only order, the taker fee alone on a resting stop (its slippage is booked in its price, P1-D13), else
+    the taker fee plus the half spread (a backtest books the spread as a cost)."""
+    if order["order_type"] == "POST-ONLY LIMIT":
+        return MAKER
+    return TAKER if order["order_type"] == "STOP" else TAKER + HALF
 
 
 def _assert_every_fee(j):
@@ -259,11 +262,25 @@ def _drops(px, stop, n=200, minutes=60):
                          "close": c, "volume": 1e9 / px}, index=idx)
 
 
+def _minutes_of(hours):
+    """Minute bars inside each hour bar, moving in a straight line from its open to its close."""
+    rows = []
+    for ts, b in hours.iterrows():
+        path = np.linspace(b["open"], b["close"], 61)
+        for k in range(60):
+            o, c = path[k], path[k + 1]
+            rows.append((ts - pd.Timedelta(minutes=59 - k), o, max(o, c), min(o, c), c, b["volume"] / 60))
+    return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+
+
 @pytest.mark.parametrize("risk", [0.005, 0.02])
 def test_one_r_is_the_loss_at_the_stop_and_a_stop_loses_one_r(risk):
     inst, px = INSTRUMENTS["BTC"]
     stop = 0.02
-    j = _run(_drops(px, stop), inst, {"period": 2, "stop_loss": stop, "risk_per_trade": risk}).journal
+    # With minute execution bars: on hour bars alone the stop is booked at the bar's low, past its level (P1-D13).
+    hours = _drops(px, stop)
+    j = _run(hours, inst, {"period": 2, "stop_loss": stop, "risk_per_trade": risk}, exec_prices=_minutes_of(hours),
+             exec_minutes=1).journal
     entries = _entries(j)
     assert entries
     for o in entries:
@@ -281,8 +298,8 @@ def test_one_r_is_the_loss_at_the_stop_and_a_stop_loses_one_r(risk):
         got = sum(f["qty"] * f["price"] - f["fee"] for f in by_order[o["order_id"]])
         realised_r = (got - cost) / entry["signal"]["risk_amount"]
         assert realised_r == pytest.approx(-1.0, abs=0.02), (entry, o, realised_r)
-        # And the stop sold at its level, not somewhere else on the bar.
-        assert o["avg_px"] == pytest.approx(entry["avg_px"] * (1 - stop), rel=2e-4), o
+        # And the stop sold at its level less its slippage, max(half spread, 0.05%), not somewhere else on the bar.
+        assert o["avg_px"] == pytest.approx(entry["avg_px"] * (1 - stop) * (1 - max(HALF, 0.0005)), rel=2e-4), o
 
 
 # --- paper and the backtest on the same prices ------------------------------------------------------
@@ -375,7 +392,8 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
     intents = {r[1] for r in paper}
     assert {"entry", "stop_loss"} <= intents or {"entry", "take_profit"} <= intents, intents
     assert [r[:2] for r in paper] == [r[:2] for r in bt]
-    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+    # A backtest stop pays max(half spread, 0.05%) where paper sells at the bid: 4 bp more than the 1 bp half spread.
+    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-6.5, 7.0), "take_profit": (-6.0, 1.0)}
     for p, b in zip(paper, bt):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
         lo, hi = tol[p[1]]
@@ -923,9 +941,14 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
         o, ts = orders[f["order_id"]], pd.Timestamp(f["ts"])
         if o["intent"] in ("risk_pause", "risk_halt"):
             trigger = o["signal"]["trigger"]
-            assert f["price"] == pytest.approx(trigger, abs=1e-6), (o, f)  # at its level
             bar = bars.loc[ts]
             assert bar["low"] <= trigger <= bar["high"] and trigger != bar["close"], (o, bar)
+            # Hour bars alone can't say what traded first inside one, so the stop is booked at the bar's worst price
+            # (or its open on a gap) less its slippage, never kinder than its level (P1-D13).
+            sell = f["side"] == "SELL"
+            gapped = bar["open"] <= trigger if sell else bar["open"] >= trigger
+            worst = bar["open"] if gapped else (bar["low"] if sell else bar["high"])
+            assert f["price"] == pytest.approx(worst * (1 - HALF if sell else 1 + HALF), abs=0.1), (o, f, bar)
             equity = cash + sum(a for t, a in funding if t <= ts) + qty * trigger
             if o["intent"] == "risk_halt":
                 peak = max(10_000.0, res.equity[res.equity.index < ts].max())
@@ -944,7 +967,8 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():
     """B11-2: a perp exit closes the whole position, to zero in the venue's exact quantities, not to a float
     residue a lot below it; so the entry that follows, on either side, opens a fresh position and rests its
-    own stop and target on the far side, the whole of its quantity, every time."""
+    own stop on the far side, the whole of its quantity, every time. (The target doesn't rest: it is judged on
+    each bar after the stop, Advisor NA-2.)"""
     from decimal import Decimal
 
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, "stop_loss": 0.05, "take_profit": 0.2, **PERP},
@@ -962,9 +986,83 @@ def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_sto
         e = orders[i]
         assert e["signal"].get("stop_frac") == pytest.approx(0.05), e
         far = "SELL" if e["side"] == "BUY" else "BUY"
-        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
-        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        legs = {o["intent"]: o for o in orders[i + 1:i + 2]}
+        assert set(legs) == {"stop_loss"}, (e, orders[i + 1:i + 2])
         assert all(o["side"] == far and o["qty"] == pytest.approx(e["filled_qty"]) for o in legs.values()), legs
+
+
+@pytest.mark.parametrize(("strategy", "side"), [("probe_short", -1), ("probe_long", 1)])
+def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_the_journal_and_the_cash(strategy,
+                                                                                                         side):
+    """Advisor NA-2: the backtest's target no longer rests at the venue; a bar that trades through it sells (or
+    buys back) at market and is booked at the target's level. A wick through the 5 % target that closes back
+    near the entry fills at the target, not the close, in the fills report, in the journal and in the equity."""
+    df = _ls_bars(np.full(12, 60_000.0), minutes=60)
+    wick = 57_000.0 * (1 - 0.001) if side < 0 else 63_000.0 * (1 + 0.001)  # just through the 5 % target
+    df.iloc[6, df.columns.get_loc("low" if side < 0 else "high")] = wick
+    res = run_backtest(strategy, df, TICK_INST, {"take_profit": 0.05, **PERP}, starting_capital=10_000,
+                       risk_profile="balanced", bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    entry, tp = sorted(j.orders_.values(), key=lambda o: o["id"])
+    assert (entry["intent"], tp["intent"]) == ("entry", "take_profit")
+    level = tp["signal"]["book_px"]
+    assert level == pytest.approx(60_000.0 * (1 + side * 0.05))  # 5 % from the venue's fill
+    (fill,) = [f for f in j.fills_ if f["order_id"] == tp["order_id"]]
+    (efill,) = [f for f in j.fills_ if f["order_id"] == entry["order_id"]]
+    qty = fill["qty"]
+    assert fill["price"] == level  # the target's level, not the 60,000 close
+    rate = efill["fee"] / (efill["qty"] * efill["price"])  # the taker fee and the half spread, as the entry paid
+    assert fill["fee"] == pytest.approx(qty * level * rate, abs=CENT)  # the fee alone, on the target's price
+    report = res.fills.loc[tp["order_id"]]
+    # The spread moved into the price, with the cent the fee's rounding left (QA m-G7).
+    assert float(report["avg_px"]) == pytest.approx(level * (1 - side * HALF), abs=CENT / qty)
+    pnl = side * qty * (level - efill["price"]) - efill["fee"] - fill["fee"]
+    assert float(res.equity.iloc[-1]) == pytest.approx(10_000 + pnl, abs=2 * CENT)
+
+
+def test_a_perp_short_whose_bar_opens_through_the_target_takes_the_target_not_the_stop():
+    """Advisor NA-2, condition 3, on a short: the bar opens below the target and then rallies through the stop; the
+    open trades first, so the short is bought back at the target's level, journaled as the take-profit."""
+    df = _ls_bars(np.full(12, 60_000.0), minutes=60)
+    df.iloc[6, df.columns.get_loc("open")] = df.iloc[6, df.columns.get_loc("low")] = 56_000.0
+    df.iloc[6, df.columns.get_loc("high")] = 64_000.0
+    res = run_backtest("probe_short", df, TICK_INST, {"stop_loss": 0.05, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    exits = [o for o in j.orders_.values() if o["intent"] != "entry" and o["filled_qty"]]
+    assert [o["intent"] for o in exits] == ["take_profit"], exits
+    (fill,) = [f for f in j.fills_ if f["order_id"] == exits[0]["order_id"]]
+    assert fill["side"] == "BUY" and fill["price"] == pytest.approx(57_000.0)
+
+
+def test_the_target_and_a_reversal_on_one_bar_make_exactly_one_exit_and_never_an_accidental_short():
+    """Advisor NA-2, condition 1: the long's target trades through on the very bar the model turns short. The long
+    is closed once (the take-profit, at its level), nothing sells it a second time, and the short is the model's
+    own entry, of its own size, after the long is flat."""
+    from decimal import Decimal
+
+    df = _ls_bars(np.full(40, 60_000.0), minutes=60)
+    step, period = 3600 * 10**9, 3
+    side = [(1, -1, 0)[(int(ts.value) // step // period) % 3] for ts in df.index]
+    flip = next(i for i in range(2, len(side)) if side[i - 1] == 1 and side[i] == -1 and side[i - 2] == 1)
+    df.iloc[flip, df.columns.get_loc("high")] = 63_500.0  # through the 5 % target, on the bar that turns short
+    res = run_backtest("probe_ls", df, TICK_INST, {"period": period, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    at_flip = [o for o in orders if o["ts"] == df.index[flip]]
+    assert [(o["intent"], o["side"]) for o in at_flip] == [("take_profit", "SELL")], at_flip
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    held = Decimal(0)
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        before = held
+        held += Decimal(str(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] != "entry":
+            assert held == 0 and before != 0, (f, before, held)  # an exit closes exactly what was held
+        else:
+            assert before == 0, (f, before)  # an entry opens from flat: no exit ever carried through it
+    shorts = [o for o in orders if o["intent"] == "entry" and o["side"] == "SELL"]
+    assert any(o["ts"] > df.index[flip] for o in shorts)  # the turn to short still comes, from flat
 
 
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
@@ -1010,7 +1108,8 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
       residue, and each order's filled quantity is the exact sum of its fills;
     - every fill other than an entry is reduce-only: it shrinks the position and never carries it through
       flat to the other side, so no exit, stop or target opens a position, after a halt or otherwise;
-    - every exit closes to exactly zero, and every entry on either side rests a full-size stop and target."""
+    - every exit closes to exactly zero, and every entry on either side rests a full-size stop (the target is
+      judged on each bar after it, Advisor NA-2)."""
     from decimal import Decimal
 
     lot = Decimal(str(XRP_INST.size_increment))
@@ -1039,8 +1138,8 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
     assert len(entries) > 30 and {orders[i]["side"] for i in entries} == {"BUY", "SELL"}
     for i in entries:
         e = orders[i]
-        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
-        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        legs = {o["intent"]: o for o in orders[i + 1:i + 2]}
+        assert set(legs) == {"stop_loss"}, (e, orders[i + 1:i + 2])
         far = "SELL" if e["side"] == "BUY" else "BUY"
         assert all(o["side"] == far and Decimal(str(o["qty"])) == Decimal(str(e["filled_qty"]))
                    for o in legs.values()), (e, legs)
@@ -1173,7 +1272,9 @@ def test_a_reconcile_halt_in_a_backtest_keeps_the_resting_stop(prices, instrumen
     fills = res.fills.sort_values("ts_last")
     intents = [res.decisions[o]["intent"] for o in fills.index]
     assert intents == ["entry", "stop_loss"], intents
-    assert float(fills.loc[fills.index[1], "avg_px"]) == pytest.approx(98.0, rel=1e-3)
+    # Bars only: the stop is booked at the low of the bar that traded through it, less its slippage (P1-D13).
+    low = float(_path(prices, closes)["low"].loc[fills.loc[fills.index[1], "ts_last"]])
+    assert low < 98.0 and float(fills.loc[fills.index[1], "avg_px"]) == pytest.approx(low * (1 - 0.0005), rel=1e-4)
 
 
 def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():

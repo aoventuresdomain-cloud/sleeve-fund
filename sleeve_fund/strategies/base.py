@@ -24,7 +24,7 @@ from nautilus_trader.config import StrategyConfig
 from datetime import datetime, timedelta, timezone
 
 from nautilus_trader.core import UUID4
-from nautilus_trader.model import (Bar, BarType, ClientOrderId, ContingencyType, InstrumentId, LimitOrder, Money, OrderSide,
+from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, Money, OrderSide,
                                    OrderStatus, OrderType, Price, PriceType, Quantity, StopMarketOrder, TimeInForce,
                                    TriggerType)
 from nautilus_trader.trading import Strategy
@@ -183,6 +183,91 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
     liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
+
+
+# A decision this long after its bar's close (a bar missed over a restart, m13-E3) opens or adds to nothing: the
+# price has moved on from the signal. Exits and reductions always run, however late (Independent Quant Advisor,
+# 5 Oct 2026). The same limit the hub client puts on a refilled bar.
+LATE_DECISION_NS = 90 * 1_000_000_000
+# Paper: this long with no trade while in a position is venue time no price reached the strategy for (QA P1-L1).
+# A quiet market's pause that long only replays minutes whose prices the live checks saw already.
+UNSEEN_GAP_NS = 15 * 1_000_000_000
+
+
+def late_bar(bars: list, now_ns: int, step_ns: int, last_alive: datetime | None, last_order_at: datetime | None):
+    """m13-E3: the latest warm-up bar, when it closed while the strategy was down and is still the latest
+    closed bar, so it is decided on once rather than only warmed up on. last_alive: the previous process's last
+    heartbeat. None (warm-up only) for a first start, when that process was still alive at the close (it saw
+    the bar), when an order was journaled at or after the close (it acted on it), or when the bar is a bar or
+    more old (a newer bar decides instead). Decided more than LATE_DECISION_NS after its close, it can only
+    exit or reduce (_late_entry)."""
+    if not bars or last_alive is None:
+        return None
+    last = bars[-1]
+    if now_ns - last.ts_event >= step_ns or _ns(last_alive) >= last.ts_event:
+        return None
+    if last_order_at is not None and _ns(last_order_at) >= last.ts_event:
+        return None
+    return last
+
+
+def outage_fill_note(decision: dict | None, px: float) -> str | None:
+    """For the first fill of an exit sent because its level was crossed while the strategy or its market data
+    was away (_replay_missed): the price it is booked at, from that level, and the market's price on return.
+    None for any other fill, or a later one."""
+    signal = (decision or {}).get("signal") or {}
+    level = signal.pop("outage_level", None)
+    if level is None:
+        return None
+    what = decision.get("intent", "exit").replace("_", "-")
+    back = signal.get("market_on_return")
+    return (f"The {what} is booked at {px:,.6g}, {px / level - 1:+.2%} from its {level:,.6g} level, as the venue "
+            f"would have filled it in the minute to {signal.get('breached_at', '?')}, reached "
+            f"{signal.pop('outage_while', 'while the strategy was down')}"
+            + (f"; the market was {back:,.6g} on return" if back else ""))
+
+
+# Advisor NA-1 to NA-3 (6 Oct 2026, 16:53): minutes no price reached the strategy for are replayed as the venue's
+# resting orders would have traded them. Within one minute the adverse side goes first: the venue's liquidation
+# and resting stop, then this strategy's own risk guard, and the target only after them.
+_VENUE_FIRST = ("liquidation", "stop_loss")
+_GUARD_ORDER = ("risk_halt", "risk_pause", "liquidation_cut")  # as the tick judges: the halt or pause, then the cut
+
+
+def replay_missed(minutes, side: int, venue: dict, guards: dict, target: float | None):
+    """The first exit over `minutes` ((close ns, open, high, low), in time order) for a position on `side`, as
+    (intent, booked price, level, close ns, the minute's worst price for the position), or None.
+
+    venue: {"liquidation": price, "stop_loss": price}, what the venue does on its own; guards: {"risk_halt",
+    "risk_pause", "liquidation_cut": price}, the levels where this strategy's risk guard acts; target: the
+    take-profit price. In each minute: an open already past the liquidation price or the stop fills there at the
+    open (a gap); an open through the target fills it at its level. Then the low (long) or high (short): the stop,
+    which always sits short of liquidation, at its level, or else the liquidation price; else the guard, at the
+    level of the first one the tick would act on. Then the target, only when the price traded through it, at its
+    level, never better."""
+    for close, o, h, lo in minutes:
+        worst, best = (lo, h) if side > 0 else (h, lo)
+        for intent in _VENUE_FIRST:
+            level = venue.get(intent)
+            if level is not None and side * (o - level) <= 0:
+                return intent, o, level, close, worst
+        if target is not None and side * (o - target) > 0:
+            return "take_profit", target, target, close, worst
+        for intent in ("stop_loss", "liquidation"):
+            level = venue.get(intent)
+            if level is not None and side * (worst - level) <= 0:
+                return intent, level, level, close, worst
+        for intent in _GUARD_ORDER:
+            level = guards.get(intent)
+            if level is not None and side * (worst - level) <= 0:
+                return intent, level, level, close, worst
+        if target is not None and side * (best - target) > 0:
+            return "take_profit", target, target, close, worst
+    return None
+
+
+def _hhmm(ns: int) -> str:
+    return f"{datetime.fromtimestamp(ns / 1e9, tz=timezone.utc):%H:%M}"
 
 
 def _side_word(side: int) -> str:
@@ -394,6 +479,7 @@ class LongFlatStrategy(Strategy):
         self._last_tick_ns = 0
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
+        self._opened_seq = -1  # backtests: the venue's bar (fee_model.bar_seq) the last entry or add filled in
         self._entry_qty = 0.0  # its size, unsigned
         self._entry_side = 0  # +1 long, -1 short, 0 flat
         # Perp only. A signal that turns a long short (or the other way) closes first; the new side opens
@@ -486,6 +572,24 @@ class LongFlatStrategy(Strategy):
         # Every order's intent, reason and signal by client order id, in backtests too, so a
         # backtest can show why each trade happened exactly as paper and live do.
         self.decisions: dict[str, dict] = {}
+        # Paper (v2 P1-2): the decision bar's close and arrival (ns) while on_bar decides, for each order's timing.
+        self._deciding: tuple[int, int] | None = None
+        self._late: Bar | None = None  # paper, m13-E3: a bar that closed while the strategy was down (late_bar)
+        self._lag: int | None = None  # ns: this decision came more than LATE_DECISION_NS after its bar's close
+        self._late_skips: list[int] = []  # the closes of the late bars an opening was skipped on, this run
+        self._last_alive: datetime | None = None  # paper: the previous process's last heartbeat
+        self._last_seen: datetime | None = None  # paper: the last market data the previous process saw
+        self._outage_check = False  # paper: check the open position's stop and target over the outage first
+        # Paper: the minutes no price reached the strategy for are replayed for the open position (_replay_missed).
+        # The booking the next exit carries (book_px and the market on return), until _submit takes it; the
+        # close of the latest minute replayed or seen in a position (nothing at or before it is replayed again);
+        # the latest trade's venue time; spans of venue time with no trade while in a position, (from, to); and,
+        # after such a span, (its end, when to stop waiting) while its minutes are awaited before the live checks.
+        self._outage_book: dict | None = None
+        self._replayed_to = 0
+        self._trade_ns: int | None = None
+        self._unseen: list[tuple[int, int]] = []
+        self._awaiting: tuple[int, int] | None = None
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -569,6 +673,9 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
+        if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
+            self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
+            self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
         self._plan_resume()
         if self._cfg.warmup_bars:
             if self.history_loader is not None and (str(self._cfg.bar_type).endswith("INTERNAL") or self.hub_fed):
@@ -586,6 +693,7 @@ class LongFlatStrategy(Strategy):
                 self._entry_px, self._entry_qty = book["entry_px"], abs(book["qty"])
                 self._entry_side = 1 if book["qty"] > 0 else -1
                 self._restore_plan()
+                self._outage_check = not self.runtime.backtest and self._last_alive is not None
                 if self._margin and not self.runtime.backtest:
                     self._restore = {"qty": book["qty"], "entry": book["entry_px"]}
             if self._margin:
@@ -621,13 +729,29 @@ class LongFlatStrategy(Strategy):
             self.recorder.trade(tick)
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
+        self._note_trade(int(tick.ts_event))
         if self._restore is not None:
             self._send_restore()
             return
+        if self._outage_check:
+            self._outage_check = False
+            if self._check_outage_exits():
+                self._late = None  # out of the position: the missed bar is warm-up only, nothing to exit
+                return
+        if self._late is not None:
+            self._decide_late()
         if self._kept:
             self._tape(tick)
-        if self._check_exits(self._last_close):
+        if self._still_awaiting():
+            self._maybe_tick()  # the stop and target wait for the missed minutes' replay
+            self._publish_signals()
             return
+        try:
+            if self._check_exits(self._last_close):
+                return
+        finally:
+            if self._pending_exit is None:
+                self._outage_book = None  # a fallback flag the live check didn't use
         if self._margin and self._guard_breached(self._last_close):
             self._on_tick()  # leveraged: the guards act on the trade, not on the next 30-second tick
             return
@@ -661,6 +785,7 @@ class LongFlatStrategy(Strategy):
             self._intrabar_guard(bar)
         if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
             self._on_tick()
+        self._bar_target(bar)
         self._rest_risk_stop()
 
     def _maybe_tick(self) -> None:
@@ -1009,6 +1134,12 @@ class LongFlatStrategy(Strategy):
         else:
             why = "the history store has none"
         level = "info" if bars else "warning"
+        if bars and self.runtime is not None and not self.runtime.backtest:
+            last = self.runtime.store.orders(self.runtime.name, limit=1)
+            self._late = late_bar(bars, time.time_ns(), bar_minutes(self._cfg.bar_type) * 60_000_000_000,
+                                  self._last_alive, last[0]["ts"] if last else None)
+            if self._late is not None:  # decided on with the first trade, once the position is back (_decide_late)
+                bars = bars[:-1]
         if bars:
             self.on_historical_bars(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
@@ -1151,8 +1282,14 @@ class LongFlatStrategy(Strategy):
         reason, values = self.explain(bar, side)
         values = {**values, "close": close}
         if current != 0:
-            self._flip = (side, bar, reason, values) if side != 0 else None
+            # Late, a reversal only closes: the new side would open on a stale signal.
+            flip = side != 0 and not self._late_entry(bar, f"{_side_word(side)} entry after closing the "
+                                                           f"{_side_word(current)}")
+            self._flip = (side, bar, reason, values) if flip else None
+            self._late_exit(bar)
             self._sell_all("exit", reason, values)
+            return
+        if self._late_entry(bar, f"{_side_word(side)} entry"):
             return
         self._open(side, bar, reason, values)
 
@@ -1237,6 +1374,235 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
+        self._deciding = None
+        try:
+            self._on_bar(bar)
+        finally:
+            self._deciding = self._lag = None
+
+    def _decide_late(self) -> None:
+        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest.
+        A bar since makes it warm-up only. Past LATE_DECISION_NS it only exits or reduces (_late_entry)."""
+        late, self._late = self._late, None
+        lag = self._now_ns() - late.ts_event
+        if lag >= bar_minutes(self._cfg.bar_type) * 60_000_000_000:
+            self.on_historical_bars([late])
+            return
+        self.runtime.store.event(self.runtime.name, "info", "late_bar",
+                                 f"Decided on the {_hhmm(late.ts_event)} candle {lag / 1e9:.0f} s after its close: it "
+                                 "closed while the strategy was down")
+        self.on_bar(late)
+
+    def _now_ns(self) -> int:
+        return self.clock.timestamp_ns()
+
+    def _late_entry(self, bar: Bar, what: str) -> bool:
+        """True when this decision is too late to open or add (LATE_DECISION_NS after its bar's close). The first
+        skip of a run of late bars is said with its lag, and the run's extent once a bar is on time again
+        (_end_late_run), so the fills-against-model check before G2 can count what was skipped (QA P1-L4)."""
+        if self._lag is None:
+            return False
+        self._late_skips.append(int(bar.ts_event))
+        if self.runtime is not None and len(self._late_skips) == 1:
+            article = "an" if what[:1] in "aeiou" else "a"
+            self.runtime.store.event(self.runtime.name, "warning", "late_entry_skipped",
+                                     f"Skipped {article} {what} on the {_hhmm(bar.ts_event)} candle: decided "
+                                     f"{self._lag / 1e9:.1f} s after its close, past the {LATE_DECISION_NS // 10**9} s "
+                                     f"limit for opening (candle close {bar.close.as_double():,.6g}, price now "
+                                     f"{self._price():,.6g}); later skips in this run of late candles are summed up "
+                                     "once the feed is current")
+        return True
+
+    def _end_late_run(self) -> None:
+        """An on-time decision after a run of late bars that skipped openings: say the run's extent once."""
+        skips, self._late_skips = self._late_skips, []
+        if len(skips) > 1 and self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info", "late_entries_summary",
+                                     f"Skipped opening on {len(skips)} late candles, {_hhmm(skips[0])} to "
+                                     f"{_hhmm(skips[-1])}; the feed is current again")
+
+    def _late_exit(self, bar: Bar) -> None:
+        """An exit or reduction runs however late; a late one is said with its lag and both prices."""
+        if self._lag is not None and self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "late_exit",
+                                     f"Exiting on the {_hhmm(bar.ts_event)} candle {self._lag / 1e9:.0f} s after its "
+                                     f"close (candle close {bar.close.as_double():,.6g}, price now "
+                                     f"{self._price():,.6g})")
+
+    def _check_outage_exits(self) -> bool:
+        """Paper, on the first trade after a restart with a position open: the process that was down watched
+        nothing, so replay the stored minutes since it last saw market data (_outage_since) as the venue's
+        resting orders would have traded them (_replay_missed). Minutes that can't be loaded leave the price on
+        return to decide, at market, with the exit flagged as that fallback (Advisor NA-1). True if an exit was
+        sent."""
+        if self._entry_px is None or self.history_loader is None or self._busy() or not self._replay_watches():
+            return False
+        since = self._outage_since()
+        minute = BarType.from_str(f"{self._cfg.instrument_id}-1-MINUTE-LAST-INTERNAL")
+        try:
+            bars = self.history_loader(self.instrument, minute, int((time.time_ns() - since) // 60_000_000_000) + 2)
+        except Exception as exc:  # noqa: BLE001 - said; the price on return decides, flagged
+            self.runtime.store.event(self.runtime.name, "warning", "outage_unchecked",
+                                     f"Couldn't replay the minutes the strategy was down for: {exc}; the stop and "
+                                     "target are checked at the price now instead, and an exit is flagged so")
+            return self._fallback_exit("the minutes the strategy was down for couldn't be loaded")
+        self._replayed_to = max(self._replayed_to, since)
+        return self._replay_missed(bars, "while the strategy was down")
+
+    def _outage_since(self) -> int:
+        """Where a restart's replay starts: the last market data the previous process saw, or its last heartbeat
+        if earlier (QA P1-L3: a process keeps its heartbeat through a hub outage until its watchdog gives up).
+        With no market data on record, the open position's last fill, the earliest its stop could matter."""
+        name = self.runtime.name
+        fills = self.runtime.store.fills(name, limit=1)
+        fill = _ns(fills[0]["ts"]) if fills else None
+        seen = self._last_seen
+        latest = min(_ns(self._last_alive), _ns(seen)) if seen is not None else None
+        if latest is None:
+            return fill if fill is not None else _ns(self._last_alive)
+        return max(latest, fill) if fill is not None else latest
+
+    def _replay_watches(self) -> bool:
+        """The open position has something a replay can act on: a stop or target, or on a perp its liquidation
+        price and the risk guard."""
+        return self._margin or self._stop_frac is not None or bool(self._tp_frac)
+
+    def _note_trade(self, ts: int) -> None:
+        """Paper: a trade at venue time ts. A stretch over UNSEEN_GAP_NS with no trade while in a position is
+        venue time no price reached the strategy for (the hub or its venue away): its minutes are replayed when
+        they arrive (_check_unseen_exits), and the live stop and target wait for them until LATE_DECISION_NS
+        has passed (QA P1-L1, Advisor NA-1)."""
+        last = self._trade_ns
+        self._trade_ns = ts if last is None else max(ts, last)
+        if last is None or self._backtest or self._entry_px is None or ts - last <= UNSEEN_GAP_NS:
+            return
+        self._unseen.append((last, ts))
+        if self._replay_watches():
+            self._awaiting = (ts, self._now_ns() + LATE_DECISION_NS)
+
+    def _still_awaiting(self) -> bool:
+        """True while the minutes of a stretch with no trade are awaited, so the live checks wait for the replay.
+        Past the wait, the live checks go ahead at the price now, and an exit they send is flagged as that
+        fallback (Advisor NA-1)."""
+        if self._awaiting is None:
+            return False
+        if self._entry_px is None:
+            self._awaiting = None
+            return False
+        if self._now_ns() < self._awaiting[1]:
+            return True
+        self._awaiting = None
+        self.runtime.store.event(self.runtime.name, "warning", "outage_unchecked",
+                                 f"The minutes the market data feed missed didn't arrive within "
+                                 f"{LATE_DECISION_NS // 10**9} s; the stop and target are checked at the price "
+                                 "now instead, and an exit is flagged so")
+        self._outage_book = {"outage_fallback": "market on return: the missed minutes didn't arrive"}
+        return False
+
+    def _fallback_exit(self, why: str) -> bool:
+        """The live check at the price now, its exit flagged as the market-on-return fallback (Advisor NA-1)."""
+        self._outage_book = {"outage_fallback": f"market on return: {why}"}
+        try:
+            return self._check_exits(self._last_close)
+        finally:
+            if self._pending_exit is None:
+                self._outage_book = None
+
+    def _check_unseen_exits(self, bar: Bar) -> bool:
+        """QA P1-L1: a decision bar holding venue time no price reached the strategy for (a stretch with no
+        trade, _note_trade, or one still open as the bar arrives), late or not. Its minutes are replayed
+        (_replay_missed): from the history store on bars longer than a minute when it has them all, else the
+        bar itself. True if an exit was sent."""
+        if self._backtest or self.runtime is None or self._entry_px is None or self._restore is not None:
+            return False
+        end = int(bar.ts_event)
+        start = end - bar_minutes(self._cfg.bar_type) * 60_000_000_000
+        spans = list(self._unseen)
+        if self._trade_ns is not None and end - self._trade_ns > UNSEEN_GAP_NS:
+            spans.append((self._trade_ns, end))
+        self._unseen = [(a, b) for a, b in self._unseen if b > end]
+        if self._awaiting is not None and end >= self._awaiting[0]:
+            self._awaiting = None  # its minutes are all here now
+        if not any(b > start and a < end for a, b in spans) or self._busy() or not self._replay_watches():
+            return False
+        return self._replay_missed(self._unseen_minutes(bar, start, end) or [bar],
+                                   "while the market data feed was away")
+
+    def _unseen_minutes(self, bar: Bar, start: int, end: int) -> list:
+        """The stored minutes of a bar longer than a minute, when the history store has every one of them."""
+        if self.history_loader is None or end - start <= 60_000_000_000:
+            return []
+        minute = BarType.from_str(f"{self._cfg.instrument_id}-1-MINUTE-LAST-INTERNAL")
+        try:
+            got = [b for b in self.history_loader(self.instrument, minute, (end - start) // 60_000_000_000 + 2)
+                   if start < b.ts_event <= end]
+        except Exception:  # noqa: BLE001 - the bar itself is replayed instead
+            return []
+        return got if len(got) == (end - start) // 60_000_000_000 else []
+
+    def _replay_missed(self, bars: list, while_: str) -> bool:
+        """Advisor NA-1 to NA-3: replay minutes no price reached the strategy for as the venue's resting orders
+        would have traded them (replay_missed), and send the first exit they make, booked at the replayed price
+        with the market's price now beside it. The stop, target and liquidation close the position; the risk
+        guard acts through the tick, as it would have on the worst price. True if an exit was sent."""
+        side, entry = self._entry_side or 1, self._entry_px
+        venue, guards = {}, {}
+        if self._stop_frac is not None:
+            venue["stop_loss"] = entry * (1 - side * self._stop_frac)
+        target = entry * (1 + side * self._tp_frac) if self._tp_frac else None
+        cash = qty = 0.0
+        if self._margin and self.runtime is not None:
+            equity, cash, qty, _ = self._mark()
+            liq = self._liq(cash, qty) if qty else None
+            if liq is not None:
+                d = self.runtime.profile.min_liquidation_distance
+                venue["liquidation"] = liq
+                guards["liquidation_cut"] = liq / (1 - d) if side > 0 else liq / (1 + d)
+            if qty:
+                p, day_open = self.runtime.profile, self.runtime._day_open or equity
+                guards["risk_halt"] = (max(self.runtime.peak, equity) * (1 - p.max_drawdown) - cash) / qty
+                guards["risk_pause"] = (day_open * (1 - p.daily_loss) - cash) / qty
+                guards = {k: v for k, v in guards.items() if v > 0}
+        rows = sorted((int(b.ts_event), b.open.as_double(), b.high.as_double(), b.low.as_double())
+                      for b in bars if int(b.ts_event) > self._replayed_to)
+        if rows:
+            self._replayed_to = rows[-1][0]
+        hit = replay_missed(rows, side, venue, guards, target)
+        if hit is None:
+            return False
+        intent, px, level, at, worst = hit
+        now = self._price()
+        words = {"stop_loss": "stop", "take_profit": "target", "liquidation": "liquidation price",
+                 "liquidation_cut": "cut before liquidation", "risk_halt": "drawdown halt's level",
+                 "risk_pause": "daily-loss pause's level"}[intent]
+        gap = " (it opened past it)" if px != level else ""
+        reason = (f"{intent.replace('_', '-').capitalize()} reached {while_}: the price passed the {level:,.6g} "
+                  f"{words} in the minute to {_hhmm(at)}{gap}; booked at {px:,.6g}, as the venue would have "
+                  f"filled it, and closing now at about {now:,.6g}")
+        self.runtime.store.event(self.runtime.name, "warning", "outage_exit", reason)
+        self._outage_book = {"book_px": round(px, 8), "market_on_return": now, "outage_level": round(level, 8),
+                             "outage_while": while_, "breached_at": _hhmm(at)}
+        try:
+            if intent in EXIT_LEGS:
+                self._exit_lock = side if self._margin else True
+                self._entry_px = None  # don't fire again while the order is in flight
+                self._sell_all(intent, reason, {"entry_px": entry, intent: self._stop_frac if intent == "stop_loss"
+                                                else self._tp_frac})
+            elif intent == "liquidation":
+                self._liquidation_guard(cash, qty, px)
+            else:  # the risk guard: the tick judges the equity at the minute's worst price, as it would have
+                self._guard_equity = cash + qty * worst
+                self._guard_price = px if intent == "liquidation_cut" else None
+                self._on_tick()
+        finally:
+            if self._pending_exit is None:
+                self._outage_book = None  # taken by the order, or nothing was sent
+        return True
+
+    def _on_bar(self, bar: Bar) -> None:
+        if self._late is not None and bar.ts_event > self._late.ts_event:  # a newer bar first: warm-up only
+            late, self._late = self._late, None
+            self.on_historical_bars([late])
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
@@ -1247,6 +1613,11 @@ class LongFlatStrategy(Strategy):
         bar = self._fill_gap(bar)
         if not self._accept(bar):
             return
+        self._deciding = (int(bar.ts_event), int(bar.ts_init))
+        lag = 0 if self._backtest or self.runtime is None else self._now_ns() - bar.ts_event
+        self._lag = lag if lag > LATE_DECISION_NS else None
+        if self._lag is None and self._late_skips:
+            self._end_late_run()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
         if self.pessimistic and self._exec_type is None:
@@ -1267,7 +1638,8 @@ class LongFlatStrategy(Strategy):
             return
         if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
-        if self._check_exits(self._last_close):
+        if (self._check_unseen_exits(bar) or (self._exec_type is None and self._bar_target(bar))
+                or self._check_exits(self._last_close)):
             return
         if self._margin:
             if self._restore is None:
@@ -1286,7 +1658,7 @@ class LongFlatStrategy(Strategy):
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
-            if self._exit_lock:
+            if self._exit_lock or self._late_entry(bar, "long entry"):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
@@ -1315,6 +1687,7 @@ class LongFlatStrategy(Strategy):
             self._held_w = w
         elif w == 0 and is_long:
             reason, values = self.explain(bar, False)
+            self._late_exit(bar)
             self._sell_all("exit", reason, {**values, "close": close})
             self._held_w = 0.0
         elif w > 0 and is_long and self._cfg.rebalance_band is not None:
@@ -1322,6 +1695,10 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
+                if w > self._held_w and self._late_entry(bar, "addition"):
+                    return
+                if w < self._held_w:
+                    self._late_exit(bar)
                 reason, values = self.explain(bar, True)
                 if self._rebalance(bar, w, reason, {**values, "target_weight": round(float(raw), 6), "close": close}):
                     self._held_w = w
@@ -1391,18 +1768,54 @@ class LongFlatStrategy(Strategy):
         self._submit(side, size, "rebalance", reason, signal)
         return True
 
+    def _bar_target(self, bar: Bar) -> bool:
+        """Backtests: the target, judged on a bar the venue has already matched. The stop rests at the venue
+        (_rest_exits), so a bar that reached it has sold the position before this runs: within a bar the stop
+        goes before the target (Advisor NA-2, as the outage replay does), whichever extreme was nearer the
+        open, unless the bar opened through the target (_rebook_as_target). A bar that traded through the target
+        sells at market, booked at the target's level, as the resting limit filled, with the taker fee paper's
+        market exit pays (the fee model carries the difference: ScheduleFeeModel.booked). True if sent."""
+        tp, side = self._tp_frac, self._entry_side or 1
+        if (not self._backtest or not tp or self._entry_px is None or self._pending_exit is not None
+                or self._busy() or self._pos_side() == 0):
+            return False
+        if self.fee_model is not None and self._opened_seq == self.fee_model.bar_seq:
+            return False  # filled inside this bar: its extremes may have come before the fill, so judge from the next
+        level = Price(self._entry_px * (1 + side * tp), self.instrument.price_precision).as_double()
+        if not (bar.high.as_double() > level if side > 0 else bar.low.as_double() < level):
+            return False  # a limit fills only when the price trades through it (fill_model)
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info", "take_profit", f"exit at {level:,.4f}, "
+                                     f"{side * tp:+.2%} from entry", ts=self.runtime.now())
+        reason = (f"Take-profit: resting {'sell' if side > 0 else 'buy'} at {level:,.6g}, {tp:.1%} "
+                  f"{'above' if side > 0 else 'below'} the {self._entry_px:,.6g} entry"
+                  + (f" ({self._cfg.take_profit_r:g}R after costs)" if self._cfg.take_profit_r else "")
+                  + "; the price traded through it, so it fills at that level (a bar that also reached the "
+                  "stop takes the stop first)")
+        values = {"entry_px": self._entry_px, "take_profit": tp, "limit_px": level}
+        self._exit_lock = side if self._margin else True
+        self._entry_px = None
+        self._outage_book = {"book_px": level}
+        try:
+            self._sell_all("take_profit", reason, values)
+        finally:
+            if self._pending_exit is None:
+                self._outage_book = None  # taken by the order, or nothing was sent
+        return True
+
     def _check_exits(self, price: float) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent.
 
         Paper and live call this on every trade, so both levels are watched tick by tick. A
-        backtest only sees whole bars, so both exits rest at the venue instead (_rest_exits)."""
+        backtest only sees whole bars: the stop rests at the venue (_rest_exits) and the target is
+        judged on each bar after it (_bar_target)."""
         stop, tp = self._stop_frac, self._tp_frac
         if self._entry_px is None or (stop is None and not tp) or price <= 0:
             return False
         if self._busy():
             return False
         if self._backtest:
-            return False  # both exits rest at the venue (_rest_exits) and fill at their levels
+            return False  # the stop rests at the venue, the target is judged on the bar (_bar_target)
         if self._restore is not None:
             return False  # the position isn't back at the simulated venue yet
         side = self._entry_side or 1
@@ -1442,7 +1855,8 @@ class LongFlatStrategy(Strategy):
         # Free cash leaves room for the taker fee and rounding so a full-size buy never rejects;
         # the other limits are sizes in their own right, and their fee comes out of the spare cash.
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
-        limits = {"free cash": free.as_decimal() * room}
+        # Never more than the journal's cash either, when an exit booked at a replayed price left it lower.
+        limits = {"free cash": (free.as_decimal() + Decimal(str(min(self._cash_adj, 0.0)))) * room}
         if weight < 1:
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         if self._cfg.max_notional is not None:
@@ -1504,11 +1918,16 @@ class LongFlatStrategy(Strategy):
         return self._cfg.assumed_half_spread
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
-        """Send an order, journaling it with its reason first so the record exists before the venue sees
-        it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first."""
+        """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
+        it, or not sent (a failed write raises here); paper's queued journal sends an exit or stop whatever
+        happens to its row, and an unwritten row is an incident (paper.queued, QA P1-L5). With
+        maker_wait_minutes set, signal-driven orders rest as post-only limits first."""
+        decided = self.clock.timestamp_ns()
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         wait = self._cfg.maker_wait_minutes
         last, tick = self._price(), self.instrument.price_increment.as_double()
+        if self._outage_book is not None and intent not in OPENING_INTENTS:
+            signal, self._outage_book = {**signal, **self._outage_book}, None  # a replayed exit's booking
         signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
         signal.setdefault("price", last)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
@@ -1531,10 +1950,15 @@ class LongFlatStrategy(Strategy):
             self._book_at[coid], self._book_stop_at = self._book_stop_at, None
             signal["booked_at"] = round(self._book_at[coid], 8)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        if self._backtest and "book_px" in signal and self.fee_model is not None:
+            self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
+        bar_close, bar_recv = self._deciding or (None, None)
         if self.runtime is not None:
+            # A decision on a bar is timed from its order's own journal row (a risk stop or restore is not).
+            timing = {"bar_close": bar_close, "bar_recv": bar_recv, "decided": decided} if bar_close else None
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
-                                  order_type="POST-ONLY LIMIT" if maker else "MARKET")
+                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing)
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}
@@ -1545,6 +1969,8 @@ class LongFlatStrategy(Strategy):
             self.submit_order(order)
             if maker:
                 self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        if self.runtime is not None and coid not in self._kept:
+            self.runtime.on_timing(coid, sent=self.clock.timestamp_ns())
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
@@ -2206,6 +2632,7 @@ class LongFlatStrategy(Strategy):
             cash = cash - qty * avg + self._cash_adj
             return cash + qty * price, cash, qty, price
         qty = sum(totals.get(c, 0.0) for c in self._codes("base"))
+        cash += self._cash_adj  # an exit booked at a replayed price (Advisor NA-1): the journal's cash
         return cash + qty * price, cash, qty, price
 
     def _market_seen(self) -> None:
@@ -2319,6 +2746,8 @@ class LongFlatStrategy(Strategy):
     def on_order_accepted(self, event) -> None:
         self._order_status(event, "accepted")
         coid = str(event.client_order_id)
+        if self.runtime is not None:
+            self.runtime.on_timing(coid, accepted=int(event.ts_init))
         if coid in self._cancel_on_accept:  # a flatten was waiting for the venue to have this order
             self._cancel_on_accept.discard(coid)
             order = self.cache.order(event.client_order_id)
@@ -2457,13 +2886,30 @@ class LongFlatStrategy(Strategy):
             journal_id = kept_id
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
-        booked = self.fee_model.booked.pop(coid, None) if self.fee_model is not None else None
-        if booked is not None:
-            # A backtest's resting exit, booked by the fee model (ScheduleFeeModel.exit_price): the journal keeps the
-            # price it was booked at and the venue's fee alone, as the fills report does (runner._spread_into_prices).
-            px, fee = booked
-        if self.fee_model is not None and coid in self.fee_model.rebooked:
-            self._rebooked_as_stop(coid, px)
+        book = ((self.decisions.get(journal_id) or {}).get("signal") or {}).get("book_px")
+        if self._backtest and self.fee_model is not None and coid in self.fee_model.rebooked:
+            book = self._rebook_as_target(coid, self.fee_model.rebooked.pop(coid), px)
+        if book and kept_id is None and self._backtest:
+            # A backtest's target (_bar_target): the fee model charged the difference from its level with the fee
+            # (ScheduleFeeModel.booked), so the account already holds the target's cash. Journal the fee alone.
+            fee -= sign * qty * (book - px)
+            px = book
+        elif book and kept_id is None:
+            # A replayed exit (Advisor NA-1): journaled at the price the venue's resting order would have had. The
+            # account's cash keeps the journal's, as for a restore; the fee is the venue's rate on that price.
+            fee = fee * book / px if px else fee
+            self._cash_adj += sign * qty * (px - book)
+            px = book
+        queued = self.fee_model.exit_booked.get(coid) if self.fee_model is not None else None
+        booked = queued.pop(0) if queued else None
+        if booked is not None and not book:
+            # A backtest's resting stop, booked by the fee model (ScheduleFeeModel.exit_price): the journal keeps the
+            # price it was booked at and the rest of the charge as the fee (the venue's, with the rounding carried
+            # from earlier fees), as the fills report does (runner._spread_into_prices).
+            px, fee = booked[0], fee - booked[1]
+        note = outage_fill_note(self.decisions.get(journal_id), px)
+        if note is not None and self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
         else:
@@ -2479,6 +2925,10 @@ class LongFlatStrategy(Strategy):
                     self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
                     self._stop_frac = self._tp_frac = None
                     self._replan_pending = self._plan_entry = None
+        if opening and self.fee_model is not None:
+            self._opened_seq = self.fee_model.bar_seq
+        if opening:  # minutes before this fill are no one's to replay for this position
+            self._replayed_to = max(self._replayed_to, int(event.ts_event))
         if opening:
             self._entry_fill_ns = self.clock.timestamp_ns()
             if self._has_exits and self._stop_frac is None and not self._tp_frac:
@@ -2516,6 +2966,7 @@ class LongFlatStrategy(Strategy):
                 self._journal_risk_stop(order, px)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
+            self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
         if self._margin and self._entry_side == 0:
             self._cover_shortfall(px)
         if coid == self._risk_stop_id:
@@ -2556,16 +3007,16 @@ class LongFlatStrategy(Strategy):
         return opening
 
     def _rest_exits(self) -> None:
-        """Backtests: after an entry fills, rest the exits at the venue as real orders would sit there.
-        (Paper and live watch every trade instead.) The stop is a sell stop at its level and the target
-        a sell limit at its level, linked one-updates-the-other: a fill on either shrinks the other by as
-        much, so together they never sell more than is held. A flatten cancels both first (_sell_all). The venue fills a
-        stop at its level, or at the open when the price gaps through it, and a target at its level; the fee model then
-        books each (ScheduleFeeModel.exit_price): a stop with its slippage, a target with no spread, and on bars that
-        can't show what traded first inside them, a stop at the bar's worst price and the stop first when both lay
-        inside one bar (P1-D13)."""
+        """Backtests: after an entry fills, rest the stop at the venue as a real order would sit there (paper and
+        live watch every trade instead): a sell stop at its level, filling there, or at the open when the price
+        gaps through it. A flatten cancels it first (_sell_all). The target doesn't rest: within a bar the adverse
+        side trades first (Advisor NA-2), so the venue takes the stop on the bar and the target is judged after it,
+        on what the bar left (_bar_target). The open trades before either: a stop filled in a bar that opened through
+        the target is booked as the target (ScheduleFeeModel.open_targets, _rebook_as_target). The fee model books the
+        stop with its slippage, and on bars that can't show what traded first inside them, at the bar's worst price
+        (ScheduleFeeModel.exit_price, P1-D13)."""
         cfg = self._cfg
-        plan = {"stop_loss": self._stop_frac, "take_profit": self._tp_frac}
+        plan = {"stop_loss": self._stop_frac}
         if not any(plan.values()) or self._entry_px is None:
             return
         if self.runtime is not None and self.runtime.status != "running":
@@ -2587,48 +3038,30 @@ class LongFlatStrategy(Strategy):
         if qty < self._min_qty():
             return
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
-        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit") if plan[k]}
-        both = len(ids) == 2
         side = self._entry_side or 1
         exit_side, exit_word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
-
-        def link(kind: str) -> dict:
-            other = "take_profit" if kind == "stop_loss" else "stop_loss"
-            return {"contingency_type": ContingencyType.OUO, "linked_order_ids": [ids[other]]} if both else {}
-
         orders = []
         now = self.clock.timestamp_ns()
         if plan["stop_loss"]:
             stop = plan["stop_loss"]
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
-                self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], exit_side, quantity,
-                Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, self._margin, False,
-                UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
+                self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
+                exit_side, quantity, Price(level, self.instrument.price_precision), TriggerType.DEFAULT,
+                TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
                 f"{self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through"
                 + ("; on bars that can't show what traded first, at the bar's worst price" if self.pessimistic else ""),
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
-        if plan["take_profit"]:
-            tp = plan["take_profit"]
-            level = self._entry_px * (1 + side * tp)
-            orders.append((LimitOrder(
-                self.trader_id, self.strategy_id, cfg.instrument_id, ids["take_profit"], exit_side, quantity,
-                Price(level, self.instrument.price_precision), TimeInForce.GTC, False, self._margin, False,
-                UUID4(), now, **link("take_profit")), "take_profit", "LIMIT",
-                f"Take-profit: resting {exit_word} at {level:,.6g}, {tp:.1%} {'above' if side > 0 else 'below'} the "
-                f"{self._entry_px:,.6g} entry"
-                + (f" ({cfg.take_profit_r:g}R after costs)" if cfg.take_profit_r else "")
-                + "; fills at that level",
-                {"entry_px": round(self._entry_px, 8), "take_profit": round(tp, 6), "limit_px": round(level, 8)}))
         for order, intent, kind, reason, signal in orders:
             self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
             if self.runtime is not None:
                 self.runtime.on_order(order_id=str(order.client_order_id), side="SELL" if side > 0 else "BUY",
                                       qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind)
         for order, *_ in orders:
+            self._open_target(str(order.client_order_id))
             self._sent.append(order.client_order_id)
             self.submit_order(order)
 
@@ -2641,8 +3074,9 @@ class LongFlatStrategy(Strategy):
         super().submit_order(order, *args, **kwargs)
 
     def _exit_booking(self, order) -> dict | None:
-        """For the backtest's fee model (ScheduleFeeModel.exit_info): what a filling order is, if it is a resting exit
-        (the model's stop or target, or the risk guard's stop) or a stop-out to be booked elsewhere (_book_at)."""
+        """For the backtest's fee model (ScheduleFeeModel.exit_info): what a filling order is, if it is a resting stop
+        (the model's or the risk guard's) or a stop-out to be booked elsewhere (_book_at). The target is booked by
+        _bar_target."""
         coid = str(order.client_order_id)
         side = -1 if order.side == OrderSide.BUY else 1  # the position the exit closes
         if coid in self._book_at:
@@ -2653,23 +3087,7 @@ class LongFlatStrategy(Strategy):
         if mine.order_type == OrderType.STOP_MARKET and intent in STOP_INTENTS:
             return {"kind": "stop", "side": side, "trigger": mine.trigger_price.as_double(), "rested": mine.ts_init < now,
                     "liq": intent in ("liquidation_cut", "liquidation")}
-        if mine.order_type == OrderType.LIMIT and intent == "take_profit":
-            stop = self._resting_exits().get("stop_loss")
-            return {"kind": "target", "side": side, "trigger": mine.price.as_double(),
-                    "stop": stop.trigger_price.as_double() if stop is not None and stop.ts_init < now else None}
         return None
-
-    def _rebooked_as_stop(self, coid: str, px: float) -> None:
-        """The venue filled the target, but the stop lay inside the same bar too, and on bars alone the stop came first
-        (adverse first, NA-2): the fill was booked as the stop (ScheduleFeeModel.exit_price), and is journaled as one."""
-        d = self.decisions.get(coid)
-        if d is None or d.get("intent") != "take_profit":
-            return
-        d["intent"] = "stop_loss"
-        d["reason"] = (f"Stop-loss, booked at {px:,.6g}: the stop and the target both lay inside this bar, and with only "
-                       "the bar to go on the stop is taken to have traded first (the target's order filled at the venue)")
-        if self.runtime is not None:
-            self.runtime.store.update_order(coid, intent="stop_loss", message=d["reason"])
 
     def _levels_in_bar(self, bar: Bar) -> None:
         """Bars too coarse to say what traded first: note whether any resting level (a stop, target or entry, or the
@@ -2686,6 +3104,10 @@ class LongFlatStrategy(Strategy):
             if level is not None and low <= level.as_double() <= high:
                 intent = self.decisions.get(str(order.client_order_id), {}).get("intent")
                 self.fee_model.intrabar.add("liq" if intent in ("liquidation_cut", "liquidation") else "fill")
+        if self._tp_frac and self._entry_px is not None and self._pos_side():
+            target = self._entry_px * (1 + (self._entry_side or 1) * self._tp_frac)  # judged on the bar (_bar_target)
+            if low <= target <= high:
+                self.fee_model.intrabar.add("fill")
         if self._margin and self._net_position()[0]:
             _, cash, qty, _ = self._mark()
             liq = self._liq(cash, qty)
@@ -2713,19 +3135,47 @@ class LongFlatStrategy(Strategy):
                                                    "stop_loss": self._stop_frac})
         return True
 
+    def _rebook_as_target(self, coid: str, level: float, px: float) -> float:
+        """Backtests: the venue filled the resting stop in a bar that opened through the target. The open trades
+        first, so the target took it at its level (Advisor NA-2); the fee model charged it so, and the order is
+        journaled as the take-profit."""
+        decision = self.decisions.get(coid)
+        if decision is not None and decision.get("intent") == "stop_loss":
+            reason = (f"Take-profit: the bar opened through the {level:,.6g} target, so it filled there at the open, "
+                      f"before the price reached the stop at {px:,.6g} later in the bar (the open trades first)")
+            decision.update(intent="take_profit", reason=reason)
+            decision["signal"] = {**(decision.get("signal") or {}), "book_px": level}
+            if self.runtime is not None:
+                self.runtime.store.update_order(coid, intent="take_profit", message=reason)
+        return level
+
+    def _open_target(self, stop_id: str) -> None:
+        """Backtests: tell the fee model where this position's target is, so a stop the venue fills in a bar that
+        opened through the target is booked at the target instead (Advisor NA-2: the open trades first)."""
+        if self.fee_model is None:
+            return
+        if self._tp_frac and self._entry_px is not None:
+            level = self._entry_px * (1 + (self._entry_side or 1) * self._tp_frac)
+            # Set during the bar the entry filled in, it counts from the next bar's open: that bar's open came
+            # before the position did. A resize moves the level and keeps when it was first set.
+            _, since = self.fee_model.open_targets.get(stop_id, (None, self.fee_model.bar_seq))
+            self.fee_model.open_targets[stop_id] = (Price(level, self.instrument.price_precision).as_decimal(), since)
+        else:
+            self.fee_model.open_targets.pop(stop_id, None)
+
     def _resting_exits(self) -> dict:
-        """The backtest's stop and target resting at the venue, by intent."""
+        """The backtest's stop resting at the venue, by intent."""
         out = {}
         exit_side = OrderSide.BUY if self._entry_side < 0 else OrderSide.SELL
         for order in self._working():
             intent = self.decisions.get(str(order.client_order_id), {}).get("intent")
-            if order.side == exit_side and intent in ("stop_loss", "take_profit"):
+            if order.side == exit_side and intent == "stop_loss":
                 out[intent] = order
         return out
 
     def _resize_exits(self, resting: dict, plan: dict) -> None:
-        """A later slice of the entry filled: grow the resting stop and target to the whole position, at
-        levels from the new average entry. An exit the venue hasn't answered yet (sent, or mid-resize) is
+        """A later slice of the entry filled: grow the resting stop to the whole position, at its level
+        from the new average entry. An exit the venue hasn't answered yet (sent, or mid-resize) is
         resized once it does (_resize_if_due): skipping it left most of a position with no stop."""
         qty = self._position_qty().quantize(self._lot(), rounding=ROUND_DOWN)
         if qty < self._min_qty():
@@ -2739,22 +3189,13 @@ class LongFlatStrategy(Strategy):
                 self._resize_due = True  # in flight or mid-resize: resized again once the venue answers
                 continue
             side = self._entry_side or 1
-            level = self._entry_px * (1 - side * frac if intent == "stop_loss" else 1 + side * frac)
+            level = self._entry_px * (1 - side * frac)
             px = Price(level, self.instrument.price_precision)
-            if ((order.quantity == quantity or (intent == "take_profit" and "stop_loss" in resting))
-                    and (order.trigger_price if intent == "stop_loss" else order.price) == px):
+            if order.quantity == quantity and order.trigger_price == px:
                 continue
-            if intent == "stop_loss":
-                self.modify_order(order.client_order_id, quantity=quantity, trigger_price=px)
-            elif "stop_loss" in resting:
-                # Linked one-updates-the-other, the venue gives the target the stop's new quantity itself;
-                # sending it here too makes the two resizes undo each other, back and forth.
-                if order.price != px:
-                    self.modify_order(order.client_order_id, price=px)
-            else:
-                self.modify_order(order.client_order_id, quantity=quantity, price=px)
-            what = "Stop-loss" if intent == "stop_loss" else "Take-profit"
-            self._resizing[str(order.client_order_id)] = (f"{what} resized to {qty.normalize():f} at {level:,.6g} as "
+            self.modify_order(order.client_order_id, quantity=quantity, trigger_price=px)
+            self._open_target(str(order.client_order_id))  # the target moves with the average entry too
+            self._resizing[str(order.client_order_id)] = (f"Stop-loss resized to {qty.normalize():f} at {level:,.6g} as "
                                                           f"more of the entry filled (average entry {self._entry_px:,.6g})")
 
     def on_order_updated(self, event) -> None:
@@ -2762,8 +3203,8 @@ class LongFlatStrategy(Strategy):
         since the order can fill before the venue gets to it."""
         coid = str(event.client_order_id)
         why = self._resizing.pop(coid, None)
-        exit_ = self.decisions.get(coid, {}).get("intent") in ("stop_loss", "take_profit")
-        if (why is not None or exit_) and self.runtime is not None:  # a linked target follows its stop's size
+        exit_ = self.decisions.get(coid, {}).get("intent") == "stop_loss"
+        if (why is not None or exit_) and self.runtime is not None:
             self.runtime.store.update_order(coid, qty=event.quantity.as_double(), message=why)
         self._resize_if_due()
 
