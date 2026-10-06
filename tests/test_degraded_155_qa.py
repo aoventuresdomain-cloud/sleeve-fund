@@ -482,6 +482,62 @@ def _session_meta(balance, params):
                        "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
 
 
+class YAtEntryMissing(AssertionError):
+    """P1-D20 (Advisor 6 Oct 20:37): the halt doesn't give Y as X over the strategy's equity at entry, in the ruled text
+    "Position margin lost (liquidated): X, Y% of strategy equity at entry". Its own exception, so a strict xfail on it
+    can't hide any other assertion of the same test (X, halted, no new order), which still fails plainly."""
+
+
+Y_AT_ENTRY = pytest.mark.xfail(strict=True, raises=YAtEntryMissing, reason="P1-D20 (Advisor 20:37): Y = X over the "
+                               "strategy's equity when the liquidated position was opened (its first entry fill; "
+                               "kept through partial reductions; never capped), text '... Y% of strategy equity at "
+                               "entry'. 6047b50 and eb737bd divide by the mark-to-market equity just before the "
+                               "liquidation and omit 'at entry'")
+
+
+def _equity_at_entry(store, name, until):
+    """Y's base (Advisor 20:37): the strategy's equity when the liquidated position was opened, at its first entry
+    fill. The fills before `until` (the first closing fill) are walked from the start; the fill that leaves the book
+    flat-to-holding, or crosses it through flat (a flip, PE2 21:00), opens the position, so partial reductions after it
+    don't move the base. The equity is the journal just before that fill: cash from the earlier fills, funding and
+    insurance up to it, plus anything still held marked at that fill's price (only a single fill that crosses through
+    flat has one), so a closed leg's realised P&L counts even with no flat mark between the two."""
+    from sleeve_fund.store import replay_book
+
+    until = pd.Timestamp(until)
+    fills = sorted((f for f in store.fills(name, limit=1_000_000) if pd.Timestamp(f["ts"]) < until),
+                   key=lambda f: (pd.Timestamp(f["ts"]), f["id"]))
+    held, first = 0.0, None
+    for i, f in enumerate(fills):
+        new = held + float(f["qty"]) * (1 if f["side"] == "BUY" else -1)
+        new = 0.0 if abs(new) < 1e-8 else new
+        if new and (abs(held) < 1e-8 or (new > 0) != (held > 0)):
+            first = i
+        held = new
+    assert first is not None and abs(held) >= 1e-8, (until, held)  # harness: a position was held up to `until`
+    at = pd.Timestamp(fills[first]["ts"])
+
+    def _upto(rows):
+        return sum(float(r["amount"]) for r in rows if pd.Timestamp(r["ts"]) <= at)
+
+    funding = _upto(store.funding(name, limit=1_000_000)) if hasattr(store, "funding") else 0.0
+    insurance = _upto(store.insurance(name, limit=1_000_000)) if hasattr(store, "insurance") else 0.0
+    book = replay_book(fills[:first], float(store.sleeve(name).starting_balance), funding, insurance)
+    return float(book["cash"]) + float(book["qty"]) * float(fills[first]["price"])
+
+
+def _says_y_at_entry(text, equity_at_entry):
+    """The ruled Y (Advisor 20:37): 'X, Y% of strategy equity at entry', Y = X over the equity at entry to the figures
+    shown, the true figure even above 100%. Raises YAtEntryMissing (only) when it isn't."""
+    m = re.search(r"\(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity( at entry)?", text)
+    assert m, text
+    x, y = float(m.group(1).replace(",", "")), m.group(2)
+    want = 100 * x / equity_at_entry
+    if not m.group(3) or abs(float(y) - want) > 0.5 * 10 ** -len(y.partition(".")[2]) + 1e-9:
+        raise YAtEntryMissing(f"Y shown {y}%{' at entry' if m.group(3) else ' (no at entry)'}, want {want:.3f}% "
+                              f"(X {x:,.2f} / equity at entry {equity_at_entry:,.2f}): {text}")
+
+
 # P1-D15 full-margin case fixed at 26fd993 (X with both fees): mark removed. Shipped caps: see the pin further down.
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
@@ -489,8 +545,9 @@ def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a
     short at 2x on full margin is gapped +60% through its liquidation price. It stays halted through a PM resume and a
     restart until an explicit reset after liquidation; no new order; every mark after the restart is the equity kept
     (isolated margin: only the position's margin is lost), not zero and not the last mark before the gap; risk_halt
-    twice; and the halt text says "Position margin lost (liquidated): X, Y% of strategy equity", X the margin lost
-    to the cent and Y = X over the strategy's equity before the gap, both as the journal has them."""
+    twice; and the halt text says "Position margin lost (liquidated): X, Y% of strategy equity at entry", X the margin
+    lost to the cent and Y = X over the strategy's equity when the short was opened (Advisor 20:37), both as the
+    journal has them; here above 100%, shown as it is."""
     import re
     from sleeve_fund.research.replay import replay
     name, params = "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
@@ -512,6 +569,8 @@ def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a
     assert orders[-2]["intent"] == "entry" and orders[-2]["side"] == "SELL"
     liq = max(liq_fills, key=lambda f: f["ts"])
     assert sum(f["qty"] for f in liq_fills) == pytest.approx(sum(f["qty"] for f in open_fills))
+    # Y's base (Advisor 20:37), read now: the restart below replays on the same clock, so its marks would come first
+    eq_entry = _equity_at_entry(store, name, min(pd.Timestamp(f["ts"]) for f in liq_fills))
     margin_lost = round(sum(f["qty"] * f["price"] for f in open_fills) / risk.profile("balanced").max_leverage
                         + sum(f["fee"] for f in open_fills) + sum(f["fee"] for f in liq_fills), 2)
     marks = store.equity_series(name)
@@ -521,12 +580,11 @@ def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a
     assert book["qty"] == 0 and left > 0  # isolated margin: what wasn't margined is kept
 
     def says_margin_lost(text):
-        m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
+        m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), ", text)
         assert m, text
-        x, y = float(m.group(1).replace(",", "")), m.group(2)
+        x = float(m.group(1).replace(",", ""))
         assert x == pytest.approx(margin_lost, abs=0.005), (x, margin_lost)
-        dp = len(y.partition(".")[2])
-        assert float(y) == pytest.approx(100 * x / eq_before, abs=0.5 * 10 ** -dp + 1e-9), (y, 100 * x / eq_before)
+        _says_y_at_entry(text, eq_entry)
 
     # The PM resumes it and the process restarts: it stays halted, with nothing new traded.
     store.command(name, "resume", "try again")
@@ -719,10 +777,11 @@ def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0,
     first["margin"] = (sum(f["qty"] * f["price"] for f in opened) / lev + sum(f["fee"] for f in opened)
                        + sum(f["fee"] for f in closed))
     liq_ts = min(pd.Timestamp(f["ts"]) for f in closed)
-    # Y (18:17): on the mark-to-market equity just before the liquidation: the last mark up to its fill still holding
-    # the position (the gap's own mark, when it was marked before the fill), else the last one before the gap
+    # The mark-to-market equity just before the liquidation (18:17's Y base, superseded by 20:37's equity at entry):
+    # the last mark up to its fill still holding the position, else the last one before the gap
     held = [m for m in store.equity_series(name) if pd.Timestamp(m["ts"]) <= liq_ts and m["qty"] != 0 and m["equity"] > 0]
-    first["equity_before"] = held[-1]["equity"]
+    first["equity_before"] = held[-1]["equity"]  # the drawdown check's view (HC sizing), no longer Y's base
+    first["equity_at_entry"] = _equity_at_entry(store, name, liq_ts)  # Y's base (Advisor 20:37, P1-D20)
     left = store.journal_book(name, balance)["cash"]
     store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
     start0, steps = test_replay.START, []
@@ -772,18 +831,17 @@ def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0,
     return first, steps, events, left
 
 
-def _says_margin_lost(text, margin, equity_before):
-    """The ruled halt text (Advisor 6 Oct 17:57 (a), 18:17 point 4): X the margin plus the entry and liquidation fees
-    to the cent, Y = X over the mark-to-market equity just before the liquidation, as the journal has them, to the
-    figures shown."""
+def _says_margin_lost(text, margin, equity_at_entry):
+    """The ruled halt text (Advisor 6 Oct 17:57 (a), 18:17 point 4, 20:37): X the margin plus the entry and liquidation
+    fees to the cent; "Y% of strategy equity at entry", Y = X over the strategy's equity when the position was opened,
+    as the journal has them, to the figures shown, never 0% for a loss and never capped."""
     import re
     m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
     assert m, text
     x, y = float(m.group(1).replace(",", "")), m.group(2)
     assert x == pytest.approx(margin, abs=0.005), (x, margin)
-    dp = len(y.partition(".")[2])
-    assert float(y) == pytest.approx(100 * x / equity_before, abs=0.5 * 10 ** -dp + 1e-9), (y, 100 * x / equity_before)
     assert float(y) > 0, text  # a loss is never shown as 0%
+    _says_y_at_entry(text, equity_at_entry)
 
 
 # P1-D15 shipped caps, P1-D17 and P1-D18 fixed on the next head after 26fd993 (PE2): marks removed.
@@ -793,10 +851,10 @@ def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_ha
     margin the profile puts up; the halt reads the ruled text throughout."""
     first, steps, events, left = _liquidate_then(tmp_path, side=side, profile=profile, pct=None, after=("resume",))
     assert first["orders"][-1]["intent"] == "liquidation"
-    _says_margin_lost(first["reason"], first["margin"], first["equity_before"])
     (st,) = steps
     assert not st["new_orders"], st
     assert st["status"] == "halted" and st["reason"].startswith("Position margin lost (liquidated): "), st
+    _says_margin_lost(first["reason"], first["margin"], first["equity_at_entry"])  # last: Y at entry (P1-D20)
 
 
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
@@ -823,15 +881,15 @@ def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_
     pytest.param("long", "aggressive", 0.004, 1_250_000.0, 50.0, id="long-3x-under-1pct-thousands"),
 ])
 def test_p1_the_liquidation_halt_gives_x_and_y_as_the_journal_has_them(tmp_path, side, profile, pct, balance, size):
-    """Advisor 17:57 (a) and 18:17 point 4, adversarial: X with thousands separators and both fees, Y on the
-    mark-to-market equity just before the liquidation, on small liquidations (about 10% of equity, long and short,
-    2x and 3x) and one under 1% of equity in the millions."""
+    """Advisor 17:57 (a), 18:17 point 4 and 20:37, adversarial: X with thousands separators and both fees, Y on the
+    strategy's equity at entry (above 100% on full margin, shown as it is), on small liquidations (about 10% of
+    equity, long and short, 2x and 3x) and one under 1% of equity in the millions."""
     first, steps, events, left = _liquidate_then(tmp_path, side=side, profile=profile, pct=pct, balance=balance,
                                                  size=size, after=())
     assert first["orders"][-1]["intent"] == "liquidation" and first["status"] == "halted"
     if first["margin"] >= 1000:
         assert re.search(r"\(liquidated\): \d{1,3}(,\d{3})+\.\d\d, ", first["reason"]), first["reason"]  # commas
-    _says_margin_lost(first["reason"], first["margin"], first["equity_before"])
+    _says_margin_lost(first["reason"], first["margin"], first["equity_at_entry"])
 
 
 @pytest.mark.parametrize("side", [pytest.param(1, id="long-pays"), pytest.param(-1, id="short-receives")])
@@ -1077,14 +1135,10 @@ def test_p1_nothing_opens_after_a_liquidation_on_a_gap_bar_with_a_resting_entry(
     assert not [f for f in fills if f["ts"] > max(x["ts"] for x in liq)]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="P1-D20 MINOR, needs an Advisor call (6047b50): Y divides by the "
-                   "last mark still holding the position up to the liquidation, which on a gap is the gap's own mark, after "
-                   "the loss: a remainder of 0.2217 short liquidated reads '6,737.79, 340% of strategy equity' (equity "
-                   "10,083.66 before the gap). 18:17 says 'MTM equity just before liquidation'; a share above 100% can't be "
-                   "what the PM is meant to read")
-def test_p1_y_is_never_above_100_percent_when_x_is_below_the_equity_before_the_gap(tmp_path):
-    """The partial-reduce run above: X (6,737.79) is below the equity marked before the gap (10,083.66), so Y, its
-    share of strategy equity, is at most 100%."""
+def test_p1_y_after_a_partial_reduce_is_x_over_the_equity_when_the_position_was_opened(tmp_path):
+    """P1-D20 pin (Advisor 20:37): the partial-reduce run above (a third of the 2x short bought back, a restart, a
+    60% gap). Y = X over the strategy's equity at the short's first entry fill, the same base after the reduction,
+    shown as it is in "Position margin lost (liquidated): X, Y% of strategy equity at entry"."""
     import dataclasses
     import test_replay
     from sleeve_fund.research.replay import replay
@@ -1111,7 +1165,10 @@ def test_p1_y_is_never_above_100_percent_when_x_is_below_the_equity_before_the_g
         replay(s2, store=store)
     finally:
         test_replay.START = start0
-    text = store.sleeve(name).status_reason
-    m = re.search(r"\(liquidated\): ([\d,]+\.\d\d), (\d+(?:\.\d+)?)% of strategy equity", text)
-    assert m, text
-    assert float(m.group(2)) <= 100.0, text
+    text = store.sleeve(name).status_reason or ""
+    assert text.startswith("Position margin lost (liquidated): "), text
+    liq_ids = {o["order_id"] for o in store.orders(name, limit=100_000) if o["intent"] == "liquidation"}
+    liq_ts = min(pd.Timestamp(f["ts"]) for f in store.fills(name, limit=100_000) if f["order_id"] in liq_ids)
+    base = _equity_at_entry(store, name, liq_ts)
+    assert 9_000 < base < 11_000, base  # harness: the short was opened on about 10,000, before the reduction
+    _says_y_at_entry(text, base)

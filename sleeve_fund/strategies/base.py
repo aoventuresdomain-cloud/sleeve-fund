@@ -2389,10 +2389,12 @@ class LongFlatStrategy(Strategy):
         fees = (replay_book(rest, 0.0)["entry_fees"] + sum(float(f["fee"]) for f in liq)
                 + notional * self.runtime.taker_fee)
         at_entry = None
-        if window:
-            mark = store.equity_at_or_before(name, window[0]["ts"] - timedelta(microseconds=1))
-            at_entry = (float(mark["equity"]) if mark is not None and mark["equity"] > 0
-                        else replay_book(fills[:flat], self.runtime.starting_balance)["cash"])
+        if window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
+            opened = window[0]["ts"]
+            at_entry = replay_book(fills[:flat], self.runtime.starting_balance,
+                                   sum(float(f["amount"]) for f in store.funding(name, 1_000_000) if f["ts"] < opened),
+                                   sum(float(i["amount"]) for i in store.insurance(name, 1_000_000) if i["ts"] < opened)
+                                   )["cash"]
         journaled = trade_id is None or any(str(f.get("trade_id")) == trade_id for f in liq)
         return fees, sum(float(f["qty"]) for f in liq), at_entry, journaled
 
