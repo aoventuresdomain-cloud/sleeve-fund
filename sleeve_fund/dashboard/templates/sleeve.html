@@ -93,8 +93,10 @@
     {# Three limits: margin (or position) against its cap, room before the drawdown halt, today's loss against the pause. #}
     {% set room = x.room if x.room is defined else none %}
     <div class="limit-bars">
-      {% if risk.margin_used is defined %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.margin_used, drift=True) }}</div>
-      {% else %}<div title="Exposure {{ '%.2f'|format(x.exposure|abs) }}× equity, against an entry cap of {{ '%.2f'|format(x.cap) }}×"><span class="k">{{ 'Isolated margin' if perp else 'Exposure' }} of cap</span>{{ usage(risk.cap_used, drift=True) }}</div>{% endif %}
+      {# Perpetuals: margin put up against the margin cap. Spot: the same exposure basis as the Exposure figure,
+         so the bar, its hover and its screen-reader text agree (P1-U17). #}
+      {% if perp %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">Isolated margin of cap</span>{{ usage(risk.margin_used, drift=True) }}</div>
+      {% else %}<div class="exposure-cap" title="Exposure {{ '%.2f'|format(x.exposure|abs) }}× equity, against an entry cap of {{ '%.2f'|format(x.cap) }}×"><span class="k">Exposure of cap</span>{{ usage(risk.cap_used, drift=True) }}</div>{% endif %}
       <div title="Drawdown {{ x.drawdown|pct1 }} of the {{ x.profile.max_drawdown|pct0 }} halt"><span class="k">Room to halt</span>{{ usage(x.dd_used) }} <b>{% if room is not none %}{{ room|money }}{% else %}<span class="faint" title="Waiting on the corrected room-to-halt figure">–</span>{% endif %}</b></div>
       {% if not backtest_id %}<div title="Today's loss {{ [0 - x.day_ret, 0]|max|pct1 }} of the {{ x.profile.daily_loss|pct0 }} pause limit"><span class="k">Today's loss</span>{{ usage(risk.day_used) }}</div>{% endif %}
     </div>
@@ -132,7 +134,7 @@
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th>Type</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody>{% for o in working %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
-      <td class="num" data-m="right">{{ o.qty|qty }}</td><td data-m="hide">{{ o.order_type|capitalize }}</td><td data-m="hide"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
+      <td class="num" data-m="right">{{ o.qty|qty }}</td><td data-m="hide">{{ o.order_type|capitalize }}</td><td data-m="hide"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 18px 14px">No orders working.</p>{% endif %}
@@ -148,7 +150,7 @@
     <tbody id="ord-list">{% for o in orders %}
     <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="hide">{{ o.qty|qty }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
-      <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
+      <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td></tr>
     {% endfor %}<tr data-none hidden><td colspan="8" class="muted">No orders match.</td></tr></tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 14px 14px">No orders journaled yet. Each order is recorded here with its reason when it is sent.</p>{% endif %}
@@ -220,7 +222,7 @@
 </section>
 {% if position %}<section class="panel flush pos" aria-labelledby="hist-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="hist-h">This position's history</h2><span class="right faint">fills, stop moves and funding since it opened</span></div>
-  {% if pos_history %}<ul class="feed history">{% for h in pos_history %}<li><span class="when">{{ h.ts|ts }}</span><span class="what"><strong>{{ h.what }}</strong> {{ h.text }}</span></li>{% endfor %}</ul>
+  {% if pos_history %}<ul class="feed history">{% for h in pos_history %}<li><span class="when">{{ h.ts|ts }}</span><span class="what"><strong>{{ h.what|no_venues }}</strong> {{ h.text|no_venues }}</span></li>{% endfor %}</ul>
   {% else %}<p class="empty" style="padding:4px 18px 14px">Nothing recorded since it opened.</p>{% endif %}
 </section>{% endif %}
 <section class="panel pos" aria-labelledby="lim-h">
@@ -246,7 +248,7 @@
   <div class="chip-row" data-chips="act-list" role="group" aria-label="Filter activity">{% for k, label in [('all', 'All'), ('decisions', 'Decisions'), ('risk', 'Risk'), ('system', 'System')] %}<button type="button" class="fchip" data-chip="{{ k }}" aria-pressed="{{ 'true' if k == 'all' else 'false' }}">{{ label }}</button>{% endfor %}</div>
   {% if timeline %}
   <ul class="feed timeline" id="act-list">{% for e in timeline %}
-    <li class="{{ e.level }}" data-kind="{{ e.kind }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><strong>{{ e.title }}</strong> {{ e.text }}</span></li>{% endfor %}
+    <li class="{{ e.level }}" data-kind="{{ e.kind }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><strong>{{ e.title|no_venues }}</strong> {{ e.text|no_venues }}</span></li>{% endfor %}
     <li data-none hidden class="muted">Nothing of this kind yet.</li>
   </ul>{% else %}<p class="empty">Nothing yet.</p>{% endif %}
 </section>
@@ -285,7 +287,7 @@
     {% set changes = decisions|selectattr('action', 'in', ['change_settings', 'move_account'])|list %}
     {% if changes %}
     <h3 style="margin:16px 0 6px;font-size:13px">Changes</h3>
-    <table class="compact"><tbody>{% for d in changes[:10] %}<tr><td class="muted" style="white-space:nowrap">{{ d.ts|ts }}</td><td style="white-space:normal">{{ d.reason }} <span class="muted">({{ d.actor }})</span></td></tr>{% endfor %}</tbody></table>
+    <table class="compact"><tbody>{% for d in changes[:10] %}<tr><td class="muted" style="white-space:nowrap">{{ d.ts|ts }}</td><td style="white-space:normal">{{ d.reason|no_venues }} <span class="muted">({{ d.actor }})</span></td></tr>{% endfor %}</tbody></table>
     {% endif %}
     {% endif %}
   </section>

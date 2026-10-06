@@ -34,7 +34,7 @@
     <div>
       <h2 class="rh-word" id="status-h"><span class="rh-dot" aria-hidden="true"></span>{{ status.word }}</h2>
       <p class="rh-line">{{ status.line }}</p>
-      {% if status.issues|length > 1 %}<ul class="rh-items">{% for i in status.issues[1:6] %}<li class="{{ i.level }}">{{ i.text }}</li>{% endfor %}{% if status.issues|length > 6 %}<li class="muted">and {{ status.issues|length - 6 }} more</li>{% endif %}</ul>{% endif %}
+      {% if status.issues|length > 1 %}<ul class="rh-items">{% for i in status.issues[1:6] %}<li class="{{ i.level }}">{{ i.text|no_venues }}</li>{% endfor %}{% if status.issues|length > 6 %}<li class="muted">and {{ status.issues|length - 6 }} more</li>{% endif %}</ul>{% endif %}
     </div>
     {% set h = health %}
     <div class="rh-pills">
@@ -158,7 +158,7 @@
 <section class="panel" aria-labelledby="hist-h">
   <div class="panel-head"><h2 id="hist-h">Limits that fired</h2></div>
   {% if risk.history %}
-  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message }}</span></li>{% endfor %}</ul>
+  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message|no_venues }}</span></li>{% endfor %}</ul>
   {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}
 </section>
 </div>
