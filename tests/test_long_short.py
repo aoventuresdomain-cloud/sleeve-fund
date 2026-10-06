@@ -477,7 +477,7 @@ def test_a_liquidation_halts_in_the_advisors_words_and_its_gap_fill_is_journaled
     assert pd.Timestamp(liq["ts"]) == bar - pd.Timedelta(days=1)
 
 
-@pytest.mark.no_open_risk_limit
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only
 def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path, full_margin):
     """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
     as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
@@ -545,7 +545,7 @@ def _says_margin_lost(text, want, before):
     assert int(m.group(2)) == round(100 * want / before), (m.group(2), 100 * want / before)
 
 
-@pytest.mark.no_open_risk_limit  # X's accounting on a stopless short carried over a restart (open_risk)
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: X's accounting on a stopless short carried over a restart (open_risk)
 def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp_path, full_margin, monkeypatch):
     """HoE and the Code Reviewer on #155 at 26fd993: X (Advisor 18:17 point 4: margin, entry fee and liquidation fee,
     as QA's D15 computes it) for a position carried over a restart still counts the fee paid to open it, which the
@@ -556,7 +556,7 @@ def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp
     _says_margin_lost(text, want, before)
 
 
-@pytest.mark.no_open_risk_limit  # as above
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: as above
 def test_a_liquidation_after_a_partial_reduce_counts_only_the_entry_fee_of_what_is_still_open(tmp_path, full_margin,
                                                                                                monkeypatch):
     """HoE and the Code Reviewer on #155 at 26fd993: after a short of 0.4 is cut to 0.3, X counts three quarters of
@@ -981,7 +981,7 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
 
 
-@pytest.mark.no_open_risk_limit
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only
 def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stays_halted_through_a_restart(
         tmp_path, full_margin):
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
