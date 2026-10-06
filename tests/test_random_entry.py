@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from sleeve_fund.research.random_entry import BAR, Trade, _random_entries, random_entry
+from sleeve_fund.research.random_entry import BAR, Trade, _random_entries, random_entry, random_side
 
 
 def _walk(n=3000, seed=1):
@@ -67,3 +67,32 @@ def test_no_trades_is_not_applicable_and_runs_repeat():
 def test_overlapping_trades_are_refused():
     with pytest.raises(ValueError):
         random_entry(_walk(), [Trade(0, 80, 1), Trade(10, 90, 1)], [(0, 999)], 0.0)
+
+
+def test_picking_the_direction_passes_the_random_side_test():
+    """C3b: the same entries and holding periods, long or short drawn at random."""
+    c = 100 + 10 * np.sin(np.arange(2000) / 20)
+    trades = [Trade(i, i + 20, 1 if c[i + 20] > c[i] else -1) for i in range(0, 1960, 40)]
+    r = random_side(c, trades, [(0, 1999)], cost_per_side=0.0005, draws=300)
+    assert r.verdict == "PASS" and r.trades == len(trades)
+    wrong = [Trade(t.entry, t.exit, -t.side) for t in trades]
+    assert random_side(c, wrong, [(0, 1999)], 0.0005, draws=300).verdict == "FAIL"
+
+
+def test_random_side_with_no_trades_is_not_applicable():
+    assert random_side(_walk(), [], [(0, 100)], 0.0005).verdict == "N/A"
+
+
+def test_window_trips_leave_out_trades_at_the_edges():
+    """Advisor, 19:19: carried in from training, or still open at the window's end, don't count."""
+    import pandas as pd
+
+    from sleeve_fund.research.study import _window_trips
+
+    t = pd.Timestamp
+    trips = [{"opened": t("2025-01-01", tz="UTC"), "closed": t("2025-02-02", tz="UTC"), "side": 1},  # carried in
+             {"opened": t("2025-02-03", tz="UTC"), "closed": t("2025-02-10", tz="UTC"), "side": -1},
+             {"opened": t("2025-02-20", tz="UTC"), "closed": None, "side": 1}]  # still open at the end
+    out = _window_trips(trips, t("2025-02-01", tz="UTC"))
+    assert (out["test_trades"], out["carried_in"], out["carried_out"]) == (1, 1, 1)
+    assert out["trips"] == [(t("2025-02-03", tz="UTC"), t("2025-02-10", tz="UTC"), -1)]

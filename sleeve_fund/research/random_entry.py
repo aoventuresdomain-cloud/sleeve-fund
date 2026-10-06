@@ -7,7 +7,11 @@ the same cost per side. The strategy's net return is then a percentile of the dr
 Advisor, 5 Oct 2026): judged on return, pooled across windows, one-sided, with a bar at the 95th percentile.
 The Sharpe percentile is shown beside it and flagged when the two disagree by more than 30 points. When the
 strategy is in the market most of the time the draws have nowhere else to go and sit almost on top of it, so
-the benchmark is called weak rather than passed.
+the benchmark is called weak: not judged, neither a pass nor a fail (Advisor, 19:19).
+
+The random-side test (C3b) is its twin for strategies that can go short: the trades keep their entry times and
+holding periods, and only long or short is drawn at random. It asks whether the strategy picks the direction, as
+the random-entry test asks whether it picks the moment.
 """
 
 from __future__ import annotations
@@ -65,6 +69,29 @@ class RandomEntryResult:
         return out
 
 
+@dataclass
+class RandomSideResult:
+    return_percentile: float
+    strategy_return: float
+    median_random_return: float
+    trades: int
+    draws: int
+
+    @property
+    def verdict(self) -> str:
+        if self.trades == 0:
+            return "N/A"
+        return "PASS" if self.return_percentile >= BAR else "FAIL"
+
+    @property
+    def words(self) -> str:
+        if self.trades == 0:
+            return "no out-of-sample trades to compare"
+        return (f"net return {self.strategy_return:+.1%} beats {self.return_percentile:.0f}% of {self.draws} runs with "
+                f"the same {self.trades} entries and holding periods but long or short drawn at random (median "
+                f"{self.median_random_return:+.1%}; bar: {BAR:.0f}%)")
+
+
 def _trade_returns(closes: np.ndarray, entries: np.ndarray, holds: np.ndarray, sides: np.ndarray,
                    cost: float) -> np.ndarray:
     gross = closes[entries + holds] / closes[entries] - 1
@@ -96,13 +123,9 @@ def _random_entries(rng: np.random.Generator, start: int, end: int, holds: np.nd
     return order, entries
 
 
-def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
-                 draws: int = DRAWS, seed: int = 0) -> RandomEntryResult:
-    """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
-    walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
-    fraction, charged on entry and exit alike."""
-    c = np.asarray(closes, dtype=float)
-    rng = np.random.default_rng(seed)
+def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
+    """Each window's trades as (start, end, entries, holds, sides), skipping windows without one, plus the
+    windows' bars in all and the bars the trades held."""
     per_window = []
     test_bars = held = 0
     for start, end in windows:
@@ -117,6 +140,36 @@ def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], co
             raise ValueError("a trade must hold for at least one bar")
         held += int(holds.sum())
         per_window.append((start, end, np.array([t.entry for t in inside]), holds, np.array([t.side for t in inside])))
+    return per_window, test_bars, held
+
+
+def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+                draws: int = DRAWS, seed: int = 0) -> RandomSideResult:
+    """As random_entry, but the entries stay put and each trade's side is drawn at random, long or short."""
+    c = np.asarray(closes, dtype=float)
+    rng = np.random.default_rng(seed)
+    per_window, _, _ = _by_window(trades, windows)
+    if not per_window:
+        return RandomSideResult(math.nan, 0.0, 0.0, 0, draws)
+    entries = np.concatenate([w[2] for w in per_window])
+    holds = np.concatenate([w[3] for w in per_window])
+    sides = np.concatenate([w[4] for w in per_window])
+    actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side))
+    gross = c[entries + holds] / c[entries] - 1
+    drawn = rng.choice(np.array([-1, 1]), size=(draws, len(holds)))
+    rets = np.prod(1 + drawn * gross - 2 * cost_per_side, axis=1) - 1
+    return RandomSideResult(return_percentile=float((rets < actual).mean() * 100), strategy_return=actual,
+                            median_random_return=float(np.median(rets)), trades=len(holds), draws=draws)
+
+
+def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+                 draws: int = DRAWS, seed: int = 0) -> RandomEntryResult:
+    """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
+    walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
+    fraction, charged on entry and exit alike."""
+    c = np.asarray(closes, dtype=float)
+    rng = np.random.default_rng(seed)
+    per_window, test_bars, held = _by_window(trades, windows)
     n = sum(len(w[3]) for w in per_window)
     if n == 0:
         return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, 0, 0.0, draws, False, False)
