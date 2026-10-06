@@ -1530,7 +1530,16 @@ class LongFlatStrategy(Strategy):
             leverage=lev if perp else 1.0, perp=perp, max_notional=self._cfg.max_notional,
             volume_notional=float(cap) if cap is not None else None,
             maintenance_margin=float(self._cfg.perp.maintenance_margin) if perp else 0.0,
-            stop_to_liquidation=share if perp else None))
+            stop_to_liquidation=share if perp else None, stop_slippage=self._stop_slippage()))
+
+    def _stop_slippage(self) -> float | None:
+        """The venue's named stop slippage, or None for sizing's default (Advisor, 16:45)."""
+        from sleeve_fund.venues import venue
+
+        try:
+            return venue(str(self._cfg.instrument_id.venue)).stop_slippage
+        except (KeyError, ValueError):
+            return None
 
     def _sizing_words(self, sizing: Sizing | None) -> dict:
         """What the journal keeps of a central sizing: the budget at risk, every limit, and whether the

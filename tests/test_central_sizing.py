@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from sleeve_fund.data import synthetic_ohlcv
-from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, loss_at_stop
+from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, DEFAULT_STOP_SLIPPAGE, loss_at_stop
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.strategies import base
 from sleeve_fund.venues import venue
@@ -71,9 +71,11 @@ def test_a_central_strategy_with_no_stop_is_sized_to_a_placed_wilder_fallback_st
     assert "Wilder average true range" in entry["stop_basis"] and "none declared" in entry["stop_fallback"]
     assert i.stop_frac == pytest.approx(entry["stop_frac"], abs=1e-6)
     assert "STOP_MARKET" in set(r.fills["type"].astype(str))
-    # 1% of equity at risk to that stop, the stop filling one half spread past its price (the stop-slippage term).
+    # 1% of equity at risk to that stop, the stop filling past its price by the venue's default stop slippage: the
+    # larger of half the spread and 0.05% (Advisor, 16:45).
     assert i.risk_per_trade == base.DEFAULT_RISK_PER_TRADE and i.stop_slippage is None and i.half_spread > 0
-    per_unit = loss_at_stop(i.stop_frac, i.leg_cost, i.side) + (1 - i.side * i.stop_frac) * i.half_spread
+    slip = max(i.half_spread, DEFAULT_STOP_SLIPPAGE)
+    per_unit = loss_at_stop(i.stop_frac, i.leg_cost, i.side) + (1 - i.side * i.stop_frac) * slip
     assert s.sized_by == "risk per trade" and s.risk_budget == pytest.approx(0.01 * i.allocated_equity)
     assert s.risk_amount == pytest.approx(float(s.qty) * i.price * per_unit) and s.risk_amount <= s.risk_budget
     # Rounded down to the venue's step, and the order is that quantity.
@@ -92,7 +94,8 @@ def test_central_sizing_takes_the_smaller_of_the_stop_and_volatility_sizes():
                   risk_per_trade=0.01, position_cap_pct=1.0, lot=Decimal("0.001"), min_qty=Decimal("0.001"),
                   stop_frac=0.05)
     by_stop = size_entry(SizingInputs(**common))
-    both = size_entry(SizingInputs(**common, overlay="vol_target", vol_target=0.002, instrument_vol=0.04))
+    both = size_entry(SizingInputs(**common, overlay="vol_target", vol_target=0.002, instrument_vol=0.04,
+                                   vol_floor=0.01))
     assert both.qty <= by_stop.qty and both.qty < by_stop.qty
 
 
@@ -104,3 +107,37 @@ def test_central_sizing_reaches_new_strategies_only():
     assert "sizing" not in app._form_params({}, "buy_and_hold")  # the benchmark sizes its own way
     assert base.central_sizing({"sizing": "central"}) and not base.central_sizing({})
     assert not base.central_sizing({"sizing": "central", "rebalance_band": 0.05})
+
+
+@pytest.mark.parametrize("stop", [{"stop_loss": 0.0}, {"stop_atr": 0.0}])
+def test_a_declared_stop_of_zero_is_refused_up_front(bars, btc, stop):
+    """Advisor, 16:45: a declared stop of 0 is refused at validation, never sized or replaced by the default."""
+    with pytest.raises(ValueError):
+        run_backtest("trend_filter", bars, btc, {"sizing": "central", **stop})
+
+
+def test_steps_between_fractions_send_only_the_difference_and_skip_below_the_minimum():
+    from sleeve_fund.portfolio.sizing import step_order
+
+    held, sent = Decimal(0), []
+    for f in (1 / 3, 2 / 3, 1.0, 0.0):
+        o = step_order(Decimal("0.900"), held, f, Decimal("0.001"), Decimal("0.001"))
+        sent.append(o.qty)
+        held += o.qty
+    assert sent == [Decimal("0.300"), Decimal("0.300"), Decimal("0.300"), Decimal("-0.900")]
+    small = step_order(Decimal("0.900"), Decimal(0), 1 / 3, Decimal("0.001"), Decimal("0.350"))
+    assert small.qty == 0 and "below the venue's smallest order" in small.skipped
+    # Closing to 0 always goes in full, however small.
+    assert step_order(Decimal("0.900"), Decimal("0.010"), 0.0, Decimal("0.001"), Decimal("0.350")).qty == Decimal("-0.010")
+
+
+@pytest.mark.parametrize("after, due", [("2026-10-06T16:00", "2026-11-02"), ("2026-05-31T23:59", "2026-06-01"),
+                                        ("2026-09-30T00:00", "2026-10-05"), ("2026-12-08T00:00", "2027-01-04"),
+                                        ("2026-11-02T00:00", "2026-12-07")])
+def test_the_monthly_rebalance_is_the_first_monday_at_midnight_utc(after, due):
+    from datetime import datetime, timezone
+
+    from sleeve_fund.portfolio.allocation import next_rebalance
+
+    t = datetime.fromisoformat(after).replace(tzinfo=timezone.utc)
+    assert next_rebalance(t) == datetime.fromisoformat(due).replace(tzinfo=timezone.utc)

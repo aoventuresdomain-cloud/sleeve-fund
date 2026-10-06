@@ -51,6 +51,9 @@ class VenueProfile:
     # Half the bid-ask spread a backtest charges on orders that take liquidity, until a paper sleeve
     # on this venue has measured the instrument's own (sleeve_fund.spreads). Deliberately cautious.
     assumed_half_spread: float = 0.0005
+    # How far past its price a stop fills, as a share, which central sizing adds to the loss at the stop (P2-1).
+    # None: the larger of half the spread and sizing.DEFAULT_STOP_SLIPPAGE, until fills are measured against it.
+    stop_slippage: float | None = None
     # The venue lists linear perpetuals only (no spot): every strategy on it trades the "perp" market, under
     # the venue's own instrument symbol (`symbol`), with its real funding (`funding_loader`).
     perpetual: bool = False

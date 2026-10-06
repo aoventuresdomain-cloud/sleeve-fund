@@ -33,6 +33,9 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 ATR_STOP_MULTIPLE = 2.5  # the fallback stop, in ATR(14)s, when a definition declares none (spec: 2-3x)
 ROUND_UP_RISK = 1.5  # the venue minimum may be bought only while its risk stays within this many budgets
 ROUND_UP_FLAG = 0.2  # a strategy rounding up on more than this share of its entries is too small for the instrument
+# A stop fills as a market order, past its price: by the venue's named setting, or by default the larger of half the
+# spread and this (Independent Quant Advisor, 6 Oct 2026, 16:45).
+DEFAULT_STOP_SLIPPAGE = 0.0005
 OVERLAYS = ("stop", "vol_target")
 
 
@@ -67,7 +70,7 @@ class SizingInputs:
     vol_target: float | None = None  # target volatility of the position, per bar, as a share of allocated equity
     instrument_vol: float | None = None  # the instrument's volatility per bar (ATR / price, or the std of returns)
     vol_floor: float | None = None  # the floor under instrument_vol: its trailing one-year 25th percentile
-    stop_slippage: float | None = None  # past the stop price, as a share; None: one half spread
+    stop_slippage: float | None = None  # past the stop price, as a share; None: max(half spread, 0.05%)
     maintenance_margin: float = 0.0  # a perpetual's maintenance margin rate, for the liquidation rule
     stop_to_liquidation: float | None = None  # the profile's share of the way to liquidation a stop may sit
 
@@ -97,8 +100,10 @@ def _risk(i: SizingInputs) -> tuple[float, str]:
 
 
 def _stop(i: SizingInputs) -> tuple[float | None, str]:
-    if i.stop_frac is not None and i.stop_frac > 0:
-        return i.stop_frac, ""
+    if i.stop_frac is not None:
+        # A declared or computed stop is used as it is: one of 0 (or not a number) skips the entry, never falling
+        # back silently to the ATR stop (Advisor, 16:45).
+        return (i.stop_frac, "") if i.stop_frac == i.stop_frac and i.stop_frac > 0 else (None, "")
     if i.atr is not None and i.atr > 0 and i.price > 0:
         return ATR_STOP_MULTIPLE * i.atr / i.price, f"stop {ATR_STOP_MULTIPLE:g} x ATR(14), none declared"
     return None, ""
@@ -128,19 +133,22 @@ def size_entry(i: SizingInputs) -> Sizing:
     stop, stop_note = _stop(i)
     equity = i.allocated_equity
     if stop is None:
-        return Sizing(Decimal(0), "", None, 0.0, 0.0, skipped="no stop declared and no ATR yet: no sizing without "
-                      "a stop")
+        why = (f"its stop came to {i.stop_frac} of the price, so the entry can't be sized" if i.stop_frac is not None
+               else "no stop declared and no ATR yet: no sizing without a stop")
+        return Sizing(Decimal(0), "", None, 0.0, 0.0, skipped=why)
     if equity <= 0:
         return Sizing(Decimal(0), "", stop, 0.0, 0.0, skipped="no allocated equity to size from")
-    slip = i.half_spread if i.stop_slippage is None else i.stop_slippage
+    slip = max(i.half_spread, DEFAULT_STOP_SLIPPAGE) if i.stop_slippage is None else i.stop_slippage
     loss = loss_at_stop(stop, i.leg_cost, i.side) + (1 - i.side * stop) * slip  # per unit of notional
     budget = equity * risk_pct * i.regime_weight * i.fraction
     limits: dict[str, float] = {risk_name: budget / loss if loss > 0 else float("inf")}
     if i.overlay == "vol_target":
-        vol = max(i.instrument_vol or 0.0, i.vol_floor or 0.0)
+        # No volatility, or no floor under it, skips the entry rather than sizing on a guess (Advisor, 16:45).
+        known = [v for v in (i.instrument_vol, i.vol_floor) if v is not None and v == v]
+        vol = max(known) if len(known) == 2 else 0.0
         if not i.vol_target or vol <= 0:
-            return Sizing(Decimal(0), "", stop, budget, 0.0, skipped="volatility targeting needs a target and the "
-                          "instrument's volatility")
+            return Sizing(Decimal(0), "", stop, budget, 0.0, skipped="volatility targeting needs a target, the "
+                          "instrument's volatility and its one-year floor")
         limits["volatility target"] = i.vol_target * equity / vol * i.regime_weight * i.fraction
     limits["margin cap" if i.perp else "position cap"] = i.position_cap_pct * equity * i.leverage
     if i.perp:
@@ -179,3 +187,31 @@ def size_entry(i: SizingInputs) -> Sizing:
                           f"and the minimum would break {why}" if broken else
                           f"entry skipped: {sized_by} comes to {qty}, below the venue's smallest order ({i.min_qty}), "
                           f"and rounding up would take {why}")
+
+
+@dataclass
+class Step:
+    qty: Decimal  # the signed order: the target less what is held; 0 when skipped or already there
+    target: Decimal  # the fraction of full size this step aims at, in units
+    skipped: str = ""  # why no order goes out, in words
+
+
+def step_order(full_qty: Decimal, held_qty: Decimal, fraction: float, lot: Decimal, min_qty: Decimal) -> Step:
+    """A8: the order that moves a position to `fraction` of its full size, fixed once at first entry (Advisor
+    18:33). Only the difference is sent. A step smaller than the venue's minimum is skipped, saying why, and the
+    target never drifts: the next step is still measured from what is held. Going to 0 always closes in full."""
+    if not 0 <= fraction <= 1:
+        raise ValueError(f"the fraction of full size is between 0 and 1, got {fraction}")
+    exact = full_qty * Decimal(repr(fraction)) / lot
+    # 1/3 as a float is a hair under a third: a target within a millionth of a step of a whole step is that step,
+    # anything else rounds down, as every size does.
+    steps = exact.to_integral_value() if abs(exact - exact.to_integral_value()) < Decimal("1e-6") else \
+        exact.to_integral_value(rounding=ROUND_DOWN)
+    target = steps * lot
+    order = target - held_qty
+    if order == 0:
+        return Step(Decimal(0), target)
+    if target != 0 and abs(order) < min_qty:
+        return Step(Decimal(0), target, skipped=f"the step to {fraction:.0%} of full size is {abs(order)}, below the "
+                                                f"venue's smallest order ({min_qty})")
+    return Step(order, target)

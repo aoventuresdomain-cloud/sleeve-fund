@@ -12,7 +12,8 @@ D = Decimal
 
 def _in(**kw) -> SizingInputs:
     base = dict(allocated_equity=10_000.0, price=100.0, side=1, leg_cost=0.001, half_spread=0.0, risk_per_trade=0.01,
-                position_cap_pct=0.5, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02)
+                position_cap_pct=0.5, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02, stop_slippage=0.0,
+                vol_floor=0.0)  # no slippage and no floor unless a test sets them, so each limit is hand-checkable
     return SizingInputs(**{**base, **kw})
 
 
@@ -114,12 +115,29 @@ def test_no_allocated_equity_skips():
     assert "no allocated equity" in size_entry(_in(allocated_equity=0.0)).skipped
 
 
-def test_a_stop_fills_past_its_price_by_one_half_spread_unless_set():
-    """Advisor, 6 Oct 2026: the loss per unit carries a named stop slippage."""
-    plain = size_entry(_in(leg_cost=0.0015, half_spread=0.0005))
-    loss = loss_at_stop(0.02, 0.0015) + 0.98 * 0.0005
+@pytest.mark.parametrize("half_spread, slip", [(0.0002, 0.0005), (0.0008, 0.0008)])
+def test_a_stop_fills_past_its_price_by_the_larger_of_half_the_spread_and_five_basis_points(half_spread, slip):
+    """Advisor, 6 Oct 2026, 16:45: the loss per unit carries a named stop slippage, by default the larger of half
+    the spread and 0.05%; a venue's own setting replaces it."""
+    plain = size_entry(_in(leg_cost=0.0015, half_spread=half_spread, stop_slippage=None))
+    loss = loss_at_stop(0.02, 0.0015) + 0.98 * slip
     assert plain.qty == D(str(int(100 / loss / 100 * 100) / 100))  # 100 of risk over loss per unit, at 100
-    assert size_entry(_in(leg_cost=0.0015, half_spread=0.0005, stop_slippage=0.0)).qty > plain.qty
+    assert size_entry(_in(leg_cost=0.0015, half_spread=half_spread, stop_slippage=0.0)).qty > plain.qty
+
+
+def test_no_volatility_or_no_floor_skips_a_vol_sized_entry():
+    """Advisor, 16:45: NaN volatility, or a missing floor, skips the entry rather than sizing on a guess."""
+    for kw in ({"instrument_vol": float("nan")}, {"instrument_vol": None}, {"instrument_vol": 0.02, "vol_floor": None},
+               {"instrument_vol": 0.02, "vol_floor": float("nan")}):
+        s = size_entry(_in(overlay="vol_target", vol_target=0.01, **kw))
+        assert not s.ok and "volatility" in s.skipped
+
+
+@pytest.mark.parametrize("stop", [0.0, float("nan")])
+def test_a_computed_stop_of_zero_skips_and_never_falls_back_to_the_atr(stop):
+    """Advisor, 16:45: never fall back silently; the ATR stop is only for a definition that declares none."""
+    s = size_entry(_in(stop_frac=stop, atr=2.0))
+    assert not s.ok and "stop came to" in s.skipped
 
 
 def test_with_a_stop_and_a_volatility_target_the_smaller_size_wins():
