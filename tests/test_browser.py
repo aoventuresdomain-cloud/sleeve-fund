@@ -253,3 +253,42 @@ def test_development_columns_end_on_the_same_line(site, browser):
         page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "development-1440.png"), full_page=True)
     ctx.close()
     assert abs((col["y"] + col["height"]) - (study["y"] + study["height"])) <= 2
+
+
+def test_records_and_risk_charts_are_lightweight_charts(site, browser):
+    # QA U10: no hand-drawn SVG line charts left; Records' return curve is drawn by Lightweight Charts.
+    page, errors = _open(browser, site + "/records")
+    assert page.locator("svg.rec-curve").count() == 0
+    if page.locator(".lw-line.rec-curve").count():
+        page.wait_for_selector(".lw-line.rec-curve canvas", timeout=5000)
+    page.context.close()
+    risk, risk_errors = _open(browser, site + "/risk")
+    assert risk.locator(".rh-chart svg").count() == 0 and risk.locator(".lw-line.rh-dd").count() == 1
+    # QA U9: no hint under the price chart; the attribution sits once in the side rail.
+    assert "Tap a buy or sell arrow" not in risk.content() and risk.locator(".rail-foot a[href*=tradingview]").count() == 1
+    assert errors == [] and risk_errors == []
+    risk.context.close()
+
+
+def test_a_models_sentence_fills_placeholders_that_carry_a_format(site, browser):
+    # QA U11: "{long_entry:g}" was left raw because the picker's pattern skipped a format spec.
+    page, errors = _open(browser, site + "/backtest?strategy=rsi_bands")
+    desc = page.locator('.params[data-strategy="rsi_bands"] .desc')
+    assert desc.count() == 1
+    text = desc.inner_text()
+    assert "{" not in text and "}" not in text, text
+    assert errors == []
+    page.context.close()
+
+
+def test_risk_limits_table_fits_its_panel_on_a_desktop(site, browser):
+    # QA U3: the nine-column Limits table fits the panel at 1440 wide, Risk to stop included, with no sideways scroll.
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD}, viewport={"width": 1440, "height": 900})
+    page = ctx.new_page()
+    page.goto(site + "/risk#limits")
+    page.wait_for_load_state("networkidle")
+    page.click('a[data-tab="limits"]')
+    size = page.evaluate("() => { const s = document.querySelector('#lim-h').closest('section');"
+                         " return [s.scrollWidth, s.clientWidth, s.querySelectorAll('thead th').length]; }")
+    assert size[2] == 9 and size[0] <= size[1], size
+    ctx.close()

@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 
+import numpy as np
+import pandas as pd
 
-from sleeve_fund.research.guardrails import MIN_OOS_TRADES, nearby_settings
+from sleeve_fund.research.guardrails import G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -24,6 +26,9 @@ G1_CONFIDENCE = 0.95
 SHARPE_CHECK = "G1 test: out-of-sample Sharpe clearly beats benchmark after fees"
 JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
+# Where N or the deflated Sharpe is shown while an idea has a run whose count failed (QA P1-T8, P1-T10).
+N_UNCERTAIN = ("N uncertain: a run of this idea couldn't be counted in full, so this N and the bar it sets read low "
+               "until it is re-counted.")
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
@@ -75,10 +80,32 @@ def _row(label: str, s: dict, b: dict) -> str:
     )
 
 
+def _idea(r: StudyResult) -> str:
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    return legacy_idea_hash(r.spec.name)
+
+
+def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
+    """The counts a result is judged by: with the trials register, its idea family's (Advisor, 6 Oct 2026);
+    without one, the idea counter's, as before."""
+    return register.counts(_idea(r)) if register is not None else ledger.counts()
+
+
+def _trial_spread(r: StudyResult, register) -> float | None:
+    """The spread of the idea family's variant Sharpes, one per variant, for G1's best-of-N hurdle (QA P1-T5)."""
+    if register is None:
+        return None
+    sharpes = [x for x in register.sharpes(_idea(r)) if x is not None and math.isfinite(x)]
+    return float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else None
+
+
 def _breakeven_words(r: StudyResult) -> str:
     from sleeve_fund.research.study import breakeven_fee
 
-    return breakeven_fee(r.cost_ladder)[1] if r.cost_ladder else "not tested: no cost ladder was run"
+    if not r.cost_ladder:
+        return "not tested: no cost ladder was run"
+    return getattr(r, "breakeven", "") or breakeven_fee(r.cost_ladder)[1]
 
 
 def _breakeven_cell(row) -> str:
@@ -89,17 +116,43 @@ def _breakeven_cell(row) -> str:
     words = row.get("breakeven")
     if not isinstance(words, str):
         return "–"
+    if words.startswith("made no trades"):
+        return "no trades"
     return "loses at no fee" if words.startswith("loses") else "above the ladder" if words.startswith("still") else "–"
 
 
-def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
+def _nearby(r: StudyResult) -> tuple[str, str]:
+    """Holds at nearby settings, around what tuning chose, never the defaults (Independent Quant Advisor,
+    6 Oct 2026, P1-G2): each walk-forward fold's choice on that fold's training grid, reporting the worst
+    fold, and the whole period's choice on the full grid. Any failure fails the check."""
+    params = [c for c in r.spec.param_grid if c in r.sensitivity.columns]
+    chosen = getattr(r, "chosen_params", None) or r.default_params
+    final = nearby_scored(r.sensitivity, chosen, params)
+    words = f"whole period's choice: {final[1]}"
+    unscored = ("FAIL", "no setting scored a Sharpe on this fold's training stretch (none traded), so nothing was "
+                        "chosen", -math.inf)
+    folds = [(f, unscored if getattr(f, "unscored", False) else nearby_scored(f.grid, f.chosen, params))
+             for f in r.folds if isinstance(getattr(f, "grid", None), pd.DataFrame) and not f.grid.empty]
+    if not folds:
+        return final[0], words
+    failed = [x for x in folds if x[1][0] == "FAIL"]
+    f, (_, worst, _) = min(folds, key=lambda x: x[1][2])
+    words += (f"; {len(folds) - len(failed)} of {len(folds)} folds' choices hold; worst, the fold testing to "
+              f"{f.test_end:%b %Y} ({json.dumps(f.chosen)}): {worst}")
+    return ("FAIL" if final[0] == "FAIL" or failed else "PASS"), words
+
+
+def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
+    """register: the trials register, when the study ran against the database. Its count of variants, which
+    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
     oos = summary(r.oos_returns)
     bench = summary(r.oos_benchmark_returns)
     bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = r.oos_trades
-    counts = ledger.counts()
-    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
+    counts = _counts(r, ledger, register)
+    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"],
+                                             trial_spread=_trial_spread(r, register))
     unjudged = math.isnan(beats)
     if unjudged:
         beats = 0.0  # too short, or too few independent days, to judge
@@ -118,7 +171,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; " + (
                 "too few independent out-of-sample days to judge" if unjudged else
                 f"{_share(beats)} likely to beat it by more than the best of {counts['variants']} variants would by "
-                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}"),
+                f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}") + (f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""),
         ),
         _random_entry_check(r),
         (RANDOM_SIDE_CHECK, *((NOT_APPLICABLE, "long only: there is no side to draw") if r.random_side is None else
@@ -131,8 +184,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
         ),
         # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
-        (NEARBY_CHECK, *nearby_settings(r.sensitivity, r.default_params,
-                                        [c for c in r.spec.param_grid if c in r.sensitivity.columns])),
+        (NEARBY_CHECK, *_nearby(r)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         (
             "Holdout not used for tuning",
@@ -234,15 +286,17 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = summary(r.oos_benchmark_returns)
     full = summary(daily_returns(r.full_period.equity))
     full_b = summary(daily_returns(r.full_period_benchmark.equity))
-    counts = ledger.counts()
-    trial_sharpes = ledger.sharpes()
-    dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
+    counts = _counts(r, ledger, register)
+    project = ({**register.counts(), "ideas_by_family": register.ideas_by_family()} if register is not None else
+               counts)
+    dsr = (register.deflated_sharpe(r.oos_returns, _idea(r)) if register is not None else
+           deflated_sharpe_probability(r.oos_returns, counts["variants"], ledger.sharpes()))
     years_full = years_covered(r.full_period.equity)
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
     ts = r.trade_stats
@@ -260,6 +314,8 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     if r.settings:
         out.append(f"Settings: {r.settings}")
         out.append("")
+    out.append(f"G1 rules: {G1_RULES}")
+    out.append("")
     out.append(
         f"Dataset `{r.dataset}` · research period {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y} · "
         f"holdout: last {r.holdout_days} days {'(opened)' if r.holdout else '(untouched)'} · "
@@ -283,7 +339,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
-    checks = g1_checks(r, ledger)
+    checks = g1_checks(r, ledger, register)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
@@ -335,12 +391,10 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append("")
     if r.cost_ladder:
-        from sleeve_fund.research.study import breakeven_fee
-
-        _, words = breakeven_fee(r.cost_ladder)
-        out.append("## Cost ladder (full research period, default params)")
+        chosen = getattr(r, "chosen_params", None) or r.default_params
+        out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
         out.append("")
-        out.append(f"**Break-even fee:** {words}.")
+        out.append(f"**Break-even fee:** {_breakeven_words(r)}.")
         out.append("")
         out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid |")
         out.append("| --- | --- | --- | --- | --- |")
@@ -348,9 +402,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
             out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
                        f"| {rung.fees_paid:,.0f} |")
         out.append("")
-        out.append("The same strategy and settings at each fee, maker and taker alike. Every rung also pays half the "
+        out.append("The settings tuning on the whole research period picks (best in-sample Sharpe on the grid), at "
+                   "each fee, charged per side on maker and taker fills alike, so for a post-only strategy it mixes "
+                   "the two. Every rung also pays half the "
                    f"bid-ask spread as above plus {r.ladder_slippage:.2%} slippage on orders that take liquidity. 0.02% and "
-                   "0.05% are a low-fee perpetual venue's maker and taker rates, 0.80% a high-fee spot venue's taker rate.")
+                   "0.05% are a low-fee perpetual venue's maker and taker rates, 0.10-0.40% typical spot taker rates, "
+                   "0.80% a high-fee spot venue's taker rate. The break-even interpolates log(1 + return) between "
+                   "rungs, then re-runs at that fee to verify it.")
         out.append("")
     out.append("## Walk-forward folds")
     out.append("")
@@ -366,7 +424,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("## Parameter sensitivity (full research period, in-sample)")
     out.append("")
     cols = [c for c in r.sensitivity.columns if c in spec.param_grid]
-    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee |")
+    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee per side, on top of spread and slippage |")
     out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- | --- |")
     for _, row in r.sensitivity.iterrows():
         out.append(
@@ -374,20 +432,27 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
             + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} "
             f"| {_breakeven_cell(row)} |"
         )
-    out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}.")
+    out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}. "
+               "Break-even fees in this table are interpolated between the cost ladder's rungs; the chosen "
+               "settings' is re-run to verify it, as the cost ladder says.")
     out.append("")
     out.append("## Idea counter")
     out.append("")
-    out.append(f"- {_n(counts['ideas'], 'idea')} and {_n(counts['variants'], 'distinct variant')} tested so far "
-               f"({counts['evaluations']} evaluations including walk-forward refits). By family: "
-               + ", ".join(f"{k} {v}" for k, v in counts["ideas_by_family"].items()))
+    uncertain = f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""
+    if register is not None:
+        out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
+                   f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
+                   f"results are judged by.{uncertain}")
+    out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
+               f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
+               + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
     if math.isnan(dsr):
         out.append("- Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns "
                    "vary, and " + ("these test windows never traded." if r.oos_trades == 0 else
-                                   f"this one has {oos['days']} days."))
+                                   f"this one has {oos['days']} days.") + uncertain)
     else:
         out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
-                   "is real rather than the best of many tries (higher is better; 95% is a strong bar).")
+                   f"is real rather than the best of many tries (higher is better; 95% is a strong bar).{uncertain}")
     out.append("")
     out.append("## Caveats")
     out.append("")

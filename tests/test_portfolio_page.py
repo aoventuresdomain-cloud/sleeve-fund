@@ -201,6 +201,37 @@ def test_pnl_by_strategy_rows_add_up_to_the_book_row_for_each_period(client):  #
     assert day.index("pp-short") < day.index("flat-one") < day.index("rsi-long")
 
 
+def test_an_archived_strategy_gets_one_row_so_the_rows_still_add_up_to_book(client):  # noqa: F811
+    """QA U1: the book's figures count an archived strategy, so its P&L goes in one Archived row."""
+    c, store = client
+    _book(store)
+    store.set_desired_state("pp-short", "stopped")
+    store.archive("pp-short")
+    page = c.get("/", auth=AUTH).text
+    panel = page.split('aria-labelledby="move-h" data-periods>')[1].split("</section>")[0]
+    for key in ("day", "week", "mtd"):
+        body = panel.split(f'data-period-rows="{key}"')[1].split("</tbody>")[0]
+        cells = re.findall(r'<td class="num">(?:<span class="\w*">)?([+−]?[\d,.]+)', body)
+        *rows, total = [float(v.replace("−", "-").replace(",", "")) for v in cells]
+        assert len(rows) == 3 and abs(sum(rows) - total) < 0.011, key
+        assert 'class="archived-row"' in body and 'title="pp-short"' in body and "/sleeves/pp-short" not in body
+    assert 'id="archived"' in page
+
+
+def test_a_positions_fees_are_its_own_not_the_strategys_since_it_started(client):  # noqa: F811
+    """QA U4: after a closed trip, the Fees cell is the open position's fees, and the footer adds those up."""
+    c, store = client
+    _book(store)
+    store.record_fill("rsi-long", side="SELL", qty=1.0, price=3_010, fee=1.0, order_id="R-2", trade_id="T-3")
+    store.record_fill("rsi-long", side="BUY", qty=1.0, price=2_990, fee=0.7, order_id="R-3", trade_id="T-4")
+    store.record_equity("rsi-long", equity=9_986.1, cash=6_996.1, qty=1.0, price=2_970, benchmark=10_000)
+    table = _panel(c.get("/", auth=AUTH).text, "positions")
+    row = next(r for r in table.split("<tr") if "rsi-long" in r)
+    assert re.findall(r'<td class="num">([\d,.]+)</td>', row)[-1] == "0.70"  # not 2.90, the strategy's fees
+    foot = table.split("<tfoot")[1]
+    assert re.findall(r'<td class="num">([\d,.]+)</td>', foot)[-1] == "2.20"  # 0.70 + pp-short's 1.50
+
+
 def test_allocation_nets_holdings_by_instrument_and_flags_crossing(client):  # noqa: F811
     c, store = client
     _book(store)

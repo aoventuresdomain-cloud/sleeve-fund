@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -257,7 +260,7 @@ def test_a_store_study_runs_under_paper_rules(tmp_path):
     assert done and done == sorted(done) and done[-1] <= 1
     with pytest.raises(ValueError, match="would take hours"):
         run_store_study(StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=1), history=hist)
-    with pytest.raises(ValueError, match="no stored Kraken spot history for SOL/USD"):
+    with pytest.raises(ValueError, match="no stored history for SOL/USD on this venue"):
         run_store_study(StudyRequest(strategy="buy_and_hold", pair="SOL/USD"), history=hist)
 
 
@@ -505,12 +508,20 @@ def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path,
     from sleeve_fund.research.study import ladder_slippage
 
     assert (ladder_slippage("ETH/USDT"), ladder_slippage("SUI/USD")) == (0.0002, 0.0005)
-    # v2 P1-6: every grid point gets its own ladder and break-even fee, and the default's is the one above.
+    # v2 P1-6: every grid point gets its own ladder and break-even fee. P1-G1/G2: the one above is the chosen
+    # settings', re-run to verify it; the grid's others are interpolated.
     assert r.sensitivity["breakeven"].map(bool).all()
-    default = r.sensitivity[(r.sensitivity["fast"] == r.default_params["fast"])
-                            & (r.sensitivity["slow"] == r.default_params["slow"])].iloc[0]
-    assert default["breakeven"] == breakeven_fee_of(r.cost_ladder)[1]
-    assert "| Break-even fee |" in sheet
+    chosen = r.sensitivity[(r.sensitivity["fast"] == r.chosen_params["fast"])
+                           & (r.sensitivity["slow"] == r.chosen_params["slow"])].iloc[0]
+    assert chosen["breakeven"] == r.breakeven and r.chosen_params == r.sensitivity.loc[r.sensitivity["sharpe"].idxmax(),
+                                                                                       ["fast", "slow"]].to_dict()
+    assert r.breakeven.split(" (")[0] == breakeven_fee_of(r.cost_ladder)[1].split(" (")[0]
+    assert "| Break-even fee per side, on top of spread and slippage |" in sheet
+    from sleeve_fund.dashboard import pipeline
+    from sleeve_fund.research.guardrails import G1_RULES
+
+    (tmp_path / "s.md").write_text(sheet)  # QA F3: a new sheet says its rules, so it is never an old bar
+    assert f"G1 rules: {G1_RULES}" in sheet and not pipeline.sheet_facts(tmp_path / "s.md")["evidence"].startswith("Old")
     checks = dict((name, verdict) for name, verdict, _ in g1_checks_of(r, ledger))
     assert checks["Break-even fee (shown, not a test)"] == "INFO" and "Holds at nearby settings" in checks
 
@@ -523,9 +534,111 @@ def test_the_break_even_fee_is_read_between_the_rungs_either_side_of_zero():
                 for f, r in zip((0.0, 0.0002, 0.0005, 0.001, 0.008), rets)]
 
     fee, words = breakeven_fee(ladder(0.10, 0.08, 0.05, -0.05, -0.9))
-    assert fee == pytest.approx(0.00075) and "about 0.075%" in words and "between 0.05% and 0.10%" in words
+    # P1-G1: log(1 + return) is interpolated, since fees compound per trade; a straight line gave 0.075%.
+    assert fee == pytest.approx(0.0005 + 0.0005 * math.log(1.05) / math.log(1.05 / 0.95))
+    assert "about 0.074%" in words and "interpolated between 0.05% and 0.10%" in words
     assert breakeven_fee(ladder(-0.01, -0.02, -0.03, -0.04, -0.5)) == (None, "loses money even at 0.00% fees")
     assert breakeven_fee(ladder(0.5, 0.5, 0.4, 0.4, 0.1))[1] == "still makes money at 0.80% per side, the top of the ladder"
+
+
+def _ar1_daily(phi: float, seed: int, days: int = 1500) -> pd.DataFrame:
+    """Daily bars whose returns carry autocorrelation, so a fast trend filter earns a gross edge over many
+    trades: QA's stress case for the break-even fee (quant-review/v2-p1/guardrails.md, g3b)."""
+    from sleeve_fund.data import validate_ohlcv
+
+    rng = np.random.default_rng(seed)
+    eps = rng.normal(0, 0.02, days)
+    rets = np.zeros(days)
+    for i in range(1, days):
+        rets[i] = phi * rets[i - 1] + eps[i]
+    close = 10_000 * np.exp(np.cumsum(rets))
+    open_ = np.concatenate([[10_000.0], close[:-1]])
+    wig = np.abs(rng.normal(0, 0.005, days))
+    idx = pd.date_range("2019-01-01", periods=days, freq="1D", tz="UTC") + pd.Timedelta("1D")
+    return validate_ohlcv(pd.DataFrame({"open": open_, "high": np.maximum(open_, close) * (1 + wig),
+                                        "low": np.minimum(open_, close) * (1 - wig), "close": close,
+                                        "volume": 1_000.0}, index=pd.DatetimeIndex(idx, name="timestamp")))
+
+
+def test_the_break_even_fee_is_where_a_re_run_nets_zero_on_qas_fast_2_slow_3_case():
+    """QA P1-G1: fast 2 / slow 3 on AR(1) daily bars (phi 0.1, seed 3) reported 0.291% per side between the
+    0.10% and 0.80% rungs, against a true 0.163%, and lost 46% at the reported fee. The figure must now be
+    one a re-run at that fee confirms nets about zero, from the old wide gap as well as the new ladder."""
+    from decimal import Decimal
+
+    from sleeve_fund.instruments import FeeSchedule
+    from sleeve_fund.research.metrics import round_trips
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.research.study import (BREAKEVEN_TOLERANCE, COST_LADDER, LadderRung, breakeven_fee,
+                                            ladder_slippage)
+    from sleeve_fund.strategies.trend_filter import SPEC as TREND
+    from sleeve_fund.venues import venue
+
+    research = _ar1_daily(0.1, 3).iloc[:-100]
+    inst = venue("KRAKEN").instrument("BTC", "USD")
+    params = {**TREND.default_params, "fast": 2, "slow": 3}
+    half = venue("KRAKEN").assumed_half_spread + ladder_slippage("BTC/USD")
+    runs = []
+
+    def run(fee: float):
+        return run_backtest(TREND.name, research, inst, params, bar_minutes=1440, half_spread=half,
+                            fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))))
+
+    def run_at(fee: float) -> float:
+        runs.append(fee)
+        return float(run(fee).equity.iloc[-1] / 10_000.0 - 1)
+
+    def rung(fee: float) -> LadderRung:
+        res = run(fee)
+        return LadderRung(fee=fee, total_return=float(res.equity.iloc[-1] / 10_000.0 - 1), sharpe=0.0,
+                          round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid)
+
+    old = [rung(f) for f in (0.0, 0.0002, 0.0005, 0.001, 0.008)]
+    lo, hi = old[3], old[4]
+    chord = lo.fee + (hi.fee - lo.fee) * lo.total_return / (lo.total_return - hi.total_return)
+    assert chord == pytest.approx(0.00291, abs=0.00005)  # the old straight line, as QA found it
+
+    for ladder in (old, [rung(f) for f in COST_LADDER]):
+        runs.clear()
+        fee, words = breakeven_fee(ladder, run_at)
+        assert fee == pytest.approx(0.00163, abs=0.00005) and "verified" in words
+        assert abs(run_at(fee)) <= BREAKEVEN_TOLERANCE and 1 <= len(runs) - 1 <= 6
+    assert "interpolated" in breakeven_fee(ladder)[1]
+
+
+def test_a_variant_without_trades_is_not_said_to_lose_money():
+    # QA F6: no trades read "loses money even at 0.00% fees" and "loses at no fee".
+    from sleeve_fund.research.study import LadderRung, breakeven_fee
+    from sleeve_fund.research.tearsheet import _breakeven_cell
+
+    idle = [LadderRung(fee=f, total_return=0.0, sharpe=float("nan"), round_trips=0, fees_paid=0.0) for f in (0.0, 0.001)]
+    fee, words = breakeven_fee(idle)
+    assert fee is None and words.startswith("made no trades")
+    assert _breakeven_cell({"breakeven_fee": float("nan"), "breakeven": words}) == "no trades"
+
+
+def test_the_trade_bar_counts_out_of_sample_trades_99_fails_100_passes(tmp_path, instrument):
+    """QA F8: the bar was only tested as a constant. Through g1_checks, 99 out-of-sample trades fail and 100
+    pass, whatever the in-sample count."""
+    import dataclasses
+
+    from sleeve_fund.research.tearsheet import g1_checks
+
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, synthetic_ohlcv(days=1500, seed=3), instrument, dataset="syn", ledger=ledger,
+                  synthetic=True, holdout_days=100, train_days=730, test_days=365)
+    in_sample = len(r.round_trips)
+
+    def row(total: int):
+        per = [total // len(r.folds)] * len(r.folds)
+        per[0] += total - sum(per)
+        folds = [dataclasses.replace(f, test_trades=n) for f, n in zip(r.folds, per)]
+        checks = g1_checks(dataclasses.replace(r, folds=folds), ledger)
+        return next((v, ev) for name, v, ev in checks if name == "Enough out-of-sample trades to judge")
+
+    verdict, words = row(99)
+    assert verdict == "FAIL" and words.startswith("99 closed") and f"{in_sample} over the full research period" in words
+    assert row(100)[0] == "PASS"
 
 
 def test_the_sensitivity_table_shows_grid_values_as_set():
@@ -533,3 +646,22 @@ def test_the_sensitivity_table_shows_grid_values_as_set():
     from sleeve_fund.research.tearsheet import _param
 
     assert [_param(v) for v in (20, 20.0, 0.005, 1.5, "ema")] == ["20", "20", "0.005", "1.5", "ema"]
+
+
+def test_a_fold_where_no_setting_scores_fails_with_a_reason_not_a_crash(tmp_path, instrument, monkeypatch):
+    """Code Reviewer on #156: when every training Sharpe in a fold is NaN, nothing is chosen. The study used to
+    raise; now the fold sits flat, the nearby-settings check fails it with the reason, and the holdout stays shut."""
+    from sleeve_fund.research import study
+    from sleeve_fund.research.tearsheet import NEARBY_CHECK, g1_checks
+
+    real = study.summary
+    monkeypatch.setattr(study, "summary", lambda r: {**real(r), "sharpe": float("nan")})
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, synthetic_ohlcv(days=1900, seed=3), instrument, dataset="syn", ledger=ledger, synthetic=True,
+                  holdout_days=200, train_days=730, test_days=365, use_holdout=True)
+    assert r.folds and all(f.unscored and f.chosen == {} for f in r.folds)
+    assert len(r.oos_returns) and (r.oos_returns == 0).all()  # sat flat through every test window
+    verdict, words = next(c[1:] for c in g1_checks(r, ledger) if c[0] == NEARBY_CHECK)
+    assert verdict == "FAIL" and "no setting scored a Sharpe on this fold's training stretch" in words
+    assert r.holdout is None and "no setting scored" in r.holdout_withheld
+    assert render(r, ledger)  # the sheet renders

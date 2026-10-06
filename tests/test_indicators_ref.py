@@ -220,10 +220,14 @@ def _true_range(bars):
     return np.maximum(bars["high"], prev.fillna(bars["high"])) - np.minimum(bars["low"], prev.fillna(bars["low"]))
 
 
-@pytest.mark.parametrize("n", [1, 5, 13])
+@pytest.mark.parametrize("n", [1, 3, 6, 14, 60])
 def test_atr_is_wilders(bars, n):
     """Pinned reference (P1-I4): `atr` is Wilder's ATR, seeded with the mean of the first n true ranges, the
-    first bar's range its high minus low."""
+    first bar's range its high minus low. It initializes after 20 lengths (QA P1-A1), so a set shorter than that
+    can't check this length; the 5,040 synthetic bars check every one."""
+    if 20 * n > len(bars):
+        which = "recorded" if bars is DATA["recorded"] else "synthetic"
+        pytest.skip(f"{len(bars)} {which} bars are fewer than the {20 * n} Atr({n}) needs to initialize")
     _check(*_stream(Atr(n), bars, _hlc), _wilder(_true_range(bars), n))
 
 
@@ -394,9 +398,9 @@ def test_warmup_bars_from_settings():
     assert warmup_for([Sma(50), Ema(20), RelativeVolume(20)]) == settle_bars(20)
     assert Donchian(20).warmup_bars == 21
     assert RsiDivergence(14, 3, 3, 50).warmup_bars == settle_bars(14) + 56
-    assert Atr(14).warmup_bars == settle_bars(14)
+    assert Atr(14).warmup_bars == 20 * 14  # QA P1-A1: a range average settles over twenty lengths
     assert Stochastic(14, 3, 3).warmup_bars == 18
-    assert Keltner(20, 10).warmup_bars == settle_bars(20) and Keltner(2, 30).warmup_bars == settle_bars(30)
+    assert Keltner(20, 10).warmup_bars == settle_bars(20) and Keltner(2, 30).warmup_bars == 20 * 30
     assert warmup_for([]) == 0
 
 

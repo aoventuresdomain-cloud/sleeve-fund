@@ -236,7 +236,7 @@ def test_an_atr_stop_is_set_from_the_market_at_entry(prices, instrument):
     assert len(buys) == 1 and buys["ts_last"].iloc[0] >= df.index[13]  # not before 14 bars of range
     assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(96.0)
     d = res.decisions[sells.index[0]]
-    assert d["intent"] == "stop_loss" and "2 x the 14-bar average true range" in d["reason"]
+    assert d["intent"] == "stop_loss" and "2 x the 14-bar simple average true range" in d["reason"]
     entry = res.decisions[buys.index[0]]["signal"]
     # 1R = 4% + 0.8% in + 0.8% of 96% out = 5.568%; 2R after costs needs (2 x 5.568% + 1.6%) / 0.992 = 12.84%.
     assert entry["stop_frac"] == pytest.approx(0.04) and entry["tp_frac"] == pytest.approx(0.128387, abs=1e-5)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Callable
 
@@ -62,6 +62,10 @@ class VenueProfile:
     # (pair, start in ms) -> up to a page of settled funding, [(time in ms, rate)], oldest first
     funding_loader: Callable[[str, int], list] | None = None
     funding_hours: tuple[int, ...] = (0, 8, 16)  # UTC hours the venue settles funding at
+    # series -> (pair, start in ms) -> up to a page of the venue's snapshots, [(time in ms, *values)], oldest first,
+    # one per `stats_minutes`: open interest and the positioning ratios (sleeve_fund.open_interest.SERIES)
+    stats_loaders: dict[str, Callable[[str, int], list]] = field(default_factory=dict)
+    stats_minutes: int = 5
     # pair -> {"price_precision", "size_precision", "min_quantity", "min_notional"}, the venue's contract limits
     contract: Callable[[str], dict] | None = None
     # Instruments the history store always keeps for this venue, before any strategy trades them
@@ -418,7 +422,54 @@ def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, 
     rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingRate?" + urllib.parse.urlencode(q))
     if isinstance(rows, dict):
         raise ValueError(f"Binance: {rows.get('msg', rows)}")
-    return [(int(r["fundingTime"]), float(r["fundingRate"])) for r in rows]
+    return [(int(r["fundingTime"]), _number_or_none(r.get("fundingRate"))) for r in rows]  # a null: refused by funding
+
+
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
+BINANCE_OI_DAYS = 30  # Binance keeps open interest history for the latest 30 days only
+
+
+def _binance_stats(path: str, fields: tuple[str, ...], pair: str, start_ms: int, get_json=None,
+                   now_ms: int | None = None) -> list[tuple]:
+    """Up to 500 five-minute snapshots of one of Binance's futures statistics from `start_ms`, [(time in ms,
+    *fields)], oldest first, each stamped at the end of its completed period. Binance keeps only the latest 30 days,
+    so an earlier start is moved up to the oldest it still has."""
+    import time
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    oldest = now_ms - BINANCE_OI_DAYS * 86_400_000 + 300_000  # a period inside the window, or Binance refuses it
+    q = {"symbol": binance_symbol(pair), "period": "5m", "startTime": max(start_ms, oldest), "limit": 500}
+    rows = (get_json or _get_json)(f"{BINANCE_FUTURES_DATA}/{path}?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    # A null or junk value stays None, and open_interest.refresh refuses that row alone (QA P1-O13): a float() that
+    # raised here would lose the whole page.
+    return [(int(r["timestamp"]), *(_number_or_none(r.get(f)) for f in fields)) for r in rows]
+
+
+def _number_or_none(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def binance_open_interest(pair: str, start_ms: int, get_json=None, now_ms: int | None = None) -> list[tuple]:
+    """[(time in ms, contracts, notional in the quote currency)]: the open interest at each period's end."""
+    return _binance_stats("openInterestHist", ("sumOpenInterest", "sumOpenInterestValue"), pair, start_ms,
+                          get_json, now_ms)
+
+
+_RATIO = ("longShortRatio", "longAccount", "shortAccount")
+BINANCE_STATS = {
+    "open_interest": binance_open_interest,
+    # unused and unvalidated (HoE, 19:07): kept only because Binance drops them after 30 days
+    "long_short_global": lambda pair, start, **kw: _binance_stats("globalLongShortAccountRatio", _RATIO, pair, start, **kw),
+    "long_short_top": lambda pair, start, **kw: _binance_stats("topLongShortPositionRatio", _RATIO, pair, start, **kw),
+}
 
 
 def _binance_data_client() -> tuple:
@@ -453,6 +504,7 @@ BINANCE = register(VenueProfile(
     perpetual=True,
     symbol=lambda pair: f"{binance_symbol(pair)}-PERP",
     funding_loader=binance_funding,
+    stats_loaders=BINANCE_STATS,
     contract=binance_contract,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,

@@ -235,7 +235,8 @@ def test_strategies_on_binance_go_to_bybit_demo_with_their_own_quantity():
                         venue="binance")
     targets = {"BYBIT": demo, "DERIBIT": testnet}
     mirror.mirror_once(store, targets)
-    assert "Bybit Demo Trading (api-demo.bybit.com)" in store.events("bn-ls")[0]["message"]
+    started = store.events("bn-ls")[0]["message"]  # activity names no venue (QA U8 ruling)
+    assert "copied to its demo account; demo money is not real" in started and "Bybit" not in started
     _fill(store, "bn-ls", "SELL", 0.05, 1)
     _fill(store, "bn-ls", "BUY", 0.0004, 2)  # under Bybit's 0.001 smallest order
     _fill(store, "pp-ls", "BUY", 0.05, 3)
@@ -264,10 +265,11 @@ def test_a_strategy_whose_demo_account_is_not_set_up_is_skipped_not_sent_elsewhe
     store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"market": "perp", "demo_mirror": True}, venue="binance")
     mirror.mirror_once(store, {"DERIBIT": testnet})
-    assert "BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET" in store.events("bn-ls")[0]["message"]
+    started = store.events("bn-ls")[0]["message"]
+    assert "its demo account, once that is set up on Setup, Accounts" in started and "BYBIT" not in started
     _fill(store, "bn-ls", "BUY", 0.05, 1)
     mirror.mirror_once(store, {"DERIBIT": testnet})
-    assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "no Bybit demo account set up"
+    assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "the demo account isn't set up"
 
 
 def test_the_start_check_says_whether_the_key_signed_in_and_flags_hedge_mode():
@@ -556,4 +558,4 @@ def test_resync_all_covers_every_bybit_strategy_and_refuses_what_is_not_copied()
         store.request_resync("pp", "x")
     with pytest.raises(ValueError, match="reason"):
         store.request_resync("bn-a", " ")
-    assert "Deribit" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced
+    assert "sized in dollars" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced
