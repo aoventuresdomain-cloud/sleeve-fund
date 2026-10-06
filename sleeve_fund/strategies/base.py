@@ -452,6 +452,10 @@ class LongFlatStrategy(Strategy):
         # Paper and its replay (set by the node): post-only orders are kept here and sliced. Live, they rest
         # at the venue, whose own queue decides.
         self.simulated_venue = False
+        # Paper fed by its venue's market data hub (v2 P1-1, sleeve_fund.paper.hub_client): the bars are the hub's,
+        # so warm-up comes from the history store the hub feeds, never from the venue (set by the node).
+        self.hub_fed = False
+        self.hub_status = None  # the hub's own word on its venue connection (hub_client.HubStatus), when hub-fed
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
@@ -553,7 +557,7 @@ class LongFlatStrategy(Strategy):
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
         self._plan_resume()
         if self._cfg.warmup_bars:
-            if self.history_loader is not None and str(self._cfg.bar_type).endswith("INTERNAL"):
+            if self.history_loader is not None and (str(self._cfg.bar_type).endswith("INTERNAL") or self.hub_fed):
                 self._warm_from_history()
                 self._finish_resume()
             else:
@@ -2178,8 +2182,8 @@ class LongFlatStrategy(Strategy):
         self._last_market_ns = self.clock.timestamp_ns()
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
-        if self._noted & {"stale_price", "feed_dead"}:
-            self._noted -= {"stale_price", "feed_dead"}
+        if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:
+            self._noted -= {"stale_price", "feed_dead", "hub_venue_down"}
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "info", "price_feed_back", "Market data is arriving again",
                                          ts=self.runtime.now())
@@ -2191,10 +2195,17 @@ class LongFlatStrategy(Strategy):
         the supervisor restarts the process, which reconnects to the venue."""
         if self._backtest or self._last_market_ns is None:
             return False
-        minutes = (self.clock.timestamp_ns() - self._last_market_ns) / 60e9
+        now = self.clock.timestamp_ns()
+        minutes = (now - self._last_market_ns) / 60e9
         if minutes >= STALE_PRICE_WARN_MINUTES:
             self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
                        f"risk guard are using the last price, {self._price():,.6g}")
+        if minutes >= STALE_PRICE_RESTART_MINUTES and self.hub_status is not None and self.hub_status.venue_down(now):
+            # The hub is up and has lost the venue itself: a restart reconnects to the same hub and can't help, and
+            # each one costs the bar under way (QA P1-C9). Wait for the hub to get the venue back.
+            self._note("hub_venue_down", "The market data hub is running but has lost its venue connection; "
+                       "waiting for it to come back rather than restarting this strategy")
+            return False
         if minutes >= STALE_PRICE_RESTART_MINUTES:
             self._note("feed_dead", f"No market data for {minutes:.0f} minutes: the price feed looks dead, so this "
                        "process stops reporting and the supervisor restarts it to reconnect", level="error")
