@@ -1588,18 +1588,32 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
             gaps = hist.gaps(v, pair)
             kinds = [e.get("kind") for e in hist.provenance(v, pair)]
+            funding_gaps = _funding_health(v, pair, hist.root, log)
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
         row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
                "state": "catching up" if behind else "current", "gaps": gaps,
-               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict")}
+               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict"), **funding_gaps}
         out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],
              "badge": dev.history_badge({"first": None})}
             for p, r in asked.items() if p not in held]
     return sorted(out, key=lambda h: h["pair"])
+
+
+def _funding_health(venue: str, pair: str, root, log) -> dict:
+    """Missed funding settlements and possible holes at a change of settlement interval (QA P1-O9/O11), for the
+    instrument's history chip. Empty where no funding is kept."""
+    from sleeve_fund import funding
+
+    try:
+        return {"funding_gaps": len(funding.gaps(venue, pair, root)),
+                "funding_maybe": len(funding.interval_changes(venue, pair, root))}
+    except Exception as exc:  # noqa: BLE001 - the prices' badge stands without it
+        log.warning(f"couldn't read the funding kept for {pair}: {exc!r}")
+        return {}
 
 
 def _study_request(form: dict) -> "study_run.StudyRequest":

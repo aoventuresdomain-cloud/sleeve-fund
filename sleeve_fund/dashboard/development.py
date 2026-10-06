@@ -169,6 +169,13 @@ def history_chip(h: dict) -> dict:
     # where a later bar for a stored minute differed and was kept out.
     n, c = h.get("refills", 0), h.get("conflicts", 0)
     title = f"{n} refill{'s' if n != 1 else ''}, {c} conflict{'s' if c != 1 else ''} recorded" if n or c else ""
+    # Funding kept beside the prices: missed settlements, and possible holes where the settlement interval changed.
+    fg, fm = h.get("funding_gaps", 0), h.get("funding_maybe", 0)
+    if fg or fm:
+        funding_note = "; ".join(p for p in (f"{fg} missed funding settlement{'s' if fg != 1 else ''}" if fg else "",
+                                             f"{fm} possible funding hole{'s' if fm != 1 else ''} at an interval change"
+                                             if fm else "") if p)
+        title = f"{title}; {funding_note}" if title else funding_note
     return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
 
 
