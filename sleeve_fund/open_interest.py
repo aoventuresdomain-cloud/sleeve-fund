@@ -22,12 +22,12 @@ rule; reading the files or snapshots() directly in a backtest or a strategy is r
 from __future__ import annotations
 
 import json
-import threading
+import uuid
 from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund.history import DEFAULT_ROOT
+from sleeve_fund.history import DEFAULT_ROOT, _durable_replace, _record, _writing
 
 # Each series' values, in the venue loader's order. Open interest's notional is contracts x price: derived.
 SERIES = {"open_interest": ("contracts", "notional"),
@@ -35,7 +35,8 @@ SERIES = {"open_interest": ("contracts", "notional"),
           "long_short_top": ("long_short_ratio", "long_share", "short_share")}
 UNMEASURED_LAG = pd.Timedelta(minutes=20)  # until lag() has live snapshots to measure: the slow end of what we see
 AT_RISK = pd.Timedelta(days=7)  # the venue keeps 30 days: say so loudly long before anything is lost
-_lock = threading.Lock()
+NEVER_KEPT = pd.Timedelta(days=1)  # a series with nothing kept a day after the collector started is failing
+_STARTED = pd.Timestamp.now(tz="UTC")  # when this process started collecting
 
 
 def _path(venue: str, pair: str, root: str | Path | None = None, series: str = "open_interest") -> Path:
@@ -95,16 +96,25 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
     if loader is None:
         raise ValueError(f"{venue_profile(venue).label} publishes no {series}")
     path = _path(venue, pair, root, series)
+    # Fetch with no lock held (a backfill is many pages), then merge and write under the series directory's write
+    # lock, shared across processes with the price history's writer (QA F3): a manual refresh while the hub runs
+    # waits for the hub's write instead of overwriting it.
+    kept = _kept(path)
+    start = kept[-1][0] + 1 if kept else 0
+    pages = []
+    for _ in range(max_pages):
+        page = loader(pair, start)
+        pages.append((page, int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)))
+        if not page or len(page) < 500 or page[-1][0] + 1 <= start:
+            break
+        start = page[-1][0] + 1
     written = unchanged = 0
     conflicts: list[dict] = []
-    with _lock:
-        kept = _kept(path)
+    with _writing(path.parent):
+        kept = _kept(path)  # again: another writer may have added snapshots while we fetched
         backfill = not kept  # the first fetch reaches back over the venue's whole window
         by_time = {r[0]: r for r in kept}
-        start = kept[-1][0] + 1 if kept else 0
-        for _ in range(max_pages):
-            page = loader(pair, start)
-            seen = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+        for page, seen in pages:
             for t, *values in page:
                 have = by_time.get(int(t))
                 if have is None:
@@ -119,19 +129,12 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
                                       "at": pd.Timestamp.now(tz="UTC").isoformat(), "source": "venue_rest",
                                       "snapshot": pd.Timestamp(int(t), unit="ms", tz="UTC").isoformat(),
                                       "stored": have[1:-2], "offered": [float(v) for v in values]})
-            if not page or len(page) < 500 or page[-1][0] + 1 <= start:
-                break
-            start = page[-1][0] + 1
         if written:
             kept.sort(key=lambda r: r[0])
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
+            tmp = path.parent / f".{path.stem}.{uuid.uuid4().hex}.tmp"
             tmp.write_text(json.dumps({"snapshots": kept}))
-            tmp.replace(path)
-        if conflicts:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path.parent / "provenance.jsonl", "a") as f:
-                f.writelines(json.dumps(e) + "\n" for e in conflicts)
+            _durable_replace(tmp, path)  # a power loss leaves the old file or the new one, never an empty one
+        _record(path.parent, conflicts)
     return {"written": written, "unchanged": unchanged, "conflicts": len(conflicts),
             "latest": pd.Timestamp(kept[-1][0], unit="ms", tz="UTC") if kept else None}
 
@@ -152,13 +155,22 @@ def gaps(venue: str, pair: str, root: str | Path | None = None, period: pd.Timed
 
 
 def at_risk(venue: str, pair: str, root: str | Path | None = None, now: pd.Timestamp | None = None,
-            series: str = "open_interest") -> str | None:
+            series: str = "open_interest", since: pd.Timestamp | None = None) -> str | None:
     """Why this instrument's open interest is close to being lost for good, or None. The venue keeps 30 days, so
-    once the newest snapshot kept is a week old the collector is failing and must be fixed while it can catch up."""
+    once the newest snapshot kept is a week old the collector is failing and must be fixed while it can catch up.
+    A series never kept at all is raised a day after the collector started (`since`, this process's start by
+    default): the venue's window moves on daily, so a loader failing from the first deploy is never silent."""
     newest = latest(venue, pair, root, series)
     now = now or pd.Timestamp.now(tz="UTC")
-    if newest is not None and now - newest > AT_RISK:
+    name = series.replace("_", " ")
+    if newest is None:
+        since = since or _STARTED
+        if now - since > NEVER_KEPT:
+            return (f"{venue.upper()} {pair}: {name} last kept never, though collected since {since:%Y-%m-%d %H:%M} "
+                    f"UTC; the venue keeps 30 days, so each day without a snapshot loses a day for good")
+        return None
+    if now - newest > AT_RISK:
         lost = newest + pd.Timedelta(days=30)
-        return (f"{venue.upper()} {pair}: {series.replace("_", " ")} last kept {newest:%Y-%m-%d %H:%M} UTC; the venue drops "
+        return (f"{venue.upper()} {pair}: {name} last kept {newest:%Y-%m-%d %H:%M} UTC; the venue drops "
                 f"snapshots after 30 days, so they start being lost for good from {lost:%Y-%m-%d %H:%M} UTC")
     return None

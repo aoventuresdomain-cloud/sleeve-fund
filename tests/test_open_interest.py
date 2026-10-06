@@ -180,3 +180,40 @@ def test_positioning_ratios_are_kept_as_their_own_unused_series(tmp_path, monkey
     assert list(kept.columns[:3]) == ["long_short_ratio", "long_share", "short_share"]
     assert kept["long_share"].iloc[0] == 0.55
     assert (tmp_path / "BINANCE" / "BTC-USDT" / "open_interest.json").exists()
+
+
+def test_a_series_never_kept_is_raised_a_day_after_the_collector_started(tmp_path):
+    started = pd.Timestamp("2026-10-01", tz="UTC")
+    kw = dict(root=tmp_path, since=started)
+    assert open_interest.at_risk("BINANCE", "BTC/USDT", now=started + pd.Timedelta(hours=23), **kw) is None
+    problem = open_interest.at_risk("BINANCE", "BTC/USDT", now=started + pd.Timedelta(hours=25), **kw)
+    assert "open interest last kept never" in problem and "2026-10-01 00:00" in problem
+    # The once-a-day key is the instrument and series, the same as for a series that stopped.
+    assert problem.split(" last kept")[0] == "BINANCE BTC/USDT: open interest"
+
+
+def test_a_write_merges_what_another_writer_kept_while_this_one_fetched_and_is_flushed_to_disk(tmp_path, monkeypatch):
+    """QA F3/F8 for the snapshots: the read-modify-write is under the series directory's cross-process lock and
+    re-reads what is kept, so a manual refresh never overwrites the hub's newer rows (or their first_seen)."""
+    from sleeve_fund import history
+
+    times = [T0 + i * STEP for i in range(4)]
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(times[:2]))
+    hub_first_seen = None
+
+    def slow_loader(pair, start):  # while this refresh fetches, the hub keeps snapshot 3 first
+        nonlocal hub_first_seen
+        if hub_first_seen is None:
+            open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(times[:3]))
+            hub_first_seen = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)["first_seen"].iloc[2]
+        return _venue_with(times)(pair, start)
+
+    synced = []
+    real = history._durable_replace
+    monkeypatch.setattr(open_interest, "_durable_replace", lambda tmp, path: synced.append(path) or real(tmp, path))
+    out = open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=slow_loader)
+    kept = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)
+    assert len(kept) == 4 and out["written"] == 1 and out["unchanged"] == 1
+    assert kept["first_seen"].iloc[2] == hub_first_seen  # the hub's row stands
+    assert synced and (tmp_path / "BINANCE" / "BTC-USDT" / ".write.lock").exists()
+    assert not list((tmp_path / "BINANCE" / "BTC-USDT").glob("*.tmp"))
