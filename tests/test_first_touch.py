@@ -218,3 +218,14 @@ def test_paper_judges_the_same_minutes_a_backtest_does():
     for k in range(1, 4):
         start, end = (START + pd.Timedelta(minutes=15 * k)).value, (START + pd.Timedelta(minutes=15 * (k + 1))).value
         assert status.minutes_of(iid, start, end) == backtest(start, end) and len(backtest(start, end)) == 15
+
+
+@pytest.mark.parametrize("cut", ["start", "end"])
+def test_minutes_that_miss_part_of_the_first_or_last_decision_candle_are_refused(cut, instrument):
+    """The engine builds its decision candles from these minutes: a candle they cover only in part (the first one's
+    early minutes, or the last one's late minutes) would be judged on a hole, or never at all (CR on #170)."""
+    candles, minutes = _frames(FLAT * 15)
+    minutes = minutes.iloc[14:] if cut == "start" else minutes.iloc[:-1]  # from the first candle's close / short
+    with pytest.raises(ValueError, match="1-minute bars of every decision candle"):
+        run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
+                     exec_prices=minutes, exec_minutes=1)

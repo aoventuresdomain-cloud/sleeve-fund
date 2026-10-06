@@ -140,7 +140,8 @@ def run_backtest(
     touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
     minutes_in = touches and bar_minutes > 1 and exec_prices is not None and not exec_prices.empty \
         and exec_minutes == 1
-    if minutes_in and (exec_prices.index[0] > prices.index[0] or exec_prices.index[-1] < prices.index[-1]):
+    first_minute = prices.index[0] - pd.Timedelta(minutes=bar_minutes - 1)  # the first decision candle's first
+    if minutes_in and (exec_prices.index[0] > first_minute or exec_prices.index[-1] < prices.index[-1]):
         # the engine decides on candles built from these minutes: one they don't reach is never judged at all
         raise ValueError(f"the first_touch rule needs the 1-minute bars of every decision candle: they run "
                          f"{exec_prices.index[0]} to {exec_prices.index[-1]}, the decision candles {prices.index[0]} "

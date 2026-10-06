@@ -82,7 +82,11 @@ class HubStatus:
         return sorted(self.lost.get(iid, ()))
 
     def minutes_of(self, iid: str, after: int, until: int) -> list[tuple]:
-        """The minutes closing in (after, until] of the sent bars closing in that span, oldest first."""
+        """The minutes closing in (after, until] of the sent bars closing in that span, oldest first. A minute not
+        here is unknown to first_touch, lost or quiet alike: on bars longer than a minute `lost` isn't kept, so the
+        two can't be told apart, and judging a path with a real hole would be the unsafe side. A quiet minute is
+        refilled from the venue's REST candles (the hub stands one in for a bar without volume), which on the paper
+        venue come flat at the last price, as the history store keeps them, so backtest and paper see the same."""
         bars = self.minutes.get(iid, {})
         return [m for end in sorted(bars) if after < end <= until for m in bars[end] if after < m[0] <= until]
 
