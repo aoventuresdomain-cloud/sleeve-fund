@@ -340,3 +340,12 @@ def test_a_catch_up_of_many_pages_is_one_fetch_and_a_null_is_refused(tmp_path, m
     out = open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path,
                                 loader=lambda pair, start: [(times[-1] + STEP, None, 1.0)])
     assert out["refused"] == 1 and out["written"] == 0
+
+
+def test_a_steady_interval_with_millisecond_jitter_is_no_change(tmp_path):
+    """Code Reviewer: the venue stamps settlements a few milliseconds late; that is not a change of interval."""
+    h = 3_600_000
+    kept = [T0 + k * 8 * h + (k * 7) % 5 for k in range(12)]
+    funding.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    assert funding.interval_changes("BINANCE", "BTC/USDT", root=tmp_path) == []
+    assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == []

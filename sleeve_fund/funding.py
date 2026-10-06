@@ -119,7 +119,7 @@ def interval_changes(venue: str, pair: str, root: str | Path | None = None) -> l
     holes = set(gaps(venue, pair, root))
     out = []
     for j in range(len(steps) - 1):
-        if steps[j] != steps[j + 1]:
+        if abs(steps[j] - steps[j + 1]) > MATCH:  # the venue's stamps jitter by milliseconds
             k = j if steps[j] > steps[j + 1] else j + 1
             span = (t[k], t[k + 1])
             if span not in holes and span not in out:
