@@ -342,7 +342,7 @@ def test_the_dashboard_refuses_a_hub_venue_strategy_on_the_venues_own_candles(cl
     c, store = client
     form = {"name": "daily-b", "strategy": "trend_filter", "instrument": "BTC/USDT", "venue": "binance",
             "bar_spec": "1-DAY-LAST-EXTERNAL", "starting_balance": "5000", "risk_profile": "balanced",
-            "warmup_bars": "0", "reason": "test"}
+            "warmup_bars": "0", "reason": "test", "market": "perp"}
     r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     error = parse_qs(urlparse(r.headers["location"]).query)["error"][0]
     assert "venue's own 1-day candles aren't available there" in error and store.sleeves() == []

@@ -381,7 +381,6 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError(f"interval: the backtest decided on {_bar_short(tested)}, so this strategy must "
                                  "too; backtest another interval before changing it")
             bar_spec = str(form.get("bar_spec", ""))
-            check_hub_bar_spec(_venue_name(form.get("venue")), bar_spec)
             # Blank means automatic: enough history for the model's longest look-back, as a backtest has.
             auto = strategy in REGISTRY and bar_spec in ALLOWED_BAR_SPECS and not str(form.get("warmup_bars", "")).strip()
             warmup = _warmup_for(strategy, form, bar_spec) if auto else int(form.get("warmup_bars", 0) or 0)
@@ -390,6 +389,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                params=params, warmup_bars=warmup, risk_profile=str(form.get("risk_profile", "")),
                                venue=_venue_name(form.get("venue")))
             _check_strategy_params(cfg, resolve_spread(cfg.venue, cfg.instrument, st()).half_spread)
+            check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
             if any(s.name == name for s in st().sleeves()):
