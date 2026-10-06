@@ -935,7 +935,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             return (f"{pair} is on the collector's core list for the venue: it is stored from its listing and "
                     "kept current, and this list shows how far it has got.")
         if profile.minute_loader is None:
-            raise ValueError(f"{profile.label} has no history loader")
+            raise ValueError("this venue has no history loader")
         if profile.check_listed is not None:
             try:
                 profile.check_listed(pair)

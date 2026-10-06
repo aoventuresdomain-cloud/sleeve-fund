@@ -71,7 +71,7 @@ def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
         profile = venue_profile(venue)
         if profile.perpetual:
             if m != PERP:
-                raise ValueError(f"{profile.label} trades its own perpetuals: choose the perp market")
+                raise ValueError("this venue trades its own perpetuals: choose the perp market")
             return native_terms(profile)
     return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
@@ -90,7 +90,7 @@ def check_venue(params: dict | None, venue: str) -> None:
 
     profile = venue_profile(venue)
     if profile.perpetual and market_of(params) != PERP:
-        raise ValueError(f"{profile.label} lists perpetuals only: set market = \"perp\"")
+        raise ValueError("this venue lists perpetuals only: set market = \"perp\"")
 
 
 def fees_for(params: dict | None, venue_fees: FeeSchedule, venue: str | None = None) -> FeeSchedule:

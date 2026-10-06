@@ -1101,3 +1101,20 @@ def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F81
     # BTC: a 3,000 short and a 1,200 long, 4,200 gross (14% of 30,000), -1,800 net (-6%); ETH: a 3,000 short.
     tile = c.get("/risk", auth=AUTH).text.split("Largest asset")[1].split("</div></div>")[0]
     assert "BTC 14%" in tile and "net" in tile and "6%" in tile, tile
+
+
+def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
+    # Code Reviewer on #152: with cap_used uncapped, a max() over the three limits let a 104% drift line replace
+    # a drawdown at 90%. Each is judged on its own now.
+    from types import SimpleNamespace
+
+    from sleeve_fund.dashboard import riskops
+
+    s = SimpleNamespace(name="btc-rsi-long", status="running", status_reason=None)
+    row = {"x": {"sleeve": s}, "dd_used": 0.9, "day_used": 0.1, "cap_used": 1.04}
+    health = {"down": [], "mismatched": [], "stale_feeds": [], "backup_issue": None}
+    texts = [i["text"] for i in riskops.status_items([row], health)]
+    assert texts == ["btc-rsi-long has used 90% of its drawdown limit",
+                     "btc-rsi-long's exposure is 104% of its entry cap because the price moved; no action"]
+    texts = [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2, "cap_used": 0.85}], health)]
+    assert texts == ["btc-rsi-long has used 85% of its position cap"]

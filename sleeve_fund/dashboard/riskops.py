@@ -192,13 +192,17 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
             continue  # already named, worse
-        used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss"), (r["cap_used"], "position cap")]
+        # The limits that halt or pause are judged on their own; drift past the entry cap gets its own line, so
+        # it never hides a drawdown or daily-loss warning (P1-U13, Code Reviewer on #152).
+        used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]
         share, which = max(used, key=lambda u: u[0])
-        if which == "position cap" and share > 1:
-            # The cap limits new entries only: past it through price drift is information, not a call to act.
-            warn.append(f"{s.name}'s exposure is {share:.0%} of its entry cap because the price moved; no action")
-        elif share > NEAR_LIMIT:
+        if share > NEAR_LIMIT:
             warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
+        if r["cap_used"] > 1:
+            # The cap limits new entries only: past it through price drift is information, not a call to act.
+            warn.append(f"{s.name}'s exposure is {r['cap_used']:.0%} of its entry cap because the price moved; no action")
+        elif r["cap_used"] > NEAR_LIMIT:
+            warn.append(f"{s.name} has used {r['cap_used']:.0%} of its position cap")
     warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:
         warn.append(health["backup_issue"])

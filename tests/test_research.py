@@ -254,7 +254,7 @@ def test_a_store_study_runs_under_paper_rules(tmp_path):
     assert done and done == sorted(done) and done[-1] <= 1
     with pytest.raises(ValueError, match="would take hours"):
         run_store_study(StudyRequest(strategy="buy_and_hold", pair="ETH/USD", minutes=1), history=hist)
-    with pytest.raises(ValueError, match="no stored Kraken spot history for SOL/USD"):
+    with pytest.raises(ValueError, match="no stored history for SOL/USD on this venue"):
         run_store_study(StudyRequest(strategy="buy_and_hold", pair="SOL/USD"), history=hist)
 
 
