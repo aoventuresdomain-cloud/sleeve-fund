@@ -331,7 +331,7 @@ window.Console = (() => {
       const m = minus(ema(k.close, f), ema(k.close, sl)), sig = ema(m, sg);
       return [{vals: minus(m, sig), hist: true}, {vals: m}, {vals: sig, style: 2, alpha: 0.7}];
     }},
-    atr: {name: "Average true range", short: "ATR", pane: {}, params: [["Length", 14]], lines: (k, [n]) => [{vals: wilder(trueRange(k), n)}]},
+    atr: {name: "Average true range (Wilder)", short: "ATR", pane: {}, params: [["Length", 14]], lines: (k, [n]) => [{vals: wilder(trueRange(k), n)}]},
     roc: {name: "Rate of change %", short: "ROC", pane: {guides: [0], digits: 2}, params: [["Length", 10]], lines: (k, [n]) => [{vals: k.close.map((c, i) => (i >= n ? (c / k.close[i - n] - 1) * 100 : null))}]},
   };
   const IND_KEY = "pc-indicators-v2", IND_MAX = 20;
@@ -920,7 +920,7 @@ window.Console = (() => {
       sync();  // the summary may be asked before this form's own input listener has run
       const out = [], r = num("take_profit_r"), atr = num("stop_atr"), swing = num("stop_swing_bars"), w = ways();
       const stop = num("stop_loss_pct") !== null ? `${num("stop_loss_pct")}% ${w.stop} entry`
-        : atr !== null ? `${atr} average true ranges (over ${num("atr_bars") || 14} bars) ${w.stop} entry`
+        : atr !== null ? `${atr} simple average true ranges (over ${num("atr_bars") || 14} bars) ${w.stop} entry`
         : swing !== null ? `at the ${w.swing} of the last ${swing} bars` : null;
       const tp = num("take_profit_pct") !== null ? `${num("take_profit_pct")}% ${w.tp} entry`
         : r !== null ? `a target that makes ${r}R after costs` : null;

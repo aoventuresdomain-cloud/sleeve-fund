@@ -1954,7 +1954,7 @@ def _risk_words(profile: str, params: dict, side: int = 0) -> dict[str, str]:
     w = trading.exit_ways(params, side)
     held = " (short)" if side < 0 else ""
     if p.get("stop_atr"):
-        stop = f"{p['stop_atr']:g} average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
+        stop = f"{p['stop_atr']:g} simple average true ranges ({p.get('atr_bars', 14)} bars) {w['stop']} the entry{held}"
     elif p.get("stop_swing_bars"):
         stop = f"at the {w['swing']} of {p['stop_swing_bars']} bars{held}"
     elif p.get("stop_loss"):

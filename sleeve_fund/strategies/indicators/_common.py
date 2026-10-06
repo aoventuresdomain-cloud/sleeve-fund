@@ -82,7 +82,7 @@ def _finite_inputs(update_raw):
 
     @functools.wraps(update_raw)
     def checked(self, *args, **kwargs):
-        for x in args:
+        for x in (*args, *kwargs.values()):  # keyword calls too (QA P1-A3)
             if x is not None and not math.isfinite(x):
                 raise ValueError(f"{type(self).__name__} was fed {x!r}: every input must be a finite number")
         update_raw(self, *args, **kwargs)
