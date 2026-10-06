@@ -1,8 +1,8 @@
 """Add order_timings: each paper or live order's bar close, arrival, decision, send, acceptance and fills, to
 the microsecond (v2 P1-2). A new table, so nothing existing changes.
 
-Revision ID: 0002
-Revises: 0001
+Revision ID: 0003
+Revises: 0002
 Create Date: 2026-10-05
 """
 
@@ -10,8 +10,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '0002'
-down_revision = '0001'
+revision = '0003'
+down_revision = '0002'
 branch_labels = None
 depends_on = None
 
@@ -36,5 +36,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index('order_timings_sleeve_decided', table_name='order_timings')
-    op.drop_table('order_timings')
+    raise NotImplementedError("order_timings holds recorded data: never dropped without review (DATA_MODEL.md)")

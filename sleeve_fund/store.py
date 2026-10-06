@@ -690,7 +690,10 @@ class Store:
                                              fee=fee, order_id=order_id, trade_id=trade_id))
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:
+        """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
+        order_timings row in the same transaction, so that row never exists without its order (DA-8)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -699,12 +702,15 @@ class Store:
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
                                               message=""))
+            if timing:
+                c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
+                    k: _from_ns(v) for k, v in timing.items() if v is not None}))
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
-        """An order's timing stamps (UNIX ns, kept to the microsecond). The call with `decided` adds the order's
-        row (at the send); later ones fill in what they know (acceptance, each fill), and are ignored for an
-        order with no row (a risk stop, a restore: nothing decided them on a bar). fill: our clock at a fill;
-        the first is kept as first_fill, every one moves last_fill."""
+        """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
+        acceptance, each fill) on the row record_order wrote with the decision; ignored for an order with no row
+        (a risk stop, a restore: nothing decided them on a bar). A call with `decided` for an order with no row
+        adds it. fill: our clock at a fill; the first is kept as first_fill, every one moves last_fill."""
         values = {k: _from_ns(v) for k, v in stamps.items() if v is not None}
         if fill is not None:
             values["last_fill"] = _from_ns(fill)

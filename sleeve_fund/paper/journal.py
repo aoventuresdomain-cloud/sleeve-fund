@@ -104,7 +104,8 @@ class MemoryJournal:
                             "price": price, "fee": fee, "order_id": order_id, "trade_id": trade_id})
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:  # timing: a backtest keeps none (record_timing)
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()

@@ -7,6 +7,9 @@ import pytest
 
 from sleeve_fund.store import Store
 from tests.test_dashboard import AUTH, client  # noqa: F401
+from tests.test_sleeve_runtime import store as _store_fixture
+
+journal = _store_fixture  # Postgres when TEST_DATABASE_URL is set
 
 NS = 1_791_223_500_123_456_789  # 18:05:00.123456789 on 5 Oct 2026
 
@@ -56,6 +59,8 @@ def test_a_paper_run_times_each_decision_and_a_backtest_keeps_none(monkeypatch):
     keep = SleeveRuntime.on_timing
     # run_backtest marks its runtime a backtest, which keeps no timings: record them anyway, as paper would.
     monkeypatch.setattr(SleeveRuntime, "on_timing", lambda self, oid, **st: self.store.record_timing(self.name, oid, **st))
+    monkeypatch.setattr(SleeveRuntime, "on_order", lambda self, timing=None, **k: self.store.record_order(
+        self.name, ts=self.now(), timing=timing, **k))
     run_backtest("trend_filter", prices, inst, params={"fast": 5, "slow": 20}, runtime=paper)
     entries = [o for o in db.orders("backtest", limit=10_000) if o["intent"] == "entry" and o["filled_qty"]]
     timed = {t["order_id"]: t for t in db.timings("backtest", limit=10_000)}
@@ -163,3 +168,138 @@ def test_a_run_journals_the_same_through_the_queue():
 
     direct = journal(lambda db: db)
     assert direct[0] and journal(QueuedStore) == direct
+
+
+def test_an_orders_timing_is_journaled_with_the_order_itself_on_the_production_engine(journal):
+    """DA-8: the order_timings row is written in the order's own transaction, so its foreign key never
+    depends on the writer thread's ordering. Runs on Postgres (foreign keys enforced) when TEST_DATABASE_URL
+    is set."""
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.paper.queued import QueuedStore
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    store = journal
+    store.create_sleeve(name="pp", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    rt = SleeveRuntime(QueuedStore(store), "pp")
+    rt.on_order(order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="test", signal={},
+                timing={"bar_close": NS - 2_000_000, "bar_recv": NS - 1_000_000, "decided": NS})
+    rt.on_timing("O-1", sent=NS + 1_000)
+    rt.store.flush()
+    (t,) = store.timings("pp")
+    assert t["order_id"] == "O-1" and (t["sent"] - t["decided"]).microseconds == 1
+    if store.engine.dialect.name == "postgresql":  # a timing row without its order is refused
+        with pytest.raises(IntegrityError):
+            store.record_timing("pp", "O-none", decided=NS)
+
+
+# --- m13-E3 as the Independent Quant Advisor ruled (5 Oct 2026): past 90 s after its bar's close, a decision
+# opens and adds nothing, but exits and reductions always run; both are journaled with the lag.
+
+def _late_strategy(lag_s=None, side_now=0, wants=1):
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.strategies import TrendFilter, TrendFilterConfig
+
+    cfg = TrendFilterConfig(instrument_id=InstrumentId.from_str("BTC/USD.KRAKEN"),
+                            bar_type=BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL"), fast=2, slow=3,
+                            assumed_taker_fee=0.008, stop_loss=0.02, take_profit=0.05, allow_short=True,
+                            market="perp")
+    s = TrendFilter(cfg)
+    events, sold, opened = [], [], []
+    s.runtime = SimpleNamespace(name="s1", store=SimpleNamespace(event=lambda *a, **k: events.append(a)))
+    s.want_side = lambda bar: wants
+    s._busy = lambda: False
+    s._pos_side = lambda: side_now
+    s.explain = lambda bar, side: ("why", {})
+    s._sell_all = lambda *a, **k: sold.append(a)
+    s._open = lambda *a: opened.append(a)
+    s._price = lambda: 101.0
+    s._lag = None if lag_s is None else lag_s * 1_000_000_000
+    bar = SimpleNamespace(ts_event=NS, close=SimpleNamespace(as_double=lambda: 100.0))
+    return s, bar, events, sold, opened
+
+
+def test_an_entry_decided_more_than_90_s_after_its_close_is_skipped_and_said_with_its_lag():
+    s, bar, events, sold, opened = _late_strategy(lag_s=91)
+    s._on_bar_sided(bar)
+    assert opened == [] and sold == []
+    (_, level, kind, msg), = events
+    assert (level, kind) == ("warning", "late_entry_skipped")
+    assert "Skipped a long entry on the 18:05 candle: decided 91 s after its close" in msg and "price now 101" in msg
+    s, bar, events, sold, opened = _late_strategy(lag_s=None)  # on time: it opens
+    s._on_bar_sided(bar)
+    assert len(opened) == 1 and events == []
+
+
+def test_an_exit_missed_by_any_amount_is_executed_and_said_with_its_lag():
+    s, bar, events, sold, opened = _late_strategy(lag_s=50 * 60, side_now=1, wants=0)
+    s._on_bar_sided(bar)
+    assert len(sold) == 1 and sold[0][0] == "exit"
+    (_, level, kind, msg), = events
+    assert kind == "late_exit" and "3000 s after its close (candle close 100, price now 101)" in msg
+
+
+def test_a_late_reversal_only_closes():
+    s, bar, events, sold, opened = _late_strategy(lag_s=120, side_now=1, wants=-1)
+    s._on_bar_sided(bar)
+    assert len(sold) == 1 and s._flip is None and opened == []  # the short isn't opened once the long closes
+    assert [e[2] for e in events] == ["late_entry_skipped", "late_exit"]
+    assert "short entry after closing the long" in events[0][3]
+    s, bar, events, sold, opened = _late_strategy(lag_s=None, side_now=1, wants=-1)  # on time: close, then open
+    s._on_bar_sided(bar)
+    assert len(sold) == 1 and s._flip is not None and s._flip[0] == -1
+
+
+def test_a_missed_bar_is_decided_however_late_until_a_newer_bar_has_closed():
+    s, bar, *_ = _late_strategy()
+    decided, warmed = [], []
+    s.on_bar, s.on_historical_bars = decided.append, warmed.append
+    s._late, s._now_ns = bar, lambda: NS + 50 * 60_000_000_000
+    s._decide_late()
+    assert decided == [bar] and warmed == []  # 50 minutes late on an hourly bar: decided (exits only)
+    s._late, s._now_ns = bar, lambda: NS + 60 * 60_000_000_000
+    s._decide_late()
+    assert decided == [bar] and warmed == [[bar]]  # a newer bar has closed: it decides instead
+
+
+def _minutes(*hl, start=NS):
+    from types import SimpleNamespace
+
+    return [SimpleNamespace(ts_event=start + (k + 1) * 60_000_000_000, high=SimpleNamespace(as_double=lambda h=h: h),
+                            low=SimpleNamespace(as_double=lambda lo=lo: lo)) for k, (h, lo) in enumerate(hl)]
+
+
+@pytest.mark.parametrize("minutes, hit, level", [
+    ([(100.5, 99.5), (100.2, 97.9), (101.0, 99.0)], "stop_loss", 98.0),  # 2% stop at 98 crossed in minute 2
+    ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0),
+    ([(105.5, 97.5)], "stop_loss", 98.0),  # both in one minute: the stop, the worse of the two
+    ([(101.0, 99.0)], None, None),
+])
+def test_a_stop_or_target_crossed_while_the_strategy_was_down_closes_on_restart(minutes, hit, level):
+    s, bar, events, sold, opened = _late_strategy()
+    s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
+    s._last_alive = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)
+    before = _minutes((90.0, 90.0), start=NS - 120_000_000_000)  # crossed before the last heartbeat: seen then
+    s.history_loader = lambda instrument, bar_type, n: before + _minutes(*minutes)
+    s.instrument = None
+    assert s._check_outage_exits() is (hit is not None)
+    if hit is None:
+        assert sold == [] and events == []
+        return
+    (intent, reason, values), = sold
+    assert intent == hit and values["outage_level"] == pytest.approx(level) and s._entry_px is None
+    assert [e[2] for e in events] == ["outage_exit"] and "while the strategy was down" in reason
+
+
+def test_an_outage_exits_fill_is_said_against_its_level_once():
+    from sleeve_fund.strategies.base import outage_fill_note
+
+    decision = {"intent": "stop_loss", "signal": {"outage_level": 98.0}}
+    assert outage_fill_note(decision, 97.02) == ("The stop-loss closed at 97.02, -1.00% from its 98 level, reached "
+                                                 "while the strategy was down")
+    assert outage_fill_note(decision, 97.0) is None  # a later part fill
+    assert outage_fill_note({"intent": "exit", "signal": {}}, 97.0) is None and outage_fill_note(None, 1.0) is None

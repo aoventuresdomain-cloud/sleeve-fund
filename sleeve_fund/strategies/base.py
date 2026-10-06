@@ -1659,10 +1659,13 @@ class LongFlatStrategy(Strategy):
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        bar_close, bar_recv = self._deciding or (None, None)
         if self.runtime is not None:
+            # A decision on a bar is timed from its order's own journal row (a risk stop or restore is not).
+            timing = {"bar_close": bar_close, "bar_recv": bar_recv, "decided": decided} if bar_close else None
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
-                                  order_type="POST-ONLY LIMIT" if maker else "MARKET")
+                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing)
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}
@@ -1673,10 +1676,8 @@ class LongFlatStrategy(Strategy):
             self.submit_order(order)
             if maker:
                 self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
-        if self.runtime is not None:
-            bar_close, bar_recv = self._deciding or (None, None)
-            self.runtime.on_timing(coid, bar_close=bar_close, bar_recv=bar_recv, decided=decided,
-                                   sent=None if coid in self._kept else self.clock.timestamp_ns())
+        if self.runtime is not None and coid not in self._kept:
+            self.runtime.on_timing(coid, sent=self.clock.timestamp_ns())
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)

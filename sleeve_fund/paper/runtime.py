@@ -351,10 +351,12 @@ class SleeveRuntime:
     # --- orders -------------------------------------------------------------------
 
     def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict,
-                 order_type: str = "MARKET") -> None:
-        """Journal an order and why it was sent, before it goes to the venue."""
+                 order_type: str = "MARKET", timing: dict | None = None) -> None:
+        """Journal an order and why it was sent, before it goes to the venue. timing: the decision's stamps
+        (on_timing), journaled with the order; a backtest keeps none."""
+        extra = {"timing": timing} if timing and not self.backtest else {}
         self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
-                                signal=signal, order_type=order_type, ts=self.now())
+                                signal=signal, order_type=order_type, ts=self.now(), **extra)
 
     def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
         self.store.update_order(order_id, status=status, message=message)
