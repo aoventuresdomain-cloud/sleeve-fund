@@ -104,7 +104,8 @@ class MemoryJournal:
                             "price": price, "fee": fee, "order_id": order_id, "trade_id": trade_id})
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:  # timing: a backtest keeps none (record_timing)
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -113,14 +114,21 @@ class MemoryJournal:
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
 
+    def record_timing(self, sleeve: str, order_id: str, **stamps) -> None:
+        """A backtest keeps no order timings: its stamps are its replay clock."""
+
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         row = self.orders_.get(order_id)
         if row is None:
             return
+        if intent is not None:
+            row["intent"] = intent
         if qty is not None:
             row["qty"] = qty
         if fill_qty:

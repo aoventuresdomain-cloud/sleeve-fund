@@ -11,9 +11,10 @@ import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 
+from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.execution import FeeModel
-from nautilus_trader.model import (Currency, CryptoPerpetual, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol,
-                                   Venue)
+from nautilus_trader.model import (Bar, Currency, CryptoPerpetual, CurrencyPair, InstrumentId, Money, OrderSide, Price,
+                                   Quantity, Symbol, Venue)
 
 @dataclass(frozen=True)
 class FeeSchedule:
@@ -146,6 +147,24 @@ def pair_of(instrument) -> str:
     return symbol if "/" in symbol else f"{instrument.base_currency.code}/{instrument.quote_currency.code}"
 
 
+# Advisor L12 (6 Oct 19:30): a phase-1 take-profit is a market order on touch, so a taker. A backtest books every
+# target fill, touched or gapped through, at its level less the taker's slippage: half the spread, at least 0.05%.
+# Never at a better open, never with price improvement. One helper for every backtest target (D13 shares it).
+TAKER_SLIPPAGE_FLOOR = Decimal("0.0005")
+
+
+def taker_slippage(half_spread) -> Decimal:
+    """A market order's slippage as a share of the price: half the spread, at least TAKER_SLIPPAGE_FLOOR."""
+    return max(Decimal(str(half_spread)), TAKER_SLIPPAGE_FLOOR)
+
+
+def target_fill_px(level, long: bool, half_spread) -> Decimal:
+    """Where a backtest books a take-profit at `level` for a position that is `long` (or short): the level less
+    the taker's slippage, exact (not rounded to the tick)."""
+    level, slip = Decimal(str(level)), taker_slippage(half_spread)
+    return level * (1 - slip) if long else level * (1 + slip)
+
+
 class ScheduleFeeModel(FeeModel):
     """Charges a FeeSchedule on every fill, regardless of what the instrument says.
 
@@ -175,6 +194,24 @@ class ScheduleFeeModel(FeeModel):
         # Paper on a perp: the order that puts a position carried over a restart back at the simulated
         # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
         self.free_orders: set[str] = set()
+        # Backtests: a target the strategy judged on a bar the venue had matched, adverse side first (Advisor NA-2,
+        # LongFlatStrategy._bar_target), sent at market and booked at its level less the taker's slippage
+        # (target_fill_px, Advisor L12), with that price and side.
+        # The commission carries the difference from the price the market order filled at; fee_paid keeps the
+        # venue's fee apart so the report can move the rest into the price, as it does the spread.
+        self.booked: dict[str, tuple[Decimal, bool]] = {}
+        # Backtests: a resting stop's target level, by the stop's order id. A bar that opens through the target
+        # takes the target before anything later in the bar can reach the stop (Advisor NA-2): if the venue fills
+        # the stop in such a bar, it is booked as the target (rebooked), at target_fill_px, never the open (L12),
+        # instead. bar_open is the open
+        # of the bar the venue is matching, handed over before it matches (BarOpens).
+        # open_targets: stop id -> (target level, the bar count when the target was first set); a target only counts
+        # for bars that opened after it was set, never the bar its entry filled in (CR on #146).
+        self.open_targets: dict[str, tuple[Decimal, int]] = {}
+        # By stop id, per fill, (target level, booked price): taken by the strategy as it journals the fill.
+        self.rebooked: dict[str, tuple[float, float]] = {}
+        self.bar_open: Decimal | None = None
+        self.bar_seq = 0  # bars the venue has been handed (BarOpens)
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -201,14 +238,46 @@ class ScheduleFeeModel(FeeModel):
             # A buy that filled below its limit pays the difference here, a sell above it gives it back.
             shift = qty * (limit - fill_px.as_decimal()) * (1 if buy else -1)
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
+        shift = Decimal(0)
+        booked = self.booked.get(str(order.client_order_id))
+        target, since = self.open_targets.get(str(order.client_order_id), (None, None))
+        if booked is None and target is not None and self.bar_open is not None and since < self.bar_seq:
+            buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below
+            if (self.bar_open <= target) if buy else (self.bar_open >= target):
+                booked = (target_fill_px(target, not buy, self.half_spread), buy)
+                self.rebooked[str(order.client_order_id)] = (float(target), float(booked[0]))
+        if booked is not None:
+            level, buy = booked
+            qty = fill_quantity.as_decimal()
+            # A sell that filled below its level gets the difference back here, a buy above it the same.
+            shift = qty * (level - fill_px.as_decimal()) * (1 if buy else -1)
+            notional = qty * level
         charge = notional * self.rate_for(order)
-        if self.half_spread and not getattr(order, "is_post_only", False):
-            spread = notional * self.half_spread
-            coid = str(order.client_order_id)
-            self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
+        coid = str(order.client_order_id)
+        if booked is not None or (self.half_spread and not getattr(order, "is_post_only", False)):
             self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
+        if booked is None and self.half_spread and not getattr(order, "is_post_only", False):
+            # A booked target's price already carries its slippage (target_fill_px), half the spread included.
+            spread = notional * self.half_spread
+            self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
-        return self._charge(charge, instrument.quote_currency)
+        return self._charge(charge + shift, instrument.quote_currency)
+
+
+class BarOpens(SimulationModule):
+    """Backtests: hands the fee model the open of each bar before the simulated venue matches it, so a resting
+    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets)."""
+
+    def __init__(self, fee_model: ScheduleFeeModel) -> None:
+        self.fee_model = fee_model
+
+    def pre_process(self, data) -> None:
+        if isinstance(data, Bar):
+            self.fee_model.bar_open = data.open.as_decimal()
+            self.fee_model.bar_seq += 1
+
+    def process(self, ts_now, context):
+        return None
 
 
 def fill_model():

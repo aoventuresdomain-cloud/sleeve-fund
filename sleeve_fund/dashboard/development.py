@@ -237,34 +237,6 @@ def _gap_words(n: int) -> str:
     return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
 
 
-# Venue names in text the PM reads (mirror reasons, alerts, the decision log), longest first so "Bybit Demo
-# Trading" goes whole. Case-sensitive on purpose: account names such as "kraken-live" and env names such as
-# BYBIT_DEMO_API_KEY are the PM's own labels and stay as they are. Only Setup, Accounts names venues (QA U8).
-_VENUE_WORDS = [
-    # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
-    (re.compile(r"(?<=\S)\.(?:BINANCE|KRAKEN|BYBIT|DERIBIT)\b"), ""),
-    (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b"), "the demo account isn't set up"),
-    (re.compile(r"\b(?:Bybit|Deribit)(?: [Dd]emo(?: Trading| account)?| [Tt]estnet)?(?:'s)?\b"), "the demo account"),
-    (re.compile(r"\bBinance(?:'s)?(?: USD-M perpetuals)?\b"), "the perpetual venue"),
-    (re.compile(r"\bKraken(?:'s)?(?: spot)?\b"), "the spot venue"),
-    (re.compile(r"\b(?:BYBIT|DERIBIT)\b(?!_)"), "the demo account"),
-    (re.compile(r"\bBINANCE\b(?!_)"), "the perpetual venue"),
-    (re.compile(r"\bKRAKEN\b(?!_)"), "the spot venue"),
-    (re.compile(r"\b(?:[Tt]he|[Aa]n?) the\b"), lambda m: "The" if m.group(0)[0].isupper() else "the"),
-]
-
-
-def no_venues(text) -> str:
-    """Text the PM reads with any venue name swapped for what it is ("the demo account", "the perpetual venue",
-    "the spot venue"). For messages stored before the wording changed, and anything a venue sends back."""
-    if not text:
-        return text
-    out = str(text)
-    for pattern, words in _VENUE_WORDS:
-        out = pattern.sub(words, out)
-    return out
-
-
 def blocked_by_gaps(pair: str, gaps: list) -> str | None:
     """Why a backtest or study on this instrument has to wait, or None: only gaps in what is stored hold it
     back. A collector still catching up doesn't; the study says where its history ends."""

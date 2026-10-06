@@ -2,7 +2,7 @@
 journal's warnings and errors to a webhook and pings an outside uptime monitor."""
 
 from sleeve_fund.alerts import Forwarder, message
-from sleeve_fund.store import Store
+from sleeve_fund.store import Store, utcnow
 
 URL = "https://hooks.example.com/services/T0/B0/token"
 
@@ -202,3 +202,71 @@ def test_a_status_that_records_no_result_is_a_failure(tmp_path):
     (tmp_path / "status.json").write_text('{"ts": "2026-10-04T02:00:00Z", "ok": true, "message": "ok"}')
     check = backups.latest(tmp_path, utcnow())["check"]
     assert check["ok"] is True and check["checked"].isoformat() == "2026-10-04T02:00:00+00:00"
+
+
+def test_clock_drift_is_an_alert_said_once_and_its_recovery_said_once():
+    from datetime import timedelta
+
+    store, offsets, t = Store.in_memory(), [12.0, 300.0, 310.0, -20.0], [utcnow()]
+    fwd = Forwarder(store, environ={"CLOCK_SERVER": "time.example"}, now=lambda: t[0],
+                    clock_offset=lambda host: offsets.pop(0))
+    for _ in range(4):
+        fwd.check_clock()
+        fwd.check_clock()  # within CLOCK_CHECK: not asked again
+        t[0] += timedelta(minutes=5)
+    said = [(e["level"], e["kind"]) for e in reversed(store.events(None, limit=10))]
+    assert said == [("info", "clock_ok"), ("warning", "clock_drift"), ("info", "clock_ok")]
+    assert "300 ms behind time.example" in store.last_event(None, ("clock_drift",))["message"]
+
+
+def test_an_unreachable_time_server_is_said_once_and_no_server_means_no_check():
+    store, calls = Store.in_memory(), []
+
+    def unreachable(host):
+        calls.append(host)
+        raise OSError("timed out")
+
+    Forwarder(store, environ={}, clock_offset=unreachable).check_clock()
+    assert calls == []
+    fwd = Forwarder(store, environ={"CLOCK_SERVER": "time.example"}, clock_offset=unreachable)
+    fwd.check_clock()
+    fwd._clock_checked = None
+    fwd.check_clock()
+    assert [e["kind"] for e in store.events(None, limit=10)] == ["clock_unchecked"]
+
+
+def test_the_clock_offset_is_read_from_a_time_server():
+    import socket
+    import struct
+    import threading
+    import time
+
+    from sleeve_fund import clock
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+
+    def answer():
+        _, addr = srv.recvfrom(48)
+        t = time.time() + 0.5 + clock.NTP_EPOCH  # a server half a second ahead
+        stamp = struct.pack("!II", int(t), int((t % 1) * 2**32))
+        srv.sendto(b"\x1c\x02" + 30 * b"\0" + stamp + stamp, addr)
+
+    threading.Thread(target=answer, daemon=True).start()
+    assert 450 < clock.offset_ms("127.0.0.1", srv.getsockname()[1]) < 550
+    srv.close()
+
+
+def test_the_outside_alert_names_no_venue():
+    """P1-U20: the message to the PM's phone reads like the Alerts page: no venue names, instrument ids
+    without their venue suffix, account and key names left alone."""
+    text = message([
+        {"level": "error", "sleeve": "btc-rsi", "message": "BTCUSDT-PERP.BINANCE is not listed on the venue"},
+        {"level": "warning", "sleeve": "btc-rsi", "message": "Demo mirror couldn't copy the sell of 0.05 to the demo "
+                                                              "account: Bybit Demo Trading /v5/order/create: no funds (110007)."},
+        {"level": "warning", "sleeve": None, "message": "kraken-live: KRAKEN_API_KEY missing"},
+    ])
+    assert "BINANCE" not in text and "Bybit" not in text
+    assert "btc-rsi: BTCUSDT-PERP is not listed on the venue" in text
+    assert "to the demo account: refused (/v5/order/create): no funds (110007)." in text
+    assert "kraken-live: KRAKEN_API_KEY missing" in text

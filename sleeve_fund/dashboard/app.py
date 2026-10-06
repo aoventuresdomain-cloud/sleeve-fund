@@ -54,8 +54,14 @@ from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
+# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
+LIQUIDATED_HALT = "Position margin lost (liquidated)"
+# Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
+LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
+                      "again only after you use Reset after liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -113,7 +119,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["venue_choices"] = venue_choices
     templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
-    templates.env.filters["no_venues"] = dev.no_venues  # stored reasons and messages name no venue (QA U18)
+    templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -233,6 +239,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
+                    earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(sleeves),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
@@ -458,6 +465,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         order_total = sum(st().order_counts(name).values())
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
+        # Its position's margin was lost (liquidated): no Start, Resume or Reset until the PM resets it after
+        # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.
+        liquidated = not bt_id and _liquidated(name)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -474,8 +484,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total,
+                    order_total=order_total, liquidated=liquidated,
                     positions=positions, working=working, fees_funding=fees_funding,
+                    timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
                     settings_error=q.get("settings_error", ""), saved=q.get("saved", ""), profiles=PROFILES,
@@ -626,6 +637,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             if command == "stop" and _flatten_waits(name):
                 raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
                                  "drop it; stop it once it is flat")
+            if command in ("start", "resume") and _liquidated(name):
+                # The page says so too; a stale page or a direct post must not restart it (QA P1-U25, U31).
+                raise ValueError(LIQUIDATED_REFUSAL)
             if command == "flatten" and then == "stop":
                 then_stop = reason
             if command in ("start", "stop"):
@@ -674,6 +688,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
         return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
 
+    def _liquidated(name: str) -> bool:
+        """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
+        strategy's position margin was lost with no Reset after liquidation since. The routes and the page
+        both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
+        return trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
+
     def _flatten_waits(name: str) -> bool:
         """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
         drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
@@ -689,6 +709,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
+            if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
+                raise ValueError(LIQUIDATED_REFUSAL)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
@@ -709,11 +731,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             error = "a reason is required"
         if not reason:
             return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        gone = set(st().archived())
+        gone, liquidated = set(st().archived()), []
         for s in st().sleeves():
-            if s.name not in gone and not st().pending_reset(s.name):
-                st().request_reset(s.name, reason, actor=actor)
-        return RedirectResponse("/setup?reset=1", status_code=303)
+            if s.name in gone or st().pending_reset(s.name):
+                continue
+            if _liquidated(s.name):  # put away unanswered otherwise; it waits for Reset after liquidation
+                liquidated.append(s.name)
+                continue
+            st().request_reset(s.name, reason, actor=actor)
+        q = {"reset": "1", **({"not_reset": ", ".join(liquidated)} if liquidated else {})}
+        return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())

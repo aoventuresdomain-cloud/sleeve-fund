@@ -945,7 +945,8 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():
     """B11-2: a perp exit closes the whole position, to zero in the venue's exact quantities, not to a float
     residue a lot below it; so the entry that follows, on either side, opens a fresh position and rests its
-    own stop and target on the far side, the whole of its quantity, every time."""
+    own stop on the far side, the whole of its quantity, every time. (The target doesn't rest: it is judged on
+    each bar after the stop, Advisor NA-2.)"""
     from decimal import Decimal
 
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, "stop_loss": 0.05, "take_profit": 0.2, **PERP},
@@ -963,9 +964,88 @@ def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_sto
         e = orders[i]
         assert e["signal"].get("stop_frac") == pytest.approx(0.05), e
         far = "SELL" if e["side"] == "BUY" else "BUY"
-        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
-        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        legs = {o["intent"]: o for o in orders[i + 1:i + 2]}
+        assert set(legs) == {"stop_loss"}, (e, orders[i + 1:i + 2])
         assert all(o["side"] == far and o["qty"] == pytest.approx(e["filled_qty"]) for o in legs.values()), legs
+
+
+@pytest.mark.parametrize(("strategy", "side"), [("probe_short", -1), ("probe_long", 1)])
+def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_the_journal_and_the_cash(strategy,
+                                                                                                         side):
+    """Advisor NA-2 and L12: the backtest's target no longer rests at the venue; a bar that reaches it sells (or
+    buys back) at market, booked at the target's level less the taker's slippage (half the spread, at least
+    0.05 %). A wick through the 5 % target that closes back near the entry fills there, not at the close, in the
+    fills report, in the journal and in the equity."""
+    df = _ls_bars(np.full(12, 60_000.0), minutes=60)
+    wick = 57_000.0 * (1 - 0.001) if side < 0 else 63_000.0 * (1 + 0.001)  # just through the 5 % target
+    df.iloc[6, df.columns.get_loc("low" if side < 0 else "high")] = wick
+    res = run_backtest(strategy, df, TICK_INST, {"take_profit": 0.05, **PERP}, starting_capital=10_000,
+                       risk_profile="balanced", bar_minutes=60, half_spread=HALF)
+    j = res.journal
+    entry, tp = sorted(j.orders_.values(), key=lambda o: o["id"])
+    assert (entry["intent"], tp["intent"]) == ("entry", "take_profit")
+    level = tp["signal"]["book_px"]
+    assert tp["signal"]["target_px"] == pytest.approx(60_000.0 * (1 + side * 0.05))  # 5 % from the venue's fill
+    assert level == pytest.approx(60_000.0 * (1 + side * 0.05) * (1 - side * max(HALF, 0.0005)))
+    (fill,) = [f for f in j.fills_ if f["order_id"] == tp["order_id"]]
+    (efill,) = [f for f in j.fills_ if f["order_id"] == entry["order_id"]]
+    qty = fill["qty"]
+    assert fill["price"] == level  # the target less its slippage, not the 60,000 close
+    # The entry paid the taker fee and the half spread; the target pays the taker fee alone, on its booked price,
+    # its slippage being in that price (Advisor L12).
+    taker = efill["fee"] / (efill["qty"] * efill["price"]) - HALF
+    assert fill["fee"] == pytest.approx(qty * level * taker, abs=CENT)
+    report = res.fills.loc[tp["order_id"]]
+    # The slippage is in the booked price already, with the cent the fee's rounding left (QA m-G7).
+    assert float(report["avg_px"]) == pytest.approx(level, abs=CENT / qty)
+    pnl = side * qty * (level - efill["price"]) - efill["fee"] - fill["fee"]
+    assert float(res.equity.iloc[-1]) == pytest.approx(10_000 + pnl, abs=2 * CENT)
+
+
+def test_a_perp_short_whose_bar_opens_through_the_target_takes_the_target_not_the_stop():
+    """Advisor NA-2, condition 3, on a short: the bar opens below the target and then rallies through the stop; the
+    open trades first, so the short is bought back as the take-profit, at the target's level plus the taker's
+    0.05 % slippage, never at the better open (Advisor L12)."""
+    df = _ls_bars(np.full(12, 60_000.0), minutes=60)
+    df.iloc[6, df.columns.get_loc("open")] = df.iloc[6, df.columns.get_loc("low")] = 56_000.0
+    df.iloc[6, df.columns.get_loc("high")] = 64_000.0
+    res = run_backtest("probe_short", df, TICK_INST, {"stop_loss": 0.05, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    exits = [o for o in j.orders_.values() if o["intent"] != "entry" and o["filled_qty"]]
+    assert [o["intent"] for o in exits] == ["take_profit"], exits
+    (fill,) = [f for f in j.fills_ if f["order_id"] == exits[0]["order_id"]]
+    assert fill["side"] == "BUY" and fill["price"] == pytest.approx(57_000.0 * 1.0005)
+
+
+def test_the_target_and_a_reversal_on_one_bar_make_exactly_one_exit_and_never_an_accidental_short():
+    """Advisor NA-2, condition 1: the long's target trades through on the very bar the model turns short. The long
+    is closed once (the take-profit, at its level), nothing sells it a second time, and the short is the model's
+    own entry, of its own size, after the long is flat: on that same bar, as paper opens it (QA P1-L10)."""
+    from decimal import Decimal
+
+    df = _ls_bars(np.full(40, 60_000.0), minutes=60)
+    step, period = 3600 * 10**9, 3
+    side = [(1, -1, 0)[(int(ts.value) // step // period) % 3] for ts in df.index]
+    flip = next(i for i in range(2, len(side)) if side[i - 1] == 1 and side[i] == -1 and side[i - 2] == 1)
+    df.iloc[flip, df.columns.get_loc("high")] = 63_500.0  # through the 5 % target, on the bar that turns short
+    res = run_backtest("probe_ls", df, TICK_INST, {"period": period, "take_profit": 0.05, **PERP},
+                       starting_capital=10_000, risk_profile="balanced", bar_minutes=60, half_spread=0)
+    j = res.journal
+    orders = sorted(j.orders_.values(), key=lambda o: o["id"])
+    at_flip = [o for o in orders if o["ts"] == df.index[flip]]
+    assert [(o["intent"], o["side"]) for o in at_flip] == [("take_profit", "SELL"), ("entry", "SELL")], at_flip
+    intent = {o["order_id"]: o["intent"] for o in orders}
+    held = Decimal(0)
+    for f in sorted(j.fills_, key=lambda f: f["id"]):
+        before = held
+        held += Decimal(str(f["qty"])) * (1 if f["side"] == "BUY" else -1)
+        if intent[f["order_id"]] != "entry":
+            assert held == 0 and before != 0, (f, before, held)  # an exit closes exactly what was held
+        else:
+            assert before == 0, (f, before)  # an entry opens from flat: no exit ever carried through it
+    shorts = [o for o in orders if o["intent"] == "entry" and o["side"] == "SELL"]
+    assert any(o["ts"] == df.index[flip] for o in shorts)  # the turn to short comes on that bar, from flat
 
 
 @pytest.mark.parametrize(("strategy", "gap"), [("probe_short", 120_000.0), ("probe_long", 25_000.0)])
@@ -1011,7 +1091,8 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
       residue, and each order's filled quantity is the exact sum of its fills;
     - every fill other than an entry is reduce-only: it shrinks the position and never carries it through
       flat to the other side, so no exit, stop or target opens a position, after a halt or otherwise;
-    - every exit closes to exactly zero, and every entry on either side rests a full-size stop and target."""
+    - every exit closes to exactly zero, and every entry on either side rests a full-size stop (the target is
+      judged on each bar after it, Advisor NA-2)."""
     from decimal import Decimal
 
     lot = Decimal(str(XRP_INST.size_increment))
@@ -1040,8 +1121,8 @@ def test_a_long_flipping_run_keeps_its_book_in_step_with_the_venue_in_exact_lots
     assert len(entries) > 30 and {orders[i]["side"] for i in entries} == {"BUY", "SELL"}
     for i in entries:
         e = orders[i]
-        legs = {o["intent"]: o for o in orders[i + 1:i + 3]}
-        assert set(legs) == {"stop_loss", "take_profit"}, (e, orders[i + 1:i + 3])
+        legs = {o["intent"]: o for o in orders[i + 1:i + 2]}
+        assert set(legs) == {"stop_loss"}, (e, orders[i + 1:i + 2])
         far = "SELL" if e["side"] == "BUY" else "BUY"
         assert all(o["side"] == far and Decimal(str(o["qty"])) == Decimal(str(e["filled_qty"]))
                    for o in legs.values()), (e, legs)
