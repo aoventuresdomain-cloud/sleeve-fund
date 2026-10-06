@@ -369,6 +369,11 @@ window.Console = (() => {
     const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
     // Candles built from the sleeve's own marks have no range inside the bar, so they draw as a line instead.
     const area = chart.addAreaSeries({lineColor: accent, topColor: rgba(accent, 0.22), bottomColor: rgba(accent, 0), lineWidth: 2, visible: false});
+    // Candles the model can't trade on yet (its indicators haven't settled) are shaded, drawn from the recorded points.
+    const warmBand = chart.addAreaSeries({priceScaleId: "warm", lineColor: rgba(css("--muted"), 0), lineWidth: 1, topColor: rgba(css("--muted"), 0.16),
+      bottomColor: rgba(css("--muted"), 0.16), lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+      autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
+    chart.priceScale("warm").applyOptions({scaleMargins: {top: 0, bottom: 0}, visible: false});
     const vol = chart.addHistogramSeries({priceScaleId: "vol", color: rgba(css("--muted"), 0.3), priceFormat: {type: "volume"}, lastValueVisible: false, priceLineVisible: false});
     chart.priceScale("vol").applyOptions({scaleMargins: {top: 0.86, bottom: 0}});
     let main = candles;
@@ -379,6 +384,7 @@ window.Console = (() => {
     // The strategy's own indicator values (P1-3s): drawn as the platform recorded them, never recomputed here.
     // Each is a synthetic LIB entry reading the latest payload, so the legend, strips and crosshair are the menu's.
     let strat = [], stratData = {}, built_sig = "";
+    const off = new Set(), extra = new Set();  // lines hidden by the PM; lines the platform didn't show by default but the PM asked for
     let syncing = false, mirroring = false;
     const quiet = {priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false};
     const colorOf = (c) => (c.color && /^#[0-9a-f]{6}$/i.test(c.color) ? c.color : css(PALETTE[0]));
@@ -405,6 +411,7 @@ window.Console = (() => {
         const series = shape.map((ln) => (ln.hist
           ? target.addHistogramSeries({...quiet, priceFormat: {type: "price", precision: def.pane?.digits ?? 2, minMove: 0.01}})
           : target.addLineSeries({...quiet, color: rgba(color, ln.alpha ?? 1), lineWidth: def.pane ? 1.5 : 1.5, lineStyle: ln.style || 0,
+              ...(ln.steps ? {lineType: 1} : {}),  // a recorded value holds from one close to the next; never a line between closes the model didn't see
               ...(def.pane && def.pane.min != null ? {autoscaleInfoProvider: () => ({priceRange: {minValue: def.pane.min, maxValue: def.pane.max}})} : {})})));
         if (def.pane) (def.pane.guides || []).forEach((g) => series[series.length - 1].createPriceLine({price: g, color: css("--line-strong"), lineWidth: 1, lineStyle: 2, axisLabelVisible: false}));
         built.push({c, def, color, series, chart: target, box: wrap, legend, vals: []});
@@ -439,7 +446,7 @@ window.Console = (() => {
     // The recorded points (t = the bar's close, UTC seconds) laid on this chart's candles. A candle on the strategy's
     // own size takes the point stamped at its close; a slower filter (tf) steps forward from its last point.
     const stratLines = (key) => {
-      const ind = stratData[key], none = [{vals: []}, {vals: [], style: 2, alpha: 0.45}];
+      const ind = stratData[key], none = [{vals: [], steps: true}, {vals: [], style: 2, alpha: 0.45, steps: true}];
       if (!ind || !data) return none;
       const iv = data.interval * 60, pts = ind.points.filter((p) => typeof p[1] === "number").sort((a, b) => a[0] - b[0]);
       const exact = new Map(pts.map((p) => [p[0], p[1]]));
@@ -455,10 +462,13 @@ window.Console = (() => {
       // The dashed part reaches the first settled point, so the two parts join with no gap at the seam.
       const seam = at.findIndex((p) => p && p[0] >= from);
       if (seam > 0 && warm[seam - 1] != null) warm[seam] = at[seam][1];
-      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null))}, {vals: warm, style: 2, alpha: 0.45}];
+      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null)), steps: true}, {vals: warm, style: 2, alpha: 0.45, steps: true}];
     };
     const syncStrategy = (d) => {
-      const list = (d.indicators || []).filter((i) => i.kind !== "marker");
+      const all = (d.indicators || []).filter((i) => i.kind !== "marker");
+      // The platform marks what the strategy's rules read (shown); the rest are listed and drawn only when asked for.
+      const list = all.filter((i) => i.shown !== false || extra.has(i.key));
+      const more = all.filter((i) => i.shown === false && !extra.has(i.key));
       stratData = Object.fromEntries(list.map((i) => [i.key, i]));
       // What the panes were built from: a settings change keeps the keys but changes labels, levels and groups.
       const sig = (i) => `${i.key}|${i.pane}|${i.label}|${i.group || ""}|${JSON.stringify(i.levels || [])}`;
@@ -476,22 +486,31 @@ window.Console = (() => {
         });
         build();
       }
-      // Plain words about what is drawn: warm-up, and a candle size the points don't sit on.
-      const note = $(".pc-strat-note");
+      // The span before every drawn line has settled: the model can't trade there, so it is shaded and said so.
+      const iv = d.interval * 60, settled = list.map((i) => i.settled_from).filter(Number.isFinite);
+      const until = settled.length ? Math.max(...settled) : null;
+      warmBand.setData(until == null ? [] : d.candles.filter((c) => c.time + iv < until).map((c) => ({time: c.time, value: 1})));
+      // Plain words about what is drawn: warm-up, a candle size the points don't sit on, and the lines left off.
+      const note = $(".pc-strat-note"), offered = $(".pc-strat-more");
       if (!note) return;
       const said = [];
       list.forEach((i) => {
         // The candle size the points sit on is their commonest gap (a trimmed or gappy series still has one).
         const ts = i.points.map((p) => p[0]).filter(Number.isFinite), gaps = ts.slice(1).map((x, k) => x - ts[k]).sort((a, b) => a - b);
         const gap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
-        if (gap && !i.tf && gap !== d.interval * 60) {
-          said.push(`${i.label} is recorded on ${Math.round(gap / 60)}-minute candles, so it shows only on that interval.`);
-        } else if (i.settled_from != null && i.points.some((p) => p[0] < i.settled_from)) {
-          said.push(`${i.label}: the dashed part was still warming up and isn't settled.`);
-        }
+        if (gap && !i.tf && gap !== d.interval * 60) said.push(`${i.label} is recorded on ${Math.round(gap / 60)}-minute candles, so it shows only on that interval.`);
       });
+      if (until != null && d.candles.some((c) => c.time + iv < until)) said.push("Shaded: warming up, the model can't trade here. Dashed lines were not settled.");
       if (d.indicators_note) said.unshift(d.indicators_note);  // the platform's own sentence when it has nothing to draw
       note.textContent = said.join(" "); note.hidden = !said.length;
+      if (offered) {
+        offered.replaceChildren(...(more.length ? [el("span", null, "Also recorded, not drawn: ")] : []), ...more.map((i) => {
+          const b = el("button", "secondary", i.label); b.type = "button";
+          b.addEventListener("click", () => { extra.add(i.key); syncStrategy(data); fill(); });
+          return b;
+        }));
+        offered.hidden = !more.length;
+      }
     };
     const fill = () => {
       const t = data.candles.map((c) => c.time);
@@ -506,6 +525,7 @@ window.Console = (() => {
             : ln.vals.map((v, i) => (v == null ? {time: t[i]} : ln.hist ? {time: t[i], value: v, color: rgba(v >= 0 ? css("--gain") : css("--loss"), 0.5)} : {time: t[i], value: v}));
           b.series[j].setData(pts);
         });
+        if (b.c.key) b.series.forEach((s) => s.applyOptions({visible: !off.has(b.c.key)}));
         if (b.chart !== chart) b.chart.applyOptions({timeScale: {timeVisible: data.interval < 1440, secondsVisible: false}});
       });
       const r = chart.timeScale().getVisibleLogicalRange();
@@ -524,6 +544,10 @@ window.Console = (() => {
     };
     const tag = (b, i) => {
       const sp = el("span"), sw = el("i"); sw.style.background = b.color;
+      if (b.c.key) {  // a recorded line: click its legend entry to hide or show it
+        sp.style.cursor = "pointer"; sp.title = "Click to hide or show"; sp.style.opacity = off.has(b.c.key) ? "0.4" : "1";
+        sp.addEventListener("click", () => { off.has(b.c.key) ? off.delete(b.c.key) : off.add(b.c.key); b.series.forEach((s) => s.applyOptions({visible: !off.has(b.c.key)})); legends(-1); });
+      }
       sp.append(sw, labelOf(b.c) + "  ", el("b", null, valueText(b, i)));
       return sp;
     };

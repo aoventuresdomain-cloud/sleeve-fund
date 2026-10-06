@@ -331,7 +331,7 @@ def test_the_strategys_recorded_indicators_are_drawn_with_warm_up_marked_and_not
     assert "EMA(10)" in legend
     assert page.locator(".pc-sub").count() == 1 and "RSI(14)" in page.inner_text(".pc-sub-legend")
     note = page.inner_text(".pc-strat-note")
-    assert "EMA(10)" in note and "warming up" in note.replace("was still warming up", "warming up")
+    assert "Shaded: warming up, the model can't trade here" in note
     assert errors == []
     ctx.close()
 
@@ -400,4 +400,32 @@ def test_the_platforms_own_sentence_shows_when_it_has_no_indicators_to_draw(site
     page.wait_for_load_state("networkidle")
     page.wait_for_selector(".pc-legend", timeout=5000)
     assert "drawn on its own 1h candles" in page.inner_text(".pc-strat-note")
+    ctx.close()
+
+
+def test_recorded_lines_are_steps_with_a_toggle_and_unshown_ones_wait_until_asked_for(site, browser):
+    """Advisor rules via QD: values hold from close to close (never joined by straight segments), only the lines the
+    strategy's rules read are drawn at first, the others are offered, and each drawn line can be hidden again."""
+    import json
+
+    fixture = _fixture_candles()
+    fixture["indicators"].append({"key": "atr", "label": "ATR(14)", "pane": "lower", "kind": "line", "shown": False,
+                                  "settled_from": None, "points": [[p[0], 2.0] for p in fixture["indicators"][0]["points"]]})
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-strat-more button", timeout=5000)
+    assert page.locator(".pc-sub").count() == 1 and "ATR(14)" not in page.inner_text(".pc-sub-legend")
+    assert "Also recorded, not drawn" in page.inner_text(".pc-strat-more")
+    page.click(".pc-strat-more button")
+    page.wait_for_function("document.querySelectorAll('.pc-sub').length === 2", timeout=5000)
+    legend = page.locator(".pc-legend span", has_text="EMA(10)")
+    legend.click()
+    assert page.locator(".pc-legend span", has_text="EMA(10)").evaluate("e => e.style.opacity") == "0.4"
+    assert errors == []
     ctx.close()
