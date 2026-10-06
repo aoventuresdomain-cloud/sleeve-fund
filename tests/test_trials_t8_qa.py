@@ -22,26 +22,19 @@ def _store(tmp_path):
 
 
 
-@pytest.mark.xfail(strict=True, reason="QA P1-T8: a failed trials count is only an error event; nothing that reads N or "
-                   "the seen-data rows (counts, deflated Sharpe, G1, holdout refusal) knows about it")
-def test_t8_a_strategy_whose_count_failed_still_blocks_a_holdout_on_seen_data(tmp_path):
+def test_t8_a_strategy_whose_count_failed_still_blocks_a_holdout_on_seen_data(tmp_path, monkeypatch):
+    """Rewritten 17:45 for the T8 interface (QD 17:40): `_counted` is gone; a strategy is created while its metrics
+    step raises. Same assertion as before: the year it was chosen on is seen data, so that holdout is refused."""
     import pandas as pd
 
-    from sleeve_fund.dashboard import app as appmod
     from sleeve_fund.research.holdout import HoldoutLocks
     from sleeve_fund.research.trials import legacy_idea_hash
 
-    store = _store(tmp_path)
-
-    def broken(*a, **k):
-        raise KeyError("from")
-
-    appmod._counted(store, None, "strategy btc-test", broken)  # trend_filter strategy created, count failed
-    assert [e for e in store.events(min_level="error") if e["kind"] == "trials_count_failed"]
+    c, store = _t8_failed_strategy(tmp_path, monkeypatch)
     now = pd.Timestamp.now(tz="UTC")
-    # The strategy was chosen having seen the last year, but nothing in the register or holdout check knows it
-    assert HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", now - pd.Timedelta(days=365),
-                                       now - pd.Timedelta(days=1)) != ""
+    refusal = HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", now - pd.Timedelta(days=365),
+                                          now - pd.Timedelta(days=1))
+    assert refusal != ""
 
 
 # ===================== P1-T8 fix: pre-build strict xfails (HoQA 17:30; Advisor 17:06) =====================
@@ -107,12 +100,12 @@ def test_t8a_a_failed_trial_insert_rolls_back_the_backtest(tmp_path, monkeypatch
     assert "Every trade" not in page and T8_SAVE_ERROR_TEXT in page
 
 
-@pytest.mark.xfail(strict=True, reason=_T8)
 def test_t8a_a_failed_trial_insert_rolls_back_a_new_strategy(tmp_path, monkeypatch):
     (c, store), td = _t8_client(tmp_path, monkeypatch)
     _fail_trial_inserts(store)
     r = td._new(c)
-    assert store.sleeve("btc-test") is None, "a strategy was made without its trial row"
+    # store.sleeve raises KeyError for a missing name (QD 17:40)
+    assert not [x for x in store.sleeves() if x.name == "btc-test"], "a strategy was made without its trial row"
     assert "error" in r.headers.get("location", "") or r.status_code >= 400
 
 
