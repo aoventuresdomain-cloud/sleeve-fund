@@ -14,7 +14,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     JSON,
@@ -215,6 +215,24 @@ orders_t = Table(
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
+)
+# When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
+# and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
+# the venue's own stamp on the last fill, which the clock check compares against. Backtests keep none.
+order_timings_t = Table(
+    "order_timings",
+    metadata,
+    Column("order_id", String(64), ForeignKey("orders.order_id"), primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("bar_close", TS),  # the decision bar's close; none when a tick or the risk guard decided
+    Column("bar_recv", TS),  # when the node had that bar
+    Column("decided", TS),
+    Column("sent", TS),  # none for an order held by the strategy until it can fill (a paper post-only)
+    Column("accepted", TS),
+    Column("first_fill", TS),
+    Column("last_fill", TS),
+    Column("venue_ts", TS),
+    Index("order_timings_sleeve_decided", "sleeve", "decided"),
 )
 # The stop and target an open position works to after the PM edited them, or after a restart set them
 # again from the market, as shares of its entry price (the entry order's signal holds the plan it was
@@ -544,6 +562,14 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _from_ns(ns: int) -> datetime:
+    """UNIX nanoseconds -> an aware UTC datetime to the microsecond (utcnow() drops them)."""
+    return _EPOCH + timedelta(microseconds=ns // 1000)
+
+
 def _aware(ts: datetime | None) -> datetime | None:
     # SQLite hands back naive datetimes; everything we store is UTC.
     if ts is not None and ts.tzinfo is None:
@@ -763,7 +789,10 @@ class Store:
                                              fee=fee, order_id=order_id, trade_id=trade_id))
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:
+        """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
+        order_timings row in the same transaction, so that row never exists without its order (DA-8)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -772,14 +801,45 @@ class Store:
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
                                               message=""))
+            if timing:
+                c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
+                    k: _from_ns(v) for k, v in timing.items() if v is not None}))
+
+    def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
+        """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
+        acceptance, each fill) on the row record_order wrote with the decision; ignored for an order with no row
+        (a risk stop, a restore: nothing decided them on a bar). A call with `decided` for an order with no row
+        adds it. fill: our clock at a fill; the first is kept as first_fill, every one moves last_fill."""
+        values = {k: _from_ns(v) for k, v in stamps.items() if v is not None}
+        if fill is not None:
+            values["last_fill"] = _from_ns(fill)
+        with self.engine.begin() as c:
+            row = c.execute(select(order_timings_t.c.first_fill).where(order_timings_t.c.order_id == order_id)).first()
+            if row is None:
+                if "decided" in values:
+                    c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **values))
+            elif values:
+                if fill is not None and row.first_fill is None:
+                    values["first_fill"] = values["last_fill"]
+                c.execute(update(order_timings_t).where(order_timings_t.c.order_id == order_id).values(**values))
+
+    def timings(self, sleeve: str, limit: int = 500) -> list[dict]:
+        """The strategy's latest order timings, newest decision first."""
+        q = (select(order_timings_t).where(order_timings_t.c.sleeve == sleeve)
+             .order_by(order_timings_t.c.decided.desc()).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         """Move an order on (accepted, cancelled, rejected...) or add a fill to it. Unknown ids are ignored:
-        orders sent before this journal existed have no row."""
+        orders sent before this journal existed have no row. intent: what the order turned out to carry out (a
+        backtest's resting stop booked as the target, when its bar opened through the target)."""
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         with self.engine.begin() as c:
             row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
             if row is None:
@@ -797,7 +857,18 @@ class Store:
                 values["status"] = status  # a late "accepted" never reopens a finished order
             if message:
                 values["message"] = message
+            if intent is not None:
+                values["intent"] = intent
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
+
+    def merge_order_signal(self, order_id: str, values: dict) -> None:
+        """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
+        are ignored, as in update_order."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id).with_for_update()).first()
+            if row is not None:
+                c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                          .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))
 
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
                intents: tuple[str, ...] | None = None) -> list[dict]:
@@ -1253,7 +1324,7 @@ class Store:
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
-                 insurance_t, orders_t, mirror_requests_t)
+                 insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")

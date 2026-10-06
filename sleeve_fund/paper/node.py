@@ -304,7 +304,9 @@ def main(argv: list[str] | None = None) -> int:
         row = store.sleeve(args.db_sleeve)
         quote = resolve(getattr(row, "venue", None), store)
         sleeve = from_store(row, fee_schedule=quote.fees)
-        runtime = SleeveRuntime(store, sleeve.name)
+        from sleeve_fund.paper.queued import QueuedStore
+
+        runtime = SleeveRuntime(QueuedStore(store), sleeve.name)  # journal writes off the decision path
         perp = markets.terms(sleeve.params, sleeve.venue)
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
                     f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "
@@ -330,6 +332,13 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if recorder is not None:
             recorder.close()
+        if runtime is not None:
+            # What the strategy journaled as it stopped, an exit's row still being retried included (QueuedStore),
+            # inside the 45 s the supervisor gives a stopping process.
+            if hasattr(runtime.store, "settle"):
+                runtime.store.settle(timeout=30)
+            else:
+                runtime.store.flush()
     return 0
 
 

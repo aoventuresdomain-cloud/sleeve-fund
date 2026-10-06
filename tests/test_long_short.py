@@ -956,14 +956,15 @@ def test_an_entry_whose_stop_sits_past_half_way_to_liquidation_is_refused(prices
 
 
 def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
-    # Short at 101.5, then a fall: the 2% target buys back at 101.5 x 0.98, not above the entry.
+    # Short at 101.5, then a fall: the 2% target buys back at 101.5 x 0.98 plus the taker's 0.05% slippage (Advisor
+    # L12 FINAL), not above the entry.
     closes = [100.0, 100.5, 100.8, 101.5, 101.0, 100.0, 99.0, 98.0, 98.0]
     res = run_backtest("ping_pong", _path(prices, closes), instrument,
                        {**PERP, "take_profit": 0.02, "dip": 0.05}, half_spread=0)
     fills = res.fills.sort_values("ts_last")
     got = [(res.decisions[o]["intent"], fills.loc[o, "side"]) for o in fills.index]
     assert got == [("entry", "BUY"), ("exit", "SELL"), ("entry", "SELL"), ("take_profit", "BUY")], got
-    assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98, rel=1e-4)
+    assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98 * 1.0005, rel=1e-4)
 
 
 def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stays_halted_through_a_restart(

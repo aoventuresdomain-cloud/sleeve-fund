@@ -400,10 +400,13 @@ class SleeveRuntime:
     # --- orders -------------------------------------------------------------------
 
     def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict,
-                 order_type: str = "MARKET") -> None:
-        """Journal an order and why it was sent, before it goes to the venue."""
+                 order_type: str = "MARKET", timing: dict | None = None) -> None:
+        """Journal an order and why it was sent. An opening order's row is written before it goes to the venue;
+        with paper's queued journal an exit's is queued and may land after it (paper.queued). timing: the
+        decision's stamps (on_timing), journaled with the order; a backtest keeps none."""
+        extra = {"timing": timing} if timing and not self.backtest else {}
         self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
-                                signal=signal, order_type=order_type, ts=self.now())
+                                signal=signal, order_type=order_type, ts=self.now(), **extra)
 
     def on_order_status(self, order_id: str, status: str, message: str = "") -> None:
         self.store.update_order(order_id, status=status, message=message)
@@ -418,6 +421,13 @@ class SleeveRuntime:
                                trade_id=trade_id, ts=ts)
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
         self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
+
+    def on_timing(self, order_id: str, **stamps: int | None) -> None:
+        """Paper and live (v2 P1-2): when the order's bar closed and arrived, the decision, the send, the venue's
+        acceptance and each fill (UNIX ns), for close-to-fill times per strategy. A backtest's are its own
+        replay clock, so it keeps none."""
+        if not self.backtest:
+            self.store.record_timing(self.name, order_id, **stamps)
 
     # --- display -------------------------------------------------------------------
 
