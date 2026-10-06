@@ -132,7 +132,7 @@ def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
         inside = sorted((t for t in trades if start <= t.entry and t.exit <= end), key=lambda t: t.entry)
         if any(b.entry < a.exit for a, b in zip(inside, inside[1:])):
             raise ValueError("out-of-sample trades overlap; the benchmark needs one position at a time")
-        test_bars += end - start
+        test_bars += end - start + 1  # inclusive: a window from bar 0 to bar 9 is 10 bars (QA P1-R3)
         if not inside:
             continue
         holds = np.array([t.exit - t.entry for t in inside])
@@ -163,10 +163,12 @@ def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cos
 
 
 def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
-                 draws: int = DRAWS, seed: int = 0) -> RandomEntryResult:
+                 draws: int = DRAWS, seed: int = 0, in_market: float | None = None) -> RandomEntryResult:
     """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
     walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
-    fraction, charged on entry and exit alike."""
+    fraction, charged on entry and exit alike. in_market: the share of the windows' bars the strategy held any
+    position, trades carried in and still open at the end included, though those stay out of the comparison
+    (Independent Quant Advisor, 6 Oct 2026); without it, the bars the given trades held."""
     c = np.asarray(closes, dtype=float)
     rng = np.random.default_rng(seed)
     per_window, test_bars, held = _by_window(trades, windows)
@@ -185,7 +187,7 @@ def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], co
     strategy_return, strategy_sharpe = _compound(actual), _sharpe(actual)
     ret_pct = float((rets < strategy_return).mean() * 100)
     sharpe_pct = float((sharpes < strategy_sharpe).mean() * 100)
-    exposure = held / test_bars if test_bars else 0.0
+    exposure = in_market if in_market is not None else held / test_bars if test_bars else 0.0
     return RandomEntryResult(
         return_percentile=ret_pct, sharpe_percentile=sharpe_pct, strategy_return=strategy_return,
         median_random_return=float(np.median(rets)), trades=n, exposure=exposure, draws=draws,

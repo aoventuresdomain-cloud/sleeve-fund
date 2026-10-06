@@ -52,6 +52,10 @@ class Fold:
     carried_out: int = 0
     # The counted trips as (opened, closed, side), for the random-entry and random-side benchmarks.
     trips: list = field(default_factory=list)
+    # The test window's bars, and how many of them held any position, carried-in and still-open ones too: the
+    # random-entry benchmark's "in the market" (Independent Quant Advisor, 6 Oct 2026, QA P1-R2).
+    window_bars: int = 0
+    in_market_bars: int = 0
     # When the risk guard halted the run before the test window ended: the day, why, and whether
     # it was in the training stretch the run traded through first. A halted fold is flat from then on.
     halted: str = ""
@@ -390,7 +394,9 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=summary(b_ret),
-                **_window_trips(trades(fills_to_rows(run.fills), run.shorts), test_idx[0]),
+                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0]),
+                window_bars=len(test_idx),
+                in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),
             )
@@ -492,9 +498,18 @@ def _window_trips(trips: list[dict], test_start) -> dict:
     counted = [t for t in trips if t["opened"] is not None and t["closed"] is not None and _utc(t["opened"]) >= start]
     carried_in = sum(1 for t in trips if t["closed"] is not None and _utc(t["closed"]) >= start
                      and (t["opened"] is None or _utc(t["opened"]) < start))
-    carried_out = sum(1 for t in trips if t["closed"] is None and t["opened"] is not None and _utc(t["opened"]) >= start)
+    carried_out = sum(1 for t in trips if t["closed"] is None)  # still open at the window's end, wherever it opened
     return {"test_trades": len(counted), "carried_in": carried_in, "carried_out": carried_out,
             "trips": [(_utc(t["opened"]), _utc(t["closed"]), int(t["side"])) for t in counted]}
+
+
+def _in_market_bars(exposure: pd.Series, first, last) -> int:
+    """The bars from first to last, inclusive, that closed holding a position of any size or side."""
+    if exposure is None or exposure.empty:
+        return 0
+    idx = exposure.index
+    inside = exposure[(idx >= first) & (idx <= last)]
+    return int((inside.abs() > 1e-9).sum())
 
 
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool):
@@ -520,7 +535,9 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_pe
             placed.append(Trade(entry, out, side))
             last = out
     closes = prices["close"].to_numpy(dtype=float)
-    entry = random_entry(closes, placed, windows, cost_per_side)
+    bars = sum(f.window_bars for f in folds)
+    in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
+    entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
     side = random_side(closes, placed, windows, cost_per_side) if shorts else None
     return entry, side
 

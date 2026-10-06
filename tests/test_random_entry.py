@@ -96,3 +96,54 @@ def test_window_trips_leave_out_trades_at_the_edges():
     out = _window_trips(trips, t("2025-02-01", tz="UTC"))
     assert (out["test_trades"], out["carried_in"], out["carried_out"]) == (1, 1, 1)
     assert out["trips"] == [(t("2025-02-03", tz="UTC"), t("2025-02-10", tz="UTC"), -1)]
+
+
+def test_a_trip_open_at_the_window_end_comes_from_the_real_fill_path():
+    """QA P1-R1: trades() never returned an open trip, so carried_out was always 0 on a real run."""
+    import pandas as pd
+
+    from sleeve_fund.research.metrics import trades
+    from sleeve_fund.research.study import _window_trips
+
+    t = lambda s: pd.Timestamp(s, tz="UTC")  # noqa: E731
+    rows = [{"ts": t("2025-02-03"), "side": "BUY", "qty": 1, "price": 100.0, "fee": 0.0},
+            {"ts": t("2025-02-10"), "side": "SELL", "qty": 1, "price": 110.0, "fee": 0.0},
+            {"ts": t("2025-02-20"), "side": "BUY", "qty": 1, "price": 105.0, "fee": 0.0}]
+    assert len(trades(rows)) == 1  # every other reader still sees closed trips only
+    out = _window_trips(trades(rows, open_trip=True), t("2025-02-01"))
+    assert (out["test_trades"], out["carried_out"]) == (1, 1)
+
+
+def test_time_in_market_counts_carried_and_open_positions():
+    """QA P1-R2 (Advisor, 6 Oct 2026): in the market means any position held, carried-in and still-open ones
+    too, though only trips inside the window are compared. 20 of 91 bars in counted trips reads 22%; the real
+    position held 80% of them, so the benchmark is weak."""
+    closes = [100 + i for i in range(101)]
+    inside = [Trade(35, 55, 1)]
+    assert not random_entry(closes, inside, [(10, 100)], 0.0, draws=50).weak
+    assert random_entry(closes, inside, [(10, 100)], 0.0, draws=50, in_market=0.8).weak
+
+
+def test_exposure_counts_every_bar_of_an_inclusive_window():
+    """QA P1-R3: a window from bar 0 to bar 9 is 10 bars, not 9."""
+    r = random_entry([100.0] * 10, [Trade(0, 9, 1)], [(0, 9)], cost_per_side=0.0, draws=50)
+    assert r.exposure == pytest.approx(9 / 10)
+
+
+def test_a_long_hold_strategy_mostly_in_market_through_carried_trades_is_weak(tmp_path):
+    """Advisor's Done-when for P1-R2, on a real study: trend_filter on QA's seed 5 holds positions across the
+    window edges most of the time. Its windows end with trades still open, those are counted as left out, and
+    the time in market comes from the real position, so random entry reads weak, not judged."""
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.strategies.trend_filter import SPEC
+    from sleeve_fund.venues import venue
+
+    r = run_study(SPEC, synthetic_ohlcv(days=1900, seed=5), venue("KRAKEN").instrument("BTC", "USD"),
+                  dataset="s5", synthetic=True, ledger=IdeaLedger(tmp_path / "l.jsonl"), holdout_days=200,
+                  train_days=730, test_days=365)
+    assert sum(f.carried_out for f in r.folds) > 0 and r.excluded_trades >= sum(f.carried_out for f in r.folds)
+    held = sum(f.in_market_bars for f in r.folds) / sum(f.window_bars for f in r.folds)
+    assert r.random_entry.exposure == pytest.approx(held) and held > 0.6
+    assert r.random_entry.weak and r.random_entry.verdict == "WEAK"
