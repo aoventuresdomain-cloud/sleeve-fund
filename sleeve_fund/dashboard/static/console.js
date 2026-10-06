@@ -719,7 +719,7 @@ window.Console = (() => {
             return {priceRange: {minValue: Math.min(r.priceRange.minValue, halt ?? 0, -0.5), maxValue: 0}};
           }});
         s.setData(pts(d.dd));
-        if (halt !== null) s.createPriceLine({price: halt, color: loss, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `${el.dataset.haltName || "Book"} halt`});
+        if (halt !== null) s.createPriceLine({price: halt, color: loss, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `${(el.dataset.haltName || "book").replace(/^./, (c) => c.toUpperCase())} halt`});
       } else {
         const bench = chart.addLineSeries({color: muted, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false});
         bench.setData(pts(d.bench));
