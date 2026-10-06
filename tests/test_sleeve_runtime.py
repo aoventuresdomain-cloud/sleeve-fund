@@ -367,9 +367,10 @@ def test_a_reload_mid_day_keeps_the_days_opening_equity(store, reload):
 
 
 @pytest.mark.parametrize("reload", [False, True])
-def test_a_pm_resume_after_a_daily_pause_survives_a_reload(store, reload):
-    """The PM's resume resets the day's baseline. A reload the same day (a settings edit) must keep it,
-    not restore the midnight open and re-pause and flatten at once (review round 9, M9-2 case f)."""
+def test_a_pm_resume_never_lifts_a_daily_pause_which_holds_through_a_reload_until_the_next_roll(store, reload):
+    """Independent Quant Advisor, 6 Oct 18:17 (HC), superseding review round 9's M9-2: a daily-loss pause is cleared
+    only by the next 00:00 UTC roll. The PM's resume is ignored, a reload the same day (a settings edit) keeps the
+    pause, and the roll lifts it."""
     from datetime import datetime, timedelta, timezone
 
     _sleeve(store)
@@ -380,19 +381,22 @@ def test_a_pm_resume_after_a_daily_pause_survives_a_reload(store, reload):
     assert rt.tick(equity=10_000, price=10_000, **mark) is None
     t[0] += timedelta(hours=10)
     assert rt.tick(equity=9_450, price=9_450, **mark) == "flatten"  # down 5.5%: paused
+    until = store.sleeve("s1").paused_until
+    assert until == datetime(2024, 3, 3, 0, 0, tzinfo=timezone.utc)  # the next 00:00 UTC
     store.command("s1", "resume", "checked, carry on")
     t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=9_450, price=9_450, **mark) is None
-    assert store.sleeve("s1").status == "running"
+    rt.tick(equity=9_450, price=9_450, **mark)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()  # the resume is ignored
     if reload:
         rt = SleeveRuntime(store, "s1", now=lambda: t[0])
         rt.on_start(0.008)
     t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=9_440, price=9_440, **mark) is None  # 5.6% off midnight, 0.1% off the resume
-    assert store.sleeve("s1").status == "running"
-    t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=8_950, price=8_950, **mark) == "flatten"  # 5.3% off the resume: paused again
-    assert store.sleeve("s1").status == "paused"
+    rt.tick(equity=9_440, price=9_440, **mark)
+    s = store.sleeve("s1")
+    assert (s.status, s.paused_until) == ("paused", until) and not rt.can_open()
+    t[0] = until + timedelta(seconds=30)
+    rt.tick(equity=9_440, price=9_440, cash=9_440, qty=0.0)  # flat, as the pause left it
+    assert rt.can_open() and store.sleeve("s1").status == "running"  # the roll lifts it
 
 
 @pytest.mark.parametrize("reload", [False, True])

@@ -34,6 +34,23 @@ def liquidation_reason(head: str, covered: float) -> str:
     """A liquidation's halt once flat: its head, and what the venue's insurance fund covered, if anything."""
     return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
 
+def clearing_action(sleeve, now: datetime | None = None) -> str | None:
+    """What alone clears the halt a strategy is in, in words, or None when it isn't halted or paused for the day
+    (Independent Quant Advisor, 6 Oct 18:17, HC): a liquidation only a reset after liquidation; a drawdown halt only a
+    resume; a daily-loss pause only the next 00:00 UTC roll. Stop, Start and restarts never do. Without `now` a daily
+    pause counts until the runtime itself rolls it; with it, one whose roll has passed doesn't, so a strategy stopped
+    across the roll can still be started (its first tick then lifts the pause)."""
+    reason = sleeve.status_reason or ""
+    if sleeve.status == "halted":
+        if reason.startswith((WIPED_OUT, "wiped out", "position margin lost")):
+            return "it was liquidated, and only a reset after liquidation clears that"
+        return "it is halted, and only a resume clears that"
+    if sleeve.status == "paused" and sleeve.paused_until is not None and (now is None or sleeve.paused_until > now):
+        return (f"it is paused for the day's loss until {sleeve.paused_until:%d %b %H:%M} UTC, and only the next "
+                "00:00 UTC roll clears that")
+    return None
+
+
 class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and
     # rests its stop at the simulated venue instead of watching every trade.
@@ -262,9 +279,10 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
             elif breach and breach.action == "pause_day":
-                until = now + timedelta(hours=24)
+                # It clears at the next 00:00 UTC roll and nothing else (Independent Quant Advisor, 6 Oct 18:17, HC).
+                until = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
                 self._set("paused", breach.reason, until)
-                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours", ts=self.now())
+                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened until the next 00:00 UTC", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
         for cmd in [] if liquidating else self.store.pending_commands(self.name):
@@ -282,6 +300,13 @@ class SleeveRuntime:
                 # Already running: a resume would only reset the day's loss baseline (review round 10, m10-3).
                 self.store.event(self.name, "info", "pm_resume_ignored",
                                  f"resume ignored, the strategy is already running: {cmd['reason']}", ts=self.now())
+                self.store.mark_applied(cmd["id"])
+                continue
+            elif cmd["command"] == "resume" and self.status == "paused" and self.paused_until is not None:
+                # A daily-loss pause clears only at the next 00:00 UTC roll, never by a resume (HC).
+                self.store.event(self.name, "info", "pm_resume_ignored",
+                                 f"resume ignored: the daily-loss pause ends at {self.paused_until:%d %b %H:%M} UTC, "
+                                 f"the next 00:00 UTC roll, and nothing else clears it ({cmd['reason']})", ts=self.now())
                 self.store.mark_applied(cmd["id"])
                 continue
             elif cmd["command"] == "resume":
