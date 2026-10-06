@@ -92,3 +92,12 @@ def test_the_evidence_gives_the_neighbours_trades():
 
 def test_the_trade_bar_is_the_specs_hundred():
     assert MIN_OOS_TRADES == 100
+
+
+def test_a_tunable_setting_with_nothing_tried_next_to_the_choice_fails():
+    # QA P1-G5: `a` is tuned (1, 2, 3 at b=1), but at the chosen b=2 only a=2 was tried, so a's nearness was
+    # never checked and the check passed on b alone.
+    rows = [{"a": a, "b": 1} for a in (1, 3)] + [{"a": 2, "b": b} for b in (1, 2, 3)]
+    grid = pd.DataFrame([{**r, "sharpe": 1.0, "round_trips": 50} for r in rows])
+    verdict, words = nearby_settings(grid, {"a": 2, "b": 2}, ["a", "b"])
+    assert verdict == "FAIL" and words.startswith("no nearby value tried for a")

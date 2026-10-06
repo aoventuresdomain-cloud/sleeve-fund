@@ -491,8 +491,7 @@ def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path,
     r = run_study(SPEC, prices, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=100,
                   train_days=730, test_days=365)
     assert [x.fee for x in r.cost_ladder] == list(COST_LADDER)
-    # The chosen settings trade once here; a free rung can still show a cent of rounding.
-    assert r.cost_ladder[0].fees_paid <= 0.01 and r.cost_ladder[-1].fees_paid > r.cost_ladder[1].fees_paid > 0
+    assert r.cost_ladder[0].fees_paid == 0 and r.cost_ladder[-1].fees_paid > r.cost_ladder[1].fees_paid > 0
     returns = [x.total_return for x in r.cost_ladder]
     assert returns == sorted(returns, reverse=True) and returns[0] > returns[-1]
     assert len({x.round_trips for x in r.cost_ladder[:3]}) == 1  # same trades; only the fee moves

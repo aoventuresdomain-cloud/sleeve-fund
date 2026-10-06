@@ -145,7 +145,7 @@ COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.008)
 # 5 Oct 2026): 2 basis points on the deepest books (BTC, ETH), 5 on the rest.
 DEEP_BOOKS = ("BTC", "ETH")
 # A re-run at the computed break-even confirms it when its net return is within this of zero (P1-G1).
-BREAKEVEN_TOLERANCE = 0.001
+BREAKEVEN_TOLERANCE = 0.0001  # 0.01% of starting capital, QA's bar (m-G6)
 BREAKEVEN_RUNS = 6  # re-runs allowed to home in on it before the figure stays "interpolated"
 
 
@@ -198,14 +198,14 @@ def breakeven_fee(rungs: list[LadderRung], run_at=None) -> tuple[float | None, s
                 ret = run_at(fee)
                 if abs(ret) <= BREAKEVEN_TOLERANCE:
                     return fee, (f"stops making money at about {fee:.3%} per side (verified: re-run at that fee, "
-                                 f"net return {ret:+.2%})")
+                                 f"net return {ret:+.3%}, within {BREAKEVEN_TOLERANCE:.2%})")
                 if ret > 0:
                     lo_fee, lo_ret = fee, ret
                 else:
                     hi_fee, hi_ret = fee, ret
                 fee = _between(lo_fee, lo_ret, hi_fee, hi_ret)
             return fee, (f"stops making money at about {fee:.3%} per side (interpolated {span}; "
-                         f"{BREAKEVEN_RUNS} re-runs did not settle within {BREAKEVEN_TOLERANCE:.1%})")
+                         f"{BREAKEVEN_RUNS} re-runs did not settle within {BREAKEVEN_TOLERANCE:.2%})")
     return None, f"still makes money at {rungs[-1].fee:.2%} per side, the top of the ladder"
 
 

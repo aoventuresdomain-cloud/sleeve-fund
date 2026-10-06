@@ -119,11 +119,15 @@ def nearby_scored(sensitivity: pd.DataFrame, centre: dict, params: list[str]) ->
     where = ", ".join(f"{p} {_setting(centre[p])}" for p in tuned)
     if row.empty:
         return "FAIL", f"the chosen settings ({where}) are not on the grid tried, so nearness can't be checked", -math.inf
-    edges = []
+    edges, lonely = [], []
     for p in tuned:
         values = _values(_line(sensitivity, centre, tuned, p), p)
-        if len(values) > 1 and (_equal(centre[p], values[0]) or _equal(centre[p], values[-1])):
+        if len(values) < 2:
+            lonely.append(p)  # tuned elsewhere on the grid, but nothing tried next to this choice (QA P1-G5)
+        elif _equal(centre[p], values[0]) or _equal(centre[p], values[-1]):
             edges.append(f"{p} {_setting(centre[p])}")
+    if lonely:
+        return "FAIL", f"no nearby value tried for {', '.join(lonely)}, so its nearness can't be checked", -math.inf
     if edges:
         return "FAIL", f"chosen at grid edge ({', '.join(edges)}), extend the grid", -math.inf
     near = neighbours(sensitivity, centre, tuned)
