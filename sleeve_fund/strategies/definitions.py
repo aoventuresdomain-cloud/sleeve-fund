@@ -229,7 +229,8 @@ def check_definition(defn: dict, bar_spec: str | None = None, bar_minutes: int |
             _check_side(defn[side], side, blocks, bar_minutes, uses_prev)
     if "long" not in defn and "short" not in defn:
         raise ValueError("a definition needs a long or a short side, each with its entry rule")
-    _check_exits(defn.get("exits") or {}, blocks, bar_minutes, uses_prev)
+    _check_exits(defn.get("exits") or {}, blocks, bar_minutes, uses_prev,
+                 sides=[side for side in ("long", "short") if side in defn])
     _check_costs(defn.get("costs") or {}, defn)
     warmup: dict = {None: 0}
     longest: dict = {}
@@ -444,7 +445,23 @@ def _reference(ref: str, where: str, blocks: dict) -> tuple:
     return ("block", bid, output or None)
 
 
-def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list) -> None:
+def _never_stop_side(level, side: str, blocks: dict) -> bool:
+    """Whether a level is on the target side of the decision close on every candle, so as a `side` position's stop
+    it would hold back every entry (Code Reviewer on a69618a): the close itself, the candle's high for a long or low
+    for a short, or this timeframe's channel upper for a long or lower for a short (it takes in the candle just
+    closed, ClosedChannel). Any other level can sit on either side, and an entry waits while it is wrong
+    (Rules._plan_exits)."""
+    if not isinstance(level, str):
+        return False
+    if level in FIELDS:
+        return level in ("close", "high" if side == "long" else "low")
+    bid, _, output = level.partition(".")
+    b = blocks.get(bid)
+    return (b is not None and b["kind"] == "donchian" and b["timeframe"] is None
+            and output == ("upper" if side == "long" else "lower"))
+
+
+def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list, sides=("long", "short")) -> None:
     if not isinstance(exits, dict):
         raise ValueError("exits is a table: time_stop, stop, trail, exit_at_level")
     unknown = set(exits) - {"time_stop", *LEVEL_EXITS}
@@ -471,6 +488,11 @@ def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list) -> Non
         if not isinstance(e.get("ratchet", True), bool):
             raise ValueError("exits.trail.ratchet is true or false")
         _check_operand(e["level"], f"exits.{kind}", blocks, uses_prev)
+        for side in sides:
+            if _never_stop_side(e["level"], side, blocks):
+                raise ValueError(f"exits.{kind}: {e['level']} is never {'below' if side == 'long' else 'above'} the "
+                                 f"close, so as the {side} side's stop it would hold back every {side} entry; a level "
+                                 "exit works only on the stop side")
 
 
 def _check_costs(costs: dict, defn: dict) -> None:

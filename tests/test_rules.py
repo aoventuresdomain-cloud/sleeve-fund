@@ -35,6 +35,14 @@ def _with(**changes):
                  "exit": {"setup": {"left": "rsi", "op": ">", "right": 70}, "trigger": {"left": "rsi", "op": "<",
                           "right": 60}, "expire_after": {"bars": 4, "timeframe": "15m"}}}), "entry rule"),
     (_with(blocks={"r": {"kind": "rsi", "timeframe": "5m"}}), "whole multiple"),
+    (_with(blocks={"rsi": {"kind": "rsi"}, "dc": {"kind": "donchian", "period": 20}},
+           exits={"stop": {"level": "dc.upper"}}),
+     "never below the close, so as the long side's stop"),
+    (_with(short={"entry": {"left": "close", "op": ">", "right": 0}}, exits={"trail": {"level": "low"}}),
+     "never above the close, so as the short side's stop"),
+    (_with(blocks={"rsi": {"kind": "rsi"}, "dc": {"kind": "donchian", "period": 20}},
+           short={"entry": {"left": "close", "op": ">", "right": 0}},
+           exits={"exit_at_level": {"level": "dc.lower"}}), "never above the close, so as the short side's stop"),
 ])
 def test_a_definition_is_refused_with_its_reason(defn, words):
     with pytest.raises(ValueError, match=words.replace("(", r"\(")):
