@@ -1901,11 +1901,12 @@ class LongFlatStrategy(Strategy):
     HOUR_NS = 3_600_000_000_000
     HELD_KEPT = 72  # hours of positions at settlement kept: a paper restart settles longer gaps at the tick
 
-    def _snap_settlements(self, event_ns: int, event_close: float | None = None) -> None:
+    def _snap_settlements(self, event_ns: int, event_close: float | None = None, qty: float | None = None) -> None:
         """Perp: before an event (a trade, a bar or a tick) changes anything, note the position and price held at
         each hour's start since the last event: nothing traded or filled in between, so they are what was held
         at that instant. The price is the last trade before the hour: a bar closing on the hour carries it as its
-        close; a trade at or after the hour leaves the one before it (so paper and backtest mark alike)."""
+        close; a trade at or after the hour leaves the one before it (so paper and backtest mark alike). A fill
+        passes `qty`, the position before it: the venue's position already includes the fill."""
         if not self._margin:
             return
         last, self._snap_ns = self._snap_ns, max(event_ns, self._snap_ns or 0)
@@ -1914,7 +1915,8 @@ class LongFlatStrategy(Strategy):
         hour = (last // self.HOUR_NS + 1) * self.HOUR_NS
         if hour > event_ns:
             return
-        qty, prev = self._net_position()[0], (self._last_close or self._price())
+        qty = self._net_position()[0] if qty is None else qty
+        prev = self._last_close or self._price()
         while hour <= event_ns:
             px = event_close if (hour == event_ns and event_close is not None) else prev
             self._held_at[hour] = (qty, px)
@@ -1923,9 +1925,10 @@ class LongFlatStrategy(Strategy):
             for k in sorted(self._held_at)[:-self.HELD_KEPT]:
                 del self._held_at[k]
 
-    def _settlements(self, terms, since: datetime, now: datetime) -> list[datetime]:
-        """The settlements in (since, now]: the venue's own times where its terms name a venue with settled
-        rates, else the profile's fixed hours (markets.settlement_times)."""
+    def _settlements(self, terms, since: datetime, now: datetime) -> tuple[list[datetime], object]:
+        """The settlements in (since, now], and the venue's settled rates they came from (None without): the
+        venue's own times where its terms name a venue with settled rates, else the profile's fixed hours
+        (markets.settlement_times)."""
         settled = None
         if terms.funding_venue is not None:
             from sleeve_fund import funding
@@ -1936,7 +1939,7 @@ class LongFlatStrategy(Strategy):
                 settled = self._settled
             else:
                 settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
-        return markets.settlement_times(since, now, terms.funding_hours, settled)
+        return markets.settlement_times(since, now, terms.funding_hours, settled), settled
 
     # Paper rescans this far back, so a settlement the venue publishes late, at a time the schedule didn't
     # foresee (a change of interval), is still charged when its record arrives.
@@ -1958,7 +1961,7 @@ class LongFlatStrategy(Strategy):
             return
         if int(now.timestamp()) // 3600 * 3600 <= since.timestamp():
             return  # no hour's start in (since, now]: settlements fall on the hour
-        times = self._settlements(terms, since, now)
+        times, settled = self._settlements(terms, since, now)
         held = [(ts, *self._held_at.get(int(ts.timestamp()) * 1_000_000_000, (self._net_position()[0], price)))
                 for ts in times]
         if not any(q for _, q, _ in held):
@@ -1968,7 +1971,7 @@ class LongFlatStrategy(Strategy):
             if qty == 0:
                 self._funding_since = ts
                 continue
-            rate = self._funding_rate(terms, ts, now)
+            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
             if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
                 return
             self._funding_since = ts
@@ -1995,7 +1998,7 @@ class LongFlatStrategy(Strategy):
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
 
-    def _funding_rate(self, terms, ts, now) -> float | None:
+    def _funding_rate(self, terms, ts, now, wait: timedelta | None = None) -> float | None:
         """The rate settled at `ts`: the venue's own where its terms name one (sleeve_fund.funding), else the
         terms' fixed rate. A settlement the venue's records lack is charged the fixed rate as a fallback, said
         once per run; paper first waits FUNDING_WAIT for the venue to publish it (None: not yet)."""
@@ -2015,7 +2018,7 @@ class LongFlatStrategy(Strategy):
                 rate = funding.rate_at(funding.fetch(terms.funding_venue, pair, when - funding.MATCH), when)
             except Exception as exc:  # noqa: BLE001 - the venue unreachable: wait, then the fallback
                 self.log.warning(f"funding rates unavailable: {exc!r}")
-            if rate is None and now - ts < self.FUNDING_WAIT:
+            if rate is None and now - ts < (wait or self.FUNDING_WAIT):
                 return None
         if rate is None:
             if not self._funding_fallback_said:
@@ -2496,6 +2499,14 @@ class LongFlatStrategy(Strategy):
         self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
+        if self._margin:  # a fill just after the hour, with no trade, bar or tick between: held before it
+            fill = float(event.last_qty) * (1 if event.is_buy else -1)
+            self._snap_settlements(event.ts_event, qty=self._net_position()[0] - fill)
+            if self._restore is None and str(event.client_order_id) != self._restore_id:
+                # Settle funding owed up to the fill before booking it, on the position held until then: a stop or a
+                # liquidation filled on a gap pays the settlements it was held through, and the insurance fund's
+                # share is then reckoned on that cash.
+                self._apply_funding(self._last_close or float(event.last_px))
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed

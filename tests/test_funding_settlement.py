@@ -10,14 +10,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sleeve_fund import funding, markets
-
-
-def utc(s: str) -> pd.Timestamp:
-    return pd.Timestamp(s, tz="UTC")
-
 from nautilus_trader.model import AggressorSide, Price, Quantity, QuoteTick, TradeId, TradeTick
 
+from sleeve_fund import funding, markets
 from sleeve_fund.instruments import BOOK_SHARE
 from sleeve_fund.paper.recorder import Recorder
 from sleeve_fund.research.replay import replay
@@ -26,6 +21,11 @@ from sleeve_fund.store import Store
 from sleeve_fund.strategies import REGISTRY
 from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
 from sleeve_fund.venues import binance_contract, venue
+
+
+def utc(s: str) -> pd.Timestamp:
+    return pd.Timestamp(s, tz="UTC")
+
 
 K = venue("kraken")
 INST = K.instrument("BTC", "USD", price_precision=1)
@@ -210,3 +210,50 @@ def test_settlement_times_follow_the_venues_records_and_carry_its_latest_interva
         t("2025-10-04 16:00")]  # (after, until]: a settlement already charged isn't charged again
     assert markets.settlement_times(t("2025-10-04 01:00"), t("2025-10-04 17:00"), (0, 8, 16), None) == [
         t("2025-10-04 08:00"), t("2025-10-04 16:00")]
+
+
+def test_a_foreseen_settlement_the_venue_skips_is_not_a_settlement_once_a_newer_record_lands():
+    """4-hourly records, then the venue goes back to 8-hourly: 04:00 was foreseen from the 4 h step, but once the
+    08:00 record is kept it is no settlement (CR minor 1: no phantom charge). A single record (a new listing)
+    falls back to the fixed hours after it."""
+    t = lambda s: utc(s).to_pydatetime()  # noqa: E731
+    four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
+    assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 05:00"), (0, 8, 16), four) == [
+        t("2025-10-05 04:00")]  # foreseen: paper waits for its record
+    eight = pd.concat([four, pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))])
+    assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 09:00"), (0, 8, 16), eight) == [
+        t("2025-10-05 08:00")]
+    one = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))
+    assert markets.settlement_times(t("2025-10-05 07:00"), t("2025-10-06 01:00"), (0, 8, 16), one) == [
+        t("2025-10-05 08:00"), t("2025-10-05 16:00"), t("2025-10-06 00:00")]
+
+
+def test_paper_waits_a_foreseen_settlement_until_a_newer_record_could_drop_it():
+    """CR minor 1: a time foreseen from the 4 h step waits one more interval than a published one, so the venue's
+    08:00 record (back to 8-hourly) lands and drops 04:00 before any baseline is charged for it."""
+    from datetime import timedelta
+
+    t = lambda s: utc(s).to_pydatetime()  # noqa: E731
+    four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
+    wait = timedelta(minutes=15)
+    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == timedelta(hours=4, minutes=15)
+    assert markets.settlement_wait(t("2025-10-05 00:00"), four, wait) == wait  # a recorded time: the usual wait
+    assert markets.settlement_wait(t("2025-10-05 04:00"), None, wait) == wait  # no records: the fixed hours'
+
+
+def test_a_fill_on_a_gap_pays_the_settlements_held_through_before_it(prices, instrument):
+    """CR minor 2: daily bars, a short stopped out by a gap at the next bar's open. The fill arrives before the bar
+    is handed to the strategy, so the position held at each settlement since is noted at the fill (as it was
+    before it), and funding for them is settled before the fill is booked: the short receives 08:00, 16:00 and
+    the 00:00 it was held to, and the trades' P&L still adds up to equity."""
+    from sleeve_fund.research.metrics import fills_to_rows, trades
+    from test_long_short import _gapped
+
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
+    res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    shut = pd.Timestamp(res.fills.sort_values("ts_last")["ts_last"].iloc[-1])
+    held_through = [shut - pd.Timedelta(hours=h) for h in (16, 8, 0)]
+    charged = {pd.Timestamp(f["ts"]): f["amount"] for f in res.funding}
+    assert all(ts in charged and charged[ts] > 0 for ts in held_through)  # a short receives at a positive rate
+    trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
+    assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)

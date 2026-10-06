@@ -128,15 +128,37 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
     first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
     out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
     out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
-    if until > last and len(idx) > 1:
-        step = (idx[-1] - idx[-2]).to_pytimedelta()
-        if step > timedelta(0):
+    if until > last:
+        step = latest_interval(settled)
+        if step is None:  # a single record (a new listing): the fixed hours after it
+            out += funding_times(max(after, last), until, hours)
+        else:
             t = last + step
             while t <= until:
                 if t > after:
                     out.append(t)
                 t += step
     return sorted(set(out))
+
+
+def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
+    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
+    `wait`, plus one of the venue's latest intervals for a settlement foreseen past its newest record. If the venue
+    has lengthened its interval, the newer record that skips the foreseen time lands within that, and the time is
+    then no settlement at all (settlement_times), so it is never charged (no phantom baseline charge)."""
+    step = latest_interval(settled)
+    if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
+        return wait
+    return wait + step
+
+
+def latest_interval(settled) -> timedelta | None:
+    """The venue's settlement interval as its two newest records show it, or None with fewer than two."""
+    if settled is None or len(settled) < 2:
+        return None
+    idx = settled.index.round("min")
+    step = (idx[-1] - idx[-2]).to_pytimedelta()
+    return step if step > timedelta(0) else None
 
 
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
