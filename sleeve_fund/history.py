@@ -586,34 +586,50 @@ def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
     """Each funding hole goes to the alerts inbox once, ever (QA P1-O11, P1-O16): the holes already raised are
     kept beside the rates, so a second new hole the same day still goes in, a restart repeats nothing, and holes
     stored before this check existed are raised on its first pass. Old holes never clear, so the daily cap of
-    _alert would either repeat them or hold new ones back. The new holes are chosen under the store's lock and sent
-    outside it, so a slow database never holds up the store's writes (QA P1-O21)."""
+    _alert would either repeat them or hold new ones back. The file's own lock is held from reading it to saving
+    it, so two refreshes of one instrument (a manual one while the hub runs) send a hole once (Code Reviewer); the
+    store's lock is taken only to save, so a slow database never holds up the store's writes (QA P1-O21)."""
     from sleeve_fund import funding
 
     path = funding._path(venue, pair, root).with_name("funding.alerted.json")
-    with _writing(path.parent):
+    with _alerting(path):
         raised, problem = _raised(path)
-    if problem:  # an incident in the alerts inbox, once a day, outside the lock (QA P1-O20, O21)
-        _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", problem)
-    new = [h for h in holes if h not in raised]
-    if not new:
-        return
-    try:
-        from sleeve_fund.store import Store
+        if problem:  # an incident in the alerts inbox, once a day (QA P1-O20)
+            _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", problem)
+        new = [h for h in holes if h not in raised]
+        if new:
+            try:
+                from sleeve_fund.store import Store
 
-        Store().event(None, "warning", "funding_gap", f"{venue} {pair}: funding: " + "; ".join(new))
-    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line still says it; retried next pass
-        print(f"could not raise the funding_gap alert: {exc!r}")
-        return
-    with _writing(path.parent):
-        tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+                Store().event(None, "warning", "funding_gap", f"{venue} {pair}: funding: " + "; ".join(new))
+            except Exception as exc:  # noqa: BLE001 - no database (locally): the log line says it; retried next pass
+                print(f"could not raise the funding_gap alert: {exc!r}")
+                return
+        elif not problem:
+            return
+        # Saved with the new holes, or rewritten clean when it couldn't be read, so its incident isn't raised daily.
+        with _writing(path.parent):
+            tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text(json.dumps(sorted(raised | set(new))))
+                _durable_replace(tmp, path)
+            except OSError as exc:  # sent, but not kept: not sent again by this process; a restart sends them again
+                _sent_holes.setdefault(str(path), set()).update(new)
+                tmp.unlink(missing_ok=True)
+                print(f"{venue} {pair}: could not keep the funding holes already raised in {path}: {exc!r}")
+
+
+@contextlib.contextmanager
+def _alerting(path: Path):
+    """One sender of an instrument's funding holes at a time, across threads and processes: a lock of its own beside
+    the alerted file, apart from the store's write lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name("funding.alerted.lock"), "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
         try:
-            tmp.write_text(json.dumps(sorted(_raised(path)[0] | set(new))))
-            _durable_replace(tmp, path)
-        except OSError as exc:  # sent, but not kept: not sent again by this process; a restart sends them once more
-            _sent_holes.setdefault(str(path), set()).update(new)
-            tmp.unlink(missing_ok=True)
-            print(f"{venue} {pair}: could not keep the funding holes already raised in {path}: {exc!r}")
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 _sent_holes: dict[str, set[str]] = {}  # alerted file -> holes this process sent but couldn't keep in it

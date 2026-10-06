@@ -508,3 +508,39 @@ def test_the_alert_is_sent_outside_the_stores_lock(tmp_path, monkeypatch):
     history._warned.clear()
     _refresh_funding(profile, "BTC/USDT", tmp_path, None)  # the incident and the hole sent again, outside it too
     assert len(sent) == 3 and held == [False, False, False]
+
+
+def test_two_refreshes_racing_send_a_new_hole_once(tmp_path, monkeypatch):
+    """Code Reviewer on #163: a manual refresh while the hub runs; both see the same new hole, one event results."""
+    import threading
+
+    from sleeve_fund import history
+
+    sent = _inbox(monkeypatch, check=lambda: time.sleep(0.2))  # a slow database widens the race
+    go = threading.Barrier(2)
+
+    def refresh():
+        go.wait()
+        history._alert_funding_holes("BINANCE", "BTC/USDT", tmp_path, ["missed between 2026-10-01 16:00 to 2026-10-02 08:00"])
+    threads = [threading.Thread(target=refresh) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [k for _, k, _ in sent] == ["funding_gap"]
+
+
+def test_an_unreadable_alerted_file_is_rewritten_so_its_incident_is_raised_once(tmp_path, monkeypatch):
+    """Code Reviewer on #163: with nothing new to send, a corrupt file is still rewritten clean."""
+    from sleeve_fund import history
+
+    profile, path = _one_hole(tmp_path, monkeypatch)
+    sent = _inbox(monkeypatch)
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    kept = json.loads(path.read_text())
+    path.write_text(json.dumps(kept)[:-3])  # truncated
+    for _ in range(3):
+        history._warned.clear()  # a day apart
+        _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [k for _, k, _ in sent] == ["funding_gap", "funding_alerted_unreadable", "funding_gap"]
+    assert json.loads(path.read_text()) == kept
