@@ -458,6 +458,9 @@ TRIAL_STATUSES = ("ok", "failed")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
+# The event a PM's "Reset after liquidation" journals (item RAL): the one thing that ends a liquidation halt.
+# The engine (#155) and the dashboard both read it from here.
+LIQUIDATION_RESET = "liquidation_reset"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
@@ -803,6 +806,14 @@ class Store:
             q = q.where(orders_t.c.status.in_(statuses))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
+
+    def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
+        """A sleeve's newest order with one of these intents, or None."""
+        q = (select(orders_t).where(orders_t.c.sleeve == sleeve, orders_t.c.intent.in_(intents))
+             .order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)

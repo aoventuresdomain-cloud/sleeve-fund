@@ -202,3 +202,18 @@ def test_a_status_that_records_no_result_is_a_failure(tmp_path):
     (tmp_path / "status.json").write_text('{"ts": "2026-10-04T02:00:00Z", "ok": true, "message": "ok"}')
     check = backups.latest(tmp_path, utcnow())["check"]
     assert check["ok"] is True and check["checked"].isoformat() == "2026-10-04T02:00:00+00:00"
+
+
+def test_the_outside_alert_names_no_venue():
+    """P1-U20: the message to the PM's phone reads like the Alerts page: no venue names, instrument ids
+    without their venue suffix, account and key names left alone."""
+    text = message([
+        {"level": "error", "sleeve": "btc-rsi", "message": "BTCUSDT-PERP.BINANCE is not listed on the venue"},
+        {"level": "warning", "sleeve": "btc-rsi", "message": "Demo mirror couldn't copy the sell of 0.05 to the demo "
+                                                              "account: Bybit Demo Trading /v5/order/create: no funds (110007)."},
+        {"level": "warning", "sleeve": None, "message": "kraken-live: KRAKEN_API_KEY missing"},
+    ])
+    assert "BINANCE" not in text and "Bybit" not in text
+    assert "btc-rsi: BTCUSDT-PERP is not listed on the venue" in text
+    assert "to the demo account: refused (/v5/order/create): no funds (110007)." in text
+    assert "kraken-live: KRAKEN_API_KEY missing" in text
