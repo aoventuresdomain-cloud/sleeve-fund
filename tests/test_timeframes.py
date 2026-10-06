@@ -220,3 +220,30 @@ def test_a_strategy_the_store_cant_warm_up_is_refused_when_created(client, tmp_p
     history.HistoryStore().append(_venue_name(None), "BTC/USD", pd.DataFrame(
         {"open": c1, "high": c1, "low": c1, "close": c1, "volume": 1.0}, index=idx), cursor="c")
     assert post().headers["location"] == "/sleeves/rsi-4h"
+
+
+def test_a_hole_inside_a_slower_candle_gives_the_same_candle_and_decisions_in_a_backtest_and_hub_paper(monkeypatch):
+    """Board rule 5a's parity check: minutes neither the hub nor the store has, inside a 15-minute trend candle
+    under 1-minute decisions. Hub-fed paper (the hub client's bars, built into slower candles in the strategy)
+    and the backtest on the store's minutes build the same slower candles from the minutes present and make the
+    same trades."""
+    from test_hub_path_parity import START, WAVE, _assert_same, backtest, hub_paper, per_order
+
+    secs = np.arange(4 * 60 * 60)
+    prices = WAVE(secs) * (1 + 0.004 * np.sin(secs / 90))
+    hole = set(range(93 * 60, 99 * 60))  # 01:33 to 01:39, inside the 01:30-01:45 trend candle
+    prices[sorted(hole)] = np.nan
+    params = {"rsi_period": 5, "trend_sma": 3, "trend_minutes": 15, "time_stop_bars": 20}
+    candles, emit = [], SlowerCandles._emit
+    monkeypatch.setattr(SlowerCandles, "_emit", lambda self, c: (candles.append(c), emit(self, c))[1])
+
+    o, f, dec, _ = hub_paper(prices, params, strategy="rsi_cross", gone=hole)
+    on_hub, candles[:] = list(candles), []
+    bo, bf = backtest(prices, params, strategy="rsi_cross")
+    hub, bt = per_order(o, f), per_order(bo, bf)
+    price = lambda cs: [(c.end, c.open, c.high, c.low, c.close) for c in cs]  # noqa: E731 - volumes are scaled apart
+    assert price(on_hub) == price(candles) and len(candles) == 4 * 4  # every 15-minute candle of the four hours
+    holed = next(c for c in on_hub if c.end == START + 105 * M)  # 01:30 to 01:45
+    assert holed.volume == 9 * 60.0  # built from the nine minutes present, nothing made up for the six missing
+    assert len(hub) >= 6 and dec.late == 0
+    _assert_same(hub, bt)
