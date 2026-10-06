@@ -255,3 +255,18 @@ def test_the_clock_offset_is_read_from_a_time_server():
     threading.Thread(target=answer, daemon=True).start()
     assert 450 < clock.offset_ms("127.0.0.1", srv.getsockname()[1]) < 550
     srv.close()
+
+
+def test_the_outside_alert_names_no_venue():
+    """P1-U20: the message to the PM's phone reads like the Alerts page: no venue names, instrument ids
+    without their venue suffix, account and key names left alone."""
+    text = message([
+        {"level": "error", "sleeve": "btc-rsi", "message": "BTCUSDT-PERP.BINANCE is not listed on the venue"},
+        {"level": "warning", "sleeve": "btc-rsi", "message": "Demo mirror couldn't copy the sell of 0.05 to the demo "
+                                                              "account: Bybit Demo Trading /v5/order/create: no funds (110007)."},
+        {"level": "warning", "sleeve": None, "message": "kraken-live: KRAKEN_API_KEY missing"},
+    ])
+    assert "BINANCE" not in text and "Bybit" not in text
+    assert "btc-rsi: BTCUSDT-PERP is not listed on the venue" in text
+    assert "to the demo account: refused (/v5/order/create): no funds (110007)." in text
+    assert "kraken-live: KRAKEN_API_KEY missing" in text

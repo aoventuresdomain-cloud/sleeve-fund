@@ -174,7 +174,7 @@
 
 {% if earlier %}
 <details class="panel archived" id="archived">
-  <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away when a new book began on {{ book_start.strftime('%d %b %Y') }}; kept with their history, and left out of this book's figures</span></summary>
+  <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away {% if book_start %}when a new book began on {{ book_start.strftime('%d %b %Y') }}{% if earlier_resets %} or by a strategy reset{% endif %}{% else %}by a strategy reset{% endif %}; kept with their history, and left out of this book's figures</span></summary>
   <ul class="feed" style="margin-top:10px">{% for s in earlier %}
     <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}
   </ul>
