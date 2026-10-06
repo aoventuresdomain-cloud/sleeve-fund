@@ -6,6 +6,7 @@ import json
 import math
 
 
+from sleeve_fund.research.guardrails import MIN_OOS_TRADES, nearby_settings
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -16,7 +17,6 @@ from sleeve_fund.research.metrics import (
 )
 from sleeve_fund.research.study import StudyResult
 
-MIN_ROUND_TRIPS = 10
 ROBUST_SHARE = 0.6
 # G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
 # than the best of the variants tried would by luck.
@@ -26,6 +26,7 @@ JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
+NEARBY_CHECK = "Holds at nearby settings"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge")
 
 
@@ -69,6 +70,23 @@ def _row(label: str, s: dict, b: dict) -> str:
     )
 
 
+def _breakeven_words(r: StudyResult) -> str:
+    from sleeve_fund.research.study import breakeven_fee
+
+    return breakeven_fee(r.cost_ladder)[1] if r.cost_ladder else "not tested: no cost ladder was run"
+
+
+def _breakeven_cell(row) -> str:
+    """A grid point's break-even fee per side, or why there is none, in a table cell."""
+    fee = row.get("breakeven_fee")
+    if fee is not None and not (isinstance(fee, float) and math.isnan(fee)):
+        return f"{fee:.3%}"
+    words = row.get("breakeven")
+    if not isinstance(words, str):
+        return "–"
+    return "loses at no fee" if words.startswith("loses") else "above the ladder" if words.startswith("still") else "–"
+
+
 def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
     oos = summary(r.oos_returns)
     bench = summary(r.oos_benchmark_returns)
@@ -102,6 +120,11 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             "PASS" if share_beating >= ROBUST_SHARE else "FAIL",
             f"{share_beating:.0%} of {len(r.sensitivity)} grid points beat the benchmark Sharpe (bar: {ROBUST_SHARE:.0%})",
         ),
+        # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
+        # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
+        (NEARBY_CHECK, *nearby_settings(r.sensitivity, r.default_params,
+                                        [c for c in r.spec.param_grid if c in r.sensitivity.columns])),
+        ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         (
             "Holdout not used for tuning",
             "PASS",
@@ -116,8 +139,8 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
             # A Sharpe built on a handful of trades is luck, not evidence, so this one fails G1. It counts
             # the trades the out-of-sample Sharpe stands on, not the in-sample ones.
             "Enough out-of-sample trades to judge",
-            "PASS" if trips >= MIN_ROUND_TRIPS else "FAIL",
-            f"{trips} closed in the {len(r.folds)} walk-forward test windows (bar: {MIN_ROUND_TRIPS}); "
+            "PASS" if trips >= MIN_OOS_TRADES else "FAIL",
+            f"{trips} closed in the {len(r.folds)} walk-forward test windows (bar: {MIN_OOS_TRADES}); "
             f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
     ]
@@ -313,12 +336,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("## Parameter sensitivity (full research period, in-sample)")
     out.append("")
     cols = [c for c in r.sensitivity.columns if c in spec.param_grid]
-    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips |")
-    out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- |")
+    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee |")
+    out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- | --- |")
     for _, row in r.sensitivity.iterrows():
         out.append(
             "| " + " | ".join(_param(row[c]) for c in cols)
-            + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} |"
+            + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} "
+            f"| {_breakeven_cell(row)} |"
         )
     out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}.")
     out.append("")
