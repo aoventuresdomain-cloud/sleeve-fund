@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
-from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow
+from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
@@ -175,35 +175,6 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
         elif before == ZERO or (before > ZERO) != (qty > ZERO):
             opened = f  # opened from flat, or went through flat to the other side
     return opened
-
-
-def liquidated_since_reset(store: Store, sleeve: str, halt_words: str) -> bool:
-    """Whether the strategy's position margin was lost (a liquidation event or order, or a halt whose message
-    starts with halt_words) with no reset after liquidation since. Read from the journal, not the latest halt:
-    a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). The halt words
-    match in any case and spacing (P1-U28a)."""
-    reset = store.last_event(sleeve, (LIQUIDATION_RESET,))
-    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
-    words = _fold(halt_words)
-    if any(e["kind"] == "liquidation" or _fold(e["message"]).startswith(words)
-           for e in store.sleeve_events_since(sleeve, ("liquidation", "risk_halt"), after_id=since_id)):
-        return True
-    order = store.last_order(sleeve, ("liquidation",))
-    if order is None:
-        return False
-    if since_ts is None or order["ts"] > since_ts:
-        return True
-    if order["ts"] < since_ts:
-        return False
-    # A liquidation order in the same instant as the reset: orders and events share no id, so the liquidation
-    # wins the tie (P1-U28b) unless the reset answered a liquidation event of that same instant.
-    answered = store.last_event(sleeve, ("liquidation",))
-    return not (answered is not None and answered["id"] < since_id and answered["ts"] == order["ts"])
-
-
-def _fold(text: str) -> str:
-    """Text for a loose match: one plain space between words, in any case (a no-break space counts as one)."""
-    return " ".join((text or "").split()).casefold()
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:

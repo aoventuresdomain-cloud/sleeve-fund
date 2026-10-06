@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import markets
+from sleeve_fund import liquidation, markets
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -56,11 +56,6 @@ from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
-# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
-LIQUIDATED_HALT = "Position margin lost (liquidated)"
-# Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
-LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
-                      "again only after you use Reset after liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -627,7 +622,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                  "drop it; stop it once it is flat")
             if command in ("start", "resume") and _liquidated(name):
                 # The page says so too; a stale page or a direct post must not restart it (QA P1-U25, U31).
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             if command == "flatten" and then == "stop":
                 then_stop = reason
             if command in ("start", "stop"):
@@ -680,7 +675,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
         strategy's position margin was lost with no Reset after liquidation since. The routes and the page
         both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
-        return trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
+        return liquidation.liquidated_since_reset(st(), name)
 
     def _flatten_waits(name: str) -> bool:
         """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
@@ -698,7 +693,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
             if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None

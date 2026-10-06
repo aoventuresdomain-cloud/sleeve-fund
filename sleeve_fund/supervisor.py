@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sleeve_fund import accounts
+from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
@@ -125,6 +125,11 @@ class Supervisor:
         the paper margin terms) before it trades again."""
         for req in self.store.pending_resets():
             name = req["sleeve"]
+            if liquidation.liquidated_since_reset(self.store, name):
+                # Asked for before the liquidation landed: carried out (or flattened for) now, it would put the
+                # liquidation away unanswered (QA P1-U33). It waits for Reset after liquidation instead.
+                self.store.refuse_reset(req, liquidation.REFUSAL)
+                continue
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
             if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:

@@ -271,6 +271,34 @@ def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_with
     assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False
 
 
+def test_a_reset_asked_for_before_a_liquidation_is_not_carried_out(store):
+    """QA P1-U33: a reset already waiting when the liquidation lands would put it away unanswered. The supervisor
+    closes it unrun, says why, and leaves the strategy for Reset after liquidation; one asked after that runs."""
+    from sleeve_fund import liquidation
+    from sleeve_fund.store import LIQUIDATION_RESET
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert not store.pending_commands("bn-ls")  # not flattened for the reset, nor started to
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    assert store.decisions("bn-ls")[0]["reason"] == f"Not reset: {liquidation.REFUSAL}"
+    assert store.last_event("bn-ls", ("reset_refused",))["message"].endswith("asks for an incident note")
+    # After Reset after liquidation, a new reset is carried out as usual.
+    store.event("bn-ls", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    store.record_fill("bn-ls", side="SELL", qty=0.076, price=80_000.0, fee=3.0, order_id="o2", trade_id="t2")
+    store.request_reset("bn-ls", "Again")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and len(store.reset_runs()) == 1
+
+
 @pytest.mark.sanity
 def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_capital(store):
     """PM, 5 Oct 2026. Nothing is deleted: the run so far moves to its own archived name under Previous book."""

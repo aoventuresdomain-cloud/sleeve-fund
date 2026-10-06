@@ -1133,7 +1133,16 @@ class Store:
     def reset_runs(self) -> dict[str, datetime]:
         """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's."""
         with self.engine.connect() as c:
-            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
+            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None),
+                                                                                         resets_t.c.run != ""))}
+
+    def refuse_reset(self, request: dict, why: str) -> None:
+        """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
+        with self.engine.begin() as c:
+            c.execute(update(resets_t).where(resets_t.c.id == request["id"], resets_t.c.done_at.is_(None))
+                      .values(done_at=utcnow(), run=""))
+        self.decide("system", "reset_refused", f"Not reset: {why}", request["sleeve"])
+        self.event(request["sleeve"], "warning", "reset_refused", f"Reset not carried out: {why}")
 
     def split_run(self, request: dict, now: datetime | None = None) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
