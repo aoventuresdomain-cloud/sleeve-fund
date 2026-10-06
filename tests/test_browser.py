@@ -479,3 +479,21 @@ def test_the_warm_up_shading_follows_the_models_own_lines_not_ones_the_pm_adds(s
     page.wait_for_selector(".pc-legend span", timeout=5000)
     assert page.get_attribute(".pc-canvas", "data-warm") == "10"
     ctx.close()
+
+
+def test_decisions_that_do_not_line_up_with_this_candle_size_say_so(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    fixture["decisions"] = [{"kind": "missed", "side": "buy", "t": 0, "signal_t": fixture["candles"][5]["time"] + 14400,
+                             "price": None, "reason": "Halted", "code": "blocked"}]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert "show only on that interval" in page.inner_text(".pc-strat-note")
+    assert page.get_attribute(".pc-canvas", "data-decisions") == '{"fills":0,"missed":0}'
+    ctx.close()

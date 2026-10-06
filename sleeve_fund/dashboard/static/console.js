@@ -369,7 +369,7 @@ window.Console = (() => {
     const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
     // Candles built from the sleeve's own marks have no range inside the bar, so they draw as a line instead.
     const area = chart.addAreaSeries({lineColor: accent, topColor: rgba(accent, 0.22), bottomColor: rgba(accent, 0), lineWidth: 2, visible: false});
-    // Candles the model can't trade on yet (its indicators haven't settled) are shaded, drawn from the recorded points.
+    // Candles before the model's indicators have settled are shaded, drawn from the recorded points; trades there are marked unsettled.
     const warmBand = chart.addAreaSeries({priceScaleId: "warm", lineColor: rgba(css("--muted"), 0), lineWidth: 1, topColor: rgba(css("--muted"), 0.16),
       bottomColor: rgba(css("--muted"), 0.16), lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
       autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
@@ -666,6 +666,12 @@ window.Console = (() => {
         && (r.kind === "missed" || (r.kind === "fill" && Number.isFinite(r.t) && Number.isFinite(r.price) && r.t <= now)));
       decide.drawn = {fills: decide.rows.filter((r) => r.kind === "fill").length, missed: decide.rows.filter((r) => r.kind === "missed").length};
       $(".pc-canvas").dataset.decisions = JSON.stringify(decide.drawn);
+      // Recorded on the strategy's own candles: on another size they don't line up, so say why none show.
+      if (d.decisions && d.decisions.length && !decide.rows.length) {
+        const note = $(".pc-strat-note");
+        note.textContent = `${note.textContent} Entries and missed entries were recorded on the strategy's own candles, so they show only on that interval.`.trim();
+        note.hidden = false;
+      }
       if (decide.redraw) decide.redraw();
     };
 
