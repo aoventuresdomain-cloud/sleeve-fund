@@ -25,6 +25,9 @@ INDICATORS = Path(__file__).resolve().parent.parent / "strategies" / "indicators
 # Trials imported from the idea counter predate the indicator library.
 LEGACY_CODE = "pre-v2"
 
+# The start of a paper strategy's seen data: the beginning of time, as it was chosen with all of history in view.
+OPEN_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 def content_hash(obj) -> str:
     """A stable SHA-256 of any JSON-able value: the same content gives the same hash whatever its key order."""
@@ -137,9 +140,10 @@ def record_model_run(store: Store, *, strategy: str, params: dict, dataset: str,
     re-set (QA P1-T1). Each is a variant tried, so the deflated Sharpe's N counts it. The whole run reads every
     bar it was given, so it is in-sample."""
     if source == "strategy" and data_end is None:
-        # Dated to the moment it was chosen (Advisor, 6 Oct 2026, QA P1-T4): what it saw then. Watching it trade
+        # Chosen having seen everything up to the moment it was made or edited (Advisor, 6 Oct 2026, QA P1-T4 and
+        # P1-T7): it read from the open start to then, so no holdout before that is unseen. Watching it trade
         # afterwards reads nothing new into the choice; each edit is a new row, dated again.
-        data_start = data_end = datetime.now(timezone.utc)
+        data_start, data_end = OPEN_START, datetime.now(timezone.utc)
     try:
         from sleeve_fund.research.run import spec_of
 

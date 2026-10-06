@@ -289,7 +289,7 @@ def test_g1_hurdle_rises_with_the_variants_sharpe_spread(tmp_path):
         r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), inst, dataset="syn", ledger=ledger, synthetic=True,
                       holdout_days=0, train_days=365, test_days=180, register=reg)
         hurdles.append(next(c for c in g1_checks(r, ledger, reg) if c[0] == SHARPE_CHECK)[2])
-    assert hurdles[0] != hurdles[1], hurdles[0]  # today identical: the trial spread never reaches G1
+    assert hurdles[0] != hurdles[1], hurdles[0]  # the variants' spread reaches the hurdle (QA P1-T5)
 
 
 def test_a_data_file_holdout_in_the_old_counter_is_locked_by_its_underlying():
@@ -298,3 +298,44 @@ def test_a_data_file_holdout_in_the_old_counter_is_locked_by_its_underlying():
 
     assert underlying_of_dataset("XBTUSD_1440") == "BTC" and underlying_of_dataset("ETHUSD") == "ETH"
     assert underlying_of_dataset("kraken-btcusd-store-60m") == "BTC" and underlying_of_dataset("synthetic") is None
+
+
+def _paper_store(tmp_path):
+    return Store(f"sqlite:///{tmp_path / 'j.db'}")
+
+
+def test_a_holdout_before_a_paper_strategy_was_chosen_is_refused(tmp_path):
+    """QA P1-T7 (QA Tester 2's test, its strict xfail removed): the strategy was chosen having seen everything up to
+    its creation (Advisor, 14:47), so a holdout over the year before it is seen data."""
+    import pandas as pd
+
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.trials import legacy_idea_hash, record_model_run, run_setup
+
+    store = _paper_store(tmp_path)
+    record_model_run(store, strategy="trend_filter", params={"a": 1}, dataset="d", source="strategy",
+                     setup=run_setup(risk_profile="balanced", fee=0.001))
+    now = pd.Timestamp.now(tz="UTC")
+    assert HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", now - pd.Timedelta(days=365),
+                                       now - pd.Timedelta(days=1)) != ""
+
+
+def test_each_paper_edit_moves_the_holdout_start_forward(tmp_path):
+    """QA Tester 2's test. Advisor 14:47: each edit is dated again, so a holdout must start after the latest edit."""
+    import time
+
+    import pandas as pd
+
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.trials import legacy_idea_hash, record_model_run, run_setup
+
+    store = _paper_store(tmp_path)
+    kw = dict(strategy="trend_filter", dataset="d", source="strategy", setup=run_setup(risk_profile="balanced", fee=0.001))
+    record_model_run(store, params={"a": 1}, **kw)
+    first = pd.Timestamp.now(tz="UTC")
+    time.sleep(0.05)
+    record_model_run(store, params={"a": 2}, **kw)  # an edit
+    rows = store.trials(legacy_idea_hash("trend_filter"))
+    assert pd.Timestamp(rows[-1]["data_end"]) > pd.Timestamp(rows[0]["data_end"])
+    # A holdout starting between the two edits now overlaps the second edit's seen data.
+    assert HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", first, first + pd.Timedelta(days=60)) != ""
