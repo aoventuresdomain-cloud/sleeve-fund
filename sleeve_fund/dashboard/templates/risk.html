@@ -100,13 +100,16 @@
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}gross of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
+  {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
+  <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ risk.margin|money }}</div></div>
+  <div{% if risk.unbounded %} title="{{ risk.unbounded|join(', ') }}: no stop, so unbounded"{% else %} title="Money lost if every stop is hit"{% endif %}><div class="k">Open risk</div><div class="v{{ ' warn' if risk.unbounded }}">{{ risk.open_risk|money }}{{ '+' if risk.unbounded }}</div></div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
 
 <section class="panel flush" style="margin:14px 0" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>
   <table class="responsive" data-hide-md="2 5 7">
-    <thead><tr><th>Strategy</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop-loss</th></tr></thead>
+    <thead><tr><th>Strategy</th><th>Profile</th><th>Drawdown</th><th>Today's loss</th><th>Position cap</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop-loss</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
@@ -116,6 +119,10 @@
       <td data-m="hide">{{ usage(r.cap_used) }} <span class="muted">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
       <td data-m="hide">{% if r.has_stop %}{{ stop_words(s.params) }}{% else %}<span class="warn">None</span>{% endif %}</td>
+      {% set pos = r.position %}
+      <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="num" data-m="hide">{% if not pos %}<span class="faint">–</span>{% elif not pos.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ pos.risk_to_stop|money }}{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table>
 </section>

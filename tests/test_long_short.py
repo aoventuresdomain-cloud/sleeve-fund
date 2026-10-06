@@ -327,6 +327,11 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
     assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
     assert "Side and leverage" not in html
+    # QA U3: Risk & health and Trades give the same margin and Risk to stop as Portfolio (1,515 put up; the
+    # stop at 61,812 is 1,672 above the 60,140 mark, so 83.60 at risk on 0.05).
+    for path in ("/risk", "/trades"):
+        other = c.get(path, auth=AUTH).text
+        assert ">Margin used</div><div class=\"v\">1,515.00" in other and ">83.60</td>" in other, path
     # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
     assert "above entry cap because the price moved" in c.get("/sleeves/pp-ls", auth=AUTH).text
