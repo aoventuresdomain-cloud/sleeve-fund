@@ -843,6 +843,15 @@ class Store:
                 values["intent"] = intent
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
+    def merge_order_signal(self, order_id: str, values: dict) -> None:
+        """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
+        are ignored, as in update_order."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id)).first()
+            if row is not None:
+                c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                          .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))
+
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))

@@ -489,6 +489,10 @@ class LongFlatStrategy(Strategy):
         # the restore filled at today's price, not the entry, and funding is the journal's alone.
         self._restore: dict | None = None
         self._restore_id: str | None = None
+        # The open perp position's liquidation price, worked out once at each entry or add from the position's own
+        # average entry and posted margin, journaled on that order and read back after a restart: never from the
+        # restore's price (Advisor 22:36, QA P1-L22).
+        self._liq_px: float | None = None
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
@@ -933,6 +937,11 @@ class LongFlatStrategy(Strategy):
         entry = next((o for o in store.orders(name, limit=200)
                       if o.get("intent") == "entry" and o.get("side") == opened), None)
         self._plan_entry, self._replan_pending = entry, None
+        if self._margin:  # the liquidation price set when it was entered or last added to (_set_liq), if journaled
+            self._liq_px = next((o["signal"]["position_liquidation_px"] for o in store.orders(name, limit=200)
+                                 if entry is not None and o["ts"] >= entry["ts"] and o.get("side") == opened
+                                 and o.get("intent") in OPENING_INTENTS
+                                 and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
         if entry is None:
             if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
                 self._stop_frac, self._tp_frac, self._stop_basis = (self._plan_exits(self._entry_px, self._entry_side or 1)
@@ -1668,20 +1677,24 @@ class LongFlatStrategy(Strategy):
                       for b in bars if int(b.ts_event) > after)
         if rows:
             self._replayed_to = max(self._replayed_to, rows[-1][0])
-        book = float(target_fill_px(target, side > 0, self._half_spread())) if target is not None else None
+        # The half spread a backtest charges (the run's measured or assumed one), not the quotes at return: replay ==
+        # backtest (Advisor 22:36). The spread at return goes in the journal beside it, as a diagnostic only.
+        spread = self._cfg.assumed_half_spread
+        book = float(target_fill_px(target, side > 0, spread)) if target is not None else None
         hit = replay_missed(rows, side, venue, guards, target, book)
         if hit is None:
             return False
         intent, px, level, at, worst = hit
+        gapped = px != level  # the minute opened past the level (replay_missed books the open), not a touch
         if intent == "stop_loss":
             # Advisor 20:42 (NA-1 replay slippage): a replayed stop is a modelled fill, as the backtest's: its level
             # (or the price that gapped through it) less the taker's slippage, max(half spread, 0.05%), adverse.
-            px = float(Decimal(str(px)) * (1 - side * taker_slippage(self._half_spread())))
+            px = float(Decimal(str(px)) * (1 - side * taker_slippage(spread)))
         now = self._price()
         words = {"stop_loss": "stop", "take_profit": "target", "liquidation": "liquidation price",
                  "liquidation_cut": "cut before liquidation", "risk_halt": "drawdown halt's level",
                  "risk_pause": "daily-loss pause's level"}[intent]
-        gap = " (it opened past it)" if px != level and intent != "take_profit" else ""
+        gap = " (it opened past it)" if gapped and intent != "take_profit" else ""
         filled = {"take_profit": "as a market order on touch would have, less the taker's slippage",
                   "stop_loss": "as the venue's stop would have filled it, less the taker's slippage"}.get(
                       intent, "as the venue would have filled it")
@@ -1691,7 +1704,8 @@ class LongFlatStrategy(Strategy):
         self.runtime.store.event(self.runtime.name, "warning", "outage_exit", reason)
         # The booked price is the replay's model of the venue, not a venue fill: fills-against-model leaves it out.
         self._outage_book = {"book_px": round(px, 8), "price_source": "replay_model", "market_on_return": now,
-                             "outage_level": round(level, 8), "outage_while": while_, "breached_at": _hhmm(at)}
+                             "outage_level": round(level, 8), "outage_while": while_, "breached_at": _hhmm(at),
+                             "half_spread_booked": spread, "half_spread_live": self._half_spread()}
         if intent in EXIT_LEGS or intent == "liquidation":
             # The venue's order closed the position in that minute: no settlement after it is the position's,
             # though the order goes now (QA P1-L19).
@@ -2321,9 +2335,26 @@ class LongFlatStrategy(Strategy):
 
     def _liq(self, cash: float, qty: float) -> float | None:
         """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
-        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin)."""
+        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin): the one set when
+        it was entered (_set_liq), else worked out from its own average entry."""
+        if qty and self._liq_px is not None:
+            return self._liq_px
+        return self._liq_from_entry(cash, qty)
+
+    def _liq_from_entry(self, cash: float, qty: float) -> float | None:
+        """From the position's average entry as the strategy (and the journal) keep it, never the simulated
+        venue's, which after a restart is the restore's price (QA P1-L22)."""
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-        return markets.isolated_liquidation(cash, qty, self._net_position()[1], lev, self._cfg.perp.maintenance_margin)
+        entry = self._entry_px if self._entry_px else self._net_position()[1]
+        return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
+
+    def _set_liq(self, order_id: str) -> None:
+        """After a perp entry or add fills: the position's liquidation price, journaled on that order beside the
+        decision's own estimate from the close (liquidation_px), which stays as it was decided."""
+        _, cash, qty, _ = self._mark()
+        self._liq_px = self._liq_from_entry(cash, qty) if qty else None
+        if self._liq_px is not None and self.runtime is not None and not self._backtest:
+            self.runtime.store.merge_order_signal(order_id, {"position_liquidation_px": round(self._liq_px, 8)})
 
     def _net_position(self) -> tuple[float, float]:
         """Perp: the signed position at the simulated venue and its average entry there."""
@@ -3069,6 +3100,8 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
+            if opening:
+                self._set_liq(coid)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
@@ -3142,7 +3175,7 @@ class LongFlatStrategy(Strategy):
         pre = post - sign * filled
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
-            self._stop_frac = self._tp_frac = None
+            self._stop_frac = self._tp_frac = self._liq_px = None
             self._funding_skip = None
             self._replan_pending = self._plan_entry = None
             return False
@@ -3153,6 +3186,8 @@ class LongFlatStrategy(Strategy):
             self._entry_px = (self._entry_px * held + px * qty) / float(abs(post))
         elif opening or self._entry_side != side or self._entry_px is None:
             self._entry_px = px  # opened from flat, or this fill went through flat and opened the other side
+        if self._entry_side != side:
+            self._liq_px = None  # went through flat: the old side's price is no longer the position's
         self._entry_qty, self._entry_side = float(abs(post)), side
         return opening
 
