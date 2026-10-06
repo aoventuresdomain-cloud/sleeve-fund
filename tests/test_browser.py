@@ -334,3 +334,26 @@ def test_the_strategys_recorded_indicators_are_drawn_with_warm_up_marked_and_not
     assert "EMA(10)" in note and "warming up" in note.replace("was still warming up", "warming up")
     assert errors == []
     ctx.close()
+
+
+def test_the_overlay_names_the_candle_size_it_was_recorded_on_and_groups_share_a_colour(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    for i in fixture["indicators"]:  # recorded on 4-hour candles, on a daily chart
+        if i["kind"] == "line":
+            i["points"] = [[p[0] - 86400 + 14400 * (k % 6), p[1]] for k, p in enumerate(i["points"])]
+    fixture["indicators"].append({"key": "bb.upper", "label": "Bollinger upper", "pane": "price", "kind": "line",
+                                  "group": "bb", "settled_from": None, "points": [[p[0], 130.0] for p in fixture["indicators"][0]["points"]]})
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert "minute candles, so it shows only on that interval" in page.inner_text(".pc-strat-note")
+    assert errors == []
+    ctx.close()

@@ -460,10 +460,13 @@ window.Console = (() => {
       const keys = list.map((i) => `${i.key}|${i.pane}`).join(",");
       if (keys !== strat.map((s) => `${s.key}|${s.pane}`).join(",")) {
         strat.forEach((s) => delete LIB["s:" + s.key]);
+        // Lines of one group (Bollinger's mid, upper and lower) share a colour, so they read as one indicator.
+        const hues = new Map();
+        const hue = (i, n) => (i.group ? (hues.has(i.group) ? hues.get(i.group) : (hues.set(i.group, n), n)) : n);
         strat = list.map((i, n) => {
           LIB["s:" + i.key] = {name: i.label, short: i.label, params: [], lines: () => stratLines(i.key),
             ...(i.pane === "lower" ? {pane: {digits: 2, guides: i.levels || []}} : {})};
-          return {type: "s:" + i.key, key: i.key, pane: i.pane, p: [], color: css(PALETTE[(n + 3) % PALETTE.length])};
+          return {type: "s:" + i.key, key: i.key, pane: i.pane, p: [], color: css(PALETTE[(hue(i, n) + 3) % PALETTE.length])};
         });
         build();
       }
@@ -472,10 +475,11 @@ window.Console = (() => {
       if (!note) return;
       const said = [];
       list.forEach((i) => {
-        const ts = i.points.map((p) => p[0]);
-        if (ts.length > 1 && !i.tf && ((ts[ts.length - 1] - ts[0]) / (ts.length - 1)) !== d.interval * 60) {
-          const m = Math.round((ts[ts.length - 1] - ts[0]) / (ts.length - 1) / 60);
-          said.push(`${i.label} is recorded on ${m}-minute candles, so it shows only on that interval.`);
+        // The candle size the points sit on is their commonest gap (a trimmed or gappy series still has one).
+        const ts = i.points.map((p) => p[0]).filter(Number.isFinite), gaps = ts.slice(1).map((x, k) => x - ts[k]).sort((a, b) => a - b);
+        const gap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+        if (gap && !i.tf && gap !== d.interval * 60) {
+          said.push(`${i.label} is recorded on ${Math.round(gap / 60)}-minute candles, so it shows only on that interval.`);
         } else if (i.settled_from != null && i.points.some((p) => p[0] < i.settled_from)) {
           said.push(`${i.label}: the dashed part was still warming up and isn't settled.`);
         }
