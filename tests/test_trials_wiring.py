@@ -7,7 +7,7 @@ from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.store import Store
 from sleeve_fund.venues import KRAKEN
 
-from tests.test_dashboard import AUTH, SAME, _new, client  # noqa: F401  (the fixture)
+from test_dashboard import AUTH, SAME, _new, client  # noqa: F401  (the fixture)
 
 
 def test_a_single_backtest_increments_the_variant_count(client, monkeypatch):
