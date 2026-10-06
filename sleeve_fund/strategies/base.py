@@ -183,11 +183,6 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
-def _utc(t) -> datetime:
-    """A journal time as an aware UTC datetime (SQLite hands them back naive)."""
-    return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
-
-
 def _side_word(side: int) -> str:
     return "long" if side > 0 else "short" if side < 0 else "flat"
 
@@ -408,7 +403,7 @@ class LongFlatStrategy(Strategy):
         self._funding_fallback_said = False  # backtest: the baseline for a missing settled rate is said once
         # Paper: the settlement whose rate the venue hadn't published by its check, watched until it arrives, and
         # when it was last asked for (funding_stale / funding_stale_cleared, per instrument, once per episode).
-        self._funding_missing = None
+        self._funding_missing: set = set()  # every settlement charged the baseline whose rate hasn't come yet
         self._funding_recheck = None
         # (time, amount, kind) for every funding payment, for a backtest's equity: kind "settled" (the venue's rate) or
         # "baseline" (missing, charged adversely).
@@ -1878,7 +1873,7 @@ class LongFlatStrategy(Strategy):
         if terms is None or price <= 0:
             return
         now = self.clock.utc_now()
-        if self._funding_missing is not None:
+        if self._funding_missing:
             self._watch_funding_recovery(terms, now)
         since, self._funding_since = self._funding_since, now
         if since is None:
@@ -1888,7 +1883,7 @@ class LongFlatStrategy(Strategy):
             if self._backtest:
                 # Flat settlements still mark where the venue's rate is missing: flat time neither breaks a stretch
                 # without it nor adds to it (funding.baseline_summary; Advisor, 6 Oct 2026).
-                self.funding_marks += [(ts, self._funding_rate(terms, ts, now)[1], False)
+                self.funding_marks += [(ts, self._funding_rate(terms, ts, now, held=False)[1], False)
                                        for ts in markets.funding_times(since, now, terms.funding_hours)]
             return
         for ts in markets.funding_times(since, now, terms.funding_hours):
@@ -1915,11 +1910,12 @@ class LongFlatStrategy(Strategy):
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
 
-    def _funding_rate(self, terms, ts, now) -> tuple[float, bool] | None:
+    def _funding_rate(self, terms, ts, now, held: bool = True) -> tuple[float, bool] | None:
         """The rate settled at `ts` and whether it is the baseline for a missing one: the venue's own where its
         terms name one (sleeve_fund.funding). A settlement the venue's records lack, and every settlement of a
         simulated perp (no venue rates), is charged the baseline (Advisor, 6 Oct 2026). Paper first waits
-        FUNDING_WAIT for the venue to publish it (None: not yet), then alerts the instrument as stale."""
+        FUNDING_WAIT for the venue to publish it (None: not yet), then alerts the instrument as stale. A flat
+        settlement (`held` False, backtest only) is looked up for the record and charges nothing, so it says nothing."""
         if terms.funding_venue is None:
             return markets.baseline_rate(terms), True
         import pandas as pd
@@ -1935,12 +1931,12 @@ class LongFlatStrategy(Strategy):
             if rate is None and now - ts < self.FUNDING_WAIT:
                 return None
             if rate is None:
-                self._funding_missing = when
-                self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
+                self._funding_missing.add(when)
+                self._funding_episode(terms, pair, True, f"No settled funding rate from the venue for {pair} at "
                                       f"{when:%d %b %Y %H:%M} UTC, {self.FUNDING_WAIT.seconds // 60} minutes after it "
                                       "settled; charging the baseline, whichever side is held, until it arrives")
         if rate is None:
-            if self._backtest and not self._funding_fallback_said and self.runtime is not None:
+            if self._backtest and held and not self._funding_fallback_said and self.runtime is not None:
                 self._funding_fallback_said = True
                 self.runtime.store.event(self.runtime.name, "warning", "funding_fallback",
                                          f"No settled funding rate from the venue for {pair} at {when:%d %b %Y %H:%M} "
@@ -1964,34 +1960,38 @@ class LongFlatStrategy(Strategy):
             return None
 
     def _watch_funding_recovery(self, terms, now) -> None:
-        """Paper, while a settlement charged the baseline is still missing: once its rate arrives, the instrument's
-        staleness episode ends (O17b trues the charge up)."""
+        """Paper, while settlements charged the baseline are still missing: once every one's rate has arrived, the
+        instrument's staleness episode ends (O17b trues the charges up). One arriving while another is still missing
+        keeps the episode open (CR, #163)."""
         if self._funding_recheck is not None and now - self._funding_recheck < self.FUNDING_RECHECK:
             return
         self._funding_recheck = now
         pair = pair_of(self.instrument)
-        if self._venue_rate(terms, pair, self._funding_missing) is None:
+        arrived = {when for when in sorted(self._funding_missing) if self._venue_rate(terms, pair, when) is not None}
+        if not arrived:
             return
-        missing, self._funding_missing = self._funding_missing, None
-        self._funding_episode(pair, False, f"The settled funding rate for {pair} at {missing:%d %b %Y %H:%M} UTC "
-                                           "has arrived from the venue")
+        self._funding_missing -= arrived
+        if self._funding_missing:
+            return
+        last = max(arrived)
+        self._funding_episode(terms, pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
+                                                  "has arrived from the venue"
+                                                  + (f", with {len(arrived) - 1} earlier" if len(arrived) > 1 else ""))
 
-    def _funding_episode(self, pair: str, stale: bool, message: str) -> None:
+    def _funding_episode(self, terms, pair: str, stale: bool, message: str) -> None:
         """Open (funding_stale, a warning) or close (funding_stale_cleared) the instrument's staleness episode, once
-        whichever strategy on it notices first: the journal's latest such event for the instrument says whether one
-        is open (Advisor, 6 Oct 2026: per instrument, once per episode)."""
+        whichever strategy on it, or the collector, notices first: the journal's latest such event for the instrument
+        says whether one is open (Advisor, 6 Oct 2026: per instrument, once per episode; CR, #163)."""
+        from sleeve_fund import funding
+
         rt = self.runtime
         if rt is None:
             return
-        tag = f"[{pair}]"
-        last = next((e for e in rt.store.events_of(("funding_stale", "funding_stale_cleared"), limit=500)
-                     if e["message"].startswith(tag)), None)
-        # An episode left open a day ago (its strategy restarted before the rate came) no longer holds a new alert back.
-        open_ = (last is not None and last["kind"] == "funding_stale"
-                 and _utc(rt.now()) - _utc(last["ts"]) < timedelta(days=1))
-        if stale and not open_:
+        tag = funding.stale_tag(terms.funding_venue, pair)
+        open_ = funding.stale_open(rt.store, tag, rt.now())
+        if stale and open_ is not True:
             rt.store.event(None, "warning", "funding_stale", f"{tag} {message}", ts=rt.now())
-        elif not stale and open_:
+        elif not stale and open_ is not False:
             rt.store.event(None, "info", "funding_stale_cleared", f"{tag} {message}", ts=rt.now())
 
     def _risk_level(self) -> tuple[float, str] | None:

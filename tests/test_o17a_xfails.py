@@ -530,3 +530,37 @@ def test_paper_marks_the_baseline_row_in_the_journal(tmp_path, monkeypatch, bina
                 "2025-10-03 07:50", 35, published={"2025-10-03 08:00": NEVER})
     (row,) = out["funding"]
     assert row.get("kind") == "baseline"
+
+
+
+def test_a_holdout_not_judged_for_funding_blocks_promotion_but_not_g1(tmp_path, binance):
+    """Advisor 19:11 / ~19:20, point 2: G1 can still pass on the OOS windows, but a strategy whose holdout is "not
+    judged" for missing rates cannot go past the holdout step: no promotion to paper evaluation until the rates are
+    backfilled and the holdout judged.
+    The real study (20% of the holdout's settlements missing, OOS clean) gives the facts the pipeline reads. Assumed:
+    sheet_facts(path)["holdout"] == "NOT JUDGED", G1 not made NOT JUDGED by it, and
+    sleeve_fund.dashboard.pipeline.promotable(facts) -> (bool, reason). Written to fail on an assertion, never on a
+    missing name."""
+    from sleeve_fund.dashboard import pipeline
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.tearsheet import render
+    from sleeve_fund.strategies.buy_and_hold import SPEC
+
+    missing = set(_every("2019-01-08", "2019-02-04")[::5])
+    prices = synthetic_ohlcv(days=400, seed=3, start_price=60_000)
+    write_rates({t: 0.00012 for t in settlements(prices.index[0] - D, prices.index[-1]) if t not in missing})
+    ledger = IdeaLedger(tmp_path / "l.jsonl")
+    r = run_study(SPEC, prices, binance.instrument("BTC", "USDT"), dataset="syn-binance-1440m", ledger=ledger,
+                  synthetic=True, holdout_days=30, train_days=120, test_days=60, use_holdout=True)
+    sheet = tmp_path / "buy_and_hold_syn-binance-1440m.md"
+    sheet.write_text(render(r, ledger), encoding="utf-8")
+    facts = pipeline.sheet_facts(sheet)
+    assert facts.get("holdout") == "NOT JUDGED", f"the pipeline does not see the holdout as not judged: {facts}"
+    assert facts["g1"] != "NOT JUDGED", "the holdout's funding made G1 itself not judged; G1 stands on the OOS windows"
+    promotable = getattr(pipeline, "promotable", None)
+    assert callable(promotable), "no promotion gate past the holdout step (pipeline.promotable)"
+    ok, why = promotable(dict(facts, g1="PASS"))
+    assert ok is False and "backfill" in why.lower(), why
+    assert promotable(dict(facts, g1="PASS", holdout="PASS"))[0] is True  # control: the same pass, holdout judged

@@ -17,6 +17,7 @@ _NAME = re.compile(r"^# Tear sheet: (\S+)", re.M)
 _TESTED = re.compile(r"^Tested on `([^`]+)` at (\d+)-minute bars", re.M)
 _SETTINGS = re.compile(r"^Settings: (.+)$", re.M)
 _RULES = re.compile(r"^G1 rules: (\S+)$", re.M)
+_HOLDOUT = re.compile(r"^Holdout: (NOT JUDGED|judged)\b", re.M)
 
 
 def _g1(text: str) -> tuple[str | None, str, list[str]]:
@@ -55,9 +56,38 @@ def sheet_facts(path: Path) -> dict:
             "g1": g1, "evidence": evidence, "failed": failed,
             "dataset": ds.group(1) if ds else "unknown", "mtime": path.stat().st_mtime,
             "settings": settings.group(1) if settings else "",
+            # The opened holdout's own read-out: NOT JUDGED (funding rates missing) blocks promotion, not G1.
+            "holdout": _holdout(text),
             # Sheets from before the instrument and bars were written down can't vouch for either.
             "instrument": tested.group(1).upper() if tested else None,
             "minutes": int(tested.group(2)) if tested else None}
+
+
+def _holdout(text: str) -> str | None:
+    m = _HOLDOUT.search(text)
+    return None if m is None else ("NOT JUDGED" if m.group(1) == "NOT JUDGED" else "PASS")
+
+
+def promotable(facts: dict) -> tuple[bool, str]:
+    """Whether a sheet's result may go past the holdout step to paper evaluation: G1 passed AND the holdout, when
+    opened, could be judged. A holdout not judged for missing funding rates blocks promotion until the rates are
+    backfilled and the study re-run; G1 itself stands on the out-of-sample windows (Advisor, 6 Oct 2026, point 2)."""
+    if facts.get("g1") != "PASS":
+        return False, "G1 has not passed"
+    if facts.get("holdout") == "NOT JUDGED":
+        return False, ("the holdout is not judged: funding rates are missing there; backfill the venue's rates "
+                       "and re-run the study to judge it")
+    return True, ""
+
+
+def promotion_for(tearsheets: Path, strategy: str, instrument: str, minutes: int,
+                  params: dict | None = None) -> tuple[bool, str] | None:
+    """promotable() for the newest real sheet of exactly this combination (as g1_for), or None without one."""
+    if not studied_as(params):
+        return None
+    hit = next((s for s in _real(_sheets(tearsheets), strategy)
+                if s["instrument"] == instrument.upper() and s["minutes"] == minutes and s["g1"]), None)
+    return promotable(hit) if hit else None
 
 
 def _sheets(tearsheets: Path) -> list[dict]:

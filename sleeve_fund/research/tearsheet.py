@@ -346,6 +346,9 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
         f"fees: {r.fee_note}"
     )
     out.append("")
+    if r.holdout:  # read by the pipeline: a holdout not judged blocks promotion, not G1 (pipeline.promotable)
+        out.append(f"Holdout: NOT JUDGED ({r.holdout_not_judged})" if r.holdout_not_judged else "Holdout: judged")
+        out.append("")
     out.append("## Idea")
     out.append("")
     out.append(f"**Family:** {spec.family} · **Asset class:** {spec.asset_class} · **Benchmark:** {spec.benchmark} · "

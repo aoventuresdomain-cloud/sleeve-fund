@@ -97,6 +97,8 @@ class O17Weight(O17Win):
                 return float(w)
         return 0.0
 
+    want_side = LongFlatStrategy.want_side  # the side from the weight (long while above 0), not O17Win's windows
+
 
 def win(*spans) -> dict:
     """Params for O17Win: spans of (open, close, side) as UTC strings."""

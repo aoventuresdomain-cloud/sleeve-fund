@@ -462,8 +462,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
+        from sleeve_fund.dashboard import pipeline
+
+        promotion = None if bt_id else pipeline.promotion_for(TEARSHEETS, s.strategy, s.instrument,
+                                                              spec_minutes(s.bar_spec), s.params)
         path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
-                                                                     s.params), st().accounts(), utcnow())
+                                                                     s.params), st().accounts(), utcnow(),
+                                                      held=promotion[1] if promotion else "")
         # The Overview's Position table is the Portfolio's, one row; Open orders lists working orders only.
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]

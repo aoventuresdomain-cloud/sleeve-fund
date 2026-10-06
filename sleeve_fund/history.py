@@ -587,18 +587,23 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
         try:  # outside the refresh, so a feed failing on every pass is still raised
             problem, key = funding.stale(profile.name, pair, root), f"{profile.name} {pair}: funding stale"
+            # One episode per instrument, whoever notices first: a paper strategy on it may have opened (or closed)
+            # it already, under the same tag (Advisor, 6 Oct 2026; CR, #163).
+            tag, now = funding.stale_tag(profile.name, pair), pd.Timestamp.now(tz="UTC")
             if problem:
                 print(f"FUNDING STALE: {problem}")
                 if key not in _stale:  # once per episode (Advisor, 6 Oct 2026)
-                    _warned.pop(key, None)
-                    _alert(key, "warning", "funding_stale", problem)
                     _stale.add(key)
+                    if funding.stale_open(_inbox(), tag, now) is not True:
+                        _warned.pop(key, None)
+                        _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}")
             elif key in _stale:  # the gap gets a clear end in the journal (Advisor, 6 Oct 2026)
                 _stale.discard(key)
-                kept = funding.rates(profile.name, pair, root).index
-                _warned.pop(f"{key}: cleared", None)
-                _alert(f"{key}: cleared", "info", "funding_stale_cleared",
-                       f"{profile.name} {pair}: funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC")
+                if funding.stale_open(_inbox(), tag, now) is not False:
+                    kept = funding.rates(profile.name, pair, root).index
+                    _warned.pop(f"{key}: cleared", None)
+                    _alert(f"{key}: cleared", "info", "funding_stale_cleared",
+                           f"{tag} funding kept up again, newest rate {kept[-1]:%Y-%m-%d %H:%M} UTC")
         except Exception as exc:  # noqa: BLE001 - an unreadable store is reported by the refresh itself
             print(f"{profile.name} {pair}: funding staleness check failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
@@ -709,6 +714,16 @@ def _warn_at_risk(problem: str | None, store=None) -> None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
     _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _inbox():
+    """The journal the alerts go to, or None without a database (locally)."""
+    try:
+        from sleeve_fund.store import Store
+
+        return Store()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _alert(key: str, level: str, kind: str, message: str, store=None) -> None:

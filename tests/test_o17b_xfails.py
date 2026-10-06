@@ -30,7 +30,7 @@ ASSUMED INTERFACES (adapt the names, never the assertions):
   stamped with the settlement it corrects, at the same qty and mark, amount = actual amount - baseline amount; the
   baseline row stays (the journal is append-only).
 - Events: "funding_true_up" (one per correction); "funding_entry_blocked" (a warning when the gate holds an entry,
-  once per episode, as base.py's _note); "funding_incident" (level error, once, 7 days after a settlement whose rate
+  once per episode, as base.py's _note); "incident" (level error, so it reaches the alerts inbox; once, 7 days after a settlement whose rate
   never arrived). A baseline still standing is "estimated": its "funding" event says so.
 """
 
@@ -231,7 +231,7 @@ def test_the_venue_answering_is_not_enough_until_the_rate_is_stored(tmp_path, mo
 def test_a_rate_that_never_arrives_stays_estimated_and_opens_an_incident_after_7_days(tmp_path, monkeypatch, binance):
     """Long from 07:56 for 7 days and 3 hours; every settlement's rate arrives on time except 08:00 on 3 Oct, which
     never does. A trade every 5 minutes and a 5-minute tick keep the replay short. The 08:00 charge stays baseline and
-    its "funding" event says "estimated"; one funding_incident (error), opened 7 days after 08:00 (within the hour),
+    its "funding" event says "estimated"; one incident event (kind "incident", level error, naming funding; ~19:20), opened 7 days after 08:00 (within the hour),
     and none before."""
     end = S + pd.Timedelta(days=7, hours=3)
     rates = {t: 0.0001 for t in pd.date_range(S, end, freq="8h")}
@@ -243,8 +243,8 @@ def test_a_rate_that_never_arrives_stays_estimated_and_opens_an_incident_after_7
     assert rows[0].get("kind") == "baseline"
     charged = [e for e in kinds(out["events"], "funding") if e["ts"] == S]
     assert charged and "estimated" in charged[-1]["message"].lower()
-    (incident,) = kinds(out["events"], "funding_incident")
-    assert incident["level"] == "error"
+    (incident,) = kinds(out["events"], "incident")
+    assert incident["level"] == "error" and "funding" in incident["message"].lower()
     assert S + pd.Timedelta(days=7) <= incident["ts"] <= S + pd.Timedelta(days=7, hours=1)
 
 
@@ -331,9 +331,9 @@ def test_a_shortened_interval_raises_the_staleness_alert_once_per_instrument(tmp
 
 
 def test_a_lengthened_interval_is_not_blocked(tmp_path, monkeypatch, binance):
-    """Plain, pending the Advisor (README, Needs Advisor 6): the venue settled every 4 hours up to 08:00, then every 8
-    (no 12:00; 16:00 comes). 18:39 blocks a shortening only, so the 16:25 entry fills and nothing is blocked. Note
-    18:35's interim guard (paper refuses a start whose latest stored step is under 8 hours) would refuse this start."""
+    """Plain (Advisor 19:11: a lengthened interval is never blocked): the venue settled every 4 hours up to 08:00, then
+    every 8 (no 12:00; 16:00 comes). The 16:25 entry fills and nothing is blocked. 18:35's interim guard refuses only a
+    step SHORTER than the charged schedule (19:11), so this start is allowed."""
     rates = {"2025-10-02 20:00": 0.0001, f"{DAY} 00:00": 0.0001, f"{DAY} 04:00": 0.0001, f"{DAY} 08:00": 0.0001,
              f"{DAY} 16:00": 0.0001}
     out = paper(tmp_path, monkeypatch, binance,
@@ -342,3 +342,51 @@ def test_a_lengthened_interval_is_not_blocked(tmp_path, monkeypatch, binance):
     assert [(t, s) for t, s, _ in out["fills"]][:3] == [
         (utc(f"{DAY} 15:52"), "BUY"), (utc(f"{DAY} 16:20"), "SELL"), (utc(f"{DAY} 16:25"), "BUY")]
     assert not kinds(out["events"], "funding_entry_blocked")
+
+
+@xfail
+def test_a_lengthened_interval_is_not_read_as_a_missed_settlement_or_charged_a_false_baseline(tmp_path, monkeypatch,
+                                                                                               binance):
+    """Advisor 19:11 / ~19:20: the instrument is charged every 4 hours; after 08:00 the venue lengthens to 8 hours (it
+    publishes the new interval, and the stored rates show 08:00 then 16:00). The expected next settlement comes from
+    the stored or published interval, so 12:00 is not missing: no 12:00 charge (today a false 0.01% baseline at the
+    12:15 check), no staleness alert, no block, and the start (whose latest step equals the 4-hour schedule) is not
+    refused. The published interval is offered as VenueProfile.funding_interval(pair), set here without raising."""
+    from o17_harness import O17Win
+
+    monkeypatch.setattr(binance, "funding_hours", (0, 4, 8, 12, 16, 20))
+
+    def published_interval(pair):
+        now = O17Win.last.clock.utc_now() if O17Win.last is not None else utc(f"{DAY} 07:50")
+        return pd.Timedelta(hours=8 if utc(now) > utc(f"{DAY} 08:00") else 4)
+
+    monkeypatch.setattr(binance, "funding_interval", published_interval, raising=False)
+    rates = {"2025-10-02 20:00": 0.0001, f"{DAY} 00:00": 0.0001, f"{DAY} 04:00": 0.0001, f"{DAY} 08:00": 0.0001,
+             f"{DAY} 16:00": 0.0003}
+    out = paper(tmp_path, monkeypatch, binance,
+                win((f"{DAY} 07:52", f"{DAY} 16:30", 1), (f"{DAY} 16:33", f"{DAY} 16:38", 1)),
+                START, 530, rates=rates, step=10)
+    assert out["fills"] and out["fills"][0][:2] == (utc(f"{DAY} 07:52"), "BUY"), "the start was refused"
+    assert not kinds(out["events"], "strategy_refused")
+    charged = [r["ts"] for r in out["funding"]]
+    assert utc(f"{DAY} 12:00") not in charged, f"12:00 read as a missed settlement and charged: {out['funding']}"
+    assert charged == [utc(f"{DAY} 08:00"), utc(f"{DAY} 16:00")]
+    assert all(r.get("kind", "settled") != "baseline" for r in out["funding"])
+    assert not kinds(out["events"], "funding_stale") and not kinds(out["events"], "funding_entry_blocked")
+    assert (utc(f"{DAY} 16:33"), "BUY") in [(t, sd) for t, sd, _ in out["fills"]]
+
+
+def test_a_perp_add_is_refused_today_in_paper(tmp_path, monkeypatch, binance):
+    """Plain (HoE + DA): until P2-1, a perp cannot add. A weight-sized model is refused before it can start on a perp
+    (check_perp_sizing, as paper/node.py and the supervisor call it), and a paper strategy on the perp that holds half
+    its weight and then asks for all of it does not increase the position, with every rate on time (no funding
+    block). This goes red if anything opens perp adds before P2-1; then the O17b add xfail above must pass with it."""
+    from sleeve_fund.strategies import check_perp_sizing
+
+    params = win((f"{DAY} 11:52", f"{DAY} 12:35", 0.5), (f"{DAY} 12:35", "2026-01-01", 1.0))
+    with pytest.raises(ValueError, match="not available on perpetuals"):
+        check_perp_sizing("o17weight", params)
+    out = paper(tmp_path, monkeypatch, binance, params, LATE, 60, strategy="o17weight", rates=EIGHT_ONLY)
+    buys = [f for f in out["fills"] if f[1] == "BUY"]
+    assert len(out["fills"]) == 1 and len(buys) == 1, f"the position was increased or changed: {out['fills']}"
+    assert buys[0][0] == utc(f"{DAY} 11:52")
