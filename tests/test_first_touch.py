@@ -152,3 +152,28 @@ def test_the_levels_are_the_candle_befores_not_the_judged_candles_own(instrument
     minute's low of 100): no entry. Reading B's close to judge B's own path would be look-ahead."""
     b = FLAT * 2 + [(101.2, 100.0)] + [(102.5, 102.5)] * 12
     assert _entered(_run(instrument, b))
+
+
+def test_paper_judges_the_same_minutes_a_backtest_does():
+    """Paper's first_touch reads the minutes the hub client built each bar from (HubStatus.minutes); a backtest reads
+    its own 1-minute bars (runner.minutes_from). Fed the same minutes, both give the same list for every candle, and
+    a minute the hub refilled late into a bar still being built is in it, as it is in the store."""
+    from sleeve_fund.paper.hub_client import Decoder, HubStatus
+    from sleeve_fund.research.runner import minutes_from
+
+    iid = "BTCUSDT-PERP.BINANCE"
+    _, minutes = _frames(FLAT * 2 + [(101.2, 100.0)] + FLAT * 6 + [(100.0, 98.8)] + [(99.0, 99.0)] * 5)
+    status = HubStatus()
+    d = Decoder("15-MINUTE-LAST-EXTERNAL", status=status)
+    rows = list(minutes.itertuples())
+    order = list(range(len(rows)))
+    order[20], order[21] = order[21], order[20]  # minute 22 lands before minute 21, which the hub refilled
+    for i in order:
+        r = rows[i]
+        ts = r.Index.as_unit("ns").value
+        d({"t": "bar", "id": iid, "o": f"{r.open:.2f}", "h": f"{r.high:.2f}", "l": f"{r.low:.2f}",
+           "c": f"{r.close:.2f}", "v": f"{r.volume:.3f}", "ts": ts, "recv": ts, "refilled": i == 20}, ts + 5)
+    backtest = minutes_from(minutes)
+    for k in range(1, 4):
+        start, end = (START + pd.Timedelta(minutes=15 * k)).value, (START + pd.Timedelta(minutes=15 * (k + 1))).value
+        assert status.minutes_of(iid, start, end) == backtest(start, end) and len(backtest(start, end)) == 15

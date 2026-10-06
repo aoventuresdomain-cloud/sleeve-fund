@@ -273,6 +273,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
     strategy.hub_fed = hub is not None
     strategy.hub_status = hub_status if hub is not None else None
+    if hub is not None and hasattr(strategy, "minute_source"):
+        # first_touch (R2): the minutes the hub client built each bar from, as a backtest judges the store's
+        iid = sleeve.instrument_id
+        strategy.minute_source = lambda after, until: hub_status.minutes_of(iid, after, until)
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
     strategy.simulated_venue = True
     strategy.fee_model = fee_model
