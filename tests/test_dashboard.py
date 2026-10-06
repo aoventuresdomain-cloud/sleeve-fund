@@ -2248,6 +2248,8 @@ def test_no_venues_keeps_account_and_key_names():
     assert no_venues("kraken-live: BYBIT_DEMO_API_KEY missing") == "kraken-live: BYBIT_DEMO_API_KEY missing"
     assert no_venues("no Bybit demo account set up") == "the demo account isn't set up"
     assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue book"
+    assert no_venues("BTCUSDT-PERP.BINANCE: the feed missed 2 minutes") == "BTCUSDT-PERP: the feed missed 2 minutes"
+    assert no_venues("BTC/USD.KRAKEN warm-up ready.") == "BTC/USD warm-up ready."
     assert no_venues(None) is None and no_venues("") == ""
 
 

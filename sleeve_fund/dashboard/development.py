@@ -226,6 +226,8 @@ def _gap_words(n: int) -> str:
 # Trading" goes whole. Case-sensitive on purpose: account names such as "kraken-live" and env names such as
 # BYBIT_DEMO_API_KEY are the PM's own labels and stay as they are. Only Setup, Accounts names venues (QA U8).
 _VENUE_WORDS = [
+    # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
+    (re.compile(r"(?<=\S)\.(?:BINANCE|KRAKEN|BYBIT|DERIBIT)\b"), ""),
     (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b"), "the demo account isn't set up"),
     (re.compile(r"\b(?:Bybit|Deribit)(?: [Dd]emo(?: Trading| account)?| [Tt]estnet)?(?:'s)?\b"), "the demo account"),
     (re.compile(r"\bBinance(?:'s)?(?: USD-M perpetuals)?\b"), "the perpetual venue"),
