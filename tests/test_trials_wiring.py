@@ -73,7 +73,23 @@ def test_a_counting_failure_is_an_error_event_and_loses_neither_the_backtest_nor
     assert len(failed) == 1 and "backtest" in failed[0]["message"] and "KeyError" in failed[0]["message"]
     made = [e for e in store.events("btc-test", min_level="error") if e["kind"] == "trials_count_failed"]
     assert len(made) == 1 and "strategy btc-test" in made[0]["message"]
-    assert not [t for t in store.trials() if t["source"] in ("backtest", "strategy")]
+    assert not [t for t in store.trials() if t["source"] in ("backtest", "strategy") and t["status"] == "ok"]
+    # QA P1-T8: each run is recorded against its idea as a failed row, never silently missing (Data Architect).
+    import json
+
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    idea = legacy_idea_hash("trend_filter")
+    stand_ins = [t for t in store.trials(idea) if t["status"] == "failed"]
+    assert len(stand_ins) == 2 and TrialsRegister(store).failed(idea) == 2
+    assert TrialsRegister(store).counts(idea)["variants"] == 2  # each still counts as a variant tried
+    assert sorted(t["source"] for t in stand_ins) == ["backtest", "strategy"]  # its own source, not a new one
+    assert all("KeyError" in t["error"] and set(json.loads(t["settings"])) == {"params"} for t in stand_ins)
+    assert all(t["data_start"] is None and t["data_end"] is None and t["sharpe"] is None and t["trades"] is None
+               for t in stand_ins)  # undated: the holdout's safe side
+    assert HoldoutLocks(store).undated(idea)
+    assert "recorded against its idea as a failed run" in failed[0]["message"]
 
 
 def test_the_research_page_shows_the_registers_count(client):

@@ -71,6 +71,23 @@ def test_a_drifted_database_without_history_stops_the_migration_and_nothing_chan
     assert "alembic_version" not in inspect(engine).get_table_names()
 
 
+def test_trials_made_before_0003_become_ok_rows_and_a_status_outside_the_two_is_refused(engine):
+    # QA P1-T8 (Data Architect): status is NOT NULL with a server default, so every row before it reads "ok".
+    from alembic import command
+    from sqlalchemy.exc import IntegrityError
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0002")
+        conn.execute(text("INSERT INTO trials (id, definition_hash, idea_hash, code_version, definition_name, family, "
+                          "settings, dataset, stage, source, created_at) VALUES ('old', 'd', 'i', 'c', 'n', 'f', "
+                          "'{}', 'ds', 'in_sample', 'study', CURRENT_TIMESTAMP)"))
+    schema.migrate(engine, log=lambda _: None)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT status, error FROM trials WHERE id = 'old'")).one() == ("ok", None)
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(text("UPDATE trials SET status = 'pending' WHERE id = 'old'"))
+
+
 def test_migrating_again_changes_nothing(engine):
     schema.migrate(engine, log=lambda _: None)
     seen = _statements(engine)

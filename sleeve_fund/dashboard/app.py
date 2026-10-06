@@ -412,7 +412,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                                venue=to_store_kwargs(cfg)["venue"])
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, st(), st().sleeve(name))
+            made = st().sleeve(name)
+            _counted(st(), name, f"strategy {name}", _count_strategy, st(), made, source="strategy",
+                     strategy=made.strategy, params=made.params)
             if needed > cfg.warmup_bars:
                 # A warning (an alert) when the most that can load falls short; a note when it was chosen.
                 st().event(name, "warning" if auto else "info", "warmup_short",
@@ -752,7 +754,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup)
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, st(), st().sleeve(name))
+            made = st().sleeve(name)
+            _counted(st(), name, f"strategy {name}", _count_strategy, st(), made, source="strategy",
+                     strategy=made.strategy, params=made.params)
             exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
             # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
             st().event(name, "info", "exits_change" if exits_changed else "settings_change",
@@ -1469,22 +1473,30 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
                         bar_spec=args["bar_spec"])
-    _counted(store, None, f"backtest {args['title']!r}", _count_backtest, store, args, result, run_id)
+    _counted(store, None, f"backtest {args['title']!r}", _count_backtest, store, args, result, run_id,
+             source="backtest", strategy=args["strategy"], params=args["params"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
 
 
-def _counted(store: Store, sleeve: str | None, what: str, count, *args) -> None:
+def _counted(store: Store, sleeve: str | None, what: str, count, *args, source: str, strategy: str,
+             params: dict) -> None:
     """Count a run in the trials register without letting a failure undo or fail the work being counted: the
-    backtest is already saved, the strategy already created (Code Reviewer, #154). The gap is an error event
-    instead, so it shows on the dashboard and the count can be put right."""
+    backtest is already saved, the strategy already created (Code Reviewer, #154). The run is then recorded
+    against its idea as a failed row, which still counts as a variant tried, so the idea's count never goes
+    silently low (QA P1-T8); an error event shows the gap on the dashboard."""
     try:
         count(*args)
     except Exception as exc:  # noqa: BLE001 - any failure here must not reach the caller
         logging.getLogger(__name__).exception(f"couldn't count {what} in the trials register")
+        try:
+            TrialsRegister(store).record_failed(strategy=strategy, params=params, source=source, error=repr(exc))
+            kept = "it is recorded against its idea as a failed run, which still counts as a variant tried"
+        except Exception as again:  # noqa: BLE001
+            logging.getLogger(__name__).exception(f"couldn't record {what} as a failed run either")
+            kept = f"recording it as a failed run failed too ({again!r}), so its idea's count is short by one"
         store.event(sleeve, "error", "trials_count_failed",
-                    f"The {what} ran but wasn't counted in the trials register ({exc!r}), so its idea's count of "
-                    "variants tried is short by one")
+                    f"The {what} ran but wasn't counted in the trials register ({exc!r}); {kept}")
 
 def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None:
     """Every backtest is a variant tried: the trials register counts it, so a setting picked from many runs is

@@ -68,7 +68,8 @@ def test_rows_are_stored_as_given_and_never_nan(reg):
     assert json.loads(row["settings"]) == {"rsi": 14} and row["oos_trades"] == 110
 
 
-@pytest.mark.parametrize("bad", [{"stage": "sensitivity"}, {"source": "guess"}, {"sharpe": float("inf")}])
+@pytest.mark.parametrize("bad", [{"stage": "sensitivity"}, {"source": "guess"}, {"sharpe": float("inf")},
+                                 {"status": "pending"}])
 def test_bad_trials_are_refused(reg, bad):
     row = {"id": "a" * 16, "definition_hash": "d", "idea_hash": "i", "code_version": "c", "definition_name": "n",
            "family": "f", "settings": "{}", "dataset": "ds", "stage": "holdout", "source": "study", "sharpe": 1.0}

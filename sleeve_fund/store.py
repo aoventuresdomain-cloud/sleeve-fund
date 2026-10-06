@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -418,6 +419,9 @@ trials_t = Table(
     # overlapping: the safe side.
     Column("data_start", TS),
     Column("data_end", TS),
+    Column("status", String(16), nullable=False, server_default="ok"),
+    Column("error", Text),  # why a failed row's count failed; NULL on an ok row
+    CheckConstraint("status IN ('ok', 'failed')", name="trials_status"),
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
@@ -448,6 +452,9 @@ TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
 # Sharpe yet (QA P1-T1). "engineering": a run deliberately marked as a fixture, the only kind not counted, and
 # never the default (Advisor, 6 Oct 2026).
 TRIAL_SOURCES = ("study", "backtest", "strategy", "optimiser", "engineering", "ledger_import")
+# "ok": a counted evaluation. "failed": a run whose count failed (QA P1-T8), recorded against its idea under its own
+# source with its settings and the error, and no Sharpe, trades or dates (Data Architect, 6 Oct 2026).
+TRIAL_STATUSES = ("ok", "failed")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -1454,6 +1461,8 @@ class Store:
         for r in rows:
             if r["source"] not in TRIAL_SOURCES:
                 raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
+            if r.get("status", "ok") not in TRIAL_STATUSES:
+                raise ValueError(f"a trial's status is one of {TRIAL_STATUSES}, got {r['status']!r}")
             if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
                 raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
             sharpe = r.get("sharpe")
@@ -1476,7 +1485,8 @@ class Store:
         with self.engine.begin() as c:
             have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
             new = [{**r, "created_at": r.get("created_at") or utcnow(), "data_start": r.get("data_start"),
-                    "data_end": r.get("data_end")} for r in rows if r["id"] not in have]
+                    "data_end": r.get("data_end"), "status": r.get("status", "ok"), "error": r.get("error")}
+                   for r in rows if r["id"] not in have]
             new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
             if new:
                 c.execute(insert(trials_t), new)
