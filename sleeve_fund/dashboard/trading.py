@@ -177,6 +177,26 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
+# The journal entry a PM's "Reset after liquidation" writes (item RAL): the one thing that ends a liquidation.
+LIQUIDATION_RESET = "liquidation_reset"
+
+
+def liquidated_since_reset(store: Store, sleeve: str, halt_words: str) -> bool:
+    """Whether the strategy's position margin was lost (a liquidation event or order, or a halt whose message
+    starts with halt_words) with no reset after liquidation since. Read from the journal, not the latest halt:
+    a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
+    reset = store.last_event(sleeve, (LIQUIDATION_RESET,))
+    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
+    liq = store.last_event(sleeve, ("liquidation",))
+    if liq and liq["id"] > since_id:
+        return True
+    if any(e["kind"] == "risk_halt" and e["id"] > since_id and e["message"].startswith(halt_words)
+           for e in store.events(sleeve, limit=500, min_level="error")):
+        return True
+    return any(o["intent"] == "liquidation" and (since_ts is None or o["ts"] > since_ts)
+               for o in store.orders(sleeve, limit=100_000))
+
+
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
     """How the open position's stop was set, in a few words, when it came from the market at entry: an ATR
     stop is the simple ATR the models use, not the chart's Wilder ATR (Advisor, atr-149 A2), so it says so.
