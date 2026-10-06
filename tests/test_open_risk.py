@@ -88,3 +88,17 @@ def test_a_backtest_counts_the_entries_the_limit_would_refuse_and_trades_them_al
     assert gated.open_risk_binds > 0 and ungated.open_risk_binds == 0
     cols = ["side", "filled_qty", "avg_px", "ts_last"]
     assert gated.fills[cols].equals(ungated.fills[cols]) and gated.equity.equals(ungated.equity)
+
+
+def test_the_setups_the_paper_mechanics_tests_lift_the_limit_for_are_refused_with_it_on(tmp_path):
+    """The tests marked no_open_risk_limit run a stopless perp above 1x in paper. With the limit on, such a strategy
+    opens nothing: at 2x ping_pong's 6,600 notional counts at 660, over 5% of its 10,000 book."""
+    from test_long_short import _meta as balanced_meta
+
+    path = tmp_path / "pp.jsonl.gz"
+    _record(path, balanced_meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP}),
+            [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
+    store = Store.in_memory()
+    orders, _ = replay(path, with_fills=True, store=store)
+    assert [o for o in orders if o["intent"] == "entry"] == []
+    assert any(e["kind"] == "entry_refused_open_risk" for e in store.events("ping-pong-test", limit=500))
