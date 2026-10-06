@@ -385,3 +385,19 @@ def test_a_settings_change_rebuilds_the_overlay_labels_and_levels_and_warm_up_jo
     page.wait_for_function("document.querySelector('.pc-sub-legend').innerText.includes('RSI(7)')", timeout=5000)
     assert "RSI(7)" in page.inner_text(".pc-sub-legend") and errors == []
     ctx.close()
+
+
+def test_the_platforms_own_sentence_shows_when_it_has_no_indicators_to_draw(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    fixture["indicators"], fixture["indicators_note"] = [], "The strategy's indicators are drawn on its own 1h candles."
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend", timeout=5000)
+    assert "drawn on its own 1h candles" in page.inner_text(".pc-strat-note")
+    ctx.close()

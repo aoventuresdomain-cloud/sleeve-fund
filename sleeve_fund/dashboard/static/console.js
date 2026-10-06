@@ -490,6 +490,7 @@ window.Console = (() => {
           said.push(`${i.label}: the dashed part was still warming up and isn't settled.`);
         }
       });
+      if (d.indicators_note) said.unshift(d.indicators_note);  // the platform's own sentence when it has nothing to draw
       note.textContent = said.join(" "); note.hidden = !said.length;
     };
     const fill = () => {
