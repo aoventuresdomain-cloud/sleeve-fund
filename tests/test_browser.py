@@ -292,3 +292,45 @@ def test_risk_limits_table_fits_its_panel_on_a_desktop(site, browser):
                          " return [s.scrollWidth, s.clientWidth, s.querySelectorAll('thead th').length]; }")
     assert size[2] == 9 and size[0] <= size[1], size
     ctx.close()
+
+
+def _fixture_candles(n=40, day=86400, start=1_760_000_000 - 1_760_000_000 % 86400 - 40 * 86400):
+    """Daily candles and the strategy's own recorded indicators in the agreed shape (v2/chart-indicators-shape.md):
+    t is the bar's close, settled_from marks where warm-up ends."""
+    times = [start + i * day for i in range(n)]
+    candles = [{"time": t, "open": 100 + i, "high": 102 + i, "low": 99 + i, "close": 101 + i} for i, t in enumerate(times)]
+    ema = [[t + day, 100.5 + i] for i, t in enumerate(times)]
+    rsi = [[t + day, 40 + (i % 20)] for i, t in enumerate(times)]
+    return {"interval": 1440, "source": "venue", "candles": candles, "volume": [{"time": t, "value": 1.0} for t in times],
+            "markers": [], "notes": {}, "lines": [], "intervals": ["1d"], "chosen": "1d", "pair": "ETH/USD",
+            "home": "ETH/USD", "pairs": [],
+            "indicators": [
+                {"key": "ema", "label": "EMA(10)", "pane": "price", "kind": "line", "group": None,
+                 "settled_from": times[10] + day, "points": ema},
+                {"key": "rsi", "label": "RSI(14)", "pane": "lower", "kind": "line", "levels": [30, 70],
+                 "settled_from": times[14] + day, "points": rsi},
+                {"key": "div", "label": "RSI divergence", "pane": "price", "kind": "marker",
+                 "points": [[times[20] + day, "bull"]]}]}
+
+
+def test_the_strategys_recorded_indicators_are_drawn_with_warm_up_marked_and_nothing_recomputed(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    legend = page.inner_text(".pc-legend")
+    assert "EMA(10)" in legend
+    assert page.locator(".pc-sub").count() == 1 and "RSI(14)" in page.inner_text(".pc-sub-legend")
+    note = page.inner_text(".pc-strat-note")
+    assert "EMA(10)" in note and "warming up" in note.replace("was still warming up", "warming up")
+    assert errors == []
+    ctx.close()

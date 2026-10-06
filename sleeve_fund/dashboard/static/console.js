@@ -376,10 +376,13 @@ window.Console = (() => {
 
     // Indicators: config is the saved list; built holds each one's series and, for oscillators, its strip.
     let config = loadInd(), built = [];
+    // The strategy's own indicator values (P1-3s): drawn as the platform recorded them, never recomputed here.
+    // Each is a synthetic LIB entry reading the latest payload, so the legend, strips and crosshair are the menu's.
+    let strat = [], stratData = {};
     let syncing = false, mirroring = false;
     const quiet = {priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false};
     const colorOf = (c) => (c.color && /^#[0-9a-f]{6}$/i.test(c.color) ? c.color : css(PALETTE[0]));
-    const labelOf = (c) => `${LIB[c.type].short} ${c.p.join(", ")}`;
+    const labelOf = (c) => `${LIB[c.type].short} ${c.p.join(", ")}`.trim();
     const strips = () => built.filter((b) => b.chart !== chart);
     const teardown = () => {
       built.forEach((b) => { if (b.chart === chart) b.series.forEach((s) => chart.removeSeries(s)); else { b.chart.remove(); b.box.remove(); } });
@@ -387,7 +390,7 @@ window.Console = (() => {
     };
     const build = () => {
       teardown();
-      config.forEach((c) => {
+      config.concat(strat).forEach((c) => {
         const def = LIB[c.type], color = colorOf(c);
         let target = chart, wrap = null, legend = null;
         if (def.pane) {
@@ -433,6 +436,52 @@ window.Console = (() => {
       if (!r || syncing) return;
       syncing = true; strips().forEach((b) => b.chart.timeScale().setVisibleLogicalRange(r)); syncing = false;
     });
+    // The recorded points (t = the bar's close, UTC seconds) laid on this chart's candles. A candle on the strategy's
+    // own size takes the point stamped at its close; a slower filter (tf) steps forward from its last point.
+    const stratLines = (key) => {
+      const ind = stratData[key], none = [{vals: []}, {vals: [], style: 2, alpha: 0.45}];
+      if (!ind || !data) return none;
+      const iv = data.interval * 60, pts = ind.points.filter((p) => typeof p[1] === "number").sort((a, b) => a[0] - b[0]);
+      const exact = new Map(pts.map((p) => [p[0], p[1]]));
+      let j = -1, last = null;
+      const at = data.candles.map((c) => {
+        const close = c.time + iv;
+        if (!ind.tf) return exact.has(close) ? [close, exact.get(close)] : null;
+        while (j + 1 < pts.length && pts[j + 1][0] <= close) { j++; last = pts[j]; }
+        return last;
+      });
+      const from = ind.settled_from == null ? -Infinity : ind.settled_from;
+      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null))},
+        {vals: at.map((p) => (p && p[0] < from ? p[1] : null)), style: 2, alpha: 0.45}];
+    };
+    const syncStrategy = (d) => {
+      const list = (d.indicators || []).filter((i) => i.kind !== "marker");
+      stratData = Object.fromEntries(list.map((i) => [i.key, i]));
+      const keys = list.map((i) => `${i.key}|${i.pane}`).join(",");
+      if (keys !== strat.map((s) => `${s.key}|${s.pane}`).join(",")) {
+        strat.forEach((s) => delete LIB["s:" + s.key]);
+        strat = list.map((i, n) => {
+          LIB["s:" + i.key] = {name: i.label, short: i.label, params: [], lines: () => stratLines(i.key),
+            ...(i.pane === "lower" ? {pane: {digits: 2, guides: i.levels || []}} : {})};
+          return {type: "s:" + i.key, key: i.key, pane: i.pane, p: [], color: css(PALETTE[(n + 3) % PALETTE.length])};
+        });
+        build();
+      }
+      // Plain words about what is drawn: warm-up, and a candle size the points don't sit on.
+      const note = $(".pc-strat-note");
+      if (!note) return;
+      const said = [];
+      list.forEach((i) => {
+        const ts = i.points.map((p) => p[0]);
+        if (ts.length > 1 && !i.tf && ((ts[ts.length - 1] - ts[0]) / (ts.length - 1)) !== d.interval * 60) {
+          const m = Math.round((ts[ts.length - 1] - ts[0]) / (ts.length - 1) / 60);
+          said.push(`${i.label} is recorded on ${m}-minute candles, so it shows only on that interval.`);
+        } else if (i.settled_from != null && i.points.some((p) => p[0] < i.settled_from)) {
+          said.push(`${i.label}: the dashed part was still warming up and isn't settled.`);
+        }
+      });
+      note.textContent = said.join(" "); note.hidden = !said.length;
+    };
     const fill = () => {
       const t = data.candles.map((c) => c.time);
       const k = {close: data.candles.map((c) => c.close), high: data.candles.map((c) => c.high), low: data.candles.map((c) => c.low),
@@ -575,7 +624,13 @@ window.Console = (() => {
       vol.setData(hasVol ? d.volume : []);
       // Keep the candles clear of the volume band when there is one.
       chart.priceScale("right").applyOptions({scaleMargins: {top: 0.08, bottom: hasVol ? 0.18 : 0.06}});
-      main.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")})));
+      // Markers the strategy recorded (an RSI divergence), at the candle its bar closed on, beside the trades' arrows.
+      const iv = d.interval * 60, opens = new Set(d.candles.map((c) => c.time));
+      const recorded = (d.indicators || []).filter((i) => i.kind === "marker").flatMap((i) => i.points
+        .filter(([ts]) => opens.has(ts - iv)).map(([ts, v]) => ({time: ts - iv, position: v === "bull" ? "belowBar" : "aboveBar", shape: "circle",
+          color: v === "bull" ? css("--gain") : css("--loss"), text: i.label})));
+      main.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")}))
+        .concat(recorded).sort((a, b) => a.time - b.time));
       lines.forEach((l) => main.removePriceLine(l));
       lines = d.lines.map((l) => main.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
@@ -587,6 +642,7 @@ window.Console = (() => {
         return r;
       }});
       if (!keepView) chart.timeScale().fitContent();
+      syncStrategy(d);
       fill();
       $(".pc-source").hidden = d.source !== "marks" && !d.note;
       $(".pc-source").textContent = d.note || marksNote;
