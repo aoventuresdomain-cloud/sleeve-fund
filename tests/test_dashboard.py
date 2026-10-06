@@ -1900,6 +1900,22 @@ def test_sub_dollar_numbers_read_in_full(client):
     assert "0.076500" in page  # the average price at the decimals the Why text uses
 
 
+def test_the_home_page_opens_after_a_strategy_reset_with_no_clean_slate_ever(client):
+    """QA on #164 (pre-existing on main): the first per-strategy Reset, with no clean slate ever made, left the
+    home page a 500, as the Previous book list named the new book's start date and there was none."""
+    from sleeve_fund.supervisor import Supervisor
+
+    c, store = client
+    _new(c)
+    store.request_reset("btc-test", "Test finished")
+    Supervisor(store, python="true").reset_pending()
+    assert store.book_start() is None and store.reset_runs()
+    r = c.get("/", auth=AUTH)
+    assert r.status_code == 200
+    assert "Previous book (1)" in r.text and "put away by a strategy reset;" in r.text
+    assert "new book began" not in r.text
+
+
 def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, tmp_path):
     """PM, 4 Oct 2026: the book's equity starts again from the new strategies; the strategies the clean
     slate put away keep their history, their pages and a "Previous book" list, and can be brought back."""
