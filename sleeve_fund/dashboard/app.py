@@ -53,7 +53,6 @@ from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
-from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -112,6 +111,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["venue_choices"] = venue_choices
     templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
+    templates.env.filters["no_venues"] = dev.no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -1303,7 +1303,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("a reason is required")
             kind = str(form.get("kind", ""))
             st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
-            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            on = f" on the {dev.venue_label(str(form.get('venue')))} venue" if kind == "live" else ""
             st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
