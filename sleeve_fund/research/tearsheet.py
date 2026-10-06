@@ -323,6 +323,16 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     for name, result, evidence in checks:
         out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
+    for label in getattr(r, "fill_labels", None) or []:
+        out.append(f"> Fills: {label}. Without 1-minute bars, what traded first inside a bar is unknown, so a stop the "
+                   "bar traded through was filled at its worst price, and a stop and a target both inside one bar as the "
+                   "stop.")
+        out.append("")
+    check = getattr(r, "spot_check", None)
+    if check and "gap" in check:
+        out.append(f"> 5-minute pass spot-checked on 1-minute bars: the window {check['window']} (seed {check['seed']}) "
+                   f"ended {check['gap']:+,.2f} on 1-minute bars against 5-minute ones.")
+        out.append("")
     gaps = oos_gaps(r)
     if gaps:
         out.append(f"> {gaps}")

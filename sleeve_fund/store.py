@@ -676,11 +676,14 @@ class Store:
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         """Move an order on (accepted, cancelled, rejected...) or add a fill to it. Unknown ids are ignored:
-        orders sent before this journal existed have no row."""
+        orders sent before this journal existed have no row. intent: what the order turned out to be (a backtest's
+        target filled on a bar that also traded through the stop is booked as the stop)."""
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         with self.engine.begin() as c:
             row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
             if row is None:
@@ -698,6 +701,8 @@ class Store:
                 values["status"] = status  # a late "accepted" never reopens a finished order
             if message:
                 values["message"] = message
+            if intent is not None:
+                values["intent"] = intent
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:

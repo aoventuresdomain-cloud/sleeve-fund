@@ -17,8 +17,9 @@ class IdeaLedger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def record(self, *, idea: str, family: str, params: dict, dataset: str, stage: str, sharpe: float) -> None:
-        entry = {
+    def record(self, *, idea: str, family: str, params: dict, dataset: str, stage: str, sharpe: float,
+               extra: dict | None = None) -> None:
+        entry = {**(extra or {}),
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "idea": idea,
             "family": family,
@@ -37,7 +38,7 @@ class IdeaLedger:
             return [json.loads(line) for line in fh if line.strip()]
 
     def counts(self) -> dict:
-        rows = [e for e in self.entries() if e["family"] != "benchmark"]
+        rows = [e for e in self.entries() if _evaluation(e)]
         variants = {(e["idea"], json.dumps(e["params"], sort_keys=True), e["dataset"]) for e in rows}
         by_family: dict[str, set] = {}
         for e in rows:
@@ -53,7 +54,7 @@ class IdeaLedger:
         return [
             e["sharpe"]
             for e in self.entries()
-            if e["family"] != "benchmark" and (family is None or e["family"] == family)
+            if _evaluation(e) and (family is None or e["family"] == family)
         ]
 
     def holdout_used(self, idea: str, dataset: str) -> bool:
@@ -72,6 +73,15 @@ class IdeaLedger:
             if e["stage"] == "holdout":
                 out.setdefault((e["idea"], _without_bars(e["dataset"])), e)
         return out
+
+
+# A study's falsifier row (P1-D13): the 1-minute run's end equity against the coarse run's, read at study 10. A record
+# of the fills, not a variant tried: it counts towards nothing.
+GAP_STAGE = "bars_only_gap"
+
+
+def _evaluation(e: dict) -> bool:
+    return e["family"] != "benchmark" and e["stage"] != GAP_STAGE
 
 
 def _without_bars(dataset: str) -> str:
