@@ -142,7 +142,6 @@ def _x_y(reason):
     return (float(m.group(1).replace(",", "")), m.group(2)) if m else (None, None)
 
 
-@GAP_LIQ
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side, profile):
     """X = margin + entry fee + liquidation fee over the whole position (grouped by order_id), to the cent; Y = X over
@@ -159,7 +158,6 @@ def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side,
     assert got == want, (got, want, out["reason"])
 
 
-@GAP_LIQ
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_the_strategy_stays_halted_until_a_reset_after_liquidation(tmp_path, side, profile):
     """Incident opened; a PM resume, the PM's Stop and Start, and each restart after them leave it halted with the
@@ -175,7 +173,6 @@ def test_gap_liq_the_strategy_stays_halted_until_a_reset_after_liquidation(tmp_p
     assert got == want, (got, want)
 
 
-@GAP_LIQ
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_hc_after_the_pms_stop_it_is_not_trading_still_halted_and_start_is_refused(tmp_path, side, profile):
     """HC (Advisor 18:17) on a stop gapped through liquidation: after Stop the strategy is not trading (desired state

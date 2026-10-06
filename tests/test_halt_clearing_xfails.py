@@ -219,7 +219,7 @@ def test_guard_nothing_but_ral_writes_a_liquidation_reset(store, tmp_path, clien
 
 # --- Start refuses while halted; Stop always works [R18:17] -------------------------------------------------------
 
-@pytest.mark.parametrize("kind", ["drawdown_halt", "daily_pause", pytest.param("liquidation", marks=xf)])
+@pytest.mark.parametrize("kind", HALTS)
 def test_start_refuses_while_halted_naming_the_clearing_action(store, tmp_path, client, monkeypatch, kind):
     """[R18:17] "Start refuses while halted naming the clearing action": stopped while halted, Start is refused in
     words that name what clears it (resume; the next 00:00 UTC; reset after liquidation), and it stays stopped."""

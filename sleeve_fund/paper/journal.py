@@ -11,7 +11,8 @@ from __future__ import annotations
 import itertools
 from datetime import datetime
 
-from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, exact_sum, utcnow
+from sleeve_fund.store import (INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, _check_rebook, _rebook_words,
+                                exact_sum, utcnow)
 
 _FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
@@ -112,6 +113,12 @@ class MemoryJournal:
                                   "updated_at": now, "side": side, "order_type": order_type, "qty": qty,
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
+
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        row = self.orders_.get(order_id)
+        _check_rebook(order_id, row)
+        row.update(intent="liquidation", reason=reason, signal=signal)
+        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,

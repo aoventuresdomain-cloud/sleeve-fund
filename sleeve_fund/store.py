@@ -469,6 +469,19 @@ INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
 
 
+def _check_rebook(order_id: str, row) -> None:
+    """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
+    if row is None:
+        raise ValueError(f"no order {order_id!r} to re-book")
+    if row["intent"] != "stop_loss" or not row["filled_qty"]:
+        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled stop-loss can "
+                         f"(it is {row['intent']}, {row['filled_qty']:g} filled)")
+
+
+def _rebook_words(order_id: str, reason: str) -> str:
+    return f"Order {order_id} re-booked from stop_loss to liquidation: {reason}"
+
+
 def exact_sum(a: float, b: float) -> float:
     """Two quantities added as the decimals they print as: 0.05 + 0.28253027 is 0.33253027, not the float
     sum 0.33253026999999996, so an order's filled quantity matches what was ordered."""
@@ -798,6 +811,17 @@ class Store:
             if message:
                 values["message"] = message
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
+
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
+        liquidation it was. The only intent change the journal allows (Data Architect): stop_loss to liquidation, on
+        an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
+            _check_rebook(order_id, row and row._mapping)
+            c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                      .values(intent="liquidation", reason=reason, signal=signal, updated_at=utcnow()))
+        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
 
     def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
                intents: tuple[str, ...] | None = None) -> list[dict]:

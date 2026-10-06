@@ -349,7 +349,6 @@ def test_guard_after_a_liquidation_a_restart_leaves_it_halted(store, tmp_path):
     assert new == []
 
 
-@xf
 def test_after_a_liquidation_a_plain_resume_leaves_it_halted_through_a_restart(store, tmp_path):
     """[R17:57] "stays halted through resume/restart"; [HoE17:55] RAL is not a resume. A resume is refused in words,
     or is taken and leaves it halted: either way no trade, and the drawdown reference is not reset."""
@@ -366,7 +365,6 @@ def test_after_a_liquidation_a_plain_resume_leaves_it_halted_through_a_restart(s
     assert _peak(store) == pytest.approx(f.peak)
 
 
-@xf
 @pytest.mark.parametrize("margin", ["capped", "full"])
 def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_path, request, margin):
     """[R17:57] (a), [R18:17], [R20:37]: the halt reads "Position margin lost (liquidated): X, Y% of strategy equity
@@ -446,7 +444,6 @@ def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(sto
     assert _y_ok(y, x, at_entry, fee), (y, x, at_entry, at_reduce, before)
 
 
-@xf
 def test_a_stop_filled_through_the_liquidation_price_is_journalled_as_a_liquidation(store, tmp_path):
     """[R17:57] / [R18:17] (the incident's field is "why the half-liquidation stop did not protect the position"): a
     gap through the resting stop AND the liquidation price is a liquidation (the venue takes the position at its
@@ -460,7 +457,6 @@ def test_a_stop_filled_through_the_liquidation_price_is_journalled_as_a_liquidat
                                                        for e in store.events(NAME, limit=20, min_level="warning")]
 
 
-@xf
 def test_a_drawdown_halt_on_the_same_tick_as_a_liquidation_keeps_the_liquidation_halt(store, tmp_path):
     """[R17:57], [R18:17] (PE2's fix): the gap also breaches the 20% drawdown halt on the same tick. The halt must
     still be the liquidation's (the ruled text, cleared only by RAL), not an ordinary drawdown halt that a plain
@@ -481,7 +477,6 @@ def test_a_drawdown_halt_on_the_same_tick_as_a_liquidation_keeps_the_liquidation
 
 # --- the incident and its note [R17:57, HoE17:55, R18:17] ---------------------------------------------------------
 
-@xf
 @pytest.mark.parametrize("where", ["paper", "restart_after_an_outage"])
 def test_the_engine_opens_an_incident_on_every_liquidation(store, tmp_path, where):
     """[R18:17] "engine opens incident on every liquidation (paper + outage replay)" [B63]: one error event of kind

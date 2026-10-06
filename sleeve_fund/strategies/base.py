@@ -180,6 +180,13 @@ def _from_entry(stop: float, side: int = 1) -> str:
     return f"{abs(stop):.1%} {'below' if below else 'above'} the entry"
 
 
+def through_liquidation(side: int, price: float, liq: float | None) -> bool:
+    """Whether a price is at or past a position's liquidation price on its losing side (side: +1 long, -1 short).
+    The one test behind the engine's liquidation check and GAP-LIQ's (a stop filled at or past it books as a
+    liquidation), in paper and in a backtest alike."""
+    return liq is not None and price > 0 and (price <= liq if side > 0 else price >= liq)
+
+
 def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: float,
                       leverage: float) -> tuple[float | None, float]:
     """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
@@ -427,6 +434,7 @@ class LongFlatStrategy(Strategy):
         self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
         # (time, amount) for every shortfall the venue's insurance fund took past the bankruptcy price
         self.insurance_log: list[tuple] = []
+        self._rebook: str | None = None  # a stop's order filled past liquidation, to re-book as one (GAP-LIQ)
         # Backtest on a perp: the equity at the minute's worst price, for the risk guard (_intrabar_guard),
         # and that price when it went through the liquidation price.
         self._guard_equity: float | None = None
@@ -1730,6 +1738,11 @@ class LongFlatStrategy(Strategy):
                   + (f"stop {_from_entry(level, side)}" if hit == "stop_loss" else
                      f"{level:.1%} target" + (" (below it, for a short)" if side < 0 else "")))
         values = {"entry_px": self._entry_px, "move": move, hit: level}
+        if hit == "stop_loss" and self._margin:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq(cash, qty) if qty else None
+            if liq is not None:
+                values["liquidation_px"] = round(liq, 8)  # GAP-LIQ: judged on its fill (_gap_liquidation)
         self._exit_lock = side if self._margin else True
         self._entry_px = None  # don't fire again while the sell is in flight
         self._sell_all(hit, reason, values)
@@ -2060,9 +2073,12 @@ class LongFlatStrategy(Strategy):
 
     def _liq(self, cash: float, qty: float) -> float | None:
         """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
-        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin)."""
+        same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin). On the position's own
+        entry, as the journal has it (cash is spot-style on that entry, _mark): after a restart the simulated venue
+        holds it at the restart's price, which put the liquidation price far past where it is (GAP-LIQ, line 6)."""
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-        return markets.isolated_liquidation(cash, qty, self._net_position()[1], lev, self._cfg.perp.maintenance_margin)
+        entry = self._entry_px or self._net_position()[1]
+        return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
 
     def _net_position(self) -> tuple[float, float]:
         """Perp: the signed position at the simulated venue and its average entry there."""
@@ -2417,6 +2433,9 @@ class LongFlatStrategy(Strategy):
         kinder by the wick. The stop fills at its level, or at the open if the price gaps through it."""
         if not (self._backtest and self._margin and self.runtime is not None) or self.instrument is None:
             return
+        stop = self._resting_exits().get("stop_loss") if self._entry_side else None
+        if stop is not None:  # GAP-LIQ: the resting stop is judged against the liquidation price as of this bar
+            self.decisions[str(stop.client_order_id)]["signal"].update(self._liq_signal())
         order = self.cache.order(ClientOrderId(self._risk_stop_id)) if self._risk_stop_id else None
         if order is not None and order.is_closed:
             order, self._risk_stop_id = None, None
@@ -2471,10 +2490,10 @@ class LongFlatStrategy(Strategy):
         word = "sell" if order.side == OrderSide.SELL else "buy"
         held = "long" if order.side == OrderSide.SELL else "short"
         liq = d.get("liq")
-        if liq is not None and (price <= liq if held == "long" else price >= liq):
+        if through_liquidation(1 if held == "long" else -1, price, liq):
             d.update(journaled=True, intent="liquidation", signal={"price": price, "liquidation_px": round(liq, 8)},
                      reason=f"Liquidated: the price {price:,.6g} gapped through the liquidation price {liq:,.6g}")
-            self.runtime.store.event(self.runtime.name, "error", "liquidation", d["reason"], ts=self.runtime.now())
+            self._liquidation_events(d["reason"], price, liq)
         else:
             what = {"risk_halt": "the drawdown halt", "risk_pause": "the daily-loss pause",
                     "liquidation_cut": "the cut before liquidation"}[intent]
@@ -2504,6 +2523,50 @@ class LongFlatStrategy(Strategy):
             self._sell_all("liquidation_cut", "Cut to avoid liquidation: the rest of the position", {"price": price})
         else:
             self._on_tick()
+
+    def _liq_signal(self) -> dict:
+        """The open position's liquidation price as the engine's check has it now, for a stop's journaled signal
+        ({} when there is none: flat, spot, or a long at 1x)."""
+        if not self._margin:
+            return {}
+        _, cash, qty, _ = self._mark()
+        liq = self._liq(cash, qty) if qty else None
+        return {"liquidation_px": round(liq, 8)} if liq is not None else {}
+
+    def _gap_liquidation(self, coid: str, journal_id: str, price: float) -> bool:
+        """GAP-LIQ (Independent Quant Advisor, 6 Oct): a stop whose fill, after slippage, is at or past the
+        liquidation price books as a liquidation, the venue having taken the position first. Its order is journaled
+        as one, with the liquidation event and an incident, so the D3 loss, the halt with X and Y, and the reset after
+        liquidation follow as for any liquidation. The liquidation price is the one the engine's own check had when
+        the stop fired (paper) or as of the bar it rested through (backtest); through_liquidation decides both."""
+        d = self.decisions.get(coid)
+        held = self._entry_side or 0
+        if d is None or d.get("intent") != "stop_loss" or not held:
+            return False
+        liq = (d.get("signal") or {}).get("liquidation_px")
+        if not through_liquidation(held, price, liq):
+            return False
+        reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
+                  "venue took the position first")
+        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price})
+        self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
+        self._liquidation_events(reason, price, liq)
+        self._exit_lock, self._flip = held, None
+        if self._entry_px is None:
+            # A paper stop clears the entry as it fires (_check_exits); the liquidation's X and a later slice's
+            # book need it, so it comes back from what the stop journaled.
+            self._entry_px = d["signal"].get("entry_px")
+        return True
+
+    def _liquidation_events(self, reason: str, price: float, liq: float) -> None:
+        """Every liquidation the engine books: the error event, and an incident for the PM (Advisor 18:17: the engine
+        opens one on every liquidation; a reset after liquidation needs its note)."""
+        rt = self.runtime
+        rt.store.event(rt.name, "error", "liquidation", reason, ts=rt.now())
+        rt.store.event(rt.name, "error", "incident",
+                       f"Incident, {rt.name}: liquidated at {price:,.6g} (liquidation price {liq:,.6g}); the position's "
+                       "margin is lost and the strategy stays halted until you reset it after liquidation, with a "
+                       "note on why the half-liquidation stop did not protect the position.", ts=rt.now())
 
     def _cover_shortfall(self, price: float, event=None) -> None:
         """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)
@@ -2622,7 +2685,7 @@ class LongFlatStrategy(Strategy):
         if liq is None:
             return
         side = 1 if qty > 0 else -1
-        crossed = price <= liq if side > 0 else price >= liq
+        crossed = through_liquidation(side, price, liq)
         distance = abs(price - liq) / price
         floor = self.runtime.profile.min_liquidation_distance if self.runtime is not None else 0.0
         if not crossed and distance >= floor:
@@ -2631,9 +2694,10 @@ class LongFlatStrategy(Strategy):
         reason = (f"Liquidated: the price {price:,.6g} reached the liquidation price {liq:,.6g}" if crossed else
                   f"Cut to avoid liquidation: the price {price:,.6g} is {distance:.1%} from the liquidation price "
                   f"{liq:,.6g}, inside the {floor:.0%} the risk profile keeps")
-        if self.runtime is not None:
-            self.runtime.store.event(self.runtime.name, "error" if crossed else "warning", intent, reason,
-                                     ts=self.runtime.now())
+        if self.runtime is not None and crossed:
+            self._liquidation_events(reason, price, liq)
+        elif self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", intent, reason, ts=self.runtime.now())
         self._exit_lock = side
         self._flip = None
         self._sell_all(intent, reason, {"price": price, "liquidation_px": round(liq, 8), "distance": round(distance, 6)})
@@ -2805,7 +2869,7 @@ class LongFlatStrategy(Strategy):
                 # so the liquidation goes first and is journaled as one (review round 11, M11-3).
                 probe = price if underwater or worst is None else worst
                 liq = self._liq(cash, qty)
-                if underwater or (liq is not None and (probe <= liq if qty > 0 else probe >= liq)):
+                if underwater or through_liquidation(1 if qty > 0 else -1, probe, liq):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
@@ -3046,6 +3110,8 @@ class LongFlatStrategy(Strategy):
             journal_id = kept_id
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
+        if self._margin and self.runtime is not None and self._gap_liquidation(coid, journal_id, px):
+            held = (held[0], self._entry_px)  # the entry a paper stop cleared as it fired, put back
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
         else:
@@ -3095,6 +3161,10 @@ class LongFlatStrategy(Strategy):
                   if intrabar is not None and intrabar[2] else None)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
+            if self._rebook is not None:
+                d = self.decisions[coid]
+                self.runtime.store.rebook_liquidation(self._rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
+                self._rebook = None
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
@@ -3204,7 +3274,8 @@ class LongFlatStrategy(Strategy):
                 f"{self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through",
-                {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
+                {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8),
+                 **self._liq_signal()}))
         if plan["take_profit"]:
             tp = plan["take_profit"]
             level = self._entry_px * (1 + side * tp)
