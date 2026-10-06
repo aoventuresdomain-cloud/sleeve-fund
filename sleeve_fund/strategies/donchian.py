@@ -11,6 +11,7 @@ from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.indicators import Donchian as DonchianChannel
 
 SPEC = IdeaSpec(
     summary="Three daily breakouts ({lookbacks} days), each a third of the position, sized to {vol_target:.0%} "
@@ -82,6 +83,10 @@ class Donchian(LongFlatStrategy):
         self._closes: deque[float] = deque(maxlen=max(config.lookbacks) + 1)  # the day's close last
         self._rets: deque[float] = deque(maxlen=config.vol_lookback_days)
         self._on = {n: False for n in config.lookbacks}
+        # The shared channel block (v2 P1-3): each third enters above the high close of the n days before and
+        # leaves below the low close of the n // 2 days before, the bar just closed left out of both.
+        self._entry = {n: DonchianChannel(n, source="close") for n in config.lookbacks}
+        self._exit = {n: DonchianChannel(max(n // 2, 1), source="close") for n in config.lookbacks}
         self._vol: float | None = None
         self._why: tuple[str, dict] = ("", {})
 
@@ -100,13 +105,15 @@ class Donchian(LongFlatStrategy):
             if prev > 0:
                 self._rets.append(math.log(close / prev))
         self._closes.append(close)
-        before = list(self._closes)[:-1]  # the days before this one, oldest first
         for n in self.c.lookbacks:
-            if len(before) < n:
+            entry, exit_ = self._entry[n], self._exit[n]
+            entry.update_raw(close, close, close)
+            exit_.update_raw(close, close, close)
+            if not entry.initialized:
                 continue
-            if not self._on[n] and close > max(before[-n:]):
+            if not self._on[n] and close > entry.values["upper"]:
                 self._on[n] = True
-            elif self._on[n] and close < min(before[-max(n // 2, 1):]):
+            elif self._on[n] and close < exit_.values["lower"]:
                 self._on[n] = False
         if len(self._rets) >= max(10, self.c.vol_lookback_days // 2):
             m = sum(self._rets) / len(self._rets)

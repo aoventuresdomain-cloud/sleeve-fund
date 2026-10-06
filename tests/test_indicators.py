@@ -18,7 +18,7 @@ from nautilus_trader.indicators import AverageTrueRange, SimpleMovingAverage
 
 from sleeve_fund.data import synthetic_ohlcv
 from sleeve_fund.store import Store
-from sleeve_fund.strategies.indicators import Atr, Rsi, Sma
+from sleeve_fund.strategies.indicators import AtrSma, Rsi, Sma
 from sleeve_fund.venues import KRAKEN
 
 AUTH = ("pm", "test-pw")
@@ -40,7 +40,7 @@ def _bars(n, seed=1):
 
 @pytest.mark.parametrize("period", [2, 14, 200, 1024])
 def test_our_averages_match_the_engines_where_it_works(period):
-    ours, theirs, our_atr, their_atr = Sma(period), SimpleMovingAverage(period), Atr(period), AverageTrueRange(period)
+    ours, theirs, our_atr, their_atr = Sma(period), SimpleMovingAverage(period), AtrSma(period), AverageTrueRange(period)
     for h, low, c in _bars(3000):
         ours.update_raw(c)
         theirs.update_raw(c)
@@ -53,7 +53,7 @@ def test_our_averages_match_the_engines_where_it_works(period):
 
 def test_our_averages_have_no_period_limit():
     closes = [c for _, _, c in _bars(6000)]
-    sma, atr = Sma(5000), Atr(5000)
+    sma, atr = Sma(5000), AtrSma(5000)
     for i, c in enumerate(closes):
         sma.update_raw(c)
         atr.update_raw(c * 1.01, c * 0.99, c)

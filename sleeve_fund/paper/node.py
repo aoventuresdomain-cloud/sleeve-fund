@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sys
 import threading
@@ -94,6 +95,23 @@ def history_loader(venue: str, pair: str, store=None, recent=None):
     return load
 
 
+def stored_minutes(venue: str, pair: str, store=None):
+    """The hub client's recover (sleeve_fund.paper.hub_client.Decoder): the history store's 1-minute bars
+    closing strictly between two times (UNIX ns), as (close ns, open, high, low, close, volume), oldest first.
+    The hub writes every minute it relays there as it relays it, so minutes the client missed are there."""
+    from sleeve_fund.history import HistoryStore
+
+    def recover(_instrument_id: str, after_ns: int, before_ns: int) -> list[tuple]:
+        # Read synchronously inside the hub client's read loop: only on a gap or at start, a few minutes from
+        # one instrument, in a process running one strategy, so the stall is short and nothing else waits on it.
+        hs = store or HistoryStore()
+        df = hs.read(venue, pair, 1, start=pd.Timestamp(after_ns, tz="UTC"), end=pd.Timestamp(before_ns, tz="UTC"))
+        df = df[df.index < pd.Timestamp(before_ns, tz="UTC")]
+        return [(int(ts.value), r.open, r.high, r.low, r.close, r.volume) for ts, r in df.iterrows()]
+
+    return recover
+
+
 def _recent_closed(recent, pair: str, minutes: int, why: str) -> pd.DataFrame:
     """The venue's complete recent candles, stamped at their close as the store's bars are. Raises LookupError
     with both reasons when the venue can't serve them either."""
@@ -137,16 +155,47 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
     return pd.concat([df, newer[list(df.columns)]]) if len(newer) else df
 
 
+def hub_address(venue: str, environ=None) -> tuple[str, int] | None:
+    """Where the venue's market data hub (v2 P1-1) serves, from HUB_<VENUE>=host:port (e.g.
+    hub-<venue>:7700 in the stack), or None: then the node keeps a venue connection of its own, as before the hub."""
+    raw = (os.environ if environ is None else environ).get(f"HUB_{venue.upper()}", "").strip()
+    if not raw:
+        return None
+    host, _, port = raw.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(f"HUB_{venue.upper()} must be host:port, not {raw!r}")
+    return host, int(port)
+
+
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
-               asset_fetch=None, recorder=None, history=None) -> LiveNode:
+               asset_fetch=None, recorder=None, history=None, hub: tuple[str, int] | None = None) -> LiveNode:
+    """hub: (host, port) of the venue's market data hub; by default HUB_<VENUE> (hub_address)."""
     assert_keyless()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
-    if profile.data_client is None:
+    hub = hub or hub_address(profile.name)
+    if profile.data_client is None and hub is None:
         raise ValueError(f"{profile.label} has no live market data client yet, so it can't run paper sleeves")
     venue = profile.venue
     base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
-    data_factory, data_config = profile.data_client()
+    if hub is not None:
+        # The hub's trades, quotes and 1-minute bars, the same for every strategy on the instrument; longer bars
+        # are built by the hub client from those minutes, as a backtest builds them from the store's.
+        from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, HubStatus, hub_bar_spec
+
+        spec = hub_bar_spec(sleeve.bar_spec)
+        bar_type = BarType.from_str(f"{sleeve.instrument_id}-{spec}")
+        data_factory = HubDataClientFactory()
+        hub_status = HubStatus()
+        data_config = HubDataClientConfig(venue=profile.name, instrument_ids=(sleeve.instrument_id,), host=hub[0],
+                                          port=hub[1], bar_spec=spec, status=hub_status,
+                                          recover=stored_minutes(profile.name, sleeve.instrument),
+                                          report=None if runtime is None else
+                                          lambda level, kind, message: runtime.store.event(sleeve.name, level, kind,
+                                                                                           message))
+    else:
+        bar_type = BarType.from_str(sleeve.bar_type)
+        data_factory, data_config = profile.data_client()
     fee_model = ScheduleFeeModel(sleeve.fees)
     perp = markets.is_perp(sleeve.params)
     balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
@@ -165,7 +214,9 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
-        .add_data_client(None, data_factory, data_config)
+        # The hub may take a minute to pick up an instrument it doesn't relay yet.
+        .with_timeout_connection(120 if hub is not None else 60)
+        .add_data_client("HUB" if hub is not None else None, data_factory, data_config)
         .add_simulated_exec_client(
             profile.name,
             SandboxExecutionClientFactory(),
@@ -179,6 +230,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 default_leverage=markets.VENUE_LEVERAGE if perp else None,
                 fee_model=fee_model,
                 fill_model=fill_model(),
+                # A hub-fed node fills from trades and quotes only: its bars are EXTERNAL, which the matching
+                # engine would otherwise replay through the book a minute late, at their receive time. A node on
+                # its own venue connection keeps the engine's default until it moves to the hub.
+                bar_execution=hub is None,
             ),
         )
         .build()
@@ -198,7 +253,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         strategy_cls(
             config_cls(
                 instrument_id=InstrumentId.from_str(sleeve.instrument_id),
-                bar_type=BarType.from_str(sleeve.bar_type),
+                bar_type=bar_type,
                 max_notional=sleeve.max_notional,
                 assumed_taker_fee=float(sleeve.fees.taker),
                 # Sizing to a loss at the stop uses live quotes; this covers the moments before the first.
@@ -209,10 +264,15 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                 **sleeve.params,
             )
         ).attach_runtime(runtime).attach_recorder(recorder)
-        .attach_history(history or history_loader(profile.name, sleeve.instrument, recent=profile.ohlc_history))
+        # A hub-fed node's history is the hub's own, in the store it writes: never the venue's candles, which
+        # could differ from the minutes it relayed (one hub, same data; QA P1-C8).
+        .attach_history(history or history_loader(profile.name, sleeve.instrument,
+                                                  recent=profile.ohlc_history if hub is None else None))
     )
-    if profile.ohlc_history is not None:
+    if profile.ohlc_history is not None and hub is None:
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
+    strategy.hub_fed = hub is not None
+    strategy.hub_status = hub_status if hub is not None else None
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
     strategy.simulated_venue = True
     strategy.fee_model = fee_model
