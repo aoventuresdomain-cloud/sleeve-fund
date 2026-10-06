@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag, cost_share %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -43,7 +43,7 @@
   <div class="kpi" title="Lost if every stop is hit{% if book.equity > 0 %}: {{ (book.open_risk / book.equity)|pct1 }} of book{% endif %}{% if book.unbounded %} · {{ book.unbounded }} position{{ 's' if book.unbounded != 1 }} without a stop, so unbounded{% endif %}"><div class="k">Open risk</div><div class="v {{ 'warn' if book.unbounded }}">{{ book.open_risk|money }}{% if book.unbounded %}+{% endif %}</div></div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected open-risk figures"><div class="k">Open risk</div><div class="v faint">–</div></div>{% endif %}
   <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
-  <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{% if book.cost_share is defined and book.cost_share is not none %} · {{ book.cost_share|pct0 }} of gross P&amp;L{% endif %}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
+  <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
 </section>
 
 <div class="grid">
@@ -70,6 +70,12 @@
         <tr><td><a href="/sleeves/{{ x.sleeve.name }}">{{ x.sleeve.name }}</a></td>
           <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if v >= 0 else 'loss' }}" style="{{ 'left:50%' if v >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
           <td class="num">{{ money_signed(v) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (v / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endfor %}
+      {# Archived strategies still count in the book's figures, so they get one row and the rows add up to Book (QA U1). #}
+      {% set arch = archived|sum(attribute=field) if archived else 0 %}
+      {% if arch|abs >= 0.005 %}{% set w = [arch|abs / scale * 50, 50]|min|round(1) %}
+        <tr class="archived-row"><td title="{{ archived|map(attribute='sleeve.name')|join(', ') }}"><a href="#archived" class="muted">Archived</a> <span class="faint">{{ archived|length }}</span></td>
+          <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if arch >= 0 else 'loss' }}" style="{{ 'left:50%' if arch >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
+          <td class="num">{{ money_signed(arch) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (arch / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endif %}
         <tr class="tot"><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(total) }}</td><td class="num muted">{% if total|abs >= 0.005 %}100%{% else %}–{% endif %}</td></tr>
       </tbody>
       {% endfor %}
@@ -141,7 +147,7 @@
       <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
       <td class="num" data-v="{{ x.ret }}" data-label="Since start">{{ signed(x.ret) }}</td>
       <td class="num" data-v="{{ x.ret - x.bench_ret }}" data-m="right" data-label="vs buy-and-hold">{{ pts(x.ret - x.bench_ret) }}</td>
-      <td class="num" data-v="{{ x.exposure }}" data-m="hide">{{ x.exposure|pct0 }}</td>
+      <td class="num" data-v="{{ x.exposure }}" data-m="hide" title="Position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</td>
       <td class="num" data-v="{{ x.trades.trades }}" data-m="hide">{{ x.trades.trades }}{% if x.trades.trades %} <span class="muted">· {{ x.trades.win_rate|pct0 }} won</span>{% endif %}</td>
       <td data-v="{{ x.dd_used }}" data-m="hide">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td class="num" data-v="{{ room }}" data-label="Room to halt"><span class="{{ 'loss' if x.dd_used >= 0.8 else ('warn' if x.dd_used >= 0.5) }}">{{ room|money }}</span></td>
@@ -158,7 +164,7 @@
 </section>
 
 {% if archived %}
-<details class="panel archived">
+<details class="panel archived" id="archived">
   <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
@@ -167,7 +173,7 @@
 {% endif %}
 
 {% if earlier %}
-<details class="panel archived">
+<details class="panel archived" id="archived">
   <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away when a new book began on {{ book_start.strftime('%d %b %Y') }}; kept with their history, and left out of this book's figures</span></summary>
   <ul class="feed" style="margin-top:10px">{% for s in earlier %}
     <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}

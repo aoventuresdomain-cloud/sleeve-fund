@@ -138,7 +138,7 @@ def _num(x) -> str:
 def exits_sentence(v: dict) -> str:
     """Step 3 in one sentence: the stop, the target and the risk profile (twin: exitsSentence in research.html)."""
     if v.get("stop_atr"):
-        stop = (f"Stop {_num(v['stop_atr'])} average true ranges below entry "
+        stop = (f"Stop {_num(v['stop_atr'])} simple average true ranges below entry "
                 f"({_num(v.get('atr_bars') or 14)} bars).")
     elif v.get("stop_loss_pct"):
         stop = f"Stop {_num(v['stop_loss_pct'])}% below entry."
@@ -242,14 +242,16 @@ def variants(spec) -> int:
 
 
 def venue_label(code: str | None) -> str | None:
+    """The market a venue code trades, in a word ("perpetual" or "spot"): pages never name the venue itself
+    (PM decision, QA U8). None when there is no code or it isn't a known venue."""
     if not code:
         return None
     from sleeve_fund.venues import venue
 
     try:
-        return venue(code).label
+        return "perpetual" if venue(code).perpetual else "spot"
     except ValueError:
-        return code
+        return None
 
 
 # --- a tear sheet read back ------------------------------------------------------------------------
@@ -327,6 +329,8 @@ def read_sheet(path: Path) -> dict:
             out.update(breakeven=0.0, breakeven_kind="none")
         elif words.startswith("still makes money"):
             out.update(breakeven=rungs[-1]["fee"] if rungs else None, breakeven_kind="above")
+        elif words.startswith("made no trades"):  # QA F6: not a loss
+            out.update(breakeven_kind="idle")
     if oos:
         out.update(oos_days=int(oos.group(2)), oos_cagr=oos.group(3).strip(), bench_cagr=oos.group(4).strip(),
                    oos_sharpe=oos.group(5).strip(), bench_sharpe=oos.group(6).strip())
@@ -346,12 +350,14 @@ def breakeven_text(s: dict) -> str:
         return "None"
     if s["breakeven_kind"] == "above":
         return f"Over {_p(s['breakeven'])}"
+    if s["breakeven_kind"] == "idle":
+        return "No trades"
     return "–"
 
 
 def banner(s: dict) -> str:
     """The verdict's one plain sentence, break-even first, built from the sheet's own words."""
-    fee, who = s.get("fee"), s.get("venue_label") or "The venue"
+    fee, who = s.get("fee"), "The venue"
     kind = s["breakeven_kind"]
     charges = f"{who} charges {_p(fee)}" if fee is not None else None
     if kind == "at":
@@ -361,6 +367,8 @@ def banner(s: dict) -> str:
                      else f" {charges}, so the edge survives its fee.")
     elif kind == "none":
         lead = "It loses money even with no fees, so there is no edge for fees to eat."
+    elif kind == "idle":
+        lead = "It made no trades, so there is no fee to break even on."
     elif kind == "above":
         lead = f"It still makes money at {_p(s['breakeven'])} per side, the top of the cost ladder."
         if charges:
@@ -442,7 +450,7 @@ def plans(rows: list[dict], sheets: list[dict]) -> list[dict]:
                 and "synthetic" not in s["dataset"] and s["g1"]]
         last = real[0] if real else None
         if last:
-            where = ", ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
+            where = " ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
             meta = f"{last['word']}{' on ' + where if where else ''}"
             if last.get("breakeven_kind") == "at":
                 meta += f" · break-even {_p(last['breakeven'])}"
