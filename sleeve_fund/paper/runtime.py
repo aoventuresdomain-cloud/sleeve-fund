@@ -14,6 +14,7 @@ import math
 from decimal import Decimal
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from sleeve_fund import risk
 from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
@@ -49,6 +50,54 @@ def clearing_action(sleeve, now: datetime | None = None) -> str | None:
         return (f"it is paused for the day's loss until {sleeve.paused_until:%d %b %H:%M} UTC, and only the next "
                 "00:00 UTC roll clears that")
     return None
+
+
+def entry_blocked(sleeve, now: datetime | None = None, *, liquidated: str | None = None,
+                  holds: dict[str, str] | None = None, starting: bool = False) -> tuple[bool, str | None]:
+    """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why in words). Blocked: liquidated
+    until a reset after liquidation (`liquidated`, from the journal: liquidation_head), a drawdown halt, the daily-loss
+    pause, then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
+    themselves) a pause with no end time, stopped, or a hold the engine has raised (`holds`, e.g. no funding rate or
+    stale data). The engine checks every order that would make the position bigger,
+    at submit and at fill; the supervisor and the dashboard's Start and Resume read the same answer. Stops,
+    reduce-only orders, the PM's close and a liquidation are never gated."""
+    if liquidated is not None:
+        return True, "it was liquidated, and only a reset after liquidation clears that"
+    why = clearing_action(sleeve, now)
+    if why is not None:
+        return True, why
+    if starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
+        return False, None
+    if sleeve.status == "paused" and sleeve.paused_until is None:  # the PM's pause, a flatten, the kill switch, or
+        # started for its exits only (a daily-loss pause past its roll is lifted by the runtime's next tick)
+        return True, "it is paused"
+    if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
+        return True, "it is stopped, and only Start clears that"
+    for why in (holds or {}).values():
+        return True, why
+    return False, None
+
+
+def liquidation_head(store, name: str) -> str | None:
+    """The head of a strategy's liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57): it
+    stays halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The journal
+    decides, not the latest halt's reason, which a later halt or stop can overwrite (QA on #164): liquidated is a
+    liquidation event, or a liquidation's halt, with no reset after liquidation since. None otherwise."""
+    reset = store.last_event(name, (RESET_AFTER_LIQUIDATION,))
+    since = store.sleeve_events_since(name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
+    heads = [e["message"].split(";")[0] for e in since
+             if e["kind"] == "risk_halt" and e["message"].startswith(WIPED_OUT)]
+    if heads:
+        return heads[-1]
+    if any(e["kind"] == "liquidation" or e["message"].startswith(("wiped out", "position margin lost"))
+           for e in since):  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
+        return WIPED_OUT
+    return None
+
+
+def entry_blocked_in(store, name: str, now: datetime | None = None, *, starting: bool = False) -> tuple[bool, str | None]:
+    """entry_blocked for a strategy as its journal has it, for the supervisor and the dashboard (no engine holds)."""
+    return entry_blocked(store.sleeve(name), now, liquidated=liquidation_head(store, name), starting=starting)
 
 
 class SleeveRuntime:
@@ -112,22 +161,13 @@ class SleeveRuntime:
         # The smallest position the strategy can close (its lot or the venue's minimum, set at start): less
         # than this is dust a flatten can't sell, so it owes nothing (sanity, 4 Oct).
         self.close_floor = 0.0
+        # Why the engine holds new entries back for now, by what raised it (e.g. "funding", "data"): CHOKE's
+        # entry_blocked reads them. Each holder sets and clears its own key.
+        self.holds: dict[str, str] = {}
 
     def _last_liquidation(self) -> str | None:
-        """The head of its liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57): it stays
-        halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The journal
-        decides, not the latest halt's reason, which a later halt or stop can overwrite (QA on #164): liquidated is
-        a liquidation event, or a liquidation's halt, with no reset after liquidation since. None otherwise."""
-        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
-        since = self.store.sleeve_events_since(self.name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
-        heads = [e["message"].split(";")[0] for e in since
-                 if e["kind"] == "risk_halt" and e["message"].startswith(WIPED_OUT)]
-        if heads:
-            return heads[-1]
-        if any(e["kind"] == "liquidation" or e["message"].startswith(("wiped out", "position margin lost"))
-               for e in since):  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
-            return WIPED_OUT
-        return None
+        """The head of its liquidation halt while it is liquidated, else None (liquidation_head)."""
+        return liquidation_head(self.store, self.name)
 
     def _restored_peak(self, starting_balance: float) -> float:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
@@ -205,6 +245,16 @@ class SleeveRuntime:
             self._set("stopped", "process stopped")
 
     # --- gates ----------------------------------------------------------------
+
+    def entry_blocked(self) -> tuple[bool, str | None]:
+        """CHOKE: whether nothing may open or add now, and why (module entry_blocked on this runtime's own state).
+        An expired daily-loss pause is rolled first; a backtest has no PM, so it is never stopped."""
+        self.can_open()
+        desired = "running" if self.backtest else self.store.sleeve(self.name).desired_state
+        state = SimpleNamespace(status=self.status, status_reason=self.liquidated or "", paused_until=self.paused_until,
+                                desired_state=desired)
+        return entry_blocked(state, self.now(), liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
+                             holds=self.holds)
 
     def can_open(self) -> bool:
         if self.wiped_out:

@@ -52,7 +52,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import clearing_action
+from sleeve_fund.paper.runtime import entry_blocked_in
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -645,8 +645,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
-                    why = clearing_action(s, utcnow())
-                    if why is not None and not (s.status == "halted" and any(
+                    blocked, why = entry_blocked_in(st(), name, utcnow(), starting=True)  # CHOKE
+                    if blocked and not (s.status == "halted" and any(
                             c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
                         raise ValueError(f"not started: {why}")  # a halt is cleared only by its own action (HC)
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
@@ -655,7 +655,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # weeks later; it lapses instead, and the decision log says so.
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
-            elif command == "resume" and (why := clearing_action(st().sleeve(name), utcnow())) and "only a resume" not in why:
+            elif (command == "resume" and (why := entry_blocked_in(st(), name, utcnow(), starting=True)[1])
+                  and "only a resume" not in why):
                 raise ValueError(f"a resume can't clear it: {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):

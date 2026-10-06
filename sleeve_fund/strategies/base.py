@@ -34,7 +34,7 @@ from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
 from sleeve_fund.paper.runtime import WIPED_OUT, liquidation_reason
-from sleeve_fund.store import DUST, replay_book
+from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -458,6 +458,8 @@ class LongFlatStrategy(Strategy):
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
         self._noted: set[str] = set()  # warnings already logged; each is said once until it clears
+        self._journal_intents: dict[str, str] | None = None  # open orders' intents from before a restart
+        self._gated_fills: set[str] = set()  # orders whose fill came in while nothing may open (CHOKE): one incident each
         self._last_market_ns: int | None = None  # the latest trade or quote, for the price watchdog
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
@@ -1694,8 +1696,7 @@ class LongFlatStrategy(Strategy):
                            f"volume is worth {cap:,.2f}, below the smallest order the venue takes")
             return False
         self._noted.discard("buy_skipped")
-        self._submit(side, size, "rebalance", reason, signal)
-        return True
+        return self._submit(side, size, "rebalance", reason, signal)
 
     def _check_exits(self, price: float) -> bool:
         """Stop-loss / take-profit against the average entry. True if an exit was sent.
@@ -1811,9 +1812,16 @@ class LongFlatStrategy(Strategy):
             return (self._ask - self._bid) / (self._ask + self._bid)
         return self._cfg.assumed_half_spread
 
-    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
+    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order, journaling it with its reason first so the record exists before the venue sees
-        it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first."""
+        it. With maker_wait_minutes set, signal-driven orders rest as post-only limits first. An order that would
+        open or add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent."""
+        if (why := self._gated(side, intent)) is not None:
+            self._note("entry_gated", f"Order not sent: it would open or add to the position, and {why}. Nothing "
+                       "opens until that clears; stops and closes still run")
+            return False
+        if intent in OPENING_INTENTS:
+            self._noted.discard("entry_gated")
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         wait = self._cfg.maker_wait_minutes
         last, tick = self._price(), self.instrument.price_increment.as_double()
@@ -1853,6 +1861,7 @@ class LongFlatStrategy(Strategy):
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
+        return True
 
     def _maker_price(self, side, last: float, tick: float) -> float:
         """Where a post-only order rests: at the best bid (to buy) or ask (to sell), so it adds liquidity
@@ -2820,20 +2829,62 @@ class LongFlatStrategy(Strategy):
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
             elif self._margin:
                 self._liquidation_guard(cash, qty, worst or price)
-            if self.runtime.wiped_out:
-                self._cancel_resting_entries()
+            self._cancel_resting_entries()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_tick", exc)
 
     def _cancel_resting_entries(self) -> None:
-        """Liquidated, nothing opens again until the PM resets it after liquidation (Advisor 17:57, rule (c) on
-        resting entries; QA P1-D21): every entry still resting at the venue is cancelled. The halt flattens nothing,
-        the position being gone, so without this a resting entry filled later and opened a position on a halted
-        strategy. Closing orders (the liquidation itself, a resting exit) are left alone."""
-        for order in self.cache.orders_open(strategy_id=self.strategy_id):
-            if (self.decisions.get(str(order.client_order_id), {}).get("intent") in ("entry", "rebalance")
-                    and order.status != OrderStatus.PENDING_CANCEL):
+        """While nothing may open (CHOKE: liquidated until a reset after liquidation, Advisor 17:57 rule (c), QA P1-D21;
+        halted, paused or stopped), every entry or rebalance still resting at the venue, or the unfilled rest of one,
+        is cancelled. Without it a resting entry filled later and opened a position on a halted strategy. Closing
+        orders (stops, exits, the liquidation itself) are left alone."""
+        open_ = [o for o in self.cache.orders_open(strategy_id=self.strategy_id) if o.status != OrderStatus.PENDING_CANCEL]
+        if self._journal_intents is None and any(str(o.client_order_id) not in self.decisions for o in open_):
+            # An order this process has no decision for was sent before a restart: the journal has its intent. Read
+            # once; such an order's intent never changes (Code Reviewer on 81e6d6f).
+            rt = self.runtime
+            self._journal_intents = {o["order_id"]: o["intent"]
+                                     for o in rt.store.orders(rt.name, statuses=OPEN_ORDER_STATUSES, limit=1000)}
+
+        def intent(coid: str):
+            return self.decisions.get(coid, {}).get("intent") or (self._journal_intents or {}).get(coid)
+        resting = [o for o in open_ if intent(str(o.client_order_id)) in OPENING_INTENTS]
+        if resting and self.runtime.entry_blocked()[0]:
+            for order in resting:
                 self.cancel_order(order.client_order_id)
+
+    def _gated_fill(self, coid: str, qty: float, px: float) -> None:
+        """CHOKE at fill: an entry or rebalance that fills while nothing may open (sent before the gate closed, its
+        cancel too late) is kept, with its stop placed for what filled as on any entry, and never flattened; it opens
+        an incident, once per order, for the PM to decide."""
+        if (self.runtime is None or coid in self._gated_fills
+                or self.decisions.get(coid, {}).get("intent") not in OPENING_INTENTS):
+            return
+        blocked, why = self.runtime.entry_blocked()
+        if not blocked:
+            return
+        self._gated_fills.add(coid)
+        rt = self.runtime
+        rt.store.event(rt.name, "error", "incident",
+                       f"Incident, {rt.name}: an order that adds to the position filled while nothing may open ({why}): "
+                       f"{qty:g} at {px:,.6g}. It is kept with its stop, not closed; you decide what to do with it.",
+                       ts=rt.now())
+
+    def _adds(self, side) -> bool:
+        """Whether an order on `side` would make the position bigger: on a perp, a buy when flat or long and a sell
+        when flat or short (a reversal's opening leg included, sent once its close has filled); on spot, a buy."""
+        if not self._margin:
+            return side == OrderSide.BUY
+        net = self._net_position()[0] if self.cache is not None and self.instrument is not None else 0.0
+        return net >= 0 if side == OrderSide.BUY else net <= 0
+
+    def _gated(self, side, intent: str) -> str | None:
+        """CHOKE at submit: why an order that would open or add may not be sent now (runtime.entry_blocked), else
+        None. An entry always opens or adds (a reversal's opening leg is sent once its close has filled); a rebalance
+        only when it buys more. Stops, exits, closes and liquidations are never gated."""
+        if self.runtime is None or not (intent == "entry" or (intent == "rebalance" and self._adds(side))):
+            return None
+        return self.runtime.entry_blocked()[1]
 
     # Order lifecycle into the journal; fills are journaled in on_order_filled.
     def _order_status(self, event, status: str) -> None:
@@ -3010,6 +3061,8 @@ class LongFlatStrategy(Strategy):
                     self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
                     self._stop_frac = self._tp_frac = None
                     self._replan_pending = self._plan_entry = None
+        if opening:
+            self._gated_fill(coid, qty, px)
         if self._backtest:
             if opening and self._pending_exit is None:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
