@@ -376,7 +376,7 @@ def _booked(s, sold):
 
 @pytest.mark.parametrize("minutes, hit, booked", [
     ([(100.5, 99.5), (100.2, 97.9), (101.0, 99.0)], "stop_loss", 98.0),  # 2% stop at 98 crossed in minute 2
-    ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0),
+    ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0 * 0.9995),  # less the taker's slippage (L12)
     ([(105.5, 97.5)], "stop_loss", 98.0),  # both in one minute: the stop, adverse first (Advisor NA-2)
     ([(100.5, 99.5), (97.0, 96.0)], "stop_loss", 96.5),  # the second minute opens past the stop: at its open
     ([(101.0, 99.0)], None, None),

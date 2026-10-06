@@ -251,8 +251,9 @@ def test_a_stop_set_inside_a_bar_is_never_rebooked_as_the_target_from_that_bars_
     assert fm.rebooked == {}  # a stop, at the stop
     opens.pre_process(second)  # the next bar opens through the target with the position held
     got = fm.get_commission(stop, Quantity(0.1, 8), Price(9_900, 2), inst).as_double()
-    assert fm.rebooked == {"S": 10_200.0}
-    assert 0.1 * 9_900 - got == pytest.approx(0.1 * 10_200 * (1 - 0.008))  # booked at the target, taker fee
+    assert fm.rebooked == {"S": (10_200.0, pytest.approx(10_200 * 0.9995))}
+    # Booked at the target less the taker's 0.05 % slippage (Advisor L12), with the taker fee.
+    assert 0.1 * 9_900 - got == pytest.approx(0.1 * 10_200 * 0.9995 * (1 - 0.008), abs=0.01)  # to the cent
 
 
 def test_a_maker_entry_inside_a_bar_that_traded_through_its_target_is_judged_from_the_next_bar(instrument):

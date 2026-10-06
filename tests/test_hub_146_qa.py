@@ -432,6 +432,23 @@ def price_at(prices, minute_k: float) -> float:
     return float(prices[int(minute_k * 60)])
 
 
+# Advisor #146 L12 FINAL (6 Oct 19:30, + 19:38, 19:40 exact touch): phase 1 targets are market-on-touch, taker. Paper
+# live books the real fill and records the level; the backtest, and paper's OUTAGE REPLAY (no real fill), book every
+# target fill (touch or gap) at the level less max(half spread, 0.05 %), taker fee, never the open; the replay row
+# is marked as a modelled price. (Supersedes "the target at its level" in the pins below, moved 6 Oct ~19:50.)
+TP_SLIP = max(SPREAD / 2 / BASE, 0.0005)
+
+
+def tp_model(level: float, side: int) -> float:
+    return level * (1 - side * TP_SLIP)
+
+
+def is_modelled(signal: dict | None) -> bool:
+    """The replay row says its price is modelled, not a fill: a key or a text value naming it."""
+    return any("model" in str(k).lower() or (isinstance(v, str) and "model" in v.lower())
+               for k, v in (signal or {}).items())
+
+
 # ======================================================== check 2: C1 on reconnect (hub away, node running)
 
 
@@ -456,12 +473,15 @@ def _outage_prices(what: str, side: int, n_minutes: int):
 
 def assert_na1_price(run: Run, p, what: str, side: int, back: float) -> None:
     """Advisor NA-1 (6 Oct 16:53): the stop at its level or worse (a few bp of spread, no more); on a gap, the open
-    of the minute that crossed it; the target at its level; the market-on-return price recorded beside the fill."""
+    of the minute that crossed it; the target at its level less TP_SLIP, marked modelled (L12 FINAL 19:30); the
+    market-on-return price recorded beside the fill."""
     ex = first_exit(run.sequence())
     entry = fill_px(run, "entry")
     if what == "target":
         level = entry * (1 + side * 0.02)
-        assert ex[0] == "take_profit" and abs(ex[3] / level - 1) < 3e-4, (ex, level)
+        assert ex[0] == "take_profit" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
+        (o,) = [o for o in run.orders if o["intent"] == "take_profit"]
+        assert is_modelled(o["signal"]), o["signal"]
     elif what == "gap_through_stop":
         gap_open = price_at(p, 7.0)
         assert ex[0] == "stop_loss" and abs(ex[3] / gap_open - 1) < 3e-4, (ex, gap_open)
@@ -1011,10 +1031,10 @@ def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_back
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, favourable(side, 0.03))
     run = _outage(path, p, side=side, perp=perp, profile=profile, tp=0.02)
     ex = first_exit(run.sequence())
-    level = _entry(run) * (1 + side * 0.02)
-    assert ex[0] == "take_profit" and abs(ex[3] / level - 1) < 3e-4, (ex, level)
+    level = _entry(run) * (1 + side * 0.02)  # L12 FINAL 19:30: the level less TP_SLIP in the replay and the backtest
+    assert ex[0] == "take_profit" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
     bt = _bt_exit(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25)
-    assert abs(ex[3] / bt[3] - 1) < 3e-4, (ex, bt)
+    assert abs(ex[3] / bt[3] - 1) < 1e-4, (ex, bt)
 
 
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
@@ -1151,6 +1171,7 @@ def _relay(monkeypatch, refill):
 
 def _raise(*a, **k):
     raise ConnectionError("qa: the venue's REST is down too")
+
 
 
 @pytest.mark.parametrize("case", ["found", "nothing_found", "refill_raises", "instrument_not_relayed"])
