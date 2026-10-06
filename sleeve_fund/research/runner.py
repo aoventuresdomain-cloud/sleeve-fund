@@ -11,6 +11,7 @@ import math
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import LoggerConfig, LogLevel
@@ -45,6 +46,9 @@ class BacktestResult:
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
+    # Entries filled on a decision candle in which an exit, stop or target of the position also filled (Advisor
+    # 22:30): a stop or target inside the candle may re-enter at its close, and this says how often.
+    reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
@@ -246,6 +250,7 @@ def run_backtest(
             unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
                                 if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
+            reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, bar_minutes),
         )
     finally:
         if runtime is not None:
@@ -253,6 +258,19 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def reentries_on_exit_candle(fills: pd.DataFrame | None, decisions: dict, bar_minutes: int) -> int:
+    """Entries filled on a decision candle, (close - bar, close], in which a non-entry order also filled."""
+    if fills is None or fills.empty:
+        return 0
+    entry = np.array([decisions.get(o, {}).get("intent") == "entry" for o in fills.index], dtype=bool)
+    ts = pd.DatetimeIndex(fills["ts_last"]).as_unit("ns").asi8
+    exits = np.sort(ts[~entry])
+    at = ts[entry]
+    # an exit in (entry - bar, entry]: the count of exits at or before the entry beats those at or before its open
+    return int(np.sum(np.searchsorted(exits, at, side="right") > np.searchsorted(exits, at - bar_minutes * 60_000_000_000,
+                                                                                 side="right")))
 
 
 def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:
