@@ -1912,7 +1912,7 @@ class LongFlatStrategy(Strategy):
                 self._funding_fallback_said = True
                 if self.runtime is not None:
                     self.runtime.store.event(self.runtime.name, "warning", "funding_fallback",
-                                             f"No settled funding rate from {terms.label} for {pair} at {when:%d %b %Y %H:%M} "
+                                             f"No settled funding rate from the venue for {pair} at {when:%d %b %Y %H:%M} "
                                              f"UTC; charged the {terms.funding_rate:.4%} baseline instead (said once)",
                                              ts=ts)
             return terms.funding_rate

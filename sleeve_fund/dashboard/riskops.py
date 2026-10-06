@@ -42,10 +42,14 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "x": x,
             "dd_used": x["dd_used"],
             "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
-            "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
+            # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
+            "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
             "headroom": x["room"],
-            "has_stop": bool(s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
-            "position": positions.get(s.name),
+            # An open position's own stop (an exit-plan edit moves it), else the model's setting (P1-U14).
+            "has_stop": bool(pos["stop_px"]) if (pos := positions.get(s.name)) else bool(
+                s.params.get("stop_loss") or s.params.get("stop_atr") or s.params.get("stop_swing_bars")),
+            "stop_dist": abs(pos["stop_px"] / pos["entry_px"] - 1) if pos and pos["stop_px"] and pos["entry_px"] else None,
+            "position": pos,
             "shocks": shocks,
         })
     equity = book["equity"] or 1.0
@@ -190,7 +194,10 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
             continue  # already named, worse
         used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss"), (r["cap_used"], "position cap")]
         share, which = max(used, key=lambda u: u[0])
-        if share > NEAR_LIMIT:
+        if which == "position cap" and share > 1:
+            # The cap limits new entries only: past it through price drift is information, not a call to act.
+            warn.append(f"{s.name}'s exposure is {share:.0%} of its entry cap because the price moved; no action")
+        elif share > NEAR_LIMIT:
             warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
     warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:

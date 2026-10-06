@@ -764,7 +764,7 @@ def test_position_tab_is_compact_with_reason_folded(client):
     store.record_equity("sol-x", equity=10_049.28, cash=9_099.28, qty=10, price=95, benchmark=10_000)
     page = c.get("/sleeves/sol-x", auth=AUTH).text
     tab = page[page.index('id="tab-positions"'):page.index('id="tab-activity"')]
-    for label in ("Size", "Quantity", "Notional", "Share of equity", "Entry", "Stop-loss", "Take-profit", "Unrealised", "Realised", "Total"):
+    for label in ("Size", "Quantity", "Notional", "Exposure", "Entry", "Stop-loss", "Take-profit", "Unrealised", "Realised", "Total"):
         assert f">{label}<" in tab or f">{label} " in tab, label
     assert "10 SOL" in tab and "950.00 USD" in tab  # quantity in the instrument and notional in the quote
     assert '<details class="why-fold">' in tab and "RSI 25.1 below 30" in tab

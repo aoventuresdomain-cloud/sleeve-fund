@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help %}
+{% from "_macros.html" import stop_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
 {% from "_signals.html" import signals_tab, signals_panel, signals_side %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
@@ -59,7 +59,7 @@
   <div class="kpi" title="{{ x.pnl|smoney }} since start · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}"><div class="k">Since start</div><div class="v">{{ signed(x.ret) }}</div></div>
   <div class="kpi" title="{% if x.entry_px %}On the open position, entered at {{ x.entry_px|px }}{% else %}No open position{% endif %}"><div class="k">Unrealised</div><div class="v">{{ money_signed(x.unrealised) }}</div></div>
   <div class="kpi" title="{{ t.trades }} closed trade{{ 's' if t.trades != 1 }}{% if t.trades %} · {{ t.win_rate|pct0 }} won{% endif %}"><div class="k">Realised</div><div class="v">{{ money_signed(realised) }}</div></div>
-  <div class="kpi" title="Fees {{ x.fees|money }} over {{ x.fills }} fills{% if perp %} · funding {{ 'received' if perp.funding_total >= 0 else 'paid' }} {{ perp.funding_total|abs|money }}{% endif %}{% if x.cost_share is defined and x.cost_share is not none %} · {{ x.cost_share|pct0 }} of gross P&amp;L{% endif %}"><div class="k">Fees and funding</div><div class="v">{{ fees_funding|money }}</div></div>
+  <div class="kpi" title="Fees {{ x.fees|money }} over {{ x.fills }} fills{% if perp %} · funding {{ 'received' if perp.funding_total >= 0 else 'paid' }} {{ perp.funding_total|abs|money }}{% endif %}{{ cost_share(x) }}"><div class="k">Fees and funding</div><div class="v">{{ fees_funding|money }}</div></div>
 </section>
 
 {# The strategy's own desk: headline figures stay on top, the detail sits in tabs. Without JavaScript every tab shows, one after another. #}
@@ -93,8 +93,8 @@
     {# Three limits: margin (or position) against its cap, room before the drawdown halt, today's loss against the pause. #}
     {% set room = x.room if x.room is defined else none %}
     <div class="limit-bars">
-      {% if risk.margin_used is defined %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.margin_used) }}</div>
-      {% else %}<div title="{{ x.exposure|abs|pct1 }} of equity in {{ 'notional' if perp else 'the position' }}, against a cap of {{ x.cap|pct0 }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.cap_used) }}</div>{% endif %}
+      {% if risk.margin_used is defined %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">{{ 'Isolated margin' if perp else 'Position' }} of cap</span>{{ usage(risk.margin_used, drift=True) }}</div>
+      {% else %}<div title="Exposure {{ '%.2f'|format(x.exposure|abs) }}× equity, against an entry cap of {{ '%.2f'|format(x.cap) }}×"><span class="k">{{ 'Isolated margin' if perp else 'Exposure' }} of cap</span>{{ usage(risk.cap_used, drift=True) }}</div>{% endif %}
       <div title="Drawdown {{ x.drawdown|pct1 }} of the {{ x.profile.max_drawdown|pct0 }} halt"><span class="k">Room to halt</span>{{ usage(x.dd_used) }} <b>{% if room is not none %}{{ room|money }}{% else %}<span class="faint" title="Waiting on the corrected room-to-halt figure">–</span>{% endif %}</b></div>
       {% if not backtest_id %}<div title="Today's loss {{ [0 - x.day_ret, 0]|max|pct1 }} of the {{ x.profile.daily_loss|pct0 }} pause limit"><span class="k">Today's loss</span>{{ usage(risk.day_used) }}</div>{% endif %}
     </div>
@@ -169,7 +169,7 @@
     <div class="pos-card"><h3>Size</h3><dl>
       <div><dt>Quantity</dt><dd>{% if position %}{{ position.qty|abs|qty }} {{ base }}{% else %}<span class="muted">0 {{ base }}</span>{% endif %}</dd></div>
       <div><dt>Notional</dt><dd>{% if position %}{{ position.value|abs|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
-      <div><dt>Share of equity</dt><dd>{{ x.exposure|pct1 }} <span class="faint">cap {{ x.cap|pct0 }}</span></dd></div>
+      {% if not perp %}<div><dt title="Position value at the current price ÷ the strategy's equity. The cap applies when a position is opened.">Exposure</dt><dd>{{ '%.2f'|format(x.exposure|abs) }}× equity <span class="faint">· cap {{ '%.2f'|format(x.cap) }}×</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn exposure-drift">above entry cap because the price moved; no action</span>{% endif %}</dd></div>{% endif %}
     </dl></div>
     <div class="pos-card"><h3>Price</h3><dl>
       <div><dt>Entry</dt><dd>{% if position %}{{ position.entry_px|px }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
@@ -227,7 +227,7 @@
   <div class="panel-head"><h2 id="lim-h">Limits and health</h2></div>
   <div class="pos-grid two">
     <div class="pos-card"><h3>Limits used</h3><dl>
-      <div><dt>Position cap</dt><dd>{{ usage(risk.cap_used) }} <span class="faint">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn" title="The cap applies when a position is opened; it doesn't trim an open one.">above entry cap because the price moved; no action</span>{% endif %}</dd></div>
+      <div><dt>Exposure</dt><dd>{{ usage(risk.cap_used, drift=True) }} <span class="faint">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}× cap</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn" title="The cap applies when a position is opened; it doesn't trim an open one.">above entry cap because the price moved; no action</span>{% endif %}</dd></div>
       <div><dt>Drawdown</dt><dd>{{ usage(x.dd_used) }} <span class="faint">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></dd></div>
       {% if not backtest_id %}<div><dt>Today's loss</dt><dd>{{ usage(risk.day_used) }} <span class="faint">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></dd></div>{% endif %}
     </dl></div>

@@ -1341,7 +1341,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import setup_view
         from sleeve_fund.venues import VENUES
 
-        fee_quotes = [{"venue_label": q.venue_label, "source": q.source, "taker": float(q.fees.taker),
+        # Named by market, not venue: venue names appear only where the PM sets up keys (QA U8 ruling).
+        fee_quotes = [{"venue_label": "Perpetual venue" if v.perpetual else "Spot venue", "source": q.source, "taker": float(q.fees.taker),
                        "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
@@ -1708,12 +1709,13 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "cap_used": min(abs(x["exposure"]) / cap, 1.0) if (cap := x.get("cap", p.max_position_pct)) else 0.0,
+        # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
+        "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
         "margin": margin,
         "margin_cap": margin_cap,
-        "margin_used": min(margin / margin_cap, 1.0) if margin_cap > 0 else 0.0,
+        "margin_used": margin / margin_cap if margin_cap > 0 else 0.0,
     }
 
 

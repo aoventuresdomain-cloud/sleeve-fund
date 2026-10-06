@@ -39,7 +39,7 @@
     <tr><td><a href="/sleeves/{{ p.sleeve }}"><strong>{{ p.sleeve }}</strong></a> <span class="muted">{{ p.pair }}</span></td>
       <td class="num" data-m="hide">{{ p.qty|abs|qty }} {{ p.pair.split('/')[0] }}{% if p.side == -1 %}<div class="sub">short</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ p.entry_px|px }}</td><td class="num" data-m="hide">{{ p.price|px }}</td>
-      <td class="num" data-m="hide">{{ p.value|money }} <span class="muted">{{ p.weight|pct0 }}</span></td>
+      <td class="num" data-m="hide">{{ p.value|money }} <span class="muted" title="Exposure: position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(p.weight|abs) }}×</span></td>
       <td class="num" data-m="right">{{ money_signed(p.unrealised) }} <span class="muted">{{ p.unrealised_ret|pct1s }}</span></td>
       <td class="num" data-label="Held">{{ p.held|held }}</td>
       <td class="num" data-m="hide">{{ p.stop_px|px if p.stop_px else '–' }} / {{ p.target_px|px if p.target_px else '–' }}</td>
