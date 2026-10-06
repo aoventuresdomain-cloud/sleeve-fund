@@ -214,26 +214,17 @@ def status_word(items: list[dict], running: int) -> dict:
     return {"word": "Needs a look", "tone": "warn", "issues": items, "line": line}
 
 
-def drawdown_chart(curve, days: int = 30, halt: float | None = None, w: float = 420, h: float = 110) -> dict:
-    """The book's drawdown over the last `days` daily closes as SVG geometry: the line and its area, the
-    current value and the worst in the window, and the y axis (0% at the top, deeper further down)."""
+def drawdown_chart(curve, days: int = 30, halt: float | None = None) -> dict:
+    """The book's drawdown over the last `days` daily closes for the Lightweight Charts area (QA U10): a UTC
+    timestamp per close and the drawdown in percent below the peak (negative), the current value and the worst
+    in the window as shares, and the halt line's level when the book shares one."""
     dd = curve["drawdown"] if len(curve) else []
     if len(dd):
         dd = dd[dd.index >= dd.index[-1] - pd.Timedelta(days=days - 1)]
     values = [max(float(v), 0.0) for v in dd]
-    worst = max(values) if values else 0.0
-    current = values[-1] if values else 0.0
-    left, top, bottom = 34.0, 10.0, h - 14
-    scale = max(worst * 1.25, halt or 0.0, 0.01)
-    y = lambda v: top + v / scale * (bottom - top)  # noqa: E731
-    step = (w - 6 - left) / (len(values) - 1) if len(values) > 1 else 0.0
-    pts = [(left + i * step, y(v)) for i, v in enumerate(values)]
-    line = " ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
-    area = (f"M{left:.1f},{top:.1f} " + " ".join(f"L{px:.1f},{py:.1f}" for px, py in pts)
-            + f" L{pts[-1][0]:.1f},{top:.1f} Z") if len(pts) > 1 else ""
-    ticks = [{"y": y(f * scale), "label": f"{f * scale:.0%}" if scale >= 0.05 else f"{f * scale:.1%}"} for f in (0.0, 0.5, 1.0)]
-    return {"line": line, "area": area, "dot": pts[-1] if pts else None, "ticks": ticks, "w": w, "h": h, "left": left,
-            "halt": halt, "halt_y": y(halt) if halt else None, "current": current, "worst": worst, "points": len(values)}
+    return {"t": [int(pd.Timestamp(t).timestamp()) for t in (dd.index if len(dd) else [])],
+            "dd": [round(-v * 100, 4) for v in values], "halt": halt,
+            "current": values[-1] if values else 0.0, "worst": max(values) if values else 0.0, "points": len(values)}
 
 
 def stress_bars(scenarios: list[dict]) -> dict:

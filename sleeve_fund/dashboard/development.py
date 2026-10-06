@@ -235,14 +235,16 @@ def variants(spec) -> int:
 
 
 def venue_label(code: str | None) -> str | None:
+    """The market a venue code trades, in a word ("perpetual" or "spot"): pages never name the venue itself
+    (PM decision, QA U8). None when there is no code or it isn't a known venue."""
     if not code:
         return None
     from sleeve_fund.venues import venue
 
     try:
-        return venue(code).label
+        return "perpetual" if venue(code).perpetual else "spot"
     except ValueError:
-        return code
+        return None
 
 
 # --- a tear sheet read back ------------------------------------------------------------------------
@@ -344,7 +346,7 @@ def breakeven_text(s: dict) -> str:
 
 def banner(s: dict) -> str:
     """The verdict's one plain sentence, break-even first, built from the sheet's own words."""
-    fee, who = s.get("fee"), s.get("venue_label") or "The venue"
+    fee, who = s.get("fee"), "The venue"
     kind = s["breakeven_kind"]
     charges = f"{who} charges {_p(fee)}" if fee is not None else None
     if kind == "at":
@@ -435,7 +437,7 @@ def plans(rows: list[dict], sheets: list[dict]) -> list[dict]:
                 and "synthetic" not in s["dataset"] and s["g1"]]
         last = real[0] if real else None
         if last:
-            where = ", ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
+            where = " ".join(x for x in (last.get("instrument"), last.get("venue_label")) if x)
             meta = f"{last['word']}{' on ' + where if where else ''}"
             if last.get("breakeven_kind") == "at":
                 meta += f" · break-even {_p(last['breakeven'])}"

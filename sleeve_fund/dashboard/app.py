@@ -29,6 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from sleeve_fund import markets
 from sleeve_fund.dashboard import book as bookm
+from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
@@ -102,7 +103,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["maker_enabled"] = maker_orders_enabled
     templates.env.globals["market_choices"] = market_choices
     templates.env.globals["venue_choices"] = venue_choices
-    templates.env.globals["venue_label"] = lambda name: _research_venue(name).label
+    templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
@@ -886,7 +887,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         jobs = app.state.jobs
         target = st().url if jobs.isolate and st().url else st()
         key = "study|" + "|".join(f"{k}={v}" for k, v in sorted(vars(req).items()))
-        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({profile.label}), "
+        title = (f"G1 study of {req.strategy.replace('_', ' ')} on {req.pair} ({dev.venue_label(profile.name) or 'venue'}), "
                  f"{study_run._bars(req.minutes)} bars")
         job = jobs.submit(key, title, run_study_job, target, req, str(LEDGER), str(TEARSHEETS))
         return RedirectResponse(f"/research?{urlencode({'job': job.id, **form})}", status_code=303)
@@ -931,7 +932,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if pair in (profile.core_pairs or CORE_PAIRS):
             # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
             # a request would change nothing, and its "from five years back" would misstate where it starts.
-            return (f"{pair} is on the collector's core list for {profile.label}: it is stored from its listing and "
+            return (f"{pair} is on the collector's core list for the venue: it is stored from its listing and "
                     "kept current, and this list shows how far it has got.")
         if profile.minute_loader is None:
             raise ValueError(f"{profile.label} has no history loader")
@@ -944,7 +945,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # Asked for unchecked, a pair the venue doesn't list sat "Asked for" for good, with no way
                 # to take it back (review round 9, N5): nothing is asked for until the venue confirms it.
                 logging.getLogger(__name__).warning(f"couldn't check {profile.label} lists {pair}: {exc!r}")
-                raise ValueError(f"couldn't reach {profile.label} to check it lists {pair}, so nothing was asked "
+                raise ValueError(f"couldn't reach the venue to check it lists {pair}, so nothing was asked "
                                  "for; try again when the venue answers") from None
         since = (utcnow() - timedelta(days=365 * REQUEST_YEARS)).replace(hour=0, minute=0, second=0, microsecond=0)
         new = st().request_history(profile.name, pair, since)
@@ -1167,7 +1168,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         market = q.get("market") if q.get("market") in markets.MARKETS else markets.SPOT
         shorts = market != markets.SPOT and str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")
         try:
-            label = markets.terms({"market": market}, venue).label if market != markets.SPOT else ""
+            t = markets.terms({"market": market}, venue) if market != markets.SPOT else None
+            label = "Perpetual" if t and t.funding_venue else (t.label if t else "")  # never the venue's name (QA U8)
         except ValueError:  # a spot market on a perpetual venue: the run itself is refused, with the reason
             label = markets.terms({"market": market}).label
         market_words = ("Spot, long only" if market == markets.SPOT else
@@ -1401,7 +1403,7 @@ def _backtest_args(q) -> dict:
                              f"daily bars. Instruments with stored minutes: {', '.join(have) or 'none yet'}.")
     _check_gaps(venue, pair)
     title = (f"{strategy.replace('_', ' ').capitalize()} on {pair}"
-             f"{'' if venue == _venue_name(None) else ' (' + _research_venue(venue).label + ')'}, "
+             f"{'' if venue == _venue_name(None) else ' (' + (dev.venue_label(venue) or 'venue') + ')'}, "
              f"{_bar_short(bar_spec)}, {BACKTEST_PERIODS[period][0].lower()}")
     return {"strategy": strategy, "pair": pair, "venue": venue, "params": params, "starting": starting,
             "days": BACKTEST_PERIODS[period][1], "minutes": spec_minutes(bar_spec),
@@ -1643,7 +1645,7 @@ def _demo_copy(store, s) -> dict | None:
     put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
-    return {"label": "Bybit Demo Trading", "put_on": put_on, "last": last,
+    return {"label": "the demo account", "put_on": put_on, "last": last,
             "leverage": PROFILES[s.risk_profile].max_leverage}
 
 
@@ -1807,11 +1809,9 @@ FEED_FRESH_SECONDS = riskops.FEED_FRESH_SECONDS  # past this the strategy page's
 
 
 def _price_feed(s, seen) -> dict:
-    """The strategy's price feed for the page header: its venue and how long since that venue last sent
-    it a trade or quote, to the second."""
-    from sleeve_fund.venues import venue
-
-    label = venue(s.venue).label
+    """The strategy's price feed for the page header: how long since its venue last sent it a trade or quote,
+    to the second. Labelled "Prices", never with the venue's name (QA U8)."""
+    label = "Prices"
     if s.desired_state != "running":
         return {"label": label, "state": "off", "age": "off while stopped"}
     if seen is None:

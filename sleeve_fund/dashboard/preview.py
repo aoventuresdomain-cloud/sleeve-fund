@@ -259,7 +259,7 @@ def _fee_view(params: dict, inst, quote_fees) -> dict:
     t = markets.terms(params, str(inst.id.venue))
     if t is not None and t.fees is not None:
         text = f"{t.label}: {t.fees.maker:.2%} maker, {t.fees.taker:.2%} taker"
-        return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": t.label,
+        return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": text,
                 "source": "market"}
     fees = markets.fees_for(params, FeeSchedule(Decimal(str(inst.maker_fee)), Decimal(str(inst.taker_fee))), str(inst.id.venue))
     return {"maker": float(fees.maker), "taker": float(fees.taker), "text": quote_fees.text,

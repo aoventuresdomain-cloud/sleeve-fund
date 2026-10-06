@@ -1434,11 +1434,11 @@ def test_research_collects_history_for_any_instrument(client, tmp_path, monkeypa
 
     monkeypatch.setattr(KRAKEN, "check_listed", unreachable)
     down = c.post("/research/history", data={"instrument": "ZZZQ/USD"}, auth=AUTH, headers=SAME)
-    assert "couldn&#39;t reach Kraken spot to check it lists ZZZQ/USD, so nothing was asked for" in down.text
+    assert "couldn&#39;t reach the venue to check it lists ZZZQ/USD, so nothing was asked for" in down.text
     assert len(store.history_requests("KRAKEN")) == 1
     # A core instrument is always stored from its listing: no request, and no "five years back" to mislead.
     core = c.post("/research/history", data={"instrument": "sol/usd"}, auth=AUTH, headers=SAME)
-    assert "SOL/USD is on the collector&#39;s core list for Kraken spot: it is stored from its listing" in core.text
+    assert "SOL/USD is on the collector&#39;s core list for the venue: it is stored from its listing" in core.text
     assert len(store.history_requests("KRAKEN")) == 1
     # A study on it before anything is stored says so with its badge, without asking again.
     form = {"strategy": "buy_and_hold", "instrument": "ADA/USD", "minutes": "240", "train_days": "60",
@@ -1975,7 +1975,7 @@ def test_the_strategy_page_shows_how_old_its_price_feed_is(client):
     c, store = client
     _new(c)
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert 'data-live="feed"' in page and "Kraken spot prices: waiting for the first trade" in page
+    assert 'data-live="feed"' in page and "Prices: waiting for the first trade" in page
     now = [utcnow()]
     rt = SleeveRuntime(store, "btc-test", now=lambda: now[0])
     rt.market_seen()
@@ -1984,13 +1984,13 @@ def test_the_strategy_page_shows_how_old_its_price_feed_is(client):
     assert store.last_feed("btc-test") == now[0] - timedelta(seconds=1)
     store.feed_seen("btc-test", utcnow() - timedelta(seconds=7))
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert "Kraken spot prices: 7 s ago" in page or "Kraken spot prices: 8 s ago" in page
-    assert '<span class="ok">Kraken spot prices' in page
+    assert "Prices: 7 s ago" in page or "Prices: 8 s ago" in page
+    assert '<span class="ok">Prices' in page
     store.feed_seen("btc-test", utcnow() - timedelta(seconds=150))
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert '<span class="bad-dot">Kraken spot prices: 2 min ago' in page
+    assert '<span class="bad-dot">Prices: 2 min ago' in page
     store.set_desired_state("btc-test", "stopped")
-    assert "Kraken spot prices: off while stopped" in c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Prices: off while stopped" in c.get("/sleeves/btc-test", auth=AUTH).text
     home = c.get("/", auth=AUTH).text
     assert "Prices: live venue feeds" in home and "Kraken live feed" not in home
 
@@ -2117,7 +2117,7 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     with pytest.raises(ValueError, match="perpetuals only"):
         _backtest_args(q)
     args = _backtest_args({**q, "market": "perp"})
-    assert args["venue"] == "BINANCE" and "(Binance USD-M perpetuals)" in args["title"]
+    assert args["venue"] == "BINANCE" and "(perpetual)" in args["title"] and "Binance" not in args["title"]
 
     spot = _new(c, name="bn-spot", instrument="BTC/USDT", venue="binance")
     assert "perpetuals+only" in spot.headers["location"] and "venue=binance" in spot.headers["location"]
@@ -2125,8 +2125,8 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
-    # The header's line: model · instrument · venue · candle · profile (combined build F2).
-    assert "BTC/USDT · Binance USD-M perpetuals ·" in shown and "venue=binance" in shown  # clone keeps it
+    # The header's line: model · instrument and market · candle · profile; never the venue's name (QA U8).
+    assert "BTC/USDT perpetual ·" in shown and "Binance USD-M" not in shown and "venue=binance" in shown  # clone keeps it
 
 
 def test_risk_and_health_reads_a_feed_as_fresh_from_its_venues_latest_trade():
@@ -2159,7 +2159,7 @@ def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervis
     store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
     page = c.get("/sleeves/bn-ls", auth=AUTH).text
     assert 'data-open="dlg-reset"' in page and 'action="/sleeves/bn-ls/reset"' in page
-    assert "Closes the long of 0.076" in page and "and the copy on Bybit Demo Trading" in page
+    assert "Closes the long of 0.076" in page and "and the copy on the demo account" in page and "Bybit" not in page
     assert "Puts this run away under Previous book" in page and "Starts bn-ls again at 10,000.00" in page
     assert "isolated margin at 2×" in page and "Demo copy" in page and "out of line" in page
     r = c.post("/sleeves/bn-ls/reset", data={"reason_pick": "Test finished; starting a clean run", "reason_note": ""},

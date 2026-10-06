@@ -51,14 +51,7 @@
     <div class="rh-chart-top"><h2 id="dd-h"><span class="rh-wide">Book drawdown, 30 days</span><span class="rh-phone">Drawdown</span></h2>
       <span><span class="rh-big">{{ chart.current|pct1 }}</span> <span class="faint">worst {{ chart.worst|pct1 }}</span></span></div>
     {% set c = chart %}
-    <svg viewBox="0 0 {{ c.w }} {{ c.h }}" role="img" aria-label="Book drawdown over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}">
-      {% for t in c.ticks %}<line x1="{{ c.left }}" y1="{{ '%.1f'|format(t.y) }}" x2="{{ c.w }}" y2="{{ '%.1f'|format(t.y) }}" class="{{ 'base' if loop.first else 'grid' }}"/>
-      <text x="{{ c.left - 4 }}" y="{{ '%.1f'|format(t.y + 3) }}" text-anchor="end" class="tick">{{ t.label }}</text>{% endfor %}
-      {% if c.halt_y %}<line x1="{{ c.left }}" y1="{{ '%.1f'|format(c.halt_y) }}" x2="{{ c.w }}" y2="{{ '%.1f'|format(c.halt_y) }}" class="halt"/>
-      <text x="{{ c.w - 4 }}" y="{{ '%.1f'|format(c.halt_y - 4) }}" text-anchor="end" class="halt-label">{{ halt_name }} halt</text>{% endif %}
-      {% if c.area %}<path d="{{ c.area }}" class="area"/><polyline points="{{ c.line }}" class="line"/>{% endif %}
-      {% if c.dot %}<circle cx="{{ '%.1f'|format(c.dot[0]) }}" cy="{{ '%.1f'|format(c.dot[1]) }}" r="3.5" class="dot"/>{% endif %}
-    </svg>
+    <div class="lw-line rh-dd" data-kind="drawdown" data-halt-name="{{ halt_name or '' }}" data-chart="{{ c|tojson|forceescape }}" role="img" aria-label="Book drawdown over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}"></div>
     {% if c.points < 2 %}<p class="faint rh-note">The chart fills in as the book's daily closes come in.</p>{% endif %}
   </section>
 </div>
@@ -184,9 +177,10 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
 <script>
-Console.tabs(); Console.dialogs(); Console.reasons();
+Console.tabs(); Console.dialogs(); Console.reasons(); Console.lineCharts();
 // "Live · 4s ago": seconds since the page last heard from the server (live.js says each time it does).
 (() => {
   const el = document.getElementById("rh-live");

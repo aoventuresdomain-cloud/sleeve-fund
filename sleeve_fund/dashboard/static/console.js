@@ -686,6 +686,65 @@ window.Console = (() => {
     load("");
   }
 
+  // Every .lw-line on the page as a Lightweight Charts line (QA U10: no hand-drawn SVG charts). The element's
+  // data-chart holds {t: [UTC seconds], ...} in percent; data-kind says which: "drawdown" (dd, below zero, with
+  // the halt level when the book shares one) or "returns" (book against the buy-and-hold bench).
+  function lineCharts() {
+    if (!window.LightweightCharts) return;
+    document.querySelectorAll(".lw-line[data-chart]").forEach((el) => {
+      let d;
+      try { d = JSON.parse(el.dataset.chart); } catch { return; }
+      if (!d.t || d.t.length < 2) return;
+      const gain = css("--gain"), loss = css("--loss"), muted = css("--muted");
+      const fmt = (v) => `${v < 0 ? "−" : v > 0 && el.dataset.kind === "returns" ? "+" : ""}${Math.abs(v).toFixed(Math.abs(v) < 10 ? 1 : 0)}%`;
+      const chart = LightweightCharts.createChart(el, {
+        autoSize: true,
+        layout: {background: {type: "solid", color: css("--panel")}, textColor: muted, fontSize: 11, fontFamily: getComputedStyle(document.body).fontFamily},
+        grid: {vertLines: {visible: false}, horzLines: {color: css("--line")}},
+        rightPriceScale: {borderVisible: false, scaleMargins: {top: 0.08, bottom: 0.08}},
+        timeScale: {borderVisible: false, fixLeftEdge: true, fixRightEdge: true},
+        crosshair: {mode: 0, vertLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}, horzLine: {color: css("--line-strong"), labelBackgroundColor: css("--raised")}},
+        handleScroll: false, handleScale: false,
+        localization: {priceFormatter: fmt},
+      });
+      const pts = (vals) => d.t.map((t, i) => ({time: t, value: vals[i]}));
+      if (el.dataset.kind === "drawdown") {
+        const halt = d.halt ? -d.halt * 100 : null;
+        const s = chart.addAreaSeries({lineColor: loss, topColor: rgba(loss, 0.05), bottomColor: rgba(loss, 0.28), invertFilledArea: true,
+          lineWidth: 1.5, priceLineVisible: false,
+          // The axis keeps 0% and the halt level in view, so the room left reads at a glance.
+          autoscaleInfoProvider: (base) => {
+            const r = base();
+            if (!r) return r;
+            return {priceRange: {minValue: Math.min(r.priceRange.minValue, halt ?? 0, -0.5), maxValue: 0}};
+          }});
+        s.setData(pts(d.dd));
+        if (halt !== null) s.createPriceLine({price: halt, color: loss, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `${el.dataset.haltName || "Book"} halt`});
+      } else {
+        const bench = chart.addLineSeries({color: muted, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false});
+        bench.setData(pts(d.bench));
+        const book = chart.addBaselineSeries({baseValue: {type: "price", price: 0}, lineWidth: 2, priceLineVisible: false,
+          topLineColor: gain, topFillColor1: rgba(gain, 0.22), topFillColor2: rgba(gain, 0.02),
+          bottomLineColor: loss, bottomFillColor1: rgba(loss, 0.02), bottomFillColor2: rgba(loss, 0.22)});
+        book.setData(pts(d.book));
+      }
+      chart.timeScale().fitContent();
+    });
+  }
+
+  // A strategy's sentence with its settings filled in. Placeholders are Python format fields, some with a
+  // spec ("{long_entry:g}", "{vol_target:.0%}"): g prints the number plainly, .N% as a percentage (QA U11).
+  function fillSummary(tpl, vals) {
+    return tpl.replace(/\{(\w+)(?::([^}]*))?\}/g, (m, k, spec) => {
+      if (!(k in vals)) return m;
+      const n = Number(vals[k]);
+      const pct = spec && /^\.(\d+)%$/.exec(spec);
+      if (pct && Number.isFinite(n)) return `${(n * 100).toFixed(Number(pct[1]))}%`;
+      if (spec === "g" && Number.isFinite(n)) return String(n);
+      return vals[k];
+    });
+  }
+
   // Any form with a strategy picker: show only the chosen strategy's settings, with its sentence filled in.
   function strategyPicker(formId) {
     const form = document.getElementById(formId);
@@ -697,7 +756,7 @@ window.Console = (() => {
       if (desc && desc.dataset.tpl) {
         const vals = JSON.parse(desc.dataset.defaults || "{}");
         form.querySelectorAll(`[name^="p_${strat}__"]`).forEach((i) => { if (i.value !== "") vals[i.name.split("__")[1]] = i.value; });
-        desc.textContent = desc.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => (k in vals ? vals[k] : m));
+        desc.textContent = fillSummary(desc.dataset.tpl, vals);
       }
     };
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
@@ -721,7 +780,7 @@ window.Console = (() => {
       if (desc && desc.dataset.tpl) {
         const vals = JSON.parse(desc.dataset.defaults || "{}");
         form.querySelectorAll(`[name^="p_${strat}__"]`).forEach((i) => { if (i.value !== "") vals[i.name.split("__")[1]] = i.value; });
-        desc.textContent = desc.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => (k in vals ? vals[k] : m));
+        desc.textContent = fillSummary(desc.dataset.tpl, vals);
       }
       const opt = $("strategy").selectedOptions[0];
       // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
@@ -1271,5 +1330,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
+  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, fillSummary, lineCharts, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
 })();

@@ -327,6 +327,10 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
     assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
     assert "Side and leverage" not in html
+    assert "Tap a buy or sell arrow" not in html and "TradingView Lightweight Charts" in html  # QA U9: attribution in the rail
+    # QA U12: the strategy's Fees and funding hover gives the costs' share of gross P&L, as the Portfolio's does.
+    kpi = re.search(r'<div class="kpi" title="([^"]*)"><div class="k">Fees and funding', html)
+    assert kpi and re.search(r"· \d+% of gross P&amp;L$", kpi.group(1)), kpi and kpi.group(1)
     # QA U3: Risk & health and Trades give the same margin and Risk to stop as Portfolio (1,515 put up; the
     # stop at 61,812 is 1,672 above the 60,140 mark, so 83.60 at risk on 0.05).
     for path in ("/risk", "/trades"):
@@ -674,7 +678,8 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     lev = __import__("sleeve_fund.risk", fromlist=["profile"]).profile(store.sleeve("pp-fund").risk_profile).max_leverage
     liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
-    assert "Margin" in html and "Short 0.59×" in html and f"{liq:,.2f}" in html and "above" in html
+    # QA U2: leverage is the position's own (notional at entry over its margin); exposure is at the mark over equity.
+    assert "Margin" in html and f">Leverage</dt><dd>{lev:.2f}×" in html and "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
     # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once
