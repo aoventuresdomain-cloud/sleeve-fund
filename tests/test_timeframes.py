@@ -176,11 +176,11 @@ def test_a_position_held_across_a_restart_with_a_short_slower_warm_up_still_exit
     assert opened == [] and [e[2] for e in events] == ["entry_held"]
 
 
-def test_slower_candles_align_to_the_venues_day_start():
+def test_slower_candles_align_to_the_venues_daily_anchor():
     from sleeve_fund.venues import VENUES
 
-    assert {v.day_start_minutes for v in VENUES.values()} == {0}  # 00:00 UTC everywhere so far (Advisor, 5 Oct)
-    s = SlowerCandles(1440, 60, day_start=8 * 60)  # a venue whose day started 08:00 UTC
+    assert {v.daily_anchor_minutes for v in VENUES.values()} == {0}  # 00:00 UTC everywhere so far (Advisor, 5 Oct)
+    s = SlowerCandles(1440, 60, anchor=8 * 60)  # a venue whose day started 08:00 UTC
     closed = [x for _, x in _feed(s, np.arange(48, dtype=float), step=60, start=T0 - 4 * 60 * M) if x is not None]
     assert [pd.Timestamp(c.end, tz="UTC").hour for c in closed] == [8, 8]  # two days, 08:00 to 08:00, not midnight
 

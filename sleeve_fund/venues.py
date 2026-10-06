@@ -69,7 +69,7 @@ class VenueProfile:
     # Where the venue's trading day starts, in minutes after 00:00 UTC. A strategy's slower candles (v2 P1-4) align
     # to it, so a daily candle closes there. 00:00 UTC on every venue so far (Independent Quant Advisor, 5 Oct); the
     # history store's resample assumes it, so a venue set otherwise can't warm slower candles from the store.
-    day_start_minutes: int = 0
+    daily_anchor_minutes: int = 0
 
     @property
     def venue(self) -> Venue:

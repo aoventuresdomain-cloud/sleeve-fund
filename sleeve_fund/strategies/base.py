@@ -722,7 +722,7 @@ class LongFlatStrategy(Strategy):
 
         profile = VENUES.get(self._cfg.instrument_id.venue.value)
         s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks,
-                          profile.day_start_minutes if profile is not None else 0)
+                          profile.daily_anchor_minutes if profile is not None else 0)
         self._slower.append(s)
         return s
 
@@ -1065,7 +1065,7 @@ class LongFlatStrategy(Strategy):
             s.need = need = warmup_for(s.blocks)
             if not need:
                 continue
-            if s.day_start:
+            if s.anchor:
                 short.append(f"its {span(s.minutes)} candles start at the venue's day start, and the history store "
                              "builds them from 00:00 UTC, so they warm up live")
                 continue
