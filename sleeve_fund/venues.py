@@ -419,7 +419,7 @@ def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, 
     rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingRate?" + urllib.parse.urlencode(q))
     if isinstance(rows, dict):
         raise ValueError(f"Binance: {rows.get('msg', rows)}")
-    return [(int(r["fundingTime"]), float(r["fundingRate"])) for r in rows]
+    return [(int(r["fundingTime"]), _number_or_none(r.get("fundingRate"))) for r in rows]  # a null: refused by funding
 
 
 BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"

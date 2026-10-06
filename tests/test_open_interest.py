@@ -390,3 +390,18 @@ def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_a_day_and_t
     first, last = pd.Timestamp("2026-01-01", tz="UTC"), pd.Timestamp("2026-10-01", tz="UTC")
     chip = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": [], **health})
     assert chip["title"] == "1 missed funding settlement; 1 possible funding hole at an interval change"
+
+
+def test_a_null_funding_rate_is_refused_alone_and_left_as_a_hole(tmp_path):
+    """QA P1-O13 for funding (HoE): a null rate loses only its settlement, which gaps() then reports."""
+    from sleeve_fund.venues import binance_funding
+
+    h = 3_600_000
+    rows = [{"symbol": "BTCUSDT", "fundingTime": T0 + k * 8 * h, "fundingRate": None if k == 2 else "0.0001"}
+            for k in range(6)]
+    loader = lambda pair, start: binance_funding(pair, start, get_json=lambda url: [r for r in rows if r["fundingTime"] >= start])  # noqa: E731
+    kept = funding.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=loader)
+    assert len(kept) == 5 and not kept.isna().any()
+    assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == [
+        (pd.Timestamp(T0 + 8 * h, unit="ms", tz="UTC"), pd.Timestamp(T0 + 24 * h, unit="ms", tz="UTC"))]
+    assert len(funding.fetch("BINANCE", "BTC/USDT", pd.Timestamp(T0, unit="ms", tz="UTC"), loader=loader)) == 5
