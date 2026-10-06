@@ -50,8 +50,8 @@ def test_counts_variants_ideas_and_evaluations(reg):
     _trial(reg, definition="d2", dataset="other")  # the same setting on other data
     _trial(reg, definition="d3", idea="i2")
     _trial(reg, definition="bh", idea="bh", family="benchmark")  # benchmarks are never counted
-    assert reg.counts() == {"ideas": 2, "variants": 4, "evaluations": 5}
-    assert sorted(reg.sharpes()) == [0.5] * 5
+    assert reg.counts() == {"ideas": 2, "variants": 4, "evaluations": 5, "n_uncertain": False}
+    assert sorted(reg.sharpes()) == [0.5] * 4  # one per variant, its latest (Advisor, 6 Oct 2026, P1-T2)
 
 
 def test_changed_indicator_code_is_a_new_variant(reg, monkeypatch):
@@ -68,7 +68,8 @@ def test_rows_are_stored_as_given_and_never_nan(reg):
     assert json.loads(row["settings"]) == {"rsi": 14} and row["oos_trades"] == 110
 
 
-@pytest.mark.parametrize("bad", [{"stage": "sensitivity"}, {"source": "guess"}, {"sharpe": float("inf")}])
+@pytest.mark.parametrize("bad", [{"stage": "sensitivity"}, {"source": "guess"}, {"sharpe": float("inf")},
+                                 {"status": "pending"}])
 def test_bad_trials_are_refused(reg, bad):
     row = {"id": "a" * 16, "definition_hash": "d", "idea_hash": "i", "code_version": "c", "definition_name": "n",
            "family": "f", "settings": "{}", "dataset": "ds", "stage": "holdout", "source": "study", "sharpe": 1.0}
@@ -88,7 +89,7 @@ def test_the_idea_counter_is_imported_once_and_left_in_place(reg, tmp_path):
     assert path.read_text() == before
     rows = reg.store.trials()
     assert {r["source"] for r in rows} == {"ledger_import"} and {r["code_version"] for r in rows} == {LEGACY_CODE}
-    assert reg.counts() == {"ideas": 1, "variants": 2, "evaluations": 2}
+    assert reg.counts() == {"ideas": 1, "variants": 2, "evaluations": 2, "n_uncertain": False}
     ledger.record(idea="a", family="trend", params={"x": 3}, dataset="d", stage="holdout", sharpe=0.4)
     assert reg.import_ledger(path) == 1  # only the new line
     assert reg.counts()["variants"] == 3
@@ -102,11 +103,11 @@ def test_deflated_sharpe_uses_the_register_count_and_falls_as_variants_grow(reg)
     rng = np.random.default_rng(3)
     returns = pd.Series(rng.normal(0.001, 0.01, 400))
     _trial(reg)
-    one = reg.deflated_sharpe(returns)
+    one = reg.deflated_sharpe(returns, content_hash("i1"))
     assert one == pytest.approx(deflated_sharpe_probability(returns, 1))
     for i in range(50):
         _trial(reg, definition=f"v{i}")
-    many = reg.deflated_sharpe(returns)
+    many = reg.deflated_sharpe(returns, content_hash("i1"))
     assert many == pytest.approx(deflated_sharpe_probability(returns, 51))
     assert many < one
 

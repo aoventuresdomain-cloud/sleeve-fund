@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from decimal import Decimal
 from dataclasses import dataclass, field
@@ -35,6 +36,9 @@ from sleeve_fund.research.metrics import (
 from sleeve_fund.research.runner import BacktestResult, run_backtest
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import IdeaSpec
+
+
+log_ = logging.getLogger(__name__)
 
 
 @dataclass
@@ -112,6 +116,9 @@ class StudyResult:
     # sides (v2 P1-7, C3 and C3b).
     random_entry: RandomEntryResult | None = None
     random_side: RandomSideResult | None = None
+    # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
+    # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
+    failed_counts: int = 0
 
     @property
     def not_judged(self) -> str:
@@ -128,6 +135,10 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
+        k = getattr(self, "failed_counts", 0)  # a stand-in result (tests) may lack it
+        if k:
+            return (f"N uncertain: {k} earlier run{'s' if k != 1 else ''} of this idea ran but couldn't be counted in "
+                    "full, so the bar is missing their Sharpes until they are re-counted")
         blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.closed_in_window == 0)]
         # Half blind is not judged either: the other half then holds the halted windows' stubs too, so the
         # verdict would rest on a window or two (review round 10, M10-1).
@@ -275,6 +286,8 @@ def run_study(
     exec_prices: pd.DataFrame | None = None,
     half_spread: float | None = None,
     progress=None,
+    register=None,
+    locks=None,
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -366,10 +379,24 @@ def run_study(
             error_count[0] += res.handler_error_count or len(res.handler_errors)
         return res
 
-    def log(params: dict, stage: str, sharpe: float) -> None:
+    def log(params: dict, stage: str, sharpe: float, data: pd.DataFrame) -> str | None:
         # Exit settings make it a different variant, so they count towards the idea counter.
-        ledger.record(idea=spec.name, family=spec.family, params={**params, **exits}, dataset=dataset, stage=stage,
-                      sharpe=sharpe)
+        full = {**params, **exits}
+        line = ledger.record(idea=spec.name, family=spec.family, params=full, dataset=dataset, stage=stage,
+                             sharpe=sharpe)
+        if register is None:
+            return None
+        # The same evaluation in the trials register, with the bars it read (v2 P1-7, C4). Its id is the
+        # counter line's, so folding the counter in later doesn't count it twice.
+        from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash, line_id, run_setup
+
+        setup = run_setup(risk_profile=risk_profile, fee=float(instrument.taker_fee) + spread_used,
+                          windows=(train_days, test_days, holdout_days))
+        return register.record(
+            definition_hash=legacy_definition_hash(spec.name, full, setup), idea_hash=legacy_idea_hash(spec.name),
+            name=spec.name, family=spec.family, settings=full, dataset=dataset,
+            stage="holdout" if stage == "holdout" else "in_sample", source="study", sharpe=sharpe,
+            row_id=line_id(line), data_start=data.index[0].to_pydatetime(), data_end=data.index[-1].to_pydatetime())
 
     # Benchmark over the research period; sliced for every comparison below.
     bench = bt("buy_and_hold", research, {}, benchmark=True)
@@ -397,7 +424,7 @@ def run_study(
     for params in combos:
         res = bt(spec.name, research, params)
         m = summary(daily_returns(res.equity))
-        log(params, "sensitivity", m["sharpe"])
+        log(params, "sensitivity", m["sharpe"], research)
         rungs = cost_ladder(params)
         ladders.append(rungs)
         fee, words = breakeven_fee(rungs)
@@ -438,7 +465,7 @@ def run_study(
         for params in combos:
             fit = bt(spec.name, train, params)
             m = summary(daily_returns(fit.equity))
-            log(params, "wf_train", m["sharpe"])
+            log(params, "wf_train", m["sharpe"], train)
             surface.append({**params, "sharpe": m["sharpe"], "round_trips": len(round_trips(fit.fills, fit.shorts))})
             if m["sharpe"] > best_sharpe:
                 best, best_sharpe = params, m["sharpe"]
@@ -549,10 +576,24 @@ def run_study(
             "Paper watches both on every trade."
         )
 
+    if register is not None:
+        from sleeve_fund.research.trials import legacy_idea_hash
+
+        result.failed_counts = register.failed(legacy_idea_hash(spec.name))
+
     # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
     # closed: opening it would spend it on no information (review round 8, M8-4).
     # Nor is it opened twice: the first look was its one use, at any bar length (review round 10, M10-1).
     opened = ledger.holdout_opened(spec.name, dataset) if use_holdout and holdout_days else None
+    # The database lock (v2 P1-7, C4): one look per idea and underlying, at any timeframe or venue, and none
+    # while an earlier evaluation of the idea read the held-back days.
+    locked = ""
+    if use_holdout and holdout_days and locks is not None:
+        from sleeve_fund.research.holdout import MIN_UNDATED_HOLDOUT_TRADES, underlying_of
+        from sleeve_fund.research.trials import legacy_idea_hash
+
+        idea_hash, underlying = legacy_idea_hash(spec.name), underlying_of(pair_of(instrument))
+        locked = locks.refusal(idea_hash, underlying, prices.index[-holdout_bars], prices.index[-1])
     if use_holdout and holdout_days and result.not_judged:
         result.holdout_withheld = f"left closed, though asked for: G1 can't judge this study ({result.not_judged})"
     elif opened is not None:
@@ -561,17 +602,48 @@ def run_study(
     elif use_holdout and holdout_days and folds[-1].unscored:
         result.holdout_withheld = ("left closed, though asked for: no setting scored on the last fold's training "
                                    "stretch, so there is no choice to test on it")
+    elif locked:
+        result.holdout_withheld = f"left closed, though asked for: {locked}"
+    elif (use_holdout and holdout_days and locks is not None and locks.undated(idea_hash)
+          and (few := _holdout_trades(bt(spec.name, prices, folds[-1].chosen), prices.index[-holdout_bars]))
+          < MIN_UNDATED_HOLDOUT_TRADES):
+        # Counted before the claim, and only the count is shown: spending the one clean look on too few trades
+        # to judge would waste it (Advisor, C4 option b).
+        result.holdout_withheld = (f"left closed, though asked for: no holdout yet: the held-back days hold {few} "
+                                   f"trades, and {MIN_UNDATED_HOLDOUT_TRADES} are needed: "
+                                   f"{MIN_UNDATED_HOLDOUT_TRADES - few} more")
+    elif use_holdout and holdout_days and locks is not None and not locks.open(
+            idea_hash, underlying, prices.index[-holdout_bars], prices.index[-1]):
+        # Claimed before the look: another study took the lock since the check above, so this one doesn't look.
+        result.holdout_withheld = ("left closed, though asked for: another study opened this idea's holdout on "
+                                   f"{underlying} while this one ran")
     elif use_holdout and holdout_days:
         chosen = folds[-1].chosen
-        run = bt(spec.name, prices, chosen)
-        b_all = bt("buy_and_hold", prices, {}, benchmark=True)
-        h_start = prices.index[-holdout_bars]
-        h_ret = whole_days(daily_returns(run.equity), h_start, bar)
-        hb_ret = whole_days(daily_returns(b_all.equity), h_start, bar)
-        result.holdout = summary(h_ret)
-        result.holdout_benchmark = summary(hb_ret)
-        log(chosen, "holdout", result.holdout["sharpe"])
+        try:
+            run = bt(spec.name, prices, chosen)
+            b_all = bt("buy_and_hold", prices, {}, benchmark=True)
+            h_start = prices.index[-holdout_bars]
+            h_ret = whole_days(daily_returns(run.equity), h_start, bar)
+            hb_ret = whole_days(daily_returns(b_all.equity), h_start, bar)
+            result.holdout = summary(h_ret)
+            result.holdout_benchmark = summary(hb_ret)
+        except Exception:
+            if locks is not None:
+                # The lock was claimed before the look, so the holdout is spent: recorded as a crash, not a result.
+                locks.crashed(idea_hash, underlying)
+                log_.error("holdout of %s on %s spent by a crash, not a failed result: the lock stays", spec.name,
+                           underlying)
+            raise
+        trial = log(chosen, "holdout", result.holdout["sharpe"], prices.iloc[-holdout_bars:])
+        if locks is not None:
+            locks.settle(idea_hash, underlying, trial)
     return result
+
+
+def _holdout_trades(run: BacktestResult, start) -> int:
+    """Round trips opened and closed inside the holdout."""
+    return sum(1 for t in trades(fills_to_rows(run.fills), run.shorts)
+               if t["closed"] is not None and _utc(t["opened"]) >= _utc(start))
 
 
 def _window_trips(trips: list[dict], test_start) -> dict:
