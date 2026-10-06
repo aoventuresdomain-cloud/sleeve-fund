@@ -467,3 +467,45 @@ def test_a_failed_save_writes_no_trial_row(tmp_path):
     with pytest.raises(IntegrityError):  # the same run id again: the save itself fails
         store.save_backtest(_journal(), run_id="a1", key="k", title="t", query="", result={}, trial=_row())
     assert len(store.backtests()) == 1 and len(store.trials()) == 1
+
+
+def test_a_trial_already_there_never_aborts_the_save(tmp_path, monkeypatch):
+    """Data Architect, QA P1-T8: a trial id another process wrote between the check and the insert is skipped
+    inside a SAVEPOINT, so the save's own transaction still commits (Postgres aborts a transaction on any error
+    otherwise). CI runs this on Postgres too, via TEST_DATABASE_URL."""
+    import os
+
+    from sqlalchemy import insert
+
+    from sleeve_fund import store as storemod
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    store = Store(url) if url else _store(tmp_path)
+    storemod.metadata.drop_all(store.engine)
+    storemod.metadata.create_all(store.engine)
+    row = _row()
+    store.add_trials([row])
+    monkeypatch.setattr(storemod, "_put_trials", lambda c, rows: c.execute(insert(storemod.trials_t), rows))  # the race
+    store.save_backtest(_journal(), run_id="a1", key="k", title="t", query="", result={}, trial=row)
+    assert [b["id"] for b in store.backtests()] == ["a1"] and len(store.trials()) == 1
+    storemod.metadata.drop_all(store.engine)
+
+
+def test_a_row_the_register_would_refuse_is_a_failed_count_not_a_refused_save(tmp_path, monkeypatch):
+    """Data Architect, QA P1-T8: the crash rule one step earlier: a run whose row fails validation is still saved,
+    with a failed row carrying the validation error."""
+    from sleeve_fund.dashboard import app as appmod
+    from sleeve_fund.research import trials as trialsmod
+
+    good = trialsmod.model_run_row
+    monkeypatch.setattr(trialsmod, "model_run_row", lambda **k: {**good(**k), "stage": "sensitivity"})
+    args = {"strategy": "trend_filter", "pair": "BTC/USD", "venue": "kraken", "params": {"fast": 50, "slow": 200},
+            "minutes": 1440, "risk_profile": "balanced", "days": 365, "title": "t"}
+    result = {"from": "2024-01-01", "to": "2025-01-01", "fee_schedule": {"taker": 0.004}, "spread": {"half": 0.0001},
+              "strategy": {"sharpe": 1.0}, "trades": {"trades": 10}}
+    row, exc = appmod._trial(appmod._backtest_run, _store(tmp_path), args, result, "r1",
+                             fallback={"strategy": "trend_filter", "params": args["params"], "source": "backtest"})
+    assert isinstance(exc, ValueError) and row["status"] == "failed" and "stage" in row["error"]
+    store = _store(tmp_path)
+    store.save_backtest(_journal(), run_id="r1", key="k", title="t", query="", result={}, trial=row)
+    assert store.backtests() and store.trials()[0]["status"] == "failed"

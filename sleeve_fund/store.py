@@ -593,7 +593,8 @@ def make_engine(url: str | None = None) -> Engine:
 
 
 
-def _check_trial(r: dict) -> None:
+def check_trial(r: dict) -> None:
+    """Raises ValueError for a trials row the register would refuse."""
     if r["source"] not in TRIAL_SOURCES:
         raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
     if r.get("status", "ok") not in TRIAL_STATUSES:
@@ -615,6 +616,18 @@ def _put_trials(c, rows: list[dict]) -> int:
     if new:
         c.execute(insert(trials_t), new)
     return len(new)
+
+
+def _put_trial_in(c, row: dict) -> None:
+    """Write a run's trial on the run's own save transaction. A SAVEPOINT holds the insert, so a row another
+    process wrote between the check and the insert is skipped without aborting the save's transaction, which
+    Postgres would otherwise do (Data Architect)."""
+    try:
+        with c.begin_nested():
+            _put_trials(c, [row])
+    except IntegrityError:
+        if not c.execute(select(trials_t.c.id).where(trials_t.c.id == row["id"])).first():
+            raise
 
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
@@ -652,7 +665,7 @@ class Store:
         """trial: the strategy's row in the trials register, written in the same transaction, so a strategy is
         never made without being counted, nor counted without being made (QA P1-T8)."""
         if trial is not None:
-            _check_trial(trial)
+            check_trial(trial)
         ts = utcnow()
         with self.engine.begin() as c:
             c.execute(insert(sleeves_t).values(
@@ -664,7 +677,7 @@ class Store:
             if venue:
                 c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
             if trial is not None:
-                _put_trials(c, [trial])
+                _put_trial_in(c, trial)
         return self.sleeve(name)
 
     def sleeve(self, name: str) -> Sleeve:
@@ -1402,7 +1415,7 @@ class Store:
         `bar_spec` is the interval the PM picked, where the run's own bars only match its length. `trial` is its
         row in the trials register, written in the same transaction (QA P1-T8)."""
         if trial is not None:
-            _check_trial(trial)
+            check_trial(trial)
         name = BACKTEST_PREFIX + run_id
         src = journal.sleeve_row
         now = utcnow()
@@ -1446,7 +1459,7 @@ class Store:
             c.execute(insert(backtests_t).values(id=run_id, sleeve=name, key=key, title=title, query=query,
                                                  created_at=datetime.now(timezone.utc), result=json.dumps(result)))
             if trial is not None:
-                _put_trials(c, [trial])
+                _put_trial_in(c, trial)
         return name
 
     def strategy_errors(self, sleeve: str, since_start: bool = False) -> int:
@@ -1495,7 +1508,7 @@ class Store:
         if not rows:
             return 0
         for r in rows:
-            _check_trial(r)
+            check_trial(r)
         try:
             return self._insert_trials(rows)
         except IntegrityError:
@@ -1603,12 +1616,12 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
         if trial is not None:
-            _check_trial(trial)
+            check_trial(trial)
         with self.engine.begin() as c:
             c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
                 updated_at=utcnow(), risk_profile=risk_profile, params=params, warmup_bars=warmup_bars))
             if trial is not None:
-                _put_trials(c, [trial])
+                _put_trial_in(c, trial)
             if s.desired_state != "running":
                 return False
             if not c.execute(select(commands_t.c.id).where(commands_t.c.sleeve == sleeve, commands_t.c.command == RELOAD,

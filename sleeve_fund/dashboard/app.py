@@ -1484,16 +1484,19 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
 def _trial(run, *args, fallback: dict) -> tuple[dict, Exception | None]:
     """A run's row for the trials register, written by the caller in the same transaction as the run's own save
     (QA P1-T8, Head of Engineering), so a failed write loses both and the request says so. run(*args) gives the
-    run's key and result. If working that out raises, the run is not lost for it (Data Architect): it gets a
+    run's key and result. If working that out raises, or the row would be refused, the run is not lost for it (Data Architect): it gets a
     failed row, which still counts as a variant tried and keeps G1 from judging its idea until it is re-counted
     (Advisor), keyed as its variant where the key itself was worked out, else by `fallback` (strategy, params,
     source). Returns the row and the error, if any."""
     from sleeve_fund.research.trials import failed_row, model_run_row
+    from sleeve_fund.store import check_trial
 
     key = None
     try:
         key = run(*args)
-        return model_run_row(**key), None
+        row = model_run_row(**key)
+        check_trial(row)  # a row the register would refuse is a failed count too, never a refused save
+        return row, None
     except Exception as exc:  # noqa: BLE001 - any failure here must not lose the run
         logging.getLogger(__name__).exception("couldn't work out a run's row for the trials register")
         keyed = key or fallback
