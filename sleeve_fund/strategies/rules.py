@@ -120,7 +120,9 @@ class Rules(LongFlatStrategy):
         checked = check_definition(params["definition"], bar_minutes=bar_minutes)
         need = checked.warmup[None]
         for tf, candles in checked.slower.items():  # a backtest builds its slower candles from these too
-            need = max(need, candles * tf // max(bar_minutes, 1))
+            # One more than the blocks take: the warm-up rarely starts on a slower candle's open, and the part
+            # candle it starts in is dropped (SlowerCandles), at any venue anchor.
+            need = max(need, (candles + 1) * tf // max(bar_minutes, 1))
         return need
 
     @classmethod
@@ -128,9 +130,10 @@ class Rules(LongFlatStrategy):
         return check_definition(params["definition"]).slower if params.get("definition") else {}
 
     def resume_leg(self, side: int, held: int) -> None:
-        # After a restart: the leg, and its time stop, from the journal's entry (its candle: the next decision's
-        # close less the candles held and that one).
-        self._leg, self._held, self._leg_ts = side, held, None
+        # After a restart: the leg, and its time stop from the journal's entry candle. Counting back the candles
+        # held from the next decision would come out late after missing candles, lengthening the hold (5.2); that
+        # is only the fallback when the journal has no entry for the position.
+        self._leg, self._held, self._leg_ts = side, held, self._resume_entry_ns
 
     def _unsettled(self) -> bool:
         return False  # every value its rules read has settled (block_value), or the rule doesn't hold
@@ -283,8 +286,11 @@ class Rules(LongFlatStrategy):
         level = self._tightest(levels, side)
         stop = side * (1 - level / close)
         if stop <= 0:
+            # A warning naming the definition: a level that sits on the target side every time (a long's exit at an
+            # average above the price, say) would otherwise leave a definition that never trades (Code Reviewer).
             self._note("stop_level_wrong_side", f"Entry held back: the stop level {level:,.6g} is "
-                       f"{'at or above' if side > 0 else 'at or below'} the close {close:,.6g}", level="info")
+                       f"{'at or above' if side > 0 else 'at or below'} the close {close:,.6g}, so it can't be a "
+                       f"stop (definition {self.c.definition_hash[:12]}); a level exit only works on the stop side")
             return None
         self._noted.discard("stop_level_wrong_side")
         basis = ", ".join(f"{k.replace('_', ' ')} at {v:,.6g}" for k, v in levels.items())

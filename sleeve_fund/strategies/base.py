@@ -525,6 +525,7 @@ class LongFlatStrategy(Strategy):
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
+        self._resume_entry_ns: int | None = None  # set by _plan_resume
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
@@ -1086,6 +1087,7 @@ class LongFlatStrategy(Strategy):
         """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first
         exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
         self._resume = None
+        self._resume_entry_ns = None  # the close of the candle the journal's last entry was decided on
         if (self.runtime is None or self.runtime.backtest
                 or type(self).resume_leg is LongFlatStrategy.resume_leg):
             return
@@ -1107,7 +1109,8 @@ class LongFlatStrategy(Strategy):
             self._resume = held
             return
         # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
-        self._resume = {"side": side, "bar": _ns(entry["ts"]) // step * step,
+        self._resume_entry_ns = _ns(entry["ts"]) // step * step
+        self._resume = {"side": side, "bar": self._resume_entry_ns,
                         "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
 
     def _replay(self, bar: Bar) -> None:

@@ -82,7 +82,7 @@ def test_warm_up_counts_chains_and_slower_candles_and_the_model_loads_enough_for
     assert checked.warmup == {None: 140 + 3 + 1, 240: 50}  # the chain, plus the candle a cross looks back to
     params = {"definition": defn}
     assert Rules.slower_needs(params) == {240: 50}
-    assert Rules.warmup_needed(params, 15) == 50 * 240 // 15
+    assert Rules.warmup_needed(params, 15) == 51 * 240 // 15  # one more: the part candle the warm-up starts in
 
 
 def _walk(n=1500, seed=3):
@@ -144,3 +144,34 @@ def test_a_channel_is_the_n_most_recent_closed_bars_the_one_just_closed_included
     defn = _with(blocks={"dc": {"kind": "donchian", "period": 3}},
                  long={"entry": {"left": "close", "op": ">", "right": "dc.upper"}})
     assert built.settled and check_definition(defn).warmup[None] == 3
+
+
+def test_the_slower_warm_up_covers_its_candles_when_it_starts_inside_one():
+    """The warm-up Rules asks for builds the slower candles its blocks take even when it starts part way through a
+    slower candle, which SlowerCandles drops (Code Reviewer on a69618a), at a midnight and a non-midnight anchor."""
+    from sleeve_fund.strategies.timeframes import SlowerCandles
+
+    defn = _with(blocks={"rsi": {"kind": "rsi"}, "trend": {"kind": "sma", "period": 50, "timeframe": "4h"}})
+    need = Rules.warmup_needed({"definition": defn}, 15)
+    for anchor in (0, 90):
+        for start in range(0, 240, 15):  # every 15-minute offset into a 4h candle
+            s = SlowerCandles(240, 15, anchor=anchor)
+            first = (start + 15) * M
+            closed = sum(s.update(1, 1, 1, 1, 1, first + i * 15 * M) is not None for i in range(need))
+            assert closed >= 50, (anchor, start, closed)
+
+
+def test_a_restarted_leg_times_its_stop_from_the_journals_entry_candle(instrument):
+    """After a restart the wall-clock time stop runs from the entry candle the journal kept, not from the candles
+    counted back from the next decision, which comes out late when candles were missing during the hold (5.2)."""
+    from sleeve_fund.data import bar_type_for
+
+    defn = _with(exits={"time_stop": {"minutes": 60}})
+    s = Rules(RulesConfig(instrument_id=instrument.id, bar_type=bar_type_for(instrument, 15), assumed_taker_fee=0.001,
+                          **to_params(defn)))
+    entry = 1_000 * 15 * M
+    s._resume_entry_ns = entry
+    s.resume_leg(1, 1)  # one candle held by the count, though three were due: two went missing
+    assert s._leg_ts == entry
+    s.env.ts = entry + 60 * M
+    assert s._time_up(15 * M)
