@@ -59,8 +59,6 @@ class VenueProfile:
     # (pair, start in ms) -> up to a page of settled funding, [(time in ms, rate)], oldest first
     funding_loader: Callable[[str, int], list] | None = None
     funding_hours: tuple[int, ...] = (0, 8, 16)  # UTC hours the venue settles funding at
-    # () -> {venue symbol: cap on |funding rate| per settlement} for the instruments the venue publishes a cap for
-    funding_caps: Callable[[], dict[str, float]] | None = None
     # series -> (pair, start in ms) -> up to a page of the venue's snapshots, [(time in ms, *values)], oldest first,
     # one per `stats_minutes`: open interest and the positioning ratios (sleeve_fund.open_interest.SERIES)
     stats_loaders: dict[str, Callable[[str, int], list]] = field(default_factory=dict)
@@ -77,27 +75,12 @@ class VenueProfile:
     def venue(self) -> Venue:
         return Venue(self.name)
 
-    def funding_cap(self, pair: str) -> float | None:
-        """The instrument's own cap on |funding rate| per settlement as the venue publishes it now, or None when it
-        publishes none (or can't be asked). The collector keeps it with when it took effect (funding.keep_cap); rates
-        are judged against the cap that applied at their settlement (funding.cap_at; Advisor, 6 Oct 2026, O17a-4)."""
-        published = self._published_caps()
-        return published.get(pair.upper().replace("/", "")) if published else None  # BTC/USDT -> BTCUSDT
+    def funding_cap(self, pair: str) -> float:
+        """The cap on |funding rate| per settlement for the instrument: a rate beyond it is refused, never charged
+        (QA P1-O17). The sanity default until each instrument's published cap is kept (DA-11)."""
+        from sleeve_fund.funding import CAP
 
-    def funding_cap_widest(self, contract_type: str = "perp") -> float | None:
-        """The widest cap on |funding rate| the venue publishes for a linear perpetual: what applies to an instrument
-        whose own cap is missing (lean to accepting, Advisor, 6 Oct 2026). None when it publishes none."""
-        published = self._published_caps() if contract_type == "perp" else None
-        return max(published.values()) if published else None
-
-    def _published_caps(self) -> dict[str, float]:
-        if self.funding_caps is None:
-            return {}
-        try:
-            return self.funding_caps()
-        except Exception as exc:  # noqa: BLE001 - the venue unreachable: no cap known now; the kept ones still apply
-            print(f"{self.label}: funding caps unavailable: {exc!r}")
-            return {}
+        return CAP
 
     def symbol_of(self, pair: str) -> str:
         """The venue's own symbol for a BASE/QUOTE pair: the instrument id paper subscribes to."""
@@ -350,42 +333,6 @@ def binance_instruments(get_json=None) -> list[str]:
                   if i.get("contractType") == "PERPETUAL" and i.get("status") == "TRADING")
 
 
-_BINANCE_CAPS: dict = {}  # "at" -> when fetched (monotonic), "caps" -> {symbol: cap}; failures are cached too
-_CAPS_TTL = 3600.0
-
-
-def binance_funding_caps(get_json=None) -> dict[str, float]:
-    """Each USD-M perpetual's published cap on |funding rate| per settlement, from fundingInfo (the instruments whose
-    cap, floor or interval Binance has set): the wider of the cap and the floor. Fetched at most once an hour per
-    process, a failure included, so an unreachable venue costs one request, not one per instrument."""
-    import time
-
-    from sleeve_fund.data import _get_json
-
-    if get_json is None and time.monotonic() - _BINANCE_CAPS.get("at", -_CAPS_TTL) < _CAPS_TTL:
-        if "error" in _BINANCE_CAPS:
-            raise _BINANCE_CAPS["error"]
-        return _BINANCE_CAPS["caps"]
-    try:
-        rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingInfo")
-        if isinstance(rows, dict):  # an error body: {"code": ..., "msg": ...}
-            raise ValueError(f"Binance: {rows.get('msg', rows)}")
-        caps = {}
-        for r in rows:
-            bounds = [abs(float(r[k])) for k in ("adjustedFundingRateCap", "adjustedFundingRateFloor") if r.get(k)]
-            if bounds and max(bounds) > 0:
-                caps[r["symbol"]] = max(bounds)
-    except Exception as exc:
-        if get_json is None:
-            _BINANCE_CAPS.clear()
-            _BINANCE_CAPS.update(at=time.monotonic(), error=exc)
-        raise
-    if get_json is None:
-        _BINANCE_CAPS.clear()
-        _BINANCE_CAPS.update(at=time.monotonic(), caps=caps)
-    return caps
-
-
 def binance_contract(pair: str, get_json=None) -> dict:
     """The perpetual's price and size steps, smallest order and smallest notional, from exchangeInfo."""
     info = _binance_listing(pair, get_json)
@@ -561,7 +508,6 @@ BINANCE = register(VenueProfile(
     perpetual=True,
     symbol=lambda pair: f"{binance_symbol(pair)}-PERP",
     funding_loader=binance_funding,
-    funding_caps=binance_funding_caps,
     stats_loaders=BINANCE_STATS,
     contract=binance_contract,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),

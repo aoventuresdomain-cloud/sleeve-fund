@@ -1924,7 +1924,7 @@ class LongFlatStrategy(Strategy):
 
         pair = pair_of(self.instrument)
         when = pd.Timestamp(ts)
-        cap = self._funding_cap(terms, pair, when)
+        cap = funding.cap_of(terms.funding_venue, pair)
         rate = funding.rate_at(funding.rates(terms.funding_venue, pair), when, cap)
         if rate is None and not self._backtest:
             rate = self._venue_rate(terms, pair, when)
@@ -1948,27 +1948,13 @@ class LongFlatStrategy(Strategy):
     # Paper asks the venue at most this often whether a missing settlement's rate has arrived.
     FUNDING_RECHECK = timedelta(minutes=1)
 
-    def _funding_cap(self, terms, pair: str, when) -> float:
-        """The cap on |rate| that applied at the settlement (funding.cap_for: the instrument's own as kept, point in
-        time; Advisor, 6 Oct 2026, O17a-4). Paper, without one kept for the settlement, takes the cap the venue
-        publishes now, since its settlements are now, before the venue's widest; a backtest never asks the venue."""
-        from sleeve_fund import funding
-        from sleeve_fund.venues import venue as venue_profile
-
-        cap, missing = funding.cap_for(terms.funding_venue, pair, when)
-        if missing and not self._backtest:
-            now = venue_profile(terms.funding_venue).funding_cap(pair)
-            if now is not None:
-                return now
-        return cap
-
     def _venue_rate(self, terms, pair: str, when) -> float | None:
         """Paper asks the venue directly (the history service keeps the store, which paper only reads)."""
         from sleeve_fund import funding
 
         try:
             return funding.rate_at(funding.fetch(terms.funding_venue, pair, when - funding.MATCH), when,
-                                   self._funding_cap(terms, pair, when))
+                                   funding.cap_of(terms.funding_venue, pair))
         except Exception as exc:  # noqa: BLE001 - the venue unreachable: wait, then the baseline
             self.log.warning(f"funding rates unavailable: {exc!r}")
             return None

@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 
 import pandas as pd
-import pytest
 
 from o17_harness import (  # noqa: F401  (fixtures are used by name)
     NEVER,
@@ -24,15 +23,6 @@ from o17_harness import (  # noqa: F401  (fixtures are used by name)
     win,
     write_rates,
 )
-
-
-@pytest.fixture(autouse=True)
-def _caps_known(monkeypatch):
-    """The staleness alerts only: the cap's own alert is pinned in test_funding_caps, and the venue isn't asked."""
-    from sleeve_fund import history
-
-    monkeypatch.setattr(history, "_keep_funding_caps", lambda *a, **k: None)
-    monkeypatch.setattr(history, "_alert_missing_cap", lambda *a, **k: None)
 
 
 def test_a_second_missing_settlement_keeps_the_episode_open_when_the_first_arrives(tmp_path, monkeypatch, binance):

@@ -20,12 +20,11 @@ from sleeve_fund.history import DEFAULT_ROOT
 
 PAGE = 1000  # settlements a venue returns per request
 MATCH = pd.Timedelta(minutes=1)  # a settlement is stamped within this of its scheduled time
-# A settled rate beyond the cap that applied to it (cap_at), either way, is not believed: quarantined raw, alerted
-# and charged as missing (Advisor, 6 Oct 2026, O17a-4). CAP is the last resort only, when neither the instrument's own
-# cap nor the venue's widest has ever been kept: a sanity bound well past any a venue sets per settlement.
+# A settled rate beyond the venue's cap (VenueProfile.funding_cap), either way, is not believed: kept as missing and
+# said. This is the default cap, a sanity bound well past any a venue sets per settlement, until each instrument's
+# published cap is kept beside its rates (DA-11).
 CAP = 0.05
 _lock = threading.Lock()
-_meta_lock = threading.Lock()  # the caps and the quarantine, written while _lock is held by refresh()
 _cache: dict[tuple[str, str, str], tuple[float, pd.Series]] = {}  # (root, venue, pair) -> (file mtime, rates)
 
 
@@ -63,7 +62,7 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
         start = kept[-1][0] + 1 if kept else (int(since.timestamp() * 1000) if since is not None else 0)
         for _ in range(max_pages):
             page = loader(pair, start)
-            kept.extend([t, r] for t, r in _usable(page, venue, pair, refused, root) if not kept or t > kept[-1][0])
+            kept.extend([t, r] for t, r in _usable(page, venue, pair, refused) if not kept or t > kept[-1][0])
             if len(page) < PAGE:
                 break
             start = page[-1][0] + 1
@@ -74,141 +73,26 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
     return rates(venue, pair, root)
 
 
-def _usable(page, venue: str, pair: str, refused: list | None = None, root: str | Path | None = None) -> list:
+def _usable(page, venue: str, pair: str, refused: list | None = None) -> list:
     """The page's settlements whose rate can be believed. A null from the venue (the loader passes it as None), a NaN,
-    an infinity or a rate beyond the cap that applied at that settlement (cap_at) is left out, so it is a hole gaps()
-    reports rather than a page lost or a bad number charged (QA P1-O13, P1-O17), and quarantined with its raw value,
-    never dropped (Advisor, 6 Oct 2026, O17a-4). `refused` gets (time in ms, rate, cap) for the collector's alert."""
-    out, bad = [], []
+    an infinity or a rate beyond the venue's cap is left out and said, so it is a hole gaps() reports rather than a
+    page lost or a bad number charged (QA P1-O13, P1-O17)."""
+    cap = cap_of(venue, pair)
+    out = [(t, r) for t, r in page if believable(r, cap)]
     for t, r in page:
-        cap = cap_at(venue, pair, pd.Timestamp(t, unit="ms", tz="UTC"), root)
-        if believable(r, cap):
-            out.append((t, r))
-            continue
-        print(f"{venue.upper()} {pair}: funding at {pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} refused: "
-              f"rate {r!r} is not a number within {cap:.2%}")
-        bad.append((t, r))
-        if refused is not None:
-            refused.append((t, r, cap))
-    if bad:
-        quarantine(venue, pair, bad, root)
+        if not believable(r, cap):
+            print(f"{venue.upper()} {pair}: funding at {pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} refused: "
+                  f"rate {r!r} is not a number within {cap:.2%}")
+            if refused is not None:
+                refused.append((t, r))
     return out
 
 
-# The instrument's published cap, kept with when it took effect (contract data, beside its rates), and the venue's
-# widest cap for a linear perpetual, used where the instrument's own is missing (Advisor, 6 Oct 2026, O17a-4).
-def _caps_path(venue: str, pair: str, root: str | Path | None = None) -> Path:
-    return _path(venue, pair, root).with_name("funding_caps.json")
+def cap_of(venue: str, pair: str) -> float:
+    """The venue's cap on |rate| per settlement for the instrument (VenueProfile.funding_cap)."""
+    from sleeve_fund.venues import venue as venue_profile
 
-
-def _widest_path(venue: str, root: str | Path | None = None) -> Path:
-    return Path(root or DEFAULT_ROOT) / venue.upper() / "funding_cap_widest.json"
-
-
-_meta_cache: dict[str, tuple[float, dict]] = {}  # path -> (file mtime, contents): read per settlement by backtests
-
-
-def _read(path: Path, key: str):
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    hit = _meta_cache.get(str(path))
-    if hit is None or hit[0] != mtime:
-        try:
-            hit = (mtime, json.loads(path.read_text()))
-        except (OSError, ValueError):
-            return None
-        _meta_cache[str(path)] = hit
-    return hit[1].get(key) if isinstance(hit[1], dict) else None
-
-
-def _write(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(path)
-
-
-def caps(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd.Timestamp, float]]:
-    """The instrument's caps as kept: (effective from, cap), oldest first."""
-    kept = _read(_caps_path(venue, pair, root), "caps") or []
-    return [(pd.Timestamp(t, unit="ms", tz="UTC"), float(c)) for t, c in kept]
-
-
-def keep_cap(venue: str, pair: str, cap: float, effective_from, root: str | Path | None = None) -> bool:
-    """Keep the instrument's published cap from `effective_from`, unless the cap already in force then is the same.
-    True when it was added. A cap that isn't a positive finite number is not kept."""
-    try:
-        cap = float(cap)
-    except (TypeError, ValueError):
-        return False
-    if not (math.isfinite(cap) and cap > 0):
-        return False
-    when = pd.Timestamp(effective_from)
-    when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
-    with _meta_lock:
-        kept = caps(venue, pair, root)
-        before = [c for t, c in kept if t <= when]
-        if before and before[-1] == cap:
-            return False
-        kept = sorted([x for x in kept if x[0] != when] + [(when, cap)])
-        _write(_caps_path(venue, pair, root), {"caps": [[int(t.timestamp() * 1000), c] for t, c in kept]})
-    return True
-
-
-def keep_widest(venue: str, cap: float, root: str | Path | None = None) -> None:
-    try:
-        cap = float(cap)
-    except (TypeError, ValueError):
-        return
-    if math.isfinite(cap) and cap > 0 and _read(_widest_path(venue, root), "widest") != cap:
-        _write(_widest_path(venue, root), {"widest": cap})
-
-
-def widest(venue: str, root: str | Path | None = None) -> float | None:
-    """The venue's widest published cap for a linear perpetual, as last kept, or None."""
-    w = _read(_widest_path(venue, root), "widest")
-    return float(w) if w is not None else None
-
-
-def cap_for(venue: str, pair: str, ts, root: str | Path | None = None) -> tuple[float, bool]:
-    """(the cap on |rate| that applied at the settlement `ts`, whether the instrument's own was missing). Its own cap
-    in force then, point in time; else the venue's widest for the contract type (lean to accepting: a false reject
-    flatters a result, since a rejected rate is charged the baseline); else CAP."""
-    when = pd.Timestamp(ts)
-    when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
-    own = [c for t, c in caps(venue, pair, root) if t <= when]
-    if own:
-        return own[-1], False
-    return widest(venue, root) or CAP, True
-
-
-def cap_at(venue: str, pair: str, ts, root: str | Path | None = None) -> float:
-    """The cap on |rate| that applied at the settlement `ts` (cap_for)."""
-    return cap_for(venue, pair, ts, root)[0]
-
-
-def _quarantine_path(venue: str, pair: str, root: str | Path | None = None) -> Path:
-    return _path(venue, pair, root).with_name("funding_quarantine.json")
-
-
-def quarantine(venue: str, pair: str, bad: list, root: str | Path | None = None) -> None:
-    """Hold rejected settlements' raw values (NaN and infinities included) for review: never dropped, never charged.
-    A settlement already held keeps its first raw value."""
-    with _meta_lock:
-        held = _read(_quarantine_path(venue, pair, root), "rates") or []
-        seen = {t for t, _ in held}
-        held += [[int(t), None if r is None else float(r)] for t, r in bad if int(t) not in seen]
-        _write(_quarantine_path(venue, pair, root), {"rates": sorted(held, key=lambda x: x[0])})
-
-
-def quarantined(venue: str, pair: str, root: str | Path | None = None) -> pd.Series:
-    """Each rejected settlement's raw value, by settlement time (a null from the venue is NaN), held for review; the
-    settlement is charged the baseline meanwhile, and trued up through the journal if the rate proves real."""
-    held = _read(_quarantine_path(venue, pair, root), "rates") or []
-    return pd.Series([float("nan") if r is None else r for _, r in held],
-                     index=pd.to_datetime([t for t, _ in held], unit="ms", utc=True), dtype=float)
+    return venue_profile(venue).funding_cap(pair)
 
 
 def believable(rate, cap: float = CAP) -> bool:
