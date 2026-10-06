@@ -74,8 +74,7 @@ def _confirmed_book_reset(store, client, monkeypatch):
 
 # --- (1) an ordinary per-strategy Reset is refused while liquidated [U27] -----------------------------------------
 
-@xf
-@pytest.mark.parametrize("via", ["dashboard", "store"])
+@pytest.mark.parametrize("via", ["dashboard", pytest.param("store", marks=xf)])
 def test_an_ordinary_reset_is_refused_while_liquidated_naming_reset_after_liquidation(store, tmp_path, client, via):
     """[U27] "an ordinary per-strategy Reset is REFUSED while a strategy is liquidated (points to reset-after-
     liquidation)": from the strategy page or the store, refused in words naming reset after liquidation; nothing is

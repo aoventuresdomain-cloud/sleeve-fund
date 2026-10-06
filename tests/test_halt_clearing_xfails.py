@@ -296,7 +296,7 @@ def _banner(page):
     return ""
 
 
-@pytest.mark.parametrize("kind", ["drawdown_halt", "daily_pause", pytest.param("liquidation", marks=xf)])
+@pytest.mark.parametrize("kind", ["drawdown_halt", "daily_pause", "liquidation"])
 def test_the_dashboard_shows_each_halt_states_clearing_action(store, tmp_path, client, kind):
     """[R18:17] Falsifier: "every halt state shows its clearing action on the dashboard". The strategy page's halt
     banner names it: "resume" for a drawdown halt (a GUARD: it passes on 3be572a); the next "00:00 UTC" for a daily
