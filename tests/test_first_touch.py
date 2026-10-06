@@ -23,8 +23,8 @@ def _m(*bars):
 
 
 @pytest.mark.parametrize("minutes, expect", [
-    (_m((100.5, 99.5), (101.0, 100.0), (100.2, 98.0)), Touch(True, 2 * M, None, "minutes", reached=True)),
-    (_m((100.5, 99.5), (100.2, 99.0), (101.5, 100.0)), Touch(False, None, 2 * M, "minutes", reached=True)),
+    (_m((100.5, 99.5), (101.0, 100.0), (100.2, 98.0)), Touch(True, 2 * M, 3 * M, "minutes", reached=True)),  # both minutes, for the lineage
+    (_m((100.5, 99.5), (100.2, 99.0), (101.5, 100.0)), Touch(False, 3 * M, 2 * M, "minutes", reached=True)),
     (_m((100.5, 99.5), (101.2, 98.9)), Touch(False, 2 * M, 2 * M, "minutes", same_minute=True, reached=True)),
     (_m((100.9, 99.1), (100.5, 99.5)), Touch(False, by="minutes")),  # neither: 101 and 99 are never reached
 ])
@@ -109,11 +109,12 @@ def test_reached_x_first_inside_the_candle_enters_on_its_close_and_says_when(ins
     b = FLAT * 2 + [(101.2, 100.0)] + FLAT * 6 + [(100.0, 98.8)] + [(99.0, 99.0)] * 5
     res = _run(instrument, b)
     entry = next(d for d in res.decisions.values() if d["intent"] == "entry")
-    ft = entry["signal"]["first_touch"]["first_touch(reach add(close,1.0), before sub(close,1.0))"]
-    assert ft == {"held": True, "by": "minutes", "reach_at": "2025-10-03T00:18:00+00:00", "before_at": None,
-                  "same_minute": False, "unknown": None}
-    stats = res.first_touch["first_touch(reach add(close,1.0), before sub(close,1.0))"]
-    assert stats["held"] == 1 and stats["same_minute"] == 0
+    ft = entry["signal"]["first_touch"]["long.entry"]
+    assert ft == {"x": 101.0, "y": 99.0, "x_minute": "2025-10-03T00:18:00+00:00",
+                  "y_minute": "2025-10-03T00:25:00+00:00", "same_minute": False, "held": True, "by": "minutes",
+                  "unknown": None}
+    stats = res.first_touch["long.entry"]
+    assert stats["true"] == 1 and stats["same_minute"] == 0
 
 
 def test_reached_y_first_doesnt_enter(instrument):
@@ -127,7 +128,7 @@ def test_both_in_one_minute_takes_the_adverse_level_first_and_the_report_counts_
     res = _run(instrument, b)
     assert not _entered(res)
     (stats,) = res.first_touch.values()
-    assert stats["same_minute"] == 1 and stats["either_reached"] == 1
+    assert stats["same_minute"] == 1 and stats["reached"] == 1
 
 
 def test_a_level_reached_only_after_the_decision_time_never_counts(instrument):
@@ -137,7 +138,7 @@ def test_a_level_reached_only_after_the_decision_time_never_counts(instrument):
     res = _run(instrument, b, after=[(101.3, 100.0)])
     stats = next(iter(res.first_touch.values()))
     entries = [d for d in res.decisions.values() if d["intent"] == "entry"]
-    assert stats["held"] == 1 and len(entries) == 1
+    assert stats["true"] == 1 and len(entries) == 1
     assert entries[0]["signal"]["first_touch"][next(iter(res.first_touch))]["by"] == "range"
     coid = next(o for o, d in res.decisions.items() if d["intent"] == "entry")
     assert res.fills.loc[coid, "ts_last"] == START + pd.Timedelta(minutes=45)  # decided at C's close, not B's
@@ -156,7 +157,7 @@ def test_with_both_inside_a_minute_missing_before_the_first_reach_leaves_it_unkn
     side's safe answer), counted. Its 7th missing instead: X already came first, so it holds."""
     b = FLAT * 4 + [(101.2, 100.0)] + FLAT * 4 + [(100.0, 98.8)] + FLAT * 5
     res = _run(instrument, b, drop=[18])
-    assert not _entered(res) and next(iter(res.first_touch.values()))["unknown_missing"] == 1
+    assert not _entered(res) and next(iter(res.first_touch.values()))["missing"] == 1
     assert _entered(_run(instrument, b, drop=[22]))
 
 
@@ -217,3 +218,14 @@ def test_paper_judges_the_same_minutes_a_backtest_does():
     for k in range(1, 4):
         start, end = (START + pd.Timedelta(minutes=15 * k)).value, (START + pd.Timedelta(minutes=15 * (k + 1))).value
         assert status.minutes_of(iid, start, end) == backtest(start, end) and len(backtest(start, end)) == 15
+
+
+@pytest.mark.parametrize("cut", ["start", "end"])
+def test_minutes_that_miss_part_of_the_first_or_last_decision_candle_are_refused(cut, instrument):
+    """The engine builds its decision candles from these minutes: a candle they cover only in part (the first one's
+    early minutes, or the last one's late minutes) would be judged on a hole, or never at all (CR on #170)."""
+    candles, minutes = _frames(FLAT * 15)
+    minutes = minutes.iloc[14:] if cut == "start" else minutes.iloc[:-1]  # from the first candle's close / short
+    with pytest.raises(ValueError, match="1-minute bars of every decision candle"):
+        run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
+                     exec_prices=minutes, exec_minutes=1)

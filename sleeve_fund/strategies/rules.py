@@ -25,6 +25,7 @@ from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked,
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
 _hash_of = definition_hash  # RulesConfig takes a parameter of that name
+FIRST_TOUCH_RERUN = 0.05  # an ambiguous share above this re-runs G1 the other way (Advisor ~22:07)
 
 SPEC = IdeaSpec(
     listed=False,
@@ -115,6 +116,9 @@ class Rules(LongFlatStrategy):
         # first_touch: (after ns, until ns) -> the 1-minute bars closing in (after, until], as (close ns, open, high,
         # low, close): the backtest's own minutes (research.runner), the hub's in paper (paper.node)
         self.minute_source = None
+        # until ns -> (high, low) of the venue's own candle closing then, where the decision candle is built from the
+        # 1-minute bars and so would miss a minute they lack (a backtest on exec_prices); None: the bar is the venue's
+        self.range_source = None
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
@@ -153,6 +157,7 @@ class Rules(LongFlatStrategy):
         env.ohlcv, env.ts, env.bar = (o, h, lo, c, v), int(bar.ts_event), env.bar + 1
         if self.rules.touches:
             env.minutes, env.minutes_due = self._minutes_of(bar), bar_minutes(self._cfg.bar_type)
+            env.span = self.range_source(env.ts) if self.range_source is not None else None
         env.closed = {tf for tf, s in self._slow.items() if s.count != self._counts[tf]}
         self._counts = {tf: s.count for tf, s in self._slow.items()}
         for side in self.rules.sides.values():  # setups arm and confirmations count on every candle
@@ -171,21 +176,23 @@ class Rules(LongFlatStrategy):
         return sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
 
     def first_touch_stats(self) -> dict:
-        """For the report, per first_touch rule: candles judged, held, either level reached, settled by minutes,
-        both first reached in one minute, and unknown (a minute missing before the first reach, or minutes that
-        disagree with the candle's range); `ambiguous_share` is the last three over either reached, which the G1
-        check reads (Advisor ~22:07: over 5%, judged on the worse resolution too). On 1-minute candles every candle
-        reaching both is a same-minute case, so the share is the assumption's, and the note says so."""
+        """For the report, per first_touch rule by its path (long.entry, long.entry[1], long.exit): candles judged,
+        resolved true, either level reached, settled by minutes, both first reached in one minute, and unknown (a
+        minute missing before the first reach, or minutes that disagree with the candle's range; `inconsistent` is the
+        latter). `ambiguous_share` is same minute + unknown over either reached, which the G1 check reads (Advisor
+        ~22:07): above 5% (`rerun_opposite_resolution`) it is re-run with first_touch_flip and judged on the worse. On
+        1-minute candles every candle reaching both is a same-minute case, so the share is the assumption's, and the
+        note says so."""
         out = {}
         for n in self.rules.touches:
             st = dict(n.stats)
-            amb = st["same_minute"] + st["unknown_missing"] + st["unknown_inconsistent"]
-            st["ambiguous_share"] = amb / st["either_reached"] if st["either_reached"] else 0.0
+            st["ambiguous_share"] = (st["same_minute"] + st["unknown"]) / st["reached"] if st["reached"] else 0.0
+            st["rerun_opposite_resolution"] = st["ambiguous_share"] > FIRST_TOUCH_RERUN
             st["resolved"] = ("true" if n.exit_rule != n.flip else "false") + " when ambiguous"
             if bar_minutes(self._cfg.bar_type) == 1:
                 st["note"] = ("on 1-minute candles the order inside a candle reaching both levels is never seen: "
                               "every such candle is assumed, so the result rests on that assumption")
-            out[n.text] = st
+            out[n.path] = st
         return out
 
     # --- the leg ----------------------------------------------------------------------------------------------
@@ -289,7 +296,8 @@ class Rules(LongFlatStrategy):
                    "blocks": blocks, "bars": bars, "data": {"source": source, "refilled_in_range": None}}  # unknown until provenance is read (DA-4)
         if armed:
             payload["armed_at"] = _iso(max(armed))
-        touched = {n.text: n.lineage() for n in self.rules.touches if n.judged_ts == self.env.ts}
+        touched = {n.path: n.lineage() for n in self.rules.touches
+                   if n.judged_ts == self.env.ts and n.last is not None}
         if touched:
             payload["first_touch"] = touched
         return payload
