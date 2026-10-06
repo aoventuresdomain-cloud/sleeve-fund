@@ -31,10 +31,15 @@ def build(strategy_name: str, instrument, params: dict, bar_minutes: int):
     config = config_cls(instrument_id=instrument.id, bar_type=bar_type_for(instrument, bar_minutes),
                         assumed_taker_fee=float(instrument.taker_fee), volume_scale=BOOK_SHARE, **params)
     strategy = strategy_cls(config)
-    spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
-    strategy.settle_bars_needed = strategy_cls.warmup_needed(
-        {**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
+    strategy.settle_bars_needed = warmup(strategy_name, params, bar_minutes)
     return strategy
+
+
+def warmup(strategy_name: str, params: dict, bar_minutes: int) -> int:
+    """Candles of `bar_minutes` the model needs before its indicators read as settled, as a backtest counts them."""
+    strategy_cls = REGISTRY[strategy_name][0]
+    spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
+    return strategy_cls.warmup_needed({**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
 
 
 def indicator_series(strategy_name: str, candles: pd.DataFrame, instrument, params: dict | None = None,
