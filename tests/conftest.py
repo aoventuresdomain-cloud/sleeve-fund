@@ -69,3 +69,7 @@ def _open_risk_setup(monkeypatch, request):
         from sleeve_fund import open_risk
 
         monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if "no_restart_safety_stop" in request.keywords:  # QA SG11: the marker, never a bare monkeypatch
+        from sleeve_fund.strategies.base import LongFlatStrategy
+
+        monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)

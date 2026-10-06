@@ -125,7 +125,8 @@ def test_a_restart_past_the_liquidation_price_books_a_liquidation_not_a_drawdown
     kinds = [e["kind"] for e in store.events(NAME, limit=200)]
     assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): "), s.status_reason
     assert "liquidation" in kinds and "incident" in kinds and "drawdown" not in s.status_reason
-    closing = [o for o in store.orders(NAME, limit=50) if o["side"] == "BUY"]
+    closing = [o for o in store.orders(NAME, limit=50)  # paper's watched stop is the journal's view, not an order sent
+               if o["side"] == "BUY" and not (o.get("signal") or {}).get("watched")]
     assert closing and {o["intent"] for o in closing} == {"liquidation"}, closing
 
 

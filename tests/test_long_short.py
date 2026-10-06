@@ -494,6 +494,27 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp
     assert orders[-1] is liq
 
 
+@pytest.mark.parametrize("legs", [
+    pytest.param([(5, 0.0), (20, 0.015), (2, 0.0), (0, 0.7), (3, 0.0)], id="gap-to-liquidation"),
+    pytest.param([(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)], id="gap-to-bankruptcy"),
+])
+def test_guards_on_twin_the_stopless_2x_short_the_gap_tests_lift_the_limit_for_is_never_opened(tmp_path, full_margin,
+                                                                                             legs):
+    """Guards-on twins (QA SG11) of the two paper gap tests below and above that lift the open-risk limit: on their
+    exact set-up, with every guard on, the stopless 2x short is refused by the limit, so nothing opens and nothing is
+    liquidated."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+
+    store = Store.in_memory()
+    path = tmp_path / "gap.jsonl.gz"
+    _record(path, _meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP}), legs)
+    orders = replay(path, store=store)
+    assert not [o for o in orders if o["intent"] in ("entry", "liquidation")], [(o["side"], o["intent"]) for o in orders]
+    kinds = {e["kind"] for e in store.events("ping-pong-test", limit=1000)}
+    assert "entry_refused_open_risk" in kinds and "liquidation" not in kinds
+
+
 def _liquidated_after_a_restart(tmp_path, carried):
     """A paper restart carrying the short the `carried` fills (side, qty, price, fee) left, then a +60% gap through its
     liquidation price. Returns the halt text, the open position's fills, the liquidation's fills and the equity
@@ -530,14 +551,6 @@ def _liquidated_after_a_restart(tmp_path, carried):
     return s.status_reason, book, liq, before
 
 
-def _no_safety_stop(monkeypatch):
-    """The restart's safety stop (stop safety) would close the carried short before the gap: these tests are about
-    what a liquidation counts, so it is left out."""
-    from sleeve_fund.strategies.base import LongFlatStrategy
-
-    monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
-
-
 def _says_margin_lost(text, want, before):
     m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+)% of strategy equity", text)
     assert m, text
@@ -545,24 +558,20 @@ def _says_margin_lost(text, want, before):
     assert int(m.group(2)) == round(100 * want / before), (m.group(2), 100 * want / before)
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: X's accounting on a stopless short carried over a restart (open_risk)
-def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp_path, full_margin, monkeypatch):
+def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp_path, full_margin):
     """HoE and the Code Reviewer on #155 at 26fd993: X (Advisor 18:17 point 4: margin, entry fee and liquidation fee,
     as QA's D15 computes it) for a position carried over a restart still counts the fee paid to open it, which the
-    process that paid it no longer holds."""
-    _no_safety_stop(monkeypatch)
+    process that paid it no longer holds. Every guard on (QA SG11): the restart's safety stop is set, and the gap
+    through it and the liquidation price books as a liquidation (GAP-LIQ)."""
     text, book, liq, before = _liquidated_after_a_restart(tmp_path, [("SELL", 0.3, 60_000.0, 9.0)])
     want = round(0.3 * 60_000.0 / 2 + 9.0 + sum(f["fee"] for f in liq), 2)
     _says_margin_lost(text, want, before)
 
 
-@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only: as above
-def test_a_liquidation_after_a_partial_reduce_counts_only_the_entry_fee_of_what_is_still_open(tmp_path, full_margin,
-                                                                                               monkeypatch):
+def test_a_liquidation_after_a_partial_reduce_counts_only_the_entry_fee_of_what_is_still_open(tmp_path, full_margin):
     """HoE and the Code Reviewer on #155 at 26fd993: after a short of 0.4 is cut to 0.3, X counts three quarters of
     its entry fees, the share of the position the liquidation took, not all of them."""
-    carried = [("SELL", 0.3, 60_000.0, 9.0), ("SELL", 0.1, 60_000.0, 3.0), ("BUY", 0.1, 60_000.0, 3.0)]
-    _no_safety_stop(monkeypatch)
+    carried = [("SELL", 0.3, 60_000.0, 9.0), ("SELL", 0.1, 60_000.0, 3.0), ("BUY", 0.1, 60_000.0, 3.0)]  # guards on
     text, book, liq, before = _liquidated_after_a_restart(tmp_path, carried)
     assert book["entry_fees"] == pytest.approx(9.0)
     want = round(0.3 * 60_000.0 / 2 + (9.0 + 3.0) * 0.3 / 0.4 + sum(f["fee"] for f in liq), 2)

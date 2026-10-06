@@ -176,3 +176,34 @@ def test_the_setups_the_paper_mechanics_tests_lift_the_limit_for_are_refused_wit
     orders, _ = replay(path, with_fills=True, store=store)
     assert [o for o in orders if o["intent"] == "entry"] == []
     assert any(e["kind"] == "entry_refused_open_risk" for e in store.events("ping-pong-test", limit=500))
+
+
+@pytest.mark.real_daily_atr
+@pytest.mark.parametrize("width, refused", [(1_200.0, False), (5_400.0, True)], ids=["calm-2pct", "wild-9pct"])
+def test_paper_applies_the_limit_with_the_daily_atr_read_from_real_history(tmp_path, monkeypatch, width, refused):
+    """QA SG13: no 2% stand-in. Paper reads 20 days of the pair's minutes from the history store. ping_pong at 1x opens
+    about 2,000 notional, stopless: on a calm 2% day it counts at the 10% floor (200, under 5% of the 10,000 book) and
+    opens; on 9% days it counts at three ATRs (27%, about 540) and is refused."""
+    from sleeve_fund import history
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.venues import venue as venue_profile
+
+    monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
+    monkeypatch.setattr(open_risk, "_ATR_CACHE", {})
+    start = pd.Timestamp("2025-10-03", tz="UTC")
+    idx = pd.date_range(start - pd.Timedelta(days=20), periods=20 * 1440, freq="1min", tz="UTC")
+    minutes = pd.DataFrame({"open": 60_000.0, "high": 60_000 + width / 2, "low": 60_000 - width / 2,
+                            "close": 60_000.0, "volume": 1.0}, index=idx)
+    store = Store.in_memory()
+    path = tmp_path / "pp.jsonl.gz"
+    _record(path, _meta(), [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
+    for v in {venue_profile(None).name, venue_profile("BINANCE").name}:  # whichever the replayed sleeve trades on
+        HistoryStore(tmp_path / "hist").append(v, "BTC/USD", minutes, cursor="x")
+    orders, _ = replay(path, with_fills=True, store=store)
+    entries = [o for o in orders if o["intent"] == "entry"]
+    notes = [e["message"] for e in store.events("pp", limit=500) if e["kind"] == "entry_refused_open_risk"]
+    assert not any("can't be measured" in n for n in notes), notes  # the real ATR was read
+    if refused:
+        assert entries == [] and notes and "over 5% of the book" in notes[0], notes
+    else:
+        assert entries and notes == [], notes

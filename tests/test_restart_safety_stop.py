@@ -262,3 +262,19 @@ def test_the_watched_stop_row_shows_the_safety_stop_once_with_its_incident_and_i
     assert sent == ["stop_loss"] and _watched_rows(store) == []
     (done,) = [r for r in _watched_rows(store, open_only=False) if r["order_id"] == row["order_id"]]
     assert done["status"] == "canceled" and done["message"].startswith("stop fired at ")
+
+
+def test_a_second_restart_further_against_the_position_never_loosens_the_safety_stop(store, instrument):
+    """QA SG4: a 2x short restarted at 65,000 gets its safety stop half way to liquidation; a deploy after the price
+    has moved further against it, with no fill since, keeps that stop rather than measuring a looser one from the new
+    mark, and writes no second incident."""
+    strat = _strategy(store, instrument, "balanced", {**PERP, "allow_short": True, "stop_atr": 2.0})
+    qty = -2 * 10_000 / 60_000
+    first, liq = _restart_at(strat, 60_000.0, qty, 65_000.0, 2.0)
+    assert first < liq
+    SleeveRuntime(store, "s1").on_start(0.008)  # the deploy: the old process's orders go with it
+    strat._watched, strat._stop_frac = None, None  # the new process restores no stop of its own
+    second, _ = _restart_at(strat, 60_000.0, qty, 70_000.0, 2.0)
+    assert second == pytest.approx(first)  # not 70,000 + half the way to liquidation
+    assert "never loosens" in strat._stop_basis or "before the last restart" in strat._stop_basis
+    _incident(store)  # still exactly one

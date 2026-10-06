@@ -86,7 +86,7 @@ def test_with_the_safety_stop_on_the_cases_gap_is_closed_by_the_safety_stop_rebo
 
 
 @LIFT
-def test_with_every_guard_on_a_steady_rise_closes_the_carried_short_long_before_liquidation(tmp_path, whole_equity):
+def test_with_every_guard_but_the_entry_limit_on_a_steady_rise_closes_the_carried_short_long_before_liquidation(tmp_path, whole_equity):
     """No gap: a steady 30% rise. The daily-loss pause (3% of equity, 1.5% of price at 2x) flattens it first, well
     inside the safety stop and the liquidation price: nothing is liquidated."""
     store, orders = _carried_then(tmp_path, [(5, 0.0), (30, 0.3), (5, 0.0)])

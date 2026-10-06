@@ -754,3 +754,21 @@ def test_orders_by_intent_and_funding_and_insurance_before_a_time_are_read_in_th
     cut = t0 + timedelta(hours=16)
     assert j.funding_total("s1", before=cut) == pytest.approx(1.0) and j.funding_total("s1") == pytest.approx(3.0)
     assert j.insurance_total("s1", before=cut) == pytest.approx(10.0) and j.insurance_total("s1") == pytest.approx(30.0)
+
+
+def test_the_daily_pause_is_lifted_by_the_first_tick_after_the_0000_utc_roll(store):
+    """QA SG14: the strategy page reads the store's status, so the roll lifts the pause on the tick, not at the next
+    entry check."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 23, 59, 30, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    rt._set("paused", "daily loss 6.0% hit the 5% limit", datetime(2025, 10, 4, tzinfo=timezone.utc))
+    flat = {"equity": 9_400, "cash": 9_400, "qty": 0.0, "price": 60_000}
+    rt.tick(**flat)
+    assert store.sleeve("s1").status == "paused"
+    t[0] += timedelta(minutes=1)
+    rt.tick(**flat)
+    assert store.sleeve("s1").status == "running"

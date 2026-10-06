@@ -1075,15 +1075,23 @@ class LongFlatStrategy(Strategy):
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
         level = mark - SAFETY_STOP_SHARE * (mark - target)
+        # A stop never loosens (QA SG4): a safety stop an earlier restart set for this same position (no fill since)
+        # stays when it is tighter than one measured from today's mark, even if the price is already through it.
+        before = self.runtime.last_watched_stop() if not self._backtest else None
+        held = before is not None and side * (before - level) > 0
+        if held:
+            level = before
         restored = entry * (1 - side * self._stop_frac) if self._stop_frac is not None else None
         kept = restored is not None and side * (restored - level) >= 0  # the restored stop is the tighter one
         if not kept:
             self._stop_frac = side * (1 - level / entry)
-            self._stop_basis = f"safety stop, half way from the {mark:,.6g} mark to " + (
-                f"the liquidation price {liq:,.6g}" if liq is not None else "zero")
+            self._stop_basis = (f"safety stop at {level:,.6g}, set before the last restart" if held else
+                                f"safety stop, half way from the {mark:,.6g} mark to "
+                                + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         why = (f"started for its exits only ({self._exits_reason()})" if self._exits_only else self._safety_why)
         work = (f"it keeps its restored stop at {restored:,.6g}, tighter than a safety stop at {level:,.6g}" if kept
-                else f"it works to a safety stop at {level:,.6g}, half way from the {mark:,.6g} mark to "
+                else f"it keeps the safety stop at {level:,.6g} set before this restart (a stop never loosens)"
+                if held else f"it works to a safety stop at {level:,.6g}, half way from the {mark:,.6g} mark to "
                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         head = f"Incident, {self.runtime.name}: the open {_side_word(side)} position of {abs(qty):.12g} (entry "
         self.runtime.incident_once(
@@ -2711,7 +2719,10 @@ class LongFlatStrategy(Strategy):
         """The incident the engine opens on every liquidation, once the position is gone (Advisor 18:17; 20:37: with
         the equity left). A reset after liquidation needs its note (RAL)."""
         rt = self.runtime
-        left = self._mark()[0]
+        book = rt.store.journal_book(rt.name, rt.starting_balance)
+        # The journal's own cash once the position is gone, to the cent the PM reads elsewhere (QA SG8); the mark
+        # only while the journal still holds part of it.
+        left = book["cash"] if abs(book["qty"]) < 1e-12 else self._mark()[0]
         rt.store.event(rt.name, "error", "incident",
                        f"Incident, {rt.name}: {self._liquidated or WIPED_OUT}; {max(left, 0.0):,.2f} of equity left. It "
                        "stays halted until you reset it after liquidation, which needs a note on why the "
@@ -3009,9 +3020,16 @@ class LongFlatStrategy(Strategy):
             return
         self._gated_fills.add(order)
         rt = self.runtime
+        # Advisor 23:05 (SG7): a raced fill is treated as the block treats a position already held. A halt, a
+        # liquidation and the daily pause flatten, so it is sold at once; Stop, stale data, funding and retire keep it.
+        sells = getattr(why, "code", None) in ("halted", "liquidated", "daily_pause")
+        if sells:
+            rt.raced = why
         rt.store.event(rt.name, "error", "incident",
                        f"Incident, {rt.name}: an order that adds to the position filled while nothing may open ({why}): "
-                       f"{qty:g} at {px:,.6g}. It is kept with its stop, not closed; you decide what to do with it.",
+                       f"{qty:g} at {px:,.6g}. "
+                       + ("It is sold at once through the exit path, as that block flattens what it holds." if sells else
+                          "It is kept with its stop, not closed; you decide what to do with it."),
                        ts=rt.now())
 
     def _adds(self, side) -> bool:
@@ -3209,6 +3227,7 @@ class LongFlatStrategy(Strategy):
                     self._replan_pending = self._plan_entry = None
         if opening:
             self._gated_fill(coid, qty, px)
+        self._sync_watched_stop()  # an add or a partial close resizes the journal's stop in the same step (QA)
         if self._backtest:
             if opening and self._pending_exit is None:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its

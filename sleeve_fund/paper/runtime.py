@@ -225,6 +225,9 @@ class SleeveRuntime:
         # entry_blocked reads them. Each holder sets and clears its own key.
         self.holds: dict[str, str] = {}
         self._block = open_block(store, sleeve_name)  # the block episode open in the journal, by its reason
+        # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
+        # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
+        self.raced: str | None = None
         self._refused = 0
 
     def _last_liquidation(self) -> str | None:
@@ -299,14 +302,14 @@ class SleeveRuntime:
             return None
         if last["kind"] == "risk_pause" and not (self.paused_until and self.paused_until > self.now()):
             return None
+        label = {"pm_flatten": "Flattened by PM", "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause"}
         fills = self.store.fills(self.name, limit=100_000)
         before = [f for f in fills if f["ts"] <= last["ts"]]
-        if len(before) < len(fills) and abs(replay_book(before[::-1], self.starting_balance)["qty"]) <= max(
-                self.close_floor, 1e-12):
-            # Flat when it fired, so nothing of it was left to sell: what is held now filled after it (an entry that
-            # raced the cancel), and is kept with its stop and an incident, never flattened (P1-U35, Advisor 20:56).
-            return None
-        label = {"pm_flatten": "Flattened by PM", "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause"}
+        if (last["kind"] != "pm_flatten" and len(before) < len(fills)
+                and abs(replay_book(before[::-1], self.starting_balance)["qty"]) <= max(self.close_floor, 1e-12)):
+            # Flat when it fired: what is held now filled after it (an entry that raced the cancel). The halt's or
+            # the daily pause's own flatten covers it, through the exit path (Advisor 23:05, SG7).
+            return last["kind"], f"Raced fill flattened by halt, after a restart ({label[last['kind']]}: {last['message']})"
         return last["kind"], f"{label[last['kind']]}, sent again after a restart: {last['message']}"
 
     def on_stop(self) -> None:
@@ -349,6 +352,18 @@ class SleeveRuntime:
         fill has changed the position since (one incident per position, QA on P1-U35)."""
         if not said_since_last_fill(self.store, self.name, head):
             self.store.event(self.name, "error", "incident", message, ts=self.now())
+
+    def last_watched_stop(self) -> float | None:
+        """The level of the newest watched stop journaled for the position held now (since its last fill), open or
+        cancelled by a restart, else None: a restart's safety stop never loosens it (QA SG4)."""
+        last = self.store.fills(self.name, limit=1)
+        since = last[0]["ts"] if last else None
+        for o in self.store.orders(self.name, limit=200):  # newest first
+            if since is not None and o["ts"] < since:
+                return None
+            if (o.get("signal") or {}).get("watched"):
+                return float(o["signal"]["stop_px"])
+        return None
 
     def position_incident(self) -> int | None:
         """The id of the latest incident about the position held now (written since its last fill), else None."""
@@ -414,6 +429,11 @@ class SleeveRuntime:
                 self._day_open = self._last_equity if self._last_equity is not None else equity
             self._day = risk.trading_day(now)
         self._last_equity = equity
+        if not self.backtest and self.status == "paused" and self.paused_until is not None and self.paused_until <= now:
+            # Paper: the 00:00 roll lifts a daily pause on the tick, not at the next entry check, so the strategy page
+            # reads it at once (QA SG14). A backtest has no page, and lifts it at its next entry check, where its
+            # resting risk stops are placed again.
+            self.can_open()
 
         flatten = False
         self.flatten_why = None
@@ -439,6 +459,23 @@ class SleeveRuntime:
                 self._set("paused", breach.reason, until)
                 self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened until the next 00:00 UTC", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
+        elif (self.status == "paused" and abs(qty) >= max(self.close_floor, 1e-12) and self._owed_flatten is None
+              and not busy):
+            # Status governs entries only (Advisor 23:05, SG5): a holder that is paused (by the PM, for its exits
+            # only, or after a flatten) keeps the drawdown halt and the daily-loss flatten. The halt outranks the
+            # pause; a daily-loss breach flattens and is journaled but keeps the pause it was in, so a PM pause or an
+            # exits-only start is never turned into one the 00:00 roll lifts. A daily pause already flattened.
+            judged = min(equity, guard_equity) if guard_equity is not None else equity
+            breach = risk.check(self.profile, judged, self.peak, self._day_open)
+            if breach and breach.action == "halt":
+                self._set("halted", breach.reason)
+                self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume",
+                                 ts=self.now())
+                flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
+            elif breach and breach.action == "pause_day" and self.paused_until is None:
+                self.store.event(self.name, "warning", "risk_pause",
+                                 f"{breach.reason}; flattened while paused, and it stays paused", ts=self.now())
+                flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss limit while paused: {breach.reason}")
 
         for cmd in [] if liquidating else self.store.pending_commands(self.name):
             if cmd["command"] == RELOAD:
@@ -511,6 +548,18 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "flatten_failed",
                                  f"still holding {qty:.12g} after {FLATTEN_RETRIES} attempts to close it; the PM must "
                                  f"flatten it ({self._owed_flatten[1]})", ts=self.now())
+        if not flatten and self.raced is not None:
+            held = abs(qty) >= max(self.close_floor, 1e-12)
+            flattening = self.status == "halted" or (self.status == "paused" and self.paused_until is not None)
+            if held and flattening and not busy:
+                kind = "risk_halt" if self.status == "halted" else "risk_pause"
+                flatten, self.flatten_why = True, (kind, f"Raced fill flattened by halt: {self.raced}")
+                self._owed_flatten, self._flatten_retries = self.flatten_why, 0
+                self.store.event(self.name, "warning", "raced_fill_flattened",
+                                 f"Raced fill flattened by halt: {qty:.12g} filled after it ({self.raced}); sold at "
+                                 "market through the exit path", ts=self.now())
+            if not (held and flattening and busy):
+                self.raced = None
         return "flatten" if flatten else None
 
     # --- reconciliation ----------------------------------------------------------

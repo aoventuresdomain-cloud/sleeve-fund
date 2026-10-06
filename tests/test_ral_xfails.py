@@ -680,7 +680,6 @@ def test_the_engines_add_cap_check_is_on_the_margin_posted_after_the_add(store):
     assert rt.position_budget(10_000, posted=p.max_position_pct * 10_000) <= 1e-6
 
 
-@xf
 def test_the_engines_incident_records_the_equity_remaining_after_the_liquidation(store, tmp_path):
     """[R20:37] "Incident also records the equity remaining after the liquidation": the engine's incident for this
     liquidation (one, at or after it) names the strategy's equity once the position is gone ("{:,.2f}")."""

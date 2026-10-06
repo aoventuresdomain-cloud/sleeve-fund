@@ -684,16 +684,19 @@ LS_CASES = {
 }
 
 
+@pytest.mark.parametrize("profile,stop", [("conservative", {}), ("balanced", {"stop_loss": 0.03})],
+                         ids=["1x-stopless", "2x-3pct-stop"])
 @pytest.mark.parametrize("strategy", list(LS_CASES))
-def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
+def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy, profile,
+                                                                                      stop):
     """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
     replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
-    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee."""
+    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee. With every guard
+    on (QA P1-S4, SG12): a stopless model at 1x, and at 2x with a 3% stop."""
     params, path = LS_CASES[strategy]
-    params = {**params, **PERP}
-    # At 1x, with the open-risk limit on (QA P1-S4): a stopless model runs at 1x only.
+    params = {**params, **PERP, **stop}
     paper, bt = _paper_and_backtest(tmp_path, path(np.arange(240 * 60)), params, strategy=strategy,
-                                    profile="conservative")
+                                    profile=profile)
     # The backtest's last bar closes on the last trade; paper's would close on a trade after it, which never
     # comes. An order on that bar alone is an edge of the recording, not a difference.
     end = pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=240)
