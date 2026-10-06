@@ -480,6 +480,8 @@ def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path,
     at which it stops making money. The rungs differ only in fees, so return falls as the fee rises, and the
     ladder leaves the idea counter alone."""
     from sleeve_fund.research.study import COST_LADDER
+    from sleeve_fund.research.study import breakeven_fee as breakeven_fee_of
+    from sleeve_fund.research.tearsheet import g1_checks as g1_checks_of
 
     prices = synthetic_ohlcv(days=1500, seed=3)
     ledger = IdeaLedger(tmp_path / "l.jsonl")
@@ -497,6 +499,14 @@ def test_every_study_runs_the_cost_ladder_and_names_the_break_even_fee(tmp_path,
     from sleeve_fund.research.study import ladder_slippage
 
     assert (ladder_slippage("ETH/USDT"), ladder_slippage("SUI/USD")) == (0.0002, 0.0005)
+    # v2 P1-6: every grid point gets its own ladder and break-even fee, and the default's is the one above.
+    assert r.sensitivity["breakeven"].map(bool).all()
+    default = r.sensitivity[(r.sensitivity["fast"] == r.default_params["fast"])
+                            & (r.sensitivity["slow"] == r.default_params["slow"])].iloc[0]
+    assert default["breakeven"] == breakeven_fee_of(r.cost_ladder)[1]
+    assert "| Break-even fee |" in sheet
+    checks = dict((name, verdict) for name, verdict, _ in g1_checks_of(r, ledger))
+    assert checks["Break-even fee (shown, not a test)"] == "INFO" and "Holds at nearby settings" in checks
 
 
 def test_the_break_even_fee_is_read_between_the_rungs_either_side_of_zero():

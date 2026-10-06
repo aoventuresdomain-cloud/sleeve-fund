@@ -408,6 +408,34 @@ signal_state_t = Table(
     Column("ts", TS, nullable=False),
     Column("payload", Text, nullable=False),
 )
+# Every variant ever tested, for the research guardrails (v2 P1-6): the count that deflates a result's Sharpe.
+# Append-only: nothing here is updated or deleted, and it has no strategy column, so a reset never touches it.
+# One row per evaluation; a variant is one (definition_hash, code_version, dataset). A new table: CREATE TABLE.
+trials_t = Table(
+    "trials",
+    metadata,
+    Column("id", String(16), primary_key=True),
+    Column("definition_hash", String(64), nullable=False),  # the whole definition, settings included
+    Column("idea_hash", String(64), nullable=False),  # the definition with its tunable settings left out
+    Column("code_version", String(40), nullable=False),  # the indicator library's version: changed code, new variant
+    Column("definition_name", Text, nullable=False),
+    Column("family", String(32), nullable=False),
+    Column("settings", Text, nullable=False),  # JSON text, sorted keys; display only, nothing filters on it
+    Column("dataset", String(128), nullable=False),
+    Column("stage", String(16), nullable=False),
+    Column("source", String(16), nullable=False),
+    Column("sharpe", Float),  # annualised; NULL where it is undefined, never NaN
+    Column("trades", Integer),
+    Column("oos_trades", Integer),
+    # Not a foreign key: saved backtests are pruned to the latest 50, and a trial outlives its run.
+    Column("backtest_id", String(16)),
+    Column("created_at", TS, nullable=False),
+    Index("trials_idea_hash", "idea_hash"),
+    Index("trials_definition_dataset", "definition_hash", "dataset"),
+)
+# Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
+TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
+TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -1436,6 +1464,33 @@ class Store:
              .order_by(backtests_t.c.created_at.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
+
+    # --- trials register (research guardrails) ----------------------------------------
+
+    def add_trials(self, rows: list[dict]) -> int:
+        """Append trials; a row whose id is already there is skipped, so replaying the same rows is a no-op.
+        Returns how many were added."""
+        if not rows:
+            return 0
+        for r in rows:
+            if r["source"] not in TRIAL_SOURCES:
+                raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
+            if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
+                raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
+            sharpe = r.get("sharpe")
+            if sharpe is not None and not math.isfinite(sharpe):
+                raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
+        with self.engine.begin() as c:
+            have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
+            new = [dict(r, created_at=r.get("created_at") or utcnow()) for r in rows if r["id"] not in have]
+            new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
+            if new:
+                c.execute(insert(trials_t), new)
+        return len(new)
+
+    def trials(self) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(trials_t).order_by(trials_t.c.created_at, trials_t.c.id)))
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

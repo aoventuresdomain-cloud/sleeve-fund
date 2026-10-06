@@ -270,7 +270,7 @@ def run_study(
     errors: list = []
     error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
-    total = (1 + len(combos) + 1 + folds_n * (len(combos) + 1) + len(COST_LADDER)
+    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 1 + folds_n * (len(combos) + 1) + len(COST_LADDER)
              + (2 if use_holdout and holdout_days else 0))
     done = [0]
 
@@ -306,29 +306,39 @@ def run_study(
     bench_ret = daily_returns(bench.equity)
 
     # 1. Sensitivity over the full research period.
+    # The cost ladder: a variant over the research period at each fee. Not logged as variants, since the
+    # strategy is the same; only what it pays changes. Every variant gets one (v2 P1-6), so a break-even fee
+    # sits next to each grid point, not only the default's.
+    slip = ladder_slippage(pair_of(instrument))
+
+    def cost_ladder(params: dict) -> list[LadderRung]:
+        rungs = []
+        for fee in COST_LADDER:
+            res = bt(spec.name, research, params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
+                     slippage=slip)
+            eq = res.equity
+            rungs.append(LadderRung(fee=fee, total_return=float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0,
+                                    sharpe=summary(daily_returns(eq))["sharpe"],
+                                    round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid))
+        return rungs
+
     rows = []
-    full_default = None
+    full_default, ladder = None, None
     for params in combos:
         res = bt(spec.name, research, params)
         m = summary(daily_returns(res.equity))
         log(params, "sensitivity", m["sharpe"])
-        rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid})
+        rungs = cost_ladder(params)
+        fee, words = breakeven_fee(rungs)
+        rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid,
+                     "breakeven_fee": float("nan") if fee is None else fee, "breakeven": words})
         if params == default_params:
-            full_default = res
+            full_default, ladder = res, rungs
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
+    if ladder is None:
+        ladder = cost_ladder(default_params)
     sensitivity = pd.DataFrame(rows)
-
-    # The cost ladder: the default params over the research period at each fee. Not logged as variants, since
-    # the strategy is the same; only what it pays changes.
-    ladder, slip = [], ladder_slippage(pair_of(instrument))
-    for fee in COST_LADDER:
-        res = bt(spec.name, research, default_params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
-                 slippage=slip)
-        eq = res.equity
-        ladder.append(LadderRung(fee=fee, total_return=float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0,
-                                 sharpe=summary(daily_returns(eq))["sharpe"],
-                                 round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid))
 
     # 2. Walk-forward.
     folds: list[Fold] = []
