@@ -134,6 +134,8 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
     r = r.iloc[:-1]  # the newest candle is still forming
     r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
     newer = r[r.index > df.index[-1]]
+    whole = {"missing": 0, "degraded": False}  # the venue's own candles: none of their minutes absent (board 5a)
+    newer = newer.assign(**{c: v for c, v in whole.items() if c in df.columns})
     return pd.concat([df, newer[list(df.columns)]]) if len(newer) else df
 
 

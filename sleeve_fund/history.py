@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from sleeve_fund import bars as bar_rule
+
 OHLCV = ["open", "high", "low", "close", "volume"]
 DEFAULT_ROOT = Path(os.environ.get("HISTORY_DIR", Path(__file__).resolve().parent.parent / "data" / "history"))
 _lock = threading.Lock()
@@ -357,18 +359,9 @@ def _save(path: Path, df: pd.DataFrame) -> None:
 
 def _resample(df: pd.DataFrame, minutes: int, first: pd.Timestamp | None = None,
               end: pd.Timestamp | None = None) -> pd.DataFrame:
-    """1-minute bars by open time -> `minutes` bars by open time. A bar the stored minutes only partly cover at
-    either end, from `first` (the first minute) to `end` (just past the last), is left out: a part-day isn't a
-    daily bar. A bar inside the series missing a minute is kept from the minutes it has, as paper builds every
-    bar (m13-E6); only a bar with no minutes at all is left out. The bounds default to the frame's own."""
-    if minutes <= 1 or df.empty:
-        return df
-    first = df.index[0] if first is None else first
-    end = df.index[-1] + pd.Timedelta(minutes=1) if end is None else end
-    g = df.resample(f"{minutes}min", origin="epoch", label="left", closed="left")
-    bars = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-    whole = (bars.index >= first) & (bars.index + pd.Timedelta(minutes=minutes) <= end)
-    return bars[whole & (g["close"].count() > 0).to_numpy()]
+    """1-minute bars by open time -> `minutes` bars by open time, by the one bar-build rule (sleeve_fund.bars,
+    m13-E6): built from the minutes present, with how many are missing; part bars at either end left out."""
+    return bar_rule.build_bars(df, minutes, first, end)
 
 
 def _load(path: Path) -> pd.DataFrame:
