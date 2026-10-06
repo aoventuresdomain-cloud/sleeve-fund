@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import math
 from dataclasses import dataclass
 
@@ -75,6 +76,30 @@ def warmup(fn):
     return _Warmup(fn)
 
 
+def _finite_inputs(update_raw):
+    """Wraps a block's update_raw: refuses a NaN or infinite input, which would otherwise poison every later
+    value while the block still reads as ready, and counts the bars fed for `settled`."""
+
+    @functools.wraps(update_raw)
+    def checked(self, *args, **kwargs):
+        for x in args:
+            if x is not None and not math.isfinite(x):
+                raise ValueError(f"{type(self).__name__} was fed {x!r}: every input must be a finite number")
+        update_raw(self, *args, **kwargs)
+        self._fed = getattr(self, "_fed", 0) + 1
+
+    return checked
+
+
+def _counted_reset(reset):
+    @functools.wraps(reset)
+    def fresh(self):
+        reset(self)
+        self._fed = 0
+
+    return fresh
+
+
 class BlockBase:
     """The interface every block keeps. A subclass lists SETTINGS (named as its attributes) and OUTPUTS, and
     implements `_outputs()` with every output by name; `values` hides them as None until it is initialized."""
@@ -82,6 +107,21 @@ class BlockBase:
     SETTINGS: tuple[Setting, ...] = ()
     OUTPUTS: tuple[str, ...] = ("value",)
     confirm_lag = 0  # bars after an event before the block can report it; swing-confirmed blocks set it
+    _fed = 0
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        if "update_raw" in cls.__dict__:
+            cls.update_raw = _finite_inputs(cls.__dict__["update_raw"])
+        if "reset" in cls.__dict__:
+            cls.reset = _counted_reset(cls.__dict__["reset"])
+
+    @property
+    def settled(self) -> bool:
+        """Fed at least its warm-up: it now reads what a block running over all history would (QA, v2 P1-3, F1).
+        Library blocks are not initialized before this; Sma, AtrSma and Rsi keep the earlier `initialized` the
+        hand-coded models trade on, so a rule reads `settled`."""
+        return self.initialized and self._fed >= self.warmup_bars
 
     @classmethod
     def check_settings(cls, settings: dict) -> dict:

@@ -50,6 +50,9 @@ def test_study_end_to_end_and_holdout_flag(tmp_path, instrument):
     assert r.oos_returns.index.max() <= r.research_end
     assert r.holdout is None
     assert "Synthetic data" in render(r, ledger)
+    # C3: the out-of-sample trades against random entry times, in G1 (v2 P1-7).
+    assert r.random_entry is not None and r.random_entry.trades <= r.oos_trades
+    assert "Beats random entry times" in render(r, ledger)
 
     first = run_study(SPEC, prices, instrument, use_holdout=True, **kw)
     assert first.holdout is not None
@@ -295,9 +298,11 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
     r = run_study(HOLD, daily, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=0,
                   train_days=60, test_days=60, risk_profile="conservative")
     first, second = r.folds
-    assert "in the test window" in first.halted and first.test_trades == 1  # the halt closed the trade
+    # The halt closed the trade in the test window, but it was opened in training: carried in, so it is left out
+    # of the out-of-sample count (Advisor, 5 Oct 2026, C3).
+    assert "in the test window" in first.halted and first.test_trades == 0 and first.carried_in == 1
     assert "in the training stretch" in second.halted and second.test_trades == 0
-    assert r.oos_trades == 1
+    assert r.oos_trades == 0 and r.excluded_trades == 1
     gaps = oos_gaps(r)
     assert "No trades out-of-sample in 1 of 2 test windows" in gaps
     # Round 9, N6: halts before and inside a test window are told apart, so the counts agree.
@@ -306,7 +311,8 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
             "(1 of them closed a trade first)") in gaps
     enough = next(c for c in g1_checks(r, ledger) if c[0] == "Enough out-of-sample trades to judge")
     # One of two windows blind, so half: not judged since round 10 (M10-1), and the trade count can't fail.
-    assert enough[1] == "N/A" and enough[2].startswith("not judged: 1 closed in the 2 walk-forward test windows")
+    assert enough[1] == "N/A" and enough[2].startswith("not judged: 0 closed in the 2 walk-forward test windows")
+    assert "1 left out at the windows' edges" in enough[2]
     sheet = render(r, ledger)
     assert "> **No trades out-of-sample in 1 of 2 test windows.**" in sheet
     assert "| 0 (halted 29 Mar 2022) |" in sheet and "| 1 (halted 27 Mar 2022) |" in sheet  # halt dates per fold
@@ -325,8 +331,8 @@ def test_a_sheet_whose_test_windows_all_traded_has_no_gap_note():
 
     from sleeve_fund.research.tearsheet import oos_gaps
 
-    fold = SimpleNamespace(test_trades=3, halted="", test_end=pd.Timestamp("2024-01-01"))
-    quiet = SimpleNamespace(test_trades=0, halted="", test_end=pd.Timestamp("2024-07-01"))
+    fold = SimpleNamespace(test_trades=3, closed_in_window=3, halted="", test_end=pd.Timestamp("2024-01-01"))
+    quiet = SimpleNamespace(test_trades=0, closed_in_window=0, halted="", test_end=pd.Timestamp("2024-07-01"))
     assert oos_gaps(SimpleNamespace(folds=[fold, fold], risk_profile="balanced")) == ""
     words = oos_gaps(SimpleNamespace(folds=[fold, quiet], risk_profile=None))
     assert "No trades out-of-sample in 1 of 2" in words and "signal never closed a trade" in words
@@ -432,7 +438,7 @@ def _folds(*spec):
     """Folds as (halted, halted_before_test, test_trades)."""
     from types import SimpleNamespace
 
-    return [SimpleNamespace(halted="12 Mar 2022 (drawdown)" if h else "", halted_before_test=b, test_trades=t)
+    return [SimpleNamespace(halted="12 Mar 2022 (drawdown)" if h else "", halted_before_test=b, test_trades=t, closed_in_window=t)
             for h, b, t in spec]
 
 

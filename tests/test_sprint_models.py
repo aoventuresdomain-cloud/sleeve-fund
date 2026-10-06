@@ -83,9 +83,6 @@ def test_dip_buy_refuses_settings_that_make_no_sense():
 
 def test_donchian_thirds_enter_on_their_breakouts_and_leave_at_their_half_length_lows():
     s = _donchian(lookbacks="2,4", vol_lookback_days=10)
-    for c in [100, 101, 102, 101, 100, 99, 100, 101, 102, 101, 100]:
-        s._closes.append(float(c))
-    s._on = {2: False, 4: False}
 
     class _Bar:
         def __init__(self, c):
@@ -93,6 +90,9 @@ def test_donchian_thirds_enter_on_their_breakouts_and_leave_at_their_half_length
 
             self.close = Price(c, 2)
 
+    for c in [100, 101, 102, 101, 100, 99, 100, 101, 102, 101, 100]:
+        s.update_indicators(_Bar(float(c)))
+    assert s._on == {2: False, 4: False}  # the last close, 100, broke both half-length lows
     s.update_indicators(_Bar(103.0))  # above the last 2 and the last 4 closes: both on
     assert s._on == {2: True, 4: True}
     s.update_indicators(_Bar(102.5))  # 2-day sub-model's half length is 1 day: below 103, out; 4-day holds
