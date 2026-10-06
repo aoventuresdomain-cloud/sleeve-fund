@@ -1270,6 +1270,24 @@ class LongFlatStrategy(Strategy):
             return "Signal to be short", {}
         return ("Signal to be long" if target else "Signal to be flat"), {}
 
+    # --- the chart's indicators (P1-3s) -----------------------------------------------------------------------------
+
+    def indicator_meta(self) -> dict[str, dict]:
+        """The indicators the chart draws for this model, by the key its decisions journal each under (explain's
+        values): {key: {"label", "pane": "price" or "lower", and optionally "group", "levels", "tf"}}. None by
+        default."""
+        return {}
+
+    def indicator_values(self) -> dict[str, float | None]:
+        """Each drawn indicator as at the last bar's close, read from the model's own indicators, so it is the value
+        its decision on that bar used (explain records the same); None where there is none yet."""
+        return {}
+
+    def indicator_settled(self, key: str) -> bool:
+        """Whether `key` has settled at the last bar: past the model's warm-up (settle_bars_needed), as the
+        "unsettled" flag on its fills reads it."""
+        return not self._unsettled()
+
     def conditions(self, side: int, price: float | None = None) -> list[Condition] | None:
         """The model's rules for `side` (+1 long, -1 short) on this bar, for the strategy page's Signals tab:
         those that would all have to hold for the model's decision to be that side, or, while the model is on

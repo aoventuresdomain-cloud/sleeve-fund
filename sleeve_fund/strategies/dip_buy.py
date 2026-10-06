@@ -191,6 +191,24 @@ class DipBuy(LongFlatStrategy):
         self._why = (self._why[0], values)
         return side
 
+    def indicator_meta(self) -> dict[str, dict]:
+        c = self.c
+        return {"rsi": {"label": f"RSI({c.rsi_period})", "pane": "lower", "levels": sorted({c.rsi_entry, 100 - c.rsi_entry})},
+                "atr": {"label": f"ATR({c.dip_atr_bars}) simple", "pane": "lower"},
+                "high_24h": {"label": "24h high", "pane": "price", "group": "range_24h"},
+                "low_24h": {"label": "24h low", "pane": "price", "group": "range_24h"},
+                "exit_sma": {"label": f"SMA({c.exit_sma}) exit", "pane": "price"},
+                "day_sma": {"label": f"SMA({c.trend_sma_days}) 1d", "pane": "price", "group": "daily_trend", "tf": "1d"},
+                "day_ema": {"label": f"EMA({c.trend_ema_days}) 1d", "pane": "price", "group": "daily_trend", "tf": "1d"}}
+
+    def indicator_values(self) -> dict[str, float | None]:
+        def v(ind, digits):
+            return round(ind.value, digits) if ind.initialized else None
+        return {"rsi": v(self.rsi, 4), "atr": v(self.atr, 8), "exit_sma": v(self.exit_avg, 8),
+                "high_24h": max(self._highs) if self._highs else None,
+                "low_24h": min(self._lows) if self._lows else None,
+                "day_sma": v(self.day_sma, 8), "day_ema": v(self.day_ema, 8)}
+
     def want_long(self, bar: Bar) -> bool | None:
         side = self.want_side(bar)
         return None if side is None else side == 1  # spot: the short leg is held flat

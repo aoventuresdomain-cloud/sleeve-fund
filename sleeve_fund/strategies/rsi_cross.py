@@ -149,13 +149,28 @@ class RsiCross(LongFlatStrategy):
             return None
         rsi = self.rsi.value
         side = self.target_side(rsi, self._prev)
-        values = {"rsi": round(rsi, 4)}
+        values = {k: v for k, v in self.indicator_values().items() if v is not None}
         if self._prev is not None:
             values["rsi_prev"] = round(self._prev, 4)
         if self.trend is not None and self.trend.initialized:
-            values.update(trend_close=self._trend_close, trend_sma=round(self.trend.value, 8))
+            values["trend_close"] = self._trend_close
         self._why = (self._why[0], values)
         return side  # a short is taken only on a perpetual with allow_short
+
+    def indicator_meta(self) -> dict[str, dict]:
+        c = self.c
+        meta = {"rsi": {"label": f"RSI({c.rsi_period})", "pane": "lower",
+                        "levels": sorted({c.long_entry, c.long_exit, c.short_exit, c.short_entry})}}
+        if self.trend is not None:
+            meta["trend_sma"] = {"label": f"SMA({c.trend_sma}) {c.trend_minutes // 60}h", "pane": "price",
+                                 "tf": f"{c.trend_minutes // 60}h"}
+        return meta
+
+    def indicator_values(self) -> dict[str, float | None]:
+        out = {"rsi": round(self.rsi.value, 4) if self.rsi.initialized else None}
+        if self.trend is not None:
+            out["trend_sma"] = round(self.trend.value, 8) if self.trend.initialized else None
+        return out
 
     def want_long(self, bar: Bar) -> bool | None:
         side = self.want_side(bar)

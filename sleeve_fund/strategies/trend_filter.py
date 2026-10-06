@@ -141,6 +141,18 @@ class TrendFilter(LongFlatStrategy):
             return 0.0  # no volatility estimate yet: stay out rather than guess a size
         return 1.0 if self._vol <= 0 else min(1.0, self._cfg.vol_target / self._vol)
 
+    def indicator_meta(self) -> dict[str, dict]:
+        c, kind = self._cfg, "EMA" if self._cfg.ema else "SMA"
+        label = kind.lower()
+        return {f"{label}_{c.fast}": {"label": f"{kind}({c.fast})", "pane": "price", "group": "trend_pair"},
+                f"{label}_{c.slow}": {"label": f"{kind}({c.slow})", "pane": "price", "group": "trend_pair"}}
+
+    def indicator_values(self) -> dict[str, float | None]:
+        c = self._cfg
+        label = "ema" if c.ema else "sma"
+        return {f"{label}_{c.fast}": self.fast.value if self.fast.initialized else None,
+                f"{label}_{c.slow}": self.slow.value if self.slow.initialized else None}
+
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         f, s, c = self.fast.value, self.slow.value, self._cfg
         kind = "exponential" if c.ema else ""

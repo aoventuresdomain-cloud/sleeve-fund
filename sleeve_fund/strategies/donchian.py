@@ -134,7 +134,8 @@ class Donchian(LongFlatStrategy):
         w = share * scale
         on = [str(n) for n in self.c.lookbacks if self._on[n]]
         values = {"close": self._closes[-1], "volatility": round(self._vol, 6), "vol_target": self.c.vol_target,
-                  "share_long": round(share, 6), **{f"long_{n}d": int(self._on[n]) for n in self.c.lookbacks}}
+                  "share_long": round(share, 6), **{f"long_{n}d": int(self._on[n]) for n in self.c.lookbacks},
+                  **{k: v for k, v in self.indicator_values().items() if v is not None}}
         if on:
             text = (f"Long on the {', '.join(on)}-day breakout{'s' if len(on) > 1 else ''} ({share:.0%} of the "
                     f"ensemble); volatility {self._vol:.0%} a year against a {self.c.vol_target:.0%} target, so hold "
@@ -143,6 +144,22 @@ class Donchian(LongFlatStrategy):
             text = "No breakout is on: every third is out below its half-length low, so hold cash"
         self._why = (text, values)
         return w
+
+    def indicator_meta(self) -> dict[str, dict]:
+        meta = {}
+        for n in self.c.lookbacks:  # the levels each third's breakout and exit were judged against on the candle
+            meta[f"upper_{n}d"] = {"label": f"{n}-day high close (entry)", "pane": "price", "group": f"channel_{n}d"}
+            meta[f"lower_{n}d"] = {"label": f"{max(n // 2, 1)}-day low close (exit)", "pane": "price",
+                                   "group": f"channel_{n}d"}
+        return meta
+
+    def indicator_values(self) -> dict[str, float | None]:
+        out = {}
+        for n in self.c.lookbacks:
+            entry, exit_ = self._entry[n], self._exit[n]
+            out[f"upper_{n}d"] = entry.values["upper"] if entry.initialized else None
+            out[f"lower_{n}d"] = exit_.values["lower"] if exit_.initialized else None
+        return out
 
     def want_long(self, bar: Bar) -> bool | None:
         w = self.target_weight(bar)
