@@ -15,7 +15,7 @@ class RsiDivergence(Block):
     Bullish divergence is a confirmed swing low below the previous one, at most `max_gap` bars earlier, while RSI
     at the new swing is higher. Bearish is the mirror on swing highs. Each fires on the bar that confirms the
     swing: `value` is 1 bullish, -1 bearish, 0 neither; `values` has both flags. Swings before the RSI is
-    initialized don't count."""
+    initialized don't count. It is itself initialized only after its warm-up."""
 
     SETTINGS = (Setting("rsi_period", int, 14, 2, PERIOD_MAX), Setting("left", int, 3, 1, 50),
                 Setting("right", int, 3, 1, 50), Setting("max_gap", int, 50, 1, 5_000))
@@ -67,7 +67,8 @@ class RsiDivergence(Block):
 
     @property
     def initialized(self) -> bool:
-        return self._rsi.initialized and len(self._recent) == self._recent.maxlen
+        # Not before its warm-up: until then the RSI at an earlier swing still leans on where it started (QA, F1).
+        return self._rsi.initialized and self.count >= self.warmup_bars
 
     def _outputs(self) -> dict:
         return dict(self._vals)
