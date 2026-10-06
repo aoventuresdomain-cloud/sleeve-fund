@@ -2378,3 +2378,14 @@ def test_a_liquidation_order_alone_marks_the_halt_as_liquidated(client):
                        reason="Liquidated: gapped through the liquidation price")
     store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
+    """Code review on #164: the liquidation is found however many events came after it."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "risk_halt", "Position margin lost (liquidated): 900.00, 18% of strategy equity")
+    for i in range(600):
+        store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text

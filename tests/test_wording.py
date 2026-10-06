@@ -27,6 +27,10 @@ VENUE = re.compile(r"bybit|binance|kraken|deribit", re.IGNORECASE)
     ("BTCUSDT-PERP.BINANCE: the feed missed 2 minutes", "BTCUSDT-PERP: the feed missed 2 minutes"),
     ("InstrumentId('BTC/USD.kraken')", "InstrumentId('BTC/USD')"),
     (".BINANCE answered", "the perpetual venue answered"),
+    # Code review: a URL ends before trailing punctuation; a file name keeps its shape.
+    ("see https://fapi.binance.com/fapi/v1/order.", "see the perpetual venue."),
+    ("GET https://api.bybit.com/v5/x: 500", "GET the demo account: 500"),
+    ("keys.binance.json missing", "keys.venue.json missing"),
 ])
 def test_no_venue_name_in_any_case_host_or_identifier(text, reads):
     assert no_venues(text) == reads

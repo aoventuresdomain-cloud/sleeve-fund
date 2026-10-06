@@ -27,8 +27,12 @@ def _as(words: str | None = None):
 # they read naturally (P1-U21).
 _VENUE_WORDS = [
     # A URL or host on a venue's domain is the venue: "https://api.Binance.com/x" reads "the perpetual venue".
-    (re.compile(rf"(?:https?://)?[\w.-]*\b(?:{_NAMES})\.(?:com|io|exchange)\b(?:/[^\s,;)\]'\"]*)?", _I), _as()),
+    (re.compile(rf"(?:https?://)?[\w.-]*\b(?:{_NAMES})\.(?:com|io|exchange)\b(?:/[^\s,;)\]'\"]*[^\s,;)\]'\".:])?", _I),
+     _as()),
     # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
+    # Inside a file name the venue becomes "venue", so the name stays a name: "keys.binance.json" reads
+    # "keys.venue.json", not "keys.json".
+    (re.compile(rf"(?<=\w)\.(?:{_NAMES})(?=\.\w)", _I), ".venue"),
     (re.compile(rf"(?<=\S)\.(?:{_NAMES})\b", _I), ""),
     (re.compile(rf"(?<!\S)\.(?:{_NAMES})\b", _I), _as()),
     (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b", _I), "the demo account isn't set up"),
@@ -38,7 +42,7 @@ _VENUE_WORDS = [
     (re.compile(r"\b(?:bybit|deribit)(?:[ ]?demo(?: trading| account)?| testnet)?(?:'s)?(?![\w-])", _I), _as(_DEMO)),
     # A venue's name inside a code identifier keeps the identifier readable: "BinanceClientError" reads
     # "VenueClientError".
-    (re.compile(rf"(?:{_NAMES})(?=[A-Z][a-z])", _I), "Venue"),
+    (re.compile(rf"(?:{_NAMES})(?=(?-i:[A-Z][a-z]))", _I), "Venue"),
     (re.compile(r"\bbinance(?: USD-M perpetuals)?(?:'s)?(?![\w-])", _I), _as(_PERP)),
     (re.compile(r"\bkraken(?: spot)?(?:'s)?(?![\w-])", _I), _as(_SPOT)),
     (re.compile(r"\b(?:[Tt]he|[Aa]n?) the\b"), lambda m: "The" if m.group(0)[0].isupper() else "the"),
