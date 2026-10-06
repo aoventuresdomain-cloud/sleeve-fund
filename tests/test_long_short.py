@@ -322,10 +322,14 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
     # A perp's 33% cap on balanced is its margin, so at 2x leverage a notional of 66% (PM, 5 Oct 2026).
-    assert "of 66%" in html and "over the cap" not in html
+    assert "of 66%" in html and "above entry cap" not in html
+    # QA U2, the Advisor's wording: leverage is notional at entry over isolated margin (3,030 / 1,515), exposure
+    # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
+    assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
+    assert "Side and leverage" not in html
     # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
-    assert "over the cap" in c.get("/sleeves/pp-ls", auth=AUTH).text
+    assert "above entry cap because the price moved" in c.get("/sleeves/pp-ls", auth=AUTH).text
     # The 2% stop sits above the entry; the open short gains as the price falls.
     assert "61,812" in html
     trades_page = c.get("/trades", auth=AUTH).text

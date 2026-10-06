@@ -270,8 +270,10 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
 
 
 def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | None:
-    """What a perpetual position adds to a spot one: leverage, isolated margin, how far it is from
-    liquidation, and the funding it has paid or received. funding: newest first, as the store returns it."""
+    """What a perpetual position adds to a spot one: leverage, exposure, isolated margin, how far it is from
+    liquidation, and the funding it has paid or received. funding: newest first, as the store returns it.
+    Leverage is the position's notional at entry over its isolated margin (the open position's own figure);
+    exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them)."""
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return None
@@ -281,7 +283,8 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     opened = position["opened"] if position else None
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
-        "leverage": notional / equity if equity > 0 else None,
+        "leverage": position["leverage"] if position else None,
+        "exposure": notional / equity if equity > 0 else None,
         "margin": margin,
         "maintenance": notional * t.maintenance_margin,
         "maintenance_rate": t.maintenance_margin,

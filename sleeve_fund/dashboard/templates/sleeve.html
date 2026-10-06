@@ -189,7 +189,9 @@
   </div>
   {% if perp %}<div class="pos-grid two">
     <div class="pos-card"><h3>Margin <span class="faint">isolated</span></h3><dl>
-      <div><dt>Side and leverage</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }} {{ '%.2f'|format(perp.leverage) if perp.leverage else '–' }}× <span class="faint">cap {{ '%g'|format(x.cap) }}× ({{ x.profile.max_position_pct|pct0 }} margin at {{ '%g'|format(x.profile.max_leverage) }}×)</span>{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
+      <div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
+      <div><dt title="Position value at entry ÷ the margin set aside for it (isolated)">Leverage</dt><dd>{% if position and perp.leverage %}{{ '%.2f'|format(perp.leverage) }}× <span class="faint">cap {{ '%g'|format(x.profile.max_leverage) }}×</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt title="Position value at the current price ÷ the strategy's equity. The cap applies when a position is opened: at most {{ x.profile.max_position_pct|pct0 }} of equity as margin × {{ '%g'|format(x.profile.max_leverage) }}× leverage = {{ '%.2f'|format(x.cap) }}× equity.">Exposure</dt><dd>{% if position and perp.exposure is not none %}{{ '%.2f'|format(perp.exposure) }}× equity <span class="faint">· cap {{ '%.2f'|format(x.cap) }}×</span>{% if perp.exposure > x.cap + 0.005 %} <span class="warn exposure-drift">above entry cap because the price moved; no action</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
       <div><dt title="Isolated: the notional at entry over the leverage cap">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
       <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
@@ -225,7 +227,7 @@
   <div class="panel-head"><h2 id="lim-h">Limits and health</h2></div>
   <div class="pos-grid two">
     <div class="pos-card"><h3>Limits used</h3><dl>
-      <div><dt>Position cap</dt><dd>{{ usage(risk.cap_used) }} <span class="faint">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="loss" title="The position has grown past the cap it was sized to, through a move against it (a losing short grows as the price rises). The cap limits new entries; it doesn't trim an open position.">over the cap</span>{% endif %}</dd></div>
+      <div><dt>Position cap</dt><dd>{{ usage(risk.cap_used) }} <span class="faint">{{ x.exposure|abs|pct0 }} of {{ x.cap|pct0 }}</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn" title="The cap applies when a position is opened; it doesn't trim an open one.">above entry cap because the price moved; no action</span>{% endif %}</dd></div>
       <div><dt>Drawdown</dt><dd>{{ usage(x.dd_used) }} <span class="faint">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></dd></div>
       {% if not backtest_id %}<div><dt>Today's loss</dt><dd>{{ usage(risk.day_used) }} <span class="faint">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></dd></div>{% endif %}
     </dl></div>
