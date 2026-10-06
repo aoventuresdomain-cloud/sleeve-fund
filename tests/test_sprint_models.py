@@ -161,3 +161,16 @@ def test_dip_buy_runs_in_a_backtest_without_errors(prices, instrument):
     res = run_backtest("dip_buy", prices.iloc[:400], instrument, {"trend_sma_days": 20, "trend_ema_days": 5},
                        half_spread=0)
     assert not res.handler_errors
+
+
+def test_the_hand_coded_models_keep_the_simple_atr():
+    """QA P1-A4: `Atr` now means Wilder's; the running models stay on the simple one (AtrSma) until they are
+    ported and switched on purpose, and their text says "simple ATR" (P1-A2)."""
+    from sleeve_fund.strategies.indicators import AtrSma
+    from sleeve_fund.strategies.rsi_pullback import SPEC as PULLBACK, RsiPullback, RsiPullbackConfig
+
+    pullback = RsiPullback(RsiPullbackConfig(instrument_id=InstrumentId.from_str("BTC/USD.KRAKEN"),
+                                             bar_type=BarType.from_str("BTC/USD.KRAKEN-1-DAY-LAST-EXTERNAL"),
+                                             assumed_taker_fee=0.008))
+    assert type(_dip().atr) is AtrSma and type(pullback.atr) is AtrSma
+    assert "simple-ATR" in PULLBACK.summary

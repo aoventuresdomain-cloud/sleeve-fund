@@ -162,6 +162,9 @@ class ScheduleFeeModel(FeeModel):
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
         self.spread_paid: dict[str, float] = {}
+        # The venue's own fee on those same orders, unrounded, so a report can show it alone to the cent and put
+        # what rounding left in the charged commission into the price with the spread (QA m-G7).
+        self.fee_paid: dict[str, float] = {}
         # Paper only: the market orders that carry a post-only order's maker fills, each with the order's
         # limit price and side (LongFlatStrategy._slice_maker). Paper's simulated venue would fill a
         # post-only order whole on the first trade through its price; a backtest fills BOOK_SHARE of
@@ -174,10 +177,9 @@ class ScheduleFeeModel(FeeModel):
         self.free_orders: set[str] = set()
         # Backtests: a target the strategy judged on a bar the venue had matched, adverse side first (Advisor NA-2,
         # LongFlatStrategy._bar_target), sent at market and booked at its level with that level's price and side.
-        # The commission carries the difference from the price the market order filled at; price_shift keeps it
-        # apart per order so the report can move it into the price, as it does the spread.
+        # The commission carries the difference from the price the market order filled at; fee_paid keeps the
+        # venue's fee apart so the report can move the rest into the price, as it does the spread.
         self.booked: dict[str, tuple[Decimal, bool]] = {}
-        self.price_shift: dict[str, float] = {}
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -212,15 +214,15 @@ class ScheduleFeeModel(FeeModel):
             # A sell that filled below its level gets the difference back here, a buy above it the same.
             shift = qty * (level - fill_px.as_decimal()) * (1 if buy else -1)
             notional = qty * level
-            coid = str(order.client_order_id)
-            self.price_shift[coid] = self.price_shift.get(coid, 0.0) + float(shift)
-        charge = notional * self.rate_for(order) + shift
+        charge = notional * self.rate_for(order)
+        coid = str(order.client_order_id)
+        if booked is not None or (self.half_spread and not getattr(order, "is_post_only", False)):
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
         if self.half_spread and not getattr(order, "is_post_only", False):
             spread = notional * self.half_spread
-            coid = str(order.client_order_id)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
-        return self._charge(charge, instrument.quote_currency)
+        return self._charge(charge + shift, instrument.quote_currency)
 
 
 def fill_model():

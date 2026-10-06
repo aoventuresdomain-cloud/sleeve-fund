@@ -188,12 +188,17 @@ class Vwap(Block):
         return s["period"]
 
 
+# Ten lengths leave up to 0.12% of a Wilder ATR's start on fast candles, where a bar's range can be ten times the
+# seed's; twenty leave under 1e-7 (QA P1-A1). A range average gets the longer settle; RSI keeps ten.
+ATR_SETTLE_LENGTHS = 20
+
+
 class Atr(Block):
     """Wilder's average true range, the standard ATR (Independent Quant Advisor and QA, P1-I4): a bar's true range
     is its high minus low, stretched to the previous close when the bar gapped, and the first bar's is its high
     minus low. The first average is the mean of the first `period` ranges; each later one is (previous x
     (period - 1) + this range) / period. Like RSI it never forgets its start, only discounts it, so it is
-    initialized after ten lengths. `atr_sma` is the simple average the hand-coded models use."""
+    initialized after ATR_SETTLE_LENGTHS lengths. `atr_sma` is the simple average the hand-coded models use."""
 
     SETTINGS = (Setting("period", int, 14, 1, PERIOD_MAX),)
 
@@ -227,11 +232,11 @@ class Atr(Block):
 
     @property
     def initialized(self) -> bool:
-        return self.count >= settle_bars(self.period)
+        return self.count >= ATR_SETTLE_LENGTHS * self.period
 
     def _outputs(self) -> dict:
         return {"value": self._value}
 
     @warmup
     def warmup_bars(cls, s) -> int:
-        return settle_bars(s["period"])
+        return ATR_SETTLE_LENGTHS * int(s["period"])

@@ -18,7 +18,7 @@ store = _store_fixture  # the same journal, on Postgres when TEST_DATABASE_URL i
 
 T0 = datetime(2026, 3, 2, 12, 0, tzinfo=timezone.utc)
 COST = 0.008  # the taker fee; no spread assumed and no live quotes
-ATR_ENTRY = {"stop_frac": 0.0143, "stop_basis": "2 x the 14-bar average true range (0.715)",
+ATR_ENTRY = {"stop_frac": 0.0143, "stop_basis": "2 x the 14-bar simple average true range (0.715)",
              "tp_frac": round(r_target(2, 0.0143, COST), 6), "risk_amount": 30.19, "planned_r": 2.0,
              "stop_cfg": {"stop_atr": 2.0, "atr_bars": 14}}
 
@@ -81,7 +81,7 @@ def test_a_new_market_stop_keeps_the_old_one_working_and_sits_at_the_swing_low(s
     it is set, it sits at the level its words name (the swing low itself), as a share of the entry."""
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
+    _edit(store, "Stop-loss 2 simple average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
     strat = _restart(store, instrument, stop_swing_bars=3, take_profit_r=2.0)
     assert strat._stop_frac == 0.0143 and strat._replan_pending == ("edit", store.last_event("s1", ("exits_change",))["id"])
     assert _applied(store) == []
@@ -99,7 +99,7 @@ def test_a_market_stop_set_after_entry_only_tightens(store, instrument):
     stop is a % edit, which the settings tab checks against the position's size (M8-1)."""
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
+    _edit(store, "Stop-loss 2 simple average true ranges (14 bars) below the entry to at the lowest low of 3 bars")
     strat = _restart(store, instrument, stop_swing_bars=3)
     strat._lows.extend([97.0, 99.0, 100.2])
     strat._replan(101.0)
@@ -109,7 +109,7 @@ def test_a_market_stop_set_after_entry_only_tightens(store, instrument):
 def test_a_new_percent_stop_applies_at_once(store, instrument):
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to 2% below the entry")
+    _edit(store, "Stop-loss 2 simple average true ranges (14 bars) below the entry to 2% below the entry")
     strat = _restart(store, instrument, stop_loss=0.02, take_profit_r=2.0)
     assert strat._stop_frac == 0.02 and strat._tp_frac == pytest.approx(r_target(2, 0.02, COST))
     assert strat._replan_pending is None
@@ -137,7 +137,7 @@ def test_an_r_target_after_a_tighter_stop_is_that_many_of_the_trades_1r(store, i
     now set from the trade's 1R, so what was typed is what is recorded."""
     _sleeve(store)
     _enter(store, ATR_ENTRY)
-    _edit(store, "Stop-loss 2 average true ranges (14 bars) below the entry to 1% below the entry; "
+    _edit(store, "Stop-loss 2 simple average true ranges (14 bars) below the entry to 1% below the entry; "
                  "Take-profit 2R after costs to 3R after costs")
     strat = _restart(store, instrument, stop_loss=0.01, take_profit_r=3.0)
     plan = store.exit_plan("s1", "E-1")
