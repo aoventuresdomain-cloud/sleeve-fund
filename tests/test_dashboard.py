@@ -2435,6 +2435,39 @@ def test_a_reset_is_refused_while_liquidated_and_points_to_the_reset_after_liqui
     assert "command_error" not in r.headers["location"] and store.pending_reset("btc-test") is not None
 
 
+@pytest.mark.parametrize("status", ["stopped", "halted"])
+def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_status(client, status):
+    """QA P1-U31 and U27: one guard for the three restart routes. Stop then Start must not restart a liquidated
+    strategy, and the page says so for a stopped one too."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", status, "drawdown 96.2% hit the 20% limit" if status == "halted" else "")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "until you use Reset after liquidation" in page
+    dialog = page.split('id="dlg-start"')[1].split("</dialog>")[0]
+    assert 'value="start"' not in dialog and "can&#39;t start" in dialog
+    for command in ("start", "resume"):
+        r = c.post("/sleeves/btc-test/command", data={"command": command, "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "command_error" in r.headers["location"], command
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" in r.headers["location"]
+    s = store.sleeve("btc-test")
+    assert s.desired_state == "stopped" and store.pending_reset("btc-test") is None
+    assert not store.pending_commands("btc-test")
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "until you use Reset after liquidation" not in page
+    r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
+
+
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
                                    " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
                                    "Position\u00a0margin lost (liquidated)"])

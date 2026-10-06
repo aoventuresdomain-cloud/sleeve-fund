@@ -25,7 +25,7 @@
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
-    {% if not backtest_id and not archived %}<button type="button" class="secondary" data-open="dlg-reset" {% if resetting %}disabled title="A reset is under way"{% elif liquidated_any %}disabled title="Its position margin was lost (liquidated): use Reset after liquidation, which asks for an incident note"{% endif %}>{{ "Resetting…" if resetting else "Reset" }}</button>{% endif %}
+    {% if not backtest_id and not archived %}<button type="button" class="secondary" data-open="dlg-reset" {% if resetting %}disabled title="A reset is under way"{% elif liquidated %}disabled title="Its position margin was lost (liquidated): use Reset after liquidation, which asks for an incident note"{% endif %}>{{ "Resetting…" if resetting else "Reset" }}</button>{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
   </div>
   <p class="lede sub-line">{{ s.strategy|replace('_', ' ')|capitalize }} · {{ s.instrument }}{% if s.venue and venue_label(s.venue) %} {{ venue_label(s.venue) }}{% elif perp %} perpetual{% endif %} · {{ bar_label(s.bar_spec).split(',')[0] }} · {{ x.profile.name }} profile</p>
@@ -35,6 +35,7 @@
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
 {% if strategy_errors %}<div class="banner loss" role="alert">The strategy's code raised an error {{ strategy_errors }} time{{ 's' if strategy_errors != 1 }}{% if backtest_id %} during this run, so its results after that can't be relied on{% else %} since it last started; its orders after that may be wrong{% endif %}. The Activity tab has the details.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived.</div>{% endif %}
+{% if liquidated and s.status != 'halted' %}<div class="banner loss" role="alert"><strong>Liquidated:</strong> its position margin was lost, so it can't start, resume or be reset until you use Reset after liquidation, which asks for an incident note.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
@@ -335,7 +336,7 @@
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
-  'start': ('Start ' ~ s.name, 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
+  'start': ('Start ' ~ s.name, 'Its position margin was lost (liquidated), so it can\'t start. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 {% if not backtest_id %}<div data-live="dialogs" data-live-forms>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
@@ -347,7 +348,7 @@
     {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now would drop it, so Stop is off until the strategy is flat.</div>{% endif %}
     {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
     {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
-    {% set refused = cmd == 'resume' and liquidated %}{# no Resume to offer: the server refuses it (QA P1-U25) #}
+    {% set refused = cmd in ['resume', 'start'] and liquidated %}{# nothing to offer: the server refuses it (QA P1-U25, U31) #}
     {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}
     <div class="dlg-actions"><button type="button" class="secondary" data-close>{{ 'Close' if refused else 'Cancel' }}</button>
       {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
