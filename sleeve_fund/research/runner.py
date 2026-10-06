@@ -52,6 +52,9 @@ class BacktestResult:
     # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
     # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
     open_risk_binds: int = 0
+    # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
+    # still goes ahead so the risk can be measured, labelled (QA P1-S8).
+    paper_refusal: str | None = None
 
     @property
     def shorts(self) -> bool:
@@ -78,6 +81,22 @@ def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
     v = feed["volume"].astype(float)
     shown = (v * BOOK_SHARE).where(v <= 0, (v * BOOK_SHARE).clip(lower=step))
     return feed.assign(volume=shown)
+
+
+PAPER_REFUSED = "would be refused on paper (stopless above 1x)"
+
+
+def paper_refusal(strategy: str, params: dict | None, risk_profile: str | None) -> str | None:
+    """PAPER_REFUSED when paper wouldn't start these settings (strategies.check_perp_stop), else None."""
+    from sleeve_fund.strategies import check_perp_stop
+
+    if risk_profile is None:
+        return None
+    try:
+        check_perp_stop(strategy, params, risk_profile)
+    except ValueError:
+        return PAPER_REFUSED
+    return None
 
 
 def run_backtest(
@@ -239,6 +258,7 @@ def run_backtest(
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
             open_risk_binds=strategy.open_risk_binds,
+            paper_refusal=paper_refusal(strategy_name, params, risk_profile),
         )
     finally:
         if runtime is not None:

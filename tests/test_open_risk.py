@@ -13,11 +13,19 @@ from sleeve_fund.store import Store
 from test_long_short import PERP, _record
 
 
-def test_a_stopped_position_risks_from_the_mark_to_its_stop_and_nothing_once_the_stop_is_in_profit():
+def test_a_stopped_position_risks_from_the_mark_to_its_stop():
     assert open_risk.position_risk(2.0, 110.0, stop=100.0) == pytest.approx(20.0)  # long: from the mark, not entry
     assert open_risk.position_risk(-2.0, 100.0, stop=104.0) == pytest.approx(8.0)  # short: the price rising to it
-    assert open_risk.position_risk(2.0, 110.0, stop=112.0) == 0.0  # a long's stop above the mark: in profit
-    assert open_risk.position_risk(-2.0, 100.0, stop=95.0) == 0.0
+
+
+def test_a_position_the_price_has_gone_through_the_stop_of_counts_as_stopless_never_0():
+    """QA P1-S9: still open past its stop (a gap, its exit not filled yet), it risks what a stopless one does."""
+    assert open_risk.position_risk(2.0, 110.0, stop=112.0, atr_pct=0.01) == pytest.approx(22.0)
+    assert open_risk.position_risk(-2.0, 100.0, stop=95.0, atr_pct=0.05) == pytest.approx(30.0)
+    assert open_risk.gapped(2.0, 110.0, 112.0) and open_risk.gapped(-2.0, 100.0, 95.0)
+    assert not open_risk.gapped(2.0, 110.0, 100.0) and not open_risk.gapped(0.0, 110.0, 112.0)
+    with pytest.raises(ValueError, match="daily ATR isn't known"):
+        open_risk.position_risk(2.0, 110.0, stop=112.0)
 
 
 @pytest.mark.parametrize("atr_pct, move", [(0.01, 0.10), (0.05, 0.15)])
@@ -27,13 +35,64 @@ def test_a_stopless_position_counts_at_the_larger_of_10_percent_and_3_daily_atrs
         open_risk.position_risk(0.5, 4_000.0)
 
 
-def test_the_daily_atr_is_wilders_over_14_days():
-    days = pd.DataFrame({"high": [102.0] * 20, "low": [98.0] * 20, "close": [100.0] * 20},
-                        index=pd.date_range("2025-01-02", periods=20, freq="D", tz="UTC"))
-    atr = open_risk.wilder_atr_pct(days)
-    assert atr.iloc[:13].isna().all() and atr.iloc[13:].tolist() == pytest.approx([0.04] * 7)
-    days.loc[days.index[14], "high"] = 116.0  # a 18-wide day: (4 x 13 + 18) / 14
-    assert open_risk.wilder_atr_pct(days).iloc[14] == pytest.approx((4 * 13 + 18) / 14 / 100)
+def _days(n, width=4.0, start="2025-01-02"):
+    return pd.DataFrame({"high": [100 + width / 2] * n, "low": [100 - width / 2] * n, "close": [100.0] * n},
+                        index=pd.date_range(start, periods=n, freq="D", tz="UTC"))
+
+
+def test_the_daily_atr_is_the_librarys_wilder_atr_14_over_the_last_42_days():
+    assert open_risk.daily_atr_pct(_days(13)) is None
+    assert open_risk.daily_atr_pct(_days(14)) == pytest.approx(0.04)
+    days = _days(15)
+    days.loc[days.index[14], "high"] = 116.0  # an 18-wide day: (4 x 13 + 18) / 14
+    assert open_risk.daily_atr_pct(days) == pytest.approx((4 * 13 + 18) / 14 / 100)
+    wide = pd.concat([_days(30, width=40.0), _days(42, start="2025-02-01")])
+    assert open_risk.daily_atr_pct(wide) == pytest.approx(0.04)  # only the last 42 days count
+
+
+def test_a_backtest_reads_the_same_daily_atr_paper_does(prices):
+    """QA P1-S5: each day's value is daily_atr_pct over the whole days before it, the window paper reads."""
+    lookup = open_risk.daily_atr_lookup(prices)
+    daily = prices[["high", "low", "close"]].groupby((prices.index - pd.Timedelta(1, "ns")).floor("D")).agg(
+        {"high": "max", "low": "min", "close": "last"})
+    assert lookup
+    for day in list(lookup)[:3] + list(lookup)[-3:]:
+        before = daily[daily.index < pd.Timestamp(day, tz="UTC")]
+        assert lookup[day] == pytest.approx(open_risk.daily_atr_pct(before))
+
+
+def _minutes(days, width):
+    now = pd.Timestamp.now(tz="UTC").floor("1D")
+    idx = pd.date_range(now - pd.Timedelta(days=days), periods=days * 1440, freq="1min", tz="UTC")
+    return pd.DataFrame({"open": 100.0, "high": 100 + width / 2, "low": 100 - width / 2, "close": 100.0, "volume": 1.0},
+                        index=idx)
+
+
+@pytest.mark.real_daily_atr
+def test_paper_reads_the_daily_atr_from_the_history_store_and_doesnt_cache_a_miss(tmp_path, monkeypatch):
+    """QA P1-S3: the real read, past the 10% floor (a 6% daily ATR counts at 18%); a store that can't give 14 days
+    returns None, and the next entry asks again rather than reading the miss from the cache."""
+    from sleeve_fund.history import HistoryStore
+
+    monkeypatch.setattr(open_risk, "_ATR_CACHE", {})
+    hs = HistoryStore(tmp_path / "hist")
+    now = pd.Timestamp.now(tz="UTC").to_pydatetime()
+    assert open_risk.history_atr_pct("BINANCE", "BTC/USDT", now, history=hs) is None
+    assert open_risk._ATR_CACHE == {}
+    hs.append("BINANCE", "BTC/USDT", _minutes(20, width=6.0), cursor="x")
+    atr = open_risk.history_atr_pct("BINANCE", "BTC/USDT", now, history=hs)
+    assert atr == pytest.approx(0.06)
+    assert open_risk.position_risk(1.0, 100.0, atr_pct=atr) == pytest.approx(18.0)  # 3 ATRs, over the 10% floor
+
+
+def test_another_strategy_past_its_stop_counts_as_stopless_and_is_named(monkeypatch):
+    store = Store.in_memory()
+    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params=PERP, risk_profile="conservative")
+    store.record_equity("other", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
+    monkeypatch.setattr(open_risk, "_journal_stop", lambda store, s, qty: 61_000.0)  # a long's stop above the mark
+    book, risk, through = open_risk.account_book(store, "pp", 10_000, lambda s: 0.01)
+    assert book == 20_000 and risk == pytest.approx(600.0) and through == ["other"]
 
 
 def test_the_limit_is_5_percent_of_the_book_counting_the_entry():
@@ -91,8 +150,8 @@ def test_a_backtest_counts_the_entries_the_limit_would_refuse_and_trades_them_al
 
 
 def test_the_setups_the_paper_mechanics_tests_lift_the_limit_for_are_refused_with_it_on(tmp_path):
-    """The tests marked no_open_risk_limit run a stopless perp above 1x in paper. With the limit on, such a strategy
-    opens nothing: at 2x ping_pong's 6,600 notional counts at 660, over 5% of its 10,000 book."""
+    """The two liquidation tests marked no_open_risk_limit run a stopless perp above 1x in paper. With the limit on,
+    such a strategy opens nothing: at 2x ping_pong's 6,600 notional counts at 660, over 5% of its 10,000 book."""
     from test_long_short import _meta as balanced_meta
 
     path = tmp_path / "pp.jsonl.gz"

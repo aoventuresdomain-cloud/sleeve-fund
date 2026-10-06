@@ -101,3 +101,17 @@ def test_a_backtest_still_runs_so_the_risk_can_be_measured(prices, instrument):
 
     res = run_backtest("ping_pong", prices.iloc[:60], instrument, PERP, risk_profile="balanced", half_spread=0)
     assert res.equity is not None
+
+
+def test_a_backtest_of_a_setting_paper_would_refuse_says_so():
+    """HoE, 6 Oct: a backtest above 1x of a stopless model runs, but is labelled; so are the entries the open-risk
+    limit would have refused on paper."""
+    from sleeve_fund.dashboard.preview import _risk
+    from sleeve_fund.research.runner import PAPER_REFUSED, paper_refusal
+
+    assert paper_refusal("ping_pong", PERP, "balanced") == PAPER_REFUSED
+    assert paper_refusal("ping_pong", PERP, "conservative") is None and paper_refusal("ping_pong", {}, "balanced") is None
+    note = _risk([], "balanced", refused=PAPER_REFUSED, binds=3)["note"]
+    assert note.startswith("Would be refused on paper (stopless above 1x).")
+    assert "Paper would refuse 3 entries (open risk over 5% of the book)." in note
+    assert _risk([], "conservative")["note"] == ""

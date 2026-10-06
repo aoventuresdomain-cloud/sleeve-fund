@@ -62,7 +62,7 @@ def ns(s: str) -> int:
     return utc(s).value
 
 
-def paper_and_backtest(tmp, start, minutes, prices, params, bar_minutes=1):
+def paper_and_backtest(tmp, start, minutes, prices, params, bar_minutes=1, profile="aggressive"):
     """The same trades replayed as paper (tick by tick, 30 s ticks, data-driven) and as a backtest on
     `bar_minutes` decision bars with 1-minute execution bars. Returns (paper fills, paper funding, bt fills,
     bt funding), funding as (ts, qty, price, amount)."""
@@ -72,7 +72,7 @@ def paper_and_backtest(tmp, start, minutes, prices, params, bar_minutes=1):
     rec = Recorder(path)
     rec.meta = {"balances": ["10000.00 USD"],
                 "sleeve": {"name": "w", "strategy": "win", "instrument": "BTC/USD", "bar_spec": spec,
-                           "starting_balance": 10_000, "risk_profile": "aggressive", "params": params,
+                           "starting_balance": 10_000, "risk_profile": profile, "params": params,
                            "max_notional": None, "maker_fee": str(fees.maker), "taker_fee": str(fees.taker),
                            "tick_seconds": 30}}
     rec.start(INST)
@@ -93,7 +93,7 @@ def paper_and_backtest(tmp, start, minutes, prices, params, bar_minutes=1):
     one["volume"] = 60 / BOOK_SHARE
     dec = trades.resample(f"{bar_minutes}min", closed="left", label="right", origin="start_day").ohlc()
     dec["volume"] = 60 / BOOK_SHARE
-    res = run_backtest("win", dec, INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+    res = run_backtest("win", dec, INST, params=params, starting_capital=10_000, risk_profile=profile,
                        bar_minutes=bar_minutes, exec_prices=one if bar_minutes > 1 else None, half_spread=6 / 60_000)
     j = res.journal
     bf = [(pd.Timestamp(f["ts"]), f["side"], f["qty"]) for f in j.fills_]
@@ -101,34 +101,34 @@ def paper_and_backtest(tmp, start, minutes, prices, params, bar_minutes=1):
     return pf, pfund, bf, bfund
 
 
+STOPLESS = "conservative"  # a stopless model runs at 1x, with the open-risk limit on (QA P1-S4)
+
+
 def _ramp(minutes):
     return 60_000 + np.arange(minutes * 60) * 0.5  # 0.5 a second: the mark tells which second was used
 
 
 @pytest.mark.parametrize("side", [1, -1])
-@pytest.mark.no_open_risk_limit
 def test_a_position_closed_before_settlement_pays_nothing_in_paper_or_backtest(tmp_path, side):
     params = {"open_at": ns("2025-10-03 07:52"), "close_at": ns("2025-10-03 07:59"), "side": side, **PERP}
-    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)
+    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params, profile=STOPLESS)
     assert pf[-1][0] < utc("2025-10-03 08:00") and bf[-1][0] < utc("2025-10-03 08:00")
     assert pfund == [] and bfund == []
 
 
 @pytest.mark.parametrize("side", [1, -1])
-@pytest.mark.no_open_risk_limit
 def test_a_position_opened_at_or_after_settlement_pays_nothing_in_paper_or_backtest(tmp_path, side):
     params = {"open_at": ns("2025-10-03 08:00"), "close_at": ns("2025-10-03 08:05"), "side": side, **PERP}
-    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)
+    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params, profile=STOPLESS)
     assert pf[0][0] >= utc("2025-10-03 08:00") and bf[0][0] >= utc("2025-10-03 08:00")
     assert pfund == [] and bfund == []
 
 
 @pytest.mark.parametrize("side", [1, -1])
 @pytest.mark.parametrize("close_at", ["2025-10-03 08:00", "2025-10-03 08:05"])  # exit on the settlement bar, or later
-@pytest.mark.no_open_risk_limit
 def test_a_position_held_across_pays_rate_times_notional_once_longs_pay_shorts_receive(tmp_path, side, close_at):
     params = {"open_at": ns("2025-10-03 07:52"), "close_at": ns(close_at), "side": side, **PERP}
-    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params)
+    pf, pfund, bf, bfund = paper_and_backtest(tmp_path, "2025-10-03 07:50", 20, _ramp(20), params, profile=STOPLESS)
     for fund in (pfund, bfund):
         (ts, qty, price, amount), = fund
         assert ts == utc("2025-10-03 08:00") and np.sign(qty) == side

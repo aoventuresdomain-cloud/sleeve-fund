@@ -685,15 +685,15 @@ LS_CASES = {
 
 
 @pytest.mark.parametrize("strategy", list(LS_CASES))
-@pytest.mark.no_open_risk_limit
 def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
     """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
     replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
     same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee."""
     params, path = LS_CASES[strategy]
     params = {**params, **PERP}
+    # At 1x, with the open-risk limit on (QA P1-S4): a stopless model runs at 1x only.
     paper, bt = _paper_and_backtest(tmp_path, path(np.arange(240 * 60)), params, strategy=strategy,
-                                    profile="balanced")
+                                    profile="conservative")
     # The backtest's last bar closes on the last trade; paper's would close on a trade after it, which never
     # comes. An order on that bar alone is an edge of the recording, not a difference.
     end = pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=240)
@@ -719,13 +719,12 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
 
 
-@pytest.mark.no_open_risk_limit
 def test_paper_sells_short_at_the_bid_and_buys_it_back_at_the_ask(tmp_path):
     """A short sale takes the bid and its cover takes the ask, like any market order: never the other side
     of the book, which would hand the short the spread. (The recording quotes $6 either side of each trade.)"""
     params = {"period": 7, **PERP}
     prices = LS_CASES["probe_ls"][1](np.arange(180 * 60))
-    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="balanced", strategy="probe_ls")
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="conservative", strategy="probe_ls")
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
     intent = {o["order_id"]: o["intent"] for o in orders}
     shorts = [f for f in fills if intent[f["order_id"]] == "entry" and f["side"] == "SELL"]

@@ -29,6 +29,7 @@ from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
+from sleeve_fund.strategies.base import EXITS_ONLY
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -82,7 +83,8 @@ class Supervisor:
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
         rather than started into a crash loop. A start that only sells a position it holds (a flatten waiting:
-        the kill switch, a PM close) still goes ahead."""
+        the kill switch, a PM close) still goes ahead. So does one still holding a position (Independent Quant
+        Advisor, NA-4, QA P1-S7): it is never left unwatched, but started for its exits only (_exits_only)."""
         s = self.store.sleeve(name)
         try:
             check_perp_sizing(s.strategy, s.params)
@@ -92,11 +94,31 @@ class Supervisor:
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
                                  "flatten pauses it, and it can't be started to trade")
                 return False
+            if self._exits_only(s, str(exc)):
+                return False
             self.store.set_desired_state(name, "stopped")
             self.store.set_status(name, "stopped", f"not started: {exc}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}")
             return True
         return False
+
+    def _exits_only(self, s: Sleeve, why: str) -> bool:
+        """A refused start still holding a position (not dust) is started anyway, paused with the EXITS_ONLY
+        reason: its exits run, a safety stop is set from the mark, no entry or add opens, and an incident is raised
+        (LongFlatStrategy._safety_stop_on_restore). Any refusal can use it, so a position is never left without a
+        process watching it. True when it applies."""
+        book = self.store.journal_book(s.name, s.starting_balance)
+        if abs(book["qty"]) <= 1e-12 or is_dust(book):
+            return False
+        reason = f"{EXITS_ONLY}: {why}"
+        if s.status != "paused" or s.status_reason != reason:
+            self.store.set_status(s.name, "paused", reason)
+            self.store.event(s.name, "error", "start_refused", f"Not started to trade: {why}. It still holds a "
+                             "position, so it is started for its exits only, with a safety stop")
+            self.store.event(s.name, "error", "incident",
+                             f"Incident, {s.name}: not started to trade ({why}), but it holds {book['qty']:.12g}, so it "
+                             "runs for its exits only, with a safety stop from the current price and no new entries")
+        return True
 
     def _start(self, name: str, proc: Proc) -> None:
         if self._refused(name):

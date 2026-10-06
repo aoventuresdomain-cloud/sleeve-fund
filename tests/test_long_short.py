@@ -257,13 +257,13 @@ def _meta(balance, params):
                        "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
 
 
-@pytest.mark.no_open_risk_limit
 def test_ping_pong_shorts_in_the_paper_runtime(tmp_path):
     from sleeve_fund.research.replay import replay
 
     path = tmp_path / "pp.jsonl.gz"
-    _record(path, _meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP}),
-            [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
+    meta = _meta(10_000, {"rise": 0.01, "dip": 0.005, **PERP})
+    meta["sleeve"]["risk_profile"] = "conservative"  # stopless: 1x, with the open-risk limit on (QA P1-S4)
+    _record(path, meta, [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
     orders, fills = replay(path, with_fills=True)
     assert [(o["side"], o["intent"]) for o in orders][:5] == [
         ("BUY", "entry"), ("SELL", "exit"), ("SELL", "entry"), ("BUY", "exit"), ("BUY", "entry")]

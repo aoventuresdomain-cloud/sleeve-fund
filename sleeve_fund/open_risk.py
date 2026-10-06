@@ -3,7 +3,7 @@ portfolio limits, P2-2, absorb it). A new entry is refused when the book's open 
 5% of the book.
 
 - A position with a stop risks what it would lose if the stop filled now: |mark - stop| x qty, from the current mark,
-  not its entry. A stop already in profit risks nothing.
+  not its entry. One the price has already gone through, still open, counts as stopless (and alerts).
 - A position with no placed stop counts at notional x max(10%, 3 x the daily Wilder ATR(14) as a share of price). Full
   margin would assume a 100% move at 1x; the 1x cap on such a position (strategies.check_perp_stop) bounds the tail.
 - The book is the current equity of every paper strategy on the same account that isn't archived, read from the
@@ -24,14 +24,17 @@ LIMIT = 0.05  # of the book
 STOPLESS_FLOOR = 0.10  # the smallest move a position with no placed stop counts at
 STOPLESS_ATRS = 3.0  # daily ATRs a position with no placed stop counts at, when that is more
 ATR_DAYS = 14
+ATR_WINDOW = ATR_DAYS * 3  # whole days the daily ATR is measured over, in paper and backtest alike
 
 
 def position_risk(qty: float, mark: float, stop: float | None = None, atr_pct: float | None = None) -> float:
     """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move."""
     if not qty or mark <= 0:
         return 0.0
-    if stop is not None:
-        return max(0.0, (mark - stop) * qty)  # a short (qty < 0) loses as the price rises to its stop
+    if stop is not None and (mark - stop) * qty > 0:
+        return (mark - stop) * qty  # a short (qty < 0) loses as the price rises to its stop
+    # No stop, or one the price has gone through with the position still open (its exit not filled yet): it counts
+    # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9).
     if atr_pct is None or not math.isfinite(atr_pct):
         raise ValueError("the daily ATR isn't known, so a position with no stop can't be measured")
     return abs(qty) * mark * stopless_move(atr_pct)
@@ -41,36 +44,36 @@ def stopless_move(atr_pct: float) -> float:
     return max(STOPLESS_FLOOR, STOPLESS_ATRS * atr_pct)
 
 
-def wilder_atr_pct(daily: pd.DataFrame) -> pd.Series:
-    """The Wilder ATR(14) of daily bars (high, low, close) as a share of each day's close, known from that day's
-    close on: the first 14 true ranges averaged, then (previous x 13 + true range) / 14. NaN before day 14."""
-    high, low, close = (daily[c].astype(float).to_numpy() for c in ("high", "low", "close"))
-    out = [math.nan] * len(close)
-    atr = None
-    trs = []
-    for i in range(len(close)):
-        tr = high[i] - low[i] if i == 0 else max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-        if atr is None:
-            trs.append(tr)
-            if len(trs) == ATR_DAYS:
-                atr = sum(trs) / ATR_DAYS
-        else:
-            atr = (atr * (ATR_DAYS - 1) + tr) / ATR_DAYS
-        if atr is not None and close[i] > 0:
-            out[i] = atr / close[i]
-    return pd.Series(out, index=daily.index, dtype=float)
+def daily_atr_pct(daily: pd.DataFrame) -> float | None:
+    """The Wilder ATR(14) of the last ATR_WINDOW whole daily bars (high, low, close), as a share of the last close: the
+    indicator library's Atr (QA P1-S5), over the same window in paper and backtest. None with under 14 days."""
+    from sleeve_fund.strategies.indicators.averages import Atr
+
+    days = daily.dropna(subset=["high", "low", "close"]).tail(ATR_WINDOW)
+    if len(days) < ATR_DAYS or float(days["close"].iloc[-1]) <= 0:
+        return None
+    atr = Atr(ATR_DAYS)
+    for h, lo, c in days[["high", "low", "close"]].itertuples(index=False):
+        atr.update_raw(h, lo, c)
+    # The library calls it settled after ten lengths (for a signal); the risk measure reads the Wilder average from
+    # day 14 on, over the same window in paper and backtest, so both see the same number.
+    return atr._outputs()["value"] / float(days["close"].iloc[-1])
 
 
 def daily_atr_lookup(prices: pd.DataFrame) -> dict[int, float]:
-    """Backtest: from bars stamped at their close, the daily ATR share known at each UTC day's start, as
-    {day start in ns: share}. Only whole days the bars have closed count."""
+    """Backtest: from bars stamped at their close, the daily ATR share known at each UTC day's start (the whole days
+    before it, as paper reads them), as {day start in ns: share}."""
     if prices is None or not len(prices) or not {"high", "low", "close"} <= set(prices.columns):
         return {}
     # A bar stamped at its close belongs to the day it closes in, less a nanosecond: the bar closing at 00:00 is the day before's.
     days = prices[["high", "low", "close"]].groupby((prices.index - pd.Timedelta(1, "ns")).floor("D")).agg(
         {"high": "max", "low": "min", "close": "last"})
-    atr = wilder_atr_pct(days).dropna()
-    return {int((day + pd.Timedelta(days=1)).value): float(v) for day, v in atr.items()}
+    out = {}
+    for i in range(ATR_DAYS - 1, len(days)):
+        v = daily_atr_pct(days.iloc[max(0, i + 1 - ATR_WINDOW):i + 1])
+        if v is not None:
+            out[int((days.index[i] + pd.Timedelta(days=1)).value)] = v
+    return out
 
 
 def check_entry(book: float, open_risk: float, entry_risk: float) -> str | None:
@@ -82,25 +85,28 @@ def check_entry(book: float, open_risk: float, entry_risk: float) -> str | None:
     return None
 
 
-_ATR_CACHE: dict[tuple[str, str, str], float | None] = {}
+_ATR_CACHE: dict[tuple[str, str, str], float] = {}
 
 
 def history_atr_pct(venue: str, pair: str, now: datetime, history=None) -> float | None:
-    """Paper: the daily ATR share for a venue's pair from the history store, as of the last whole day, cached per day.
-    None when the store can't give 14 whole days."""
+    """Paper: the daily ATR share for a venue's pair from the history store, as of the last whole day, cached per day
+    once read. None when the store can't give 14 whole days; that isn't cached, so the next entry asks again (QA
+    P1-S3)."""
     key = (venue, pair, now.strftime("%Y-%m-%d"))
-    if key not in _ATR_CACHE:
-        from sleeve_fund.history import HistoryStore
+    if key in _ATR_CACHE:
+        return _ATR_CACHE[key]
+    from sleeve_fund.history import HistoryStore
 
-        try:
-            daily = (history or HistoryStore()).read(venue, pair, 1440, start=now - timedelta(days=ATR_DAYS * 3))
-            series = wilder_atr_pct(daily[daily.index <= pd.Timestamp(now)].dropna(subset=["close"])).dropna()
-            _ATR_CACHE[key] = float(series.iloc[-1]) if len(series) else None
-        except (KeyError, OSError, ValueError):
-            _ATR_CACHE[key] = None
+    try:
+        daily = (history or HistoryStore()).read(venue, pair, 1440, start=now - timedelta(days=ATR_WINDOW + 2))
+        value = daily_atr_pct(daily[daily.index <= pd.Timestamp(now)])
+    except (KeyError, OSError, ValueError):
+        return None
+    if value is not None:
         if len(_ATR_CACHE) > 256:
             _ATR_CACHE.pop(next(iter(_ATR_CACHE)))
-    return _ATR_CACHE[key]
+        _ATR_CACHE[key] = value
+    return value
 
 
 def _journal_stop(store, sleeve, qty: float) -> float | None:
@@ -119,14 +125,20 @@ def _journal_stop(store, sleeve, qty: float) -> float | None:
     return None if frac is None else entry_px * (1 - side * frac)
 
 
-def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[float, float]:
-    """Paper: (the book, the open risk of the other perp strategies on the account). `atr_pct(sleeve)` gives a
-    strategy's daily ATR share. Raises ValueError when a stopless position can't be measured."""
+def gapped(qty: float, mark: float, stop: float | None) -> bool:
+    """A position whose stop the price has already gone through while it is still open."""
+    return bool(qty) and stop is not None and (mark - stop) * qty <= 0
+
+
+def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[float, float, list[str]]:
+    """Paper: (the book, the open risk of the other perp strategies on the account, those of them whose stop the
+    price has gone through while still open). `atr_pct(sleeve)` gives a strategy's daily ATR share. Raises
+    ValueError when a stopless position can't be measured."""
     from sleeve_fund import markets
 
     account = store.account_of(sleeve_name)
     archived = store.archived()
-    book, risk = own_equity, 0.0
+    book, risk, through = own_equity, 0.0, []
     for s in store.sleeves():
         if s.name == sleeve_name or s.name in archived or store.account_of(s.name) != account:
             continue
@@ -138,5 +150,8 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
         if not last["qty"] or not markets.is_perp(s.params):
             continue
         stop = _journal_stop(store, s, last["qty"])
-        risk += position_risk(last["qty"], last["price"], stop, None if stop is not None else atr_pct(s))
-    return book, risk
+        if gapped(last["qty"], last["price"], stop):
+            through.append(s.name)
+        measured = stop is not None and s.name not in through
+        risk += position_risk(last["qty"], last["price"], stop, None if measured else atr_pct(s))
+    return book, risk, through
