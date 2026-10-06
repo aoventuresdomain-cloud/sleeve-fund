@@ -442,7 +442,16 @@ def _binance_stats(path: str, fields: tuple[str, ...], pair: str, start_ms: int,
     rows = (get_json or _get_json)(f"{BINANCE_FUTURES_DATA}/{path}?" + urllib.parse.urlencode(q))
     if isinstance(rows, dict):
         raise ValueError(f"Binance: {rows.get('msg', rows)}")
-    return [(int(r["timestamp"]), *(float(r[f]) for f in fields)) for r in rows]
+    # A null or junk value stays None, and open_interest.refresh refuses that row alone (QA P1-O13): a float() that
+    # raised here would lose the whole page.
+    return [(int(r["timestamp"]), *(_number_or_none(r.get(f)) for f in fields)) for r in rows]
+
+
+def _number_or_none(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def binance_open_interest(pair: str, start_ms: int, get_json=None, now_ms: int | None = None) -> list[tuple]:

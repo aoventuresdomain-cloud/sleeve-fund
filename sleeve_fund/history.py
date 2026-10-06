@@ -570,11 +570,13 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
             kept = funding.refresh(profile.name, pair, root=root, since=since)
             funding_to = kept.index[-1] if len(kept) else None
             missed, maybe = funding.gaps(profile.name, pair, root), funding.interval_changes(profile.name, pair, root)
-            if missed or maybe:  # the hub's log is what the status workflow shows: data health is said there
+            if missed or maybe:  # in the hub's log (the status workflow) and, once a day, the alerts inbox (QA P1-O11)
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
-                print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
-                      + "".join(f"; missed between {span(g)}" for g in missed)
-                      + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
+                problem = (f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
+                           + "".join(f"; missed between {span(g)}" for g in missed)
+                           + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
+                print(problem)
+                _alert(f"{profile.name} {pair}: funding", "warning", "funding_gap", problem)
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
@@ -608,21 +610,25 @@ _warned: dict[str, float] = {}  # message prefix -> when it last went to the ale
 
 def _warn_at_risk(problem: str | None, store=None) -> None:
     """Open interest about to be lost for good goes to the alerts inbox, at most once a day per instrument."""
-    import time
-
     if problem is None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
-    key = problem.split(" last kept")[0]  # instrument and series
+    _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _alert(key: str, level: str, kind: str, message: str, store=None) -> None:
+    """One event in the alerts inbox, at most once a day per key."""
+    import time
+
     if time.time() - _warned.get(key, 0) < 86_400:
         return
     try:
         from sleeve_fund.store import Store
 
-        (store or Store()).event(None, "error", "open_interest_at_risk", problem)
+        (store or Store()).event(None, level, kind, message)
         _warned[key] = time.time()
-    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line above still says it
-        print(f"could not raise the open interest alert: {exc!r}")
+    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line still says it
+        print(f"could not raise the {kind} alert: {exc!r}")
 
 
 def unwritable(path: Path) -> str | None:
