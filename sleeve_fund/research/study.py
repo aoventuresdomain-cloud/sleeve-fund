@@ -135,8 +135,8 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
-        if self.failed_counts:
-            k = self.failed_counts
+        k = getattr(self, "failed_counts", 0)  # a stand-in result (tests) may lack it
+        if k:
             return (f"N uncertain: {k} earlier run{'s' if k != 1 else ''} of this idea ran but couldn't be counted in "
                     "full, so the bar is missing their Sharpes until they are re-counted")
         blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.closed_in_window == 0)]
