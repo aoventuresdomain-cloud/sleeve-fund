@@ -327,3 +327,16 @@ def test_a_change_of_settlement_interval_is_reported_as_a_possible_hole_and_logg
     change = (pd.Timestamp(T0 + 40 * h, unit="ms", tz="UTC"), pd.Timestamp(T0 + 48 * h, unit="ms", tz="UTC"))
     assert funding.interval_changes("BINANCE", "BTC/USDT", root=tmp_path) == [change]
     assert "possible hole at interval change 2026-10-02 16:00 to 2026-10-03 00:00" in capfd.readouterr().out
+
+
+def test_a_catch_up_of_many_pages_is_one_fetch_and_a_null_is_refused(tmp_path, monkeypatch):
+    """Code Reviewer on P1-O4: first_seen is one time for the whole refresh, so a catch-up past 500 snapshots adds
+    one row to the lag statistic, not one per page; a null value is refused like a NaN."""
+    times = [T0 + i * STEP for i in range(1200)]
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(times[:1]))  # the first backfill
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(times))  # back after an outage
+    kept = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)
+    assert kept["first_seen"].iloc[1:].nunique() == 1
+    out = open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path,
+                                loader=lambda pair, start: [(times[-1] + STEP, None, 1.0)])
+    assert out["refused"] == 1 and out["written"] == 0

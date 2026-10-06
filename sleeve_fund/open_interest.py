@@ -130,8 +130,7 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
     start = kept[-1][0] + 1 if kept else 0
     pages = []
     for _ in range(max_pages):
-        page = loader(pair, start)
-        pages.append((page, now_ms()))
+        pages.append(page := loader(pair, start))
         if not page or len(page) < 500 or page[-1][0] + 1 <= start:
             break
         start = page[-1][0] + 1
@@ -142,9 +141,12 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
         kept = held["snapshots"]
         backfill = not kept  # the first fetch reaches back over the venue's whole window
         by_time = {r[0]: r for r in kept}
-        for page, seen in pages:
+        # One first_seen for the whole fetch, taken once it is complete: no row is dated before it was held, and
+        # a catch-up of many pages reads as one fetch, whose newest row alone counts towards lag() (QA P1-O4).
+        seen = now_ms()
+        for page in pages:
             for t, *values in page:
-                values = [float(v) for v in values]
+                values = [_number(v) for v in values]
                 at = pd.Timestamp(int(t), unit="ms", tz="UTC").isoformat()
                 if not all(math.isfinite(v) for v in values):
                     records.append({"kind": "refused", "series": series, "snapshot": at, "offered": repr(values),
@@ -172,6 +174,14 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, loader=None, 
             "conflicts": sum(e["kind"] == "conflict" for e in records),
             "refused": sum(e["kind"] == "refused" for e in records),
             "latest": pd.Timestamp(kept[-1][0], unit="ms", tz="UTC") if kept else None}
+
+
+def _number(v) -> float:
+    """A venue value as a float; anything that isn't a number (null, junk) as NaN, so it is refused, not raised."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return math.nan
 
 
 def _replace(path: Path, content: dict) -> None:
