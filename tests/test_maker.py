@@ -117,7 +117,7 @@ def test_the_wait_must_fit_inside_a_bar(prices, instrument, wait, match):
 
 def test_a_stop_the_price_is_already_through_sells_at_market(instrument):
     """A post-only buy fills at its limit as the price gaps down through it; the stop would rest
-    above the price, so the venue refuses it and its linked target with it. The position must not
+    above the price, so the venue refuses it (the target doesn't rest, Advisor NA-2). The position must not
     be left unprotected until the next decision: it is sold at market on the spot, as paper would."""
     k = 1440 + 5  # five minutes after the first decision's post-only buy
     m = _minutes([10_000.0] * k + [9_000.0] * (2 * 1440))
@@ -126,8 +126,7 @@ def test_a_stop_the_price_is_already_through_sells_at_market(instrument):
                risk_profile="aggressive")
     orders = sorted(res.journal.orders_.values(), key=lambda o: (o["ts"], o["id"]))
     assert [(o["intent"], o["order_type"], o["status"]) for o in orders] == [
-        ("entry", "POST-ONLY LIMIT", "filled"), ("stop_loss", "STOP", "rejected"),
-        ("take_profit", "LIMIT", "rejected"), ("stop_loss", "MARKET", "filled")]
+        ("entry", "POST-ONLY LIMIT", "filled"), ("stop_loss", "STOP", "rejected"), ("stop_loss", "MARKET", "filled")]
     sell = orders[-1]
     assert sell["ts"] == orders[1]["ts"]  # the same minute, not the next decision
     assert "already through the 9,599.99 stop" in sell["reason"]

@@ -168,8 +168,9 @@ def run_backtest(
             starting_balances=_opening_balances(starting_capital, quote, base, runtime, perp),
             fee_model=(fee_model := ScheduleFeeModel(fees, half_spread=half_spread)),
             fill_model=fill_model(),
-            # Within a bar, the extreme nearer the open trades first: a bar that opens near its low hits a
-            # stop before a target, rather than always high-then-low.
+            # Within a bar, the extreme nearer the open trades first for orders resting here (a post-only
+            # entry, the stops). The stop and target don't race on it: the target is judged after the bar,
+            # so the stop goes first (Advisor NA-2, LongFlatStrategy._bar_target).
             bar_adaptive_high_low_ordering=True,
         )
         engine.add_instrument(instrument)
@@ -189,6 +190,7 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
+        strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         engine.add_strategy(strategy)
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
@@ -198,7 +200,8 @@ def run_backtest(
             engine.clear_data()
         engine.end()
 
-        fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid)
+        fills = _spread_into_prices(_spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid),
+                                    fee_model.price_shift)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
@@ -323,12 +326,13 @@ def _mark_to_market(
 def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float]) -> pd.DataFrame:
     """The engine charges the spread with the commission (bars have no bid or ask to fill on). Move
     it into each order's average price, so the report reads as a fill on the ask or bid would, and
-    leave the commissions as the venue's fee alone. Cash and equity are the same either way."""
+    leave the commissions as the venue's fee alone. Cash and equity are the same either way. A target
+    booked at its level (ScheduleFeeModel.price_shift, which can be either sign) is moved the same way."""
     if fills is None or fills.empty or not spread_paid:
         return fills
     fills = fills.copy()
     for coid, spread in spread_paid.items():
-        if coid not in fills.index or spread <= 0:
+        if coid not in fills.index or spread == 0:
             continue
         qty = float(fills.at[coid, "filled_qty"])
         px = float(fills.at[coid, "avg_px"])

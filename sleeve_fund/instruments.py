@@ -172,6 +172,12 @@ class ScheduleFeeModel(FeeModel):
         # Paper on a perp: the order that puts a position carried over a restart back at the simulated
         # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
         self.free_orders: set[str] = set()
+        # Backtests: a target the strategy judged on a bar the venue had matched, adverse side first (Advisor NA-2,
+        # LongFlatStrategy._bar_target), sent at market and booked at its level with that level's price and side.
+        # The commission carries the difference from the price the market order filled at; price_shift keeps it
+        # apart per order so the report can move it into the price, as it does the spread.
+        self.booked: dict[str, tuple[Decimal, bool]] = {}
+        self.price_shift: dict[str, float] = {}
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -198,7 +204,17 @@ class ScheduleFeeModel(FeeModel):
             # A buy that filled below its limit pays the difference here, a sell above it gives it back.
             shift = qty * (limit - fill_px.as_decimal()) * (1 if buy else -1)
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
-        charge = notional * self.rate_for(order)
+        shift = Decimal(0)
+        booked = self.booked.get(str(order.client_order_id))
+        if booked is not None:
+            level, buy = booked
+            qty = fill_quantity.as_decimal()
+            # A sell that filled below its level gets the difference back here, a buy above it the same.
+            shift = qty * (level - fill_px.as_decimal()) * (1 if buy else -1)
+            notional = qty * level
+            coid = str(order.client_order_id)
+            self.price_shift[coid] = self.price_shift.get(coid, 0.0) + float(shift)
+        charge = notional * self.rate_for(order) + shift
         if self.half_spread and not getattr(order, "is_post_only", False):
             spread = notional * self.half_spread
             coid = str(order.client_order_id)

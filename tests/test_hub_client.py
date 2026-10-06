@@ -206,3 +206,29 @@ def test_the_hub_is_found_from_its_variable_and_absent_means_a_venue_connection(
     assert hub_address("binance", {}) is None and hub_address("kraken", {"HUB_BINANCE": "x:1"}) is None
     with pytest.raises(ValueError, match="host:port"):
         hub_address("binance", {"HUB_BINANCE": "hub-binance"})
+
+
+def test_the_live_minute_after_an_announced_gap_waits_for_the_refill_so_no_minute_is_dropped():
+    """QA P1-L2: the hub publishes a gap's live minute before its refill. The live minute is held until the refill
+    is done, so every refilled minute reaches the bars in order; a hole the refill can't fill releases it on
+    "filled", and a refill that never says so on the heartbeat after HOLD_SECONDS."""
+    from sleeve_fund.paper.hub_client import HOLD_SECONDS
+
+    d = Decoder()
+    assert d(_bar(T0), T0 + 5).ts_event == T0
+    assert d({"t": "gap", "id": BTC, "since": T0 + M, "until": T0 + 2 * M}, T0 + 3 * M) is None
+    assert d(_bar(T0 + 3 * M), T0 + 3 * M + 5) is None  # held: the refill of 2 minutes is on its way
+    sent = [d(_bar(T0 + k * M, refilled=True), T0 + 3 * M + 9) for k in (1, 2)]
+    assert sent[0].ts_event == T0 + M and [b.ts_event for b in sent[1]] == [T0 + 2 * M, T0 + 3 * M]
+    assert d({"t": "filled", "id": BTC, "since": T0 + M, "until": T0 + 2 * M}, T0 + 3 * M + 10) is None
+    # A hole: the refill finds nothing, and "filled" releases the live minute.
+    assert d({"t": "gap", "id": BTC, "since": T0 + 4 * M, "until": T0 + 4 * M}, T0 + 5 * M) is None
+    assert d(_bar(T0 + 5 * M), T0 + 5 * M + 5) is None
+    assert d({"t": "filled", "id": BTC, "since": T0 + 4 * M, "until": T0 + 4 * M}, T0 + 5 * M + 7).ts_event == T0 + 5 * M
+    # No "filled" at all: the heartbeat's flush lets it go once it has waited HOLD_SECONDS.
+    d({"t": "gap", "id": BTC, "since": T0 + 6 * M, "until": T0 + 6 * M}, T0 + 7 * M)
+    assert d(_bar(T0 + 7 * M), T0 + 7 * M + 5) is None
+    assert d.flush(T0 + 7 * M + 6) == []
+    assert [b.ts_event for b in d.flush(T0 + 7 * M + 5 + HOLD_SECONDS * 10**9)] == [T0 + 7 * M]
+    # Without a gap announced (a hole the hub never refills), nothing waits.
+    assert d(_bar(T0 + 9 * M), T0 + 9 * M + 5).ts_event == T0 + 9 * M

@@ -303,7 +303,7 @@ def test_a_target_in_r_clears_costs_even_on_a_tight_stop(prices, instrument):
     assert entry["stop_frac"] == pytest.approx(0.005) and entry["tp_frac"] > 0.05
     assert entry["planned_r"] == pytest.approx(2.0)
     resting = [d for d in res.decisions.values() if d["intent"] in ("stop_loss", "take_profit")]
-    assert [d["intent"] for d in resting] == ["stop_loss", "take_profit"]
+    assert [d["intent"] for d in resting] == ["stop_loss"]  # the target is judged on each bar (Advisor NA-2)
 
 
 def test_sub_cent_prices_get_a_fine_enough_price_step(prices):

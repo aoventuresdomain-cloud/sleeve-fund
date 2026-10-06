@@ -40,6 +40,8 @@ RECONNECT_SECONDS = (1, 2, 5)  # the hub is on the same host: back within second
 CONNECT_TIMEOUT = 90  # the hub picks up an instrument it doesn't relay yet within a minute
 LATE_BAR_SECONDS = 90  # a bar complete this long after its close is late: the strategy only exits on it
 HEALTHY_SECONDS = 30  # a stream back this long is reconnected: one that breaks sooner keeps the backoff growing
+# A live minute that shows a gap the history store can't fill yet waits this long for the hub's refill (QA P1-L2).
+HOLD_SECONDS = 20
 HUB_ALIVE_SECONDS = 30  # a hub heartbeat this recent means the hub itself is up (heartbeats come every 5 s)
 
 
@@ -105,6 +107,10 @@ def _decimals(text: str) -> int:
     return len(text.partition(".")[2])
 
 
+def _as_list(got) -> list:
+    return got if isinstance(got, list) else [] if got is None else [got]
+
+
 def _one_or_all(bars: list):
     """None, the one bar, or (minutes recovered across several bars) all of them, oldest first."""
     return None if not bars else bars[0] if len(bars) == 1 else bars
@@ -144,6 +150,8 @@ class Decoder:
         self.building: dict[str, _Building] = {}
         self.sent: set[str] = set()  # instruments with a bar sent: a part bar after that is a gap, still sent
         self.late = 0  # bars sent late
+        self.held: dict[str, tuple[dict, int]] = {}  # instrument -> a live minute held for its gap's refill, since
+        self.refilling: dict[str, set] = {}  # instrument -> the hub's announced gaps whose refill isn't done yet
         self._late_run: dict[str, list[int]] = {}  # instrument -> the closes of a run of late bars
         # instrument -> its price and size decimals, from the hub's definitions. A refilled minute's numbers
         # can carry fewer ("60000.1" for 60000.10), so a bar is written at these, not at its minutes' own.
@@ -161,10 +169,23 @@ class Decoder:
                              Quantity.from_str(m["bid_qty"]), Quantity.from_str(m["ask_qty"]), m["ts"], now_ns)
         if t == "bar":
             return self._minute(m, now_ns)
-        return None  # heartbeats, gaps and anything newer: read for their effect, not passed on
+        if t == "gap":  # a refill on its way: the live minute after it waits for it (QA P1-L2)
+            self.refilling.setdefault(m["id"], set()).add((m["since"], m["until"]))
+            return None
+        if t == "filled":
+            self.refilling.get(m["id"], set()).discard((m["since"], m["until"]))
+            return _one_or_all(self._release(m["id"], now_ns, done=True))
+        return None  # heartbeats and anything newer: read for their effect, not passed on
 
-    def _minute(self, m: dict, now_ns: int):
+    def _minute(self, m: dict, now_ns: int, hold: bool = True):
         iid, close = m["id"], m["ts"]
+        out = []
+        held = self.held.get(iid)
+        if held is not None and close >= held[0]["ts"]:  # a newer live minute: wait no longer for the gap's
+            del self.held[iid]
+            out += _as_list(self._minute(held[0], now_ns, hold=False))
+            if close == held[0]["ts"]:
+                return _one_or_all(out)
         end = -(-close // self.period) * self.period  # the close of the bar this minute is part of
         b = self.building.get(iid)
         last = self.last_bar.get(iid)
@@ -173,16 +194,41 @@ class Decoder:
             # being built if that bar lacks it.
             if b is not None and b.end == end:
                 b.minutes.setdefault(close, m)
-            return None
+            return _one_or_all(out)
         if last is not None and close - last > MINUTE_NS:  # minutes missing between the last one and this
             after = last
         elif last is None and self.period > MINUTE_NS and close != end - self.period + MINUTE_NS:
             after = end - self.period  # the bar under way at start: its minutes before this one
         else:
-            return _one_or_all(self._add(iid, m, now_ns))
-        out = [b for r in self._recovered(iid, after, close, m, now_ns, at_start=last is None)
-               for b in self._add(iid, r, now_ns)]
-        return _one_or_all(out + self._add(iid, m, now_ns))
+            return _one_or_all(out + self._add(iid, m, now_ns) + self._release(iid, now_ns))
+        got = self._recovered(iid, after, close, m, now_ns, at_start=last is None)
+        out += [b for r in got for b in self._add(iid, r, now_ns)]
+        if (hold and last is not None and not m.get("refilled") and len(got) < (close - after) // MINUTE_NS - 1
+                and any(a < close and b > after for a, b in self.refilling.get(iid, ()))):
+            # QA P1-L2: the hub publishes a gap's live minute before its refill, which the store may not have yet.
+            # Hold this minute until the refill is done ("filled"), a newer minute comes, or HOLD_SECONDS pass
+            # (flush), so the refilled minutes reach the bars and the strategy in order rather than being dropped.
+            self.held[iid] = (m, now_ns)
+            return _one_or_all(out)
+        return _one_or_all(out + self._add(iid, m, now_ns) + self._release(iid, now_ns))
+
+    def _release(self, iid: str, now_ns: int, done: bool = False) -> list:
+        """The minute held for a gap, once the refills have filled it or (done) the hub's refill is over."""
+        held = self.held.get(iid)
+        if held is None or (not done and held[0]["ts"] - self.last_bar.get(iid, 0) != MINUTE_NS):
+            return []
+        del self.held[iid]
+        return _as_list(self._minute(held[0], now_ns, hold=False))
+
+    def flush(self, now_ns: int) -> list:
+        """The minutes held for a gap over HOLD_SECONDS, sent with the gap still in them (the hub's heartbeat
+        calls this, so a refill that never comes holds nothing for long)."""
+        out = []
+        for iid, (m, since) in list(self.held.items()):
+            if now_ns - since >= HOLD_SECONDS * 1_000_000_000:
+                del self.held[iid]
+                out += _as_list(self._minute(m, now_ns, hold=False))
+        return out
 
     def _recovered(self, iid: str, after: int, before: int, like: dict, now_ns: int, at_start: bool) -> list[dict]:
         """The minutes closing between `after` and `before` from the store, as hub messages priced like `like`;
@@ -365,6 +411,8 @@ class HubDataClient(MarketDataClient):
                         self.last_heartbeat_ns, self.venue_up = now, bool(m.get("venue_up"))
                         if (status := getattr(self.cfg, "status", None)) is not None:
                             status.heartbeat_ns, status.venue_up = now, self.venue_up
+                        for d in self.decode.flush(now):
+                            self._handle_data(d)
                     elif (data := self.decode(m, now)) is not None:
                         for d in data if isinstance(data, list) else (data,):
                             self._handle_data(d)

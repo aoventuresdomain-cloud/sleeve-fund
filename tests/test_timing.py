@@ -133,16 +133,47 @@ def test_journal_writes_leave_the_decision_path_and_every_read_sees_them():
     slow = Slow.in_memory()
     slow.create_sleeve(name="pp", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                        starting_balance=10_000)
-    q = QueuedStore(slow)
+    q = QueuedStore(slow, retry_seconds=(0.01,))
     t0 = time.monotonic()
-    q.record_order("pp", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="test")
+    q.record_order("pp", order_id="O-1", side="SELL", qty=0.1, intent="exit", reason="test")
     q.record_timing("pp", "O-1", decided=NS, sent=NS)  # after its order, in order
-    assert time.monotonic() - t0 < 0.05  # the decision didn't wait for the database
+    assert time.monotonic() - t0 < 0.05  # an exit didn't wait for the database
     assert [o["order_id"] for o in q.orders("pp")] == ["O-1"] and len(q.timings("pp")) == 1  # reads wait
     q.record_order("pp", order_id="O-2", side="BUY", qty=0.1, intent="nonsense", reason="test")
     with pytest.raises(RuntimeError, match="journal write failed"):
-        q.orders("pp")  # a failed write surfaces on the next read
+        q.orders("pp")  # a failed write surfaces on the next read, after its retry
     assert [o["order_id"] for o in q.orders("pp")] == ["O-1"]
+    (incident,) = [e for e in q.events("pp") if e["kind"] == "incident"]  # and was an alert at once
+    assert incident["level"] == "error" and "O-2" in incident["message"]
+    t0 = time.monotonic()
+    q.record_order("pp", order_id="O-3", side="BUY", qty=0.1, intent="entry", reason="test")
+    assert time.monotonic() - t0 >= 0.2  # an opening order is on record before it goes (QA P1-L5)
+
+
+def test_an_opening_order_whose_journal_row_fails_is_never_sent_an_exit_is_and_its_row_is_retried():
+    """QA P1-L5, HoE's ruling: nothing opens without its row; an exit goes whatever happens to its row, which is
+    an incident and is retried."""
+    from sleeve_fund.paper.queued import QueuedStore
+
+    db = Store.in_memory()
+    db.create_sleeve(name="q", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                     starting_balance=1_000)
+    real, tries = db.record_order, []
+
+    def flaky(*a, **k):
+        tries.append(k["order_id"])
+        if len(tries) < 3:
+            raise RuntimeError("database gone")
+        real(*a, **k)
+
+    db.record_order = flaky
+    q = QueuedStore(db, retry_seconds=(0.01, 0.01))
+    with pytest.raises(RuntimeError, match="database gone"):
+        q.record_order("q", order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="t")
+    q.record_order("q", order_id="O-2", side="SELL", qty=0.1, intent="stop_loss", reason="t")  # queued: no raise
+    q.flush()
+    assert tries == ["O-1", "O-2", "O-2"] and [o["order_id"] for o in q.orders("q")] == ["O-2"]
+    assert [e["kind"] for e in q.events("q")] == ["incident"]
 
 
 def test_a_run_journals_the_same_through_the_queue():
@@ -229,7 +260,7 @@ def test_an_entry_decided_more_than_90_s_after_its_close_is_skipped_and_said_wit
     assert opened == [] and sold == []
     (_, level, kind, msg), = events
     assert (level, kind) == ("warning", "late_entry_skipped")
-    assert "Skipped a long entry on the 18:05 candle: decided 91 s after its close" in msg and "price now 101" in msg
+    assert "Skipped a long entry on the 18:05 candle: decided 91.0 s after its close" in msg and "price now 101" in msg
     s, bar, events, sold, opened = _late_strategy(lag_s=None)  # on time: it opens
     s._on_bar_sided(bar)
     assert len(opened) == 1 and events == []
@@ -269,20 +300,36 @@ def test_a_missed_bar_is_decided_however_late_until_a_newer_bar_has_closed():
 def _minutes(*hl, start=NS):
     from types import SimpleNamespace
 
-    return [SimpleNamespace(ts_event=start + (k + 1) * 60_000_000_000, high=SimpleNamespace(as_double=lambda h=h: h),
-                            low=SimpleNamespace(as_double=lambda lo=lo: lo)) for k, (h, lo) in enumerate(hl)]
+    def px(v):
+        return SimpleNamespace(as_double=lambda: v)
+
+    return [SimpleNamespace(ts_event=start + (k + 1) * 60_000_000_000, open=px((h + lo) / 2), high=px(h), low=px(lo))
+            for k, (h, lo) in enumerate(hl)]
 
 
-@pytest.mark.parametrize("minutes, hit, level", [
+def _booked(s, sold):
+    """What the strategy sends, with the booking the replay hands its order (_outage_book, taken by _submit)."""
+    s._sell_all = lambda intent, reason, values=None: sold.append((intent, reason, dict(s._outage_book or {})))
+
+
+@pytest.mark.parametrize("minutes, hit, booked", [
     ([(100.5, 99.5), (100.2, 97.9), (101.0, 99.0)], "stop_loss", 98.0),  # 2% stop at 98 crossed in minute 2
     ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0),
-    ([(105.5, 97.5)], "stop_loss", 98.0),  # both in one minute: the stop, the worse of the two
+    ([(105.5, 97.5)], "stop_loss", 98.0),  # both in one minute: the stop, adverse first (Advisor NA-2)
+    ([(100.5, 99.5), (97.0, 96.0)], "stop_loss", 96.5),  # the second minute opens past the stop: at its open
     ([(101.0, 99.0)], None, None),
 ])
-def test_a_stop_or_target_crossed_while_the_strategy_was_down_closes_on_restart(minutes, hit, level):
+def test_a_stop_or_target_crossed_while_the_strategy_was_down_is_booked_where_the_venue_would_have_filled_it(
+        minutes, hit, booked):
+    """On restart the stored minutes since the previous process last saw market data are replayed as the venue's
+    resting orders would have traded them (Advisor NA-1): a stop at its level, or the open on a gap; a target at
+    its level; the market's price now beside it."""
     s, bar, events, sold, opened = _late_strategy()
+    _booked(s, sold)
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
-    s._last_alive = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)
+    s._last_alive = s._last_seen = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)  # market data seen till then
+    s.runtime.store.fills = lambda name, limit: [{"ts": datetime.fromtimestamp((NS - 600e9) / 1e9, tz=timezone.utc)}]
+    s._mark = lambda: (1e4, 1e4, 0.0, 101.0)  # the perp's position isn't at a venue here: no liquidation price
     before = _minutes((90.0, 90.0), start=NS - 120_000_000_000)  # crossed before the last heartbeat: seen then
     s.history_loader = lambda instrument, bar_type, n: before + _minutes(*minutes)
     s.instrument = None
@@ -290,44 +337,68 @@ def test_a_stop_or_target_crossed_while_the_strategy_was_down_closes_on_restart(
     if hit is None:
         assert sold == [] and events == []
         return
-    (intent, reason, values), = sold
-    assert intent == hit and values["outage_level"] == pytest.approx(level) and s._entry_px is None
+    (intent, reason, book), = sold
+    assert intent == hit and book["book_px"] == pytest.approx(booked) and book["market_on_return"] == 101.0
+    assert s._entry_px is None and s._outage_book is None
     assert [e[2] for e in events] == ["outage_exit"] and "while the strategy was down" in reason
 
 
-@pytest.mark.parametrize("lag_s, high, low, hit", [
-    (300, 100.5, 97.9, "stop_loss"),  # refilled after the feed was away: the stop crossed inside it
-    (300, 105.2, 99.0, "take_profit"),
-    (300, 101.0, 99.0, None),  # nothing crossed
-    (None, 100.5, 97.9, None),  # on time: the live checks saw every price, nothing to do here
+def test_the_restart_replay_starts_at_the_last_market_data_seen_not_the_last_heartbeat():
+    """QA P1-L3: a process keeps its heartbeat through a hub outage, so the replay starts from the last market data
+    it saw; with none on record, from the open position's last fill."""
+    from sleeve_fund.strategies.base import _ns
+
+    s, *_ = _late_strategy()
+    at = lambda m: datetime.fromtimestamp((NS + m * 60_000_000_000) / 1e9, tz=timezone.utc)  # noqa: E731
+    s.runtime.store.fills = lambda name, limit: [{"ts": at(-30)}]
+    s._last_alive, s._last_seen = at(0), at(-20)
+    assert s._outage_since() == _ns(at(-20))
+    s._last_seen = None
+    assert s._outage_since() == _ns(at(-30))
+    s._last_seen = at(-40)  # older than the fill: nothing before the fill is this position's
+    assert s._outage_since() == _ns(at(-30))
+
+
+@pytest.mark.parametrize("unseen, high, low, hit", [
+    (True, 100.5, 97.9, "stop_loss"),  # no trade reached the strategy while the bar formed: the stop crossed in it
+    (True, 105.2, 99.0, "take_profit"),
+    (True, 101.0, 99.0, None),  # nothing crossed
+    (False, 100.5, 97.9, None),  # trades all through it: the live checks saw every price, nothing to do here
 ])
-def test_a_stop_or_target_inside_a_bar_decided_late_closes_at_once(lag_s, high, low, hit):
-    """QA P1-C1: the hub away, its refilled bars arrive late; a stop crossed only inside them still runs, on the
-    bar's high and low, not only its close."""
+def test_a_stop_or_target_inside_a_bar_no_trade_reached_the_strategy_for_is_replayed(unseen, high, low, hit):
+    """QA P1-L1: a bar holding venue time with no trade (the hub or its venue away), late or on time: its high and
+    low are replayed, not only its close."""
     from types import SimpleNamespace
 
-    s, bar, events, sold, opened = _late_strategy(lag_s=lag_s, side_now=1)
+    s, bar, events, sold, opened = _late_strategy(side_now=1)
+    _booked(s, sold)
     s.runtime.backtest = False
+    s._mark = lambda: (1e4, 1e4, 0.0, 101.0)
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
-    late = SimpleNamespace(ts_event=NS, high=SimpleNamespace(as_double=lambda: high),
-                           low=SimpleNamespace(as_double=lambda: low), close=SimpleNamespace(as_double=lambda: 100.2))
-    assert s._check_late_bar_exits(late) is (hit is not None)
+    s._trade_ns = NS - (40 if unseen else 2) * 60_000_000_000 // 60
+    late = SimpleNamespace(ts_event=NS, open=SimpleNamespace(as_double=lambda: 100.0),
+                           high=SimpleNamespace(as_double=lambda: high), low=SimpleNamespace(as_double=lambda: low),
+                           close=SimpleNamespace(as_double=lambda: 100.2))
+    assert s._check_unseen_exits(late) is (hit is not None)
     if hit is None:
         assert sold == [] and events == []
         return
-    (intent, reason, values), = sold
-    assert intent == hit and values["outage_while"] == "while the market data feed was away"
-    assert "reached while the market data feed was away: the price passed the" in reason and "in the candle to" in reason
+    (intent, reason, book), = sold
+    assert intent == hit and book["outage_while"] == "while the market data feed was away"
+    assert "reached while the market data feed was away: the price passed the" in reason and "in the minute to" in reason
     from sleeve_fund.strategies.base import outage_fill_note
 
-    assert outage_fill_note({"intent": intent, "signal": values}, 97.0).endswith("while the market data feed was away")
+    note = outage_fill_note({"intent": intent, "signal": book}, book["book_px"])
+    assert "while the market data feed was away" in note and "the market was 101 on return" in note
 
 
 def test_an_outage_exits_fill_is_said_against_its_level_once():
     from sleeve_fund.strategies.base import outage_fill_note
 
-    decision = {"intent": "stop_loss", "signal": {"outage_level": 98.0}}
-    assert outage_fill_note(decision, 97.02) == ("The stop-loss closed at 97.02, -1.00% from its 98 level, reached "
-                                                 "while the strategy was down")
+    decision = {"intent": "stop_loss", "signal": {"outage_level": 98.0, "breached_at": "18:07",
+                                                  "market_on_return": 99.5}}
+    assert outage_fill_note(decision, 97.02) == (
+        "The stop-loss is booked at 97.02, -1.00% from its 98 level, as the venue would have filled it in the minute "
+        "to 18:07, reached while the strategy was down; the market was 99.5 on return")
     assert outage_fill_note(decision, 97.0) is None  # a later part fill
     assert outage_fill_note({"intent": "exit", "signal": {}}, 97.0) is None and outage_fill_note(None, 1.0) is None

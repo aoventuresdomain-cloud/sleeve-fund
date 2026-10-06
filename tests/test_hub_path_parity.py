@@ -301,13 +301,16 @@ def test_c5_backtest_on_the_same_minutes_stops_out_inside_the_outage(recover):
 
 
 def test_c5_hub_away_while_long_and_the_price_still_past_the_stop_the_stop_runs_on_reconnect():
-    """The stop is not lost when the price is still past it: it sells on the first trade after the hub is
-    back (00:12:00), at that price, five minutes after the backtest's."""
+    """The stop is not lost when the price is still past it. The live check waits for the missed minutes, which
+    come back at 00:12:05, and the replay books the stop as the venue's resting stop would have filled it, at the
+    backtest's price in the minute to 00:07 (Advisor NA-1, 6 Oct; it was sold at market on the first trade back)."""
     o, f, dec, store = hub_paper(_dip_prices(False), {"period": 5, "stop_loss": 0.01}, gone=GONE, away=AWAY,
                                  back_at=BACK)
     hub = per_order(o, f)
+    bt = per_order(*backtest(_dip_prices(False), {"period": 5, "stop_loss": 0.01}))
     assert [r[1] for r in hub][:2] == ["entry", "stop_loss"]
-    assert hub[1][2] == pd.Timestamp(START + 12 * M, unit="ns", tz="UTC")
+    assert hub[1][2] == pd.Timestamp(START + 13 * M, unit="ns", tz="UTC")  # sent at 00:12:05
+    assert abs(hub[1][4] / bt[1][4] - 1) < 5e-4, (hub[1], bt[1])
     assert dec.late == 4  # the bars closing 00:07-00:10 came late: exits only
 
 
