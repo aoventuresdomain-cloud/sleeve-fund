@@ -589,17 +589,17 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
             problem, key = funding.stale(profile.name, pair, root), f"{profile.name} {pair}: funding stale"
             # One episode per instrument, whoever notices first: a paper strategy on it may have opened (or closed)
             # it already, under the same tag (Advisor, 6 Oct 2026; CR, #163).
-            tag, now = funding.stale_tag(profile.name, pair), pd.Timestamp.now(tz="UTC")
+            tag = funding.stale_tag(profile.name, pair)
             if problem:
                 print(f"FUNDING STALE: {problem}")
                 if key not in _stale:  # once per episode (Advisor, 6 Oct 2026)
                     _stale.add(key)
-                    if funding.stale_open(_inbox(), tag, now) is not True:
+                    if funding.stale_open(_inbox(), tag) is not True:
                         _warned.pop(key, None)
                         _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}")
             elif key in _stale:  # the gap gets a clear end in the journal (Advisor, 6 Oct 2026)
                 _stale.discard(key)
-                if funding.stale_open(_inbox(), tag, now) is not False:
+                if funding.stale_open(_inbox(), tag) is not False:
                     kept = funding.rates(profile.name, pair, root).index
                     _warned.pop(f"{key}: cleared", None)
                     _alert(f"{key}: cleared", "info", "funding_stale_cleared",

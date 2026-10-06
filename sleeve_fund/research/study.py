@@ -48,7 +48,19 @@ def _window_funding(marks: list, after: pd.Timestamp, end: pd.Timestamp) -> dict
     without the venue's rate (funding.baseline_summary)."""
     inside = [m for m in marks if after < pd.Timestamp(m[0]) <= end]
     n, m, longest = funding.baseline_summary(inside)
-    return {"funding_held": m, "funding_baseline": n, "funding_gap": longest}
+    return {"funding_held": m, "funding_baseline": n, "funding_gap": longest, "funding_window_marks": inside}
+
+
+def _oos_funding(folds) -> tuple[int, int, pd.Timedelta]:
+    """(N, M, the longest stretch) over the out-of-sample windows joined: the test windows are contiguous, so a
+    stretch without the venue's rate runs on across a window's edge, broken only by a stored real rate (Advisor,
+    18:18; QA P1-O17a-2). Folds without their marks (older results) fall back to the per-window figures."""
+    n = sum(getattr(f, "funding_baseline", 0) for f in folds)
+    m = sum(getattr(f, "funding_held", 0) for f in folds)
+    joined = sorted((mk for f in folds for mk in getattr(f, "funding_window_marks", ())), key=lambda mk: mk[0])
+    if joined:
+        return n, m, funding.baseline_summary(joined)[2]
+    return n, m, max((getattr(f, "funding_gap", pd.Timedelta(0)) for f in folds), default=pd.Timedelta(0))
 
 
 def _funding_check(r) -> tuple[str, str]:
@@ -56,10 +68,7 @@ def _funding_check(r) -> tuple[str, str]:
     simulated perp has no venue's rates at all: every settlement is the baseline, and it is not judged until a
     modelled rate series is in the trials register before the run (none can be registered yet). Nor is a run whose
     venue's settlements don't fit the schedule charged (funding.schedule_mismatch)."""
-    folds = r.folds  # read with defaults: a fold that never held a perp carries no funding
-    n = sum(getattr(f, "funding_baseline", 0) for f in folds)
-    m = sum(getattr(f, "funding_held", 0) for f in folds)
-    longest = max((getattr(f, "funding_gap", pd.Timedelta(0)) for f in folds), default=pd.Timedelta(0))
+    n, m, longest = _oos_funding(r.folds)  # read with defaults: a fold that never held a perp carries no funding
     verdict, words = funding.baseline_check(n, m, longest, "out-of-sample")
     full = getattr(r, "full_period", None)
     if getattr(full, "funding_schedule", ""):
@@ -102,6 +111,7 @@ class Fold:
     funding_held: int = 0
     funding_baseline: int = 0
     funding_gap: pd.Timedelta = pd.Timedelta(0)
+    funding_window_marks: list = field(default_factory=list, repr=False)  # (ts, missing, held) in the window
     unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
 
     @property
@@ -193,8 +203,7 @@ class StudyResult:
     def funding_baseline(self) -> tuple[int, int, pd.Timedelta]:
         """Out-of-sample funding settlements charged the baseline for a missing rate, of those a position was held
         through, and the longest stretch of held time without the venue's rate: what the G1 funding check reads."""
-        return (sum(f.funding_baseline for f in self.folds), sum(f.funding_held for f in self.folds),
-                max((f.funding_gap for f in self.folds), default=pd.Timedelta(0)))
+        return _oos_funding(self.folds)
 
     @property
     def funding_check(self) -> tuple[str, str]:

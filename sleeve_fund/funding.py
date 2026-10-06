@@ -231,28 +231,20 @@ def stale(venue: str, pair: str, root: str | Path | None = None, now: pd.Timesta
 def stale_tag(venue: str, pair: str) -> str:
     """The prefix of an instrument's funding_stale / funding_stale_cleared messages, the same whether the collector
     or a paper strategy raises it, so one episode per instrument is alerted once, whoever notices first (CR, #163)."""
-    return f"[{venue.upper()} {pair}]"
+    return f"[{venue.upper()} {pair}]" if venue else f"[{pair}]"
 
 
-STALE_EPISODE_EXPIRES = pd.Timedelta(days=1)
-
-
-def stale_open(store, tag: str, now) -> bool | None:
+def stale_open(store, tag: str) -> bool | None:
     """Whether the instrument's staleness episode is open in the journal: its latest funding_stale /
-    funding_stale_cleared is a funding_stale under a day old (one left open by a process that stopped before the rate
-    came no longer holds a new alert back). None when the journal can't be read: the caller then alerts, since
-    alerting twice beats never."""
+    funding_stale_cleared is a funding_stale, however long ago, so an outage of days alerts once and a rate arriving
+    days late still logs its recovery (QA P1-O17a-1). None when the journal can't be read: the caller then alerts,
+    since alerting twice beats never."""
     try:
         last = next((e for e in store.events_of(("funding_stale", "funding_stale_cleared"), limit=500)
                      if e["message"].startswith(tag)), None)
     except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
         return None
-    return last is not None and last["kind"] == "funding_stale" and _utc(now) - _utc(last["ts"]) < STALE_EPISODE_EXPIRES
-
-
-def _utc(t) -> pd.Timestamp:
-    t = pd.Timestamp(t)
-    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    return last is not None and last["kind"] == "funding_stale"
 
 
 # Funding charged at the baseline for a missing rate (Advisor, 6 Oct 2026, QA P1-O17): from BASELINE_WARN of the held

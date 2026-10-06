@@ -1932,7 +1932,7 @@ class LongFlatStrategy(Strategy):
                 return None
             if rate is None:
                 self._funding_missing.add(when)
-                self._funding_episode(terms, pair, True, f"No settled funding rate from the venue for {pair} at "
+                self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
                                       f"{when:%d %b %Y %H:%M} UTC, {self.FUNDING_WAIT.seconds // 60} minutes after it "
                                       "settled; charging the baseline, whichever side is held, until it arrives")
         if rate is None:
@@ -1974,11 +1974,11 @@ class LongFlatStrategy(Strategy):
         if self._funding_missing:
             return
         last = max(arrived)
-        self._funding_episode(terms, pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
+        self._funding_episode(pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
                                                   "has arrived from the venue"
                                                   + (f", with {len(arrived) - 1} earlier" if len(arrived) > 1 else ""))
 
-    def _funding_episode(self, terms, pair: str, stale: bool, message: str) -> None:
+    def _funding_episode(self, pair: str, stale: bool, message: str) -> None:
         """Open (funding_stale, a warning) or close (funding_stale_cleared) the instrument's staleness episode, once
         whichever strategy on it, or the collector, notices first: the journal's latest such event for the instrument
         says whether one is open (Advisor, 6 Oct 2026: per instrument, once per episode; CR, #163)."""
@@ -1987,8 +1987,9 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         if rt is None:
             return
-        tag = funding.stale_tag(terms.funding_venue, pair)
-        open_ = funding.stale_open(rt.store, tag, rt.now())
+        perp = getattr(getattr(self, "_cfg", None), "perp", None)
+        tag = funding.stale_tag(getattr(perp, "funding_venue", None) or "", pair)
+        open_ = funding.stale_open(rt.store, tag)
         if stale and open_ is not True:
             rt.store.event(None, "warning", "funding_stale", f"{tag} {message}", ts=rt.now())
         elif not stale and open_ is not False:
