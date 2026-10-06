@@ -246,3 +246,15 @@ def test_re_entries_on_an_exit_candle_count_entries_in_a_candle_where_an_exit_fi
     assert reentries_on_exit_candle(fills, decisions, 15) == 1  # e2: the stop filled inside its candle
     assert reentries_on_exit_candle(fills, decisions, 5) == 0
     assert reentries_on_exit_candle(None, {}, 15) == 0
+
+
+def test_after_a_stop_inside_a_candle_the_rules_may_enter_again_at_its_close_and_it_is_counted(instrument):
+    """Advisor 22:30 (QA P1-5-X2): a stop or target filled inside the candle ends the leg; the entry rules are read
+    afresh at that candle's close and may open the same side there. The backtest counts it."""
+    df = _flat(n=30, spike=10, at=100.0)
+    df.iloc[10, df.columns.get_loc("low")] = 98.0  # through the 1 % stop inside the minute, back to 100 at its close
+    defn = _with(blocks={}, long={"entry": {"left": "close", "op": ">", "right": 0}})
+    res = run_backtest("rules", df, instrument, params={**to_params(defn), "stop_loss": 0.01}, bar_minutes=1,
+                       half_spread=0)
+    entries = [ts for entry, _, ts in _trades(res) if entry]
+    assert entries[:2] == [df.index[0], df.index[10]] and res.reentries_on_exit_candle == 1

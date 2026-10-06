@@ -95,6 +95,8 @@ def _iso(ns: int) -> str:
 
 
 class Rules(LongFlatStrategy):
+    REENTER_AFTER_EXIT_LEG = True
+
     def __init__(self, config: RulesConfig) -> None:
         super().__init__(config)
         self.c = config
@@ -203,6 +205,12 @@ class Rules(LongFlatStrategy):
                 return self._leg
         self._why = ("; ".join(w for _, w in fired), self._lineage(fired)) if fired else None
         return self._leg
+
+    def exit_leg_closed(self) -> None:
+        """A stop or target closed the position inside the candle: the leg ends with it, and the entry rules are
+        read afresh at the close, so the same side may open again there (Advisor 22:30; counted by a backtest as
+        reentries_on_exit_candle). A leg ended at the close never reopens on that candle (want_side)."""
+        self._leg, self._held, self._leg_ts = 0, 0, None
 
     def _time_up(self, step: int) -> bool:
         """The time stop: wall-clock by default, so missing candles never lengthen a hold; it ends the leg on the
