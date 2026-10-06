@@ -313,3 +313,17 @@ def test_the_lag_is_not_trusted_until_twenty_live_captures(tmp_path):
     assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) is None
     _put(tmp_path, rows)
     assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) == pd.Timedelta(minutes=3)
+
+
+def test_a_change_of_settlement_interval_is_reported_as_a_possible_hole_and_logged(tmp_path, capfd, monkeypatch):
+    """QA P1-O9 / HoE: 8h to 16:00 then 4h from 00:00 reads the same as a missed 20:00, so it is flagged, not passed."""
+    h = 3_600_000
+    kept = [T0 + k * 8 * h for k in range(6)] + [T0 + 48 * h + k * 4 * h for k in range(6)]  # change at 40h -> 48h
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == []
+    change = (pd.Timestamp(T0 + 40 * h, unit="ms", tz="UTC"), pd.Timestamp(T0 + 48 * h, unit="ms", tz="UTC"))
+    assert funding.interval_changes("BINANCE", "BTC/USDT", root=tmp_path) == [change]
+    assert "possible hole at interval change 2026-10-02 16:00 to 2026-10-03 00:00" in capfd.readouterr().out

@@ -569,6 +569,12 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         try:
             kept = funding.refresh(profile.name, pair, root=root, since=since)
             funding_to = kept.index[-1] if len(kept) else None
+            missed, maybe = funding.gaps(profile.name, pair, root), funding.interval_changes(profile.name, pair, root)
+            if missed or maybe:  # the hub's log is what the status workflow shows: data health is said there
+                span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
+                print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
+                      + "".join(f"; missed between {span(g)}" for g in missed)
+                      + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)

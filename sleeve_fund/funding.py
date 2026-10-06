@@ -97,7 +97,8 @@ def gaps(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd
     longer than one and a half times the shortest of the few intervals before it AND of the few after it. Taking
     the shortest finds two holes in a row (QA P1-O9), and needing both sides keeps a clean change of interval from
     counting. A hole exactly at a change can't be told from data alone (8h to 16:00 then 4h from 00:00 reads the
-    same as a missed 20:00), so it is not reported."""
+    same as a missed 20:00), so it is not reported here: interval_changes() lists each such interval as a possible
+    hole, and the collector's log says so."""
     t = rates(venue, pair, root).index
     steps = [b - a for a, b in zip(t, t[1:])]
     out = []
@@ -105,4 +106,22 @@ def gaps(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd
         before, after = steps[max(j - _NEAR, 0):j], steps[j + 1:j + 1 + _NEAR]
         if (before or after) and all(here > 1.5 * min(side) for side in (before, after) if side):
             out.append((t[j], t[j + 1]))
+    return out
+
+
+def interval_changes(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Each interval where the settlement interval changes, as (previous kept, next kept) for the longer interval at
+    the change: it can't be told from the rates alone whether that interval was the old schedule or the new one with
+    settlements missed (QA P1-O9), so it is a possible hole, reported beside gaps() rather than passed silently.
+    The venue's published interval, once kept with each rate, would settle it (board follow-up)."""
+    t = rates(venue, pair, root).index
+    steps = [b - a for a, b in zip(t, t[1:])]
+    holes = set(gaps(venue, pair, root))
+    out = []
+    for j in range(len(steps) - 1):
+        if steps[j] != steps[j + 1]:
+            k = j if steps[j] > steps[j + 1] else j + 1
+            span = (t[k], t[k + 1])
+            if span not in holes and span not in out:
+                out.append(span)
     return out
