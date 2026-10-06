@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+
+import test_replay
 from fastapi.testclient import TestClient
 
 from sleeve_fund.paper.journal import MemoryJournal
@@ -259,3 +261,32 @@ def test_a_strategys_own_reset_never_clears_its_halt_or_daily_pause(store, statu
     assert s.status == status and store.pending_reset("s1") is None
     blocked, why = entry_blocked(store, "s1", starting=True)
     assert blocked and ("only a resume" in why if status == "halted" else "00:00 UTC" in why), why
+
+
+@pytest.mark.no_open_risk_limit(reason="guards off: the 2x short must open in session 1 to be carried")
+@pytest.mark.parametrize("holder", ["stopped_holder", "pm_paused"])
+def test_sg5_a_holder_still_guarded_by_its_limits_never_opens_an_entry(tmp_path, holder, monkeypatch):
+    """HoE 23:22 (SG5 done-when 2): the exits-only and PM-paused holders of QA's SG5 pins (test_gate_845_u35, where the
+    drawdown halt, the daily-loss flatten, the liquidation check and the stop each still fire) never open an entry:
+    across later sessions that trade both ways, quiet enough to stay inside every limit, nothing that grows the
+    position is sent or filled."""
+    import dataclasses
+
+    from sleeve_fund import risk
+    from test_gate_845_u35 import ENTRY, _deploys
+
+    for nm, p in list(risk.PROFILES.items()):  # QA's whole_equity fixture, inline
+        monkeypatch.setitem(risk.PROFILES, nm, dataclasses.replace(p, max_position_pct=1.0))
+    swings = [(3, -0.004), (3, 0.006), (4, -0.004), (3, 0.005)]  # dips and rises ping_pong would trade on
+    store = _deploys(tmp_path, holder, [(ENTRY, swings), (ENTRY, swings)])
+    name = "ping-pong-test"
+    orders = sorted(store.orders(name, limit=1000), key=lambda o: o["ts"])
+    s2 = datetime.fromtimestamp(test_replay.START / 1e9, timezone.utc) + timedelta(hours=2)  # the holder's sessions
+    held = [o for o in orders if o["ts"] < s2 and o["status"] == "filled"]
+    after = [o for o in orders if o["ts"] >= s2]
+    assert not [o for o in after if o["intent"] in ("entry", "rebalance")], [(o["ts"], o["intent"], o["side"])
+                                                                            for o in after]
+    carried = abs(sum(o["filled_qty"] * (1 if o["side"] == "BUY" else -1) for o in held))
+    assert abs(store.journal_book(name, 10_000)["qty"]) <= carried + 1e-12
+    kinds = {e["kind"] for e in store.events(name, limit=1000)}
+    assert "entry_blocked" in kinds, kinds  # it did try to trade, and the gate refused it
