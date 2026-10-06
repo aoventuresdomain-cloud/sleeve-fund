@@ -189,3 +189,14 @@ def test_rsi_bands_trades_the_standard_rsi(prices, instrument):
         quoted = float(re.search(r"RSI ([\d.]+)", d["reason"]).group(1))
         assert any(r is not None and abs(r - quoted) < 0.051 for r in ref), d["reason"]
         assert min(abs(r - d["signal"]["rsi"]) for r in ref if r is not None) < 1e-6
+
+
+def test_a_keyword_nan_is_refused_like_a_positional_one():
+    # QA P1-A3: the guard read positional arguments only, so update_raw(close=nan) poisoned the block.
+    import math
+
+    from sleeve_fund.strategies.indicators import Atr, Ema
+
+    for block, kwargs in ((Ema(5), {"x": math.nan}), (Atr(3), {"high": 1.0, "low": 1.0, "close": math.inf})):
+        with pytest.raises(ValueError, match="finite"):
+            block.update_raw(**kwargs)

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from sleeve_fund import markets
+from sleeve_fund.research.guardrails import G1_RULES
 from sleeve_fund.strategies import REGISTRY
 
 STAGES = ["Idea", "Tested", "Passed G1", "Paper", "Passed G2", "Live"]
@@ -15,6 +16,7 @@ _DATASET = re.compile(r"^Dataset `([^`]+)`", re.M)
 _NAME = re.compile(r"^# Tear sheet: (\S+)", re.M)
 _TESTED = re.compile(r"^Tested on `([^`]+)` at (\d+)-minute bars", re.M)
 _SETTINGS = re.compile(r"^Settings: (.+)$", re.M)
+_RULES = re.compile(r"^G1 rules: (\S+)$", re.M)
 
 
 def _g1(text: str) -> tuple[str | None, str, list[str]]:
@@ -29,6 +31,13 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
     if unjudged:  # neither a pass nor a fail: the study's runs can't be judged (tearsheet.g1_verdict)
         return "NOT JUDGED", "; ".join(ev or label for label, ev in unjudged), [label for label, _ in unjudged]
     failed = [(label, ev.strip()) for label, verdict, ev in rows if verdict not in ("PASS", "INFO", "N/A")]
+    rules = _RULES.search(text)
+    if not failed and (rules is None or rules.group(1) != G1_RULES):
+        # Passed under older, looser rules (a 10-trade bar, no nearby-settings check, or one centred on the
+        # defaults): not a pass now, and never one the path to live can count, until re-run (QA F3).
+        then = f"the G1 rules of {rules.group(1)}" if rules else "G1 rules"
+        return ("NOT JUDGED", f"Old bar: passed under {then} older than the current {G1_RULES}; re-run the study "
+                "to judge it", ["G1 rules"])
     evidence = sharpe[2].strip()
     if failed:
         # Lead with what failed: a strong Sharpe beside "Fail" otherwise reads like a pass.

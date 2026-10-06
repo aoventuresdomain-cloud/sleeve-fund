@@ -262,3 +262,16 @@ def test_trades_arriving_after_their_minutes_bar_are_counted_for_the_parity_repo
     r.on_trade(trade(T0 + 1))
     r._write_late()
     assert json.loads(r.late_path.read_text()) == {"BTC/USDT": [1, 3]}
+
+
+def test_a_refill_is_followed_by_filled_whatever_it_found_so_a_client_holding_the_live_bar_stops_waiting():
+    r, _ = _relay(last_close={BTC: T0 - 3 * MINUTE_NS})
+    r.on_bar(_bar(BTC, T0))
+    kinds = [(m["t"], m.get("ts")) for m in r.fanout.sent]
+    filled = next(m for m in r.fanout.sent if m["t"] == "filled")
+    assert (filled["since"], filled["until"]) == (T0 - 2 * MINUTE_NS, T0 - MINUTE_NS)
+    assert kinds.index(("filled", None)) > max(i for i, (t, ts) in enumerate(kinds) if t == "bar" and ts < T0)
+    r2, _ = _relay(last_close={BTC: T0 - 3 * MINUTE_NS})
+    r2.recent = lambda pair, minutes: (_ for _ in ()).throw(OSError("REST down"))
+    r2.on_bar(_bar(BTC, T0))
+    assert [m["t"] for m in r2.fanout.sent].count("filled") == 1  # a failed refill is over too

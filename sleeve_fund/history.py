@@ -560,15 +560,85 @@ def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None
 
 
 def _refresh_funding(profile, pair: str, root, since) -> None:
-    """A perpetual venue's settled funding for the instrument, kept beside its prices (sleeve_fund.funding)."""
-    if profile.funding_loader is None:
-        return
-    from sleeve_fund import funding
+    """A perpetual venue's settled funding for the instrument, kept beside its prices (sleeve_fund.funding), and
+    its open interest snapshots (sleeve_fund.open_interest)."""
+    funding_to = None
+    if profile.funding_loader is not None:
+        from sleeve_fund import funding
 
+        try:
+            flags = lambda: (funding.gaps(profile.name, pair, root),  # noqa: E731
+                             funding.interval_changes(profile.name, pair, root))
+            was_missed, was_maybe = flags()
+            kept = funding.refresh(profile.name, pair, root=root, since=since)
+            funding_to = kept.index[-1] if len(kept) else None
+            missed, maybe = flags()
+            if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
+                span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
+                print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
+                      + "".join(f"; missed between {span(g)}" for g in missed)
+                      + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
+                # The alerts inbox only what this pass found new (QA P1-O11, Code Reviewer): old holes never clear,
+                # so alerting on the whole history would repeat it every day and on every restart.
+                new_missed = [g for g in missed if g not in was_missed]
+                new_maybe = [g for g in maybe if g not in was_maybe]
+                if new_missed or new_maybe:
+                    _alert(f"{profile.name} {pair}: funding", "warning", "funding_gap",
+                           f"{profile.name} {pair}: funding: new since the last pass"
+                           + "".join(f"; missed between {span(g)}" for g in new_missed)
+                           + "".join(f"; possible hole at interval change {span(g)}" for g in new_maybe))
+        except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
+            print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+    _refresh_open_interest(profile, pair, root, funding_to)
+
+
+def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
+    """The venue's open interest and positioning snapshots for the instrument (sleeve_fund.open_interest), then
+    one line saying how far open interest and funding are kept, which the status workflow shows in the hub's log."""
+    if not profile.stats_loaders:
+        return
+    from sleeve_fund import open_interest
+
+    outs = {}
+    for series in profile.stats_loaders:
+        try:
+            outs[series] = open_interest.refresh(profile.name, pair, root=root, series=series)
+        except Exception as exc:  # noqa: BLE001 - snapshots the venue still keeps are fetched on the next pass
+            print(f"{profile.name} {pair}: {series.replace('_', ' ')} refresh failed: {exc!r}")
+        _warn_at_risk(open_interest.at_risk(profile.name, pair, root=root, series=series))
+    out = outs.get("open_interest")
+    if out is None:
+        return
+    oi = f"{out['latest']:%Y-%m-%d %H:%M}" if out["latest"] is not None else "none yet"
+    fr = f"{funding_to:%Y-%m-%d %H:%M}" if funding_to is not None else "none yet"
+    extra = f", {out['conflicts']} differing (open_interest.provenance.jsonl)" if out["conflicts"] else ""
+    print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
+
+
+_warned: dict[str, float] = {}  # message prefix -> when it last went to the alerts inbox
+
+
+def _warn_at_risk(problem: str | None, store=None) -> None:
+    """Open interest about to be lost for good goes to the alerts inbox, at most once a day per instrument."""
+    if problem is None:
+        return
+    print(f"OPEN INTEREST AT RISK: {problem}")
+    _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _alert(key: str, level: str, kind: str, message: str, store=None) -> None:
+    """One event in the alerts inbox, at most once a day per key."""
+    import time
+
+    if time.time() - _warned.get(key, 0) < 86_400:
+        return
     try:
-        funding.refresh(profile.name, pair, root=root, since=since)
-    except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
-        print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+        from sleeve_fund.store import Store
+
+        (store or Store()).event(None, level, kind, message)
+        _warned[key] = time.time()
+    except Exception as exc:  # noqa: BLE001 - no database (locally): the log line still says it
+        print(f"could not raise the {kind} alert: {exc!r}")
 
 
 def unwritable(path: Path) -> str | None:
@@ -630,9 +700,12 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 out = refresh(store, profile, pair, max_pages=args.pages, since=since)
                 behind |= out["pages"] >= args.pages
-                _refresh_funding(profile, pair, args.root, since)
             except Exception as exc:  # noqa: BLE001 - one bad pair or a venue hiccup must not stop the rest
                 print(f"{profile.name} {pair}: refresh failed: {exc!r}")
+            try:  # on its own: failing prices must not skip funding, open interest or the week-old alert (QA P1-O5)
+                _refresh_funding(profile, pair, args.root, since)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{profile.name} {pair}: funding and open interest refresh failed: {exc!r}")
         if not behind:
             time.sleep(args.idle)
 

@@ -329,7 +329,12 @@ def main(argv: list[str] | None = None) -> int:
         if recorder is not None:
             recorder.close()
         if runtime is not None:
-            runtime.store.flush()  # what the strategy journaled as it stopped
+            # What the strategy journaled as it stopped, an exit's row still being retried included (QueuedStore),
+            # inside the 45 s the supervisor gives a stopping process.
+            if hasattr(runtime.store, "settle"):
+                runtime.store.settle(timeout=30)
+            else:
+                runtime.store.flush()
     return 0
 
 

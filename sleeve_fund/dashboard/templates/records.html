@@ -4,7 +4,7 @@
 {% macro tl_item(d, link=True) %}{% set k = kinds[d.kind] %}
 <li class="tl" data-kind="{{ d.kind }}"><span class="when">{{ d.ts.strftime('%H:%M') }}</span><span class="ic {{ d.kind }}" aria-hidden="true">{{ k[1] }}</span>
   <span class="what"><span class="sr-only">{{ k[0] }}: </span><strong>{{ d.action|action_words }}</strong>{% if d.sleeve %} {% if link %}<a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% else %}{{ d.sleeve }}{% endif %}{% endif %}
-  <span class="why">{{ d.reason }}{% if d.actor %} <span class="faint">· {{ d.actor }}</span>{% endif %}</span></span></li>
+  <span class="why">{{ d.reason|no_venues }}{% if d.actor %} <span class="faint">· {{ d.actor }}</span>{% endif %}</span></span></li>
 {% endmacro %}
 {% block content %}
 <div class="page-head rec-head">
@@ -54,15 +54,7 @@
     <section class="panel span-8" aria-labelledby="curve-h">
       <div class="panel-head"><h2 id="curve-h">{{ label }} vs benchmark</h2>{% if m.rows %}<span class="right faint">Tap a month to see only that month</span>{% endif %}</div>
       {% if not perf.empty %}{% set c = perf.chart %}
-      <svg class="rec-curve" viewBox="0 0 {{ c.w }} {{ c.h }}" role="img" aria-label="{{ label }} return {{ perf.ret|pct1s }} against buy-and-hold {{ perf.bench|pct1s }} over the period">
-        {% for t in c.ticks %}<line x1="{{ c.left }}" x2="{{ c.w }}" y1="{{ t.y }}" y2="{{ t.y }}" class="grid-l"/><text x="{{ c.left - 6 }}" y="{{ t.y }}" text-anchor="end" dominant-baseline="middle" class="tick">{{ t.label }}</text>{% endfor %}
-        {% for mo in c.months %}<text x="{{ mo.x + 3 }}" y="{{ c.h - 6 }}" class="tick">{{ mo.label }}</text><line x1="{{ mo.x }}" x2="{{ mo.x }}" y1="8" y2="{{ c.bottom }}" class="grid-l"/>{% endfor %}
-        <line x1="{{ c.left }}" x2="{{ c.w }}" y1="{{ c.zero }}" y2="{{ c.zero }}" class="zero"/>
-        <polygon points="{{ c.area }}" class="area"/>
-        <polyline points="{{ c.bench }}" class="bench"/>
-        <polyline points="{{ c.book }}" class="book"/>
-        <circle cx="{{ c.end.x }}" cy="{{ c.end.y }}" r="3.5" class="dot-end"/>
-      </svg>
+      <div class="lw-line rec-curve" data-kind="returns" data-chart="{{ c|tojson|forceescape }}" role="img" aria-label="{{ label }} return {{ perf.ret|pct1s }} against buy-and-hold {{ perf.bench|pct1s }} over the period"></div>
       <div class="chart-legend"><span><i></i>{{ label }}<b>{{ perf.ret|pct1s }}</b></span><span><i class="bench"></i>Buy-and-hold<b>{{ perf.bench|pct1s }}</b></span></div>
       {% else %}<p class="empty">No marks yet in this period. The curve appears once strategies have run.</p>{% endif %}
       {% if m.rows %}
@@ -121,9 +113,10 @@
 <p class="muted rec-foot">Amounts are in each instrument's quote currency (USD for */USD instruments). Pound values and UK capital gains are not included yet.</p>
 {% endblock %}
 {% block scripts %}
+<script src="/static/lightweight-charts.js"></script>
 <script src="/static/console.js"></script>
 <script>
-Console.tabs();
+Console.tabs(); Console.lineCharts();
 (() => {
   // The filters keep the tab you are on.
   document.addEventListener("click", (e) => {

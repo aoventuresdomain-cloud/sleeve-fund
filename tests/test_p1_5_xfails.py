@@ -913,7 +913,9 @@ def test_breakout_slippage_costs_only_entries_on_the_breakout_candle(instrument)
     assert any(x[1] == "SELL" and "stop" in x[0] for x in plain), "the case needs a stop exit"
     for a, b in zip(plain, slipped):
         on_breakout = a[0] == "entry" and a[2] in first_true
-        assert b[4] / a[4] == pytest.approx(1.0025 if on_breakout else 1.0, abs=1e-9), (a, b)
+        # The report puts what rounding left in the order's charged commission into its price with the slippage
+        # (QA m-G7, #156): up to about a cent per order, so the price is within 2 cents' worth of its quantity.
+        assert b[4] == pytest.approx(a[4] * (1.0025 if on_breakout else 1.0), abs=0.02 / b[3]), (a, b)
 
 
 def test_a_channel_trailing_stop_ratchets_up_and_never_follows_the_channel_down(prices, instrument):
