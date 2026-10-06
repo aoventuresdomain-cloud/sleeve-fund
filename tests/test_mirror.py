@@ -269,7 +269,7 @@ def test_a_strategy_whose_demo_account_is_not_set_up_is_skipped_not_sent_elsewhe
     assert "its demo account, once that is set up on Setup, Accounts" in started and "BYBIT" not in started
     _fill(store, "bn-ls", "BUY", 0.05, 1)
     mirror.mirror_once(store, {"DERIBIT": testnet})
-    assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "no Bybit demo account set up"
+    assert testnet.orders == [] and store.mirror_rows("bn-ls")[0]["message"] == "the demo account isn't set up"
 
 
 def test_the_start_check_says_whether_the_key_signed_in_and_flags_hedge_mode():
@@ -571,4 +571,4 @@ def test_resync_all_covers_every_bybit_strategy_and_refuses_what_is_not_copied()
         store.request_resync("pp", "x")
     with pytest.raises(ValueError, match="reason"):
         store.request_resync("bn-a", " ")
-    assert "Deribit" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced
+    assert "sized in dollars" in mirror.resync(store, {"BYBIT": demo}, "pp-ls", {})  # testnet copies can't be resynced

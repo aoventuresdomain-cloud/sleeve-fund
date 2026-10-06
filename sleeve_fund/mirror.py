@@ -144,7 +144,7 @@ class Testnet:
         out = self._get(f"{self.url}/api/v2/{method}?{urllib.parse.urlencode(params)}", headers)
         if "error" in out:
             err = out["error"]
-            raise RuntimeError(f"Deribit testnet {method}: {err.get('message', err)} ({err.get('data', '')})")
+            raise RuntimeError(f"the demo account {method}: {err.get('message', err)} ({err.get('data', '')})")
         return out["result"]
 
     def _auth(self) -> str:
@@ -237,7 +237,7 @@ class BybitDemo:
         if not isinstance(out, dict) or out.get("retCode") != 0:
             msg = out.get("retMsg", out) if isinstance(out, dict) else out
             code = out.get("retCode", "") if isinstance(out, dict) else ""
-            raise RuntimeError(f"Bybit Demo Trading {path}: {msg} ({code})")
+            raise RuntimeError(f"the demo account {path}: {msg} ({code})")
         return out.get("result") or {}
 
     @staticmethod
@@ -251,12 +251,12 @@ class BybitDemo:
         symbol = sleeve.instrument.replace("/", "").upper()
         contract = BYBIT_CONTRACTS.get(symbol)
         if contract is None:
-            return None, 0.0, f"no Bybit demo perpetual set up for {sleeve.instrument}"
+            return None, 0.0, f"the demo account has no perpetual set up for {sleeve.instrument}"
         step, min_notional = contract
         qty = round(round(float(fill["qty"]) / step) * step, 8)
         if qty < step or qty * fill["price"] < min_notional:
             return symbol, 0.0, (f"{fill['qty']:.8g} ({fill['qty'] * fill['price']:,.2f} USDT) is under the smallest "
-                                 f"order Bybit takes ({step:g}, {min_notional:g} USDT)")
+                                 f"order the demo account takes ({step:g}, {min_notional:g} USDT)")
         return symbol, qty, ""
 
     def market(self, side: str, instrument: str, amount: float, label: str) -> tuple[str, float | None]:
@@ -381,7 +381,7 @@ def mirror_once(store, targets: dict) -> int:
         for f in store.fills_after(s.name, mark):
             if venue is None:
                 store.record_mirror(s.name, fill_id=f["id"], status="skipped",
-                                    message=f"no {name.title()} demo account set up")
+                                    message="the demo account isn't set up")
                 continue
             try:
                 instrument, amount, why = venue.size(s, f)
@@ -537,7 +537,7 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
                         if put_on.get(s.name):
                             store.record_mirror(s.name, fill_id=store.mirror_watermark(s.name) or 0, status="filled",
                                                 instrument=symbol, amount=-put_on[s.name], price=price,
-                                                order_id=order_id, message="closed to switch Bybit Demo to isolated "
+                                                order_id=order_id, message="closed to switch the demo account to isolated "
                                                 "margin; the catch-up reopens it at the paper leverage")
                     state = venue.margin_setup(symbol, lev)
                 except Exception as e:  # noqa: BLE001
@@ -573,8 +573,8 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float], t
     if sleeve is not None:
         groups = {sym: g for sym, g in groups.items() if any(s.name == sleeve for s in g[1])}
     if venue is None or not groups:
-        return ("nothing to resync: only a perpetual strategy copied to Bybit Demo can be resynced (the Deribit "
-                "testnet copy is sized in dollars, so it has no exact target)")
+        return ("nothing to resync: only a perpetual strategy copied to the demo account can be resynced (a copy "
+                "sized in dollars has no exact target)")
     lines = []
     for symbol, (lev, sleeves) in groups.items():
         step = BYBIT_CONTRACTS[symbol][0]
@@ -618,7 +618,7 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float], t
         if not note:
             margin[symbol] = lev
         after = f"{venue.position(symbol):+g}, {venue.margin_state(symbol)}"
-        lines.append(f"{symbol}: paper {target:+g} at {lev:g}x isolated; Bybit Demo before {before}; after {after}{note}")
+        lines.append(f"{symbol}: paper {target:+g} at {lev:g}x isolated; demo account before {before}; after {after}{note}")
     return "; ".join(lines)
 
 

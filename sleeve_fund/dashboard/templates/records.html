@@ -4,7 +4,7 @@
 {% macro tl_item(d, link=True) %}{% set k = kinds[d.kind] %}
 <li class="tl" data-kind="{{ d.kind }}"><span class="when">{{ d.ts.strftime('%H:%M') }}</span><span class="ic {{ d.kind }}" aria-hidden="true">{{ k[1] }}</span>
   <span class="what"><span class="sr-only">{{ k[0] }}: </span><strong>{{ d.action|action_words }}</strong>{% if d.sleeve %} {% if link %}<a href="/sleeves/{{ d.sleeve }}">{{ d.sleeve }}</a>{% else %}{{ d.sleeve }}{% endif %}{% endif %}
-  <span class="why">{{ d.reason }}{% if d.actor %} <span class="faint">· {{ d.actor }}</span>{% endif %}</span></span></li>
+  <span class="why">{{ d.reason|no_venues }}{% if d.actor %} <span class="faint">· {{ d.actor }}</span>{% endif %}</span></span></li>
 {% endmacro %}
 {% block content %}
 <div class="page-head rec-head">

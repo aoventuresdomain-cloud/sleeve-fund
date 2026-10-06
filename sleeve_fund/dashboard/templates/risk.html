@@ -2,7 +2,7 @@
 {% from "_macros.html" import chip, usage, help, stop_words %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
-{% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
+{% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
 {# The stop a row shows: an open position's own, as Risk to stop prices it (P1-U14); else the model's setting. #}
 {% macro live_stop_title(r) %}{% if r.stop_dist is not none %}The position's stop at {{ r.position.stop_px|px }}, {{ r.stop_dist|pct1 }} from its entry{% else %}{{ stop_words(r.x.sleeve.params) }}{% endif %}{% endmacro %}
 {% macro tone_of(status) %}{{ {'running': 'ok', 'paused': 'warn', 'starting': 'warn', 'halted': 'bad', 'error': 'bad'}.get(status, 'off') }}{% endmacro %}
@@ -34,7 +34,7 @@
     <div>
       <h2 class="rh-word" id="status-h"><span class="rh-dot" aria-hidden="true"></span>{{ status.word }}</h2>
       <p class="rh-line">{{ status.line }}</p>
-      {% if status.issues|length > 1 %}<ul class="rh-items">{% for i in status.issues[1:6] %}<li class="{{ i.level }}">{{ i.text }}</li>{% endfor %}{% if status.issues|length > 6 %}<li class="muted">and {{ status.issues|length - 6 }} more</li>{% endif %}</ul>{% endif %}
+      {% if status.issues|length > 1 %}<ul class="rh-items">{% for i in status.issues[1:6] %}<li class="{{ i.level }}">{{ i.text|no_venues }}</li>{% endfor %}{% if status.issues|length > 6 %}<li class="muted">and {{ status.issues|length - 6 }} more</li>{% endif %}</ul>{% endif %}
     </div>
     {% set h = health %}
     <div class="rh-pills">
@@ -158,7 +158,7 @@
 <section class="panel" aria-labelledby="hist-h">
   <div class="panel-head"><h2 id="hist-h">Limits that fired</h2></div>
   {% if risk.history %}
-  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message }}</span></li>{% endfor %}</ul>
+  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message|no_venues }}</span></li>{% endfor %}</ul>
   {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}
 </section>
 </div>

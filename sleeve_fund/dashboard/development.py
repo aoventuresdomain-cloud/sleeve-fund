@@ -140,7 +140,7 @@ def _num(x) -> str:
 def exits_sentence(v: dict) -> str:
     """Step 3 in one sentence: the stop, the target and the risk profile (twin: exitsSentence in research.html)."""
     if v.get("stop_atr"):
-        stop = (f"Stop {_num(v['stop_atr'])} average true ranges below entry "
+        stop = (f"Stop {_num(v['stop_atr'])} simple average true ranges below entry "
                 f"({_num(v.get('atr_bars') or 14)} bars).")
     elif v.get("stop_loss_pct"):
         stop = f"Stop {_num(v['stop_loss_pct'])}% below entry."
@@ -171,6 +171,13 @@ def history_chip(h: dict) -> dict:
     # where a later bar for a stored minute differed and was kept out.
     n, c = h.get("refills", 0), h.get("conflicts", 0)
     title = f"{n} refill{'s' if n != 1 else ''}, {c} conflict{'s' if c != 1 else ''} recorded" if n or c else ""
+    # Funding kept beside the prices: missed settlements, and possible holes where the settlement interval changed.
+    fg, fm = h.get("funding_gaps", 0), h.get("funding_maybe", 0)
+    if fg or fm:
+        funding_note = "; ".join(p for p in (f"{fg} missed funding settlement{'s' if fg != 1 else ''}" if fg else "",
+                                             f"{fm} possible funding hole{'s' if fm != 1 else ''} at an interval change"
+                                             if fm else "") if p)
+        title = f"{title}; {funding_note}" if title else funding_note
     return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
 
 
@@ -222,6 +229,34 @@ def history_badge(h: dict | None) -> dict:
 
 def _gap_words(n: int) -> str:
     return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
+
+
+# Venue names in text the PM reads (mirror reasons, alerts, the decision log), longest first so "Bybit Demo
+# Trading" goes whole. Case-sensitive on purpose: account names such as "kraken-live" and env names such as
+# BYBIT_DEMO_API_KEY are the PM's own labels and stay as they are. Only Setup, Accounts names venues (QA U8).
+_VENUE_WORDS = [
+    # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
+    (re.compile(r"(?<=\S)\.(?:BINANCE|KRAKEN|BYBIT|DERIBIT)\b"), ""),
+    (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b"), "the demo account isn't set up"),
+    (re.compile(r"\b(?:Bybit|Deribit)(?: [Dd]emo(?: Trading| account)?| [Tt]estnet)?(?:'s)?\b"), "the demo account"),
+    (re.compile(r"\bBinance(?:'s)?(?: USD-M perpetuals)?\b"), "the perpetual venue"),
+    (re.compile(r"\bKraken(?:'s)?(?: spot)?\b"), "the spot venue"),
+    (re.compile(r"\b(?:BYBIT|DERIBIT)\b(?!_)"), "the demo account"),
+    (re.compile(r"\bBINANCE\b(?!_)"), "the perpetual venue"),
+    (re.compile(r"\bKRAKEN\b(?!_)"), "the spot venue"),
+    (re.compile(r"\b(?:[Tt]he|[Aa]n?) the\b"), lambda m: "The" if m.group(0)[0].isupper() else "the"),
+]
+
+
+def no_venues(text) -> str:
+    """Text the PM reads with any venue name swapped for what it is ("the demo account", "the perpetual venue",
+    "the spot venue"). For messages stored before the wording changed, and anything a venue sends back."""
+    if not text:
+        return text
+    out = str(text)
+    for pattern, words in _VENUE_WORDS:
+        out = pattern.sub(words, out)
+    return out
 
 
 def blocked_by_gaps(pair: str, gaps: list) -> str | None:

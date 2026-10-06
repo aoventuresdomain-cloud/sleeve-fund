@@ -10,6 +10,7 @@ instrument as one JSON file in the history store's directory, topped up from the
 from __future__ import annotations
 
 import json
+import math
 import threading
 from pathlib import Path
 
@@ -56,7 +57,7 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
         start = kept[-1][0] + 1 if kept else (int(since.timestamp() * 1000) if since is not None else 0)
         for _ in range(max_pages):
             page = loader(pair, start)
-            kept.extend([t, r] for t, r in page if not kept or t > kept[-1][0])
+            kept.extend([t, r] for t, r in _usable(page, venue, pair) if not kept or t > kept[-1][0])
             if len(page) < PAGE:
                 break
             start = page[-1][0] + 1
@@ -67,6 +68,17 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
     return rates(venue, pair, root)
 
 
+def _usable(page, venue: str, pair: str) -> list:
+    """The page's settlements whose rate is a finite number. A null from the venue (the loader passes it as None)
+    is left out and said, so it is a hole gaps() reports rather than a page lost or a NaN charged (QA P1-O13)."""
+    out = [(t, r) for t, r in page if r is not None and math.isfinite(r)]
+    for t, r in page:
+        if r is None or not math.isfinite(r):
+            print(f"{venue.upper()} {pair}: funding at {pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} refused: "
+                  f"rate {r!r} is not a number")
+    return out
+
+
 def fetch(venue: str, pair: str, since: pd.Timestamp, loader=None) -> pd.Series:
     """The venue's settled rates from `since`, asked for directly and not kept (paper reads the store only)."""
     from sleeve_fund.venues import venue as venue_profile
@@ -74,7 +86,7 @@ def fetch(venue: str, pair: str, since: pd.Timestamp, loader=None) -> pd.Series:
     loader = loader or venue_profile(venue).funding_loader
     if loader is None:
         raise ValueError(f"{venue_profile(venue).label} publishes no funding rates")
-    page = loader(pair, int(since.timestamp() * 1000))
+    page = _usable(loader(pair, int(since.timestamp() * 1000)), venue, pair)
     return pd.Series([r for _, r in page], index=pd.to_datetime([t for t, _ in page], unit="ms", utc=True), dtype=float)
 
 
