@@ -311,10 +311,12 @@ def run_study(
             return None
         # The same evaluation in the trials register, with the bars it read (v2 P1-7, C4). Its id is the
         # counter line's, so folding the counter in later doesn't count it twice.
-        from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash, line_id
+        from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash, line_id, run_setup
 
+        setup = run_setup(risk_profile=risk_profile, fee=float(instrument.taker_fee) + spread_used,
+                          windows=(train_days, test_days, holdout_days))
         return register.record(
-            definition_hash=legacy_definition_hash(spec.name, full), idea_hash=legacy_idea_hash(spec.name),
+            definition_hash=legacy_definition_hash(spec.name, full, setup), idea_hash=legacy_idea_hash(spec.name),
             name=spec.name, family=spec.family, settings=full, dataset=dataset,
             stage="holdout" if stage == "holdout" else "in_sample", source="study", sharpe=sharpe,
             row_id=line_id(line), data_start=data.index[0].to_pydatetime(), data_end=data.index[-1].to_pydatetime())

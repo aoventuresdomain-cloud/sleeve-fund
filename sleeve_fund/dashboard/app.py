@@ -402,6 +402,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                                venue=to_store_kwargs(cfg)["venue"])
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
+            _count_strategy(st(), st().sleeve(name))
             if needed > cfg.warmup_bars:
                 # A warning (an alert) when the most that can load falls short; a note when it was chosen.
                 st().event(name, "warning" if auto else "info", "warmup_short",
@@ -739,6 +740,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             restart = st().change_settings(name, risk_profile=profile, params=params, warmup_bars=warmup)
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
+            _count_strategy(st(), st().sleeve(name))
             exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
             # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
             st().event(name, "info", "exits_change" if exits_changed else "settings_change",
@@ -835,7 +837,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                       "plans": {c["name"]: {"values": c["values"], "variants": c["variants"]} for c in cards},
                       "venues": {v["key"]: {k: v[k] for k in ("label", "perpetual", "fee", "suggest", "held")}
                                  for v in venues}}
-        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=ledger.counts(), rows=rows, cards=cards,
+        # The trials register's counts, which include single backtests and paper strategies (QA P1-T1).
+        return page(request, "research.html", sheets=sheets, study_data=study_data, counts=TrialsRegister(st()).counts(), rows=rows, cards=cards,
                     chosen=chosen, values=values, venues=venues, on_venue=here, stored_all=stored_all,
                     stages=pipeline.STAGES, job=job, error=error, notice=notice,
                     tab=tab, msg_in=tab or "development", request_years=REQUEST_YEARS, spent_holdouts=spent, fit_text=fit_text,
@@ -1449,10 +1452,43 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
+    _count_backtest(store, args, result, run_id)
     store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
                         bar_spec=args["bar_spec"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
+
+def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None:
+    """Every backtest is a variant tried: the trials register counts it, so a setting picked from many runs is
+    judged against all of them (QA P1-T1). It read every bar from its first day to its last."""
+    import pandas as pd
+
+    from sleeve_fund.research.run import dataset_name
+    from sleeve_fund.research.trials import record_model_run, run_setup
+
+    start = pd.Timestamp(result["from"], tz="UTC")
+    end = pd.Timestamp(result["to"], tz="UTC") + pd.Timedelta(days=1)
+    fees = result.get("fee_schedule") or {}
+    setup = run_setup(risk_profile=args["risk_profile"],
+                      fee=float(fees.get("taker", 0.0)) + float((result.get("spread") or {}).get("half", 0.0)))
+    record_model_run(store, strategy=args["strategy"], params=args["params"], setup=setup,
+                     dataset=dataset_name(_venue_name(args["venue"]), args["pair"], args["minutes"]), source="backtest",
+                     sharpe=result["strategy"]["sharpe"], data_start=start, data_end=end, backtest_id=run_id,
+                     trades=(result.get("trades") or {}).get("trades"))
+
+
+def _count_strategy(store: Store, s) -> None:
+    """A paper strategy created, cloned or re-set is a variant chosen to run: counted, with no Sharpe yet."""
+    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.research.run import dataset_name
+    from sleeve_fund.research.trials import record_model_run, run_setup
+
+    cfg = from_store(s)
+    fee = float(cfg.fees.taker) + resolve_spread(cfg.venue, cfg.instrument, store).half_spread
+    record_model_run(store, strategy=s.strategy, params=s.params, source="strategy",
+                     setup=run_setup(risk_profile=s.risk_profile, fee=fee),
+                     dataset=dataset_name(_venue_name(s.venue), s.instrument, spec_minutes(s.bar_spec)))
+
 
 LOST_JOB = ("that run is no longer known, most likely because the server restarted while it ran; "
             "run it again (review round 10, m9)")

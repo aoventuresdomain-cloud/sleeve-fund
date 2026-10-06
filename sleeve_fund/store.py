@@ -444,7 +444,10 @@ HOLDOUT_SOURCES = ("study", "ledger_import")
 HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
-TRIAL_SOURCES = ("study", "backtest", "optimiser", "ledger_import")
+# "strategy": a paper strategy created, cloned or re-set: a variant chosen to run, counted though it has no
+# Sharpe yet (QA P1-T1). "engineering": a run deliberately marked as a fixture, the only kind not counted, and
+# never the default (Advisor, 6 Oct 2026).
+TRIAL_SOURCES = ("study", "backtest", "strategy", "optimiser", "engineering", "ledger_import")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -1456,6 +1459,20 @@ class Store:
             sharpe = r.get("sharpe")
             if sharpe is not None and not math.isfinite(sharpe):
                 raise ValueError("a trial's Sharpe is a finite number or None, never NaN or infinite")
+        try:
+            return self._insert_trials(rows)
+        except IntegrityError:
+            # Another process added some of the same rows between the check and the insert (two start-ups
+            # importing the idea counter at once, QA m3): add the rest one at a time, skipping those it has.
+            added = 0
+            for r in rows:
+                try:
+                    added += self._insert_trials([r])
+                except IntegrityError:
+                    pass
+            return added
+
+    def _insert_trials(self, rows: list[dict]) -> int:
         with self.engine.begin() as c:
             have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
             new = [{**r, "created_at": r.get("created_at") or utcnow(), "data_start": r.get("data_start"),

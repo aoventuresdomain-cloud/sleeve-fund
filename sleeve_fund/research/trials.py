@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -59,29 +59,50 @@ class TrialsRegister:
             "definition_name": name, "family": family, "settings": json.dumps(settings, sort_keys=True),
             "dataset": dataset, "stage": stage, "source": source, "sharpe": _finite(sharpe), "trades": trades,
             "oos_trades": oos_trades, "backtest_id": backtest_id, "data_start": data_start, "data_end": data_end,
+            # To the microsecond, so a variant's latest evaluation is known even within a second (sharpes()).
+            "created_at": datetime.now(timezone.utc),
         }])
         return row_id
 
-    def _counted(self) -> list[dict]:
-        return [t for t in self.store.trials() if t["family"] != "benchmark"]
+    def _counted(self, idea_hash: str | None = None) -> list[dict]:
+        """Every evaluation that counts: not benchmarks, and not runs deliberately marked as engineering
+        (fixtures), which nothing marks by default (Advisor, 6 Oct 2026)."""
+        return [t for t in self.store.trials(idea_hash) if t["family"] != "benchmark" and t["source"] != "engineering"]
 
-    def counts(self) -> dict:
-        """ideas: distinct ideas; variants: distinct (definition, indicator code, dataset); evaluations: rows."""
-        rows = self._counted()
+    def counts(self, idea_hash: str | None = None) -> dict:
+        """ideas: distinct ideas; variants: distinct (definition, indicator code, dataset); evaluations: rows.
+        With idea_hash, one idea family's: everything tried under that core idea, across settings, instruments,
+        timeframes and registrations. That is the N a result is judged by; the project-wide total, without
+        idea_hash, is shown for awareness and never gates (Advisor, 6 Oct 2026)."""
+        rows = self._counted(idea_hash)
         return {
             "ideas": len({t["idea_hash"] for t in rows}),
-            "variants": len({(t["definition_hash"], t["code_version"], t["dataset"]) for t in rows}),
+            "variants": len({_variant(t) for t in rows}),
             "evaluations": len(rows),
         }
 
-    def sharpes(self) -> list[float]:
-        return [t["sharpe"] for t in self._counted() if t["sharpe"] is not None]
+    def ideas_by_family(self) -> dict[str, int]:
+        """How many ideas each family (trend, breakout...) holds, project-wide."""
+        by_family: dict[str, set] = {}
+        for t in self._counted():
+            by_family.setdefault(t["family"], set()).add(t["idea_hash"])
+        return {k: len(v) for k, v in sorted(by_family.items())}
 
-    def deflated_sharpe(self, returns: pd.Series) -> float:
-        """Probability the result's true Sharpe beats the best of every variant tried so far by luck: the deflated
-        Sharpe ratio (Bailey and Lopez de Prado), with this register's variant count. The spread of trial Sharpes
-        is the no-skill sampling error, as the tear sheet uses, so fee-destroyed variants don't distort it."""
-        return deflated_sharpe_probability(returns, max(self.counts()["variants"], 1))
+    def sharpes(self, idea_hash: str | None = None) -> list[float]:
+        """One Sharpe per variant: its latest evaluation's (Advisor, 6 Oct 2026), so a variant re-run many times
+        doesn't weigh more in the spread than one run once."""
+        latest: dict[tuple, dict] = {}
+        for t in self._counted(idea_hash):
+            if t["sharpe"] is not None:
+                latest[_variant(t)] = t  # trials() is oldest first
+        return [t["sharpe"] for t in latest.values()]
+
+    def deflated_sharpe(self, returns: pd.Series, idea_hash: str) -> float:
+        """Probability the result's true Sharpe beats the best of every variant of its idea tried so far by luck:
+        the deflated Sharpe ratio (Bailey and Lopez de Prado). N is the idea family's variant count; the spread is
+        that family's trial Sharpes, one per variant, floored at the no-skill error 1/sqrt(T). The tear sheet and
+        the Research page read this one number (QA P1-T2)."""
+        return deflated_sharpe_probability(returns, max(self.counts(idea_hash)["variants"], 1), self.sharpes(idea_hash))
 
     def import_ledger(self, path: str | Path) -> int:
         """Fold the JSONL idea counter into the register. Each line gets an id from a hash of the line itself,
@@ -109,6 +130,29 @@ class TrialsRegister:
         return self.store.add_trials(rows)
 
 
+def record_model_run(store: Store, *, strategy: str, params: dict, dataset: str, source: str, setup: dict,
+                     sharpe: float | None = None, data_start=None, data_end=None, backtest_id: str | None = None,
+                     trades: int | None = None) -> str:
+    """Count one run of a hand-coded model outside a study: a backtest, or a paper strategy created, cloned or
+    re-set (QA P1-T1). Each is a variant tried, so the deflated Sharpe's N counts it. The whole run reads every
+    bar it was given, so it is in-sample."""
+    try:
+        from sleeve_fund.research.run import spec_of
+
+        family = spec_of(strategy).family
+    except ValueError:
+        family = "unknown"
+    return TrialsRegister(store).record(
+        definition_hash=legacy_definition_hash(strategy, params, setup), idea_hash=legacy_idea_hash(strategy),
+        name=strategy,
+        family=family, settings=params, dataset=dataset, stage="in_sample", source=source, sharpe=sharpe,
+        trades=trades, backtest_id=backtest_id, data_start=data_start, data_end=data_end)
+
+
+def _variant(t: dict) -> tuple:
+    return t["definition_hash"], t["code_version"], t["dataset"]
+
+
 def line_id(line: str) -> str:
     """A trial id from an idea-counter line, so the same evaluation is one row however it arrives."""
     return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
@@ -119,8 +163,19 @@ def legacy_idea_hash(idea: str) -> str:
     return content_hash({"idea": idea})
 
 
-def legacy_definition_hash(idea: str, params: dict) -> str:
-    return content_hash({"idea": idea, "params": params})
+def legacy_definition_hash(idea: str, params: dict, setup: dict | None = None) -> str:
+    """A hand-coded model's variant. setup holds what else someone could choose to make a result look better:
+    the risk profile (and so the sizing), the walk-forward windows and the fee assumed when choosing (Advisor,
+    6 Oct 2026). Fee-ladder rungs are not part of it. Counter lines imported from before it kept none."""
+    return content_hash({"idea": idea, "params": params} if setup is None else
+                        {"idea": idea, "params": params, "setup": setup})
+
+
+def run_setup(*, risk_profile: str | None, fee: float, windows: tuple[int, int, int] | None = None) -> dict:
+    """The setup part of a variant's key: risk profile, walk-forward windows (train, test, holdout days; None
+    for a single run over all the bars) and the fee per side assumed when choosing, rounded to a basis point
+    hundredth so a float's last digit doesn't make a new variant."""
+    return {"risk_profile": risk_profile, "windows": list(windows) if windows else None, "fee": round(fee, 6)}
 
 
 def _finite(x) -> float | None:

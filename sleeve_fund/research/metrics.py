@@ -262,19 +262,18 @@ def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
 def deflated_sharpe_probability(returns: pd.Series, n_trials: int, trial_sharpes: list[float] | None = None) -> float:
     """Probability the true Sharpe beats the best-of-n luck hurdle (daily units internally).
 
-    With trial_sharpes None, the spread of trial Sharpes is the no-skill sampling error 1/sqrt(T).
-    Use that when the tried variants include fee-destroyed ones (Sharpe -10 and worse), whose
-    spread would make any hurdle absurd; the lab found this in its first round."""
+    The expected best of n_trials is spread by the trial Sharpes given (one per variant, annualised as the
+    result is), floored at the no-skill sampling error 1/sqrt(T): whichever is larger (Independent Quant
+    Advisor, 6 Oct 2026). With trial_sharpes None, the floor alone."""
     r = returns.dropna()
     n = len(r)
     if n < 30 or r.std(ddof=1) == 0:
         return float("nan")
     sr = r.mean() / r.std(ddof=1)
-    if trial_sharpes is None:
-        sr_std = 1 / math.sqrt(n - 1)
-    else:
+    sr_std = 1 / math.sqrt(n - 1)
+    if trial_sharpes is not None and len(trial_sharpes) > 1:
         daily_trials = np.asarray(trial_sharpes, dtype=float) / math.sqrt(PERIODS_PER_YEAR)
-        sr_std = float(daily_trials.std(ddof=1)) if len(daily_trials) > 1 else 0.0
+        sr_std = max(sr_std, float(daily_trials.std(ddof=1)))
     hurdle = expected_max_sharpe(n_trials, sr_std)
     skew = float(r.skew())
     kurt = float(r.kurt()) + 3

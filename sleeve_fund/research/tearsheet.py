@@ -69,13 +69,27 @@ def _row(label: str, s: dict, b: dict) -> str:
     )
 
 
-def g1_checks(r: StudyResult, ledger: IdeaLedger) -> list[tuple[str, str, str]]:
+def _idea(r: StudyResult) -> str:
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    return legacy_idea_hash(r.spec.name)
+
+
+def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
+    """The counts a result is judged by: with the trials register, its idea family's (Advisor, 6 Oct 2026);
+    without one, the idea counter's, as before."""
+    return register.counts(_idea(r)) if register is not None else ledger.counts()
+
+
+def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
+    """register: the trials register, when the study ran against the database. Its count of variants, which
+    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
     oos = summary(r.oos_returns)
     bench = summary(r.oos_benchmark_returns)
     bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = r.oos_trades
-    counts = ledger.counts()
+    counts = _counts(r, ledger, register)
     beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
     unjudged = math.isnan(beats)
     if unjudged:
@@ -181,15 +195,17 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = summary(r.oos_benchmark_returns)
     full = summary(daily_returns(r.full_period.equity))
     full_b = summary(daily_returns(r.full_period_benchmark.equity))
-    counts = ledger.counts()
-    trial_sharpes = ledger.sharpes()
-    dsr = deflated_sharpe_probability(r.oos_returns, counts["variants"], trial_sharpes)
+    counts = _counts(r, ledger, register)
+    project = ({**register.counts(), "ideas_by_family": register.ideas_by_family()} if register is not None else
+               counts)
+    dsr = (register.deflated_sharpe(r.oos_returns, _idea(r)) if register is not None else
+           deflated_sharpe_probability(r.oos_returns, counts["variants"], ledger.sharpes()))
     years_full = years_covered(r.full_period.equity)
     fee_drag = r.full_period.fees_paid / r.full_period.equity.mean() / years_full
     ts = r.trade_stats
@@ -230,7 +246,7 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
-    checks = g1_checks(r, ledger)
+    checks = g1_checks(r, ledger, register)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
@@ -324,9 +340,13 @@ def render(r: StudyResult, ledger: IdeaLedger) -> str:
     out.append("")
     out.append("## Idea counter")
     out.append("")
-    out.append(f"- {_n(counts['ideas'], 'idea')} and {_n(counts['variants'], 'distinct variant')} tested so far "
-               f"({counts['evaluations']} evaluations including walk-forward refits). By family: "
-               + ", ".join(f"{k} {v}" for k, v in counts["ideas_by_family"].items()))
+    if register is not None:
+        out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
+                   f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
+                   "results are judged by.")
+    out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
+               f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
+               + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
     if math.isnan(dsr):
         out.append("- Deflated Sharpe: can't be computed here: out-of-sample needs at least 30 days whose returns "
                    "vary, and " + ("these test windows never traded." if r.oos_trades == 0 else

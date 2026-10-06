@@ -51,7 +51,7 @@ def test_counts_variants_ideas_and_evaluations(reg):
     _trial(reg, definition="d3", idea="i2")
     _trial(reg, definition="bh", idea="bh", family="benchmark")  # benchmarks are never counted
     assert reg.counts() == {"ideas": 2, "variants": 4, "evaluations": 5}
-    assert sorted(reg.sharpes()) == [0.5] * 5
+    assert sorted(reg.sharpes()) == [0.5] * 4  # one per variant, its latest (Advisor, 6 Oct 2026, P1-T2)
 
 
 def test_changed_indicator_code_is_a_new_variant(reg, monkeypatch):
@@ -102,11 +102,11 @@ def test_deflated_sharpe_uses_the_register_count_and_falls_as_variants_grow(reg)
     rng = np.random.default_rng(3)
     returns = pd.Series(rng.normal(0.001, 0.01, 400))
     _trial(reg)
-    one = reg.deflated_sharpe(returns)
+    one = reg.deflated_sharpe(returns, content_hash("i1"))
     assert one == pytest.approx(deflated_sharpe_probability(returns, 1))
     for i in range(50):
         _trial(reg, definition=f"v{i}")
-    many = reg.deflated_sharpe(returns)
+    many = reg.deflated_sharpe(returns, content_hash("i1"))
     assert many == pytest.approx(deflated_sharpe_probability(returns, 51))
     assert many < one
 
