@@ -385,3 +385,34 @@ def test_a_failed_count_leaves_g1_not_judged_and_the_holdout_closed(tmp_path, in
     assert result.holdout is None and "G1 can't judge this study (N uncertain" in result.holdout_withheld
     assert not store.holdout_locks()
     assert "**G1: NOT JUDGED** (N uncertain" in render(result, ledger, register)
+
+
+def test_a_failed_count_then_a_good_one_is_one_variant(tmp_path, monkeypatch):
+    """Data Architect, QA P1-T8: a failed row carries its variant's real key, so the retry that counts joins it
+    rather than adding a variant, and the same failing run retried stays one variant too."""
+    from sleeve_fund.dashboard import app as appmod
+    from sleeve_fund.research import trials as trialsmod
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    store = _store(tmp_path)
+    args = {"strategy": "trend_filter", "pair": "BTC/USD", "venue": "kraken", "params": {"fast": 50, "slow": 200},
+            "minutes": 1440, "risk_profile": "balanced", "days": 365, "title": "t"}
+    result = {"from": "2024-01-01", "to": "2025-01-01", "fee_schedule": {"taker": 0.004}, "spread": {"half": 0.0001},
+              "strategy": {"sharpe": 1.0}, "trades": {"trades": 10}}
+    idea, register = legacy_idea_hash("trend_filter"), trialsmod.TrialsRegister(store)
+
+    def count(*a):
+        appmod._counted(store, None, "backtest 't'", appmod._count_backtest, appmod._backtest_run, store, args,
+                        result, "r1", source="backtest", strategy="trend_filter", params=args["params"])
+
+    good = trialsmod.TrialsRegister.record
+    monkeypatch.setattr(trialsmod.TrialsRegister, "record", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    count()
+    count()  # the same run failing again
+    assert register.failed(idea) == 2 and register.counts(idea)["variants"] == 1
+    monkeypatch.setattr(trialsmod.TrialsRegister, "record", good)
+    count()
+    rows = store.trials(idea)
+    assert [r["status"] for r in rows].count("ok") == 1 and register.counts(idea)["variants"] == 1
+    assert len({(r["definition_hash"], r["dataset"]) for r in rows}) == 1  # the failures join their twin
+    assert {r["backtest_id"] for r in rows} == {"r1"}

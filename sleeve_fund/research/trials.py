@@ -89,24 +89,29 @@ class TrialsRegister:
         says how far that count rests on rows with no result."""
         return sum(1 for t in self._counted(idea_hash) if t["status"] == "failed")
 
-    def record_failed(self, *, strategy: str, params: dict, source: str, error: str) -> str:
+    def record_failed(self, *, strategy: str, params: dict, source: str, error: str, setup: dict | None = None,
+                      dataset: str | None = None, backtest_id: str | None = None) -> str:
         """Record, against its idea, a run whose count failed (QA P1-T8): its own source, its settings and the
         error. It has no Sharpe, trades or dates, so it counts as a variant tried and a holdout treats the idea as
-        having read undated data: the safe side on both. Each failure is its own variant, never merged with
-        another, as its full definition could not be worked out."""
+        having read undated data: the safe side on both. With the run's setup and dataset it is keyed as its
+        variant, so a retry that counts joins it rather than adding one (Data Architect); without them, by its
+        strategy and settings alone, so the same failing run retried is still one variant."""
         try:
             from sleeve_fund.research.run import spec_of
 
             family = spec_of(strategy).family
         except ValueError:
             family = "unknown"
+        definition = (legacy_definition_hash(strategy, params, setup) if setup is not None else
+                      content_hash({"unkeyed": strategy, "params": params}))
         row_id = secrets.token_hex(8)
         self.store.add_trials([{
-            "id": row_id, "definition_hash": content_hash({"failed": row_id}), "idea_hash": legacy_idea_hash(strategy),
+            "id": row_id, "definition_hash": definition, "idea_hash": legacy_idea_hash(strategy),
             "code_version": code_version(), "definition_name": strategy, "family": family,
-            "settings": json.dumps({"params": params}, sort_keys=True), "dataset": "unknown", "stage": "in_sample",
-            "source": source, "sharpe": None, "trades": None, "oos_trades": None, "backtest_id": None,
-            "status": "failed", "error": error, "created_at": datetime.now(timezone.utc),
+            "settings": json.dumps({"params": params}, sort_keys=True), "dataset": dataset or "unknown",
+            "stage": "in_sample", "source": source, "sharpe": None, "trades": None, "oos_trades": None,
+            "backtest_id": backtest_id, "status": "failed", "error": error,
+            "created_at": datetime.now(timezone.utc),
         }])
         return row_id
 

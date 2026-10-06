@@ -413,7 +413,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
             made = st().sleeve(name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, st(), made, source="strategy",
+            _counted(st(), name, f"strategy {name}", _count_strategy, _strategy_run, st(), made, source="strategy",
                      strategy=made.strategy, params=made.params)
             if needed > cfg.warmup_bars:
                 # A warning (an alert) when the most that can load falls short; a note when it was chosen.
@@ -755,7 +755,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             text = "; ".join(changes)
             st().decide(actor, "change_settings", f"{text}. {reason}", name)
             made = st().sleeve(name)
-            _counted(st(), name, f"strategy {name}", _count_strategy, st(), made, source="strategy",
+            _counted(st(), name, f"strategy {name}", _count_strategy, _strategy_run, st(), made, source="strategy",
                      strategy=made.strategy, params=made.params)
             exits_changed = any(c.startswith(("Stop-loss", "Take-profit")) for c in changes)
             # The strategy reads "exits_change" on restart: an open position takes the new stop and target.
@@ -1473,24 +1473,32 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     store.save_backtest(keep["journal"], run_id=run_id, key=key, title=args["title"], query=query, result=result,
                         bar_spec=args["bar_spec"])
-    _counted(store, None, f"backtest {args['title']!r}", _count_backtest, store, args, result, run_id,
+    _counted(store, None, f"backtest {args['title']!r}", _count_backtest, _backtest_run, store, args, result, run_id,
              source="backtest", strategy=args["strategy"], params=args["params"])
     store.prune_backtests(keep=BACKTEST_KEEP)
     return run_id
 
 
-def _counted(store: Store, sleeve: str | None, what: str, count, *args, source: str, strategy: str,
+def _counted(store: Store, sleeve: str | None, what: str, count, run, *args, source: str, strategy: str,
              params: dict) -> None:
     """Count a run in the trials register without letting a failure undo or fail the work being counted: the
     backtest is already saved, the strategy already created (Code Reviewer, #154). The run is then recorded
     against its idea as a failed row, which still counts as a variant tried, so the idea's count never goes
-    silently low (QA P1-T8); an error event shows the gap on the dashboard."""
+    silently low (QA P1-T8); an error event shows the gap on the dashboard. run(*args) gives the run's variant
+    and dataset, so the failed row joins its variant (Data Architect); the strategy, params and source stand in
+    when even that fails."""
     try:
         count(*args)
     except Exception as exc:  # noqa: BLE001 - any failure here must not reach the caller
         logging.getLogger(__name__).exception(f"couldn't count {what} in the trials register")
         try:
-            TrialsRegister(store).record_failed(strategy=strategy, params=params, source=source, error=repr(exc))
+            try:
+                key = run(*args)
+            except Exception:  # noqa: BLE001 - the variant can't be worked out: recorded by its settings alone
+                key = {"strategy": strategy, "params": params, "source": source}
+            TrialsRegister(store).record_failed(
+                strategy=key["strategy"], params=key["params"], source=key["source"], error=repr(exc),
+                setup=key.get("setup"), dataset=key.get("dataset"), backtest_id=key.get("backtest_id"))
             kept = "it is recorded against its idea as a failed run, which still counts as a variant tried"
         except Exception as again:  # noqa: BLE001
             logging.getLogger(__name__).exception(f"couldn't record {what} as a failed run either")
@@ -1500,11 +1508,18 @@ def _counted(store: Store, sleeve: str | None, what: str, count, *args, source: 
 
 def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None:
     """Every backtest is a variant tried: the trials register counts it, so a setting picked from many runs is
-    judged against all of them (QA P1-T1). It read every bar from its first day to its last."""
+    judged against all of them (QA P1-T1)."""
+    from sleeve_fund.research.trials import record_model_run
+
+    record_model_run(store, **_backtest_run(store, args, result, run_id))
+
+
+def _backtest_run(store: Store, args: dict, result: dict, run_id: str) -> dict:
+    """A backtest as the register keys it: its variant, its dataset, and every bar from its first day to its last."""
     import pandas as pd
 
     from sleeve_fund.research.run import dataset_name
-    from sleeve_fund.research.trials import backtest_period, record_model_run, run_setup
+    from sleeve_fund.research.trials import backtest_period, run_setup
 
     start = pd.Timestamp(result["from"], tz="UTC")
     end = pd.Timestamp(result["to"], tz="UTC") + pd.Timedelta(days=1)
@@ -1512,23 +1527,30 @@ def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None
     setup = run_setup(risk_profile=args["risk_profile"],
                       fee=float(fees.get("taker", 0.0)) + float((result.get("spread") or {}).get("half", 0.0)),
                       period=backtest_period(args.get("days")))
-    record_model_run(store, strategy=args["strategy"], params=args["params"], setup=setup,
-                     dataset=dataset_name(_venue_name(args["venue"]), args["pair"], args["minutes"]), source="backtest",
-                     sharpe=result["strategy"]["sharpe"], data_start=start, data_end=end, backtest_id=run_id,
-                     trades=(result.get("trades") or {}).get("trades"))
+    return dict(strategy=args["strategy"], params=args["params"], setup=setup,
+                dataset=dataset_name(_venue_name(args["venue"]), args["pair"], args["minutes"]), source="backtest",
+                sharpe=result["strategy"]["sharpe"], data_start=start, data_end=end, backtest_id=run_id,
+                trades=(result.get("trades") or {}).get("trades"))
 
 
 def _count_strategy(store: Store, s) -> None:
     """A paper strategy created, cloned or re-set is a variant chosen to run: counted, with no Sharpe yet."""
+    from sleeve_fund.research.trials import record_model_run
+
+    record_model_run(store, **_strategy_run(store, s))
+
+
+def _strategy_run(store: Store, s) -> dict:
+    """A paper strategy as the register keys it: its variant and its dataset."""
     from sleeve_fund.paper.config import from_store
     from sleeve_fund.research.run import dataset_name
-    from sleeve_fund.research.trials import record_model_run, run_setup
+    from sleeve_fund.research.trials import run_setup
 
     cfg = from_store(s)
     fee = float(cfg.fees.taker) + resolve_spread(cfg.venue, cfg.instrument, store).half_spread
-    record_model_run(store, strategy=s.strategy, params=s.params, source="strategy",
-                     setup=run_setup(risk_profile=s.risk_profile, fee=fee),
-                     dataset=dataset_name(_venue_name(s.venue), s.instrument, spec_minutes(s.bar_spec)))
+    return dict(strategy=s.strategy, params=s.params, source="strategy",
+                setup=run_setup(risk_profile=s.risk_profile, fee=fee),
+                dataset=dataset_name(_venue_name(s.venue), s.instrument, spec_minutes(s.bar_spec)))
 
 
 LOST_JOB = ("that run is no longer known, most likely because the server restarted while it ran; "
