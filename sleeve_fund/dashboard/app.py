@@ -1870,6 +1870,8 @@ def _strategy_choices() -> list[dict]:
     out = []
     for name in sorted(REGISTRY):
         spec = importlib.import_module(f"sleeve_fund.strategies.{name}").SPEC
+        if not spec.listed:
+            continue
         out.append({"name": name, "idea": _idea(name), "params": spec.default_params, "family": spec.family,
                     "tpl": spec.summary, "defaults": _config_defaults(name)})
     return out

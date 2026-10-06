@@ -1,0 +1,33 @@
+# RSI pullback, rebuilt as a definition (v2 P1-5): the hand-coded rsi_pullback model with its default settings.
+# Its trailing stop is checked on the close, as the model does: out when the close falls below the highest close
+# since the entry less 3 x the simple-average ATR(14).
+version = 1
+name = "rsi-pullback"
+reason = """Buy an oversold dip (RSI(14) below 30) only while price is above its 200-candle EMA and volume spikes
+to 1.5 x its 20-candle average, so the dip is inside an uptrend and has sellers exhausting; give it room with a
+3 ATR trailing stop."""
+
+[blocks.rsi]
+kind = "rsi"
+period = 14
+
+[blocks.ema]
+kind = "ema"
+period = 200
+
+[blocks.vol]
+kind = "sma"
+period = 20
+input = "volume"
+
+[blocks.atr]
+kind = "atr_sma"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "rsi", op = "<", right = 30 },
+    { left = "close", op = ">", right = "ema" },
+    { left = "volume", op = ">", right = { mul = [1.5, { prev = "vol" }] } },
+] }
+exit = { left = "close", op = "<", right = { sub = [{ max_since_entry = "close" }, { mul = [3.0, "atr"] }] } }

@@ -62,6 +62,9 @@ class IdeaSpec:
     known_weaknesses: str = ""
     # One sentence with {param} placeholders, filled from a sleeve's own settings for display.
     summary: str = ""
+    # False keeps a model off the dashboard's pickers and the Development tab: the rule builder needs a
+    # definition, and until the form can pick one a bare entry would only start a strategy that refuses to run.
+    listed: bool = True
 
 
 _OPS = {"<=": lambda v, t: v <= t, ">=": lambda v, t: v >= t, "<": lambda v, t: v < t, ">": lambda v, t: v > t}
@@ -529,6 +532,12 @@ class LongFlatStrategy(Strategy):
         self._signals_bar = -1
         self._signals_on = True
         self._signals_warned = False
+        # Backtest (set by the runner): decision bars fed before the window, without trading, as paper's history
+        # warm-up is; and the warm-up the model says its indicators need to settle (warmup_needed), so a decision
+        # taken on fewer bars is flagged "unsettled" (Independent Quant Advisor, 6 Oct, 5.1).
+        self.preload: list | None = None
+        self.settle_bars_needed: int | None = None
+        self._decision_bars = 0
         for name in REPORTED_HANDLERS:
             setattr(self, name, self._reporting(name, getattr(self, name)))
 
@@ -605,6 +614,9 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None and not self.runtime.backtest:  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
         self._plan_resume()
+        if self.preload:
+            preload, self.preload = self.preload, None
+            self.on_historical_bars(preload)
         if self._slower and self.history_loader is not None:
             self._warm_slower()  # before the decision bars, which then complete the slower candle forming now
         if self._cfg.warmup_bars:
@@ -732,6 +744,7 @@ class LongFlatStrategy(Strategy):
         if bar.ts_event <= self._last_bar_ts:
             return False
         self._last_bar_ts = bar.ts_event
+        self._decision_bars += 1
         self._volumes.append(bar.volume.as_double() / self._cfg.volume_scale)
         if self._atr is not None:
             self._atr.update_raw(bar.high.as_double(), bar.low.as_double(), bar.close.as_double())
@@ -1753,6 +1766,12 @@ class LongFlatStrategy(Strategy):
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        if self._unsettled():
+            # Decided before the model's indicators could have settled: kept as the model trades it, and flagged.
+            self.decisions[coid]["unsettled"] = signal["unsettled"] = True
+        if intent == "entry" and signal.get("breakout_slippage_bp") and self._backtest and self.fee_model is not None:
+            # A backtest's fills are at the candle's price; a breakout entry pays this much more (P1-5, board 9b B3).
+            self.fee_model.slippage[coid] = Decimal(str(signal["breakout_slippage_bp"])) / 10_000
         bar_close, bar_recv = self._deciding or (None, None)
         if self.runtime is not None:
             # A decision on a bar is timed from its order's own journal row (a risk stop or restore is not).
@@ -1775,6 +1794,11 @@ class LongFlatStrategy(Strategy):
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
+
+    def _unsettled(self) -> bool:
+        """Whether a decision now comes before the warm-up the model's indicators need (settle_bars_needed): today's
+        hand-coded models trade once an indicator is `initialized`, which can be before it has settled."""
+        return self.settle_bars_needed is not None and self._decision_bars < self.settle_bars_needed
 
     def _maker_price(self, side, last: float, tick: float) -> float:
         """Where a post-only order rests: at the best bid (to buy) or ask (to sell), so it adds liquidity
@@ -2780,7 +2804,8 @@ class LongFlatStrategy(Strategy):
         gaps through it; a target fills at its level, never better, never worse."""
         cfg = self._cfg
         plan = {"stop_loss": self._stop_frac, "take_profit": self._tp_frac}
-        if not any(plan.values()) or self._entry_px is None:
+        # A stop moved from the market can sit at the entry price (0) or past it, in profit (below 0).
+        if (plan["stop_loss"] is None and not plan["take_profit"]) or self._entry_px is None:
             return
         if self.runtime is not None and self.runtime.status != "running":
             return  # halted, paused or flattening: nothing new rests (review round 11, B11-3)
@@ -2801,7 +2826,8 @@ class LongFlatStrategy(Strategy):
         if qty < self._min_qty():
             return
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
-        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit") if plan[k]}
+        ids = {k: self.order_factory.generate_client_order_id() for k in ("stop_loss", "take_profit")
+               if plan[k] is not None and (k == "stop_loss" or plan[k])}
         both = len(ids) == 2
         side = self._entry_side or 1
         exit_side, exit_word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
@@ -2812,15 +2838,15 @@ class LongFlatStrategy(Strategy):
 
         orders = []
         now = self.clock.timestamp_ns()
-        if plan["stop_loss"]:
+        if plan["stop_loss"] is not None:
             stop = plan["stop_loss"]
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, ids["stop_loss"], exit_side, quantity,
                 Price(level, self.instrument.price_precision), TriggerType.DEFAULT, TimeInForce.GTC, self._margin, False,
                 UUID4(), now, **link("stop_loss")), "stop_loss", "STOP",
-                f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
-                f"{self._entry_px:,.6g} entry"
+                f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
+                f"the {self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through",
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
@@ -2865,7 +2891,7 @@ class LongFlatStrategy(Strategy):
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         for intent, order in resting.items():
             frac = plan.get(intent)
-            if not frac:
+            if frac is None or (intent == "take_profit" and not frac):
                 continue
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 self._resize_due = True  # in flight or mid-resize: resized again once the venue answers

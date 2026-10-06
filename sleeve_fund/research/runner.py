@@ -6,6 +6,7 @@ so the benchmark and the strategy are measured identically.
 
 from __future__ import annotations
 
+import importlib
 import math
 
 from dataclasses import dataclass, field
@@ -48,6 +49,9 @@ class BacktestResult:
     funding: list = field(default_factory=list)
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
+    # Filled orders decided before the model's indicators had settled (its warmup_needed), each flagged
+    # "unsettled" in its decision; kept as the model trades them (Independent Quant Advisor, 6 Oct, 5.1).
+    unsettled_fills: int = 0
 
     @property
     def shorts(self) -> bool:
@@ -91,6 +95,7 @@ def run_backtest(
     half_spread: float | None = None,
     progress=None,
     fees: FeeSchedule | None = None,
+    warmup_prices: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -112,7 +117,10 @@ def run_backtest(
     progress: with a risk profile, called with the simulated time at every bar, to report how far a
     long run has got.
 
-    fees: charge this schedule instead of the market's or the instrument's (the cost ladder)."""
+    fees: charge this schedule instead of the market's or the instrument's (the cost ladder).
+
+    warmup_prices: bars of `bar_minutes` before `prices`, fed to the strategy first without trading, as a paper
+    strategy's warm-up from the history store is, so the window opens on settled indicators."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -189,6 +197,16 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
+        strategy.fee_model = fee_model
+        # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
+        spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
+        strategy.settle_bars_needed = strategy_cls.warmup_needed(
+            {**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
+        if warmup_prices is not None and not warmup_prices.empty:
+            if warmup_prices.index[-1] >= prices.index[0]:
+                raise ValueError("warmup_prices must end before the backtest's first bar")
+            strategy.preload = list(to_bars(_book_volume(warmup_prices, instrument), instrument,
+                                            bar_type_for(instrument, bar_minutes)))
         engine.add_strategy(strategy)
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
@@ -223,6 +241,8 @@ def run_backtest(
             funding=[{"ts": ts, "amount": a} for ts, a in strategy.funding_log],
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
+            unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
+                                if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
         )
     finally:

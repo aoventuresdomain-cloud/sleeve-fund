@@ -172,6 +172,9 @@ class ScheduleFeeModel(FeeModel):
         # Paper on a perp: the order that puts a position carried over a restart back at the simulated
         # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
         self.free_orders: set[str] = set()
+        # Backtests only: extra slippage on an order, as a share of its price, by client order id (a rule-builder
+        # entry on a breakout candle, LongFlatStrategy._submit). Charged and reported as the half spread is.
+        self.slippage: dict[str, Decimal] = {}
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -199,9 +202,10 @@ class ScheduleFeeModel(FeeModel):
             shift = qty * (limit - fill_px.as_decimal()) * (1 if buy else -1)
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         charge = notional * self.rate_for(order)
-        if self.half_spread and not getattr(order, "is_post_only", False):
-            spread = notional * self.half_spread
-            coid = str(order.client_order_id)
+        coid = str(order.client_order_id)
+        paid = self.half_spread + self.slippage.get(coid, 0)
+        if paid and not getattr(order, "is_post_only", False):
+            spread = notional * paid
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
         return self._charge(charge, instrument.quote_currency)
