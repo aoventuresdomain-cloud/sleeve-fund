@@ -23,7 +23,7 @@ import time
 from sleeve_fund.store import Store
 
 QUEUED = frozenset({"record_order", "record_timing", "update_order", "record_fill", "event", "record_equity",
-                    "heartbeat", "set_signal_state"})
+                    "heartbeat", "set_signal_state", "merge_order_signal"})
 OPENING = ("entry", "rebalance")  # as LongFlatStrategy's OPENING_INTENTS
 RETRY_SECONDS = (1.0, 5.0, 30.0)  # an exit's journal row: retried after each wait before the failure is kept
 
@@ -32,7 +32,7 @@ def _order_of(name: str, args, kwargs) -> str | None:
     """The order a queued write belongs to, for the writes that need its row."""
     if name in ("record_fill", "record_order"):
         return kwargs.get("order_id")
-    if name == "update_order":
+    if name in ("update_order", "merge_order_signal"):
         return args[0] if args else kwargs.get("order_id")
     if name == "record_timing":
         return args[1] if len(args) > 1 else kwargs.get("order_id")
