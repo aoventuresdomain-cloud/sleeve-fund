@@ -171,6 +171,13 @@ def isolated_margin(qty: float, entry: float, leverage: float, balance: float | 
     return min(margin, max(balance, 0.0)) if balance is not None else margin
 
 
+def gap_loss_cap(qty: float, entry: float, leverage: float, balance: float, taker: float, liq: float | None) -> float:
+    """The most an isolated perpetual position can lose however far the price gaps (Independent Quant Advisor, QA
+    P1-D3): its whole isolated margin, plus the taker fee on the close at its liquidation price. The engine books a
+    gap past the bankruptcy price at this (the insurance fund takes the rest), and the Risk page's stress rows use it."""
+    return isolated_margin(qty, entry, leverage, balance) + taker * abs(qty) * (liq or 0.0)
+
+
 def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:
     """The liquidation price of a position of qty opened at entry on isolated margin at this leverage.
     cash is the strategy's spot-style cash (its balance less qty x entry). None when flat, or when no

@@ -212,7 +212,7 @@ def run_backtest(
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
                                                     _opening_cash(starting_capital, runtime),
-                                                    [ts for ts, _ in strategy.insurance_log])
+                                                    list(strategy.insurance_log))
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
@@ -279,10 +279,10 @@ def _perp_mark_to_market(
     takes its payments, and equity is cash plus the signed position at the close. Exposure is the
     position's gross value over equity, signed: negative while short.
 
-    insurance: the times the strategy closed past its bankruptcy price (LongFlatStrategy._cover_shortfall).
-    Isolated margin loses no more than the strategy's equity, so at each the insurance fund brings this
-    book's cash back to zero, by this book's own arithmetic (its fill prices carry the spread, and its fees
-    round apart from the venue's by fractions of a cent)."""
+    insurance: (time, amount) for each close past the bankruptcy price (LongFlatStrategy._cover_shortfall): the
+    insurance fund takes a loss past the position's isolated margin, so the amount comes back to cash; and should
+    this book's own arithmetic still leave flat cash below zero (its fill prices carry the spread, and its fees
+    round apart from the venue's by fractions of a cent), it is brought back to zero."""
     idx = prices.index
     flows = []  # (ts, cash change, qty change)
     if fills is not None and not fills.empty:
@@ -296,11 +296,15 @@ def _perp_mark_to_market(
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
     for ts, amount in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
-    for ts in sorted(pd.Timestamp(t) for t in insurance):
+    for ts, amount in sorted((pd.Timestamp(t), float(a)) for t, a in insurance):
         before = [(c, q) for t, c, q in flows if t <= ts]
         cash_now, qty_now = opening_cash + sum(c for c, _ in before), sum(q for _, q in before)
-        if cash_now < 0 and abs(qty_now) < 1e-9:  # flat: equity is cash
-            flows.append((ts, math.ceil(-cash_now * 100) / 100, 0.0))  # to the cent, as the strategy books it
+        if abs(qty_now) < 1e-9:  # flat: equity is cash
+            # The margin-cap part as the strategy booked it; any part that only brought equity to zero, by this
+            # book's own arithmetic.
+            amount = max(amount if cash_now + amount >= 0 else 0.0, 0.0) or math.ceil(max(-cash_now, 0.0) * 100) / 100
+            if amount:
+                flows.append((ts, amount, 0.0))
     if not flows:
         return (pd.Series(opening_cash, index=idx).rename("equity"),
                 pd.Series(0.0, index=idx).rename("exposure"))

@@ -76,10 +76,10 @@ def most_it_can_lose(x: dict) -> float:
     if t is None:
         return equity
     entry, lev = x.get("entry_px") or x["price"], x["profile"].max_leverage
-    margin = markets.isolated_margin(qty, entry, lev, x["cash"] + qty * entry)
     liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
-    return min(max(margin + x.get("unrealised", 0.0), 0.0) + taker * abs(qty) * (liq or 0.0), equity)
+    cap = markets.gap_loss_cap(qty, entry, lev, x["cash"] + qty * entry, taker, liq)  # what the engine books (P1-D3)
+    return min(max(cap + x.get("unrealised", 0.0), 0.0), equity)
 
 
 def largest_asset(allocation: list[dict], equity: float) -> dict | None:

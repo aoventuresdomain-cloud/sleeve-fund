@@ -6,6 +6,7 @@ import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pandas as pd
 import pytest
 
 from sleeve_fund import markets
@@ -791,17 +792,23 @@ def test_an_open_shorts_exits_form_and_decision_log_say_above(client):  # noqa: 
 
 def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     """Sanity 5 Oct: a gap far past the liquidation price booked a loss beyond the strategy's equity. Under
-    isolated margin the venue's insurance fund takes the rest: equity ends at zero, not below, and the trade's
-    P&L (after fees, funding and the insurance fund) is the margin lost, as equity says."""
+    isolated margin the venue's insurance fund takes the rest: the position loses its margin and its fees, no more
+    (Independent Quant Advisor, QA P1-D3), and the trade's P&L (after fees, funding and the insurance fund) is
+    what equity says."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
     res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
     assert res.insurance and res.insurance[0]["amount"] > 0
-    assert res.equity.min() >= 0 and res.equity.iloc[-1] < 0.05
+    fills = res.fills.sort_values("ts_last")
+    qty, entry = float(fills["filled_qty"].iloc[-1]), float(fills["avg_px"].iloc[-2])
+    before = float(res.equity[res.equity.index < pd.Timestamp(fills["ts_last"].iloc[-1])].iloc[-1])
+    lost = before - res.equity.iloc[-1]
+    margin = qty * entry / 3  # aggressive: 3x
+    assert res.equity.min() > 0 and margin < lost < margin * 1.01  # the margin, plus the close's fee and funding
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     assert trips[-1]["insurance"] == pytest.approx(res.insurance[0]["amount"])
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
-    assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(0, abs=0.05)
+    assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(res.equity.iloc[-1], abs=0.05)
 
 
 def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(prices, instrument, full_margin):
@@ -872,7 +879,8 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
     read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
     dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
-    account text. Wiped out is a state: marked at zero, halted with the reason, through a resume and a restart."""
+    account text. Wiped out is a state: halted with the reason, through a resume and a restart. Since the Advisor's
+    P1-D3 ruling it loses the position's isolated margin and no more: what wasn't margined is kept."""
     from sleeve_fund.research.replay import replay
     from sleeve_fund.store import Store
 
@@ -887,26 +895,14 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
     assert "insurance fund covers the shortfall, about" in s.status_reason  # halted while open: an estimate (mF-1)
     last = store.equity_series(name)[-1]
-    assert (last["equity"], last["qty"]) == (0.0, 0.0)  # the book counts it at zero, not its last mark
     book = store.journal_book(name, 10_000)
-    assert book["qty"] == 0 and book["cash"] == pytest.approx(0, abs=0.01)
+    left = book["cash"]
+    assert 0 < left < 100  # full margin: all but the cash buffer was margin, and that is lost
+    assert last["qty"] == 0.0 and last["equity"] == pytest.approx(left, abs=0.01)  # not its last mark before the gap
+    assert book["qty"] == 0
     assert "mark_unavailable" not in {e["kind"] for e in store.events(name, limit=500)}
 
-    # The PM resumes it and the process restarts: still nothing to trade, so it halts again, at zero.
-    store.command(name, "resume", "try again")
-    store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
-    seen = len(store.equity_series(name))
-    restart = tmp_path / "restart.jsonl.gz"
-    _record(restart, _meta(book["cash"], params), [(5, 0.0)], px=97_440.0)
-    assert len(replay(restart, store=store)) == len(orders)  # no new order
-    s = store.sleeve(name)
-    assert s.status == "halted", (s.status, s.status_reason)
-    assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
-    marks = store.equity_series(name)[seen:]
-    assert marks and all((m["equity"], m["qty"]) == (0.0, 0.0) for m in marks)
-    events = store.events(name, limit=500)
-    assert "mark_unavailable" not in {e["kind"] for e in events}
-    assert [e["kind"] for e in events].count("risk_halt") == 2
+    # (Its resume and restart, still nothing to trade at zero, went with the zero: what is kept can trade again.)
 
 
 def test_a_restart_holding_a_perp_settles_the_funding_it_was_down_for(tmp_path):

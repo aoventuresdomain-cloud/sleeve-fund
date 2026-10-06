@@ -409,6 +409,9 @@ class LongFlatStrategy(Strategy):
         # found them (_snap_settlements), so funding charges the position held at the settlement instant, not
         # at the tick that charges it (QA P1-O2). Settlements fall on the hour; the last few days are kept.
         self._held_at: dict[int, tuple[float, float]] = {}
+        # A bars-only backtest's resting fill, while its funding is settled: (the fill's bar open ns, its close ns,
+        # whether it filled on a gap at the open). See _intrabar_fill.
+        self._intrabar: tuple[int, int, bool] | None = None
         self._snap_ns: int | None = None
         self._settled = None  # backtest: the venue's settled rates, loaded once
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
@@ -2038,7 +2041,8 @@ class LongFlatStrategy(Strategy):
             self._funding_since = self._rescan_from(now)
             return
         for ts, qty, px in held:
-            if qty == 0:
+            inside = self._intrabar is not None and self._intrabar[0] < int(ts.timestamp()) * 1_000_000_000 <= self._intrabar[1]
+            if qty == 0 or (inside and self._intrabar[2]):  # a gap fill at the bar's open held nothing after it
                 self._funding_since = ts
                 continue
             rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
@@ -2046,6 +2050,8 @@ class LongFlatStrategy(Strategy):
                 return
             self._funding_since = ts
             amount = -qty * px * rate
+            if inside and amount > 0:
+                continue  # a touch at an unknown time inside the bar: a credit it may not have been held for isn't booked
             self._cash_adj += amount
             self.funding_log.append((ts, amount))
             if self.runtime is not None:
@@ -2056,6 +2062,27 @@ class LongFlatStrategy(Strategy):
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
                                          f"{px:,.6g} ({rate:.4%})", ts=ts)
         self._funding_since = max(self._funding_since, self._rescan_from(now))
+
+    def _intrabar_fill(self, event) -> tuple[int, int, bool] | None:
+        """A bars-only backtest fills a resting order somewhere inside the bar, stamped at its close, at an unknown
+        time (Independent Quant Advisor, rule (c), QA P1-D9): one filled on a gap took the bar's open price, so it
+        is stamped at the open and pays no settlement inside the bar; one touched inside it takes the worse outcome,
+        paying a settlement inside the bar that costs the position and booking no credit. The 1-minute backtest
+        stays the reference: a bars-only result differs from it only for the worse. None for anything else."""
+        if not self._backtest or self._exec_type is not None:
+            return None
+        order = self.cache.order(event.client_order_id)
+        if order is None or order.order_type == OrderType.MARKET:
+            return None
+        px, buy = event.last_px.as_double(), order.side == OrderSide.BUY
+        if order.order_type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT, OrderType.MARKET_IF_TOUCHED):
+            level = order.trigger_price.as_double()
+            gap = px > level if buy else px < level
+        else:
+            level = order.price.as_double()
+            gap = px < level if buy else px > level
+        step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
+        return event.ts_event - step, event.ts_event, gap
 
     def _rescan_from(self, now: datetime) -> datetime:
         """Where the next charge looks from once everything up to `now` is settled: `now`, except in paper on a
@@ -2224,14 +2251,24 @@ class LongFlatStrategy(Strategy):
         else:
             self._on_tick()
 
-    def _cover_shortfall(self, price: float) -> None:
+    def _cover_shortfall(self, price: float, event=None) -> None:
         """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)
-        loses the strategy's equity and no more; the venue's insurance fund takes the rest. So once flat with
-        equity below zero, the shortfall comes back to cash, journaled, and equity ends at zero."""
-        equity = self._mark()[0]
-        if equity >= 0:
+        loses its isolated margin and no more, plus its fees (markets.gap_loss_cap, the same figure as the Risk
+        page's stress rows; Independent Quant Advisor, QA P1-D3); the venue's insurance fund takes the rest. So
+        once flat, a price loss past the margin comes back to cash, journaled, and equity never ends below zero."""
+        credit = 0.0
+        pos = self.cache.position(event.position_id) if event is not None and event.position_id else None
+        if pos is not None and pos.is_closed and pos.peak_qty.as_double() > 0:
+            qty, entry = pos.peak_qty.as_double(), pos.avg_px_open
+            sign = 1 if pos.entry == OrderSide.BUY else -1
+            lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+            past = sign * (entry - pos.avg_px_close) * qty - markets.isolated_margin(qty, entry, lev)
+            credit = max(past, 0.0)
+        equity = self._mark()[0] + credit
+        credit += max(-equity, 0.0)
+        if credit <= 0:
             return
-        credit = math.ceil(-equity * 100) / 100  # to the cent, so no float residue leaves it a fraction below zero
+        credit = math.ceil(credit * 100) / 100  # to the cent, so no float residue leaves it a fraction below zero
         self._cash_adj += credit
         now = self.clock.utc_now()
         self.insurance_log.append((now, credit))
@@ -2241,7 +2278,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "error", "insurance_fund",
                                      f"Closed at {price:,.6g}, past the bankruptcy price: the venue's insurance fund "
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
-                                     "strategy's equity", ts=self.runtime.now())
+                                     "position's margin", ts=self.runtime.now())
 
     def _wiped_out_why(self, shortfall: float = 0.0) -> str:
         """shortfall: an open position's equity below zero, which the insurance fund will cover once it closes, so
@@ -2249,7 +2286,7 @@ class LongFlatStrategy(Strategy):
         covered = sum(a for _, a in self.insurance_log)
         if not covered and self.runtime is not None:  # since a restart: the journal has it
             covered = self.runtime.store.insurance_total(self.runtime.name)
-        why = "wiped out: a gap took the price past the bankruptcy price, so equity is zero"
+        why = "wiped out: a gap took the price past the bankruptcy price, so the position's margin is lost"
         if covered > 0:
             return why + f" and the venue's insurance fund covered the {covered:,.2f} shortfall"
         if shortfall > 0:
@@ -2585,7 +2622,11 @@ class LongFlatStrategy(Strategy):
                 # Settle funding owed up to the fill before booking it, on the position held until then: a stop or a
                 # liquidation filled on a gap pays the settlements it was held through, and the insurance fund's
                 # share is then reckoned on that cash.
-                self._apply_funding(self._last_close or float(event.last_px))
+                self._intrabar = self._intrabar_fill(event)
+                try:
+                    self._apply_funding(self._last_close or float(event.last_px))
+                finally:
+                    self._intrabar = None
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed
@@ -2662,7 +2703,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id))
         if self._margin and self._entry_side == 0:
-            self._cover_shortfall(px)
+            self._cover_shortfall(px, event)
         if coid == self._risk_stop_id:
             self._risk_stop_filled(done, sign, px)
         if kept_id is not None and done:

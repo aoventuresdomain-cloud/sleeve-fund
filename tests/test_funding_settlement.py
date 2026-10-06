@@ -243,18 +243,19 @@ def test_paper_waits_a_foreseen_settlement_until_a_newer_record_could_drop_it():
 
 
 def test_a_fill_on_a_gap_pays_the_settlements_held_through_before_it(prices, instrument):
-    """CR minor 2: daily bars, a short stopped out by a gap at the next bar's open. The fill arrives before the bar
-    is handed to the strategy, so the position held at each settlement since is noted at the fill (as it was
-    before it), and funding for them is settled before the fill is booked: the short receives 08:00, 16:00 and
-    the 00:00 it was held to, and the trades' P&L still adds up to equity."""
+    """CR minor 2, then the Advisor's rule (c) (QA P1-D9): daily bars, a short stopped out by a gap at the next bar's
+    open. A bars-only fill on a gap took the open's price, so it is held to the open: the settlement at the open is
+    settled before the fill is booked, and none inside the bar is (the short would have received them). The trades'
+    P&L still adds up to equity."""
     from sleeve_fund.research.metrics import fills_to_rows, trades
     from test_long_short import _gapped
 
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
     res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
     shut = pd.Timestamp(res.fills.sort_values("ts_last")["ts_last"].iloc[-1])
-    held_through = [shut - pd.Timedelta(hours=h) for h in (16, 8, 0)]
     charged = {pd.Timestamp(f["ts"]): f["amount"] for f in res.funding}
-    assert all(ts in charged and charged[ts] > 0 for ts in held_through)  # a short receives at a positive rate
+    opened = shut - pd.Timedelta(days=1)
+    assert opened in charged and charged[opened] > 0  # held to the open; a short receives at a positive rate
+    assert not [ts for ts in charged if opened < ts <= shut]  # none inside the bar it gapped out in
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)

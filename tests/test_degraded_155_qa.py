@@ -1,5 +1,5 @@
 """QA round on PR #155 (head 73d3908; quant-review/v2-p1/degraded-155.md): every finding as a test, the open ones as
-strict xfails (P1-D3, P1-D9: awaiting the Independent Quant Advisor's ruling). Synthetic data only, no venue called.
+fixed per the Independent Quant Advisor's rulings (P1-D3 option (a), P1-D9 rule (c)). Synthetic data only, no venue called.
 
 """
 import collections
@@ -126,9 +126,6 @@ def test_d2_paper_and_backtest_take_the_same_decision_on_a_holed_slower_candle(t
     assert paper[0].floor("min") == bt[0][0]
 
 
-@pytest.mark.xfail(strict=True, reason="P1-D3 MAJOR (m13-U6, the PR's stress Done-when): at 3x a -50% gap books "
-                   "7,503.75 in the engine, but the Risk page now shows 5,005.03 (isolated margin plus fee): the engine "
-                   "charges a loss past the bankruptcy price to the strategy's equity, the stress row caps it at margin")
 def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tmp_path):
     from sleeve_fund.dashboard.riskops import most_it_can_lose
     inst = binance_inst()
@@ -236,10 +233,6 @@ def test_d8_a_hole_inside_the_warm_up_window_is_named(tmp_path):
     assert "hole" in msg or "missing" in msg or "gap" in msg
 
 
-@pytest.mark.xfail(strict=True, reason="P1-D9 MAJOR (aa7c2c6/73d3908): with bars only (no execution bars) a resting stop "
-                   "filled on a gap is stamped at the bar's close, so it pays every settlement up to and including that "
-                   "close: 13 charges where paper (and the same backtest on 1-minute execution bars) pays the 7 strictly "
-                   "before the gap trade at 00:00:01; on 15m bars it pays the settlement at the very instant of the fill")
 @pytest.mark.parametrize("gap_at", ["2025-10-04 00:00:01", "2025-10-04 10:00:01"])
 def test_d9_a_gap_stop_on_daily_bars_pays_only_the_settlements_before_the_gap(tmp_path, gap_at):
     times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
@@ -255,4 +248,17 @@ def test_d9_a_gap_stop_on_daily_bars_pays_only_the_settlements_before_the_gap(tm
     params = {**PERP, "at": ns("2025-10-02 00:00"), "side": 1, "stop_loss": 0.02, "tag": "d9"}
     r = backtest(binance_inst(), day, strategy="qa_t", params=params, minutes=1440, profile="balanced", half_spread=0.0)
     owed = [t for t in times if pd.Timestamp("2025-10-02 00:00", tz="UTC") < t < gap]  # what paper pays (s10_gapfund)
-    assert [pd.Timestamp(x["ts"]) for x in r.journal.funding_] == owed
+    paid = {pd.Timestamp(x["ts"]): x["amount"] for x in r.journal.funding_}
+    if gap.floor("D") + pd.Timedelta(seconds=1) == gap:  # the bar opens gapped: the fill is held to its open, exactly
+        assert list(paid) == owed
+        return
+    # Rule (c), the Independent Quant Advisor: a stop touched at an unknown time inside the bar takes the worse
+    # outcome. The 1-minute backtest stays the reference, and the bars-only result differs from it only for the worse.
+    one = tape.resample("1min", closed="left", label="right").ohlc()
+    one["volume"] = 1e9
+    ref = backtest(binance_inst(), day, strategy="qa_t", params=params, minutes=1440, profile="balanced",
+                   half_spread=0.0, exec_prices=one, exec_minutes=1)
+    ref_paid = {pd.Timestamp(x["ts"]): x["amount"] for x in ref.journal.funding_}
+    assert list(ref_paid) == owed  # the reference pays what paper pays
+    assert set(ref_paid) <= set(paid) and all(paid[t] == pytest.approx(ref_paid[t]) for t in ref_paid)
+    assert [t for t in paid if t not in ref_paid] and all(paid[t] < 0 for t in paid if t not in ref_paid)
