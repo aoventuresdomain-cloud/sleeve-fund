@@ -15,7 +15,7 @@
   {% for a in alerts %}
   <li class="{{ a.level }}">
     <div><div class="when">{{ a.ts|ts }} · {{ a.ts|ago }} · {{ a.level|capitalize }} · {{ a.kind|kind_words }}{% if a.sleeve %} · <a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>{% endif %}</div>
-      <div class="msg">{{ a.message }}</div>
+      <div class="msg">{{ a.message|no_venues }}</div>
       {% if a.acked_at %}<div class="acked">Acknowledged by {{ a.acked_by }} {{ a.acked_at|ago }}{% if a.ack_note %}: {{ a.ack_note }}{% endif %}</div>{% endif %}</div>
     {% if not a.acked_at %}
     <form method="post" action="/alerts/{{ a.id }}/ack" class="inline">

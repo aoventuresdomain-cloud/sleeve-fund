@@ -21,7 +21,7 @@
 {% if alerts %}{% set a = alerts[0] %}
 <section class="needs-you" aria-label="Needs you" data-live-forms>
   <span class="tag">Needs you</span>
-  <span class="grow">{% if a.sleeve %}<a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>: {% endif %}{{ a.message }} <span class="when" title="{{ a.ts|ts }}">{{ a.ts|ago }}</span>{% if alerts|length > 1 %} · <a href="/alerts">{{ alerts|length - 1 }} more</a>{% endif %}</span>
+  <span class="grow">{% if a.sleeve %}<a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>: {% endif %}{{ a.message|no_venues }} <span class="when" title="{{ a.ts|ts }}">{{ a.ts|ago }}</span>{% if alerts|length > 1 %} · <a href="/alerts">{{ alerts|length - 1 }} more</a>{% endif %}</span>
   <form method="post" action="/alerts/{{ a.id }}/ack"><input type="hidden" name="next" value="/"><button class="secondary" title="Mark as seen">Acknowledge</button></form>
 </section>
 {% endif %}
@@ -197,7 +197,7 @@
       <td class="num" data-m="right">{{ o.qty|qty }}{% if o.filled_qty %}<div class="sub">{{ o.filled_qty|qty }} filled</div>{% endif %}</td>
       <td data-m="hide">{{ o.order_type|capitalize }}</td>
       <td data-m="hide"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td>
-      <td class="reason" data-m="hide" title="{{ o.reason }}">{{ o.reason }}</td></tr>
+      <td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 18px 16px">No orders working. Strategies trade at market, so an order is normally open for seconds.</p>{% endif %}
@@ -220,7 +220,7 @@
       <td class="num" data-m="hide">{{ f.price|px }}</td>
       <td class="num" data-m="hide">{{ f.fee|money }}</td>
       <td data-m="hide">{% if f.intent %}{{ tag(f.intent_label, f.intent) }}{% else %}<span class="faint">–</span>{% endif %}</td>
-      <td class="reason" title="{{ f.reason or '' }}">{% if f.reason %}{{ f.reason }}{% else %}<span class="faint">Not recorded</span>{% endif %}</td></tr>
+      <td class="reason" title="{{ f.reason|no_venues or '' }}">{% if f.reason %}{{ f.reason|no_venues }}{% else %}<span class="faint">Not recorded</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 18px 16px">No fills yet. Each buy and sell a strategy makes lands here with the reason it gave.</p>{% endif %}

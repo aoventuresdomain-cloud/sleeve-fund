@@ -2199,6 +2199,78 @@ def test_room_to_halt_is_measured_from_the_peak(client):
     assert "1,200.00" in c.get("/", auth=AUTH).text and "1,200.00" in c.get("/risk", auth=AUTH).text
 
 
+VENUE_NAME = re.compile(r"\b(?:Bybit|Binance|Kraken|Deribit|BYBIT|BINANCE|KRAKEN|DERIBIT)\b(?!_)")
+
+
+def _visible(html: str) -> str:
+    """The words a reader sees and hears: text, hovers and screen-reader labels, without scripts or markup."""
+    html = re.sub(r"(?s)<(script|style)\b.*?</\1>", " ", html)
+    shown = re.findall(r'\b(?:title|aria-label|placeholder|alt)="([^"]*)"', html)
+    return " ".join([re.sub(r"<[^>]+>", " ", html), *shown])
+
+
+def test_the_pm_pages_name_no_venue_even_in_old_messages(client):
+    """P1-U18: mirror reasons, alerts and the decision log name no venue, including rows stored before the
+    wording changed; only Setup, Accounts does."""
+    c, store = client
+    assert _new(c).status_code == 303
+    old = {
+        "mirror_skipped": "Demo mirror didn't copy the buy of 0.0001 to the demo account: 0.0001 (6.00 USDT) is under "
+                          "the smallest order Bybit takes (0.001, 5 USDT). The paper book is unaffected.",
+        "mirror_failed": "Demo mirror couldn't copy the sell of 0.01 at 60,000.00 to the demo account: Bybit Demo "
+                         "Trading /v5/order/create: insufficient balance (110007). The paper book is unaffected.",
+        "mirror_resync": "Demo copy resynced (test): BTCUSDT: paper +0.01 at 2x isolated; Bybit Demo before +0; "
+                         "after +0.01",
+    }
+    for kind, message in old.items():
+        store.event("btc-test", "warning", kind, message)
+    store.event(None, "error", "mirror_drift", "Deribit testnet holds -5 USD of BTC-PERPETUAL; KRAKEN feed stale")
+    store.decide("pm", "create_account", "live account qa-live on Kraken spot: QA walk")
+    store.decide("pm", "create_account", "live account qa-perp on Binance USD-M perpetuals: QA walk")
+    for path in ("/", "/alerts", "/risk", "/trades", "/orders", "/records", "/sleeves/btc-test"):
+        r = c.get(path, auth=AUTH)
+        assert r.status_code == 200, path
+        text = _visible(r.text)
+        assert not VENUE_NAME.findall(text), (path, VENUE_NAME.findall(text))
+    alerts = _visible(c.get("/alerts", auth=AUTH).text)
+    assert "under the smallest order the demo account takes" in alerts
+    assert "the demo account /v5/order/create: insufficient balance" in alerts
+    records = _visible(c.get("/records", auth=AUTH).text)
+    assert "live account qa-live on the spot venue" in records
+    assert "live account qa-perp on the perpetual venue" in records
+    # Setup, Accounts is where a venue is named on purpose: the filter leaves it alone.
+    assert "Kraken" in c.get("/setup", auth=AUTH).text
+
+
+def test_no_venues_keeps_account_and_key_names():
+    from sleeve_fund.dashboard.development import no_venues
+
+    assert no_venues("kraken-live: BYBIT_DEMO_API_KEY missing") == "kraken-live: BYBIT_DEMO_API_KEY missing"
+    assert no_venues("no Bybit demo account set up") == "the demo account isn't set up"
+    assert no_venues("A Kraken order on Binance's book") == "The spot venue order on the perpetual venue book"
+    assert no_venues("BTCUSDT-PERP.BINANCE: the feed missed 2 minutes") == "BTCUSDT-PERP: the feed missed 2 minutes"
+    assert no_venues("BTC/USD.KRAKEN warm-up ready.") == "BTC/USD warm-up ready."
+    assert no_venues(None) is None and no_venues("") == ""
+
+
+def test_the_spot_cap_bar_reads_on_the_exposure_basis(client):
+    """P1-U17: on spot the limit bar uses the same basis as the Exposure figure (value at today's price against
+    the entry cap), so its hover and screen-reader text agree with it after the price has moved."""
+    c, store = client
+    _new(c)
+    store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="o1", trade_id="t1")
+    store.record_equity("btc-test", equity=5_600, cash=2_000, qty=0.05, price=72_000, benchmark=5_000)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    shown, cap = map(float, re.search(r"<dt[^>]*>Exposure</dt><dd>([\d.]+)× equity <span class=\"faint\">· cap "
+                                      r"([\d.]+)×", page).groups())
+    bar = re.search(r'<div class="exposure-cap" title="([^"]+)"><span class="k">Exposure of cap</span>'
+                    r'<span class="meter[^"]*" role="img" aria-label="(\d+)% of the entry cap used"', page)
+    assert bar, "the spot limit bar is on the exposure basis"
+    assert f"Exposure {shown:.2f}× equity, against an entry cap of {cap:.2f}×" in bar.group(1)
+    assert int(bar.group(2)) == round(3_600 / 5_600 / cap * 100)
+    assert "Isolated margin of cap" not in page and "Position of cap" not in page
+
+
 def test_an_atr_stop_says_it_is_the_simple_atr_and_the_chart_draws_it(client):
     """atr-149 A2: the models' ATR stops use the simple ATR, the chart's ATR is Wilder's, so wherever the
     position's stop is shown its basis says "simple ATR", and the chart draws the stop level itself."""

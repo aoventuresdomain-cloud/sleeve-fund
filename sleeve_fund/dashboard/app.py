@@ -53,7 +53,6 @@ from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
-from sleeve_fund.venues import venue as venue_profile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -112,6 +111,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["venue_choices"] = venue_choices
     templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
+    templates.env.filters["no_venues"] = dev.no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -1303,7 +1303,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("a reason is required")
             kind = str(form.get("kind", ""))
             st().create_account(name, kind, str(form.get("note", "")).strip()[:200], venue=str(form.get("venue", "")))
-            on = f" on {venue_profile(str(form.get('venue'))).label}" if kind == "live" else ""
+            on = f" on the {dev.venue_label(str(form.get('venue')))} venue" if kind == "live" else ""
             st().decide(actor, "create_account", f"{kind} account {name}{on}: {reason}")
         except ValueError as exc:
             kept = {k: str(v) for k, v in form.items() if isinstance(v, str) and v}
@@ -1588,18 +1588,32 @@ def _stored_history(store: Store, profile=None) -> list[dict]:
             behind = now - last.to_pydatetime() > study_run.STALE_HISTORY
             gaps = hist.gaps(v, pair)
             kinds = [e.get("kind") for e in hist.provenance(v, pair)]
+            funding_gaps = _funding_health(v, pair, hist.root, log)
         except Exception as exc:  # noqa: BLE001 - see the docstring
             log.warning(f"couldn't read the stored history of {pair} on {profile.label}: {exc!r}")
             continue
         row = {"pair": pair, "first": first, "last": last, "requested": asked.get(pair, {}).get("requested_at"),
                "state": "catching up" if behind else "current", "gaps": gaps,
-               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict")}
+               "refills": kinds.count("refill"), "conflicts": kinds.count("conflict"), **funding_gaps}
         out.append({**row, "badge": dev.history_badge(row)})
     held = {h["pair"] for h in out}
     out += [{"pair": p, "first": None, "last": None, "requested": r["requested_at"], "state": "asked for", "gaps": [],
              "badge": dev.history_badge({"first": None})}
             for p, r in asked.items() if p not in held]
     return sorted(out, key=lambda h: h["pair"])
+
+
+def _funding_health(venue: str, pair: str, root, log) -> dict:
+    """Missed funding settlements and possible holes at a change of settlement interval (QA P1-O9/O11), for the
+    instrument's history chip. Empty where no funding is kept."""
+    from sleeve_fund import funding
+
+    try:
+        return {"funding_gaps": len(funding.gaps(venue, pair, root)),
+                "funding_maybe": len(funding.interval_changes(venue, pair, root))}
+    except Exception as exc:  # noqa: BLE001 - the prices' badge stands without it
+        log.warning(f"couldn't read the funding kept for {pair}: {exc!r}")
+        return {}
 
 
 def _study_request(form: dict) -> "study_run.StudyRequest":

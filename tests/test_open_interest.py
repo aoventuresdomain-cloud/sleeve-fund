@@ -349,3 +349,61 @@ def test_a_steady_interval_with_millisecond_jitter_is_no_change(tmp_path):
     funding.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
     assert funding.interval_changes("BINANCE", "BTC/USDT", root=tmp_path) == []
     assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == []
+
+
+def test_a_null_from_the_venue_loses_only_its_own_row_not_the_page(tmp_path):
+    """QA P1-O13: the loader passes values through, and refresh refuses a null row by row."""
+    rows = [{"timestamp": T0 + i * STEP, "sumOpenInterest": None if i == 1 else str(100.0 + i),
+             "sumOpenInterestValue": "6000000.0"} for i in range(3)]
+    now = T0 + 86_400_000
+    loader = lambda pair, start: binance_open_interest(pair, start, get_json=lambda url: rows if start <= T0 else [], now_ms=now)  # noqa: E731
+    out = open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=loader)
+    assert out["written"] == 2 and out["refused"] == 1
+    assert list(open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)["contracts"]) == [100.0, 102.0]
+
+
+def test_funding_gaps_and_possible_holes_reach_the_alerts_inbox_once_a_day_and_the_history_chip(tmp_path, monkeypatch):
+    """QA P1-O11: the funding flags reach the alerts inbox and the instrument's history chip, not only the log."""
+    from sleeve_fund import history
+    from sleeve_fund.dashboard import development as dev
+
+    h = 3_600_000
+    kept = [T0 + k * 8 * h for k in range(6) if k != 3] + [T0 + 48 * h + k * 4 * h for k in range(6)]
+    profile = venue("BINANCE")
+    monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    monkeypatch.setattr(profile, "stats_loaders", {})
+    sent = []
+
+    class Inbox:
+        def event(self, sleeve, level, kind, message):
+            sent.append((level, kind, message))
+    monkeypatch.setattr("sleeve_fund.store.Store", Inbox)
+    history._warned.clear()
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert [(level, kind) for level, kind, _ in sent] == [("warning", "funding_gap")]
+    assert "missed between 2026-10-01 16:00" in sent[0][2] and "possible hole at interval change" in sent[0][2]
+    history._warned.clear()  # as after a restart: a pass that finds nothing new raises nothing (Code Reviewer)
+    _refresh_funding(profile, "BTC/USDT", tmp_path, None)
+    assert len(sent) == 1
+
+    from sleeve_fund.dashboard.app import _funding_health
+    health = _funding_health("BINANCE", "BTC/USDT", tmp_path, None)
+    assert health == {"funding_gaps": 1, "funding_maybe": 1}
+    first, last = pd.Timestamp("2026-01-01", tz="UTC"), pd.Timestamp("2026-10-01", tz="UTC")
+    chip = dev.history_chip({"first": first, "last": last, "state": "current", "gaps": [], **health})
+    assert chip["title"] == "1 missed funding settlement; 1 possible funding hole at an interval change"
+
+
+def test_a_null_funding_rate_is_refused_alone_and_left_as_a_hole(tmp_path):
+    """QA P1-O13 for funding (HoE): a null rate loses only its settlement, which gaps() then reports."""
+    from sleeve_fund.venues import binance_funding
+
+    h = 3_600_000
+    rows = [{"symbol": "BTCUSDT", "fundingTime": T0 + k * 8 * h, "fundingRate": None if k == 2 else "0.0001"}
+            for k in range(6)]
+    loader = lambda pair, start: binance_funding(pair, start, get_json=lambda url: [r for r in rows if r["fundingTime"] >= start])  # noqa: E731
+    kept = funding.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=loader)
+    assert len(kept) == 5 and not kept.isna().any()
+    assert funding.gaps("BINANCE", "BTC/USDT", root=tmp_path) == [
+        (pd.Timestamp(T0 + 8 * h, unit="ms", tz="UTC"), pd.Timestamp(T0 + 24 * h, unit="ms", tz="UTC"))]
+    assert len(funding.fetch("BINANCE", "BTC/USDT", pd.Timestamp(T0, unit="ms", tz="UTC"), loader=loader)) == 5
