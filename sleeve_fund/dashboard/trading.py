@@ -177,6 +177,21 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
+def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
+    """How the open position's stop was set, in a few words, when it came from the market at entry: an ATR
+    stop is the simple ATR the models use, not the chart's Wilder ATR (Advisor, atr-149 A2), so it says so.
+    None for a fixed % stop or none. Reads the stop settings the entry, or a later plan, journaled."""
+    cfg = (plan or {}).get("stop_cfg") if plan is not None else (signal or {}).get("stop_cfg")
+    if cfg is None and plan is None and not (signal or {}).get("stop_frac"):
+        cfg = params  # an entry from before stop settings were journaled: the strategy's own
+    cfg = cfg or {}
+    if cfg.get("stop_atr"):
+        return f"{float(cfg['stop_atr']):g} simple ATR ({int(cfg.get('atr_bars') or 14)} bars) at entry"
+    if cfg.get("stop_swing_bars"):
+        return f"swing {'high' if side < 0 else 'low'} of {int(cfg['stop_swing_bars'])} bars at entry"
+    return None
+
+
 def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> tuple[float | None, float | None]:
     """The open position's stop and target as shares of its entry price: the plan set since entry, if
     any, else what its entry journaled (an ATR or swing-low stop is set at entry), else the strategy's
@@ -254,6 +269,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
         "stop_px": stop_px,
+        "stop_basis": stop_basis(x["sleeve"].params, entry["signal"] if entry else None, plan, side) if stop_px else None,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "notional": abs(x["qty"]) * x["price"],
         "margin": margin,

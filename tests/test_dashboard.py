@@ -2197,3 +2197,34 @@ def test_room_to_halt_is_measured_from_the_peak(client):
     x = sleeve_summary(store, store.sleeve("btc-room"))
     assert x["room"] == pytest.approx(10_000 - 11_000 * (1 - 0.20))  # 1,200.00 on the balanced 20% limit
     assert "1,200.00" in c.get("/", auth=AUTH).text and "1,200.00" in c.get("/risk", auth=AUTH).text
+
+
+def test_an_atr_stop_says_it_is_the_simple_atr_and_the_chart_draws_it(client):
+    """atr-149 A2: the models' ATR stops use the simple ATR, the chart's ATR is Wilder's, so wherever the
+    position's stop is shown its basis says "simple ATR", and the chart draws the stop level itself."""
+    c, store = client
+    _new(c, stop_atr="2", atr_bars="14")
+    store.record_order("btc-test", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="trend up",
+                       signal={"stop_frac": 0.04, "stop_basis": "2 x the 14-bar average true range (1,200)",
+                               "stop_cfg": {"stop_atr": 2.0, "atr_bars": 14}})
+    store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("btc-test", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "57,600" in page and "· 2 simple ATR (14 bars) at entry" in page
+    risk = c.get("/risk", auth=AUTH).text
+    assert "from its entry, 2 simple ATR (14 bars) at entry" in risk
+    lines = c.get("/api/sleeves/btc-test/candles", auth=AUTH).json()["lines"]
+    assert {"price": 57_600.0, "title": "SL · simple ATR", "kind": "stop"} in lines
+
+
+def test_a_fixed_stop_has_no_atr_label_and_the_stress_note_names_3x_gap_loss(client):
+    c, store = client
+    _new(c, stop_loss_pct="3")
+    store.record_order("btc-test", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="trend up",
+                       signal={"stop_frac": 0.03, "stop_cfg": {"stop_loss": 0.03}})
+    store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("btc-test", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    assert "simple ATR" not in c.get("/sleeves/btc-test", auth=AUTH).text
+    lines = c.get("/api/sleeves/btc-test/candles", auth=AUTH).json()["lines"]
+    assert {"price": 58_200.0, "title": "SL", "kind": "stop"} in lines
+    assert "at 3x, a gap through liquidation loses the whole position margin" in c.get("/risk", auth=AUTH).text
