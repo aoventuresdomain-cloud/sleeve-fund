@@ -2651,8 +2651,10 @@ class LongFlatStrategy(Strategy):
                 cash = 0.0 if ruined else cash
             elif kept and (self.runtime.status != "halted" or self.runtime.liquidated is None):
                 wiped = self._wiped_out_why()
+            liquidating = any(self.decisions.get(str(o.client_order_id), {}).get("intent") == "liquidation"
+                              for o in self._working())
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
-                                 busy=bool(self._working()), ruined=wiped) == "flatten":
+                                 busy=bool(self._working()), ruined=wiped, liquidating=liquidating) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")

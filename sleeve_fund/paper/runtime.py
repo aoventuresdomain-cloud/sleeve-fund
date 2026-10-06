@@ -203,13 +203,17 @@ class SleeveRuntime:
     # --- periodic tick ----------------------------------------------------------
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
-             guard_equity: float | None = None, busy: bool = False, ruined: str | None = None) -> str | None:
+             guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
+             liquidating: bool = False) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
         a perp), which the guard judges by when lower; the mark is still this tick's equity.
         busy: the strategy has an order working, so a flatten still owed waits for it rather than send another.
         ruined: why the strategy has nothing left (a gap past the bankruptcy price took its equity to zero): it
-        halts, from running or paused, and flattens whatever is still open."""
+        halts, from running or paused, and flattens whatever is still open.
+        liquidating: a liquidation order is working (the price went through the liquidation price): the PM's commands
+        wait, so a resume queued while paused is never applied on the liquidating tick (QA P1-U34); the next tick has
+        the liquidation's halt, which a resume doesn't clear."""
         now = self.now()
         self.store.heartbeat(self.name)
         if self.progress is not None:
@@ -263,7 +267,7 @@ class SleeveRuntime:
                 self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
-        for cmd in self.store.pending_commands(self.name):
+        for cmd in [] if liquidating else self.store.pending_commands(self.name):
             if cmd["command"] == RELOAD:
                 continue  # the supervisor's: it restarts this process under the new settings
             if cmd["command"] == "flatten":

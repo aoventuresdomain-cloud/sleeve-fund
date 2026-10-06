@@ -705,3 +705,26 @@ def test_a_reset_after_liquidation_in_the_journal_ends_the_liquidated_state(stor
     _liquidated(store, t)
     store.event("s1", "info", RESET_AFTER_LIQUIDATION, "reset after the liquidation")
     assert SleeveRuntime(store, "s1", now=lambda: t[0]).liquidated is None
+
+
+def test_the_pms_commands_wait_while_a_liquidation_order_is_working(store):
+    """QA P1-U34: a resume queued while paused is never applied on the tick that liquidates (the guard has sent the
+    liquidation, which hasn't filled): it waits, so the strategy is never running with the position still held; the
+    next tick has the liquidation's halt, which a resume doesn't clear."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2024, 3, 2, 12, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    mark = {"cash": 0.0, "qty": 1.0}
+    rt.tick(equity=10_000, price=10_000, **mark)
+    store.command("s1", "pause", "holding")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=10_000, price=10_000, **mark)
+    assert store.sleeve("s1").status == "paused"
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=9_900, price=9_900, liquidating=True, **mark)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()
+    assert [c["command"] for c in store.pending_commands("s1")] == ["resume"]  # still waiting
