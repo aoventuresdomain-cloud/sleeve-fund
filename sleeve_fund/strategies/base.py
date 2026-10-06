@@ -465,7 +465,7 @@ class LongFlatStrategy(Strategy):
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._slower: list[SlowerCandles] = []  # slower candles the model reads (slower(), v2 P1-4)
-        self._short_history: str | None = None  # why the slower candles' warm-up couldn't be met: no decisions
+        self._short_history: str | None = None  # why the slower candles' warm-up isn't met yet: no new entries
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
@@ -718,7 +718,11 @@ class LongFlatStrategy(Strategy):
         """Slower candles of this instrument for the model to read, e.g. self.slower(240, Sma(50)) for a 4-hour
         trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
         decision on the bar that closed it. Warm-up loads them from the history store at their own size."""
-        s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks)
+        from sleeve_fund.venues import VENUES
+
+        profile = VENUES.get(self._cfg.instrument_id.venue.value)
+        s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks,
+                          profile.day_start_minutes if profile is not None else 0)
         self._slower.append(s)
         return s
 
@@ -1052,12 +1056,18 @@ class LongFlatStrategy(Strategy):
     def _warm_slower(self) -> None:
         """Each slower timeframe's warm-up (v2 P1-4): its blocks' look-back in candles of its own size from the
         history store, up to the last closed one; the decision bars loaded after this carry on from there. When
-        the store can't cover it the model makes no decisions (_short_history), rather than run on a filter that
-        isn't settled, and says why."""
+        the store can't cover it the model opens and adds nothing until the candles have closed live
+        (_short_history, _entry_held), rather than enter on a filter that isn't settled, and says why. Stops,
+        targets and exits still run: a position held across a restart is still managed (Independent Quant
+        Advisor, 5 Oct)."""
         short = []
         for s in self._slower:
-            need = warmup_for(s.blocks)
+            s.need = need = warmup_for(s.blocks)
             if not need:
+                continue
+            if s.day_start:
+                short.append(f"its {span(s.minutes)} candles start at the venue's day start, and the history store "
+                             "builds them from 00:00 UTC, so they warm up live")
                 continue
             bar_type = BarType.from_str(f"{self._cfg.instrument_id}-{bar_spec(s.minutes)}")
             try:
@@ -1071,7 +1081,8 @@ class LongFlatStrategy(Strategy):
                              f"loaded ({why})")
         if short:
             self._short_history = "; ".join(short)
-            msg = f"Not trading: {self._short_history}. It trades after a restart once the history store covers them."
+            msg = (f"No new entries: {self._short_history}. Stops, targets and exits still run; entries start once "
+                   "those candles have closed live, or after a restart once the history store covers them.")
             self.log.error(msg)
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "error", "warmup_short", msg)
@@ -1242,13 +1253,13 @@ class LongFlatStrategy(Strategy):
         values = {**values, "close": close}
         if current != 0:
             # Late, a reversal only closes: the new side would open on a stale signal.
-            flip = side != 0 and not self._late_entry(bar, f"{_side_word(side)} entry after closing the "
+            flip = side != 0 and not self._entry_held(bar, f"{_side_word(side)} entry after closing the "
                                                            f"{_side_word(current)}")
             self._flip = (side, bar, reason, values) if flip else None
             self._late_exit(bar)
             self._sell_all("exit", reason, values)
             return
-        if self._late_entry(bar, f"{_side_word(side)} entry"):
+        if self._entry_held(bar, f"{_side_word(side)} entry"):
             return
         self._open(side, bar, reason, values)
 
@@ -1354,6 +1365,21 @@ class LongFlatStrategy(Strategy):
 
     def _now_ns(self) -> int:
         return self.clock.timestamp_ns()
+
+    def _entry_held(self, bar: Bar, what: str) -> bool:
+        """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
+        (v2 P1-4), or the decision is late (_late_entry). Exits and reductions are never held."""
+        if self._short_history is not None:
+            if any(s.count < s.need for s in self._slower):
+                self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "
+                           f"{self._short_history}. Said once until entries open again")
+                return True
+            self._short_history = None
+            self._noted.discard("entry_held")
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "info", "warmup_met",
+                                         "Entries open again: its slower candles now have the closed ones they need")
+        return self._late_entry(bar, what)
 
     def _late_entry(self, bar: Bar, what: str) -> bool:
         """True when this decision is too late to open or add (LATE_DECISION_NS after its bar's close), saying
@@ -1462,8 +1488,6 @@ class LongFlatStrategy(Strategy):
             self._replan(self._last_close)
         if self._check_late_bar_exits(bar) or self._check_exits(self._last_close):
             return
-        if self._short_history is not None:  # its slower candles' warm-up isn't met: stops work, the model doesn't
-            return
         if self._margin:
             if self._restore is None:
                 self._apply_funding(self._last_close)
@@ -1481,7 +1505,7 @@ class LongFlatStrategy(Strategy):
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
-            if self._exit_lock or self._late_entry(bar, "long entry"):
+            if self._exit_lock or self._entry_held(bar, "long entry"):
                 return
             if self.runtime is not None and not self.runtime.can_open():
                 return
@@ -1518,7 +1542,7 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
-                if w > self._held_w and self._late_entry(bar, "addition"):
+                if w > self._held_w and self._entry_held(bar, "addition"):
                     return
                 if w < self._held_w:
                     self._late_exit(bar)

@@ -1,7 +1,9 @@
 """Slower candles for a strategy (v2 P1-4): a strategy deciding on 15-minute candles can read 4-hour ones of the
 same instrument, built here from its own decision candles, so a backtest and paper build them the same way.
 
-Candles are aligned to UTC (4-hour ones close at 00, 04, 08 ... and daily ones at 00:00). A slower candle closes on
+Candles are aligned to the venue's day start, 00:00 UTC on every venue so far (VenueProfile.day_start_minutes): 4-hour
+ones close at 00, 04, 08 ... and daily ones at 00:00. A slower candle with no decision candles at all is missing:
+none is made up for it. A slower candle closes on
 the decision candle stamped at its end; both close at that instant, so the decision on that candle sees it and no
 earlier one does, and the candle still forming is never visible. When that decision candle is missing (a gap),
 the slower candle closes on the first one after its end, stamped at its own end. A slower candle missing decision
@@ -41,9 +43,11 @@ class Candle:
 
 class SlowerCandles:
     """Closed `minutes` candles from decision candles of `step_minutes`, each fed on closing to `blocks` (indicator
-    blocks, by update_ohlcv). `last` is the latest closed candle, `count` how many have closed."""
+    blocks, by update_ohlcv). `last` is the latest closed candle, `count` how many have closed, `need` how many
+    the blocks' warm-up takes (set by the strategy). day_start: the venue's day start, in minutes after 00:00 UTC,
+    the candles align to."""
 
-    def __init__(self, minutes: int, step_minutes: int, blocks=()) -> None:
+    def __init__(self, minutes: int, step_minutes: int, blocks=(), day_start: int = 0) -> None:
         if int(minutes) != minutes or minutes <= 0 or DAY_MINUTES % minutes:
             raise ValueError(f"slower candles of {minutes} minutes don't divide a day (e.g. 60, 240 or 1440)")
         if minutes <= step_minutes or minutes % step_minutes:
@@ -52,8 +56,10 @@ class SlowerCandles:
         self.minutes, self.step_minutes = int(minutes), int(step_minutes)
         self.period, self.step = self.minutes * MINUTE_NS, self.step_minutes * MINUTE_NS
         self.blocks = list(blocks)
+        self.day_start = int(day_start)
+        self._offset = self.day_start * MINUTE_NS % self.period
         self.last: Candle | None = None
-        self.count = 0
+        self.count = self.need = 0
         self._end: int | None = None  # the forming candle's close, None between candles
         self._whole = False
         self._ohlcv: list[float] = []
@@ -62,7 +68,7 @@ class SlowerCandles:
         """One decision candle, stamped at its close `ts` (ns). Returns the slower candle it closed, if any."""
         if self.last is not None and ts <= self.last.end:  # inside a candle already closed (seeded from the store)
             return None
-        end = -(-ts // self.period) * self.period  # the close of the slower candle this one is part of
+        end = -(-(ts - self._offset) // self.period) * self.period + self._offset  # the slower candle's close
         out = None
         if self._end is not None and self._end != end:  # its closing decision candle never came
             out = self._close()

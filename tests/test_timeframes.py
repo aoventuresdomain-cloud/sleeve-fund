@@ -117,7 +117,7 @@ def _strategy(tmp_path, n_minutes, sma):
     events = []
     s.instrument = instrument
     # backtest: no m13-E3 hold-back of the last warm-up candle (#146), which this test isn't about
-    s.runtime = type("R", (), {"name": "s1", "backtest": True, "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    s.runtime = type("R", (), {"name": "s1", "backtest": True, "store": type("S", (), {"event": lambda self, *a, **k: events.append(a)})()})()
     return s, events
 
 
@@ -132,13 +132,57 @@ def test_a_strategy_warms_its_slower_candles_from_the_store_at_their_own_size(tm
     assert not [e for e in events if e[1] == "error"]
 
 
-def test_a_strategy_whose_slower_warm_up_the_store_cant_meet_says_so_and_decides_nothing(tmp_path):
+def test_a_strategy_whose_slower_warm_up_the_store_cant_meet_says_so_and_opens_nothing_until_it_fills(tmp_path):
+    """Independent Quant Advisor (5 Oct): a short slower warm-up at start holds new entries and additions only,
+    until the candles have closed live; a position held across the restart is still managed."""
     s, events = _strategy(tmp_path, 12 * 60, sma=5)  # half a day: 2 closed 4-hour candles of the 5 needed
     s._warm_slower()
     assert s._short_history is not None
     (name, level, kind, msg), = [e for e in events if e[2] == "warmup_short"]
     assert level == "error" and "4-hour candles need 5 closed ones of history and 2 loaded" in msg
-    assert "Not trading" in msg
+    assert msg.startswith("No new entries") and "Stops, targets and exits still run" in msg
+    bar = type("B", (), {"ts_event": T0})()
+    s.runtime.now = lambda: None
+    assert s._entry_held(bar, "long entry") and s._entry_held(bar, "addition")
+    assert [e[2] for e in events].count("entry_held") == 1  # said once, not every bar
+    s._trend_candles.seed(Candle(1, 1, 1, 1, 1, s._trend_candles.last.end + k * H4) for k in (1, 2, 3))
+    s._lag = None
+    assert not s._entry_held(bar, "long entry") and s._short_history is None  # five closed now: entries open
+    assert [e[2] for e in events][-1] == "warmup_met"
+
+
+def test_a_position_held_across_a_restart_with_a_short_slower_warm_up_still_exits():
+    """Done when (Advisor, 5 Oct): restarted holding, with the slower warm-up short, the stop and the model's
+    own exit still run; only an entry is held."""
+    from test_timing import _late_strategy
+
+    s, bar, events, sold, opened = _late_strategy(side_now=1, wants=0)
+    s._short_history, s._slower = "its 4-hour candles need 5", [SlowerCandles(240, 60)]
+    s._slower[0].need = 5
+    s._on_bar_sided(bar)  # the model wants out: it exits
+    assert len(sold) == 1 and sold[0][0] == "exit"
+    s, bar, events, sold, opened = _late_strategy(side_now=1)
+    s._short_history, s._slower = "its 4-hour candles need 5", [SlowerCandles(240, 60)]
+    s._slower[0].need = 5
+    s._entry_px, s._entry_side, s._stop_frac, s._tp_frac, s._restore = 100.0, 1, 0.02, 0.05, None
+    s.runtime.backtest, s.runtime.now = False, lambda: None
+    assert s._check_exits(97.5)  # past the 2% stop: it sells
+    assert sold[-1][0] == "stop_loss"
+    s, bar, events, sold, opened = _late_strategy(side_now=0, wants=1)
+    s._short_history, s._slower = "its 4-hour candles need 5", [SlowerCandles(240, 60)]
+    s._slower[0].need = 5
+    s.runtime.now = lambda: None
+    s._on_bar_sided(bar)  # flat and the model wants in: held
+    assert opened == [] and [e[2] for e in events] == ["entry_held"]
+
+
+def test_slower_candles_align_to_the_venues_day_start():
+    from sleeve_fund.venues import VENUES
+
+    assert {v.day_start_minutes for v in VENUES.values()} == {0}  # 00:00 UTC everywhere so far (Advisor, 5 Oct)
+    s = SlowerCandles(1440, 60, day_start=8 * 60)  # a venue whose day started 08:00 UTC
+    closed = [x for _, x in _feed(s, np.arange(48, dtype=float), step=60, start=T0 - 4 * 60 * M) if x is not None]
+    assert [pd.Timestamp(c.end, tz="UTC").hour for c in closed] == [8, 8]  # two days, 08:00 to 08:00, not midnight
 
 
 def test_a_strategy_with_a_slower_filter_trades_the_same_in_a_backtest_and_a_paper_replay(tmp_path):
