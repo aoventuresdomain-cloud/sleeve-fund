@@ -176,7 +176,13 @@ def test_guard_the_open_risk_check_never_gates_a_start(store, monkeypatch):
     _stored(store, "new", strategy="ping_pong", profile="conservative")
     started = _popen(monkeypatch)
     supervisor.Supervisor(store).step()
-    assert started == ["new"] and store.sleeve("new").desired_state == "running"
+    # Open risk never gates a start: "new" starts and runs. Since U35 (CHOKE) the stopped holder "big" may also be
+    # started for its exits only (PE2 22:27, QA option (a)); if it is, it must be paused "exits only", never running.
+    assert "new" in started and set(started) <= {"new", "big"}, started
+    assert store.sleeve("new").desired_state == "running"
+    if "big" in started:
+        big = store.sleeve("big")
+        assert big.status == "paused" and "exits only" in (big.status_reason or ""), (big.status, big.status_reason)
 
 
 def test_the_shipped_stopless_2x_perp_configs_seed_but_are_refused_at_start(store, monkeypatch):
