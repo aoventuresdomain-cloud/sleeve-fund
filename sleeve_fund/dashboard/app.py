@@ -61,6 +61,8 @@ LIQUIDATED_HALT = "Position margin lost (liquidated)"
 # Why a Resume is refused then: the same words as the Resume dialog (QA P1-U25).
 LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it stays halted: resuming doesn't restart it. "
                       "It trades again only after you use Reset after liquidation, which asks for an incident note")
+LIQUIDATED_NO_RESET = ("its position margin was lost (liquidated), so it can't be reset this way; use Reset after "
+                       "liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -461,7 +463,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         perp_x = trading.perp_view(x, position, funding) if perp else None
         # Halted after its position's margin was lost (liquidated): resuming keeps it halted until the PM resets
         # it after liquidation with an incident note (Advisor 6 Oct 17:57), whatever halts it again meanwhile.
-        liquidated = s.status == "halted" and trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
+        # A liquidated strategy can't take an ordinary Reset either, halted or not (Advisor 20:41, QA P1-U27).
+        liquidated_any = not bt_id and trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
+        liquidated = s.status == "halted" and liquidated_any
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -473,7 +477,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total, liquidated=liquidated,
+                    order_total=order_total, liquidated=liquidated, liquidated_any=liquidated_any,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
@@ -692,6 +696,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
+            if trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT):
+                # Advisor 6 Oct 20:41 (QA P1-U27): an ordinary reset would put the liquidation away unanswered.
+                raise ValueError(LIQUIDATED_NO_RESET)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None

@@ -2410,6 +2410,31 @@ def test_a_resume_is_refused_while_liquidated_and_the_page_points_to_the_reset(c
     assert any(cmd["command"] == "resume" for cmd in store.pending_commands("btc-test"))
 
 
+def test_a_reset_is_refused_while_liquidated_and_points_to_the_reset_after_liquidation(client):
+    """Advisor 6 Oct 20:41 (QA P1-U27): an ordinary per-strategy Reset would put the liquidation away
+    unanswered, so it is refused, halted or not, and the Reset button is off, until Reset after liquidation."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "stopped")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    button = page.split('data-open="dlg-reset"')[1].split(">")[0]
+    assert "disabled" in button and "Reset after liquidation" in button
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and "command_error" in r.headers["location"]
+    assert store.pending_reset("btc-test") is None
+    assert "Reset after liquidation" in c.get(r.headers["location"], auth=AUTH).text
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    button = c.get("/sleeves/btc-test", auth=AUTH).text.split('data-open="dlg-reset"')[1].split(">")[0]
+    assert "disabled" not in button
+    r = c.post("/sleeves/btc-test/reset", data={"reason": "Test finished"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" not in r.headers["location"] and store.pending_reset("btc-test") is not None
+
+
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
                                    " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
                                    "Position\u00a0margin lost (liquidated)"])
