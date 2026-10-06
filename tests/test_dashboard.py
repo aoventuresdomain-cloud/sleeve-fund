@@ -996,10 +996,14 @@ def _wavy_minutes(days):
 @pytest.mark.usefixtures("maker_on")
 def test_backtest_matches_maker_orders_on_stored_minutes_and_says_so(client, monkeypatch, tmp_path):
     from sleeve_fund import history
+    from sleeve_fund.dashboard import app as app_mod
     from sleeve_fund.dashboard import preview
     from sleeve_fund.data import synthetic_ohlcv
 
     c, _ = client
+    # A 90-day minute run can outlast the page's 8 s wait on a busy runner, which then shows the run's progress
+    # instead of its result: wait for it, as test_jobs does (QA: this test failed at random).
+    monkeypatch.setattr(app_mod, "BACKTEST_WAIT", 120.0)
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
     deep = _wavy_minutes(90).assign(volume=1_000.0)  # the whole order fits in what one minute shows
     history.HistoryStore(tmp_path / "hist").append("KRAKEN", "ETH/USD", deep, cursor="x")
