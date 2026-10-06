@@ -52,7 +52,8 @@ def auto_warmup(strategy: str, params: dict, bar_spec: str) -> int:
 def check_hub_bar_spec(venue: str, bar_spec: str) -> None:
     """Raises ValueError for the venue's own candles on a venue a market data hub feeds (VenueProfile.hub): there
     every bar is built from the hub's minutes, and slower ones only from P1-4 (QA P1-C7). Checked where a
-    strategy is created, so it is refused there rather than failing to start."""
+    strategy is created, so it is refused there rather than failing to start, and by the supervisor before
+    each start, for one saved before this check (QA P1-C10)."""
     profile = venue_profile(venue)
     if profile.hub and not bar_spec.endswith("-INTERNAL"):
         size = "-".join(bar_spec.split("-")[:2]).lower()  # 1-DAY-LAST-EXTERNAL -> 1-day

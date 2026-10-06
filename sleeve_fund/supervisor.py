@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from sleeve_fund import accounts
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
-from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
+from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import Sleeve, Store, utcnow
 from sleeve_fund.strategies import check_perp_sizing
 
@@ -78,8 +78,16 @@ class Supervisor:
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
         rather than started into a crash loop. A start that only sells a position it holds (a flatten waiting:
-        the kill switch, a PM close) still goes ahead."""
+        the kill switch, a PM close) still goes ahead. One saved on the venue's own candles where the market data
+        hub feeds the venue (check_hub_bar_spec, QA P1-C10) can't start at all, so it is refused even then."""
         s = self.store.sleeve(name)
+        try:
+            check_hub_bar_spec(s.venue, s.bar_spec)
+        except ValueError as exc:
+            self.store.set_desired_state(name, "stopped")
+            self.store.set_status(name, "stopped", f"not started: {exc}")
+            self.store.event(name, "error", "start_refused", f"Not started: {exc}")
+            return True
         try:
             check_perp_sizing(s.strategy, s.params)
         except ValueError as exc:
