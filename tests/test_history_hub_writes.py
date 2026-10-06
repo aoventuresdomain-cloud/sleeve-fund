@@ -99,3 +99,94 @@ def test_bad_bars_are_refused_and_nothing_is_written(tmp_path, bad, why):
 def test_source_must_be_live_or_refill(tmp_path):
     with pytest.raises(ValueError, match="source"):
         HistoryStore(tmp_path).append_bars(V, P, _rows("2026-10-05 12:00", 1), "rest")
+
+
+def test_a_stamp_a_few_ns_off_the_minute_is_refused(tmp_path):
+    t = pd.Timestamp("2026-10-05 12:00", tz="UTC").value + 100  # rounds onto the minute through a float64
+    with pytest.raises(ValueError, match="whole minutes"):
+        HistoryStore(tmp_path).append_bars(V, P, [(t, 1.0, 1.0, 1.0, 1.0, 1.0)], "live")
+
+
+def _loader_page(start, n, price):
+    idx = pd.date_range(start, periods=n, freq="1min", tz="UTC")
+    return pd.DataFrame({"open": price, "high": price + 1, "low": price - 1, "close": price, "volume": 3.0}, index=idx)
+
+
+def test_the_rest_loader_fills_holes_but_never_overwrites_a_hub_bar(tmp_path):
+    # The hub runs the REST backfill in the same process: a loader page overlapping the hub's bars.
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
+    store.append_bars(V, P, _rows("2026-10-05 12:04", 2, price=104.0), "live")  # 12:02-12:03 missed
+    cov = store.append(V, P, _loader_page("2026-10-05 12:00", 7, price=500.0), cursor="next")
+    one = store.read(V, P, 1)
+    stamped = lambda m: pd.Timestamp(m, tz="UTC") + pd.Timedelta("1min")
+    assert one.loc[stamped("2026-10-05 12:00"), "close"] == 100.0  # the hub's bar is kept
+    assert one.loc[stamped("2026-10-05 12:02"), "close"] == 500.0  # the hole is filled from the loader
+    assert store.gaps(V, P) == [] and cov.cursor == "next"
+    kinds = [(r["kind"], r["source"]) for r in store.provenance(V, P)]
+    assert kinds.count(("conflict", "loader")) == 4 and ("refill", "loader") in kinds
+    # 12:06, beyond the hub's newest closed minute, is the loader's newest and may still be forming.
+    assert cov.closed == pd.Timestamp("2026-10-05 12:05", tz="UTC") and cov.last == pd.Timestamp("2026-10-05 12:06", tz="UTC")
+
+
+def test_the_loader_does_not_fill_a_hub_hole_flat(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
+    store.append(V, P, _loader_page("2026-10-05 12:10", 2, price=110.0), cursor="c")  # loader ahead of the hub
+    hole = (pd.Timestamp("2026-10-05 12:02", tz="UTC"), pd.Timestamp("2026-10-05 12:09", tz="UTC"))
+    assert store.gaps(V, P) == [hole]
+
+
+def _rest(start, n, price=90.0):
+    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), periods=n, freq="1min")
+    return pd.DataFrame({"open": price, "high": price + 1, "low": price - 1, "close": price, "volume": 1.0}, index=idx)
+
+
+def test_rest_forming_minute_is_not_promoted_to_complete_when_the_hub_starts_one_minute_later(tmp_path):
+    """QA P1-H1 (quant-review/v2-p1/hub-storage.md): the REST loader's newest minute (12:00) is a part bar. The
+    hub's first stored bar is 12:01, its refill for 12:00 failed or is late. The part bar must not be served as
+    complete, gaps() must show it, and the complete bar must replace it when it comes."""
+    s = HistoryStore(tmp_path)
+    s.append(V, P, _rest("2026-10-05 11:58", 3), cursor="c")  # 12:00 is still forming
+    s.append_bars(V, P, _rows("2026-10-05 12:01", 2), "live")
+    assert pd.Timestamp("2026-10-05 12:01", tz="UTC") not in s.read(V, P, 1).index  # 12:00, stamped at its close
+    at = pd.Timestamp("2026-10-05 12:00", tz="UTC")
+    assert (at, at) in s.gaps(V, P)
+    res = s.append_bars(V, P, _rows("2026-10-05 12:00", 1, 95.0), "refill")
+    assert (res.written, res.conflicts) == (1, 0)
+    assert s.read(V, P, 1).loc[pd.Timestamp("2026-10-05 12:01", tz="UTC"), "close"] == 95.0
+    assert s.gaps(V, P) == [] and s.coverage(V, P).forming is None
+
+
+def test_the_loaders_next_page_completes_its_own_part_bar_after_the_hub_has_started(tmp_path):
+    s = HistoryStore(tmp_path)
+    s.append(V, P, _rest("2026-10-05 11:58", 3), cursor="c")
+    s.append_bars(V, P, _rows("2026-10-05 12:01", 2), "live")
+    s.append(V, P, _rest("2026-10-05 12:00", 2, 96.0), cursor="d")  # resumes on 12:00, now complete
+    assert s.read(V, P, 1).loc[pd.Timestamp("2026-10-05 12:01", tz="UTC"), "close"] == 96.0
+    assert s.read(V, P, 1).loc[pd.Timestamp("2026-10-05 12:02", tz="UTC"), "close"] == 100.0  # the hub's 12:01 kept
+    assert s.coverage(V, P).forming is None and s.gaps(V, P) == []
+
+
+def test_coverage_written_before_the_forming_minute_was_recorded_reads_as_it_did(tmp_path):
+    import json
+
+    s = HistoryStore(tmp_path)
+    s.append(V, P, _rest("2026-10-05 11:58", 3), cursor="c")
+    path = s._dir(V, P) / "coverage.json"
+    raw = json.loads(path.read_text())
+    raw.pop("forming")
+    path.write_text(json.dumps(raw))
+    assert s.coverage(V, P).forming == pd.Timestamp("2026-10-05 12:00", tz="UTC")
+
+
+def test_a_loader_page_ahead_of_the_hub_keeps_the_venues_candles_and_records_the_hubs_later_bars(tmp_path):
+    """Code Reviewer's question on #143: the loader writes past the hub's end; only its newest minute is forming.
+    The hub's live bars arriving later for the minutes in between are conflicts, and the venue's candles stay."""
+    s = HistoryStore(tmp_path)
+    s.append_bars(V, P, _rows("2026-10-05 12:00", 6), "live")  # closed 12:05
+    s.append(V, P, _rest("2026-10-05 12:04", 5, 200.0), cursor="c")  # 12:04-12:08; 12:08 forming
+    res = s.append_bars(V, P, _rows("2026-10-05 12:06", 2, 106.0), "live")
+    assert (res.written, res.conflicts) == (0, 2)
+    assert s.read(V, P, 1).loc[pd.Timestamp("2026-10-05 12:07", tz="UTC"), "close"] == 200.0
+    assert s.coverage(V, P).forming == pd.Timestamp("2026-10-05 12:08", tz="UTC")

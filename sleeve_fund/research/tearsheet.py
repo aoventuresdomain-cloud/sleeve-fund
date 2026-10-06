@@ -7,6 +7,7 @@ import math
 
 import numpy as np
 
+from sleeve_fund.research.guardrails import MIN_OOS_TRADES, nearby_settings
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -17,7 +18,6 @@ from sleeve_fund.research.metrics import (
 )
 from sleeve_fund.research.study import StudyResult
 
-MIN_ROUND_TRIPS = 10
 ROBUST_SHARE = 0.6
 # G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
 # than the best of the variants tried would by luck.
@@ -27,7 +27,13 @@ JUDGED_CHECK = "Runs complete enough to judge"
 NOT_JUDGED = "NOT JUDGED"
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
-OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge")
+NEARBY_CHECK = "Holds at nearby settings"
+RANDOM_ENTRY_CHECK = "Beats random entry times"
+RANDOM_SIDE_CHECK = "Beats random long or short"
+OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
+              RANDOM_ENTRY_CHECK, RANDOM_SIDE_CHECK)
+# More of the test windows' trades than this left out at the edges, and the trade count is flagged.
+EXCLUDED_FLAG = 0.10
 
 
 def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
@@ -90,6 +96,23 @@ def _trial_spread(r: StudyResult, register) -> float | None:
     return float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else None
 
 
+def _breakeven_words(r: StudyResult) -> str:
+    from sleeve_fund.research.study import breakeven_fee
+
+    return breakeven_fee(r.cost_ladder)[1] if r.cost_ladder else "not tested: no cost ladder was run"
+
+
+def _breakeven_cell(row) -> str:
+    """A grid point's break-even fee per side, or why there is none, in a table cell."""
+    fee = row.get("breakeven_fee")
+    if fee is not None and not (isinstance(fee, float) and math.isnan(fee)):
+        return f"{fee:.3%}"
+    words = row.get("breakeven")
+    if not isinstance(words, str):
+        return "–"
+    return "loses at no fee" if words.startswith("loses") else "above the ladder" if words.startswith("still") else "–"
+
+
 def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
     """register: the trials register, when the study ran against the database. Its count of variants, which
     includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
@@ -121,11 +144,20 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
                 f"{_share(beats)} likely to beat it by more than the best of {counts['variants']} variants would by "
                 f"luck ({_num(hurdle)}); bar: {G1_CONFIDENCE:.0%}"),
         ),
+        _random_entry_check(r),
+        (RANDOM_SIDE_CHECK, *((NOT_APPLICABLE, "long only: there is no side to draw") if r.random_side is None else
+                              (NOT_APPLICABLE if r.random_side.verdict == "N/A" else r.random_side.verdict,
+                               r.random_side.words))),
         (
             "Holds up when parameters move",
             "PASS" if share_beating >= ROBUST_SHARE else "FAIL",
             f"{share_beating:.0%} of {len(r.sensitivity)} grid points beat the benchmark Sharpe (bar: {ROBUST_SHARE:.0%})",
         ),
+        # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
+        # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
+        (NEARBY_CHECK, *nearby_settings(r.sensitivity, r.default_params,
+                                        [c for c in r.spec.param_grid if c in r.sensitivity.columns])),
+        ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         (
             "Holdout not used for tuning",
             "PASS",
@@ -140,8 +172,9 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
             # A Sharpe built on a handful of trades is luck, not evidence, so this one fails G1. It counts
             # the trades the out-of-sample Sharpe stands on, not the in-sample ones.
             "Enough out-of-sample trades to judge",
-            "PASS" if trips >= MIN_ROUND_TRIPS else "FAIL",
-            f"{trips} closed in the {len(r.folds)} walk-forward test windows (bar: {MIN_ROUND_TRIPS}); "
+            "PASS" if trips >= MIN_OOS_TRADES else "FAIL",
+            f"{trips} closed in the {len(r.folds)} walk-forward test windows, opened there too (bar: {MIN_OOS_TRADES}); "
+            + _excluded_words(r) +
             f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
     ]
@@ -154,13 +187,33 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
     return checks
 
 
+def _random_entry_check(r: StudyResult) -> tuple[str, str, str]:
+    """C3: a weak benchmark is not judged, neither a pass nor a fail, and says why (Advisor, 19:19). The Sharpe
+    test against buy-and-hold still has to pass on its own."""
+    re_ = r.random_entry
+    if re_ is None or re_.verdict == "N/A":
+        return RANDOM_ENTRY_CHECK, NOT_APPLICABLE, "no out-of-sample trades to compare"
+    if re_.verdict == "WEAK":
+        return RANDOM_ENTRY_CHECK, NOT_APPLICABLE, f"weak, not judged (in market {re_.exposure:.0%}): {re_.words}"
+    return RANDOM_ENTRY_CHECK, re_.verdict, re_.words
+
+
+def _excluded_words(r: StudyResult) -> str:
+    excluded = r.excluded_trades
+    if not excluded:
+        return ""
+    share = excluded / (excluded + r.oos_trades)
+    flag = f"; flagged: more than {EXCLUDED_FLAG:.0%}" if share > EXCLUDED_FLAG else ""
+    return f"{excluded} left out at the windows' edges ({share:.0%}{flag}); "
+
+
 def oos_gaps(r: StudyResult) -> str:
     """Why out-of-sample has test windows without a trade, in words, or '' when every window traded.
     A halted fold reads +0.0% with a Sharpe of 0.00, which looks like a result and isn't one. Halts
     before a test window and inside one are told apart: only the first leaves the whole window flat,
     so the counts can't seem to disagree (review round 9, N6)."""
     n = len(r.folds)
-    idle = [f for f in r.folds if f.test_trades == 0]
+    idle = [f for f in r.folds if f.closed_in_window == 0]
     halted = [f for f in r.folds if f.halted]
     if not idle and not halted:
         return ""
@@ -176,7 +229,7 @@ def oos_gaps(r: StudyResult) -> str:
             split.append(f"{len(before)} in the training stretch, so {'that' if len(before) == 1 else 'each'} "
                          "test window sat flat at +0.0% throughout")
         if inside:
-            traded = sum(1 for f in inside if f.test_trades)
+            traded = sum(1 for f in inside if f.closed_in_window)
             split.append(f"{len(inside)} inside the test window, flat from then on"
                          + (f" ({traded} of them closed a trade first)" if traded else ""))
         words.append(
@@ -332,19 +385,20 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     for f in r.folds:
         out.append(
             f"| {f.train_start:%b %Y} to {f.train_end:%b %Y} | {f.test_end:%b %Y} | {json.dumps(f.chosen)} "
-            f"| {_num(f.train_sharpe)} | {f.test_trades}{_halted_on(f.halted)} | {_pct(f.test['cagr'])} "
+            f"| {_num(f.train_sharpe)} | {f.closed_in_window}{_halted_on(f.halted)} | {_pct(f.test['cagr'])} "
             f"| {_pct(f.benchmark_test['cagr'])} | {_num(f.test['sharpe'])} | {_num(f.benchmark_test['sharpe'])} |"
         )
     out.append("")
     out.append("## Parameter sensitivity (full research period, in-sample)")
     out.append("")
     cols = [c for c in r.sensitivity.columns if c in spec.param_grid]
-    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips |")
-    out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- |")
+    out.append("| " + " | ".join(cols) + " | CAGR | Sharpe | Max DD | Round trips | Break-even fee |")
+    out.append("| " + " | ".join("---" for _ in cols) + " | --- | --- | --- | --- | --- |")
     for _, row in r.sensitivity.iterrows():
         out.append(
             "| " + " | ".join(_param(row[c]) for c in cols)
-            + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} |"
+            + f" | {_pct(row['cagr'])} | {_num(row['sharpe'])} | {_pct(row['max_drawdown'])} | {int(row['round_trips'])} "
+            f"| {_breakeven_cell(row)} |"
         )
     out.append(f"\nBenchmark over the same period: CAGR {_pct(full_b['cagr'])}, Sharpe {_num(full_b['sharpe'])}.")
     out.append("")

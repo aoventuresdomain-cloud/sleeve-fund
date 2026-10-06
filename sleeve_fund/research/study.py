@@ -21,6 +21,7 @@ from nautilus_trader.model import CurrencyPair
 from sleeve_fund.instruments import FeeSchedule, pair_of
 from sleeve_fund.markets import PERP
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
+from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
     daily_returns,
     fills_to_rows,
@@ -48,11 +49,26 @@ class Fold:
     train_sharpe: float
     test: dict
     benchmark_test: dict
-    test_trades: int = 0  # round trips closed inside the test window: what out-of-sample was judged on
+    # Round trips opened and closed inside the test window: what out-of-sample is judged on. A trip carried in
+    # from training, or still open when the window ends, is left out and counted (Advisor, 5 Oct 2026).
+    test_trades: int = 0
+    carried_in: int = 0
+    carried_out: int = 0
+    # The counted trips as (opened, closed, side), for the random-entry and random-side benchmarks.
+    trips: list = field(default_factory=list)
+    # The test window's bars, and how many of them held any position, carried-in and still-open ones too: the
+    # random-entry benchmark's "in the market" (Independent Quant Advisor, 6 Oct 2026, QA P1-R2).
+    window_bars: int = 0
+    in_market_bars: int = 0
     # When the risk guard halted the run before the test window ended: the day, why, and whether
     # it was in the training stretch the run traded through first. A halted fold is flat from then on.
     halted: str = ""
     halted_before_test: bool = False  # halted in the training stretch: the whole test window sat flat
+
+    @property
+    def closed_in_window(self) -> int:
+        """Round trips closed inside the test window, carried in or not: whether the window traded at all."""
+        return self.test_trades + self.carried_in
 
 
 @dataclass
@@ -87,6 +103,10 @@ class StudyResult:
     # The default params over the research period at each fee of COST_LADDER: what costs the idea survives.
     cost_ladder: list[LadderRung] = field(default_factory=list)
     ladder_slippage: float = 0.0  # charged on every rung on top of the half spread, on orders that take liquidity
+    # Out-of-sample timing against random entry times, and for strategies that can go short, side against random
+    # sides (v2 P1-7, C3 and C3b).
+    random_entry: RandomEntryResult | None = None
+    random_side: RandomSideResult | None = None
 
     @property
     def not_judged(self) -> str:
@@ -103,7 +123,7 @@ class StudyResult:
             return (f"the strategy raised {self.error_count} error{'s' if self.error_count != 1 else ''} in "
                     f"{len(self.errors)} of its runs, the first {handler_error_words(handler, what)}, so its "
                     "orders after that may be wrong")
-        blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.test_trades == 0)]
+        blind = [f for f in self.folds if f.halted_before_test or (f.halted and f.closed_in_window == 0)]
         # Half blind is not judged either: the other half then holds the halted windows' stubs too, so the
         # verdict would rest on a window or two (review round 10, M10-1).
         if blind and (2 * len(blind) >= len(self.folds) or self.oos_trades == 0):
@@ -120,8 +140,14 @@ class StudyResult:
 
     @property
     def oos_trades(self) -> int:
-        """Round trips closed inside the walk-forward test windows: the trades out-of-sample stands on."""
+        """Round trips opened and closed inside the walk-forward test windows: the trades out-of-sample stands on."""
         return sum(f.test_trades for f in self.folds)
+
+    @property
+    def excluded_trades(self) -> int:
+        """Round trips at the test windows' edges, left out of the count: carried in from training, or still
+        open when the window ended."""
+        return sum(f.carried_in + f.carried_out for f in self.folds)
 
     @property
     def trade_stats(self) -> dict:
@@ -276,7 +302,7 @@ def run_study(
     errors: list = []
     error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
-    total = (1 + len(combos) + 1 + folds_n * (len(combos) + 1) + len(COST_LADDER)
+    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 1 + folds_n * (len(combos) + 1) + len(COST_LADDER)
              + (2 if use_holdout and holdout_days else 0))
     done = [0]
 
@@ -326,29 +352,39 @@ def run_study(
     bench_ret = daily_returns(bench.equity)
 
     # 1. Sensitivity over the full research period.
+    # The cost ladder: a variant over the research period at each fee. Not logged as variants, since the
+    # strategy is the same; only what it pays changes. Every variant gets one (v2 P1-6), so a break-even fee
+    # sits next to each grid point, not only the default's.
+    slip = ladder_slippage(pair_of(instrument))
+
+    def cost_ladder(params: dict) -> list[LadderRung]:
+        rungs = []
+        for fee in COST_LADDER:
+            res = bt(spec.name, research, params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
+                     slippage=slip)
+            eq = res.equity
+            rungs.append(LadderRung(fee=fee, total_return=float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0,
+                                    sharpe=summary(daily_returns(eq))["sharpe"],
+                                    round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid))
+        return rungs
+
     rows = []
-    full_default = None
+    full_default, ladder = None, None
     for params in combos:
         res = bt(spec.name, research, params)
         m = summary(daily_returns(res.equity))
         log(params, "sensitivity", m["sharpe"], research)
-        rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid})
+        rungs = cost_ladder(params)
+        fee, words = breakeven_fee(rungs)
+        rows.append({**params, **m, "round_trips": len(round_trips(res.fills, res.shorts)), "fees": res.fees_paid,
+                     "breakeven_fee": float("nan") if fee is None else fee, "breakeven": words})
         if params == default_params:
-            full_default = res
+            full_default, ladder = res, rungs
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
+    if ladder is None:
+        ladder = cost_ladder(default_params)
     sensitivity = pd.DataFrame(rows)
-
-    # The cost ladder: the default params over the research period at each fee. Not logged as variants, since
-    # the strategy is the same; only what it pays changes.
-    ladder, slip = [], ladder_slippage(pair_of(instrument))
-    for fee in COST_LADDER:
-        res = bt(spec.name, research, default_params, fees=FeeSchedule(maker=Decimal(str(fee)), taker=Decimal(str(fee))),
-                 slippage=slip)
-        eq = res.equity
-        ladder.append(LadderRung(fee=fee, total_return=float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0,
-                                 sharpe=summary(daily_returns(eq))["sharpe"],
-                                 round_trips=len(round_trips(res.fills, res.shorts)), fees_paid=res.fees_paid))
 
     # 2. Walk-forward.
     folds: list[Fold] = []
@@ -378,8 +414,9 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=summary(b_ret),
-                test_trades=sum(1 for t in trades(fills_to_rows(run.fills), run.shorts)
-                                if t["closed"] is not None and _utc(t["closed"]) >= _utc(test_idx[0])),
+                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0]),
+                window_bars=len(test_idx),
+                in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),
             )
@@ -417,6 +454,9 @@ def run_study(
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),
     )
+    # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
+    result.random_entry, result.random_side = _benchmarks(
+        research, folds, test_bars, float(instrument.taker_fee) + spread_used, full_default.shorts)
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "
@@ -510,6 +550,56 @@ def _holdout_trades(run: BacktestResult, start) -> int:
     """Round trips opened and closed inside the holdout."""
     return sum(1 for t in trades(fills_to_rows(run.fills), run.shorts)
                if t["closed"] is not None and _utc(t["opened"]) >= _utc(start))
+
+
+def _window_trips(trips: list[dict], test_start) -> dict:
+    """A test-window run's round trips sorted into the counted ones and those at the window's edges."""
+    start = _utc(test_start)
+    counted = [t for t in trips if t["opened"] is not None and t["closed"] is not None and _utc(t["opened"]) >= start]
+    carried_in = sum(1 for t in trips if t["closed"] is not None and _utc(t["closed"]) >= start
+                     and (t["opened"] is None or _utc(t["opened"]) < start))
+    carried_out = sum(1 for t in trips if t["closed"] is None)  # still open at the window's end, wherever it opened
+    return {"test_trades": len(counted), "carried_in": carried_in, "carried_out": carried_out,
+            "trips": [(_utc(t["opened"]), _utc(t["closed"]), int(t["side"])) for t in counted]}
+
+
+def _in_market_bars(exposure: pd.Series, first, last) -> int:
+    """The bars from first to last, inclusive, that closed holding a position of any size or side."""
+    if exposure is None or exposure.empty:
+        return 0
+    idx = exposure.index
+    inside = exposure[(idx >= first) & (idx <= last)]
+    return int((inside.abs() > 1e-9).sum())
+
+
+def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool):
+    """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
+    counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
+    are priced on those bars' closes, so the benchmark compares timing, not fills."""
+    index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
+
+    def bar(ts) -> int:
+        return max(int(index.searchsorted(ts, side="right")) - 1, 0)
+
+    windows, placed = [], []
+    for f in folds:
+        end = bar(f.test_end)
+        start = end - test_bars + 1
+        windows.append((start, end))
+        last = start
+        for opened, closed, side in sorted(f.trips):
+            entry = max(bar(opened), last)  # one position at a time on the bar grid too
+            out = min(max(bar(closed), entry + 1), end)
+            if out <= entry:
+                continue
+            placed.append(Trade(entry, out, side))
+            last = out
+    closes = prices["close"].to_numpy(dtype=float)
+    bars = sum(f.window_bars for f in folds)
+    in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
+    entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
+    side = random_side(closes, placed, windows, cost_per_side) if shorts else None
+    return entry, side
 
 
 def _utc(ts) -> pd.Timestamp:

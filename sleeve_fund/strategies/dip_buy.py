@@ -11,7 +11,7 @@ from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Atr, Rsi, Sma, settle_bars
+from sleeve_fund.strategies.indicators import AtrSma, Rsi, Sma, settle_bars
 
 DAY_NS = 86_400_000_000_000
 
@@ -94,7 +94,7 @@ class DipBuy(LongFlatStrategy):
         self.c = config
         per_day = 1440 // bar_minutes(config.bar_type)
         self.rsi = Rsi(config.rsi_period)
-        self.atr = Atr(config.dip_atr_bars)
+        self.atr = AtrSma(config.dip_atr_bars)
         self.exit_avg = Sma(config.exit_sma)
         self._highs: deque[float] = deque(maxlen=per_day)  # the last 24 hours of bars
         self._lows: deque[float] = deque(maxlen=per_day)
