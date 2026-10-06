@@ -70,9 +70,11 @@ def _guards_off(reason=GUARDS_OFF):
 def _guard_marks(monkeypatch, request):
     """The guard-lift mark, applied here so this file behaves the same in the repo and run from QA's shared folder,
     where tests/conftest.py isn't loaded; as the repo's conftest does, open risk reads a calm 2% daily ATR unless
-    real_daily_atr."""
-    from sleeve_fund import open_risk
-
+    real_daily_atr. A head without the open-risk limit (before stop safety) has nothing to lift."""
+    try:
+        from sleeve_fund import open_risk
+    except ImportError:
+        return
     if request.node.get_closest_marker("real_daily_atr") is None:
         monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
     if request.node.get_closest_marker("no_open_risk_limit") is not None:
