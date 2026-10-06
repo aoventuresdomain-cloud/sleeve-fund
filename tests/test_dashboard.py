@@ -2380,6 +2380,78 @@ def test_a_liquidation_order_alone_marks_the_halt_as_liquidated(client):
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
 
 
+def test_a_resume_is_refused_while_liquidated_and_the_page_points_to_the_reset(client):
+    """QA P1-U25 and U26: the server refuses a Resume while liquidated (a stale page or a direct post), the
+    dialog offers no Resume button, and the halted banner points to Reset after liquidation."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Nothing trades until you resume" not in page
+    assert "nothing trades until you use Reset after liquidation, which asks for an incident note" in page
+    dialog = page.split('id="dlg-resume"')[1].split("</dialog>")[0]
+    assert 'value="resume"' not in dialog and ">Resume trading<" not in dialog and ">Close<" in dialog
+    r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and "command_error" in r.headers["location"]
+    assert not any(cmd["command"] == "resume" for cmd in store.pending_commands("btc-test"))
+    assert "Reset after liquidation" in c.get(r.headers["location"], auth=AUTH).text
+    # After the reset, an ordinary halt resumes as before.
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Nothing trades until you resume" in page
+    assert 'value="resume"' in page.split('id="dlg-resume"')[1].split("</dialog>")[0]
+    r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"]
+    assert any(cmd["command"] == "resume" for cmd in store.pending_commands("btc-test"))
+
+
+@pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
+                                   " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
+                                   "Position\u00a0margin lost (liquidated)"])
+def test_the_liquidated_halt_matches_in_any_case_and_spacing(client, words):
+    """QA P1-U28a."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "risk_halt", words)
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_liquidation_order_in_the_same_instant_as_the_reset_wins_the_tie(client):
+    """QA P1-U28b: orders and events share no id, so a liquidation order with the reset's timestamp counts,
+    unless the reset answered a liquidation event of that same instant."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    at = utcnow()
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation", ts=at)
+    store.record_order("btc-test", order_id="L-1", side="SELL", qty=0.05, intent="liquidation",
+                       reason="Liquidated", ts=at)
+    assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_reset_answering_a_liquidation_of_the_same_instant_clears_it(client):
+    """The engine journals the event with the order; a reset of that instant, written after both, clears it."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    at = utcnow()
+    store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
+    store.record_order("btc-test", order_id="L-1", side="SELL", qty=0.05, intent="liquidation",
+                       reason="Liquidated", ts=at)
+    store.event("btc-test", "error", "liquidation", "Liquidated: gapped through the liquidation price", ts=at)
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation", ts=at)
+    assert "it stays halted" not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
 def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
     """Code review on #164: the liquidation is found however many events came after it."""
     c, store = client

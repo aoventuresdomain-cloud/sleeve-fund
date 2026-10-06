@@ -58,6 +58,9 @@ from sleeve_fund.wording import no_venues
 HERE = Path(__file__).resolve().parent
 # How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
 LIQUIDATED_HALT = "Position margin lost (liquidated)"
+# Why a Resume is refused then: the same words as the Resume dialog (QA P1-U25).
+LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it stays halted: resuming doesn't restart it. "
+                      "It trades again only after you use Reset after liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -639,6 +642,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # weeks later; it lapses instead, and the decision log says so.
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
+            elif (command == "resume" and st().sleeve(name).status == "halted"
+                  and trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)):
+                # The dialog says so too; a stale page or a direct post must not restart it (QA P1-U25).
+                raise ValueError(LIQUIDATED_REFUSAL)
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).

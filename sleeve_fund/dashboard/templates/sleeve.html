@@ -38,7 +38,7 @@
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
   <strong>{{ s.status|capitalize }}:</strong> {{ s.status_reason }}.
-  {% if s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
+  {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
@@ -347,10 +347,11 @@
     {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now would drop it, so Stop is off until the strategy is flat.</div>{% endif %}
     {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
     {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
-    {{ reason_picker(cmd, 'r-' ~ cmd) }}
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button>
+    {% set refused = cmd == 'resume' and liquidated %}{# no Resume to offer: the server refuses it (QA P1-U25) #}
+    {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>{{ 'Close' if refused else 'Cancel' }}</button>
       {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
-      <button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button></div>
+      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button>{% endif %}</div>
   </form>
 </dialog>
 {% endfor %}
