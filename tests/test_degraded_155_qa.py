@@ -542,6 +542,8 @@ def _says_y_at_entry(text, equity_at_entry):
 
 
 # P1-D15 full-margin case fixed at 26fd993 (X with both fees): mark removed. Shipped caps: see the pin further down.
+@pytest.mark.no_open_risk_limit  # stop safety: a stopless model above 1x is refused; these test the liquidation
+@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
     a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
@@ -814,9 +816,13 @@ def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0,
                     assert c.post(f"/sleeves/{name}/command", data={"command": "stop", "reason": "QA stop"}, auth=auth,
                                   headers=same, follow_redirects=False).status_code == 303
                     sv.step()
-                    assert store.sleeve(name).status == "stopped"  # the supervisor writes "stopped" over the halt
-                    assert c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "QA start"}, auth=auth,
-                                  headers=same, follow_redirects=False).status_code == 303
+                    s = store.sleeve(name)  # HC (HoE 20:03): after Stop it isn't trading, the halt stays, Start is refused
+                    assert s.desired_state == "stopped" and sv.procs[name].popen is None, (s.desired_state, sv.procs[name])
+                    assert s.status == "halted", (s.status, s.status_reason)
+                    r = c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "QA start"}, auth=auth,
+                               headers=same, follow_redirects=False)
+                    assert r.status_code == 303 and "command_error" in r.headers["location"], r.headers.get("location")
+                    assert store.sleeve(name).desired_state == "stopped"
                     sv.procs[name].popen = None
                     sv.step()
                 finally:
@@ -847,6 +853,8 @@ def _says_margin_lost(text, margin, equity_at_entry):
     _says_y_at_entry(text, equity_at_entry)
 
 
+@pytest.mark.no_open_risk_limit  # stop safety: a stopless model above 1x is refused; these test the liquidation
+@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 # P1-D15 shipped caps, P1-D17 and P1-D18 fixed on the next head after 26fd993 (PE2): marks removed.
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_halted(tmp_path, side, profile):
@@ -860,6 +868,8 @@ def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_ha
     _says_margin_lost(first["reason"], first["margin"], first["equity_at_entry"])  # last: Y at entry (P1-D20)
 
 
+@pytest.mark.no_open_risk_limit  # stop safety: a stopless model above 1x is refused; these test the liquidation
+@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_path, side, profile):
     """Head of QA adversarial case (HC, owned by PE2's stop-safety PR; reported on #155): a liquidation that loses
@@ -876,6 +886,8 @@ def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_
         assert "drawdown" not in st["reason"], st  # not a fresh drawdown text
 
 
+@pytest.mark.no_open_risk_limit  # stop safety: a stopless model above 1x is refused; these test the liquidation
+@pytest.mark.no_perp_stop_check  # path itself, so the gates are lifted for them only (HoE 20:04, option (a))
 @pytest.mark.parametrize("side,profile,pct,balance,size", [
     pytest.param("short", "balanced", 0.1, 10_000.0, 1.0, id="short-2x-10pct"),
     pytest.param("long", "aggressive", 0.1, 10_000.0, 1.0, id="long-3x-10pct"),

@@ -69,3 +69,13 @@ def _open_risk_setup(monkeypatch, request):
         from sleeve_fund import open_risk
 
         monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if "no_perp_stop_check" in request.keywords:
+        # A mechanics test of the liquidation path with a stopless perp above 1x, which stop safety refuses
+        # (strategies.check_perp_stop at Start, in the supervisor and in the engine): lifted for that test only.
+        from sleeve_fund import supervisor
+        from sleeve_fund.dashboard import app
+        from sleeve_fund.strategies import base
+
+        monkeypatch.setattr(supervisor, "check_perp_stop", lambda *a, **k: None)
+        monkeypatch.setattr(app, "check_perp_stop", lambda *a, **k: None)
+        monkeypatch.setattr(base.LongFlatStrategy, "_refused_to_trade", staticmethod(lambda sleeve: None))
