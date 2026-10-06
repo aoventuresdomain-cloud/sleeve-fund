@@ -28,17 +28,18 @@ def _fills(r):
             for f in r.fills.itertuples()]
 
 
-# Recorded on main before P2-1 (0ceac6f). The same 21 runs over every model, with and without a risk profile and
-# with each kind of stop, were checked identical to the byte; these three are pinned here.
+# Recorded on main (5df446a, re-recorded after main moved the fee rounding's cent into the price); the branch matches
+# it exactly. The same 21 runs over every model, with and without a risk profile and with each kind of stop, were
+# checked identical to the byte; these three are pinned here.
 LEGACY = [
     ({"stop_loss": 0.05, "risk_per_trade": 0.02}, None, 9800.0,
-     [("BUY", "0.20752534", "14483.207985", "2018-07-20"), ("SELL", "0.20752534", "13745.293915", "2018-08-09")]),
-    ({"market": "perp", "allow_short": True, "stop_loss": 0.04}, "balanced", 9579.701757,
-     [("BUY", "0.45592799", "14477.417597", "2018-07-20"), ("SELL", "0.45592799", "14175.242334", "2018-07-25"),
-      ("BUY", "0.43499491", "14942.424093", "2018-07-26"), ("SELL", "0.43499491", "14341.855671", "2018-07-27")]),
+     [("BUY", "0.20752534", "14483.246220", "2018-07-20"), ("SELL", "0.20752534", "13745.327462", "2018-08-09")]),
+    ({"market": "perp", "allow_short": True, "stop_loss": 0.04}, "balanced", 9579.70196,
+     [("BUY", "0.45592799", "14477.417597", "2018-07-20"), ("SELL", "0.45592799", "14175.234336", "2018-07-25"),
+      ("BUY", "0.43499491", "14942.424270", "2018-07-26"), ("SELL", "0.43499491", "14341.864696", "2018-07-27")]),
     ({}, "balanced", 15440.0,
-     [("BUY", "0.22796399", "14483.207985", "2018-07-20"), ("SELL", "0.22796399", "33492.735255", "2019-07-19"),
-      ("BUY", "0.14467298", "32511.417585", "2019-07-20"), ("SELL", "0.14467298", "41355.571870", "2020-02-11")]),
+     [("BUY", "0.22796399", "14483.207985", "2018-07-20"), ("SELL", "0.22796399", "33492.732967", "2019-07-19"),
+      ("BUY", "0.14467298", "32511.413531", "2019-07-20"), ("SELL", "0.14467298", "41355.592699", "2020-02-11")]),
 ]
 
 
