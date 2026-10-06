@@ -138,7 +138,7 @@ def _num(x) -> str:
 def exits_sentence(v: dict) -> str:
     """Step 3 in one sentence: the stop, the target and the risk profile (twin: exitsSentence in research.html)."""
     if v.get("stop_atr"):
-        stop = (f"Stop {_num(v['stop_atr'])} average true ranges below entry "
+        stop = (f"Stop {_num(v['stop_atr'])} simple average true ranges below entry "
                 f"({_num(v.get('atr_bars') or 14)} bars).")
     elif v.get("stop_loss_pct"):
         stop = f"Stop {_num(v['stop_loss_pct'])}% below entry."

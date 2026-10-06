@@ -43,7 +43,7 @@ def signal_items(signal: dict | None) -> list[tuple[str, str]]:
         elif k == "volume_x":
             label, text = "Volume vs normal", f"{v:.2f}x"
         elif k == "atr":
-            label, text = "ATR", _px(v)
+            label, text = "Simple ATR", _px(v)
         elif k in _PX:
             label, text = {"close": "Bar close", "price": "Last price", "entry_px": "Entry", "peak": "Peak close",
                            "trail_stop": "Trailing stop"}[k], _px(v)

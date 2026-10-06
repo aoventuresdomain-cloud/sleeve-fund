@@ -17,7 +17,7 @@ DAY_NS = 86_400_000_000_000
 
 SPEC = IdeaSpec(
     summary="In a daily up-trend, buys when 4-hour RSI({rsi_period}) is at or below {rsi_entry:g} and the close is "
-            "{dip_atr:g} ATR below the day's high; sells at the {exit_sma}-bar average or after {time_stop_bars} "
+            "{dip_atr:g} simple ATR below the day's high; sells at the {exit_sma}-bar average or after {time_stop_bars} "
             "bars. Mirrored short in a down-trend (on a perpetual; held flat on spot).",
     name="dip_buy",
     family="pullback-in-trend",
@@ -28,9 +28,9 @@ SPEC = IdeaSpec(
     rules=(
         "Daily regime from the last closed day: up when the close is above its trend_sma_days simple average and "
         "the trend_ema_days exponential average rose that day; down when below and falling. On each decision bar "
-        "close (4 hours), with Wilder's RSI(rsi_period) and ATR(dip_atr_bars) of those bars. Flat, up-trend: long "
-        "when RSI <= rsi_entry and the close is at least dip_atr ATR below the highest high of the last 24 hours. "
-        "Flat, down-trend: short when RSI >= 100 - rsi_entry and the close is at least dip_atr ATR above the lowest "
+        "close (4 hours), with Wilder's RSI(rsi_period) and the simple ATR(dip_atr_bars) of those bars. Flat, up-trend: long "
+        "when RSI <= rsi_entry and the close is at least dip_atr simple ATR below the highest high of the last 24 hours. "
+        "Flat, down-trend: short when RSI >= 100 - rsi_entry and the close is at least dip_atr simple ATR above the lowest "
         "low of the last 24 hours. A leg ends when the close reaches its exit_sma-bar simple average (at or above "
         "for a long, at or below for a short) or after time_stop_bars bars. The stop comes from the exits (the "
         "sprint's: stop_atr = 2 over atr_bars = 20). Market orders (the research spec's maker entry waits until "
@@ -162,12 +162,12 @@ class DipBuy(LongFlatStrategy):
             self._why = ("The daily trend averages are still filling: no position", {})
         elif regime == 1 and rsi <= c.rsi_entry and dip >= c.dip_atr * atr:
             self._side, self._held = 1, 0
-            self._why = (f"Daily up-trend, RSI {rsi:.1f} at or below {c.rsi_entry:g} and the close {dip / atr:.2f} ATR "
+            self._why = (f"Daily up-trend, RSI {rsi:.1f} at or below {c.rsi_entry:g} and the close {dip / atr:.2f} simple ATR "
                          f"below the day's high {high24:,.6g}: long until the {c.exit_sma}-bar average", {})
         elif regime == -1 and rsi >= 100 - c.rsi_entry and rip >= c.dip_atr * atr:
             self._side, self._held = -1, 0
             self._why = (f"Daily down-trend, RSI {rsi:.1f} at or above {100 - c.rsi_entry:g} and the close "
-                         f"{rip / atr:.2f} ATR above the day's low {low24:,.6g}: short until the "
+                         f"{rip / atr:.2f} simple ATR above the day's low {low24:,.6g}: short until the "
                          f"{c.exit_sma}-bar average", {})
         elif not ended:
             trend = {1: "up-trend", -1: "down-trend", 0: "no daily trend"}[regime]

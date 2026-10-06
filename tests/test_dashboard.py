@@ -352,7 +352,7 @@ def test_risk_overview_lists_room_before_halt_and_stops(client):
     page = c.get("/risk", auth=AUTH).text
     overview = page.split('data-panel="overview"', 1)[1].split('data-panel="limits"', 1)[0]
     assert "Limits by strategy" not in overview and "Limits by strategy" in page  # the full table is on Limits
-    assert '<span class="rh-chip ok" title="2.0 ATR (14 bars) below entry">2 ATR</span>' in overview
+    assert '<span class="rh-chip ok" title="2.0 simple ATR (14 bars) below entry">2 simple ATR</span>' in overview
     assert '<span class="rh-chip warn">None</span>' in overview
     assert 'class="w" style="width:60.0%"' in overview and "8.0% left" in overview
     assert "If the market moved now" in overview and "Book drawdown, 30 days" in overview
@@ -1485,7 +1485,7 @@ def test_a_strategy_takes_an_atr_stop_and_a_target_in_multiples_of_it(client):
     assert params["stop_atr"] == 2.5 and params["atr_bars"] == 20 and params["take_profit_r"] == 3.0
     assert store.sleeve("btc-test").warmup_bars >= 21  # the ATR's bars load at start, like the model's
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    assert "2.5 ATR (20 bars) below entry" in page and "3.0R after costs" in page
+    assert "2.5 simple ATR (20 bars) below entry" in page and "3.0R after costs" in page
     clone = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "stop_atr=2.5" in clone and "take_profit_r=3" in clone  # Clone with changes keeps them
     form = c.get("/sleeves/new?stop_atr=2.5&take_profit_r=3", auth=AUTH).text
@@ -1514,7 +1514,7 @@ def test_risk_settings_change_in_place_with_a_reason_and_restart(client):
                         "take_profit_r": 3.0, "max_notional": 500.0}  # the model and order type untouched
     assert s.warmup_bars >= 11  # enough bars for the new stop's average true range
     (d,) = store.decisions("btc-test", action="change_settings")
-    assert "Risk profile balanced to conservative" in d["reason"] and "Stop-loss 8% below the entry to 2 average" \
+    assert "Risk profile balanced to conservative" in d["reason"] and "Stop-loss 8% below the entry to 2 simple average" \
         in d["reason"] and d["reason"].endswith("tighter risk")
     assert store.pending_reload("btc-test") is not None
     assert store.last_event("btc-test", ("exits_change",)) is not None
@@ -1818,7 +1818,7 @@ def test_every_page_renders_for_every_stop_type_and_strategy_state(client, monke
                                 risk_profile="balanced")
             if state in ("running", "paused", "halted", "holding"):
                 rt = SleeveRuntime(store, name)
-                basis = {"atr": "2 x the 14-bar average true range (1,000)",
+                basis = {"atr": "2 x the 14-bar simple average true range (1,000)",
                          "swing": "at the lowest low of the last 10 bars (48,500)"}.get(kind)
                 sig = {"stop_frac": 0.03, "tp_frac": 0.07, "risk_amount": 70.0, "planned_r": 2.0,
                        "stop_cfg": {k: v for k, v in exits.items() if k.startswith(("stop", "atr"))},

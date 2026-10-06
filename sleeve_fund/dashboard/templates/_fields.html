@@ -57,12 +57,12 @@
     <div class="field"><label for="stop_kind">Stop-loss</label><select id="stop_kind" data-kind="stop">
       <option value="" {{ 'selected' if not stop_kind }}>None</option>
       <option value="pct" {{ 'selected' if stop_kind == 'pct' }} data-exit-tpl="A % {stop} the entry">A % {{ w.stop }} the entry</option>
-      <option value="atr" {{ 'selected' if stop_kind == 'atr' }} data-exit-tpl="Average true ranges {stop} the entry">Average true ranges {{ w.stop }} the entry</option>
+      <option value="atr" {{ 'selected' if stop_kind == 'atr' }} data-exit-tpl="Simple average true ranges {stop} the entry">Simple average true ranges {{ w.stop }} the entry</option>
       <option value="swing" {{ 'selected' if stop_kind == 'swing' }} data-exit-tpl="At the recent {swing_short}">At the recent {{ w.swing_short }}</option>
     </select></div>
     <div class="field" data-stop="pct"><label for="stop_loss_pct" data-exit-tpl="Stop, % {stop} entry">Stop, % {{ w.stop }} entry</label><input id="stop_loss_pct" name="stop_loss_pct" type="number" min="0.1" max="50" step="0.01" placeholder="e.g. 5" value="{{ pre.get('stop_loss_pct', '') }}"></div>
-    <div class="field" data-stop="atr"><label for="stop_atr" data-exit-tpl="Stop, average true ranges {stop} entry">Stop, average true ranges {{ w.stop }} entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>
-    <div class="field" data-stop="atr"><label for="atr_bars">Average true range over, bars</label><input id="atr_bars" name="atr_bars" type="number" min="2" max="500" step="1" value="{{ pre.get('atr_bars', 14) }}"></div>
+    <div class="field" data-stop="atr"><label for="stop_atr" data-exit-tpl="Stop, simple average true ranges {stop} entry">Stop, simple average true ranges {{ w.stop }} entry</label><input id="stop_atr" name="stop_atr" type="number" min="0.1" max="20" step="0.1" placeholder="e.g. 2" value="{{ pre.get('stop_atr', '') }}"></div>
+    <div class="field" data-stop="atr"><label for="atr_bars">Simple average true range over, bars</label><input id="atr_bars" name="atr_bars" type="number" min="2" max="500" step="1" value="{{ pre.get('atr_bars', 14) }}"></div>
     <div class="field" data-stop="swing"><label for="stop_swing_bars" data-exit-tpl="Stop at the {swing} of the last, bars">Stop at the {{ w.swing }} of the last, bars</label><input id="stop_swing_bars" name="stop_swing_bars" type="number" min="2" max="500" step="1" placeholder="e.g. 20" value="{{ pre.get('stop_swing_bars', '') }}"></div>
   </div>
   <div class="grid2">
