@@ -32,7 +32,7 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
-from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, ROUND_UP_FLAG, Sizing, SizingInputs, size_entry
+from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, ROUND_UP_FLAG, Sizing, SizingInputs, rounds_up_too_often, size_entry
 from sleeve_fund.strategies.indicators import Atr, AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -1204,6 +1204,8 @@ class LongFlatStrategy(Strategy):
             return
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
         share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+        if self._cfg.sizing == "central" and not self._central_stop_ok():
+            return
         if self._stop_frac and self._cfg.sizing == "central":
             sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share)
             if not sizing.ok:
@@ -1465,6 +1467,8 @@ class LongFlatStrategy(Strategy):
         if weight < 1:
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         sizing = None
+        if self._cfg.sizing == "central" and not self._central_stop_ok():
+            return
         if self._stop_frac and self._cfg.sizing == "central":
             # P2-1: what it loses at the stop sizes it, with the caps, in sizing.size_entry; free cash and a
             # target weight still bound it here, since only the account knows them.
@@ -1532,6 +1536,16 @@ class LongFlatStrategy(Strategy):
             maintenance_margin=float(self._cfg.perp.maintenance_margin) if perp else 0.0,
             stop_to_liquidation=share if perp else None, stop_slippage=self._stop_slippage()))
 
+    def _central_stop_ok(self) -> bool:
+        """A centrally sized entry needs a stop above 0: one computed at run time that comes to 0 or isn't a number
+        skips the entry, saying why, and never falls back to another stop (Advisor, 16:45)."""
+        stop = self._stop_frac
+        if stop is not None and stop == stop and stop > 0:
+            return True
+        self._note("buy_skipped", f"Entry skipped: its stop came to {stop} of the price ({self._stop_basis or 'no basis'}),"
+                   " so it can't be sized")
+        return False
+
     def _stop_slippage(self) -> float | None:
         """The venue's named stop slippage, or None for sizing's default (Advisor, 16:45)."""
         from sleeve_fund.venues import venue
@@ -1549,7 +1563,7 @@ class LongFlatStrategy(Strategy):
             return {}
         self._entries += 1
         self._rounded_up += sizing.rounded_up
-        if self._entries >= 5 and self._rounded_up / self._entries > ROUND_UP_FLAG:
+        if self._entries >= 5 and rounds_up_too_often(self._entries, self._rounded_up):
             self._note("rounding_up", f"{self._rounded_up} of {self._entries} entries were rounded up to the venue's "
                        f"smallest order, over {ROUND_UP_FLAG:.0%}: the strategy's allocation is too small for this "
                        "instrument at its risk per trade")

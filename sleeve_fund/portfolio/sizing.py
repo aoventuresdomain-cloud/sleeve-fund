@@ -36,6 +36,12 @@ ROUND_UP_FLAG = 0.2  # a strategy rounding up on more than this share of its ent
 # A stop fills as a market order, past its price: by the venue's named setting, or by default the larger of half the
 # spread and this (Independent Quant Advisor, 6 Oct 2026, 16:45).
 DEFAULT_STOP_SLIPPAGE = 0.0005
+
+
+def rounds_up_too_often(entries: int, rounded_up: int) -> bool:
+    """A strategy whose entries round up to the venue's minimum MORE than ROUND_UP_FLAG of the time is too small for
+    the instrument at its risk per trade (Advisor, 16:45)."""
+    return entries > 0 and rounded_up / entries > ROUND_UP_FLAG
 OVERLAYS = ("stop", "vol_target")
 
 
@@ -101,9 +107,8 @@ def _risk(i: SizingInputs) -> tuple[float, str]:
 
 def _stop(i: SizingInputs) -> tuple[float | None, str]:
     if i.stop_frac is not None:
-        # A declared or computed stop is used as it is: one of 0 (or not a number) skips the entry, never falling
-        # back silently to the ATR stop (Advisor, 16:45).
-        return (i.stop_frac, "") if i.stop_frac == i.stop_frac and i.stop_frac > 0 else (None, "")
+        return i.stop_frac, ""
+    # No stop declared: the fallback, when there is an ATR to set it from; a zero or unknown one skips the entry.
     if i.atr is not None and i.atr > 0 and i.price > 0:
         return ATR_STOP_MULTIPLE * i.atr / i.price, f"stop {ATR_STOP_MULTIPLE:g} x ATR(14), none declared"
     return None, ""
@@ -122,6 +127,10 @@ def _validate(i: SizingInputs) -> None:
         v = getattr(i, name)
         if not v == v or v < 0 or (name in ("price", "leverage") and v <= 0):
             raise ValueError(f"{name} must be a positive number, got {v}")
+    if i.stop_frac is not None and not i.stop_frac > 0:
+        # A declared stop of 0 is refused, never sized or replaced by the fallback; a stop computed at run time
+        # that comes to 0 is the caller's to skip before sizing (Advisor, 16:45).
+        raise ValueError(f"a declared stop must be above 0, got {i.stop_frac}")
     if not i.perp and i.leverage != 1:
         raise ValueError("leverage applies only to a perpetual; spot is 1")
 
@@ -133,9 +142,8 @@ def size_entry(i: SizingInputs) -> Sizing:
     stop, stop_note = _stop(i)
     equity = i.allocated_equity
     if stop is None:
-        why = (f"its stop came to {i.stop_frac} of the price, so the entry can't be sized" if i.stop_frac is not None
-               else "no stop declared and no ATR yet: no sizing without a stop")
-        return Sizing(Decimal(0), "", None, 0.0, 0.0, skipped=why)
+        return Sizing(Decimal(0), "", None, 0.0, 0.0, skipped="no stop declared and no ATR yet: no sizing without "
+                      "a stop")
     if equity <= 0:
         return Sizing(Decimal(0), "", stop, 0.0, 0.0, skipped="no allocated equity to size from")
     slip = max(i.half_spread, DEFAULT_STOP_SLIPPAGE) if i.stop_slippage is None else i.stop_slippage

@@ -134,10 +134,10 @@ def test_no_volatility_or_no_floor_skips_a_vol_sized_entry():
 
 
 @pytest.mark.parametrize("stop", [0.0, float("nan")])
-def test_a_computed_stop_of_zero_skips_and_never_falls_back_to_the_atr(stop):
+def test_a_declared_stop_of_zero_is_refused_and_never_falls_back_to_the_atr(stop):
     """Advisor, 16:45: never fall back silently; the ATR stop is only for a definition that declares none."""
-    s = size_entry(_in(stop_frac=stop, atr=2.0))
-    assert not s.ok and "stop came to" in s.skipped
+    with pytest.raises(ValueError, match="a declared stop must be above 0"):
+        size_entry(_in(stop_frac=stop, atr=2.0))
 
 
 def test_with_a_stop_and_a_volatility_target_the_smaller_size_wins():
