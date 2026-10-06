@@ -472,6 +472,7 @@ class LongFlatStrategy(Strategy):
         self._last_tick_ns = 0
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
+        self._opened_seq = -1  # backtests: the venue's bar (fee_model.bar_seq) the last entry or add filled in
         self._entry_qty = 0.0  # its size, unsigned
         self._entry_side = 0  # +1 long, -1 short, 0 flat
         # Perp only. A signal that turns a long short (or the other way) closes first; the new side opens
@@ -1753,6 +1754,8 @@ class LongFlatStrategy(Strategy):
         if (not self._backtest or not tp or self._entry_px is None or self._pending_exit is not None
                 or self._busy() or self._pos_side() == 0):
             return False
+        if self.fee_model is not None and self._opened_seq == self.fee_model.bar_seq:
+            return False  # filled inside this bar: its extremes may have come before the fill, so judge from the next
         level = Price(self._entry_px * (1 + side * tp), self.instrument.price_precision).as_double()
         if not (bar.high.as_double() > level if side > 0 else bar.low.as_double() < level):
             return False  # a limit fills only when the price trades through it (fill_model)
@@ -2855,7 +2858,7 @@ class LongFlatStrategy(Strategy):
         sign = 1 if event.is_buy else -1
         book = ((self.decisions.get(journal_id) or {}).get("signal") or {}).get("book_px")
         if self._backtest and self.fee_model is not None and coid in self.fee_model.rebooked:
-            book = self._rebook_as_target(coid, self.fee_model.rebooked[coid], px)
+            book = self._rebook_as_target(coid, self.fee_model.rebooked.pop(coid), px)
         if book and kept_id is None and self._backtest:
             # A backtest's target (_bar_target): the fee model charged the difference from its level with the fee
             # (ScheduleFeeModel.booked), so the account already holds the target's cash. Journal the fee alone.
@@ -2885,6 +2888,8 @@ class LongFlatStrategy(Strategy):
                     self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
                     self._stop_frac = self._tp_frac = None
                     self._replan_pending = self._plan_entry = None
+        if opening and self.fee_model is not None:
+            self._opened_seq = self.fee_model.bar_seq
         if opening:  # minutes before this fill are no one's to replay for this position
             self._replayed_to = max(self._replayed_to, int(event.ts_event))
         if self._backtest:
@@ -3033,7 +3038,10 @@ class LongFlatStrategy(Strategy):
             return
         if self._tp_frac and self._entry_px is not None:
             level = self._entry_px * (1 + (self._entry_side or 1) * self._tp_frac)
-            self.fee_model.open_targets[stop_id] = Price(level, self.instrument.price_precision).as_decimal()
+            # Set during the bar the entry filled in, it counts from the next bar's open: that bar's open came
+            # before the position did. A resize moves the level and keeps when it was first set.
+            _, since = self.fee_model.open_targets.get(stop_id, (None, self.fee_model.bar_seq))
+            self.fee_model.open_targets[stop_id] = (Price(level, self.instrument.price_precision).as_decimal(), since)
         else:
             self.fee_model.open_targets.pop(stop_id, None)
 

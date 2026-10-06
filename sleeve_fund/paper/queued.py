@@ -62,7 +62,7 @@ class QueuedStore:
             name, args, kwargs = self._q.get()
             try:
                 if name == "_retry":
-                    self._retry(args[0])
+                    self._retry(*args)
                 elif (oid := _order_of(name, args, kwargs)) in self._held:
                     self._held[oid]["after"].append((name, args, kwargs))  # needs the order's row: after it
                 else:
@@ -94,18 +94,21 @@ class QueuedStore:
         timer.daemon = True
         timer.start()
 
-    def _retry(self, oid: str) -> None:
-        held = self._held[oid]
+    def _retry(self, oid: str, last: bool = False) -> None:
+        """One more try at a held row; `last` (settle's deadline, as the process stops) gives up if it fails."""
+        held = self._held.get(oid)
+        if held is None:
+            return  # given up on at settle's deadline before this wait ran out
         args, kwargs = held["row"]
         try:
             self._store.record_order(*args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 - retried until the waits run out
             held["tries"] += 1
-            if held["tries"] < len(self.retry_seconds):
+            if held["tries"] < len(self.retry_seconds) and not last:
                 self._later(oid)
                 return
             del self._held[oid]
-            self._incident(args, kwargs, f"still couldn't be written after {len(self.retry_seconds) + 1} tries "
+            self._incident(args, kwargs, f"still couldn't be written after {held['tries'] + 1} tries "
                            f"({type(exc).__name__}: {exc}). Its fill may be missing from the journal too: "
                            f"{len(held['after'])} later row(s) of this order (status, fill, timing) need its row and "
                            "were not written. Reconcile the journal against the venue's fills for this order")
@@ -128,11 +131,17 @@ class QueuedStore:
             print(f"journal: incident for {kwargs.get('order_id')} not recorded: {again!r}")
 
     def settle(self, timeout: float = 60.0) -> None:
-        """Wait until no exit's row is waiting on a retry (each written, or given up on), then flush."""
+        """Wait until no exit's row is waiting on a retry (each written, or given up on), then flush. At the
+        deadline each row still held has one last try, and the give-up incident if that fails too."""
         deadline = time.monotonic() + timeout
         while True:
             self.flush()
-            if not self._held or time.monotonic() > deadline:
+            if not self._held:
+                return
+            if time.monotonic() > deadline:
+                for oid in list(self._held.copy()):  # the writer owns _held: the last try goes through the queue
+                    self._q.put(("_retry", (oid, True), {}))
+                self.flush()
                 return
             time.sleep(0.01)
 

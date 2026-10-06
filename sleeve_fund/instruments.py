@@ -185,9 +185,12 @@ class ScheduleFeeModel(FeeModel):
         # takes the target at its level before anything later in the bar can reach the stop (Advisor NA-2): if the
         # venue fills the stop in such a bar, it is booked at the target (rebooked) instead. bar_open is the open
         # of the bar the venue is matching, handed over before it matches (BarOpens).
-        self.open_targets: dict[str, Decimal] = {}
-        self.rebooked: dict[str, float] = {}
+        # open_targets: stop id -> (target level, the bar count when the target was first set); a target only counts
+        # for bars that opened after it was set, never the bar its entry filled in (CR on #146).
+        self.open_targets: dict[str, tuple[Decimal, int]] = {}
+        self.rebooked: dict[str, float] = {}  # by stop id, per fill: taken by the strategy as it journals the fill
         self.bar_open: Decimal | None = None
+        self.bar_seq = 0  # bars the venue has been handed (BarOpens)
         # The account keeps the quote currency to its own decimals (USD to the cent), so each fee is rounded.
         # Rounding every one alone charged equal small fills the same way: $1.17 slices paid nothing and
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
@@ -216,8 +219,8 @@ class ScheduleFeeModel(FeeModel):
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         shift = Decimal(0)
         booked = self.booked.get(str(order.client_order_id))
-        target = self.open_targets.get(str(order.client_order_id))
-        if booked is None and target is not None and self.bar_open is not None:
+        target, since = self.open_targets.get(str(order.client_order_id), (None, None))
+        if booked is None and target is not None and self.bar_open is not None and since < self.bar_seq:
             buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below
             if (self.bar_open < target) if buy else (self.bar_open > target):
                 booked = (target, buy)
@@ -249,6 +252,7 @@ class BarOpens(SimulationModule):
     def pre_process(self, data) -> None:
         if isinstance(data, Bar):
             self.fee_model.bar_open = data.open.as_decimal()
+            self.fee_model.bar_seq += 1
 
     def process(self, ts_now, context):
         return None

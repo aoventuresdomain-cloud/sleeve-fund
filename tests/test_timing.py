@@ -225,6 +225,19 @@ def test_an_exit_row_that_never_lands_says_its_fill_may_be_missing_too():
     assert any("fill may be missing" in m and "1 later row" in m for m in said)
 
 
+def test_a_process_stopping_mid_retry_gives_the_exit_row_one_last_try_and_says_so():
+    """CR on #146: the node stops inside the supervisor's 45 s, so settle can't wait out a 30 s retry. At its
+    deadline the held row gets one last try, and the give-up incident if that fails, rather than nothing."""
+    q, tries = _flaky_queue(99, (60.0,))
+    q.record_order("q", order_id="O-1", side="SELL", qty=0.1, intent="stop_loss", reason="t")
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="database gone"):
+        q.settle(timeout=0.2)
+    assert time.monotonic() - t0 < 5 and len(tries) == 2
+    said = [e["message"] for e in q.events("q") if e["kind"] == "incident"]
+    assert len(said) == 2 and any("after 2 tries" in m for m in said)
+
+
 def test_a_run_journals_the_same_through_the_queue():
     from sleeve_fund.data import synthetic_ohlcv
     from sleeve_fund.paper.queued import QueuedStore
