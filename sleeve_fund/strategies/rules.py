@@ -102,6 +102,24 @@ LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratio
 MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
 
 
+def _operands(definition: dict) -> set:
+    """Every block output the definition's rules and level exits read, by its key ("rsi", "bb.upper")."""
+    found: set = set()
+
+    def walk(node) -> None:
+        if isinstance(node, str):
+            found.add(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk({k: definition.get(k) for k in ("long", "short", "exits")})
+    return found
+
+
 def _levels(definition: dict) -> dict[str, set]:
     """Block key -> the numbers the definition's rules compare it with directly, for the lower pane's guide lines."""
     found: dict[str, set] = {}
@@ -334,6 +352,8 @@ class Rules(LongFlatStrategy):
 
     def _drawn(self) -> dict[str, tuple]:
         """key -> (block id, output or None), keyed as the lineage payload keys them; markers left out."""
+        if getattr(self, "_drawn_keys", None) is not None:
+            return self._drawn_keys
         out = {}
         for bid, b in self.rules.blocks.items():
             if self.c.checked.blocks[bid]["kind"] in MARKER_KINDS:
@@ -341,6 +361,7 @@ class Rules(LongFlatStrategy):
             outputs = type(b).OUTPUTS
             for o in ((None,) if outputs == ("value",) else outputs):
                 out[bid if o is None else f"{bid}.{o}"] = (bid, o)
+        self._drawn_keys = out
         return out
 
     def _pane(self, bid: str, output: str | None) -> str:
@@ -354,6 +375,7 @@ class Rules(LongFlatStrategy):
 
     def indicator_meta(self) -> dict[str, dict]:
         levels = _levels(self.c.definition)
+        read = _operands(self.c.definition)
         meta = {}
         for key, (bid, o) in self._drawn().items():
             spec = self.c.checked.blocks[bid]
@@ -363,7 +385,10 @@ class Rules(LongFlatStrategy):
             pane = self._pane(bid, o)
             meta[key] = {"label": label, "pane": pane, "tf": tf,
                          "group": bid if o and pane == "price" else None,
-                         "levels": sorted(levels[key]) if levels.get(key) else None}
+                         "levels": sorted(levels[key]) if levels.get(key) else None,
+                         # only what the rules read is drawn at first: a line the model ignores invites a reader to
+                         # find signals it never took (Independent Quant Advisor, 6 Oct 23:24)
+                         "shown": key in read}
         return meta
 
     def indicator_values(self) -> dict[str, float | None]:

@@ -124,3 +124,5 @@ def test_a_rule_builder_strategys_lines_carry_their_panes_groups_levels_and_time
     assert {series[k]["group"] for k in ("bb.mid", "bb.upper", "bb.lower")} == {"bb"}
     assert series["rsi"]["levels"] == [65.0] and series["avg"]["levels"] == [40.0]
     assert series["trend"]["tf"] == "4h" and series["rsi"]["tf"] is None
+    # At first only what the rules read: the RSI, its average, the 4h trend and the outer bands, not mid, width or %b.
+    assert {k for k, s in series.items() if s["shown"]} == {"avg", "rsi", "trend", "bb.upper", "bb.lower"}
