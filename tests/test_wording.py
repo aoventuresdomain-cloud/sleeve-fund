@@ -43,6 +43,11 @@ VENUE = re.compile(r"bybit|binance|kraken|deribit", re.IGNORECASE)
     ("binance.py:42", "venue.py:42"),
     ("kraken.Kraken.json", "venue.venue.json"),
     ("<https://API.binance.com/x>.", "<the perpetual venue>."),
+    # The funding alerts' tag: the venue upper-cased, then the pair (#163).
+    ("[BINANCE BTC/USDT] funding kept up again, newest rate 2026-10-06 08:00 UTC",
+     "[BTC/USDT] funding kept up again, newest rate 2026-10-06 08:00 UTC"),
+    ("[KRAKEN BTC/USD] the feed went stale", "[BTC/USD] the feed went stale"),
+    ("FUNDING STALE: BINANCE BTC/USDT", "FUNDING STALE: BTC/USDT"),
 ])
 def test_no_venue_name_in_any_case_host_or_identifier(text, reads):
     assert no_venues(text) == reads

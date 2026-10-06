@@ -2500,6 +2500,19 @@ def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
     assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
 
 
+def test_a_funding_alert_tag_names_the_pair_and_no_venue(client):
+    """The funding alerts tag their messages with the venue upper-cased and the pair (#163); the Alerts page
+    and the outside alert read "[BTC/USDT] …" (QA P1-U30, CR)."""
+    from sleeve_fund import alerts
+
+    c, store = client
+    store.event(None, "warning", "funding_stale", "[BINANCE BTC/USDT] funding is 9 hours behind")
+    page = c.get("/alerts", auth=AUTH).text
+    assert "[BTC/USDT] funding is 9 hours behind" in page and "BINANCE" not in page
+    ev = store.alerts(limit=5)
+    assert "[BTC/USDT] funding is 9 hours behind" in alerts.message(ev) and "BINANCE" not in alerts.message(ev)
+
+
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
                                    " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
                                    "Position\u00a0margin lost (liquidated)"])

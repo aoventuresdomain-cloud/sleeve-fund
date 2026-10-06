@@ -37,6 +37,9 @@ _VENUE_WORDS = [
     (re.compile(rf"(?<=\w)\.(?:{_NAMES})(?=\.\w)", _I), ".venue"),
     (re.compile(rf"(?<=\S)\.(?:{_NAMES})\b", _I), ""),
     (re.compile(rf"(?<!\S)\.(?:{_NAMES})\b", _I), _as()),
+    # An alert's tag names the venue and the pair ("[BINANCE BTC/USDT] funding stale"): the pair is what it is
+    # about, so the tag reads "[BTC/USDT] funding stale".
+    (re.compile(rf"\b(?:{_NAMES})\s+(?=(?-i:[A-Z0-9]{{2,}}/[A-Z0-9]{{2,}})\b)", _I), ""),
     # A venue's name at the start of a file name: "binance.py:42" reads "venue.py:42", "kraken.env" "venue.env".
     (re.compile(rf"\b(?:{_NAMES})(?=\.\w)", _I), "venue"),
     (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b", _I), "the demo account isn't set up"),
