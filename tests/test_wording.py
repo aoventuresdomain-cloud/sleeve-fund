@@ -31,6 +31,18 @@ VENUE = re.compile(r"bybit|binance|kraken|deribit", re.IGNORECASE)
     ("see https://fapi.binance.com/fapi/v1/order.", "see the perpetual venue."),
     ("GET https://api.bybit.com/v5/x: 500", "GET the demo account: 500"),
     ("keys.binance.json missing", "keys.venue.json missing"),
+    # QA P1-U30: acronyms and lower-case run-ons, hosts with a port or a longer name, file names, angle brackets.
+    ("KrakenAPIError: boom", "VenueAPIError: boom"),
+    ("DeribitAPI timed out", "VenueAPI timed out"),
+    ("krakenex raised", "venueex raised"),
+    ("binancefutures and bybitusdt", "venuefutures and venueusdt"),
+    ("binanceapi refused it", "venueapi refused it"),
+    ("testnet.binancefuture.com: 503", "the perpetual venue: 503"),
+    ("GET https://api.bybit.com:443/v5/order/create?category=linear&symbol=BTCUSDT failed", "GET the demo account failed"),
+    ("kraken.env missing", "venue.env missing"),
+    ("binance.py:42", "venue.py:42"),
+    ("kraken.Kraken.json", "venue.venue.json"),
+    ("<https://API.binance.com/x>.", "<the perpetual venue>."),
 ])
 def test_no_venue_name_in_any_case_host_or_identifier(text, reads):
     assert no_venues(text) == reads
@@ -40,6 +52,7 @@ def test_no_venue_name_in_any_case_host_or_identifier(text, reads):
 @pytest.mark.parametrize("text", [
     "kraken-live: KRAKEN_API_KEY missing",  # the PM's own account and key names
     "BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET",
+    "binancebot--20261006193736 and kraken_dip are the PM's own strategy names",
     "1,234.56 62,850.00 0.0004 -2021 1.5e-3 BTCUSDT-PERP BTC/USD XBTUSD BTC-PERPETUAL",
 ])
 def test_labels_keys_numbers_and_symbols_are_left_alone(text):
