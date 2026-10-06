@@ -295,6 +295,34 @@ def test_a_stop_or_target_crossed_while_the_strategy_was_down_closes_on_restart(
     assert [e[2] for e in events] == ["outage_exit"] and "while the strategy was down" in reason
 
 
+@pytest.mark.parametrize("lag_s, high, low, hit", [
+    (300, 100.5, 97.9, "stop_loss"),  # refilled after the feed was away: the stop crossed inside it
+    (300, 105.2, 99.0, "take_profit"),
+    (300, 101.0, 99.0, None),  # nothing crossed
+    (None, 100.5, 97.9, None),  # on time: the live checks saw every price, nothing to do here
+])
+def test_a_stop_or_target_inside_a_bar_decided_late_closes_at_once(lag_s, high, low, hit):
+    """QA P1-C1: the hub away, its refilled bars arrive late; a stop crossed only inside them still runs, on the
+    bar's high and low, not only its close."""
+    from types import SimpleNamespace
+
+    s, bar, events, sold, opened = _late_strategy(lag_s=lag_s, side_now=1)
+    s.runtime.backtest = False
+    s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
+    late = SimpleNamespace(ts_event=NS, high=SimpleNamespace(as_double=lambda: high),
+                           low=SimpleNamespace(as_double=lambda: low), close=SimpleNamespace(as_double=lambda: 100.2))
+    assert s._check_late_bar_exits(late) is (hit is not None)
+    if hit is None:
+        assert sold == [] and events == []
+        return
+    (intent, reason, values), = sold
+    assert intent == hit and values["outage_while"] == "while the market data feed was away"
+    assert "reached while the market data feed was away: the price passed the" in reason and "in the candle to" in reason
+    from sleeve_fund.strategies.base import outage_fill_note
+
+    assert outage_fill_note({"intent": intent, "signal": values}, 97.0).endswith("while the market data feed was away")
+
+
 def test_an_outage_exits_fill_is_said_against_its_level_once():
     from sleeve_fund.strategies.base import outage_fill_note
 

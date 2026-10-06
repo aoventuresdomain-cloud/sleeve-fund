@@ -209,11 +209,12 @@ def late_bar(bars: list, now_ns: int, step_ns: int, last_alive: datetime | None,
 def outage_fill_note(decision: dict | None, px: float) -> str | None:
     """For the first fill of an exit sent because its level was crossed while the strategy was down
     (_check_outage_exits): how far from that level it filled. None for any other fill, or a later one."""
-    level = ((decision or {}).get("signal") or {}).pop("outage_level", None)
+    signal = (decision or {}).get("signal") or {}
+    level = signal.pop("outage_level", None)
     if level is None:
         return None
     return (f"The {decision.get('intent', 'exit').replace('_', '-')} closed at {px:,.6g}, {px / level - 1:+.2%} from "
-            f"its {level:,.6g} level, reached while the strategy was down")
+            f"its {level:,.6g} level, reached {signal.pop('outage_while', 'while the strategy was down')}")
 
 
 def _hhmm(ns: int) -> str:
@@ -1328,8 +1329,8 @@ class LongFlatStrategy(Strategy):
         the process that was down, so check them against the high and low since its last heartbeat, from the
         stored minutes, and close at once on a breach (the stop first when one minute crossed both). The gap
         from the level to the fill is said when it fills. True if an exit was sent."""
-        stop, tp, entry, side = self._stop_frac, self._tp_frac, self._entry_px, self._entry_side or 1
-        if entry is None or (stop is None and not tp) or self.history_loader is None or self._busy():
+        if (self._entry_px is None or (self._stop_frac is None and not self._tp_frac) or self.history_loader is None
+                or self._busy()):
             return False
         since = _ns(self._last_alive)
         minute = BarType.from_str(f"{self._cfg.instrument_id}-1-MINUTE-LAST-INTERNAL")
@@ -1339,11 +1340,25 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "warning", "outage_unchecked",
                                      f"Couldn't check the stop and target over the time the strategy was down: {exc}")
             return False
+        return self._exit_on_breach([b for b in bars if b.ts_event > since], "while the strategy was down", "minute")
+
+    def _check_late_bar_exits(self, bar: Bar) -> bool:
+        """QA P1-C1: a bar decided late is one refilled after the market data feed was away, so no price reached
+        the strategy while it formed and the live stop and target checks never saw it. Check its high and low
+        and close at once on a breach, as on a restart (_check_outage_exits). True if an exit was sent."""
+        if self._lag is None or self._backtest or self._entry_px is None or self._busy():
+            return False
+        if self._stop_frac is None and not self._tp_frac:
+            return False
+        return self._exit_on_breach([bar], "while the market data feed was away", "candle")
+
+    def _exit_on_breach(self, bars: list, while_: str, span: str) -> bool:
+        """Close at market on the first of `bars` (in time order) whose high or low crossed the stop or target,
+        the stop first when one crossed both; the level and when it was crossed go with the order."""
+        stop, tp, entry, side = self._stop_frac, self._tp_frac, self._entry_px, self._entry_side or 1
         stop_px = entry * (1 - side * stop) if stop is not None else None
         tp_px = entry * (1 + side * tp) if tp else None
         for b in sorted(bars, key=lambda b: b.ts_event):
-            if b.ts_event <= since:
-                continue
             worst, best = (b.low.as_double(), b.high.as_double()) if side > 0 else (b.high.as_double(), b.low.as_double())
             hit, level = ((("stop_loss", stop_px) if stop_px is not None and side * (worst - stop_px) <= 0 else
                           ("take_profit", tp_px) if tp_px is not None and side * (best - tp_px) >= 0 else (None, None)))
@@ -1351,14 +1366,15 @@ class LongFlatStrategy(Strategy):
                 continue
             words = "stop" if hit == "stop_loss" else "target"
             price = self._price()
-            reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'} reached while the strategy was down: "
-                      f"the price passed the {level:,.6g} {words} in the minute to {_hhmm(b.ts_event)}; closing at "
-                      f"market now, at about {price:,.6g}")
+            reason = (f"{'Stop-loss' if hit == 'stop_loss' else 'Take-profit'} reached {while_}: the price passed "
+                      f"the {level:,.6g} {words} in the {span} to {_hhmm(b.ts_event)}; closing at market now, at "
+                      f"about {price:,.6g}")
             self.runtime.store.event(self.runtime.name, "warning", "outage_exit", reason)
             self._exit_lock = side if self._margin else True
             self._entry_px = None  # don't fire again while the order is in flight
             self._sell_all(hit, reason, {"entry_px": entry, hit: stop if hit == "stop_loss" else tp,
-                                         "outage_level": level, "breached_at": _hhmm(b.ts_event)})
+                                         "outage_level": level, "outage_while": while_,
+                                         "breached_at": _hhmm(b.ts_event)})
             return True
         return False
 
@@ -1392,7 +1408,7 @@ class LongFlatStrategy(Strategy):
             return
         if self._replan_pending is not None and self._entry_px is not None:
             self._replan(self._last_close)
-        if self._check_exits(self._last_close):
+        if self._check_late_bar_exits(bar) or self._check_exits(self._last_close):
             return
         if self._margin:
             if self._restore is None:
