@@ -136,6 +136,10 @@ def record_model_run(store: Store, *, strategy: str, params: dict, dataset: str,
     """Count one run of a hand-coded model outside a study: a backtest, or a paper strategy created, cloned or
     re-set (QA P1-T1). Each is a variant tried, so the deflated Sharpe's N counts it. The whole run reads every
     bar it was given, so it is in-sample."""
+    if source == "strategy" and data_end is None:
+        # Dated to the moment it was chosen (Advisor, 6 Oct 2026, QA P1-T4): what it saw then. Watching it trade
+        # afterwards reads nothing new into the choice; each edit is a new row, dated again.
+        data_start = data_end = datetime.now(timezone.utc)
     try:
         from sleeve_fund.research.run import spec_of
 
@@ -171,11 +175,24 @@ def legacy_definition_hash(idea: str, params: dict, setup: dict | None = None) -
                         {"idea": idea, "params": params, "setup": setup})
 
 
-def run_setup(*, risk_profile: str | None, fee: float, windows: tuple[int, int, int] | None = None) -> dict:
+def run_setup(*, risk_profile: str | None, fee: float, windows: tuple[int, int, int] | None = None,
+              period: str | None = None) -> dict:
     """The setup part of a variant's key: risk profile, walk-forward windows (train, test, holdout days; None
-    for a single run over all the bars) and the fee per side assumed when choosing, rounded to a basis point
-    hundredth so a float's last digit doesn't make a new variant."""
-    return {"risk_profile": risk_profile, "windows": list(windows) if windows else None, "fee": round(fee, 6)}
+    for a single run over all the bars), the fee per side assumed when choosing, rounded to a basis point
+    hundredth so a float's last digit doesn't make a new variant, and a backtest's period (backtest_period)."""
+    out = {"risk_profile": risk_profile, "windows": list(windows) if windows else None, "fee": round(fee, 6)}
+    if period is not None:  # left out when not given, so studies' keys are as before
+        out["period"] = period
+    return out
+
+
+def backtest_period(days: int | None = None, start=None, end=None) -> str:
+    """A backtest's period in the variant key (Independent Quant Advisor, 6 Oct 2026, QA P1-T6): a preset by its
+    name, so re-running "last 365 days" next week is the same variant, and a custom range by its exact dates.
+    The dates actually read are stored on the row either way."""
+    if start is not None or end is not None:
+        return f"{pd.Timestamp(start):%Y-%m-%d} to {pd.Timestamp(end):%Y-%m-%d}"
+    return f"last {int(days)} days" if days else "all history"
 
 
 def _finite(x) -> float | None:

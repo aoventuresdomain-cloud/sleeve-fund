@@ -173,3 +173,99 @@ def test_spread_is_the_variants_trial_sharpes_floored_at_the_no_skill_error(tmp_
     assert deflated_sharpe_probability(returns, 30, flat) == pytest.approx(deflated_sharpe_probability(returns, 30))
     wide = [float(x) for x in rng.normal(0, 3 * math.sqrt(PERIODS_PER_YEAR / 399), 30)]
     assert deflated_sharpe_probability(returns, 30, wide) < deflated_sharpe_probability(returns, 30)
+
+
+# QA round on #154 (quant-review/v2-p1/trials-154.md): QA Tester 2's strict xfails, now passing.
+from sleeve_fund.data import synthetic_ohlcv  # noqa: E402
+from sleeve_fund.data import synthetic_ohlcv
+
+
+# QA P1-T3: the CLI study on a real data file (--data) never writes the trials register
+def test_cli_study_on_a_data_file_is_counted(tmp_path, monkeypatch):
+    from sleeve_fund.__main__ import main
+    from sleeve_fund.store import Store
+
+    db = f"sqlite:///{tmp_path / 'j.db'}"
+    monkeypatch.setenv("DATABASE_URL", db)
+    store = Store(db)
+    before = len(store.trials())
+    import sleeve_fund.__main__ as cli
+    monkeypatch.setattr(cli, "load_kraken_ohlcvt", lambda path: synthetic_ohlcv(days=1900, seed=3))
+    csv = tmp_path / "XBTUSD_1440.csv"
+    csv.write_text("stand-in: the loader is replaced with 1,900 synthetic days\n")
+    assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "trend_filter", "--data", str(csv),
+                 "--holdout-days", "200", "--train-days", "730", "--test-days", "365",
+                 "--out", str(tmp_path / "sheet.md")]) == 0
+    assert len(store.trials()) > before  # Advisor 14:26: every run counts, whatever path started it
+
+
+def _store(tmp_path):
+    from sleeve_fund.store import Store
+
+    return Store(f"sqlite:///{tmp_path / 'j.db'}")
+
+
+# QA P1-T4 (Advisor 14:47): a paper strategy row must store data_end = creation/edit time, not be undated
+def test_a_paper_strategy_is_dated_to_its_creation(tmp_path):
+    import pandas as pd
+
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.trials import legacy_idea_hash, record_model_run, run_setup
+
+    store = _store(tmp_path)
+    record_model_run(store, strategy="trend_filter", params={"a": 1}, dataset="d", source="strategy",
+                     setup=run_setup(risk_profile="balanced", fee=0.001))
+    row = store.trials(legacy_idea_hash("trend_filter"))[-1]
+    assert row["data_end"] is not None
+    now = pd.Timestamp.now(tz="UTC")
+    # A 30-day holdout wholly after the creation: unseen, so no undated 90-day/20-trade rule applies.
+    assert HoldoutLocks(store).refusal(legacy_idea_hash("trend_filter"), "BTC", now + pd.Timedelta(days=1),
+                                       now + pd.Timedelta(days=31)) == ""
+
+
+# QA P1-T6 (Advisor 14:47): the backtest period (preset name or exact custom dates) is in the variant key
+def test_backtest_period_preset_is_in_the_variant_key(tmp_path):
+    from sleeve_fund.dashboard import app as appmod
+    from sleeve_fund.research.trials import TrialsRegister, legacy_idea_hash
+
+    store = _store(tmp_path)
+    monkey = {"strategy": "trend_filter", "pair": "BTC/USD", "venue": "kraken", "params": {"fast": 50, "slow": 200},
+              "minutes": 1440, "risk_profile": "balanced"}
+    result = {"from": "2024-01-01", "to": "2025-01-01", "fee_schedule": {"taker": 0.004}, "spread": {"half": 0.0001},
+              "strategy": {"sharpe": 1.0}, "trades": {"trades": 10}}
+    appmod._count_backtest(store, {**monkey, "days": 365}, result, "r1")
+    appmod._count_backtest(store, {**monkey, "days": None}, {**result, "from": "2018-01-01"}, "r2")
+    assert TrialsRegister(store).counts(legacy_idea_hash("trend_filter"))["variants"] == 2  # last year vs all history
+
+
+# QA P1-T5 (Advisor 14:47): G1's best-of-N hurdle must use max(cross-variant spread, bootstrap spread), as the DSR does
+def test_g1_hurdle_rises_with_the_variants_sharpe_spread(tmp_path):
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.research.tearsheet import SHARPE_CHECK, g1_checks
+    from sleeve_fund.research.trials import TrialsRegister, legacy_idea_hash
+    from sleeve_fund.strategies.trend_filter import SPEC
+    from sleeve_fund.venues import venue
+
+    inst = venue("KRAKEN").instrument("BTC", "USD")
+    hurdles = []
+    for tag, spread in (("narrow", 0.0), ("wide", 3.0)):
+        store = _store(tmp_path / tag) if (tmp_path / tag).mkdir() is None else None
+        reg = TrialsRegister(store)
+        idea = legacy_idea_hash(SPEC.name)
+        for i in range(40):  # 40 variants of this idea; Sharpes all equal, or spread from -3 to +3
+            reg.record(definition_hash=f"d{i}", idea_hash=idea, name=SPEC.name, family="trend", settings={"fast": i},
+                       dataset="other", stage="in_sample", source="backtest", sharpe=0.5 + spread * (i / 39 * 2 - 1))
+        ledger = IdeaLedger(tmp_path / tag / "l.jsonl")
+        r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), inst, dataset="syn", ledger=ledger, synthetic=True,
+                      holdout_days=0, train_days=365, test_days=180, register=reg)
+        hurdles.append(next(c for c in g1_checks(r, ledger, reg) if c[0] == SHARPE_CHECK)[2])
+    assert hurdles[0] != hurdles[1], hurdles[0]  # today identical: the trial spread never reaches G1
+
+
+def test_a_data_file_holdout_in_the_old_counter_is_locked_by_its_underlying():
+    # QA m-145a: the CLI names a data file's dataset by its stem, in the venue's own codes.
+    from sleeve_fund.research.holdout import underlying_of_dataset
+
+    assert underlying_of_dataset("XBTUSD_1440") == "BTC" and underlying_of_dataset("ETHUSD") == "ETH"
+    assert underlying_of_dataset("kraken-btcusd-store-60m") == "BTC" and underlying_of_dataset("synthetic") is None

@@ -1464,13 +1464,14 @@ def _count_backtest(store: Store, args: dict, result: dict, run_id: str) -> None
     import pandas as pd
 
     from sleeve_fund.research.run import dataset_name
-    from sleeve_fund.research.trials import record_model_run, run_setup
+    from sleeve_fund.research.trials import backtest_period, record_model_run, run_setup
 
     start = pd.Timestamp(result["from"], tz="UTC")
     end = pd.Timestamp(result["to"], tz="UTC") + pd.Timedelta(days=1)
     fees = result.get("fee_schedule") or {}
     setup = run_setup(risk_profile=args["risk_profile"],
-                      fee=float(fees.get("taker", 0.0)) + float((result.get("spread") or {}).get("half", 0.0)))
+                      fee=float(fees.get("taker", 0.0)) + float((result.get("spread") or {}).get("half", 0.0)),
+                      period=backtest_period(args.get("days")))
     record_model_run(store, strategy=args["strategy"], params=args["params"], setup=setup,
                      dataset=dataset_name(_venue_name(args["venue"]), args["pair"], args["minutes"]), source="backtest",
                      sharpe=result["strategy"]["sharpe"], data_start=start, data_end=end, backtest_id=run_id,

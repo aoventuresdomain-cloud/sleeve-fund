@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 
+import numpy as np
 
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -81,6 +82,14 @@ def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
     return register.counts(_idea(r)) if register is not None else ledger.counts()
 
 
+def _trial_spread(r: StudyResult, register) -> float | None:
+    """The spread of the idea family's variant Sharpes, one per variant, for G1's best-of-N hurdle (QA P1-T5)."""
+    if register is None:
+        return None
+    sharpes = [x for x in register.sharpes(_idea(r)) if x is not None and math.isfinite(x)]
+    return float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else None
+
+
 def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
     """register: the trials register, when the study ran against the database. Its count of variants, which
     includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
@@ -90,7 +99,8 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = r.oos_trades
     counts = _counts(r, ledger, register)
-    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"])
+    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"],
+                                             trial_spread=_trial_spread(r, register))
     unjudged = math.isnan(beats)
     if unjudged:
         beats = 0.0  # too short, or too few independent days, to judge

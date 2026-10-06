@@ -29,6 +29,9 @@ MIN_UNDATED_HOLDOUT_TRADES = 20  # the per-instrument floor of the pooled 100-tr
 # Quote currencies a dataset name can end in, longest first, to find the underlying of an old counter entry.
 _QUOTES = ("usdt", "usdc", "usd", "eur", "gbp")
 _DATASET = re.compile(r"^[a-z0-9_]+-([a-z0-9]+?)(" + "|".join(_QUOTES) + r")-store(?:-\d+m)?$")
+# A data file's stem, as the CLI's `study --data` names its dataset ("XBTUSD_1440"), with the venue's own codes.
+_FILE = re.compile(r"^([a-z0-9]+?)(" + "|".join(_QUOTES) + r")(?:_\d+)?$")
+_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 
 def underlying_of(pair: str) -> str:
@@ -37,10 +40,10 @@ def underlying_of(pair: str) -> str:
 
 
 def underlying_of_dataset(dataset: str) -> str | None:
-    """The base asset a stored-history dataset name was built from ("venue-btcusdt-store-60m" -> "BTC"), or None
-    for a name that isn't one (synthetic data)."""
-    m = _DATASET.match(dataset)
-    return m.group(1).upper() if m else None
+    """The base asset a dataset name was built from: stored history ("venue-btcusdt-store-60m" -> "BTC") or a data
+    file's stem ("XBTUSD_1440" -> "BTC", QA m-145a); None for a name that is neither (synthetic data)."""
+    m = _DATASET.match(dataset) or _FILE.match(dataset.lower())
+    return _ALIASES.get(m.group(1).upper(), m.group(1).upper()) if m else None
 
 
 def lock_id(idea_hash: str, underlying: str) -> str:
