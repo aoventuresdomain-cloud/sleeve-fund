@@ -1,6 +1,7 @@
 """DA-10: open interest snapshots and funding rates are kept append-only, survive restarts, and report holes."""
 
 import json
+import time
 
 import pandas as pd
 
@@ -63,8 +64,10 @@ def test_a_kept_snapshot_is_never_replaced_and_a_differing_copy_goes_to_provenan
                                 loader=lambda pair, start: _venue_with(times, scale=2.0)(pair, 0))
     assert out["written"] == 0 and out["conflicts"] == 4  # the first snapshot is the same in both
     assert open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)["contracts"].iloc[-1] == 104.0
-    log = [json.loads(line) for line in (tmp_path / "BINANCE" / "BTC-USDT" / "provenance.jsonl").read_text().splitlines()]
+    log = open_interest.provenance("BINANCE", "BTC/USDT", root=tmp_path)
     assert {e["series"] for e in log} == {"open_interest"} and log[-1]["stored"][0] == 104.0
+    # The series' own file: the price series' provenance.jsonl, whose readers expect bar minutes, is untouched.
+    assert not (tmp_path / "BINANCE" / "BTC-USDT" / "provenance.jsonl").exists()
 
 
 def test_gaps_reports_the_periods_missing_between_snapshots(tmp_path):
@@ -106,14 +109,14 @@ def test_a_funding_failure_does_not_stop_open_interest(tmp_path, capfd, monkeypa
 
 
 def test_each_snapshot_keeps_when_it_was_first_seen_and_the_lag_ignores_the_backfill(tmp_path, monkeypatch):
+    monkeypatch.setattr(open_interest, "MIN_LIVE", 1)  # the lag from a handful of live captures
     stamps = [T0 + i * STEP for i in range(4)]
-    clock = iter([pd.Timestamp(T0 + 10 * 86_400_000, unit="ms", tz="UTC"),  # the backfill, days later
-                  pd.Timestamp(stamps[2] + 7 * 60_000, unit="ms", tz="UTC"),  # then each one 7, then 9 minutes late
-                  pd.Timestamp(stamps[3] + 9 * 60_000, unit="ms", tz="UTC")])
-    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: next(clock)))
-    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:2]))
-    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:3]))
-    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps))
+    clock = [None]
+    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: clock[0]))
+    for n, seen in ((2, T0 + 10 * 86_400_000),  # the backfill, days later
+                    (3, stamps[2] + 7 * 60_000), (4, stamps[3] + 9 * 60_000)):  # then each one 7, then 9 minutes late
+        clock[0] = pd.Timestamp(seen, unit="ms", tz="UTC")
+        open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:n]))
     kept = open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)
     assert list(kept["backfill"]) == [True, True, False, False]
     assert kept["first_seen"].iloc[2] - kept.index[2] == pd.Timedelta(minutes=7)
@@ -123,11 +126,13 @@ def test_each_snapshot_keeps_when_it_was_first_seen_and_the_lag_ignores_the_back
 def test_a_week_without_new_snapshots_is_raised_once_a_day_before_any_are_lost(tmp_path):
     from sleeve_fund import history
 
-    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with([T0]))
-    day6, day8 = (pd.Timestamp(T0, unit="ms", tz="UTC") + pd.Timedelta(days=d) for d in (6, 8))
-    assert open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=day6) is None
-    problem = open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=day8)
-    assert "lost for good from 2026-10-31 00:00 UTC" in problem
+    path = open_interest._path("BINANCE", "BTC/USDT", tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"snapshots": [[T0, 1.0, 1.0, T0 + 3 * 60_000, 0]]}))  # received 3 minutes late
+    received = pd.Timestamp(T0 + 3 * 60_000, unit="ms", tz="UTC")
+    assert open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=received + pd.Timedelta(days=7)) is None
+    problem = open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=received + pd.Timedelta(days=7, minutes=1))
+    assert "last kept 2026-10-01 00:03 UTC" in problem and "lost for good from 2026-10-31 00:00 UTC" in problem
 
     class Inbox:
         events = []
@@ -141,12 +146,12 @@ def test_a_week_without_new_snapshots_is_raised_once_a_day_before_any_are_lost(t
 
 
 def test_as_of_hides_a_snapshot_until_its_measured_lag_has_passed(tmp_path, monkeypatch):
+    monkeypatch.setattr(open_interest, "MIN_LIVE", 1)  # the lag from a handful of live captures
     stamps = [T0 + i * STEP for i in range(3)]
-    clock = iter([pd.Timestamp(stamps[0] + 60_000, unit="ms", tz="UTC"),
-                  pd.Timestamp(stamps[1] + 8 * 60_000, unit="ms", tz="UTC"),
-                  pd.Timestamp(stamps[2] + 8 * 60_000, unit="ms", tz="UTC")])
-    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: next(clock)))
-    for n in (1, 2, 3):
+    clock = [None]
+    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: clock[0]))
+    for n, late in ((1, 1), (2, 8), (3, 8)):
+        clock[0] = pd.Timestamp(stamps[n - 1] + late * 60_000, unit="ms", tz="UTC")
         open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=_venue_with(stamps[:n]))
     assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) == pd.Timedelta(minutes=8)
     at = pd.Timestamp(stamps[2], unit="ms", tz="UTC") + pd.Timedelta(minutes=7)  # the newest is stored, not yet known
@@ -217,3 +222,94 @@ def test_a_write_merges_what_another_writer_kept_while_this_one_fetched_and_is_f
     assert kept["first_seen"].iloc[2] == hub_first_seen  # the hub's row stands
     assert synced and (tmp_path / "BINANCE" / "BTC-USDT" / ".write.lock").exists()
     assert not list((tmp_path / "BINANCE" / "BTC-USDT").glob("*.tmp"))
+
+
+def _put(root, rows):
+    path = open_interest._path("BINANCE", "BTC/USDT", root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"snapshots": rows}))
+
+
+def test_the_lag_is_the_venues_not_an_outage_this_collector_caught_up_after(tmp_path):
+    """QA P1-O4: snapshots fetched together on return from an outage share one first_seen; only the newest of a
+    fetch measures the venue, so a two-day outage leaves the lag at the venue's three minutes."""
+    rows = [[T0 + i * STEP, 1.0 + i, 1.0, T0 + i * STEP + 3 * 60_000, 0] for i in range(3000)]
+    back = T0 + 2600 * STEP + 2 * 60_000
+    for i in range(2000, 2576):  # 48 hours missed, fetched at once
+        rows[i][3] = back
+    _put(tmp_path, rows)
+    assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) == pd.Timedelta(minutes=3)
+
+
+def test_as_of_never_serves_a_live_snapshot_before_it_was_first_seen(tmp_path):
+    """QA P1-O6, MAJOR per the Advisor: the p95 lag lets 5% through early; first_seen <= at holds every live one
+    back. QA's case: the 12:30 snapshot reached us at 13:30, so as_of(12:32) serves the 12:25 one."""
+    rows = [[T0 + i * STEP, 1.0 + i, 1.0, T0 + i * STEP + 2 * 60_000, 0] for i in range(288)]
+    rows[150][3] = rows[150][0] + 60 * 60_000  # the venue was an hour late with the 12:30 one
+    _put(tmp_path, rows)
+    at = pd.Timestamp("2026-10-01 12:32", tz="UTC")
+    assert open_interest.as_of("BINANCE", "BTC/USDT", at, root=tmp_path)["contracts"] == 150.0  # the 12:25 one
+    later = pd.Timestamp("2026-10-01 13:30", tz="UTC")
+    assert open_interest.as_of("BINANCE", "BTC/USDT", later, root=tmp_path)["contracts"] >= 151.0
+
+
+def test_a_snapshot_that_is_not_a_finite_number_is_refused_and_recorded(tmp_path):
+    loader = lambda pair, start: [(T0, float("nan"), 1e6), (T0 + STEP, 101.0, 1e6)]  # noqa: E731
+    out = open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=loader)
+    assert out["written"] == 1 and out["refused"] == 1
+    assert list(open_interest.snapshots("BINANCE", "BTC/USDT", root=tmp_path)["contracts"]) == [101.0]
+    assert [e["kind"] for e in open_interest.provenance("BINANCE", "BTC/USDT", root=tmp_path)] == ["refused"]
+
+
+def test_never_kept_counts_from_the_first_try_across_restarts(tmp_path, monkeypatch):
+    """QA P1-O7: when collection was first tried is kept in the series' file, so a restart doesn't reset it."""
+    first = pd.Timestamp("2026-10-01", tz="UTC")
+    monkeypatch.setattr(open_interest.pd.Timestamp, "now", staticmethod(lambda tz=None: first))
+    open_interest.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=lambda pair, start: [])
+    later = first + pd.Timedelta(days=3)
+    assert "collected since 2026-10-01 00:00" in open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=later)
+    assert open_interest.at_risk("BINANCE", "BTC/USDT", root=tmp_path, now=first + pd.Timedelta(hours=23)) is None
+    assert "never tried" in open_interest.at_risk("BINANCE", "ETH/USDT", root=tmp_path, now=later)
+
+
+def test_failing_prices_skip_neither_open_interest_nor_its_alert(tmp_path, monkeypatch):
+    """QA P1-O5: the run loop refreshes funding and open interest in their own try."""
+    from sleeve_fund import history
+
+    old = T0 - 30 * 86_400_000  # received a month before the test data
+    _put(tmp_path, [[old, 1.0, 1.0, old, 0]])
+    raised = []
+
+    class Stop(Exception):
+        pass
+
+    def fail(*a, **k):
+        raise RuntimeError("venue 503")
+    monkeypatch.setattr(history, "_pairs_in_use", lambda v, store=None: [("BTC/USDT", None)])
+    monkeypatch.setattr(history, "refresh", fail)
+    monkeypatch.setattr(funding, "refresh", fail)
+    monkeypatch.setattr(open_interest, "refresh", fail)
+    monkeypatch.setattr(history, "_warn_at_risk", lambda problem, store=None: raised.append(problem))
+    monkeypatch.setattr(time, "sleep", lambda s: (_ for _ in ()).throw(Stop()))
+    try:
+        history.main(["--root", str(tmp_path), "run", "--venue", "binance"])
+    except Stop:
+        pass
+    assert any(p and p.startswith("BINANCE BTC/USDT: open interest last kept") for p in raised)
+
+
+def test_funding_gaps_find_two_missed_settlements_in_a_row(tmp_path):
+    h = 3_600_000
+    kept = [T0 + k * 8 * h for k in range(12) if k not in (3, 5)]
+    funding.refresh("BINANCE", "BTC/USDT", root=tmp_path, loader=lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
+    assert [a for a, b in funding.gaps("BINANCE", "BTC/USDT", root=tmp_path)] == [
+        pd.Timestamp(T0 + k * 8 * h, unit="ms", tz="UTC") for k in (2, 4)]
+
+
+def test_the_lag_is_not_trusted_until_twenty_live_captures(tmp_path):
+    """Advisor (15:07 6 Oct): keep the 20-minute fallback until there are enough live captures for a p95."""
+    rows = [[T0 + i * STEP, 1.0 + i, 1.0, T0 + i * STEP + 3 * 60_000, 0] for i in range(open_interest.MIN_LIVE)]
+    _put(tmp_path, rows[:-1])
+    assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) is None
+    _put(tmp_path, rows)
+    assert open_interest.lag("BINANCE", "BTC/USDT", root=tmp_path) == pd.Timedelta(minutes=3)

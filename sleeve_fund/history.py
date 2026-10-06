@@ -593,7 +593,7 @@ def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
         return
     oi = f"{out['latest']:%Y-%m-%d %H:%M}" if out["latest"] is not None else "none yet"
     fr = f"{funding_to:%Y-%m-%d %H:%M}" if funding_to is not None else "none yet"
-    extra = f", {out['conflicts']} differing (provenance.jsonl)" if out["conflicts"] else ""
+    extra = f", {out['conflicts']} differing (open_interest.provenance.jsonl)" if out["conflicts"] else ""
     print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
 
 
@@ -678,9 +678,12 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 out = refresh(store, profile, pair, max_pages=args.pages, since=since)
                 behind |= out["pages"] >= args.pages
-                _refresh_funding(profile, pair, args.root, since)
             except Exception as exc:  # noqa: BLE001 - one bad pair or a venue hiccup must not stop the rest
                 print(f"{profile.name} {pair}: refresh failed: {exc!r}")
+            try:  # on its own: failing prices must not skip funding, open interest or the week-old alert (QA P1-O5)
+                _refresh_funding(profile, pair, args.root, since)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{profile.name} {pair}: funding and open interest refresh failed: {exc!r}")
         if not behind:
             time.sleep(args.idle)
 

@@ -88,15 +88,21 @@ def rate_at(series: pd.Series, ts: pd.Timestamp) -> float | None:
     return None
 
 
+_NEAR = 3  # intervals either side of one that set what it is expected to be
+
+
 def gaps(venue: str, pair: str, root: str | Path | None = None) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     """Settlements missing between the first and last rate kept, as (previous kept, next kept). A venue can change
-    an instrument's settlement interval (8 hours to 4, say), so a hole is an interval longer than one and a half
-    times both the one before it and the one after it, not a fixed grid."""
+    an instrument's settlement interval (8 hours to 4, say), so there is no fixed grid: a hole is an interval
+    longer than one and a half times the shortest of the few intervals before it AND of the few after it. Taking
+    the shortest finds two holes in a row (QA P1-O9), and needing both sides keeps a clean change of interval from
+    counting. A hole exactly at a change can't be told from data alone (8h to 16:00 then 4h from 00:00 reads the
+    same as a missed 20:00), so it is not reported."""
     t = rates(venue, pair, root).index
     steps = [b - a for a, b in zip(t, t[1:])]
     out = []
     for j, here in enumerate(steps):
-        near = steps[max(j - 1, 0):j] + steps[j + 1:j + 2]
-        if near and all(here > 1.5 * n for n in near):
+        before, after = steps[max(j - _NEAR, 0):j], steps[j + 1:j + 1 + _NEAR]
+        if (before or after) and all(here > 1.5 * min(side) for side in (before, after) if side):
             out.append((t[j], t[j + 1]))
     return out
