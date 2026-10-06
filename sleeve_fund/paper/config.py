@@ -56,7 +56,8 @@ def check_hub_bar_spec(venue: str, bar_spec: str) -> None:
     profile = venue_profile(venue)
     if profile.hub and not bar_spec.endswith("-INTERNAL"):
         size = "-".join(bar_spec.split("-")[:2]).lower()  # 1-DAY-LAST-EXTERNAL -> 1-day
-        raise ValueError(f"bar_spec: {profile.label} strategies decide on bars built from the market data hub's "
+        # No venue name: this is shown on the dashboard when a strategy is created.
+        raise ValueError(f"bar_spec: strategies on this market decide on bars built from the market data hub's "
                          f"minutes, so the venue's own {size} candles aren't available "
                          "there; choose 1, 5 or 15-minute or 1-hour bars")
 

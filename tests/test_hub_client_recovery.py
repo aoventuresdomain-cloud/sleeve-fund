@@ -111,6 +111,53 @@ def test_on_one_minute_bars_a_missed_minute_is_told_and_kept_as_history_not_deci
     assert d(_msg(df, 2), T0 + 6 * M + 5 * S) is None and len(said) == 1
 
 
+def _as_refilled(m):
+    """A minute as the hub refills it from the venue's candles: its numbers as str(float), 60000.1 for 60000.10."""
+    return {**m, **{k: str(float(m[k])) for k in "ohlcv"}, "refilled": True}
+
+
+def test_a_bar_built_from_live_and_refilled_minutes_is_written_at_the_instruments_decimals(tmp_path):
+    """Code review on #140: the refilled minute holds the bar's high, written 61000.1; the bar is 61000.10, as
+    every other price of the instrument, and the store's bar to the cent."""
+    df = _minutes(15)
+    df.iloc[7, df.columns.get_loc("high")] = 61_000.10
+    hs = _store(tmp_path, df)
+    d = Decoder("15-MINUTE-LAST-EXTERNAL")
+    d.precision[IID] = (2, 3)
+    out = [d(_as_refilled(_msg(df, i)) if i == 7 else _msg(df, i), int(df.index[i].value) + M + 2 * S)
+           for i in range(15)]
+    (b,) = [x for x in out if x is not None]
+    assert str(b.high) == "61000.10" and {p.precision for p in (b.open, b.high, b.low, b.close)} == {2}
+    assert b.volume.precision == 3 and _tup(b) == _store_bars(hs, 15)[0]
+
+
+def test_minutes_recovered_after_a_refilled_one_keep_their_cents(tmp_path):
+    """Code review on #140: the minute that shows the gap is a refill written 60000.0; the minutes taken from
+    the store for the gap keep the instrument's decimals rather than that message's one."""
+    df = _minutes(15)
+    df.iloc[8, df.columns.get_loc("close")] = 60_000.0
+    df.iloc[8, df.columns.get_loc("high")] = max(df.high.iloc[8], 60_000.0)
+    df.iloc[8, df.columns.get_loc("low")] = min(df.low.iloc[8], 60_000.0)
+    hs = _store(tmp_path, df)
+    d = Decoder("15-MINUTE-LAST-EXTERNAL", recover=stored_minutes("BINANCE", "BTC/USDT", hs))
+    d.precision[IID] = (2, 3)
+    for i in (0, 1, 2, 3, 4, 8):
+        d(_as_refilled(_msg(df, i)) if i == 8 else _msg(df, i), int(df.index[i].value) + M + 2 * S)
+    kept = d.building[IID].minutes
+    assert [kept[int(df.index[i].value) + M]["h"] for i in (5, 6, 7)] == [f"{df.high.iloc[i]:.2f}" for i in (5, 6, 7)]
+    out = [d(_msg(df, i), int(df.index[i].value) + M + 2 * S) for i in range(9, 15)]
+    assert _tup(out[-1]) == _store_bars(hs, 15)[0]
+
+
+def test_a_decoder_without_the_definition_rounds_nothing():
+    d = Decoder("15-MINUTE-LAST-EXTERNAL")
+    df = _minutes(15)
+    out = [d(_as_refilled(_msg(df, i)) if i == 3 else _msg(df, i), int(df.index[i].value) + M + 2 * S)
+           for i in range(15)]
+    (b,) = [x for x in out if x is not None]
+    assert {p.precision for p in (b.open, b.high, b.low, b.close)} == {2} and b.volume.precision == 3
+
+
 def test_a_store_that_cant_be_read_leaves_the_minutes_missing_and_says_why():
     df = _minutes(20)
     said, report = _recorder()
@@ -231,8 +278,10 @@ def test_a_node_started_before_its_hub_listens_waits_for_it(monkeypatch):
     port = s.getsockname()[1]
     s.close()
     monkeypatch.setattr(hub_client, "RECONNECT_SECONDS", (0.1,))
-    monkeypatch.setattr(hub_client, "instrument_from", lambda d: d)
-    hub = Fanout("BINANCE", known=lambda: {IID}, instruments=lambda ids: [{"id": IID}], log=lambda *_: None)
+    monkeypatch.setattr(hub_client, "instrument_from", lambda d: SimpleNamespace(**d))
+    hub = Fanout("BINANCE", known=lambda: {IID}, instruments=lambda ids: [{"id": IID, "price_precision": 2,
+                                                                           "size_precision": 3}],
+                 log=lambda *_: None)
     c = _Client(port)
 
     async def run():
@@ -246,7 +295,8 @@ def test_a_node_started_before_its_hub_listens_waits_for_it(monkeypatch):
 
     asyncio.run(run())
     hub.stop()
-    assert c.connects == 1 and c.defined == [{"id": IID}]
+    assert c.connects == 1 and [i.id for i in c.defined] == [IID]
+    assert c.decode.precision == {IID: (2, 3)}  # the bars it builds are written at the instrument's decimals
 
 
 def test_a_hub_that_never_comes_gives_up_at_the_connect_timeout(monkeypatch):
@@ -346,6 +396,7 @@ def test_the_dashboard_refuses_a_hub_venue_strategy_on_the_venues_own_candles(cl
     r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     error = parse_qs(urlparse(r.headers["location"]).query)["error"][0]
     assert "venue's own 1-day candles aren't available there" in error and store.sleeves() == []
+    assert "strategies on this market" in error and "Binance" not in error  # no venue name on the dashboard
 
 
 def test_a_hub_fed_node_takes_no_data_from_the_venue(monkeypatch):

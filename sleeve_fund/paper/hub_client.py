@@ -138,6 +138,9 @@ class Decoder:
         self.sent: set[str] = set()  # instruments with a bar sent: a part bar after that is a gap, still sent
         self.late = 0  # bars skipped as late
         self._skipped: dict[str, list[int]] = {}  # instrument -> the closes of a run of skipped bars
+        # instrument -> its price and size decimals, from the hub's definitions. A refilled minute's numbers
+        # can carry fewer ("60000.1" for 60000.10), so a bar is written at these, not at its minutes' own.
+        self.precision: dict[str, tuple[int, int]] = {}
 
     def __call__(self, m: dict, now_ns: int):
         t = m.get("t")
@@ -185,7 +188,7 @@ class Decoder:
             except Exception as exc:  # noqa: BLE001 - no store to hand: the minutes stay missing, as before
                 self.report("warning", "hub_gap", f"{iid}: couldn't read the history store for the minutes the "
                                                   f"feed missed ({type(exc).__name__}: {exc})")
-        px, qty = _decimals(like["c"]), _decimals(like["v"])
+        px, qty = self._digits(iid, [like])
         got = [{"t": "bar", "id": iid, "o": f"{o:.{px}f}", "h": f"{h:.{px}f}", "l": f"{lo:.{px}f}", "c": f"{c:.{px}f}",
                 "v": f"{v:.{qty}f}", "ts": int(ts), "recv": now_ns, "refilled": True, "recovered": True}
                for ts, o, h, lo, c, v in rows if after < ts < before]
@@ -205,6 +208,14 @@ class Decoder:
                         f"lacks {(before - after) // MINUTE_NS - 1 - len(got)} of its minutes before the first "
                         "one received, even from the history store: not sent, so the indicators skip it")
         return got
+
+    def _digits(self, iid: str, minutes) -> tuple[int, int]:
+        """The instrument's price and size decimals; without its definition (a bare Decoder), the most any of
+        these minutes is written with, so no number is rounded."""
+        if (known := self.precision.get(iid)) is not None:
+            return known
+        minutes = list(minutes)
+        return (max(_decimals(m[k]) for m in minutes for k in "ohlc"), max(_decimals(m["v"]) for m in minutes))
 
     def _add(self, iid: str, m: dict, now_ns: int):
         """A minute newer than every one before it: into its bar, and the bar out if this closes it."""
@@ -249,9 +260,10 @@ class Decoder:
                         f"{iid}: the bar closing {_hhmm(b.end)} was sent missing {missing} of its "
                         f"{self.period // MINUTE_NS} minutes")
         bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
-        o, h, lo, c, v = b.ohlcv()
-        return Bar(bt, Price.from_str(str(o)), Price.from_str(str(h)), Price.from_str(str(lo)), Price.from_str(str(c)),
-                   Quantity.from_str(str(v)), b.end, now_ns)
+        px, qty = self._digits(iid, b.minutes.values())
+        *prices, v = b.ohlcv()
+        return Bar(bt, *(Price.from_str(f"{n:.{px}f}") for n in prices), Quantity.from_str(f"{v:.{qty}f}"),
+                   b.end, now_ns)
 
 
 class HubDataClientConfig(DataClientConfig):
@@ -327,7 +339,9 @@ class HubDataClient(MarketDataClient):
                 raise ConnectionError(f"the hub doesn't serve {', '.join(missing)}")
             await asyncio.sleep(5)
         for d in defs.values():
-            self._handle_instrument(instrument_from(d))
+            inst = instrument_from(d)
+            self.decode.precision[d["id"]] = (inst.price_precision, inst.size_precision)
+            self._handle_instrument(inst)
         self._reader_task = self.create_task(self._read(reader), name="hub-read")
 
     async def _read(self, reader: asyncio.StreamReader) -> None:

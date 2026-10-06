@@ -102,6 +102,8 @@ def stored_minutes(venue: str, pair: str, store=None):
     from sleeve_fund.history import HistoryStore
 
     def recover(_instrument_id: str, after_ns: int, before_ns: int) -> list[tuple]:
+        # Read synchronously inside the hub client's read loop: only on a gap or at start, a few minutes from
+        # one instrument, in a process running one strategy, so the stall is short and nothing else waits on it.
         hs = store or HistoryStore()
         df = hs.read(venue, pair, 1, start=pd.Timestamp(after_ns, tz="UTC"), end=pd.Timestamp(before_ns, tz="UTC"))
         df = df[df.index < pd.Timestamp(before_ns, tz="UTC")]
