@@ -1249,3 +1249,32 @@ def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
                      "btc-rsi-long's exposure is 104% of its entry cap because the price moved; no action"]
     texts = [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2, "cap_used": 0.85}], health)]
     assert texts == ["btc-rsi-long has used 85% of its position cap"]
+
+
+def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_last_flat():
+    """Code Reviewer on 6047b50: a risk stop journaled as a liquidation can take part of the position and the guard's
+    close the rest; X counts both (quantity and fees), the entry fee of what was held, and nothing from an earlier,
+    closed trade. A fill not yet in the journal is reported as such, so the halt keeps its estimate."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.paper.journal import MemoryJournal
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    j = MemoryJournal()
+    j.create_sleeve(name="s", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                    starting_balance=10_000, risk_profile="balanced", params={})
+    t0 = datetime(2025, 10, 3, tzinfo=timezone.utc)
+    for i, (oid, intent, side, qty, px, fee) in enumerate([
+            ("old-in", "entry", "BUY", 0.2, 60_000.0, 6.0), ("old-out", "exit", "SELL", 0.2, 60_500.0, 6.05),
+            ("in", "entry", "SELL", 0.3, 60_000.0, 9.0), ("stop", "liquidation", "BUY", 0.1, 90_000.0, 4.5),
+            ("guard", "liquidation", "BUY", 0.2, 97_440.0, 9.74)]):
+        at = t0 + pd.Timedelta(minutes=i)
+        j.record_order("s", order_id=oid, side=side, qty=qty, intent=intent, reason="", ts=at)
+        j.record_fill("s", side=side, qty=qty, price=px, fee=fee, order_id=oid, trade_id=f"t-{oid}", ts=at)
+    j.record_equity("s", equity=9_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
+                    ts=t0 + pd.Timedelta(minutes=2, seconds=30))
+    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005))
+    fees, taken, before, journaled = LongFlatStrategy._liquidation_figures(me, "t-guard")
+    assert fees == pytest.approx(9.0 + 4.5 + 9.74) and taken == pytest.approx(0.3)
+    assert before == 9_000.0 and journaled
+    assert LongFlatStrategy._liquidation_figures(me, "t-not-yet")[3] is False

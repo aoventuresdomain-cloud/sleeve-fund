@@ -26,13 +26,13 @@ FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy pa
 SPREAD_MIN_SAMPLES = 100
 
 
-WIPED_OUT = "Position margin lost (liquidated)"
+WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
 RESET_AFTER_LIQUIDATION = "liquidation_reset"  # what a reset after liquidation journals (trading.LIQUIDATION_RESET, #164)
 
 
 def liquidation_reason(head: str, covered: float) -> str:
     """A liquidation's halt once flat: its head, and what the venue's insurance fund covered, if anything."""
-    return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
+    return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
 
 class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and

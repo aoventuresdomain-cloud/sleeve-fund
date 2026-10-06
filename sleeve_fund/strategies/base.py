@@ -34,7 +34,7 @@ from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
 from sleeve_fund.paper.runtime import WIPED_OUT, liquidation_reason
-from sleeve_fund.store import replay_book
+from sleeve_fund.store import DUST, replay_book
 from sleeve_fund.strategies.indicators import AtrSma
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
@@ -2365,25 +2365,36 @@ class LongFlatStrategy(Strategy):
                                      f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
                                      "position's margin", ts=self.runtime.now())
 
-    def _liquidation_figures(self, order_id: str | None, notional: float = 0.0) -> tuple[float, float, float | None]:
-        """What a liquidation lost, from the journal (Advisor 18:17 point 4), as (fees, quantity taken, equity before).
-        The fees: the entry fees of the position held, so a restart and a partial reduce are counted right, plus the
-        liquidation's own as journaled (order_id), or at the taker rate on `notional` before it fills. The quantity:
-        the sum of its fills, as it can fill in slices. The equity: the last mark still holding the position, up to
-        its first fill (the mark-to-market equity just before it)."""
+    def _liquidation_figures(self, trade_id: str | None, notional: float = 0.0) -> tuple[float, float, float | None, bool]:
+        """What a liquidation lost, from the journal (Advisor 18:17 point 4), as (fees, quantity taken, equity before,
+        whether the fill `trade_id` is journaled yet). Its fills are those of every liquidation order since the
+        position was last flat: a risk stop journaled as one can take part and the guard's close the rest (Code
+        Reviewer on 6047b50). The fees: the entry fees of the position held, so a restart and a partial reduce are
+        counted right, plus the liquidation's own as journaled, plus the taker rate on `notional`, what is still to
+        close. The equity: the last mark still holding the position, up to its first fill."""
         import pandas as pd
 
         if self.runtime is None:
-            return 0.0, 0.0, None
+            return 0.0, 0.0, None, True
         store, name = self.runtime.store, self.runtime.name
         fills = sorted(store.fills(name, limit=1_000_000), key=lambda f: (f["ts"], f["id"]))
-        liq = [f for f in fills if order_id is not None and f["order_id"] == order_id]
-        held = replay_book([f for f in fills if order_id is None or f["order_id"] != order_id], 0.0)["entry_fees"]
-        fees = held + (sum(float(f["fee"]) for f in liq) if liq else notional * self.runtime.taker_fee)
+        liquidations = {o["order_id"] for o in store.orders(name, limit=100_000) if o["intent"] == "liquidation"}
+        held, flat = Decimal(0), 0  # the fills since the position was last flat before now
+        for i, f in enumerate(fills[:-1]):
+            held += Decimal(repr(float(f["qty"]))) * (1 if f["side"] == "BUY" else -1)
+            if abs(held) < DUST:
+                held, flat = Decimal(0), i + 1
+        window = fills[flat:]
+        liq = [f for f in window if f["order_id"] in liquidations]
+        rest = [f for f in window if f["order_id"] not in liquidations]
+        fees = (replay_book(rest, 0.0)["entry_fees"] + sum(float(f["fee"]) for f in liq)
+                + notional * self.runtime.taker_fee)
         at = min(pd.Timestamp(f["ts"]) for f in liq) if liq else None
         marks = [m for m in store.equity_series(name, limit=500)
                  if m["qty"] and m["equity"] > 0 and (at is None or pd.Timestamp(m["ts"]) <= at)]
-        return fees, sum(float(f["qty"]) for f in liq), (float(marks[-1]["equity"]) if marks else None)
+        journaled = trade_id is None or any(str(f.get("trade_id")) == trade_id for f in liq)
+        return (fees, sum(float(f["qty"]) for f in liq), (float(marks[-1]["equity"]) if marks else None),
+                journaled)
 
     def _margin_lost(self, qty: float, entry: float, fees: float = 0.0, before: float | None = None) -> str:
         """The halt for a liquidation (Independent Quant Advisor, 6 Oct 17:57): "Position margin lost (liquidated): X,
@@ -2610,8 +2621,8 @@ class LongFlatStrategy(Strategy):
             wiped = None
             if underwater and self._liquidated is None:
                 # Its liquidation fee at the taker rate on this mark, until the fill gives the fee charged.
-                fees, _, before = self._liquidation_figures(None, abs(qty) * price)
-                self._liquidated = self._margin_lost(abs(qty), self._entry_px or price, fees, before)
+                fees, taken, before, _ = self._liquidation_figures(None, abs(qty) * price)
+                self._liquidated = self._margin_lost(abs(qty) + taken, self._entry_px or price, fees, before)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
                 wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
                 equity = 0.0
@@ -2840,9 +2851,11 @@ class LongFlatStrategy(Strategy):
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
             if self.decisions.get(coid, {}).get("intent") == "liquidation" and held[0] and held[1]:
-                fees, taken, before = self._liquidation_figures(journal_id)
+                fees, taken, before, journaled = self._liquidation_figures(str(event.trade_id))
                 margin = self._margin_lost(max(taken, held[0]), held[1], fees, before)  # every slice, not the last
-                if self._liquidated is not None and margin != self._liquidated and self.runtime is not None:
+                if not journaled:
+                    margin = self._liquidated or margin  # its fill isn't in the journal yet: keep the estimate
+                elif self._liquidated is not None and margin != self._liquidated and self.runtime is not None:
                     # Halted on the mark with the liquidation fee estimated: once the whole position has gone, the
                     # halt gives the X the journal has, from all its slices (QA P1-D18).
                     old, self._liquidated = self._liquidated, margin
