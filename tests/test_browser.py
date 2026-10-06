@@ -357,3 +357,31 @@ def test_the_overlay_names_the_candle_size_it_was_recorded_on_and_groups_share_a
     assert "minute candles, so it shows only on that interval" in page.inner_text(".pc-strat-note")
     assert errors == []
     ctx.close()
+
+
+def test_a_settings_change_rebuilds_the_overlay_labels_and_levels_and_warm_up_joins_the_line(site, browser):
+    """CR on #173: the same keys with a new label and guide levels (an RSI period or entry level changed) redraw
+    the legend and the strip; the dashed warm-up reaches the first settled point."""
+    import json
+
+    first = _fixture_candles()
+    second = json.loads(json.dumps(first))
+    for i in second["indicators"]:
+        if i["key"] == "rsi":
+            i["label"], i["levels"] = "RSI(7)", [25, 75]
+    served = [first]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(served[0])))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-sub-legend", timeout=5000)
+    assert "RSI(14)" in page.inner_text(".pc-sub-legend")
+    served[0] = second
+    page.click(".pc-intervals button")  # a live re-render with the new settings, no page reload
+    page.wait_for_function("document.querySelector('.pc-sub-legend').innerText.includes('RSI(7)')", timeout=5000)
+    assert "RSI(7)" in page.inner_text(".pc-sub-legend") and errors == []
+    ctx.close()

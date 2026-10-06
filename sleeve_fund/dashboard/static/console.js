@@ -378,7 +378,7 @@ window.Console = (() => {
     let config = loadInd(), built = [];
     // The strategy's own indicator values (P1-3s): drawn as the platform recorded them, never recomputed here.
     // Each is a synthetic LIB entry reading the latest payload, so the legend, strips and crosshair are the menu's.
-    let strat = [], stratData = {};
+    let strat = [], stratData = {}, built_sig = "";
     let syncing = false, mirroring = false;
     const quiet = {priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false};
     const colorOf = (c) => (c.color && /^#[0-9a-f]{6}$/i.test(c.color) ? c.color : css(PALETTE[0]));
@@ -451,14 +451,20 @@ window.Console = (() => {
         return last;
       });
       const from = ind.settled_from == null ? -Infinity : ind.settled_from;
-      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null))},
-        {vals: at.map((p) => (p && p[0] < from ? p[1] : null)), style: 2, alpha: 0.45}];
+      const warm = at.map((p) => (p && p[0] < from ? p[1] : null));
+      // The dashed part reaches the first settled point, so the two parts join with no gap at the seam.
+      const seam = at.findIndex((p) => p && p[0] >= from);
+      if (seam > 0 && warm[seam - 1] != null) warm[seam] = at[seam][1];
+      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null))}, {vals: warm, style: 2, alpha: 0.45}];
     };
     const syncStrategy = (d) => {
       const list = (d.indicators || []).filter((i) => i.kind !== "marker");
       stratData = Object.fromEntries(list.map((i) => [i.key, i]));
-      const keys = list.map((i) => `${i.key}|${i.pane}`).join(",");
-      if (keys !== strat.map((s) => `${s.key}|${s.pane}`).join(",")) {
+      // What the panes were built from: a settings change keeps the keys but changes labels, levels and groups.
+      const sig = (i) => `${i.key}|${i.pane}|${i.label}|${i.group || ""}|${JSON.stringify(i.levels || [])}`;
+      const keys = list.map(sig).join(",");
+      if (keys !== built_sig) {
+        built_sig = keys;
         strat.forEach((s) => delete LIB["s:" + s.key]);
         // Lines of one group (Bollinger's mid, upper and lower) share a colour, so they read as one indicator.
         const hues = new Map();
