@@ -211,6 +211,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
         (NEARBY_CHECK, *_nearby(r)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
+        *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
         (
             "Holdout not used for tuning",
@@ -295,6 +296,28 @@ def _ack_for(ack, liq: dict) -> str | None:
     if row is None:
         return None
     return (row.get("note") if isinstance(row, dict) else None) or "acknowledged"
+
+
+FIRST_TOUCH_CHECK = "First-touch candles resolved by rule (shown, not a test)"
+
+
+def first_touch_words(r: StudyResult) -> str:
+    """R2-G1: how many out-of-sample candles a first_touch rule settled by its fixed resolution, and over the
+    threshold, both resolutions' results and which one G1 judged."""
+    ft = r.first_touch
+    words = (f"{ft['ambiguous']} of {ft['reached']} out-of-sample level-reaching candles ({ft['share']:.1%}) were "
+             f"same-minute ambiguous (threshold {ft['threshold']:.0%} pooled or in any fold, or under "
+             f"{ft['min_reached']} candles)")
+    if not ft["flipped"]:
+        return words + ": judged as ruled"
+    ruled, opposite = ft["as_ruled"], ft["opposite"]
+    words += (f": re-run the opposite way. As ruled ({ft['resolved']}): Sharpe {_num(ruled['sharpe'])}, CAGR "
+              f"{_pct(ruled['cagr'])}; opposite ({ft['opposite_resolved']}): Sharpe {_num(opposite['sharpe'])}, CAGR "
+              f"{_pct(opposite['cagr'])}. "
+              f"Judged on the worse, {'the opposite' if ft['judged_on'] == 'opposite' else 'as ruled'}")
+    if "holdout_judged_on" in ft:
+        words += f"; the holdout on {'the opposite' if ft['holdout_judged_on'] == 'opposite' else 'as ruled'}"
+    return words
 
 
 def _random_entry_check(r: StudyResult) -> tuple[str, str, str]:
