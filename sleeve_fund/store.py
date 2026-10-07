@@ -1260,9 +1260,17 @@ class Store:
             return _rows(c.execute(select(resets_t).where(resets_t.c.done_at.is_(None)).order_by(resets_t.c.id)))
 
     def reset_runs(self) -> dict[str, datetime]:
-        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's."""
+        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's. A dropped
+        reset (drop_reset) put nothing away."""
         with self.engine.connect() as c:
-            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
+            return {r.run: _aware(r.done_at) for r in c.execute(
+                select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
+
+    def drop_reset(self, request: dict, why: str) -> None:
+        """Close a reset request unapplied (no run put away), noted in the decision log."""
+        with self.engine.begin() as c:
+            c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=utcnow(), run=""))
+        self.decide("system", "drop reset", f"{why} ({request['reason']})", request["sleeve"])
 
     def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
@@ -1708,9 +1716,9 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def drop_pending(self, sleeve: str, why: str) -> int:
-        """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
-        pending = self.pending_commands(sleeve)
+    def drop_pending(self, sleeve: str, why: str, keep: tuple[str, ...] = ()) -> int:
+        """Retire a strategy's waiting commands unapplied, each noted in the decision log; those in `keep` stay."""
+        pending = [c for c in self.pending_commands(sleeve) if c["command"] not in keep]
         for cmd in pending:
             self.mark_applied(cmd["id"])
             if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them

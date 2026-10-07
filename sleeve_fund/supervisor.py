@@ -29,7 +29,7 @@ from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
-from sleeve_fund.paper.runtime import entry_blocked, said_since_last_fill
+from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
 
 POLL_SECONDS = 5
@@ -191,6 +191,16 @@ class Supervisor:
         for req in self.store.pending_resets():
             name = req["sleeve"]
             s = self.store.sleeve(name)
+            if liquidation_head(self.store, name) is not None:
+                # Asked before a liquidation that landed while it waited (its flatten parked on the liquidating
+                # tick): an ordinary reset would put the liquidation away unanswered (U27), so it is dropped and the
+                # halt stays until a reset after liquidation (QA P1-D24)
+                self.store.drop_reset(req, "dropped: the strategy was liquidated before the reset was carried out; "
+                                      "only a reset after liquidation clears that")
+                self.store.event(name, "warning", "reset_dropped",
+                                 f"The reset asked for ({req['reason']}) was not carried out: the strategy was "
+                                 "liquidated first, and only a reset after liquidation clears that")
+                continue
             pending = self.store.pending_commands(name)
             book = self.store.journal_book(name, s.starting_balance)
             qty = book["qty"]
@@ -245,6 +255,9 @@ class Supervisor:
                     self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
             elif action == "stop":
                 self._stop(sleeve.name, proc, "stopped by PM")
+                # A flatten kept through the PM's Stop for its exits-only run (P1-D23) lapses once there is
+                # nothing left to sell, rather than act on the next start
+                self.store.drop_pending(sleeve.name, "lapsed: the strategy was stopped before it acted")
                 if not entry_blocked(self.store, sleeve.name, starting=True)[0]:  # a halt stays through a stop (HC)
                     self.store.set_status(sleeve.name, "stopped", "stopped by PM")
             elif action == "restart_stale":

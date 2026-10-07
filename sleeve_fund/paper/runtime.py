@@ -25,6 +25,10 @@ RECONCILE_EVERY = timedelta(hours=24)
 SPREAD_EVERY = timedelta(hours=1)
 FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy page is at most this stale
 SPREAD_MIN_SAMPLES = 100
+# A liquidation order working this long with the PM's commands waiting behind it is stuck: an incident says so once
+# (QA P1-D23). Paper fills a liquidation at once; at a venue one can hang.
+LIQ_STUCK = timedelta(minutes=5)
+LIQ_STUCK_HEAD = "A liquidation order is still working"
 
 
 WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
@@ -228,6 +232,7 @@ class SleeveRuntime:
         # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
         # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
         self.raced: str | None = None
+        self.liq_working_since: datetime | None = None  # when the liquidation order now working was first seen
         self._refused = 0
 
     def _last_liquidation(self) -> str | None:
@@ -346,6 +351,20 @@ class SleeveRuntime:
         if why is not None:
             self.store.event(self.name, "warning", BLOCK_STARTED, BLOCK_PREFIX + why, ts=self.now())
         self._block, self._refused = why, 0
+
+    def _liq_stuck(self, now: datetime, liquidating: bool) -> None:
+        """The PM's commands wait while a liquidation order works (P1-U34). Should that order hang, they would wait
+        unseen: past LIQ_STUCK, one incident names what waits (QA P1-D23). Stop is still taken by the dashboard."""
+        if not liquidating:
+            self.liq_working_since = None
+            return
+        self.liq_working_since = self.liq_working_since or now
+        waiting = [c["command"] for c in self.store.pending_commands(self.name) if c["command"] != RELOAD]
+        if waiting and now - self.liq_working_since >= LIQ_STUCK:
+            mins = (now - self.liq_working_since).total_seconds() / 60
+            self.incident_once(LIQ_STUCK_HEAD, f"{LIQ_STUCK_HEAD} after {mins:.0f} minutes, and the PM's "
+                               f"{', '.join(waiting)} waits behind it: check the order at the venue. Stop is still "
+                               "taken, and a waiting flatten is kept through it")
 
     def incident_once(self, head: str, message: str) -> None:
         """An incident about the position held now, written once: a restart or a deploy doesn't repeat it while no
@@ -477,6 +496,7 @@ class SleeveRuntime:
                                  f"{breach.reason}; flattened while paused, and it stays paused", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss limit while paused: {breach.reason}")
 
+        self._liq_stuck(now, liquidating)
         for cmd in [] if liquidating else self.store.pending_commands(self.name):
             if cmd["command"] == RELOAD:
                 continue  # the supervisor's: it restarts this process under the new settings
