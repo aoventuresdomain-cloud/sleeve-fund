@@ -82,10 +82,10 @@ def check_funding_schedule(s: Sleeve) -> None:
     """Raises ValueError when a perp's newest stored settlement step is shorter than the schedule funding is charged
     on: the engine would skip settlements (funding.schedule_mismatch; Advisor, 6 Oct 2026), until DA-11."""
     from sleeve_fund import funding, markets
-    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.venues import DEFAULT_VENUE
 
-    try:
-        terms = markets.terms(s.params, from_store(s).venue)
+    try:  # the venue as from_store reads it, without building the node's config (its warm-up reads the model)
+        terms = markets.terms(s.params, getattr(s, "venue", None) or DEFAULT_VENUE)
     except ValueError:  # a market the venue doesn't list: the node's own start refuses it, with its reason
         return
     if terms is None or terms.funding_venue is None:

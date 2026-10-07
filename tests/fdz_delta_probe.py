@@ -519,8 +519,15 @@ def test_restart_journal_path_with_an_exit_filled_while_the_rate_is_awaited_char
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     ready = utc(f"{DAY} 08:10").to_pydatetime()
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate",
-                        lambda self, terms, ts, now, *_: None if now < ready else BASELINE)
+    # Set-up only (HoQA 7 Oct, DA): on either signature. Before #163 `_funding_rate(terms, ts, now)` returns the rate;
+    # from #163 it also takes held= and returns (rate, is_baseline). None (not published yet) on both.
+    import inspect
+
+    if "held" in inspect.signature(LongFlatStrategy._funding_rate).parameters:
+        stub = lambda self, terms, ts, now, *_, **__: None if now < ready else (BASELINE, False)  # noqa: E731
+    else:
+        stub = lambda self, terms, ts, now, *_, **__: None if now < ready else BASELINE  # noqa: E731
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", stub)
     run, _ = restarted(monkeypatch, back_min=12, heartbeat_min=11, trades="dense", leave=15, prior=True)
     ex = [f for f in run.fills if f["side"] == "SELL"]
     assert ex and utc(ex[0]["ts"]) < utc(f"{DAY} 08:10"), ("set-up: B exits before the rate arrives", run.fills)
