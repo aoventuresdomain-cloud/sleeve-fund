@@ -3,6 +3,7 @@ position's entry, stop and target as lines. Drawn by TradingView Lightweight Cha
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -112,6 +113,81 @@ def payload(df: pd.DataFrame, minutes: int, fills: list[dict], orders: dict[str,
     markers.sort(key=lambda m: m["time"])
     return {"interval": minutes, "source": source, "candles": out_candles, "volume": volume, "markers": markers,
             "notes": notes, "lines": lines}
+
+
+# One entry per strategy and candle size: (when drawn, the chart's first and last candle, the lines). A chart that
+# moves on a candle replaces its entry, so the cache holds one per chart however long it stays open (CR #176).
+_drawn: dict[tuple, tuple[float, int, int, list[dict]]] = {}
+
+
+def spec_minutes(bar_spec: str) -> int:
+    step, unit = bar_spec.split("-")[:2]
+    return int(step) * {"MINUTE": 1, "HOUR": 60, "DAY": 1440}[unit]
+
+
+def indicators(sleeve, chart: pd.DataFrame, minutes: int, store=None) -> tuple[list[dict], str | None]:
+    """The strategy's own indicator lines over the chart's candles (v2 P1-3s, strategies.series), with a note when
+    there are none to draw. They are drawn on the strategy's own candle size only, recomputed from the history
+    store's closed candles with the model's warm-up before the chart's first, so each point is the value the model
+    read when it decided on that candle; t is the candle's CLOSE (the chart's candles are stamped at their open).
+    Never raises: the candles still chart when the lines can't be drawn."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.instruments import spot_pair
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.strategies.series import indicator_series, warmup
+
+    try:
+        own = spec_minutes(sleeve.bar_spec)
+    except (ValueError, KeyError, IndexError):
+        return [], None
+    if sleeve.strategy not in REGISTRY:
+        return [], None
+    if minutes != own:
+        return [], f"The strategy's indicators are drawn on its own {_label(own)} candles."
+    if not len(chart):
+        return [], None
+    first_close = pd.Timestamp(chart.index[0]) + pd.Timedelta(minutes=minutes)
+    key = (sleeve.name, sleeve.strategy, repr(sorted(sleeve.params.items())), minutes)
+    span = (_secs(chart.index[0]), _secs(chart.index[-1]))
+    with _lock:
+        hit = _drawn.get(key)
+        if hit and hit[1:3] == span and time.time() - hit[0] < (3600 if minutes >= 1440 else 60):
+            return hit[3], None
+    profile = venue_profile(sleeve.venue)
+    try:
+        hs = store or HistoryStore()
+        cov = hs.coverage(profile.name, sleeve.instrument)
+        if cov is None:
+            return [], f"No stored history for {sleeve.instrument} yet, so the strategy's indicators can't be drawn."
+        # Twice the warm-up: an exponential or Wilder average still carries a trace of where it started. After its own
+        # warm-up the trace is near the journal's last digit; from twice as far back it is far below it (an RSI(14)
+        # read 282 candles in differs from one read on years of history by about 3e-8).
+        need = warmup(sleeve.strategy, sleeve.params, minutes)
+        df = hs.read(profile.name, sleeve.instrument, minutes,
+                     start=first_close - pd.Timedelta(minutes=minutes * (2 * need + 2)))
+        df = df[df.index <= cov.last + pd.Timedelta(minutes=1)]  # complete candles only: none past the last minute
+        if not len(df):
+            return [], f"No stored history for {sleeve.instrument} over this chart yet."
+        base, quote = sleeve.instrument.split("/")
+        # Prices kept to 8 decimals: finer than any venue's tick, so the candles reach the model exactly as stored
+        # (a perpetual draws the same lines).
+        inst = spot_pair(base, quote, fees=profile.fees, venue=profile.venue, price_precision=8)
+        lines = indicator_series(sleeve.strategy, df, inst, sleeve.params, minutes)
+    except (LookupError, ValueError, OSError) as exc:
+        return [], f"The strategy's indicators can't be drawn: {exc}"
+    except Exception:  # noqa: BLE001 - an overlay must never take the chart down
+        logging.getLogger(__name__).exception("chart indicators for %s", sleeve.name)
+        return [], "The strategy's indicators can't be drawn just now."
+    start = _secs(first_close)
+    for line in lines:
+        line["points"] = [p for p in line["points"] if p[0] >= start]
+    with _lock:
+        _drawn[key] = (time.time(), *span, lines)
+    return lines, None
+
+
+def _label(minutes: int) -> str:
+    return next((k for k, v in INTERVALS.items() if v == minutes), f"{minutes}-minute")
 
 
 def position_lines(position: dict | None) -> list[dict]:

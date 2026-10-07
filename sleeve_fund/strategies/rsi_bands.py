@@ -137,6 +137,14 @@ class RsiBands(LongFlatStrategy):
         self._why = (self._why[0], {"rsi": rsi})
         return side  # a short is taken only on a perpetual with allow_short
 
+    def indicator_meta(self) -> dict[str, dict]:
+        c = self.c
+        return {"rsi": {"label": f"RSI({c.rsi_period})", "pane": "lower",
+                        "levels": sorted({c.long_entry, c.long_exit, c.short_exit, c.short_entry})}}
+
+    def indicator_values(self) -> dict[str, float | None]:
+        return {"rsi": self.rsi.value if self.rsi.initialized else None}
+
     def want_long(self, bar: Bar) -> bool | None:
         side = self.want_side(bar)
         return None if side is None else side == 1  # spot: the short leg is held flat

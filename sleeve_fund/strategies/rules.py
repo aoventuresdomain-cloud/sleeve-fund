@@ -13,6 +13,7 @@ that fired, the block values, the candles they were read from and where those ca
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from nautilus_trader.model import Bar
@@ -93,6 +94,57 @@ class _Feed:
 
 def _iso(ns: int) -> str:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).isoformat()
+
+
+# The chart's panes (P1-3s): blocks in price units are drawn over the candles, the rest in the lower pane.
+PRICE_KINDS = frozenset({"sma", "ema", "wma", "vwap", "bollinger", "donchian", "keltner"})
+LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratios
+MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
+
+
+def _primary(outputs: tuple) -> str:
+    """The output a bare block id reads on a block with several (its `value`): the mid of a band or channel, a
+    stochastic's k."""
+    return "mid" if "mid" in outputs else outputs[0]
+
+
+def _operands(definition: dict) -> set:
+    """Every block output the definition's rules and level exits read, by its key ("rsi", "bb.upper")."""
+    found: set = set()
+
+    def walk(node) -> None:
+        if isinstance(node, str):
+            found.add(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk({k: definition.get(k) for k in ("long", "short", "exits")})
+    return found
+
+
+def _levels(definition: dict) -> dict[str, set]:
+    """Block key -> the numbers the definition's rules compare it with directly, for the lower pane's guide lines."""
+    found: dict[str, set] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            left, right = node.get("left"), node.get("right")
+            if "op" in node:
+                for a, b in ((left, right), (right, left)):
+                    if isinstance(a, str) and isinstance(b, (int, float)) and not isinstance(b, bool):
+                        found.setdefault(a, set()).add(float(b))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk({k: definition.get(k) for k in ("long", "short")})
+    return found
 
 
 class Rules(LongFlatStrategy):
@@ -319,6 +371,63 @@ class Rules(LongFlatStrategy):
         if touched:
             payload["first_touch"] = touched
         return payload
+
+    # --- the chart's indicators (P1-3s) -----------------------------------------------------------------------
+
+    def _drawn(self) -> dict[str, tuple]:
+        """key -> (block id, output or None), keyed as the lineage payload keys them; markers left out."""
+        if getattr(self, "_drawn_keys", None) is not None:
+            return self._drawn_keys
+        out = {}
+        for bid, b in self.rules.blocks.items():
+            if self.c.checked.blocks[bid]["kind"] in MARKER_KINDS:
+                continue
+            outputs = type(b).OUTPUTS
+            for o in ((None,) if outputs == ("value",) else outputs):
+                out[bid if o is None else f"{bid}.{o}"] = (bid, o)
+        self._drawn_keys = out
+        return out
+
+    def _pane(self, bid: str, output: str | None) -> str:
+        spec = self.c.checked.blocks[bid]
+        if spec["kind"] not in PRICE_KINDS or output in LOWER_OUTPUTS:
+            return "lower"
+        src = spec["input"]  # ("field", name) or ("block", id, output): an average of an RSI is drawn with the RSI
+        if src and src[0] == "block":
+            return self._pane(src[1], src[2])
+        return "lower" if src and src[1] == "volume" else "price"
+
+    def indicator_meta(self) -> dict[str, dict]:
+        levels = _levels(self.c.definition)
+        read = _operands(self.c.definition)
+        meta = {}
+        for key, (bid, o) in self._drawn().items():
+            spec = self.c.checked.blocks[bid]
+            settings = ", ".join(f"{v}" for v in spec["settings"].values() if v is not None)
+            tf = timeframe_label(spec["timeframe"]) if spec["timeframe"] else None
+            label = f"{spec['kind'].upper()}({settings})" + (f" {o}" if o else "") + (f" {tf}" if tf else "")
+            pane = self._pane(bid, o)
+            meta[key] = {"label": label, "pane": pane, "tf": tf,
+                         "group": bid if o and pane == "price" else None,
+                         "levels": sorted(levels[key]) if levels.get(key) else None,
+                         # only what the rules read is drawn at first: a line the model ignores invites a reader to
+                         # find signals it never took (Independent Quant Advisor, 6 Oct 23:24)
+                         "shown": key in read or (o is not None and bid in read
+                                                  and o == _primary(type(self.rules.blocks[bid]).OUTPUTS))}
+        return meta
+
+    def indicator_values(self) -> dict[str, float | None]:
+        # Raw outputs, warm-up included (indicator_settled says which the rules could read): from settling on, each
+        # is block_value's, the value the rules and the lineage payload read.
+        out = {}
+        for key, (bid, o) in self._drawn().items():
+            b = self.rules.blocks[bid]
+            v = b.value if o is None else b.values.get(o)
+            out[key] = float(v) if v is not None and math.isfinite(v) else None
+        return out
+
+    def indicator_settled(self, key: str) -> bool:
+        return self.rules.blocks[self._drawn()[key][0]].settled
 
     # --- level exits ------------------------------------------------------------------------------------------
 
