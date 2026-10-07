@@ -48,7 +48,7 @@ def test_a_replayed_fill_is_booked_once_and_moves_its_order_once(journal):
     assert len(journal.fills("s1")) == 1
     assert journal.journal_book("s1", 10_000) == book
     order = next(o for o in journal.orders("s1") if o["order_id"] == "O-1")
-    assert order["filled_qty"] == pytest.approx(0.05) and order["status"] == "partially_filled"
+    assert float(order["filled_qty"]) == pytest.approx(0.05) and order["status"] == "partially_filled"
     assert sum(e["kind"] == "fill" for e in journal.events("s1")) == 1
 
 
@@ -57,9 +57,9 @@ def test_a_different_fill_under_a_booked_key_is_kept_out_and_raised(journal):
     journal.book_fill("s1", **FILL)
     assert journal.book_fill("s1", **{**FILL, "qty": 0.07}) == "differs"
     (f,) = journal.fills("s1")
-    assert f["qty"] == pytest.approx(0.05)
+    assert float(f["qty"]) == pytest.approx(0.05)
     order = next(o for o in journal.orders("s1") if o["order_id"] == "O-1")
-    assert order["filled_qty"] == pytest.approx(0.05)
+    assert float(order["filled_qty"]) == pytest.approx(0.05)
     (e,) = [e for e in journal.events("s1", min_level="error") if e["kind"] == "fill_conflict"]
     assert "O-1" in e["message"] and "T-1" in e["message"]
 
@@ -96,7 +96,7 @@ def test_two_writers_of_the_same_fill_book_it_once(store):
         t.join()
     assert sorted(out) == ["new", "same", "same", "same"]
     assert len(store.fills("s1")) == 1
-    assert store.orders("s1")[0]["filled_qty"] == pytest.approx(0.05)
+    assert float(store.orders("s1")[0]["filled_qty"]) == pytest.approx(0.05)
 
 
 def test_paper_runtime_through_the_queued_journal_books_a_replay_once(store):
@@ -105,7 +105,7 @@ def test_paper_runtime_through_the_queued_journal_books_a_replay_once(store):
     for _ in range(2):
         rt.on_fill(**FILL)
     rt.store.flush()
-    assert len(store.fills("s1")) == 1 and store.orders("s1")[0]["filled_qty"] == pytest.approx(0.05)
+    assert len(store.fills("s1")) == 1 and float(store.orders("s1")[0]["filled_qty"]) == pytest.approx(0.05)
 
 
 def test_the_migration_stops_on_fills_already_booked_twice_and_changes_nothing(tmp_path):

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sleeve_fund import risk
+from sleeve_fund.exact import EngineJournal
 from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
                                replay_book, utcnow)
 
@@ -337,11 +338,13 @@ class SleeveRuntime:
 
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:
         self.tick_seconds = tick_seconds
-        self.store = store
+        # The engine's figures are floats: it reads the journal's exact figures (DA-9) as floats and writes through
+        # the one boundary that makes them exact (EngineJournal).
+        self.store = EngineJournal(store)
         # Clock source: wall clock in paper, the engine's simulated clock in backtest tests.
         self.now = now
         self.name = sleeve_name
-        sleeve = store.sleeve(sleeve_name)
+        sleeve = self.store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
         self.cap = risk.position_cap(self.profile, sleeve.params)  # on a perp, the margin cap times the leverage cap
         self.starting_balance = sleeve.starting_balance
@@ -350,11 +353,11 @@ class SleeveRuntime:
         self.peak = self._restored_peak(sleeve.starting_balance)
         self.liquidated = self._last_liquidation()  # its halt, when the last one was a liquidation
         self.wiped_out = self.liquidated is not None
-        first = store.first_equity(sleeve_name)
+        first = self.store.first_equity(sleeve_name)
         self.bench_base_price = first["price"] if first else None
         self.taker_fee = 0.008
         # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
-        self.book = store.journal_book(sleeve_name, sleeve.starting_balance)
+        self.book = self.store.journal_book(sleeve_name, sleeve.starting_balance)
         self.last_reconciled = None
         self._day = None
         self._day_open = None
