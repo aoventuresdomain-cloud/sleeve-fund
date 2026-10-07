@@ -11,7 +11,7 @@ import pytest
 
 import test_hub_146_qa as qa
 from sleeve_fund.paper.hub_client import HubStatus
-from test_hub_146_qa import M, S, START, _probe, flat_prices, minute, paper  # noqa: F401 - _probe registers the probe
+from test_hub_146_qa import M, S, START, _guard_marks, _probe, flat_prices, minute, paper  # noqa: F401 - autouse
 
 GONE = frozenset(range(6 * 60, 10 * 60))  # no trade 00:06 to 00:10 reaches the client
 
@@ -174,7 +174,7 @@ def test_minutes_with_no_trades_are_never_held_as_lost(monkeypatch):
     assert not any(status.lost.values())
 
 
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", qa.LIQ_PATHS)  # reconnect: guards off, liquidation mechanics only
 def test_a_liquidation_found_by_the_replay_calls_the_liquidation_hook_once(path, monkeypatch):
     """QA P1-L18: #155 hangs the liquidation incident and halt on _on_liquidation; the outage replay's liquidation
     reaches it as a live one does, once, at the replayed price."""

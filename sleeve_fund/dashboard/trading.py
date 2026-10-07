@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
-from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow
+from sleeve_fund.paper.runtime import liquidation_head
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
@@ -16,15 +17,17 @@ EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", 
 
 STATUS_TABS = {
     "open": ("Open", OPEN_ORDER_STATUSES),
-    "filled": ("Filled", ("filled",)),
+    "filled": ("Filled", ("filled", "triggered")),
     "canceled": ("Cancelled", ("canceled", "expired")),
     "rejected": ("Rejected", ("rejected", "denied")),
     "all": ("All", None),
 }
 STATUS_LABELS = {"submitted": "Sent", "accepted": "Working", "partially_filled": "Part filled", "filled": "Filled",
-                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired"}
+                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired",
+                 "triggered": "Triggered"}
 STATUS_TONES = {"submitted": "paused", "accepted": "paused", "partially_filled": "paused", "filled": "running",
-                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted"}
+                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted",
+                "triggered": "running"}
 
 _PX = ("close", "price", "entry_px", "peak", "trail_stop")
 _PCT = ("gap", "move", "stop_loss", "take_profit")
@@ -177,33 +180,11 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
-def liquidated_since_reset(store: Store, sleeve: str, halt_words: str) -> bool:
-    """Whether the strategy's position margin was lost (a liquidation event or order, or a halt whose message
-    starts with halt_words) with no reset after liquidation since. Read from the journal, not the latest halt:
-    a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). The halt words
-    match in any case and spacing (P1-U28a)."""
-    reset = store.last_event(sleeve, (LIQUIDATION_RESET,))
-    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
-    words = _fold(halt_words)
-    if any(e["kind"] == "liquidation" or _fold(e["message"]).startswith(words)
-           for e in store.sleeve_events_since(sleeve, ("liquidation", "risk_halt"), after_id=since_id)):
-        return True
-    order = store.last_order(sleeve, ("liquidation",))
-    if order is None:
-        return False
-    if since_ts is None or order["ts"] > since_ts:
-        return True
-    if order["ts"] < since_ts:
-        return False
-    # A liquidation order in the same instant as the reset: orders and events share no id, so the liquidation
-    # wins the tie (P1-U28b) unless the reset answered a liquidation event of that same instant.
-    answered = store.last_event(sleeve, ("liquidation",))
-    return not (answered is not None and answered["id"] < since_id and answered["ts"] == order["ts"])
-
-
-def _fold(text: str) -> str:
-    """Text for a loose match: one plain space between words, in any case (a no-break space counts as one)."""
-    return " ".join((text or "").split()).casefold()
+def liquidated_since_reset(store: Store, sleeve: str) -> bool:
+    """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
+    (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
+    return liquidation_head(store, sleeve) is not None
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
