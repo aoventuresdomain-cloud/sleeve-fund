@@ -1050,7 +1050,8 @@ class LongFlatStrategy(Strategy):
     def slower(self, minutes: int, *blocks) -> SlowerCandles:
         """Slower candles of this instrument for the model to read, e.g. self.slower(240, Sma(50)) for a 4-hour
         trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
-        decision on the bar that closed it. Warm-up loads them from the history store at their own size."""
+        decision on the bar that closed it. Warm-up loads them from the history store at their own size. Call it in
+        __init__ (as rsi_cross does): missing minutes are only counted once a slower candle exists (mark_missing)."""
         from sleeve_fund.venues import VENUES
 
         profile = VENUES.get(self._cfg.instrument_id.venue.value)
