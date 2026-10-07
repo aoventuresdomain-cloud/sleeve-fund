@@ -232,3 +232,24 @@ def test_trades_filtered_to_one_strategy_shows_no_headroom(client):
     _hold(store, "b", 0.1)
     assert "headroom to the 5% limit" in c.get("/trades", auth=AUTH).text
     assert "headroom to the 5% limit" not in c.get("/trades?sleeve=a", auth=AUTH).text
+
+
+def test_with_two_accounts_each_has_its_own_headroom_as_the_gate_measures_it(client):
+    """RR-1: the gate measures each account's open risk against that account's own book, so with two accounts the
+    headroom is per account, and each equals what the gate works out for it."""
+    c, store = client
+    store.create_account("second", "paper")
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00 on the default account
+    _hold(store, "b", 0.1)  # no stop: 600.00
+    store.assign_account("b", "second")
+    for name, sleeve in (("paper", "a"), ("second", "b")):
+        own = {r["sleeve"]: r for r in open_risk.book_open_risk(store, lambda s: 0.02, name)}[sleeve]
+        book, others, _ = open_risk.account_book(store, sleeve, store.last_equity(sleeve)["equity"], lambda s: 0.02)
+        assert open_risk.account_equity(store, name) == pytest.approx(book)
+        room = open_risk.LIMIT * book - (others + own["risk"])
+        line = (f"{name}: {room:,.2f} headroom to the 5% limit" if room >= 0 else
+                f'{name}: <span class="loss">over the 5% limit by {-room:,.2f}</span>')
+        for url in ("/risk", "/trades"):
+            assert line in c.get(url, auth=AUTH).text, (url, line)
+        assert line.replace('<span class="loss">', "").replace("</span>", "") in c.get("/", auth=AUTH).text
+    assert "second: over the 5% limit by 100.00" in c.get("/", auth=AUTH).text  # 600 against 500
