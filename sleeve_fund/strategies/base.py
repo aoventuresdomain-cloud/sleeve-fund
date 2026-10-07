@@ -595,6 +595,10 @@ class LongFlatStrategy(Strategy):
         # sleeve_fund.bars.DEGRADED_ABOVE of their minutes absent. Indicators update and exits run on them;
         # no new entry is decided on one. Given by mark_degraded(); each is dropped once its bar is seen.
         self._degraded: dict[int, int] = {}
+        # Every bar with minutes missing, degraded or not: close time (ns) -> minutes missing, so the slower candles
+        # built from it count them (Independent Quant Advisor 6 Oct 16:40, 4.2). Given by mark_missing().
+        self._bar_missing: dict[int, int] = {}
+        self._missed_said: dict[int, int] = {}  # per slower candles (index): the latest missing one journaled
         self._no_entry_ts: int | None = None  # the close time of the degraded bar being decided on
         self._degraded_missing = 0
         # Paper on its own trade feed builds its decision bars itself: the minutes (open time, in minutes since the
@@ -699,6 +703,12 @@ class LongFlatStrategy(Strategy):
         builder each one as it closes, before handing the bar over."""
         self._degraded.update({int(ts): int(m) for ts, m in bars.items()})
 
+    def mark_missing(self, bars: dict[int, int]) -> None:
+        """Bars, by close time in ns, built with some of their minutes missing, degraded or not, with how many: the
+        slower candles built from them add these up (v2 P1-4, Advisor 4.2). Entries are held only on the degraded
+        ones (mark_degraded)."""
+        self._bar_missing.update({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
+
     def expect_bars(self, closes) -> "LongFlatStrategy":
         """Backtest on execution bars: the close times (ns) of the decision bars they build. The engine makes up any
         other one flat at the last price from nothing, and it is dropped (runner.decision_bars, QA P1-D1)."""
@@ -749,6 +759,9 @@ class LongFlatStrategy(Strategy):
         if self.hub_status is not None and self.hub_status.degraded:
             self._degraded.update(self.hub_status.degraded)
             self.hub_status.degraded.clear()
+        if self.hub_status is not None and self.hub_status.missing:
+            self._bar_missing.update(self.hub_status.missing)
+            self.hub_status.missing.clear()
         if str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
             return False
         if self._backtest:
@@ -758,9 +771,7 @@ class LongFlatStrategy(Strategy):
             return True
         if self.hub_fed or not str(bar.bar_type).endswith("INTERNAL"):
             return False
-        minutes = bar_minutes(self._cfg.bar_type)
-        if minutes <= 1:
-            return False
+        minutes = bar_minutes(self._cfg.bar_type)  # 1-minute bars too: a minute with no data isn't built (P1-4 5a)
         end = bar.ts_event // MINUTE_NS
         seen = sum(1 for m in self._minutes_seen if end - minutes <= m < end)
         self._minutes_seen = {m for m in self._minutes_seen if m >= end}
@@ -770,6 +781,8 @@ class LongFlatStrategy(Strategy):
             self.log.info(f"bar {bar} dropped: no data in any of its minutes, so it isn't built (board 5a)")
             return True
         missing = minutes - seen
+        if missing > 0:
+            self._bar_missing.setdefault(bar.ts_event, missing)
         if bar_rule.degraded(missing, minutes):
             self._degraded.setdefault(bar.ts_event, missing)
         return False
@@ -974,10 +987,32 @@ class LongFlatStrategy(Strategy):
         if self._lows is not None:
             self._lows.append(bar.low.as_double())
             self._highs.append(bar.high.as_double())
-        for s in self._slower:
-            s.handle_bar(bar)
+        if self._slower:
+            missing = self._bar_missing.pop(bar.ts_event, None)
+            missing = self._degraded.get(bar.ts_event, 0) if missing is None else missing
+            for s in self._slower:
+                s.handle_bar(bar, missing)
+            self._journal_missed()
         self.update_indicators(bar)
         return True
+
+    def _journal_missed(self) -> None:
+        """Each slower candle with no decision candles at all is recorded missing as it is found, never made up
+        (Advisor 5 Oct 19:48; 6 Oct 16:40, 4.5): a journal event, the source of truth, and the Signals tab."""
+        for k, s in enumerate(self._slower):
+            said = self._missed_said.get(k, 0)
+            new = [end for end in s.missed if end > said]
+            if not new:
+                continue
+            self._missed_said[k] = new[-1]
+            if self.runtime is None or self._backtest:
+                continue
+            when = ", ".join(f"{_hhmm(end - s.period)}-{_hhmm(end)}" for end in new[-6:])
+            more = f" (and {len(new) - 6} earlier)" if len(new) > 6 else ""
+            self.runtime.store.event(self.runtime.name, "warning", "slower_candle_missing",
+                                     f"Recorded missing: no {span(s.minutes)} candle {when} UTC{more}. No trades "
+                                     "reached the strategy in it, so none is made up and its indicators skip it",
+                                     ts=self.runtime.now())
 
     def _hold_gap(self, bar: Bar) -> bool:
         """Paper: a candle with no volume was built while no trades reached this process, a flat candle at the
@@ -1020,6 +1055,7 @@ class LongFlatStrategy(Strategy):
         if own is not None and own.volume.as_double() >= bar.volume.as_double():
             bar = own
             self._degraded.pop(bar.ts_event, None)  # the venue's whole candle: no longer a part bar (CR minor)
+            self._bar_missing.pop(bar.ts_event, None)
         if (rebuilt or unchecked) and self.runtime is not None:
             step = bar_minutes(self._cfg.bar_type)
             first = datetime.fromtimestamp(held[0].ts_event / 1e9 - step * 60, tz=timezone.utc)
@@ -1461,9 +1497,13 @@ class LongFlatStrategy(Strategy):
     def signal_state(self, price: float | None = None) -> dict | None:
         """What the Signals tab shows, as JSON-ready data: both sides' conditions on the forming candle at
         `price` (the latest price when None), and the open position's stop and target. None when the model
-        doesn't list its conditions. Reads only: nothing the model trades by changes."""
+        doesn't list its conditions and reads no slower candles; a model that only reads slower candles sends their
+        notes alone (v2 P1-4). Reads only: nothing the model trades by changes."""
         if type(self).conditions is LongFlatStrategy.conditions:
-            return None
+            if not self._slower:
+                return None
+            return {"price": None, "bar_ts": self._last_bar_ts or None, "bar_minutes": bar_minutes(self._cfg.bar_type),
+                    "long": None, "short": None, "held": 0, "guards": [], "notes": self._slower_notes()}
         price = price if price is not None else self._price()
         sides = {}
         for side, key in ((1, "long"), (-1, "short")):
@@ -1471,7 +1511,24 @@ class LongFlatStrategy(Strategy):
             sides[key] = None if rows is None else [_condition_json(r) for r in rows]
         held = self._entry_side if self._entry_px is not None else 0
         return {"price": price, "bar_ts": self._last_bar_ts or None, "bar_minutes": bar_minutes(self._cfg.bar_type),
-                **sides, "held": held, "guards": [_condition_json(r) for r in self.guard_conditions(price)]}
+                **sides, "held": held, "guards": [_condition_json(r) for r in self.guard_conditions(price)],
+                "notes": self._slower_notes()}
+
+    def _slower_notes(self) -> list[str]:
+        """The Signals tab's lines on the slower candles (v2 P1-4): the latest closed one when it is degraded, and
+        the latest recorded missing in the last day (Advisor 4.1, 4.5)."""
+        notes = []
+        for s in self._slower:
+            last, size = s.last, span(s.minutes)
+            if last is not None and last.degraded(s.minutes):
+                notes.append(f"The latest {size} candle, to {_hhmm(last.end)} UTC, is missing {last.missing} of its "
+                             f"{s.minutes} minutes (over 10%): no entries or additions until a fuller one closes")
+            recent = [end for end in s.missed if self._last_bar_ts - end < 86_400_000_000_000]
+            if recent:
+                notes.append(f"The {size} candle {_hhmm(recent[-1] - s.period)}-{_hhmm(recent[-1])} UTC had no trades: "
+                             "recorded missing, none made up" + (f" ({len(recent)} in the last day)"
+                                                                  if len(recent) > 1 else ""))
+        return notes
 
     def _publish_signals(self) -> None:
         """Paper: write the model's conditions on the forming candle for the Signals tab, at most every
@@ -1726,7 +1783,16 @@ class LongFlatStrategy(Strategy):
 
     def _entry_held(self, bar: Bar, what: str) -> bool:
         """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
-        (v2 P1-4), or the decision is late (_late_entry). Exits and reductions are never held."""
+        (v2 P1-4), the latest closed slower candle is degraded (over 10% of its minutes missing: Advisor 6 Oct
+        16:40, 4.1), or the decision is late (_late_entry). Exits and reductions are never held."""
+        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
+        if thin is not None:
+            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
+                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
+                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
+                       level="info")
+            return True
+        self._noted.discard("slower_degraded")
         if self._short_history is not None:
             if any(s.count < s.need for s in self._slower):
                 self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "

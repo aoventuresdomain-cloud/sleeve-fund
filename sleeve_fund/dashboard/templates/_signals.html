@@ -19,12 +19,13 @@
 
 {% macro _board(sig, pre) -%}
 {% if not sig.supported %}
-  <section class="panel sig-empty"><p class="muted">This model doesn't list its conditions yet.</p></section>
+  <section class="panel sig-empty"><p class="muted">This model doesn't list its conditions yet.</p>{% for n in sig.notes %}<p class="muted sig-note">{{ n }}</p>{% endfor %}</section>
 {% elif sig.state == 'stopped' %}
   <section class="panel sig-empty"><p class="muted">The strategy is stopped. The lights show while it runs.</p></section>
 {% elif sig.state != 'live' %}
   <section class="panel sig-empty"><p><strong>Waiting for the model.</strong> <span class="muted">{% if sig.age %}Its last reading came {{ sig.age }}; the lights show again once the strategy's process sends a fresh one.{% else %}The strategy's process hasn't sent its conditions yet.{% endif %}</span></p></section>
 {% else %}
+  {% for n in sig.notes %}<p class="muted sig-note">{{ n }}</p>{% endfor %}
   <div class="sig-board">
   {% for c in sig.cards %}
     <section class="panel sig-card sig-{{ c.key }}{% if c.flat %} is-flat{% endif %}" aria-labelledby="{{ pre }}sig-{{ c.key }}-h">

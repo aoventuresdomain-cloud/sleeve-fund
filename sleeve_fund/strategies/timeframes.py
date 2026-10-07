@@ -8,12 +8,20 @@ still forming is never visible. When that decision candle is missing (a gap), th
 one after its end, stamped at its own end. A slower candle missing decision candles inside it is built from those it
 has, and a part candle at the very start (begun before the data was) is dropped: the history store resamples the
 same way (m13-E6), so warm-ups from it agree with candles built here. A slower candle with no decision candles at all
-is missing: none is made up for it, and its close is kept in `missed`."""
+is missing: none is made up for it, and its close is kept in `missed`.
+
+Every slower candle is built by the one bar rule (sleeve_fund.bars, board 5a): from the decision candles present,
+carrying `missing`, the minutes it lacks: whole decision candles that never came plus the minutes recorded missing
+inside those that did (Independent Quant Advisor 6 Oct 16:40, 4.2), against the candle's own minutes. More than 10% of
+them missing makes it degraded: its blocks still take it, but no entry or addition is decided while it is the latest
+closed one (4.1). A decision candle of unknown completeness counts as complete."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+
+from sleeve_fund import bars as bar_rule
 
 MINUTE_NS = 60_000_000_000
 DAY_MINUTES = 1440
@@ -40,6 +48,11 @@ class Candle:
     close: float
     volume: float
     end: int  # ns: the candle's close, which stamps it
+    missing: int = 0  # its minutes that are absent (bar rule, board 5a); a seeded candle's are unknown: complete
+
+    def degraded(self, minutes: int) -> bool:
+        """Whether this `minutes` candle is too thin to decide an entry on (bar rule: over 10% missing)."""
+        return bar_rule.degraded(self.missing, minutes)
 
 
 class SlowerCandles:
@@ -66,10 +79,13 @@ class SlowerCandles:
         self._seen_end: int | None = None  # the close of the latest candle that had decision candles
         self._end: int | None = None  # the forming candle's close, None between candles
         self._whole = False
-        self._ohlcv: list[float] = []
+        self._parts: list[tuple[float, float, float, float, float]] = []  # the forming candle's decision candles
+        self._inner = 0  # minutes recorded missing inside them
 
-    def update(self, open_: float, high: float, low: float, close: float, volume: float, ts: int) -> Candle | None:
-        """One decision candle, stamped at its close `ts` (ns). Returns the slower candle it closed, if any."""
+    def update(self, open_: float, high: float, low: float, close: float, volume: float, ts: int,
+               missing: int = 0) -> Candle | None:
+        """One decision candle, stamped at its close `ts` (ns), `missing` of its own minutes recorded absent.
+        Returns the slower candle it closed, if any."""
         if self.last is not None and ts <= self.last.end:  # inside a candle already closed (seeded from the store)
             return None
         end = -(-(ts - self._offset) // self.period) * self.period + self._offset  # the slower candle's close
@@ -80,17 +96,16 @@ class SlowerCandles:
             if self._seen_end is not None:
                 self.missed.extend(range(self._seen_end + self.period, end, self.period))
             self._end, self._whole, self._seen_end = end, ts - self.step == end - self.period, end
-            self._ohlcv = [open_, high, low, close, volume]
-        else:
-            o, h, lo, _, v = self._ohlcv
-            self._ohlcv = [o, max(h, high), min(lo, low), close, v + volume]
+            self._parts, self._inner = [], 0
+        self._parts.append((open_, high, low, close, volume))
+        self._inner += max(int(missing), 0)
         if ts == end:  # never with a late close above: a candle can't open and close on one decision candle
             out = self._close()
         return out
 
-    def handle_bar(self, bar) -> Candle | None:
+    def handle_bar(self, bar, missing: int = 0) -> Candle | None:
         return self.update(bar.open.as_double(), bar.high.as_double(), bar.low.as_double(), bar.close.as_double(),
-                           bar.volume.as_double(), bar.ts_event)
+                           bar.volume.as_double(), bar.ts_event, missing)
 
     def seed(self, candles) -> None:
         """Warm-up from slower candles already closed (the history store's, resampled to this size): fed as if
@@ -99,11 +114,16 @@ class SlowerCandles:
             self._emit(c)
 
     def _close(self) -> Candle | None:
-        end, whole, (o, h, lo, c, v) = self._end, self._whole, self._ohlcv
+        end, whole, parts = self._end, self._whole, self._parts
         self._end = None
         if not whole and self.last is None:  # a part candle at the start of the data
             return None
-        return self._emit(Candle(o, h, lo, c, v, end))
+        built = bar_rule.combine(parts, self.minutes)
+        # Absent decision candles count all their minutes; those present, the minutes recorded missing inside them.
+        # A candle begun before the decision candles fed here (after a store warm-up) counts its unseen start as
+        # missing too, so a part-built candle reads degraded rather than whole (CR minor on #158).
+        missing = min(self.minutes - self.step_minutes * len(parts) + self._inner, self.minutes)
+        return self._emit(Candle(built.open, built.high, built.low, built.close, built.volume, end, missing))
 
     def _emit(self, candle: Candle) -> Candle:
         self._seen_end = max(self._seen_end or candle.end, candle.end)

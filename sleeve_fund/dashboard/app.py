@@ -2393,8 +2393,12 @@ def _signals_view(s, row: dict | None) -> dict:
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
-            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
-    if not view["supported"]:
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False,
+            "notes": []}
+    if not view["supported"]:  # a model that lists no conditions may still send notes on its slower candles (P1-4)
+        if row is not None and s.desired_state == "running" and \
+                (utcnow() - row["ts"]).total_seconds() <= SIGNALS_FRESH_SECONDS:
+            view["notes"] = [str(n) for n in row["payload"].get("notes") or []]
         return view
     if s.desired_state != "running":
         view["state"] = "stopped"
@@ -2418,6 +2422,7 @@ def _signals_view(s, row: dict | None) -> dict:
     view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
                      _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
     view["warming"] = not view["cards"][0]["rows"]
+    view["notes"] = [str(n) for n in p.get("notes") or []]  # slower candles degraded or recorded missing (P1-4)
     view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
     view["state"] = "live"
     # The model acts at its bar's close: the next one after the last bar it decided on.
