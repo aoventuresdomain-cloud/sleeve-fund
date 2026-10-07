@@ -117,3 +117,19 @@ def test_the_first_visible_point_is_the_models_own_after_its_warm_up_is_read_in_
     inst = KRAKEN.instrument("SOL", "USD", price_precision=8)
     whole = dict(map(tuple, indicator_series("rsi_bands", df, inst, params, 60)[0]["points"]))
     assert all(abs(v - whole[t]) < 1e-6 for t, v in shown.items())  # RSI points: far under the journal's 4 decimals
+
+
+def test_a_chart_moving_on_two_candles_keeps_one_cache_entry_and_a_new_range_is_redrawn(stored):
+    """CR #176: one entry per strategy and candle size, however many candles close while the chart is open; a chart
+    over another range is drawn for that range, not served the last one's lines."""
+    from types import SimpleNamespace
+
+    s = SimpleNamespace(name="c", strategy="trend_filter", params={"fast": 10, "slow": 30},
+                        bar_spec="1-HOUR-LAST-INTERNAL", venue=None, instrument="SOL/USD")
+    for end in (200, 201, 202):  # two candle closes after the first draw
+        lines, why = charts.indicators(s, stored.iloc[100:end], 60)
+        assert why is None and lines
+    assert len(charts._drawn) == 1
+    lines, _ = charts.indicators(s, stored.iloc[150:202], 60)
+    assert min(p[0] for p in lines[0]["points"]) == int(stored.index[150].timestamp()) + 3600
+    assert len(charts._drawn) == 1

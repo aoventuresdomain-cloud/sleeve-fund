@@ -115,7 +115,9 @@ def payload(df: pd.DataFrame, minutes: int, fills: list[dict], orders: dict[str,
             "notes": notes, "lines": lines}
 
 
-_drawn: dict[tuple, tuple[float, list[dict]]] = {}
+# One entry per strategy and candle size: (when drawn, the chart's first and last candle, the lines). A chart that
+# moves on a candle replaces its entry, so the cache holds one per chart however long it stays open (CR #176).
+_drawn: dict[tuple, tuple[float, int, int, list[dict]]] = {}
 
 
 def spec_minutes(bar_spec: str) -> int:
@@ -145,11 +147,12 @@ def indicators(sleeve, chart: pd.DataFrame, minutes: int, store=None) -> tuple[l
     if not len(chart):
         return [], None
     first_close = pd.Timestamp(chart.index[0]) + pd.Timedelta(minutes=minutes)
-    key = (sleeve.name, sleeve.strategy, repr(sorted(sleeve.params.items())), minutes, _secs(chart.index[-1]))
+    key = (sleeve.name, sleeve.strategy, repr(sorted(sleeve.params.items())), minutes)
+    span = (_secs(chart.index[0]), _secs(chart.index[-1]))
     with _lock:
         hit = _drawn.get(key)
-        if hit and time.time() - hit[0] < (3600 if minutes >= 1440 else 60):
-            return hit[1], None
+        if hit and hit[1:3] == span and time.time() - hit[0] < (3600 if minutes >= 1440 else 60):
+            return hit[3], None
     profile = venue_profile(sleeve.venue)
     try:
         hs = store or HistoryStore()
@@ -179,7 +182,7 @@ def indicators(sleeve, chart: pd.DataFrame, minutes: int, store=None) -> tuple[l
     for line in lines:
         line["points"] = [p for p in line["points"] if p[0] >= start]
     with _lock:
-        _drawn[key] = (time.time(), lines)
+        _drawn[key] = (time.time(), *span, lines)
     return lines, None
 
 
