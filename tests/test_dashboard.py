@@ -2579,3 +2579,27 @@ def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
         store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
     store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_the_chart_passes_on_the_strategys_recorded_indicators_untouched_and_survives_a_failure(client, monkeypatch):
+    """P1-3s: the platform's own values go to the chart as recorded (v2/chart-indicators-shape.md); a recording that
+    isn't there yet or fails leaves an empty list and a chart that still draws."""
+    from sleeve_fund.dashboard import charts
+
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD", bar_spec="1-HOUR-LAST-INTERNAL")
+    store.record_equity("sol-x", equity=10_000, cash=10_000, qty=0, price=100, benchmark=10_000)
+    charts._cache.clear()
+    monkeypatch.setattr(charts, "candles", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == []
+    sample = [{"key": "ema", "label": "EMA(20)", "pane": "price", "kind": "line", "group": None,
+               "settled_from": 3600, "points": [[3600, 101.5], [7200, 101.7]]}]
+    monkeypatch.setattr(store, "chart_indicators", lambda name: sample, raising=False)
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == sample
+
+    def broken(name):
+        raise RuntimeError("recording failed")
+
+    monkeypatch.setattr(store, "chart_indicators", broken, raising=False)
+    d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
+    assert d["indicators"] == [] and d["candles"]
