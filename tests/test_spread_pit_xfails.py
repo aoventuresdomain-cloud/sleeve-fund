@@ -8,8 +8,18 @@ refresh is OK). Today the backtest charges one run-level number, the latest meas
 research/run.py:126, dashboard/preview.py:291 -> research/runner.py:169 -> instruments.py:261), and paper resolves once
 at node start (paper/node.py:260).
 
-Two measurements are recorded throughout: 0.05% effective from T1 and 0.2% effective from T2 (Store.record_spread with
-ts=T: today's measured_at is read as the effective-from time).
+Two measurements are recorded throughout: LOW = 0.1% effective from T1 and HIGH = 0.3% effective from T2
+(Store.record_spread with ts=T). Both sit above the 0.05% moving-market floor, so a stop booked with the wrong
+measurement books a different price with or without D13's floor.
+
+The Advisor's answers (advisor-rulings.md, "GAP-LIQ-CAP / SPREAD-PIT edges", 7 Oct ~00:19-00:22): (7) a measurement is
+effective from max(end of its measured window, the time it landed); history with no landing time uses the window end.
+The spreads table has one time, measured_at, and paper writes it when it records (paper/runtime.py on_quote:
+record_spread(..., ts=now) at the end of the hour it measured), so measured_at is both the window end and the landing
+time, and effective-from = measured_at meets (7) (PE1, 7 Oct). The schema cannot record a landing later than the
+window end, so no case pins one (see the README). (8) Before the first measurement: the venue's assumption, with the
+0.05% floor still applied to moving-market fills. (9) Fills-vs-model counts the daily-refresh lag in its own labelled
+bucket, never inside a tolerance.
 
 Marks: SPREAD_PIT = `xfail(strict=True, raises=AssertionError, reason="SPREAD-PIT ...")`. Tests named
 `test_control_...` carry no mark. Paper cases use #146's QA harness (tests/test_hub_146_qa.py) and skip on a head
@@ -34,7 +44,7 @@ START = 1_759_449_600_000_000_000  # 2025-10-03 00:00 UTC, the #146 harness's cl
 S = 1_000_000_000
 M = 60 * S
 BASE = 60_000.0
-LOW, HIGH, FLOOR = 0.0005, 0.002, 0.0005  # 0.05% from T1, 0.2% from T2; the moving-market floor
+LOW, HIGH, FLOOR = 0.001, 0.003, 0.0005  # 0.1% from T1, 0.3% from T2, both above the moving-market floor
 VENUE, PAIR = "KRAKEN", "BTC/USD"
 TOL = 5e-6  # fees are charged to the cent: 0.01 on ~5,000 of notional
 
@@ -88,18 +98,22 @@ def _at(series_like, ts) -> float:
 
 
 def test_spread_pit_resolve_gives_the_measurement_in_force_at_a_minute():
-    """ASSUMED: spreads.resolve(venue, instrument, store, at=ts). Before T1: the venue's assumption; from T1: 0.05%;
-    from T2 (inclusive): 0.2%. Never the later measurement for an earlier minute."""
+    """ASSUMED: spreads.resolve(venue, instrument, store, at=ts). Before T1: the venue's assumption; from T1: LOW;
+    from T2 (inclusive): HIGH. Never the later measurement for an earlier minute. T2 is the measurement's measured_at,
+    the end of the hour it measured (as paper writes it): a minute inside that hour, before T2, still gets LOW, so the
+    measurement never reaches back to the start of its window (Advisor 00:19 (7))."""
     from sleeve_fund import spreads
     from sleeve_fund.venues import venue
 
     t2 = _ts(30)
     st = _store([(LOW, T1), (HIGH, t2)])
     assumed = venue(VENUE).assumed_half_spread
-    assert spreads.resolve(VENUE, PAIR, st).half_spread == HIGH, "set-up: today's resolve gives the latest, 0.2%"
-    want = {"before T1": assumed, "T1 + 1h": LOW, "T2 - 1 min": LOW, "T2": HIGH, "T2 + 1 day": HIGH}
-    at = {"before T1": T1 - timedelta(hours=1), "T1 + 1h": T1 + timedelta(hours=1), "T2 - 1 min": t2 - timedelta(
-        minutes=1), "T2": t2, "T2 + 1 day": t2 + timedelta(days=1)}
+    assert spreads.resolve(VENUE, PAIR, st).half_spread == HIGH, "set-up: today's resolve gives the latest, HIGH"
+    want = {"before T1": assumed, "T1 + 1h": LOW, "inside T2's measured hour (T2 - 30 min)": LOW, "T2 - 1 min": LOW,
+            "T2": HIGH, "T2 + 1 day": HIGH}
+    at = {"before T1": T1 - timedelta(hours=1), "T1 + 1h": T1 + timedelta(hours=1),
+          "inside T2's measured hour (T2 - 30 min)": t2 - timedelta(minutes=30),
+          "T2 - 1 min": t2 - timedelta(minutes=1), "T2": t2, "T2 + 1 day": t2 + timedelta(days=1)}
     try:
         got = {k: spreads.resolve(VENUE, PAIR, st, at=v).half_spread for k, v in at.items()}
     except TypeError as exc:
@@ -211,25 +225,26 @@ def _paid(res, params, inst) -> dict:
     return out
 
 
-@SPREAD_PIT
 @pytest.mark.parametrize("side,perp,profile", BT_CASES)
 @pytest.mark.parametrize("t2_minute,want_stop", [pytest.param(30, LOW, id="stop-between-T1-and-T2"),
                                                  pytest.param(15, HIGH, id="stop-after-T2")])
 def test_spread_pit_a_backtest_charges_each_fill_the_half_spread_in_force_at_its_minute(side, perp, profile,
                                                                                         t2_minute, want_stop):
-    """Entry at 00:05, stop at 00:21. With T2 at 00:30 the stop falls between T1 and T2 and pays 0.05%, never the
-    later 0.2%; with T2 at 00:15 it pays 0.2%. The entry (00:05, before T2 either way) pays 0.05%."""
+    """Entry at 00:05, stop at 00:21. With T2 at 00:30 the stop falls between T1 and T2 and pays LOW (0.1%), never the
+    later HIGH (0.3%); with T2 at 00:15 it pays HIGH. The entry (00:05, before T2 either way) pays LOW. Both values
+    sit above the 0.05% floor, so the floor (D13) never decides the outcome."""
     t2 = _ts(t2_minute)
     st = _store([(LOW, T1), (HIGH, t2)])
     ref, p0, i0 = _bt(side, perp, profile, 0.0)  # set-up, on today's float interface
     plain = _paid(ref, p0, i0)
     assert set(plain) == {"entry", "stop_loss"}, ("set-up: one entry and its stop", plain)
     assert plain["entry"][0] == pd.Timestamp(_ts(5)) and plain["stop_loss"][0] == pd.Timestamp(_ts(21)), plain
-    assert all(abs(v[1]) < TOL for v in plain.values()), ("set-up: no spread, nothing paid beyond the taker fee",
-                                                           plain)
+    assert abs(plain["entry"][1]) < TOL and min(abs(plain["stop_loss"][1]), abs(plain["stop_loss"][1] - FLOOR)) < TOL, (
+        "set-up: at zero spread the entry pays nothing beyond the taker fee, and the stop nothing or, with D13, "
+        "the 0.05% floor", plain)
     res, params, inst = _bt(side, perp, profile, _series(st))
     got = {k: round(v[1], 6) for k, v in _paid(res, params, inst).items()}
-    want = {"entry": LOW, "stop_loss": want_stop}
+    want = {"entry": LOW, "stop_loss": max(want_stop, FLOOR)}
     assert set(got) == set(want) and all(abs(got[k] - want[k]) < TOL for k in want), (got, want)
 
 
@@ -245,9 +260,31 @@ def test_spread_pit_a_backtest_stop_pays_the_0_05pc_floor_when_the_measurement_i
     assert set(got) == set(want) and all(abs(got[k] - want[k]) < TOL for k in want), (got, want)
 
 
+@pytest.mark.parametrize("side,perp,profile", BT_CASES)
+def test_spread_pit_before_the_first_measurement_a_backtest_uses_the_venues_assumption_and_the_stop_the_floor(
+        monkeypatch, side, perp, profile):
+    """Advisor 00:19 (8): minutes before the first measurement use the venue's assumption, and the 0.05% floor still
+    applies to moving-market fills. The venue's assumption is set to 0.01% here (below the floor; Kraken's own is 0.05%,
+    equal to it, so it could not tell), and the only measurement (HIGH) lands the day after the run: the entry pays
+    0.01%, the stop the 0.05% floor, and neither pays the later HIGH."""
+    import dataclasses
+
+    from sleeve_fund import venues
+
+    monkeypatch.setitem(venues.VENUES, VENUE, dataclasses.replace(venues.venue(VENUE), assumed_half_spread=0.0001))
+    st = _store([(HIGH, _ts(24 * 60))])
+    from sleeve_fund import spreads
+
+    assert spreads.resolve(VENUE, PAIR, _store([])).half_spread == 0.0001, "set-up: the venue assumes 0.01%"
+    res, params, inst = _bt(side, perp, profile, _series(st))
+    got = {k: round(v[1], 6) for k, v in _paid(res, params, inst).items()}
+    want = {"entry": 0.0001, "stop_loss": FLOOR}
+    assert set(got) == set(want) and all(abs(got[k] - want[k]) < TOL for k in want), (got, want)
+
+
 def test_spread_pit_a_store_study_hands_the_engine_the_series_not_the_latest_measurement(monkeypatch):
     """research/run.py:126 resolves the latest measurement once and passes that number to every run. Built, the
-    study passes the series: 0.05% for a minute between T1 and T2, 0.2% from T2."""
+    study passes the series: LOW (0.1%) for a minute between T1 and T2, HIGH (0.3%) from T2."""
     from sleeve_fund.research import run as run_mod
     from sleeve_fund.research import study as study_mod
 
@@ -336,10 +373,10 @@ def _replayed_stop(run, h, side: int, stop: float = 0.01):
     return ex, o, entry * (1 - side * stop)
 
 
-def test_spread_pit_paper_started_before_t2_books_0_2pc_on_an_outage_stop_a_day_after_t2_lands(monkeypatch):
-    """The bound: a node started at 00:00 on 3 Oct with 0.05% in force; 0.2% lands at 00:10 (T2) while it runs. At
-    00:27 on 4 Oct (T2 + 24h17m, past any daily refresh) the hub is away and a 2% dip crosses the 1% stop; the
-    replayed stop books the level less 0.2%, the value in force at that minute, not the node-start 0.05%."""
+def test_spread_pit_paper_started_before_t2_books_the_new_value_on_an_outage_stop_a_day_after_t2_lands(monkeypatch):
+    """The bound: a node started at 00:00 on 3 Oct with LOW (0.1%) in force; HIGH (0.3%) lands at 00:10 (T2) while it
+    runs. At 00:27 on 4 Oct (T2 + 24h17m, past any daily refresh) the hub is away and a 2% dip crosses the 1% stop;
+    the replayed stop books the level less HIGH, the value in force at that minute, not the node-start LOW."""
     h = _harness(monkeypatch)
     D = 24 * 60
     rows = [(LOW, T1), (HIGH, _ts(10))]
@@ -356,7 +393,7 @@ def test_spread_pit_paper_started_before_t2_books_0_2pc_on_an_outage_stop_a_day_
     assert ex[0] == "stop_loss" and h.minute(D + 32) <= ex[2] <= h.minute(D + 33), ("set-up: the stop replayed on "
                                                                                     "the hub's return", ex)
     assert h.is_modelled(o["signal"]), ("set-up: booked by the outage replay's model", o["signal"])
-    assert _node_start(rows, _ts(0))["assumed_half_spread"] == LOW, "set-up: 0.05% in force when the node started"
+    assert _node_start(rows, _ts(0))["assumed_half_spread"] == LOW, "set-up: LOW in force when the node started"
     got = round(ex[3] / level - 1, 6)
     assert abs(got + HIGH) < 2e-6, {"booked_vs_level": got, "want": -HIGH}
 
@@ -366,9 +403,10 @@ def test_spread_pit_paper_started_before_t2_books_0_2pc_on_an_outage_stop_a_day_
                          ids=["spot-long", "perp-1x-short"])
 def test_spread_pit_restart_replay_of_a_minute_before_t2_equals_the_backtest_at_that_minute(monkeypatch, label, perp,
                                                                                            profile, side):
-    """The process is down 00:06-00:12; a 2% dip crosses the 1% stop at 00:07:30; 0.2% lands at 00:09 (T2), before
-    the restart, so the restarted node starts on 0.2%. The replayed stop is booked with the half spread in force at
-    00:07 (0.05%), and equals the backtest's stop at that minute on the same series: level less 0.05% in both."""
+    """The process is down 00:06-00:12; a 2% dip crosses the 1% stop at 00:07:30; HIGH (0.3%) lands at 00:09 (T2),
+    before the restart, so the restarted node starts on HIGH. The replayed stop is booked with the half spread in
+    force at 00:07 (LOW, 0.1%), and equals the backtest's stop at that minute on the same series: level less LOW in
+    both."""
     h = _harness(monkeypatch)
     rows = [(LOW, T1), (HIGH, _ts(9))]
     _with_store(monkeypatch, rows)
@@ -377,7 +415,7 @@ def test_spread_pit_restart_replay_of_a_minute_before_t2_equals_the_backtest_at_
     ex, o, level = _replayed_stop(run, h, side)
     assert ex[0] == "stop_loss" and ex[2] <= h.minute(13), ("set-up: the stop replayed on return", ex)
     assert h.is_modelled(o["signal"]), ("set-up: booked by the outage replay's model", o["signal"])
-    assert _node_start(rows, _ts(12))["assumed_half_spread"] == HIGH, "set-up: the restarted node starts on 0.2%"
+    assert _node_start(rows, _ts(12))["assumed_half_spread"] == HIGH, "set-up: the restarted node starts on HIGH"
     replay_paid = side * (1 - ex[3] / level)
     st = _store(rows)
     mins = h.minutes_of(p)
@@ -410,3 +448,62 @@ def test_control_the_replay_books_the_0_05pc_floor_when_the_measurement_is_below
     ex, o, level = _replayed_stop(run, h, side)
     assert ex[0] == "stop_loss" and h.is_modelled(o["signal"]), ex
     assert abs(side * (1 - ex[3] / level) - FLOOR) < 2e-6, (ex, level)
+
+
+# ------------------------------------------------------------------------------------------- fills-vs-model
+
+
+def _fills_vs_model(paper, model, store):
+    """ASSUMED interface (one place to change): sleeve_fund.research.fills_vs_model.compare(paper_fills, model_fills,
+    store=..., venue=..., instrument=...), fills as the journal's rows (paper's carrying the `half_spread` it booked
+    with), returning a report whose `buckets` maps a label to {"count", "amount"}."""
+    try:
+        from sleeve_fund.research import fills_vs_model
+    except ImportError as exc:
+        raise AssertionError(f"not built: sleeve_fund.research.fills_vs_model ({exc})") from None
+    fn = getattr(fills_vs_model, "compare", None)
+    if fn is None:
+        raise AssertionError("not built: fills_vs_model.compare(paper_fills, model_fills, store=..., venue=..., "
+                             "instrument=...)")
+    try:
+        rep = fn(paper, model, store=store, venue=VENUE, instrument=PAIR)
+    except TypeError as exc:
+        raise AssertionError(f"not built: fills_vs_model.compare as assumed: {exc}") from exc
+    buckets = getattr(rep, "buckets", None)
+    if buckets is None and isinstance(rep, dict):
+        buckets = rep.get("buckets")
+    if buckets is None:
+        raise AssertionError(f"not built: a fills-vs-model report with labelled buckets; got {rep!r}")
+    return buckets
+
+
+@SPREAD_PIT
+def test_spread_pit_fills_vs_model_reports_the_daily_refresh_lag_in_its_own_labelled_bucket():
+    """Advisor 00:19 (9): fills-vs-model counts the daily-refresh lag as a known divergence in its own labelled
+    bucket, never absorbed into a tolerance. HIGH (0.3%) lands at 00:10 (T2); paper last refreshed at 00:00 and
+    books a stop at 00:21 with LOW (0.1%), while the model books it with HIGH, the value in force at that minute: a
+    difference of (HIGH - LOW) x level x qty = 11.88. Exactly one bucket, labelled for the refresh lag, holds it
+    (count 1, amount 11.88), and no other bucket (tolerance, slippage, unexplained) counts it."""
+    t2 = _ts(10)
+    st = _store([(LOW, T1), (HIGH, t2)])
+    from sleeve_fund import spreads
+
+    level, qty, ts = 59_400.0, 0.1, _ts(21)
+    assert spreads.resolve(VENUE, PAIR, st).half_spread == HIGH and t2 < ts < t2 + timedelta(hours=24), (
+        "set-up: HIGH landed before the stop, inside the 24 hours a daily refresh may lag")
+
+    def fill(hs, **extra):
+        px = round(level * (1 - hs), 2)
+        return {"ts": ts, "order_id": "O-stop", "intent": "stop_loss", "side": "SELL", "qty": qty, "price": px,
+                "fee": round(0.0005 * qty * px, 2), **extra}
+
+    paper, model = [fill(LOW, half_spread=LOW)], [fill(HIGH)]
+    gap = (paper[0]["price"] - model[0]["price"]) * qty
+    assert abs(gap - (HIGH - LOW) * level * qty) < 0.011, ("set-up: paper and model differ by the lag only", gap)
+    buckets = _fills_vs_model(paper, model, st)
+    lag = {k: v for k, v in buckets.items() if "refresh" in str(k).lower()}
+    others = {k: v for k, v in buckets.items() if k not in lag and (v or {}).get("count")}
+    got = {"lag": lag, "others": others}
+    want = {"lag": {"<a label naming the refresh lag>": {"count": 1, "amount": round(gap, 2)}}, "others": {}}
+    assert (len(lag) == 1 and next(iter(lag.values())).get("count") == 1
+            and abs(abs(next(iter(lag.values())).get("amount", 0.0)) - gap) < 0.011 and not others), (got, want)
