@@ -216,6 +216,10 @@ LATE_DECISION_NS = 90 * 1_000_000_000
 UNSEEN_GAP_NS = 15 * 1_000_000_000
 MISSING_KEEP_NS = 6 * 60 * 60_000_000_000  # how long a minute the feed missed is still replayed if it lands
 HOLD_NS = 20 * 1_000_000_000  # hub_client.HOLD_SECONDS: a minute this late was held for a refill that didn't come
+# R203-1 (Advisor regrade, 7 Oct): how long after its close a candle may still reach the strategy and be decided: the
+# hub builds a minute 2 s after it ends (relay.BAR_GRACE_SECONDS), may hold it HOLD_NS for a refill, and flushes held
+# minutes on its 5 s heartbeat. A heartbeat less than this after a close does not show that close decided.
+DECIDE_WINDOW_NS = HOLD_NS + 10 * 1_000_000_000
 
 
 def outage_fill_note(decision: dict | None, px: float) -> str | None:
@@ -517,6 +521,11 @@ class LongFlatStrategy(Strategy):
         # the restore filled at today's price, not the entry, and funding is the journal's alone.
         self._restore: dict | None = None
         self._restore_id: str | None = None
+        # R-I5-4: the restored position's average at the venue (the restore's price) and how far it sits from the
+        # journal's entry, per unit: {"side", "n" (venue qty still held from it), "avg", "gap"}. Each fill that
+        # closes part of it (_restored_rounding) books the venue's per-fill cent rounding as the run straight
+        # through would have had it, so cash, equity and the next entry's size are the same as without the restart.
+        self._restored: dict | None = None
         # The open perp position's liquidation price, worked out once at each entry or add from the position's own
         # average entry and posted margin, journaled on that order and read back after a restart: never from the
         # restore's price (Advisor 22:36, QA P1-L22).
@@ -1587,9 +1596,16 @@ class LongFlatStrategy(Strategy):
         orders = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
                   if not (o.get("signal") or {}).get("watched")]  # paper's watched stop is no venue order
         if self._last_alive is not None:
-            # The last candle the journal shows decided: the previous process saw every close up to its last heartbeat,
-            # and an order sent after a close was decided on it. A first start missed nothing.
-            self._missed_after = max([_ns(self._last_alive)] + [_ns(o["ts"]) for o in orders[:1]])
+            # The last candle the journal shows decided. The tick timer stamps the heartbeat on its own, so a close up
+            # to DECIDE_WINDOW_NS before it may not have been decided yet (R203-1), nor one after the last market data
+            # the process saw (it heartbeats through a hub outage). An order sent after a close was decided on it.
+            # Counting a decided candle missed changes nothing: a missed candle only exits, only when it says the
+            # held side is wrong, and a decided exit left its order. A first start missed nothing.
+            alive = _ns(self._last_alive)
+            if self._last_seen is not None:
+                alive = min(alive, _ns(self._last_seen))
+            decided = (alive - DECIDE_WINDOW_NS) // step * step
+            self._missed_after = max([decided] + [_ns(o["ts"]) for o in orders[:1]])
         at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
         qty = self.runtime.book["qty"]
         held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False,
@@ -3316,6 +3332,28 @@ class LongFlatStrategy(Strategy):
                                      ts=self.runtime.now())
         self.submit_order(order)
 
+    def _restored_rounding(self, sign: int, qty: float, px: float) -> None:
+        """R-I5-4: a fill on the position put back at the simulated venue after a restart. The venue books each
+        closing fill's profit to the cent from its own average (the restore's price); the run straight through
+        booked it from the journal's entry. The restore's _cash_adj carries the difference before rounding; this
+        adds the difference the cent rounding makes, the venue's own (Money), so the account's cash is the run's.
+        An add moves both averages alike: the gap per unit shrinks as the position grows."""
+        g = self._restored
+        if sign == g["side"]:
+            n = g["n"] + qty
+            g["avg"] = (g["avg"] * g["n"] + px * qty) / n
+            g.update(n=n, gap=g["gap"] * g["n"] / n)
+            return
+        c = min(qty, g["n"])
+        cur = getattr(self.instrument, "settlement_currency", None) or self.instrument.quote_currency
+        at_venue = g["side"] * c * (px - g["avg"])
+        restored = g["side"] * c * g["gap"]
+        self._cash_adj += (Money(at_venue + restored, cur).as_double() - Money(at_venue, cur).as_double()
+                           - restored)
+        g["n"] -= c
+        if g["n"] <= float(DUST):
+            self._restored = None
+
     HOUR_NS = 3_600_000_000_000
     HELD_KEPT = 72  # hours of positions at settlement kept: a paper restart settles longer gaps at the tick
 
@@ -4736,6 +4774,11 @@ class LongFlatStrategy(Strategy):
             # cash by taking up the difference from the journal's entry. Not a trade, so not journaled.
             q = event.last_qty.as_double() * (1 if event.is_buy else -1)
             self._cash_adj += q * (event.last_px.as_double() - self._restore["entry"])
+            g = self._restored or {"side": 1 if q > 0 else -1, "n": 0.0, "avg": 0.0, "gap": 0.0}
+            n = g["n"] + abs(q)
+            g["avg"] = (g["avg"] * g["n"] + event.last_px.as_double() * abs(q)) / n
+            g.update(n=n, gap=g["avg"] - self._restore["entry"])
+            self._restored = g
             if done:
                 if self.runtime is not None:
                     self.runtime.store.event(self.runtime.name, "info", "restore_filled",
@@ -4744,6 +4787,8 @@ class LongFlatStrategy(Strategy):
                                              ts=self.runtime.now())
                 self._restore = self._restore_id = None
             return
+        if self._restored is not None:
+            self._restored_rounding(1 if event.is_buy else -1, event.last_qty.as_double(), event.last_px.as_double())
         if coid in self._maker and done:
             self._maker.pop(coid)
             self._cancel_alert(coid)
