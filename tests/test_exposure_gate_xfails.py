@@ -748,10 +748,10 @@ def _marked(cells, table):
     out = []
     for r, p in cells:
         marks = []
-        if r == "liquidation_gap" and not p:  # PE2 (stop-safety, master 43bf3747): the path cells pass; the reason-only stay
+        if (r, p) in table:  # PE2 (P1-RAL): None, a cell that now passes (mark removed)
+            marks += [table[(r, p)]] if table[(r, p)] is not None else []
+        elif r == "liquidation_gap" and not p:  # PE2 (stop-safety, master 43bf3747): the path cells pass; the reason-only stay
             marks.append(xf(GAP_LIQ))
-        elif (r, p) in table:
-            marks.append(table[(r, p)])
         elif r == "winding_down":
             marks.append(xf(GATE))
         out.append(pytest.param(r, p, id=f"{r}-{p}", marks=marks))
@@ -1318,6 +1318,7 @@ XFAIL_CLEAR: dict = {
     "liquidation": xf(GATE),  # halted through the liquidation_reset row: nothing reads it until RAL
     "funding_missing": xf(GATE),  # never blocked in the first place (O17b)
     "stale_data": xf(GATE, condition=ON_MAIN),
+    "liquidation_gap": None,  # PE2 (P1-RAL): passes (mark removed)
 }
 
 
@@ -1588,7 +1589,7 @@ def test_a_per_strategy_reset_never_clears_a_halt_or_the_daily_pause(tmp_path, s
     assert_no_exposure_added(store, t2)
 
 
-@pytest.mark.parametrize("reason_name", [pytest.param("daily_pause", id="book-reset-daily_pause", marks=xf(GATE)),
+@pytest.mark.parametrize("reason_name", [pytest.param("daily_pause", id="book-reset-daily_pause"),  # PE2 (P1-RAL): passes
                                          pytest.param("portfolio_halt", id="book-reset-portfolio_halt", marks=xf(GATE)),
                                          pytest.param("liquidation", id="book-reset-liquidation")])  # passes on main once the set-up writes the incident (02:20)
 def test_a_book_reset_clears_the_daily_pause_and_the_portfolio_halt_but_not_a_liquidation_incident(

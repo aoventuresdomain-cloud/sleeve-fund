@@ -45,7 +45,10 @@ from sqlalchemy.exc import IntegrityError
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
-COMMANDS = {"pause", "resume", "flatten"}
+# The PM's reset after a liquidation (P1-RAL): ends a liquidation halt, from a new high-water mark at the remaining
+# equity, once the liquidation's incident has its note (Independent Quant Advisor, 6 Oct 17:57 and 18:17).
+RAL = "reset_after_liquidation"
+COMMANDS = {"pause", "resume", "flatten", RAL}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
@@ -488,6 +491,10 @@ ERROR_KINDS = ("handler_failed", "tick_failed")
 # The event a PM's "Reset after liquidation" journals (item RAL): the one thing that ends a liquidation halt.
 # The engine (#155) and the dashboard both read it from here.
 LIQUIDATION_RESET = "liquidation_reset"
+# The note on a liquidation's incident that a reset after liquidation needs (Advisor 18:17): an events row of its own,
+# "Incident #<id> note by <author>: ...", so the incident it answers is in its words.
+INCIDENT_NOTE = "incident_note"
+WHY_STOP_FIELD = "why the half-liquidation stop did not protect the position"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
@@ -697,6 +704,19 @@ def _put_trial_in(c, row: dict) -> None:
     except IntegrityError:
         if not c.execute(select(trials_t.c.id).where(trials_t.c.id == row["id"])).first():
             raise
+
+def _cleared_words(store: "Store", s: "Sleeve") -> str:
+    """What a book reset clears for one strategy, with the old reference and level (Advisor 7 Oct 00:20)."""
+    from sleeve_fund import risk
+
+    profile = risk.profile(s.risk_profile)
+    if s.status == "halted":
+        peak = store.peak_equity(s.name) or s.starting_balance
+        return (f"the drawdown halt ({s.status_reason}) is cleared: its reference, the high-water mark of {peak:,.2f} "
+                f"against a {profile.max_drawdown:.0%} limit, is re-based with the book")
+    return (f"the daily-loss pause ({s.status_reason}) is cleared: its reference, the day's opening equity, against a "
+            f"{profile.daily_loss:.0%} limit, is re-based with the book")
+
 
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
@@ -1312,9 +1332,12 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(select(orders_t.c.reason).where(orders_t.c.order_id == order_id)).scalar() or ""
 
-    def request_reset(self, sleeve: str, reason: str, actor: str = "PM") -> None:
+    def request_reset(self, sleeve: str, reason: str, actor: str = "PM", *, book: bool = False) -> None:
         """Ask the supervisor to reset a strategy: it flattens it, puts the run so far away and restarts it at
-        its starting capital (supervisor.Supervisor.reset_pending)."""
+        its starting capital (supervisor.Supervisor.reset_pending). A per-strategy reset keeps any halt or pause. A
+        book reset (`book`) re-bases the high-water mark and the day's start with the book, so it clears the
+        strategy's own drawdown halt and daily-loss pause, journaled once each with the old reference and level; never
+        the PM's pause, a stop or a liquidation's incident (Independent Quant Advisor, 7 Oct 00:20)."""
         s = self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest can't be reset; run a new backtest instead")
@@ -1324,13 +1347,20 @@ class Store:
             raise ValueError("a reason is required")
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
+        from sleeve_fund.paper.runtime import liquidation_head  # the engine's liquidation rule
+
+        if liquidation_head(self, sleeve) is not None:
+            # Advisor 20:41 (U27): an ordinary reset can't clear a liquidation.
+            raise ValueError("its position margin was lost (liquidated), so a reset can't clear it: use Reset after "
+                             "liquidation, which asks for an incident note")
         with self.engine.begin() as c:
             rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
                                                     restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
+            cleared = book and (s.status == "halted" or (s.status == "paused" and s.paused_until is not None))
             # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
             hold = ({"status": s.status, "status_reason": s.status_reason or "", "paused_until": s.paused_until}
-                    if s.status in ("paused", "halted") else None)
-            if s.status != "halted":  # never downgrade a halt, as the paper process doesn't
+                    if s.status in ("paused", "halted") and not cleared else None)
+            if not (hold and hold["status"] == "halted"):  # never downgrade a halt, as the paper process doesn't
                 # P1-KR-2: a PM pause or flatten (the kill switch) pressed just before the reset, which the paper
                 # process has not applied yet, is kept as the pause it would have set (paper.runtime): the reset
                 # puts its pending commands away with the old run. The system's own flattens (a clean slate's) aren't.
@@ -1344,7 +1374,9 @@ class Store:
                     hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
             if hold:
                 c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
-        self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
+        if cleared:
+            self.event(sleeve, "info", "halt_cleared", f"book_reset: {_cleared_words(self, s)}")
+        self.decide(actor, "reset", f"{'Book reset' if book else 'Reset strategy'}: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
         rows = self.pending_resets()
@@ -1544,6 +1576,46 @@ class Store:
                     _not_backtest(events_t.c.sleeve)))
         with self.engine.connect() as c:
             return c.execute(q).scalar() or 0
+
+    def event_by_id(self, event_id: int) -> dict | None:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(events_t).where(events_t.c.id == event_id)))
+        return rows[0] if rows else None
+
+    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str) -> None:
+        """The note on a liquidation's incident (Advisor 18:17): why the half-liquidation stop did not protect the
+        position, and who wrote it. Both are required. A later note on the same incident replaces it."""
+        why, author = (why_stop_did_not_protect or "").strip(), (author or "").strip()
+        if not why:
+            raise ValueError(f"the note needs {WHY_STOP_FIELD}")
+        if not author:
+            raise ValueError("the note needs its author")
+        ev = self.event_by_id(incident_id)
+        if ev is None or ev["kind"] != "incident" or ev["sleeve"] is None:
+            raise ValueError(f"#{incident_id} is not a strategy's incident")
+        self.event(ev["sleeve"], "info", INCIDENT_NOTE,
+                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}")
+
+    def incident_note(self, incident_id: int) -> dict | None:
+        """The latest note on an incident (write_incident_note), with its author, else None."""
+        ev = self.event_by_id(incident_id)
+        if ev is None or ev["sleeve"] is None:
+            return None
+        head = f"Incident #{incident_id} note by "
+        notes = [e for e in self.sleeve_events_since(ev["sleeve"], (INCIDENT_NOTE,), after_id=incident_id)
+                 if e["message"].startswith(head)]
+        if not notes:
+            return None
+        note = notes[-1]
+        note["author"] = note["message"][len(head):].split(f": {WHY_STOP_FIELD}: ", 1)[0]
+        return note
+
+    def incident_is_open(self, incident_id: int) -> bool:
+        """An incident closes only once its note is written AND the PM has acknowledged it (Advisor 21:05, RAL 7/8):
+        neither a reset after liquidation nor a book reset closes it."""
+        with self.engine.connect() as c:
+            acked = c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == incident_id)).first() is not None
+        return not (acked and self.incident_note(incident_id) is not None)
 
     def ack(self, event_id: int, actor: str, note: str = "") -> None:
         with self.engine.begin() as c:
@@ -1778,11 +1850,25 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
         self.sleeve(sleeve)  # raises if unknown
-        with self.engine.begin() as c:
-            c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
-                                                created_at=utcnow(), incident=incident))
-            if holds_through_reset and command in ("pause", "flatten"):
-                self._hold_on_reset(c, sleeve, command, reason)
+        if command == RAL:
+            from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
+
+            if (why := ral_refusal(self, sleeve, incident, actor)) is not None:
+                raise ValueError(why)
+            reason = f"{reason.strip()} (incident #{incident})"
+        elif incident is not None:
+            raise ValueError("only a reset after liquidation names an incident")
+        try:
+            with self.engine.begin() as c:
+                c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
+                                                    created_at=utcnow(), incident=incident))
+                if holds_through_reset and command in ("pause", "flatten"):
+                    self._hold_on_reset(c, sleeve, command, reason)
+        except IntegrityError:
+            if incident is None:
+                raise
+            raise ValueError(f"already reset for this liquidation: incident #{incident} has its reset after "
+                             "liquidation") from None
         self.decide(actor, command, reason, sleeve)
 
     def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
