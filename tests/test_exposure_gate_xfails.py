@@ -27,7 +27,10 @@ Rulings pinned (advisor-rulings.md; the latest entry wins):
 Marks. `xfail(strict=True, raises=AssertionError, reason="EXPOSURE-GATE")` where today's code fails; GAP-LIQ where the
 set-up needs the gap through the stop to book as a liquidation; CHOKE-2 (deferred: backtest/study mode, demo mirror,
 P2-1 resizes, rebalance) in TestChoke2 (every id contains "choke2", so `-k "not choke2"` runs the gate set alone).
-P1-U35 (raced fills, Advisor 23:05): reason "CHOKE", in the gate set. A missing interface fails as
+P1-U35 (raced fills, Advisor 23:05): reason "CHOKE", in the gate set. REFUSAL-CAUSE (Advisor 7 Oct 00:20 (b)): every
+refusal carries a reason code (why.code, why.codes: all active causes in a fixed order) and PM text giving the figure and
+what clears it; ids test_cause_*. P1-RAL (00:20 (a)): the book reset's own clears, refusals and transaction; ids
+test_ral_*; P1-RAL's PR, so they stay strict xfails on the gate. A missing interface fails as
 AssertionError("not built: ..."), never ImportError or AttributeError. Plain tests already hold.
 
 Modes. "replay": a recorded paper session replayed through the paper engine (sleeve_fund.research.replay: the same
@@ -402,11 +405,12 @@ def assert_no_exposure_added(store, at, in_flight=(), until=None):
 # The single gate (assumed interface: adapt the names, never the assertions)
 # ---------------------------------------------------------------------------------------------------------------
 
-def gate(store, rt=None, at=None) -> tuple[bool, str]:
+def _gate_out(store, rt=None, at=None):
     """The ONE gate's state function, (blocked, reason), as the engine, supervisor and dashboard read it. Looked for,
     in order, each only when its parameters fit: sleeve_fund.paper.runtime.entry_blocked_in(store, name, now) (PE2's
     name on 845df4d: the journal's answer, for the supervisor and the dashboard); runtime.entry_blocked(store, name,
-    now); Store.entry_blocked(name, now=); SleeveRuntime.entry_blocked(). Otherwise AssertionError("not built")."""
+    now); Store.entry_blocked(name, now=); SleeveRuntime.entry_blocked(). Otherwise AssertionError("not built").
+    Returns the function's own answer, (blocked, why), unconverted (REFUSAL-CAUSE reads why.code and why.codes)."""
     import inspect
 
     from sleeve_fund.paper import runtime as rt_mod
@@ -431,6 +435,12 @@ def gate(store, rt=None, at=None) -> tuple[bool, str]:
     else:
         raise AssertionError("not built: the single exposure gate's state function (blocked, reason): "
                              "sleeve_fund.paper.runtime.entry_blocked_in(store, name, now)")
+    return out
+
+
+def gate(store, rt=None, at=None) -> tuple[bool, str]:
+    """_gate_out's reading as (blocked, reason in words)."""
+    out = _gate_out(store, rt, at)
     assert isinstance(out, tuple) and len(out) == 2, f"the gate must return (blocked, reason), got {out!r}"
     return bool(out[0]), str(out[1] or "")
 
@@ -723,7 +733,9 @@ for _r in REASONS:
 # (reason, path) -> mark, from the runs on main 9ae1f8a and #155 eb737bd (README). Funding: O17b's block isn't built.
 # Stopped and retired: the process still running after the PM's Stop opens and fills (the stopped-process window).
 XFAIL_REPLAY: dict = {
-    **{(r, p): xf(GATE) for r in ("funding_missing",) for p in PATHS},  # PE2 (stop-safety 8fd2c57): marks removed where these pass: stopped, retired, stale_data
+    **{(r, p): xf(GATE) for r in ("funding_missing",) for p in PATHS},  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass: stopped, retired
+    **{("stale_data", p): xf(GATE, condition=ON_MAIN) for p in ("new_entry", "reversal_open_leg")},  # #155 D-items
+    # PE2 (stop-safety, master 3e66ce8f): stale_data resting_entry_fill and resting_add_fill pass (marks removed)
 }
 
 
@@ -731,7 +743,7 @@ def _marked(cells, table):
     out = []
     for r, p in cells:
         marks = []
-        if r == "liquidation_gap" and not p:  # PE2: the path cells pass on the stop-safety head; the reason-only stay
+        if r == "liquidation_gap" and not p:  # PE2 (stop-safety, master 3e66ce8f): the path cells pass; the reason-only stay
             marks.append(xf(GAP_LIQ))
         elif (r, p) in table:
             marks.append(table[(r, p)])
@@ -759,7 +771,7 @@ def test_replay_no_exposure_is_added_while_blocked(tmp_path, store, monkeypatch,
         assert not live, f"resting entry not cancelled at the block: {live}"
 
 
-@pytest.mark.parametrize("reason_name", [pytest.param("stopped"), pytest.param("retired")])  # PE2 (stop-safety 8fd2c57): marks removed where these pass
+@pytest.mark.parametrize("reason_name", [pytest.param("stopped"), pytest.param("retired")])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
 def test_a_stop_market_entry_resting_before_stop_or_retire_is_cancelled_and_never_fills(tmp_path, store, monkeypatch,
                                                                                        reason_name):
     """[R113; PE2 via the coordinator] A breakout-style resting entry (a STOP_MARKET order with intent entry, BUY 0.05
@@ -901,7 +913,7 @@ for _r in PAPER_REASONS:
         PAPER_CELLS.append((_r, _p))
 
 XFAIL_PAPER: dict = {
-    # PE2 (stop-safety 8fd2c57): daily_pause-dashboard_resume and retired-dashboard_start pass (marks removed)
+    # PE2 (stop-safety, master 3e66ce8f): daily_pause-dashboard_resume and retired-dashboard_start pass (marks removed)
     **{("funding_missing", p): xf(GATE) for p in PAPER_PATHS},  # O17b not built
 }
 
@@ -1041,7 +1053,7 @@ def _maker_run(tmp_path, store, monkeypatch, reason_name, after=None):
 # The missing funding rate is a perp-only block, and maker-first is refused on a perp: no partial-fill cell for it
 # until maker reaches perps (README).
 PARTIAL_REASONS = ("drawdown_halt", "daily_pause", "stopped", "winding_down")
-XFAIL_PARTIAL: dict = {}  # PE2 (stop-safety 8fd2c57): marks removed where these pass (stopped)  #  # README: the process trades on after the PM's Stop
+XFAIL_PARTIAL: dict = {}  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped)  # README: the process trades on after the PM's Stop
 
 
 @pytest.mark.parametrize("reason_name", _marked1(PARTIAL_REASONS, XFAIL_PARTIAL))
@@ -1062,7 +1074,7 @@ def test_a_partly_filled_entry_has_its_remainder_cancelled_at_the_block(tmp_path
 # held: a flattening block sells it with the rest; a block that doesn't flatten keeps it with its stop.
 KEPT_REASONS = tuple(r for r in ("drawdown_halt", "daily_pause", "stopped", "winding_down") if not _flattens(r))
 FLAT_PARTIAL_REASONS = tuple(r for r in ("drawdown_halt", "daily_pause") if _flattens(r))
-XFAIL_KEPT: dict = {}  # PE2 (stop-safety 8fd2c57): marks removed where these pass (stopped)  #  # Stop trades on
+XFAIL_KEPT: dict = {}  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped)  # Stop trades on
 
 
 @pytest.mark.parametrize("reason_name", FLAT_PARTIAL_REASONS)
@@ -1139,7 +1151,7 @@ FALL = 10  # minutes into the next session when the price falls 3% through the r
 
 
 @pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}")
-                                                for st, r in U35_FLAT])  # PE2 (stop-safety 8fd2c57): marks removed where these pass
+                                                for st, r in U35_FLAT])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
 def test_a_raced_fill_under_a_flattening_block_is_sold_at_once(tmp_path, store, client, monkeypatch, status,
                                                                reason_name):
     """P1-U35 under the Advisor's 23:05 ruling: under a drawdown halt, a liquidation, or the daily pause of a profile
@@ -1167,9 +1179,9 @@ def test_a_raced_fill_under_a_flattening_block_is_sold_at_once(tmp_path, store, 
         "the journal doesn't say the raced fill was flattened by the block (\"raced fill flattened by halt\")")
 
 
-@pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}", marks=xf(CHOKE)
-                                                             if st not in ("stopped", "retired") else [])
-                                                for st, r in U35_KEEP])  # PE2 (stop-safety 8fd2c57): marks removed where these pass (stopped, retired)
+@pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}",
+                                                             marks=[] if st in ("stopped", "retired") else xf(CHOKE))
+                                                for st, r in U35_KEEP])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped, retired)
 def test_a_raced_fill_under_a_block_that_does_not_flatten_is_kept_with_its_stop_and_one_incident(
         tmp_path, store, client, monkeypatch, status, reason_name):
     """P1-U35 [R113 Advisor 20:56 "fills racing cancel accepted and stopped, never unwatched"; Advisor 20:52 via the
@@ -1316,7 +1328,7 @@ def test_after_its_own_clearing_action_opening_works_again(tmp_path, store, clie
                                f"{[(o['ts'], o['intent']) for o in _orders(store)]}")
 
 
-# PE2 (stop-safety 8fd2c57): passes (mark removed)
+# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
 def test_a_daily_pause_ends_at_the_next_0000_utc_roll_and_not_before(tmp_path, store, monkeypatch):
     """Assertion 5 for the daily pause [R79 "daily pause: next 00:00 UTC roll"]: paused at 10:15, it is still
     blocked 30 s before 00:00 UTC (a restart then keeps it), and opens 30 s after it, on a frozen clock."""
@@ -1349,7 +1361,7 @@ JOURNAL_HELD = ("drawdown_halt", "daily_pause", "liquidation", "winding_down", "
 
 
 @pytest.mark.parametrize("reason_name", [pytest.param(r, marks=xf(GATE) if r in ("funding_missing", "winding_down")
-                                                      else []) for r in GATE_REASONS])  # PE2: the rest pass (8fd2c57)
+                                                          else []) for r in GATE_REASONS])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
 def test_the_gate_returns_blocked_and_names_its_reason(tmp_path, store, monkeypatch, reason_name):
     """Assertion 4, at its source: in each blocked state the ONE gate's state function returns (True, reason), the
     reason naming the state in words the PM reads (drawdown, daily loss, liquidated, funding, degraded data, wind-down,
@@ -1381,7 +1393,7 @@ def test_the_gate_returns_blocked_and_names_its_reason(tmp_path, store, monkeypa
 
 
 REFUSAL = "entry_blocked"  # the decision log's action for a refused opening order (assumed; README)
-XFAIL_NAMED: dict = {r: xf(GATE) for r in ("funding_missing",)}  # PE2 (stop-safety): the rest pass (marks removed)
+XFAIL_NAMED: dict = {r: xf(GATE) for r in ("funding_missing",)}  # PE2 (stop-safety, master 3e66ce8f): the rest pass (marks removed)
 
 
 @pytest.mark.parametrize("reason_name", _marked1(GATE_REASONS, XFAIL_NAMED))
@@ -1403,7 +1415,7 @@ ROUTE_CELLS = ([("dashboard_resume", r) for r in ("daily_pause", "liquidation", 
                + [("dashboard_reset", r) for r in ("liquidation",)])
 XFAIL_ROUTE: dict = {
     **{c: xf(GATE) for c in ROUTE_CELLS if c[1] == "winding_down"},  # accepted (wind-down: not built)
-    # PE2 (stop-safety 8fd2c57): the daily_pause, retired and drawdown_halt routes pass (marks removed)
+    # PE2 (stop-safety, master 3e66ce8f): the daily_pause, retired and drawdown_halt routes pass (marks removed)
     **{c: xf(GATE, condition=not HAS_164) for c in ROUTE_CELLS if c[1] == "liquidation"},  # #164 refuses them
 }
 
@@ -1440,7 +1452,7 @@ def test_each_route_refusal_names_its_reason(tmp_path, store, client, monkeypatc
 # ---------------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("what", [pytest.param("resting_fill_1s_after", id="zero-window-resting-fill"),
-                                  pytest.param("new_submit_next_bar", id="zero-window-new-submit")])  # PE2: pass
+                                  pytest.param("new_submit_next_bar", id="zero-window-new-submit")])  # PE2 (stop-safety, master 3e66ce8f): pass
 def test_nothing_opens_from_the_moment_the_stop_is_accepted(tmp_path, store, monkeypatch, what):
     """[CHOKE invariants 22:29 (2)] Zero window after Stop: nothing that opens or adds is accepted from the timestamp
     the Stop was ACCEPTED (the journal's desired_state write, noted at the runtime tick that makes it), not from when the
@@ -1480,7 +1492,7 @@ GATE_ALERT = "entry_blocked"  # the event kind of the ONE alert when a block epi
 GATE_CLEARED = "entry_block_cleared"  # the event kind when it ends, carrying the refusal count (assumed; README)
 
 
-# PE2 (stop-safety): passes (mark removed)
+# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
 def test_a_block_episode_journals_one_alert_a_decision_per_refusal_and_one_cleared_event(tmp_path, store, monkeypatch):
     """[CHOKE invariants 22:29 (3)] A drawdown halt at t0+25 while the signal wants long on every one-minute bar from
     t0+30 to the end (so the gate refuses an entry on each of about 20 bars), then the PM's Resume and a restart whose
@@ -1600,6 +1612,577 @@ def test_a_book_reset_clears_the_daily_pause_and_the_portfolio_halt_but_not_a_li
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# REFUSAL-CAUSE (Advisor 7 Oct 00:20 (b)): every refused entry names its cause, not just the state: a stable reason
+# code plus PM text giving the figure and what clears it, listing ALL active causes (so clearing one does not surprise
+# the PM with the next), no venue names. Interface (PE2's CHOKE gate): entry_blocked() -> (blocked, why), why the PM
+# text (a str) with why.code (the first cause) and why.codes (every active cause, in CAUSE_ORDER), read from the
+# journal (runtime.entry_blocked(store, name, now), as gate() finds it) and in the engine (SleeveRuntime.entry_blocked()).
+# A why without code/codes fails as AssertionError("not built: ..."). Decision rows: action "entry_blocked". Events:
+# one "entry_blocked" when a block starts, one "entry_block_cleared" when the LAST cause clears; nothing per tick.
+# ---------------------------------------------------------------------------------------------------------------
+
+CAUSE = "REFUSAL-CAUSE"
+CAUSE_ORDER = ("liquidated", "drawdown_halt", "halted", "daily_pause", "retired", "winding_down", "stopped", "paused",
+               "exits_only", "stale_data", "degraded_candle", "funding_missing")
+CAUSE_WORDS = {  # the words the PM text names each cause by (Retired, Winding down and Stopped are distinct words)
+    "liquidated": r"liquidat",
+    "drawdown_halt": r"drawdown",
+    "halted": r"halt",
+    "daily_pause": r"daily[- ]loss|daily pause",
+    "retired": r"\bretired\b",
+    "winding_down": r"wind(ing)?[- ]down",
+    "stopped": r"\bstopped\b",
+    "paused": r"\bpaused\b",
+    "exits_only": r"exits? only",
+    "stale_data": r"stale|no (price|data|trade)|last price",
+    "degraded_candle": r"degraded",
+    "funding_missing": r"funding",
+}
+CAUSE_CLEARS = {  # what clears it, in the PM text
+    "liquidated": r"reset after (the |a )?liquidation",
+    "drawdown_halt": r"only you|resume",
+    "daily_pause": r"00:00 utc",
+    "retired": r"cannot be started|can't be started|can not be started|restore",
+    "stopped": r"\bstart\b",
+    "stale_data": r"resum|arriv|back|again",
+    "degraded_candle": r"\bnext\b",
+}
+VENUE_WORDS = ("binance", "kraken", "bybit", "okx", "coinbase", "bitmex", "deribit", "hyperliquid", "bitfinex",
+               "kucoin", "bitstamp")
+AT = datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)  # journal-only set-ups: the guard's frozen clock
+OTHER = "egxb"  # a second strategy on the book
+
+
+def _gate_why(out, where: str):
+    """The why of a blocked gate reading, with its codes; AssertionError("not built") while it has none."""
+    assert isinstance(out, tuple) and len(out) == 2, f"{where}: the gate must return (blocked, why), got {out!r}"
+    blocked, why = bool(out[0]), out[1]
+    assert blocked, f"{where}: not blocked: {why!r}"
+    if not isinstance(getattr(why, "code", None), str) or not isinstance(getattr(why, "codes", None), (tuple, list)):
+        raise AssertionError(f"not built: {where}'s why.code and why.codes (every active cause, in the fixed order; "
+                             f"Advisor 00:20 (b)): got {why!r}")
+    return why
+
+
+def _engine_out(rt):
+    if not callable(getattr(rt, "entry_blocked", None)):
+        raise AssertionError("not built: SleeveRuntime.entry_blocked() -> (blocked, why)")
+    return rt.entry_blocked()
+
+
+def _pm_words(text: str, where: str) -> None:
+    """PM text: no venue names [00:20 (b)], no "coin" or "crypto"."""
+    from sleeve_fund import venues as venues_mod
+
+    low = str(text).lower()
+    names = set(VENUE_WORDS) | {k.lower() for k in getattr(venues_mod, "VENUES", {})}
+    named = sorted(v for v in names if v in low)
+    assert not named, f"{where}: the PM text names a venue {named}: {text!r}"
+    assert not re.search(r"coin|crypto", low), f"{where}: the PM text says coin or crypto: {text!r}"
+
+
+def _causes(why, want, where: str) -> None:
+    """why.codes is exactly `want` (all active causes, in CAUSE_ORDER), why.code the first, and the text names each."""
+    assert list(want) == sorted(want, key=CAUSE_ORDER.index), f"test: {want} is not in the fixed order"
+    codes = tuple(why.codes)
+    assert codes == tuple(want), f"{where}: why.codes {codes} != {tuple(want)} (every active cause, in the fixed order)"
+    assert why.code == want[0], f"{where}: why.code {why.code!r} is not the first cause {want[0]!r}"
+    low = str(why).lower()
+    unnamed = [c for c in want if not re.search(CAUSE_WORDS[c], low)]
+    assert not unnamed, f"{where}: the PM text does not name every active cause ({unnamed} unnamed): {str(why)!r}"
+    _pm_words(str(why), where)
+
+
+def _create_as(store, name):
+    if not any(x.name == name for x in store.sleeves()):
+        store.create_sleeve(name=name, strategy="egx", instrument=PAIR, bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={**PERP, "stop_loss": STOP}, venue="BINANCE")
+
+
+GUARDED = {"drawdown_halt": (7_500.0, "halted"), "daily_pause": (9_400.0, "paused")}
+FIGURES = {  # the guard's figure and its limit, as the set-up makes them (balanced: 20% drawdown, 5% daily loss)
+    "drawdown_halt": (r"\b25(\.0+)?\s*%", r"\b20(\.0+)?\s*%"),
+    "daily_pause": (r"\b6(\.0+)?\s*%", r"\b5(\.0+)?\s*%"),
+}
+
+
+def _guarded(store, name, cause, at=AT):
+    """A flat strategy halted or paused by the production guard (risk.check in SleeveRuntime.tick) on a frozen clock:
+    marked 10,000 at `at`, then a minute later 7,500 (drawdown 25.0% against the 20% limit) or 9,400 (daily loss 6.0%
+    against the 5% limit). Returns the runtime, its clock at `at` + 5 minutes."""
+    _create_as(store, name)
+    clock = [at]
+    rt = SleeveRuntime(store, name, now=lambda: clock[0])
+    rt.on_start(0.0005)
+    rt.tick(equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0)
+    clock[0] = at + timedelta(minutes=1)
+    eq, status = GUARDED[cause]
+    rt.tick(equity=eq, cash=eq, qty=0.0, price=60_000.0)
+    s = store.sleeve(name)
+    assert s.status == status, f"setup: not {status} by the guard: {s.status} {s.status_reason!r}"
+    clock[0] = at + timedelta(minutes=5)
+    return rt
+
+
+def _stop_as(store, name):
+    """The dashboard's Stop for `name`, as _pm_stop."""
+    store.set_desired_state(name, "stopped")
+    store.drop_pending(name, "lapsed: the strategy was stopped before it acted")
+    store.decide("PM", "stop", "QA: stop it", name)
+
+
+JOURNAL_COMBOS = {
+    "drawdown_halt+stopped": ("drawdown_halt", False, ("drawdown_halt", "stopped")),
+    "drawdown_halt+retired+stopped": ("drawdown_halt", True, ("drawdown_halt", "retired", "stopped")),
+    "daily_pause+stopped": ("daily_pause", False, ("daily_pause", "stopped")),
+    "liquidated+retired+stopped": ("liquidated", True, ("liquidated", "retired", "stopped")),
+}
+
+
+@pytest.mark.parametrize("combo", [pytest.param(c, marks=[] if c in ('drawdown_halt+stopped', 'drawdown_halt+retired+stopped', 'daily_pause+stopped', 'liquidated+retired+stopped') else xf(CAUSE))
+                                   for c in list(JOURNAL_COMBOS)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_the_gate_lists_every_active_cause_in_the_fixed_order(store, combo):
+    """[00:20 (b) "When several causes apply, list all of them"] Several causes at once, read from the journal (the
+    gate the supervisor and the dashboard read): a drawdown halt or a daily-loss pause by the guard, or a liquidation,
+    then the PM's Stop, and for some Retire (Stop + Archive). why.codes is every active cause in the fixed order
+    (liquidated, drawdown_halt, halted, daily_pause, retired, winding_down, stopped, paused, exits_only, stale_data,
+    degraded_candle, funding_missing), why.code the first, and the PM text names each one."""
+    first, retire, want = JOURNAL_COMBOS[combo]
+    if first == "liquidated":
+        _liquidated_journal(store, utc(AT))
+    else:
+        _guarded(store, NAME, first)
+    _stop_as(store, NAME)
+    if retire:
+        store.archive(NAME)
+    why = _gate_why(_gate_out(store, at=AT + timedelta(minutes=10)), "the journal's gate")
+    _causes(why, want, "the journal's gate")
+
+
+def _engine_reads(tmp_path, store, monkeypatch, plan, when) -> list:
+    """Replay `plan`, reading the engine's gate (SleeveRuntime.entry_blocked()) on the first tick at or after each
+    time in `when`."""
+    seen = []
+
+    def read(rt, kw):
+        try:
+            seen.append(_engine_out(rt))
+        except AssertionError as exc:
+            seen.append(exc)
+
+    for w in when:
+        plan.hooks.append((w, read))
+    run(tmp_path, store, plan, monkeypatch)
+    assert len(seen) == len(when), f"setup: the engine was asked {len(seen)} of {len(when)} times"
+    for s in seen:
+        if isinstance(s, AssertionError):
+            raise s
+    return seen
+
+
+ENGINE_COMBOS = {
+    # a drawdown halt at t0+25, then the degraded 5-minute candle closing at t0+30: read at t0+31
+    "drawdown_halt+degraded_candle": (("drawdown_halt", BLOCK), ("drawdown_halt", "degraded_candle")),
+    # the degraded candle at t0+30, then the PM's Stop at t0+32: read at t0+33
+    "stopped+degraded_candle": (("stopped", 32), ("stopped", "degraded_candle")),
+}
+
+
+@pytest.mark.parametrize("combo", [pytest.param(c, marks=[] if c in ('drawdown_halt+degraded_candle', 'stopped+degraded_candle') else xf(CAUSE))
+                                   for c in list(ENGINE_COMBOS)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_the_engine_lists_every_active_cause_in_the_fixed_order(tmp_path, store, monkeypatch, combo):
+    """[00:20 (b)] The engine's own reading in a replayed session with two causes at once, one the journal holds (a
+    drawdown halt, or the PM's Stop) and one only the engine knows (the degraded candle [R46]): both are listed, in
+    the fixed order, and named in the PM text."""
+    (other, at_m), want = ENGINE_COMBOS[combo]
+    stale = REASONS["stale_data"]
+    plan = _plan_for(stale, tag="cc")
+    enter(stale, plan, store)
+    enter(REASONS[other], plan, store, at=M(plan.t0, at_m))
+    read_at = max(SIGNAL, at_m) + 1
+    seen = _engine_reads(tmp_path, store, monkeypatch, plan, [M(plan.t0, read_at)])
+    _causes(_gate_why(seen[0], "the engine's gate"), want, "the engine's gate")
+
+
+@pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('drawdown_halt', 'daily_pause') else xf(CAUSE))
+                                   for c in ["drawdown_halt", "daily_pause"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_a_guard_refusal_gives_the_figure_its_limit_and_what_clears_it(store, cause):
+    """[00:20 (b): "Drawdown halt: down 15.3% against a 15% limit since 22:10 UTC. Only you can clear it."] The guard's
+    halt (drawdown 25.0% against the 20% limit) or daily-loss pause (6.0% against 5%), read by the engine that halted
+    it and from the journal: code drawdown_halt or daily_pause (one cause), the figure and the limit in the text, and
+    what clears it (the PM's resume; the 00:00 UTC roll). No venue name."""
+    rt = _guarded(store, NAME, cause)
+    for where, read in (("the engine's gate", lambda: _engine_out(rt)),
+                        ("the journal's gate", lambda: _gate_out(store, at=AT + timedelta(minutes=10)))):
+        why = _gate_why(read(), where)
+        _causes(why, (cause,), where)
+        text = str(why)
+        for f in FIGURES[cause]:
+            assert re.search(f, text), f"{where}: the PM text does not give the figure /{f}/: {text!r}"
+        assert re.search(CAUSE_CLEARS[cause], text.lower()), f"{where}: the PM text does not say what clears it: {text!r}"
+
+
+@pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('liquidated', 'retired', 'stopped') else xf(CAUSE))
+                                   for c in ["liquidated", "retired", "stopped"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_a_state_refusal_names_the_state_in_its_own_word_and_what_clears_it(store, cause):
+    """[00:20 (b): "Retired: cannot be started."; "Retired, Winding down and Stopped are distinct words"] From the
+    journal: a liquidated strategy (code liquidated; cleared only by the reset after liquidation), a retired one (Stop +
+    Archive: codes retired then stopped; "cannot be started"), a stopped one (code stopped; Start clears it, and the
+    text does not say retired)."""
+    if cause == "liquidated":
+        _liquidated_journal(store, utc(AT))
+        want = ("liquidated",)
+    else:
+        _create(store)
+        _stop_as(store, NAME)
+        want = ("stopped",)
+        if cause == "retired":
+            store.archive(NAME)
+            want = ("retired", "stopped")
+    why = _gate_why(_gate_out(store, at=AT + timedelta(minutes=10)), "the journal's gate")
+    _causes(why, want, "the journal's gate")
+    low = str(why).lower()
+    assert re.search(CAUSE_CLEARS[cause], low), f"the PM text does not say what clears it: {str(why)!r}"
+    if cause == "stopped":
+        assert not re.search(r"retired|wind(ing)?[- ]down", low), f"stopped reads as another state: {str(why)!r}"
+
+
+def _stale_plan(tag):
+    """1-minute candles; no trade or quote reaches the process from t0+20 to t0+28 (8 minutes; past the 5-minute
+    stale-price warning, short of the 15-minute restart)."""
+    plan = Plan(t0=STD_T0, tag=tag)
+    plan.holes.append((20 * 60, 28 * 60))
+    return plan
+
+
+def _ages(text: str) -> list[float]:
+    """Every age the text gives, in seconds."""
+    return [float(n) * (60 if u.startswith("m") else 1)
+            for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?)\b", text.lower())]
+
+
+@pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('degraded_candle',) else xf(CAUSE))
+                                   for c in ["degraded_candle", "stale_data", "funding_missing"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_a_data_refusal_gives_the_figure_and_what_clears_it(tmp_path, store, monkeypatch, cause):
+    """[00:20 (b): "Data stale: last price 94 s old. Clears when data resumes."; "Funding rate missing."] The engine's
+    own causes, read in a replayed session: the degraded 5-minute candle closing at t0+30 (2 of its 5 minutes
+    missing; read at t0+31; the next whole candle clears it); stale data (no price for about 7 minutes, read at
+    t0+27: the age given, ~420 s, and that it clears when data resumes); the missing 08:00 funding rate (read at 08:20:
+    named as funding, no venue)."""
+    if cause == "degraded_candle":
+        reason = REASONS["stale_data"]
+        plan = _plan_for(reason, tag="dc")
+        enter(reason, plan, store)
+        when = M(plan.t0, SIGNAL + 1)
+    elif cause == "stale_data":
+        plan = _stale_plan("sd")
+        when = M(plan.t0, 27)
+    else:
+        reason = REASONS["funding_missing"]
+        plan = _plan_for(reason, tag="fm")
+        enter(reason, plan, store)
+        when = M(plan.t0, SIGNAL)
+    seen = _engine_reads(tmp_path, store, monkeypatch, plan, [when])
+    why = _gate_why(seen[0], "the engine's gate")
+    _causes(why, (cause,), "the engine's gate")
+    text = str(why)
+    if cause == "degraded_candle":
+        assert re.search(r"\b2 (of|out of)\b|\b40(\.0+)?\s*%", text), f"no figure (2 of its 5 minutes missing): {text!r}"
+    elif cause == "stale_data":
+        age = (27 * 60 - (20 * 60 - 1))
+        assert any(abs(a - age) <= 61 for a in _ages(text)), f"no data age near {age} s in the PM text: {text!r}"
+    if cause in CAUSE_CLEARS:
+        assert re.search(CAUSE_CLEARS[cause], text.lower()), f"the PM text does not say what clears it: {text!r}"
+
+
+@xf(CAUSE)
+def test_cause_each_refused_entry_decision_row_lists_every_cause_with_its_figure(tmp_path, store, monkeypatch):
+    """[00:20 (b); 22:29 (3)] A drawdown halt at t0+25, the degraded 5-minute candle closing at t0+30, and a signal
+    that wants long from that candle on: one decision row (action "entry_blocked") per refused entry, each naming the
+    drawdown with its figure (25.0% against 20%) and what clears it; the refusal on the degraded candle lists both
+    causes. No venue name."""
+    stale = REASONS["stale_data"]
+    plan = _plan_for(stale, tag="cr")
+    path_new_entry(stale, plan)
+    enter(stale, plan, store)
+    enter(REASONS["drawdown_halt"], plan, store)
+    run(tmp_path, store, plan, monkeypatch)
+    rows = store.decisions(NAME, action=REFUSAL, limit=10_000)
+    assert rows, "no refused entry in the decision log"
+    for r in rows:
+        text = r["reason"]
+        assert re.search(CAUSE_WORDS["drawdown_halt"], text.lower()), f"a refusal does not name the drawdown: {text!r}"
+        for f in FIGURES["drawdown_halt"]:
+            assert re.search(f, text), f"a refusal does not give the figure /{f}/: {text!r}"
+        assert re.search(CAUSE_CLEARS["drawdown_halt"], text.lower()), f"a refusal does not say what clears it: {text!r}"
+        _pm_words(text, "a decision row")
+    assert any(re.search(CAUSE_WORDS["degraded_candle"], r["reason"].lower()) for r in rows), (
+        f"the refusal on the degraded candle does not list both causes: {[r['reason'][:120] for r in rows]}")
+
+
+EPISODES = {
+    # the degraded candle at t0+30 (clears at t0+35), the PM's Stop at t0+32 (stays): one start, no clear
+    "one_of_two_clears": ([GATE_ALERT], None),
+    # the degraded candle alone: one start at t0+30, one clear when the next whole candle closes at t0+35
+    "degraded_candle_alone": ([GATE_ALERT, GATE_CLEARED], 35),
+    # stale data from t0+20 to t0+28 (the age grows every tick): one start, one clear once data resumes
+    "stale_data_alone": ([GATE_ALERT, GATE_CLEARED], 28),
+}
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, marks=[] if c in ('degraded_candle_alone',) else xf(CAUSE))
+                                   for c in list(EPISODES)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+def test_cause_block_events_follow_the_transitions_not_the_causes_or_the_ticks(tmp_path, store, monkeypatch, case):
+    """[00:20 (b); 22:29 (3)] One "entry_blocked" event when a block starts and one "entry_block_cleared" when the last
+    cause clears: not when one of several clears (the degraded candle ends at t0+35 while the PM's Stop from t0+32
+    holds), and nothing again per tick while the figure moves (stale data, its age growing). Counted from the block's
+    start (t0+30; stale data: t0+20): the candle's two missing minutes before it closes may be a stale-data episode of
+    their own, which is not this test's business."""
+    if case == "stale_data_alone":
+        plan = _stale_plan("se")
+        since = M(plan.t0, 20)
+    else:
+        stale = REASONS["stale_data"]
+        plan = _plan_for(stale, tag="ce")
+        enter(stale, plan, store)
+        if case == "one_of_two_clears":
+            enter(REASONS["stopped"], plan, store, at=M(plan.t0, 32))
+        since = M(plan.t0, SIGNAL)
+    run(tmp_path, store, plan, monkeypatch)
+    want, cleared_after = EPISODES[case]
+    got = [(e["kind"], e["ts"]) for e in _events(store, (GATE_ALERT, GATE_CLEARED))
+           if e["ts"] >= since.to_pydatetime()]
+    assert [k for k, _ in got] == want, f"not one event per transition (want {want}): {got}"
+    if cleared_after is not None:
+        assert got[-1][1] >= M(plan.t0, cleared_after).to_pydatetime(), f"cleared before its cause ended: {got}"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# P1-RAL: the book reset (Advisor 7 Oct 00:20 (a), BOOK-RESET-HALTS). These belong to P1-RAL's PR, not to CHOKE: they
+# stay strict xfails (reason "P1-RAL") on the gate until that PR lands. A book reset re-bases every strategy's
+# reference points with the book, so it clears each strategy's own drawdown halt and daily-loss pause: one clear per
+# strategy, journalled "book_reset" with the old reference and level, in the same transaction as the new equity. It
+# does NOT clear a liquidation (the PM acknowledges it) or Retired / Winding down, and starts nothing (Stopped stays
+# stopped until the PM presses Start). Refused unless every strategy is flat with no resting orders.
+# Interface (assumed; adapt the names, never the assertions): Store.book_reset(reason, actor="PM"); each clear is an
+# event of kind "book_reset" on the strategy; a refusal raises an exception carrying `code` (a stable reason code)
+# whose text is the PM's, and changes nothing. The clock is fixed at RAL_NOW (midday), as the repo's tests freeze it
+# (tests/test_records_setup.py: monkeypatch sleeve_fund.store.utcnow), and the reset is passed now= when it takes it:
+# the set-up's marks, three minutes before, cannot cross a 00:00 UTC roll whenever the cells run.
+# ---------------------------------------------------------------------------------------------------------------
+
+RAL = "P1-RAL"
+BOOK_RESET = "book_reset"
+
+
+RAL_NOW = datetime(2025, 10, 3, 12, 0, tzinfo=timezone.utc)  # the book-reset cells' fixed instant (midday UTC)
+
+
+def _book_reset(store, reason="QA: a new book"):
+    import inspect
+
+    fn = getattr(store, "book_reset", None)
+    if not callable(fn):
+        raise AssertionError("not built: Store.book_reset(reason, actor=) (P1-RAL, Advisor 00:20 (a))")
+    try:
+        takes_now = "now" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        takes_now = False
+    return fn(reason, actor="PM", **({"now": RAL_NOW} if takes_now else {}))
+
+
+def _ral_clock(monkeypatch):
+    """Freeze the wall clock at RAL_NOW the way the repo's tests do (monkeypatch sleeve_fund.store.utcnow), in the store
+    and in every loaded sleeve_fund module that imported it by name. Returns the set-up's mark time, 3 minutes before
+    (the same UTC day)."""
+    import sys
+
+    from sleeve_fund import store as store_mod
+
+    real = store_mod.utcnow
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "__name__", "").startswith("sleeve_fund") and getattr(mod, "utcnow", None) is real:
+            monkeypatch.setattr(mod, "utcnow", lambda: RAL_NOW)
+    return RAL_NOW - timedelta(minutes=3)
+
+
+def _clears(store, name):
+    return [e for e in reversed(store.events(name, limit=100_000)) if e["kind"] == BOOK_RESET]
+
+
+def _book_snapshot(store, names) -> dict:
+    """What a refused or failed book reset must leave as it was."""
+    out = {}
+    for n in names:
+        s = store.sleeve(n)
+        out[n] = (s.status, s.status_reason, s.paused_until, s.desired_state,
+                  len(store.equity_series(n, limit=100_000)), len(_clears(store, n)))
+    out["book_start"], out["archived"] = store.book_start(), sorted(store.archived())
+    return out
+
+
+@xf(RAL)
+def test_ral_a_book_reset_clears_each_strategys_drawdown_halt_and_daily_pause_once_journalled_book_reset(store,
+                                                                                                        monkeypatch):
+    """[00:20 (a)] One strategy halted on its drawdown (10,000 to 7,500), another paused on its daily loss (10,000 to
+    9,400), both flat: the book reset clears both, starting nothing (desired state unchanged); exactly one "book_reset"
+    event each, giving the old reference (10,000) and the level (7,500; 9,400); the references are re-based, so a
+    restart on the journal at the same equity stays clear and can open; a second book reset clears nothing again."""
+    t = _ral_clock(monkeypatch)
+    for n, cause in ((NAME, "drawdown_halt"), (OTHER, "daily_pause")):
+        _guarded(store, n, cause, at=t)
+    desired = {n: store.sleeve(n).desired_state for n in (NAME, OTHER)}
+    _book_reset(store)
+    for n, level in ((NAME, 7_500), (OTHER, 9_400)):
+        s = store.sleeve(n)
+        assert s.status not in ("halted", "paused") and s.paused_until is None, (n, s.status, s.status_reason)
+        assert s.desired_state == desired[n], f"{n}: the book reset changed its desired state to {s.desired_state}"
+        clears = _clears(store, n)
+        assert len(clears) == 1, f"{n}: not one book_reset clear: {[c['message'] for c in clears]}"
+        msg = clears[0]["message"]
+        assert re.search(r"10,?000", msg) and re.search(f"{level:,.0f}".replace(",", ",?"), msg), (
+            f"{n}: the clear does not give the old reference (10,000) and the level ({level:,}): {msg!r}")
+        rt = SleeveRuntime(store, n, now=lambda: RAL_NOW + timedelta(minutes=10))
+        rt.on_start(0.0005)
+        rt.tick(equity=float(level), cash=float(level), qty=0.0, price=60_000.0)
+        assert rt.can_open(), f"{n}: not re-based; a restart at the same equity is {store.sleeve(n).status}: " \
+                              f"{store.sleeve(n).status_reason!r}"
+    _book_reset(store, "QA: again")
+    assert [len(_clears(store, n)) for n in (NAME, OTHER)] == [1, 1], "a second book reset cleared again"
+
+
+@xf(RAL)
+@pytest.mark.parametrize("kept", ["liquidated", "retired", "stopped"])
+def test_ral_a_book_reset_keeps_a_liquidation_a_retirement_and_a_stop_and_starts_nothing(store, monkeypatch, kept):
+    """[00:20 (a) "It does NOT clear: a liquidation incident, Retired or Winding down status, or Stopped"] Beside a
+    drawdown-halted strategy the reset clears: a liquidated strategy stays halted as liquidated (no clear; a restart
+    still cannot open); a retired one stays archived and stopped; a drawdown-halted strategy the PM then stopped has
+    its halt cleared (one clear) but stays stopped. Neither of the last two is started: desired state unchanged, and
+    the supervisor's next step starts no process for it."""
+    t = _ral_clock(monkeypatch)
+    _guarded(store, OTHER, "drawdown_halt", at=t)
+    if kept == "liquidated":
+        _liquidated_journal(store, utc(t))
+    else:
+        _guarded(store, NAME, "drawdown_halt", at=t)
+        _stop_as(store, NAME)
+        if kept == "retired":
+            store.archive(NAME)
+    s0 = store.sleeve(NAME)
+    _book_reset(store)
+    assert store.sleeve(OTHER).status != "halted", "setup: the book reset cleared nothing"
+    s = store.sleeve(NAME)
+    assert s.desired_state == s0.desired_state, f"the book reset changed the desired state to {s.desired_state}"
+    if kept == "liquidated":
+        assert (s.status, s.status_reason) == (s0.status, s0.status_reason), ("the liquidation was cleared", s.status,
+                                                                               s.status_reason)
+        assert not _clears(store, NAME), "a book_reset clear was journalled for the liquidated strategy"
+        rt = SleeveRuntime(store, NAME, now=lambda: RAL_NOW + timedelta(minutes=10))
+        rt.on_start(0.0005)
+        assert not rt.can_open(), "a restart of the liquidated strategy can open after the book reset"
+        return
+    if kept == "retired":
+        assert NAME in store.archived(), "the book reset brought the retired strategy back"
+    else:
+        assert s.status != "halted", f"the stopped strategy's own drawdown halt was kept: {s.status_reason!r}"
+        assert len(_clears(store, NAME)) == 1, "not one clear for the stopped strategy's halt"
+    assert s.status != "running", "the book reset set a stopped strategy running"
+    sup = _supervisor(store, monkeypatch)
+    sup.step()
+    assert NAME not in sup.procs or not sup.procs[NAME].alive, "the supervisor started it after the book reset"
+
+
+@xf(RAL)
+@pytest.mark.parametrize("what", ["holding", "resting_order"])
+def test_ral_a_book_reset_is_refused_unless_every_strategy_is_flat_with_no_resting_orders(store, monkeypatch, what):
+    """[00:20 (a) "refused unless every strategy is flat and has no resting orders"; (b) a code and PM text] One
+    strategy halted on its drawdown and another holding 0.01 (or with a resting entry order): the reset is refused,
+    with a stable reason code and PM text naming the strategy, what stands in the way and what clears it (flat /
+    close; cancel), no venue name; and nothing changes (statuses, references, journal, book start)."""
+    t = _ral_clock(monkeypatch)
+    _guarded(store, NAME, "drawdown_halt", at=t)
+    _create_as(store, OTHER)
+    from sleeve_fund.store import OPEN_ORDER_STATUSES
+
+    store.record_order(OTHER, order_id="qa-open", side="BUY", qty=0.01, intent="entry", reason="QA entry", signal={},
+                       order_type="MARKET" if what == "holding" else "STOP_MARKET", ts=t)
+    if what == "holding":
+        store.record_fill(OTHER, side="BUY", qty=0.01, price=60_000.0, fee=0.3, order_id="qa-open", trade_id="qa-open",
+                          ts=t)
+        store.update_order("qa-open", status="filled", fill_qty=0.01, fill_px=60_000.0, fee=0.3)
+        assert store.journal_book(OTHER, 10_000)["qty"] == pytest.approx(0.01), "setup: not holding"
+    else:
+        assert store.orders(OTHER, statuses=OPEN_ORDER_STATUSES, limit=10), "setup: no resting order"
+    before = _book_snapshot(store, (NAME, OTHER))
+    try:
+        _book_reset(store)
+    except AssertionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the refusal, whatever its class
+        refused = exc
+    else:
+        raise AssertionError(f"the book reset went ahead while {OTHER} "
+                             f"{'held a position' if what == 'holding' else 'had a resting order'}")
+    code, text = getattr(refused, "code", None), str(refused)
+    assert isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]*", code), (
+        f"the refusal carries no stable reason code: code={code!r}, {refused!r}")
+    low = text.lower()
+    assert OTHER in text, f"the refusal does not name the strategy in the way: {text!r}"
+    blocker, clears = (r"position|holds|holding", r"flat|close") if what == "holding" else (r"order", r"cancel|flat")
+    assert re.search(blocker, low) and re.search(clears, low), f"the refusal does not say what blocks it and what " \
+                                                                f"clears it: {text!r}"
+    _pm_words(text, "the book reset's refusal")
+    assert _book_snapshot(store, (NAME, OTHER)) == before, "a refused book reset changed something"
+
+
+def _fail_second_book_reset(store):
+    """Inject a failure mid-way: the database refuses the second "book_reset" row written from now on."""
+    from sqlalchemy import text as sql
+
+    with store.engine.begin() as c:
+        marker = int(c.execute(sql("SELECT COALESCE(MAX(id), 0) FROM events")).scalar())
+        if store.engine.dialect.name == "postgresql":
+            c.execute(sql(f"""
+                CREATE OR REPLACE FUNCTION qa_egx_fail_second_book_reset() RETURNS trigger AS $$
+                BEGIN
+                  IF NEW.kind = 'book_reset' AND EXISTS (SELECT 1 FROM events WHERE kind = 'book_reset' AND id > {marker})
+                  THEN RAISE EXCEPTION 'QA injected failure on the second book_reset row';
+                  END IF;
+                  RETURN NEW;
+                END $$ LANGUAGE plpgsql"""))
+            c.execute(sql("CREATE TRIGGER qa_egx_fail BEFORE INSERT ON events FOR EACH ROW "
+                          "EXECUTE FUNCTION qa_egx_fail_second_book_reset()"))
+        else:
+            c.execute(sql(f"CREATE TRIGGER qa_egx_fail BEFORE INSERT ON events WHEN NEW.kind = 'book_reset' AND EXISTS "
+                          f"(SELECT 1 FROM events WHERE kind = 'book_reset' AND id > {marker}) "
+                          "BEGIN SELECT RAISE(ABORT, 'QA injected failure on the second book_reset row'); END"))
+
+
+@xf(RAL)
+def test_ral_a_book_reset_is_one_transaction(store, monkeypatch):
+    """[00:20 (a) "the clears are written in the same transaction as the new equity"] Two strategies to clear (a
+    drawdown halt, a daily pause); the database refuses the second "book_reset" row: the reset fails and leaves
+    nothing changed (both still halted / paused, no clear, no new equity, the book start as it was)."""
+    t = _ral_clock(monkeypatch)
+    _guarded(store, NAME, "drawdown_halt", at=t)
+    _guarded(store, OTHER, "daily_pause", at=t)
+    before = _book_snapshot(store, (NAME, OTHER))
+    if not callable(getattr(store, "book_reset", None)):
+        _book_reset(store)  # not built
+    _fail_second_book_reset(store)
+    try:
+        _book_reset(store)
+    except AssertionError:
+        raise
+    except Exception:  # noqa: BLE001 - the injected failure, however it surfaces
+        pass
+    else:
+        raise AssertionError("setup: the second strategy's book_reset row was written without the injected failure "
+                             "(are the clears journalled as 'book_reset' events?)")
+    assert _book_snapshot(store, (NAME, OTHER)) == before, "a book reset that failed mid-way left part of it done"
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # CHOKE-2 (deferred, agreed with the HoE): backtest/study mode, the demo mirror, P2-1 resizes and the rebalance.
 # Must close before any G1 is judged and before the demo mirror runs for any strategy (README). Run the gate set
 # alone with -k "not choke2".
@@ -1691,7 +2274,7 @@ def _backtest_cell(monkeypatch, reason_name, path_name):
 CHOKE2_BACKTEST = [(r, p) for r in ("drawdown_halt", "daily_pause", "liquidation_gap")
                    for p in ("new_entry", "resting_entry_fill")]
 XFAIL_CHOKE2: dict = {
-    # PE2 (stop-safety 8fd2c57): ("rebalance", "stopped") passes (mark removed)
+    # PE2 (stop-safety, master 3e66ce8f): ("rebalance", "stopped") passes (mark removed)
     ("mirror", "drawdown_halt"): xf(CHOKE2),  # the catch-up buys a failed copy whatever the state now
     ("mirror", "stopped"): xf(CHOKE2),
 }
