@@ -210,7 +210,7 @@ def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
     for url, got in _tiles(c).items():
         assert got[1] == "220.00" and "warn" not in got[0], (url, got)
     # The headroom against 5% of the book: the book here is the two strategies' 20,000.
-    for url in ("/", "/risk", "/trades"):
+    for url in ("/", "/risk", "/trades"):  # on the Portfolio, in the KPI's hover
         assert "780.00 headroom to the 5% limit · 1.1% of book" in c.get(url, auth=AUTH).text, url
     for url in ("/risk", "/trades"):
         assert re.search(r'<div class="s">spot, outside the limit: [\d,.]+ to stop</div>', c.get(url, auth=AUTH).text), url
@@ -220,5 +220,6 @@ def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
 def test_a_book_over_the_limit_reads_red(client):
     c, store = client
     _hold(store, "big", 1.0)  # no stop: 6,000 counted against 5% of a 10,000 book
-    for url in ("/", "/risk", "/trades"):
+    for url in ("/risk", "/trades"):
         assert '<span class="loss">over the 5% limit by 5,500.00</span> · 60.0% of book' in c.get(url, auth=AUTH).text, url
+    assert "over the 5% limit by 5,500.00 · 60.0% of book" in c.get("/", auth=AUTH).text  # the KPI's hover
