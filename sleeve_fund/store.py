@@ -1323,9 +1323,22 @@ class Store:
             rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
                                                     restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
             # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
-            if s.status in ("paused", "halted"):
-                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
-                                                       paused_until=s.paused_until))
+            hold = ({"status": s.status, "status_reason": s.status_reason or "", "paused_until": s.paused_until}
+                    if s.status in ("paused", "halted") else None)
+            if s.status != "halted":  # never downgrade a halt, as the paper process doesn't
+                # P1-KR-2: a PM pause or flatten (the kill switch) pressed just before the reset, which the paper
+                # process has not applied yet, is kept as the pause it would have set (paper.runtime): the reset
+                # puts its pending commands away with the old run. The system's own flattens (a clean slate's) aren't.
+                system = {r for (r,) in c.execute(select(decisions_t.c.reason).where(
+                    decisions_t.c.sleeve == sleeve, decisions_t.c.actor == "system"))}
+                asked = [r for r in c.execute(select(commands_t.c.command, commands_t.c.reason).where(
+                    commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                    commands_t.c.command.in_(("pause", "flatten"))).order_by(commands_t.c.id)) if r.reason not in system]
+                if asked:
+                    words = "flattened by PM" if asked[-1].command == "flatten" else "paused by PM"
+                    hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
+            if hold:
+                c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
@@ -1367,6 +1380,11 @@ class Store:
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
                  insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
+            # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
+            # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
+            locked = c.execute(select(resets_t.c.restart).where(resets_t.c.id == request["id"]).with_for_update()).first()
+            if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
+                request["restart"] = locked.restart
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
@@ -1742,7 +1760,9 @@ class Store:
 
     # --- PM commands and decisions ----------------------------------------------
 
-    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:
+    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True) -> None:
+        """holds_through_reset: a pause or flatten asked for while a reset is under way is kept on the fresh run, as
+        one in force before the reset is (m13-U5); the reset's own flatten passes False."""
         if command not in COMMANDS:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
@@ -1753,7 +1773,36 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
+            if holds_through_reset and command in ("pause", "flatten"):
+                self._hold_on_reset(c, sleeve, command, reason)
         self.decide(actor, command, reason, sleeve)
+
+    def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
+        """A PM control on a strategy whose reset is under way, kept on the fresh run without a command for its
+        process (Advisor, 7 Oct, P1-KR-1/3): a Pause or Flatten (the kill switch) whose sale the reset's own flatten
+        already makes becomes the reset's hold; a Stop keeps the fresh run stopped. False when no reset is open."""
+        with self.engine.begin() as c:
+            return self._hold_on_reset(c, sleeve, command, reason)
+
+    def _hold_on_reset(self, c, sleeve: str, command: str, reason: str) -> bool:
+        # Locked as split_run locks it, so a press while the reset completes waits for it: it then finds the reset
+        # done and acts on the fresh run as on any other, never on a run already put away.
+        req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))
+                        .with_for_update()).first()
+        if req is None:
+            return False
+        if command == "stop":
+            c.execute(update(resets_t).where(resets_t.c.id == req.id).values(restart=0))
+            return True
+        held = c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
+        if held != "halted":  # never downgrade a halt, as the paper process doesn't
+            # The reset drops pending commands and starts the run afresh, so record the pause the paper process
+            # would have set (paper.runtime) as the hold split_run carries over.
+            words = "flattened by PM" if command == "flatten" else "paused by PM"
+            c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
+            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
+                                                   status_reason=f"{words}: {reason.strip()}", paused_until=None))
+        return True
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:
         """Set one parameter a strategy has never had, without a restart (True if set). A key it already has,

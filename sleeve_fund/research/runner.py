@@ -6,10 +6,12 @@ so the benchmark and the strategy are measured identically.
 
 from __future__ import annotations
 
+import importlib
 import math
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import LoggerConfig, LogLevel
@@ -45,6 +47,9 @@ class BacktestResult:
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
+    # Entries filled on a decision candle in which an exit, stop or target of the position also filled (Advisor
+    # 22:30): a stop or target inside the candle may re-enter at its close, and this says how often.
+    reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
     # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
@@ -59,6 +64,9 @@ class BacktestResult:
     funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
+    # Filled orders decided before the model's indicators had settled (its warmup_needed), each flagged
+    # "unsettled" in its decision; kept as the model trades them (Independent Quant Advisor, 6 Oct, 5.1).
+    unsettled_fills: int = 0
     # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
     # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
     open_risk_binds: int = 0
@@ -126,6 +134,7 @@ def run_backtest(
     half_spread: float | None = None,
     progress=None,
     fees: FeeSchedule | None = None,
+    warmup_prices: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -147,7 +156,10 @@ def run_backtest(
     progress: with a risk profile, called with the simulated time at every bar, to report how far a
     long run has got.
 
-    fees: charge this schedule instead of the market's or the instrument's (the cost ladder)."""
+    fees: charge this schedule instead of the market's or the instrument's (the cost ladder).
+
+    warmup_prices: bars of `bar_minutes` before `prices`, fed to the strategy first without trading, as a paper
+    strategy's warm-up from the history store is, so the window opens on settled indicators."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -227,6 +239,15 @@ def run_backtest(
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
+        # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
+        spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
+        strategy.settle_bars_needed = strategy_cls.warmup_needed(
+            {**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
+        if warmup_prices is not None and not warmup_prices.empty:
+            if warmup_prices.index[-1] >= prices.index[0]:
+                raise ValueError("warmup_prices must end before the backtest's first bar")
+            strategy.preload = list(to_bars(_book_volume(warmup_prices, instrument), instrument,
+                                            bar_type_for(instrument, bar_minutes)))
         engine.add_strategy(strategy)
         if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
             built = decision_bars(exec_prices, bar_minutes, exec_minutes)
@@ -252,6 +273,7 @@ def run_backtest(
         engine.end()
 
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
+        fills = _liquidations_booked(fills, strategy.liquidation_books)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
@@ -281,7 +303,10 @@ def run_backtest(
                        funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
+            unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
+                                if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
+            reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, bar_minutes),
             open_risk_binds=strategy.open_risk_binds,
             open_risk_max=strategy.open_risk_max,
             paper_refusal=paper_refusal(strategy_name, params, risk_profile),
@@ -292,6 +317,19 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def reentries_on_exit_candle(fills: pd.DataFrame | None, decisions: dict, bar_minutes: int) -> int:
+    """Entries filled on a decision candle, (close - bar, close], in which a non-entry order also filled."""
+    if fills is None or fills.empty:
+        return 0
+    entry = np.array([decisions.get(o, {}).get("intent") == "entry" for o in fills.index], dtype=bool)
+    ts = pd.DatetimeIndex(fills["ts_last"]).as_unit("ns").asi8
+    exits = np.sort(ts[~entry])
+    at = ts[entry]
+    # an exit in (entry - bar, entry]: the count of exits at or before the entry beats those at or before its open
+    return int(np.sum(np.searchsorted(exits, at, side="right") > np.searchsorted(exits, at - bar_minutes * 60_000_000_000,
+                                                                                 side="right")))
 
 
 def decision_bars(exec_prices: pd.DataFrame, bar_minutes: int, exec_minutes: int) -> pd.DataFrame:
@@ -450,6 +488,23 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
         moved = float(first) - fee  # the spread, and whatever rounding left in the charge
         fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
         fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
+    return fills
+
+
+def _liquidations_booked(fills: pd.DataFrame, books: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """GAP-LIQ-CAP: each liquidation order as the strategy booked it (LongFlatStrategy._book_liquidation), at the
+    bankruptcy price with the fee on the liquidation (trigger) price, in place of the venue's fill at the market's
+    price: the same loss of exactly X as its journal, and none of the market's gap in any price, fee or trip."""
+    if fills is None or fills.empty or not books:
+        return fills
+    fills = fills.copy()
+    for coid, (px, fee) in books.items():
+        if coid not in fills.index:
+            continue
+        entry = fills.at[coid, "commissions"]
+        moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
+        fills.at[coid, "avg_px"] = str(px)
+        fills.at[coid, "commissions"] = [f"{fee:.2f} {moneys[0].split()[1]}", *moneys[1:]]
     return fills
 
 

@@ -194,6 +194,9 @@ class ScheduleFeeModel(FeeModel):
         # Paper on a perp: the order that puts a position carried over a restart back at the simulated
         # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
         self.free_orders: set[str] = set()
+        # Backtests only: extra slippage on an order, as a share of its price, by client order id (a rule-builder
+        # entry on a breakout candle, LongFlatStrategy._submit). Charged and reported as the half spread is.
+        self.slippage: dict[str, Decimal] = {}
         # Backtests: a target the strategy judged on a bar the venue had matched, adverse side first (Advisor NA-2,
         # LongFlatStrategy._bar_target), sent at market and booked at its level less the taker's slippage
         # (target_fill_px, Advisor L12), with that price and side.
@@ -254,11 +257,12 @@ class ScheduleFeeModel(FeeModel):
             notional = qty * level
         charge = notional * self.rate_for(order)
         coid = str(order.client_order_id)
-        if booked is not None or (self.half_spread and not getattr(order, "is_post_only", False)):
+        paid = self.half_spread + self.slippage.get(coid, 0)
+        if booked is not None or (paid and not getattr(order, "is_post_only", False)):
             self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
-        if booked is None and self.half_spread and not getattr(order, "is_post_only", False):
+        if booked is None and paid and not getattr(order, "is_post_only", False):
             # A booked target's price already carries its slippage (target_fill_px), half the spread included.
-            spread = notional * self.half_spread
+            spread = notional * paid
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
             charge += spread
         return self._charge(charge + shift, instrument.quote_currency)

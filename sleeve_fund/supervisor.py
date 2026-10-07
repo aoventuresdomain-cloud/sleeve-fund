@@ -236,7 +236,7 @@ class Supervisor:
                 why = f"Reset strategy: {req['reason']}"
                 if not any(c["command"] == "flatten" for c in pending) and _flatten_again(self.store, name, why,
                                                                                          req["created_at"], qty):
-                    self.store.command(name, "flatten", why, actor=req["actor"])
+                    self.store.command(name, "flatten", why, actor=req["actor"], holds_through_reset=False)
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue
@@ -456,7 +456,7 @@ def clear(store: Store, path: str) -> list[str]:
                 why = f"{reason}: flattened so it can be archived"
                 if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
                         and _flatten_again(store, s.name, why, store.book_start(), qty)):
-                    store.command(s.name, "flatten", why, actor="system")
+                    store.command(s.name, "flatten", why, actor="system", holds_through_reset=False)
                 if s.desired_state != "running":
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)
