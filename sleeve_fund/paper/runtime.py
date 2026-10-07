@@ -873,11 +873,9 @@ class SleeveRuntime:
     def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str,
                 ts: datetime | None = None) -> None:
         """ts: when it filled, when that isn't now (a backtest's fill on a gap, at the bar's open)."""
-        ts = ts or self.now()
-        self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
-                               trade_id=trade_id, ts=ts)
-        self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
-        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
+        # One call, so a fill replayed after a reconnect or restart is booked once and moves its order once (DA-2).
+        self.store.book_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
+                             trade_id=trade_id, ts=ts or self.now())
 
     def on_timing(self, order_id: str, **stamps: int | None) -> None:
         """Paper and live (v2 P1-2): when the order's bar closed and arrived, the decision, the send, the venue's
