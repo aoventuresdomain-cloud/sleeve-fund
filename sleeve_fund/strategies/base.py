@@ -2059,8 +2059,11 @@ class LongFlatStrategy(Strategy):
         if self._trade_ns is not None and end - self._trade_ns > UNSEEN_GAP_NS:
             spans.append((self._trade_ns, end))
         self._unseen = [(a, b) for a, b in self._unseen if b > end]
-        if self._awaiting is not None and end >= self._awaiting[0]:
-            self._awaiting = None  # its minutes are all here now
+        if self._awaiting is not None and end >= self._awaiting[0] - UNSEEN_GAP_NS:
+            # Its minutes are all here now, bar a stretch after the bar shorter than UNSEEN_GAP_NS: ordinary trade
+            # spacing, not time unseen. A sparse trade landing just before each minute's bar would otherwise re-arm
+            # the wait for ever (QA FD-F8).
+            self._awaiting = None
         if not any(b > start and a < end for a, b in spans) or self._busy() or not self._replay_watches():
             return False
         return self._replay_missed(self._unseen_minutes(bar, start, end) or [bar],
