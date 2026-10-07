@@ -37,7 +37,9 @@ def signal_items(signal: dict | None) -> list[tuple[str, str]]:
     """The values behind a decision as (label, text) pairs for display."""
     out = []
     for k, v in (signal or {}).items():
-        if v is None or k == "stop_cfg":  # the stop settings, kept to tell whether a later edit changed the stop
+        # the stop settings, kept to tell whether a later edit changed the stop; the decision's bar, an audit record
+        # (P1-1-CANON) whose close is shown as "Bar close"
+        if v is None or k in ("stop_cfg", "bar"):
             continue
         if k.startswith(("sma_", "ema_")):
             label, text = f"{k[:3].upper()} {k[4:]}", _px(v)
@@ -463,7 +465,7 @@ def audit_rows(sleeve, fills: list[dict], orders: dict[str, dict], venue: str) -
             avg = (avg * abs(qty) + px * abs(signed)) / (abs(qty) + abs(signed))
             qty += signed
         order = orders.get(f.get("order_id") or "") or {}
-        signal = {k: v for k, v in (order.get("signal") or {}).items() if k != "stop_cfg"}
+        signal = {k: v for k, v in (order.get("signal") or {}).items() if k not in ("stop_cfg", "bar")}
         for k in signal:
             if k not in keys:
                 keys.append(k)

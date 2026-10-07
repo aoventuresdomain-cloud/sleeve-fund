@@ -707,6 +707,9 @@ class LongFlatStrategy(Strategy):
         self.decisions: dict[str, dict] = {}
         # Paper (v2 P1-2): the decision bar's close and arrival (ns) while on_bar decides, for each order's timing.
         self._deciding: tuple[int, int] | None = None
+        # P1-1-CANON (Advisor): the bar a decision used, as it was then, journalled with each order's signal. The
+        # store may later replace a hub bar with the venue's candle; this record is never overwritten.
+        self._deciding_bar: dict | None = None
         self._late: Bar | None = None  # paper, m13-E3: a bar that closed while the strategy was down (late_bar)
         self._lag: int | None = None  # ns: this decision came more than LATE_DECISION_NS after its bar's close
         self._late_skips: list[int] = []  # the closes of the late bars an opening was skipped on, this run
@@ -2039,11 +2042,11 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
-        self._deciding = None
+        self._deciding = self._deciding_bar = None
         try:
             self._on_bar(bar)
         finally:
-            self._deciding = self._lag = None
+            self._deciding = self._deciding_bar = self._lag = None
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
 
@@ -2455,6 +2458,12 @@ class LongFlatStrategy(Strategy):
                     "The next whole candle clears it")
                 self._cancel_resting_entries()
         self._deciding = (int(bar.ts_event), int(bar.ts_init))
+        self._deciding_bar = {
+            "close_ts": _utc(int(bar.ts_event)).isoformat(),
+            "o": bar.open.as_double(), "h": bar.high.as_double(), "l": bar.low.as_double(),
+            "c": bar.close.as_double(), "v": bar.volume.as_double(),
+            # where its minutes came from: the history store (backtest), the hub's live build, or the venue feed
+            "src": "store" if self._backtest else "hub" if self.hub_fed else "feed"}
         lag = 0 if self._backtest or self.runtime is None else self._now_ns() - bar.ts_event
         self._lag = lag if lag > LATE_DECISION_NS else None
         if self._lag is None and self._late_skips:
@@ -2868,6 +2877,8 @@ class LongFlatStrategy(Strategy):
             signal, self._outage_book = {**signal, **self._outage_book}, None  # a replayed exit's booking
         signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
         signal.setdefault("price", last)
+        if self._deciding_bar is not None:
+            signal.setdefault("bar", self._deciding_bar)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
         # On a perp every exit is reduce-only: whatever the strategy's own book says, the venue never lets an
         # exit open the other side (review round 11, B11-3).
