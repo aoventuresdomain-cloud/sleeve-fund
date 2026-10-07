@@ -14,7 +14,8 @@ Rulings (every trading-behaviour expectation cites a tag; advisor-rulings.md lin
   across venues and contract types.
 - [R-RISK] Open risk: existing positions from the MARK (+ exit fee + stop slippage), floored at 0 per position; proposed
   = qty x (expected fill - stop) + both fees + slippage; a definition with a stop counts its planned stop; stopless (no
-  stop rule) = notional x max(10%, 3 x ATR) (15:30 rule). The 40% share is OUT of v1.
+  stop rule) = notional x max(10%, 3 x ATR) (15:30 rule); a stop the mark has gone through counts
+  as stopless, never 0 (Advisor P1-S9/S2, HoE 7 Oct). The 40% share is OUT of v1.
 - [R-HALT] The 15% halt flattens ALL (exit path, never gated), PM-only clear; Resume re-bases the halt reference to the
   book at resume (true HWM kept in the record). The 3% pause blocks entries, keeps positions and stops, auto-clears at
   00:00 UTC; each clears only by its own condition.
@@ -242,11 +243,17 @@ def test_open_risk_binds_and_trims():
     assert (d.outcome, d.approved_qty, d.limit_hit) == ("trimmed", D("20"), "open_risk")
 
 
-@xf("a stop already through the mark is floored at 0 risk, never a negative credit that buys headroom [R-RISK]")
-def test_an_existing_stop_through_the_mark_is_floored_at_zero_not_negative():
-    gapped = pos("s9", "DDD/USDT", 1, 3_000, stop_price=105.0)  # a long's stop ABOVE its mark: raw risk -150
+@pytest.mark.parametrize("atr,want", [
+    pytest.param(0.0, D("10"), id="gapped-1000-counts-10pct-floor-100"),
+    pytest.param(0.05, D("5"), id="gapped-1000-counts-3-atr-15pct-150"),
+])
+def test_an_existing_stop_the_mark_has_gone_through_counts_as_stopless(atr, want):
+    # HoE-OK'd correction 7 Oct: this cell used to pin 0 risk. A long of 1,000 with its stop ABOVE the mark (raw -50):
+    # stopless = 1,000 x max(10%, 3 x ATR). Held 300 + 100 (or 150) -> 100 (or 50) of headroom at 10 a unit.
+    # 0 risk would give 20; a negative credit 25.
+    gapped = pos("s9", "DDD/USDT", 1, 1_000, stop_price=105.0, atr=atr)
     _, d = decide(_risk_book([gapped]), intent("s3", "CCC/USDT", 1, 4_000, stop_frac=0.10))
-    assert (d.approved_qty, d.limit_hit) == (D("20"), "open_risk")  # 300 held, NOT 150: still 20, not 35
+    assert (d.outcome, d.approved_qty, d.limit_hit) == ("trimmed", want, "open_risk")
 
 
 def test_existing_open_risk_is_from_the_mark():
