@@ -3880,7 +3880,7 @@ class LongFlatStrategy(Strategy):
         # Advisor 7 Oct 05:01: each raced fill is on record with how long after the block it filled, for fills-vs-model.
         ms = max(0, round((rt.now() - rt.block_began(why)).total_seconds() * 1000))
         rt.store.event(rt.name, "info", RACED_FILL, f"Raced fill: {qty:g} at {px:,.6g}, {ms} ms after nothing could "
-                       f"open any more ({', '.join(block_codes(why))}).", ts=rt.now())
+                       f"open any more ({', '.join(block_codes(why)) or why}).", ts=rt.now())
 
     def _adds(self, side) -> bool:
         """Whether an order on `side` would make the position bigger: on a perp, a buy when flat or long and a sell

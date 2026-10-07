@@ -99,7 +99,7 @@ def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(pric
 def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_incident():
     """An entry sent before the gate closed and filled after it: kept (never flattened), one incident per order."""
     j = MemoryJournal()
-    rt = SimpleNamespace(store=j, name="s", now=lambda: NOW,
+    rt = SimpleNamespace(store=j, name="s", now=lambda: NOW, block_began=lambda why: NOW - timedelta(milliseconds=40),
                          entry_blocked=lambda: (True, "it is halted, and only a resume clears that"))
     me = SimpleNamespace(runtime=rt, _gated_fills=set(), _slices={"s1": "k1", "s2": "k1"},
                          decisions={"e1": {"intent": "entry"}, "x1": {"intent": "exit"}, "s1": {"intent": "entry"},
@@ -109,6 +109,10 @@ def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_inciden
     inc, kept = [e for e in j.events_ if e["kind"] == "incident"]  # one for the entry, one for the kept order
     assert inc["level"] == "error" and "filled while nothing may open: 0.1 at 60,000. it is halted" in inc["message"]
     assert "kept with its stop, not closed" in inc["message"]
+    # Advisor 7 Oct 05:01: each raced order is on record with the ms after the block began, for fills-vs-model
+    raced = [e["message"] for e in j.events_ if e["kind"] == "raced_fill"]
+    assert raced == ["Raced fill: 0.1 at 60,000, 40 ms after nothing could open any more (it is halted, and only a "
+                     "resume clears that)."] * 2, raced
 
 
 @pytest.fixture
