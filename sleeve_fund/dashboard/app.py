@@ -701,7 +701,6 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
                     # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                    st().apply_waiting_ral(name)  # QA RAL-F2: a waiting reset after liquidation can't lapse
                     st().hold_on_reset(name, command, reason)  # P1-KR-3: a reset under way leaves it stopped
                 st().decide(actor, command, reason, name, ts=accepted)
                 if command == "stop":  # after the Stop is held and logged, whatever this does (QA D-1)
