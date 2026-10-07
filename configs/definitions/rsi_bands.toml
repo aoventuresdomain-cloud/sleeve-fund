@@ -1,0 +1,17 @@
+# RSI bands, rebuilt as a definition (v2 P1-5): the hand-coded rsi_bands model with its default settings.
+version = 1
+name = "rsi-bands"
+reason = """A test strategy, ported to prove the rule builder: after a stretch down RSI(14) at or below 30 tends to
+recover towards 55, and after a stretch up RSI at or above 70 tends to fall back towards 50."""
+
+[blocks.rsi]
+kind = "rsi"
+period = 14
+
+[long]
+entry = { left = "rsi", op = "<=", right = 30.0 }
+exit = { left = "rsi", op = ">=", right = 55.0 }
+
+[short]
+entry = { left = "rsi", op = ">=", right = 70.0 }
+exit = { left = "rsi", op = "<=", right = 50.0 }

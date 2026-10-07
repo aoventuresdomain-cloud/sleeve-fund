@@ -69,6 +69,9 @@ class IdeaSpec:
     known_weaknesses: str = ""
     # One sentence with {param} placeholders, filled from a sleeve's own settings for display.
     summary: str = ""
+    # False keeps a model off the dashboard's pickers and the Development tab: the rule builder needs a
+    # definition, and until the form can pick one a bare entry would only start a strategy that refuses to run.
+    listed: bool = True
 
 
 _OPS = {"<=": lambda v, t: v <= t, ">=": lambda v, t: v >= t, "<": lambda v, t: v < t, ">": lambda v, t: v > t}
@@ -495,6 +498,8 @@ class LongFlatStrategy(Strategy):
     """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
     want_long() for all-or-nothing, or target_weight() for anything in between."""
 
+    REENTER_AFTER_EXIT_LEG = False  # True: a stop or target ends the model's leg, not locks its side (_lock_exit_leg)
+
     def __init__(self, config: LongFlatConfig) -> None:
         super().__init__(config)
         self._cfg = config
@@ -572,6 +577,7 @@ class LongFlatStrategy(Strategy):
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
+        self._resume_entry_ns: int | None = None  # set by _plan_resume
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
@@ -701,6 +707,12 @@ class LongFlatStrategy(Strategy):
         self._signals_bar = -1
         self._signals_on = True
         self._signals_warned = False
+        # Backtest (set by the runner): decision bars fed before the window, without trading, as paper's history
+        # warm-up is; and the warm-up the model says its indicators need to settle (warmup_needed), so a decision
+        # taken on fewer bars is flagged "unsettled" (Independent Quant Advisor, 6 Oct, 5.1).
+        self.preload: list | None = None
+        self.settle_bars_needed: int | None = None
+        self._decision_bars = 0
         for name in REPORTED_HANDLERS:
             setattr(self, name, self._reporting(name, getattr(self, name)))
 
@@ -909,6 +921,9 @@ class LongFlatStrategy(Strategy):
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
         self._plan_resume()
+        if self.preload:
+            preload, self.preload = self.preload, None
+            self.on_historical_bars(preload)
         if self._slower and self.history_loader is not None:
             self._warm_slower()  # before the decision bars, which then complete the slower candle forming now
         if self._cfg.warmup_bars:
@@ -1039,7 +1054,8 @@ class LongFlatStrategy(Strategy):
     def slower(self, minutes: int, *blocks) -> SlowerCandles:
         """Slower candles of this instrument for the model to read, e.g. self.slower(240, Sma(50)) for a 4-hour
         trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
-        decision on the bar that closed it. Warm-up loads them from the history store at their own size."""
+        decision on the bar that closed it. Warm-up loads them from the history store at their own size. Call it in
+        __init__ (as rsi_cross does): missing minutes are only counted once a slower candle exists (mark_missing)."""
         from sleeve_fund.venues import VENUES
 
         profile = VENUES.get(self._cfg.instrument_id.venue.value)
@@ -1054,6 +1070,7 @@ class LongFlatStrategy(Strategy):
         if bar.ts_event <= self._last_bar_ts:
             return False
         self._last_bar_ts = bar.ts_event
+        self._decision_bars += 1
         self._volumes.append(bar.volume.as_double() / self._cfg.volume_scale)
         if self._atr is not None:
             self._atr.update_raw(bar.high.as_double(), bar.low.as_double(), bar.close.as_double())
@@ -1524,6 +1541,7 @@ class LongFlatStrategy(Strategy):
         """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first
         exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
         self._resume = None
+        self._resume_entry_ns = None  # the close of the candle the journal's last entry was decided on
         if (self.runtime is None or self.runtime.backtest
                 or type(self).resume_leg is LongFlatStrategy.resume_leg):
             return
@@ -1546,7 +1564,8 @@ class LongFlatStrategy(Strategy):
             self._resume = held
             return
         # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
-        self._resume = {"side": side, "bar": _ns(entry["ts"]) // step * step,
+        self._resume_entry_ns = _ns(entry["ts"]) // step * step
+        self._resume = {"side": side, "bar": self._resume_entry_ns,
                         "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
 
     def _replay(self, bar: Bar) -> None:
@@ -1573,6 +1592,18 @@ class LongFlatStrategy(Strategy):
             if min(max(float(raw), 0.0), 1.0, self._cap_pct()) == 0:
                 self._exit_lock = False
         r["on"] = True
+
+    def _lock_exit_leg(self, lock) -> None:
+        """A stop or target closed the position inside a candle: the side it closed waits for its signal to move
+        off it (_exit_lock), unless the model ends its leg there instead (exit_leg_closed), as the rule builder
+        does: it may then enter again at the candle's close (Advisor 22:30), and a backtest counts that."""
+        if self.REENTER_AFTER_EXIT_LEG:
+            self.exit_leg_closed()
+        else:
+            self._exit_lock = lock
+
+    def exit_leg_closed(self) -> None:
+        """For a model with REENTER_AFTER_EXIT_LEG: its stop or target closed the position."""
 
     def _lock_resumed(self, r: dict) -> None:
         self._exit_lock = r["side"] if self._margin else True
@@ -2300,7 +2331,7 @@ class LongFlatStrategy(Strategy):
             self._replayed_close = self._funding_skip[0]
         try:
             if intent in EXIT_LEGS:
-                self._exit_lock = side if self._margin else True
+                self._lock_exit_leg(side if self._margin else True)
                 self._entry_px = None  # don't fire again while the order is in flight
                 self._exit_at_market(intent, reason, {"entry_px": entry, intent: self._stop_frac
                                                       if intent == "stop_loss" else self._tp_frac}, px)
@@ -2535,7 +2566,7 @@ class LongFlatStrategy(Strategy):
                   f"target less the taker's {float(taker_slippage(spread)):.2%} slippage (a bar that also reached "
                   "the stop takes the stop first)")
         values = {"entry_px": self._entry_px, "take_profit": tp, "target_px": level}
-        self._exit_lock = side if self._margin else True
+        self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None
         self._outage_book = {"book_px": book}
         try:
@@ -2617,7 +2648,7 @@ class LongFlatStrategy(Strategy):
                 values["liquidation_px"] = round(liq, 8)  # GAP-LIQ: judged on its fill (_gap_liquidation)
         if hit == "take_profit":  # the level beside the real fill, for fills-against-model (Advisor L12)
             values["target_px"] = round(self._entry_px * (1 + side * tp), 8)
-        self._exit_lock = side if self._margin else True
+        self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None  # don't fire again while the sell is in flight
         self._exit_at_market(hit, reason, values, price)
         return True
@@ -2753,6 +2784,12 @@ class LongFlatStrategy(Strategy):
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
+        if self._unsettled():
+            # Decided before the model's indicators could have settled: kept as the model trades it, and flagged.
+            self.decisions[coid]["unsettled"] = signal["unsettled"] = True
+        if intent == "entry" and signal.get("breakout_slippage_bp") and self._backtest and self.fee_model is not None:
+            # A backtest's fills are at the candle's price; a breakout entry pays this much more (P1-5, board 9b B3).
+            self.fee_model.slippage[coid] = Decimal(str(signal["breakout_slippage_bp"])) / 10_000
         if self._backtest and "book_px" in signal and self.fee_model is not None:
             self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
         bar_close, bar_recv = self._deciding or (None, None)
@@ -2779,6 +2816,11 @@ class LongFlatStrategy(Strategy):
                                       callback=self._maker_timeout)
         self._last_submitted = coid
         return True
+
+    def _unsettled(self) -> bool:
+        """Whether a decision now comes before the warm-up the model's indicators need (settle_bars_needed): today's
+        hand-coded models trade once an indicator is `initialized`, which can be before it has settled."""
+        return self.settle_bars_needed is not None and self._decision_bars < self.settle_bars_needed
 
     def _maker_price(self, side, last: float, tick: float) -> float:
         """Where a post-only order rests: at the best bid (to buy) or ask (to sell), so it adds liquidity
@@ -4200,7 +4242,7 @@ class LongFlatStrategy(Strategy):
         self.log.info(reason)
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "stop_rejected", reason, ts=self.runtime.now())
-        self._exit_lock = self._pos_side() if self._margin else True
+        self._lock_exit_leg(self._pos_side() if self._margin else True)
         self._sell_all("stop_loss", reason, {**signal, "price": price})
 
     def _drop_kept(self, earn: bool = False) -> None:
@@ -4356,7 +4398,7 @@ class LongFlatStrategy(Strategy):
                 self._rest_risk_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 # As in paper: no re-entry until the signal has moved off the side that was closed.
-                self._exit_lock = -sign if self._margin else True
+                self._lock_exit_leg(-sign if self._margin else True)
                 # Paper's stop sells the whole position and cancels an entry still working (_sell_all); so does
                 # this. A slice that filled after the stop last grew is sold at market with what is left.
                 intent = self.decisions[str(event.client_order_id)]["intent"]
@@ -4452,7 +4494,8 @@ class LongFlatStrategy(Strategy):
         the target is booked as the target (ScheduleFeeModel.open_targets, _rebook_as_target)."""
         cfg = self._cfg
         plan = {"stop_loss": self._stop_frac}
-        if not any(plan.values()) or self._entry_px is None:
+        # A stop moved from the market can sit at the entry price (0) or past it, in profit (below 0).
+        if plan["stop_loss"] is None or self._entry_px is None:
             return
         if self.runtime is not None and self.runtime.status != "running" and not (
                 self._exits_only and self.runtime.status == "paused"):
@@ -4478,15 +4521,15 @@ class LongFlatStrategy(Strategy):
         exit_side, exit_word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
         orders = []
         now = self.clock.timestamp_ns()
-        if plan["stop_loss"]:
+        if plan["stop_loss"] is not None:
             stop = plan["stop_loss"]
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
                 exit_side, quantity, Price(level, self.instrument.price_precision), TriggerType.DEFAULT,
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
-                f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
-                f"{self._entry_px:,.6g} entry"
+                f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
+                f"the {self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through",
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8),
@@ -4554,7 +4597,7 @@ class LongFlatStrategy(Strategy):
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         for intent, order in resting.items():
             frac = plan.get(intent)
-            if not frac:
+            if frac is None or (intent == "take_profit" and not frac):
                 continue
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 self._resize_due = True  # in flight or mid-resize: resized again once the venue answers

@@ -6,6 +6,7 @@ from sleeve_fund.strategies.ping_pong import PingPong, PingPongConfig
 from sleeve_fund.strategies.rsi_bands import RsiBands, RsiBandsConfig
 from sleeve_fund.strategies.rsi_cross import RsiCross, RsiCrossConfig
 from sleeve_fund.strategies.rsi_pullback import RsiPullback, RsiPullbackConfig
+from sleeve_fund.strategies.rules import Rules, RulesConfig
 from sleeve_fund.strategies.trend_filter import TrendFilter, TrendFilterConfig
 
 REGISTRY = {
@@ -16,6 +17,7 @@ REGISTRY = {
     "rsi_bands": (RsiBands, RsiBandsConfig),
     "rsi_cross": (RsiCross, RsiCrossConfig),
     "rsi_pullback": (RsiPullback, RsiPullbackConfig),
+    "rules": (Rules, RulesConfig),
     "trend_filter": (TrendFilter, TrendFilterConfig),
 }
 
@@ -95,6 +97,8 @@ __all__ = [
     "RsiCrossConfig",
     "RsiPullback",
     "RsiPullbackConfig",
+    "Rules",
+    "RulesConfig",
     "TrendFilter",
     "TrendFilterConfig",
 ]
