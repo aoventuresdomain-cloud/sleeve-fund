@@ -173,9 +173,11 @@ class MemoryJournal:
     def exit_plans(self, sleeve: str) -> dict[str, dict]:
         return {k: v[-1] for k, v in self.exit_plans_.items() if v}
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         rows = sorted(self.orders_.values(), key=lambda o: (o["ts"], o["id"]), reverse=True)
-        return [o for o in rows if not statuses or o["status"] in statuses][:limit]
+        return [o for o in rows if (not statuses or o["status"] in statuses)
+                and (not intents or o["intent"] in intents)][:limit]
 
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         return list(reversed(self.fills_))[:limit]
@@ -210,22 +212,23 @@ class MemoryJournal:
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
                        ts: datetime | None = None) -> None:
-        self.funding_.append({"sleeve": sleeve, "ts": ts, "qty": qty, "price": price, "rate": rate, "amount": amount})
+        self.funding_.append({"sleeve": sleeve, "ts": ts or utcnow(), "qty": qty, "price": price, "rate": rate,
+                              "amount": amount})
 
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.funding_))[:limit]
 
-    def funding_total(self, sleeve: str) -> float:
-        return float(sum(f["amount"] for f in self.funding_))
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        return float(sum(f["amount"] for f in self.funding_ if before is None or f["ts"] < before))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
-        self.insurance_.append({"sleeve": sleeve, "ts": ts, "price": price, "amount": amount})
+        self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount})
 
     def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.insurance_))[:limit]
 
-    def insurance_total(self, sleeve: str) -> float:
-        return float(sum(f["amount"] for f in self.insurance_))
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        return float(sum(f["amount"] for f in self.insurance_ if before is None or f["ts"] < before))
 
     # --- into the real journal ---------------------------------------------------------
 
