@@ -137,40 +137,40 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
 
 @dataclass(frozen=True)
 class LiquidationBooking:
-    """What an isolated-margin liquidation books (GAP-LIQ-CAP, Independent Quant Advisor 6 Oct 23:42).
+    """What an isolated-margin liquidation books (GAP-LIQ-CAP, Independent Quant Advisor 6 Oct 23:42 and 7 Oct 00:19).
 
-    loss: X, the posted margin plus the entry and liquidation fees, the one figure the strategy books, gapped or not
-    (the same X as the RAL halt's). fill_loss: what the fills alone come to (the price move plus both fees).
-    insurance: how far the fills went past the bankruptcy price (fill_loss - X when positive), which the venue's
-    insurance fund covers: a diagnostic, never P&L. forfeited: the margin left when it closed short of bankruptcy
-    (X - fill_loss when positive), which the venue keeps, so the loss is X either way."""
+    fill_px: the bankruptcy price, where the fill is booked, gapped or not: there the price move loses exactly the
+    posted margin. loss: X, that margin plus the entry and liquidation fees, the one figure the strategy books (the
+    same X as the RAL halt's). market_px: where the market actually closed it. insurance: how far the market went past
+    bankruptcy, in money, which the venue's insurance fund covers; forfeited: the margin the venue kept when it closed
+    short of bankruptcy. Both are journal diagnostics only, never in any P&L line, equity mark or trip."""
 
+    fill_px: float
     loss: float
-    fill_loss: float
+    market_px: float
     insurance: float
     forfeited: float
 
-    @property
-    def adjustment(self) -> float:
-        """Cash to add to what the fills booked so the books show exactly X: + the insurance fund's cover, - the
-        margin forfeited."""
-        return self.insurance - self.forfeited
+
+def bankruptcy_price(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
+    """The price at which an isolated position of signed qty has lost exactly its posted margin (never below 0)."""
+    return max(entry - isolated_margin(qty, entry, leverage, balance) / qty, 0.0)
 
 
 def liquidation_booking(qty: float, entry: float, exit_px: float, leverage: float, entry_fee: float,
                         liquidation_fee: float, balance: float | None = None) -> LiquidationBooking:
-    """The booking for a position of signed qty at average entry `entry`, liquidated at an average exit_px, on
-    isolated margin at this leverage (balance: what there was to put up, as isolated_margin). The fees are the
-    money charged (entry: on the whole liquidated qty, adds included; liquidation: on its fills)."""
+    """The booking for a position of signed qty at average entry `entry`, liquidated by the market at an average
+    exit_px, on isolated margin at this leverage (balance: what there was to put up, as isolated_margin). The fees are
+    the money charged (entry: on the whole liquidated qty, adds included; liquidation: on its booked fill)."""
     if qty == 0 or entry <= 0 or exit_px <= 0 or leverage <= 0:
         raise ValueError("a liquidation needs a position, positive prices and a positive leverage")
     if entry_fee < 0 or liquidation_fee < 0:
         raise ValueError("fees are money charged, never negative")
-    fees = entry_fee + liquidation_fee
-    x = isolated_margin(qty, entry, leverage, balance) + fees
-    fill_loss = -qty * (exit_px - entry) + fees
-    return LiquidationBooking(loss=x, fill_loss=fill_loss, insurance=max(fill_loss - x, 0.0),
-                              forfeited=max(x - fill_loss, 0.0))
+    margin = isolated_margin(qty, entry, leverage, balance)
+    bankrupt = bankruptcy_price(qty, entry, leverage, balance)
+    past = -qty * (exit_px - bankrupt)  # > 0: the market went past bankruptcy; < 0: it closed short of it
+    return LiquidationBooking(fill_px=bankrupt, loss=margin + entry_fee + liquidation_fee, market_px=exit_px,
+                              insurance=max(past, 0.0), forfeited=max(-past, 0.0))
 
 
 def liquidation_price(cash: float, qty: float, maintenance: float) -> float | None:
