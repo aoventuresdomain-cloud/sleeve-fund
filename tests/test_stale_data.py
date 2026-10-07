@@ -255,3 +255,48 @@ def test_a_stop_accepted_between_ticks_cancels_a_resting_entry_before_the_next_t
     (entry,) = [o for o in _orders(store) if o["intent"] == "entry"]
     assert entry["status"] in ("canceled", "cancelled"), entry
     assert entry["order_id"] not in {f["order_id"] for f in _fills(store)}, "the resting entry filled after the Stop"
+
+
+def test_a_stop_accepted_just_before_the_print_that_fills_a_resting_entry_keeps_it_with_its_stop_and_one_incident(
+        tmp_path, store, monkeypatch):  # noqa: F811
+    """The residual the HoE logged before G2 (one print): the Stop lands between two prints (t0+25:10.5) and the very
+    next print crosses a resting stop entry. The venue fills it before the strategy hears of either, as a real venue
+    can fill a resting order before a cancel lands; the raced-fill rule covers it: kept with its stop, one incident."""
+    from test_exposure_gate_xfails import NAME, Egx, _events, _pm_stop
+
+    k = 25 * 60 + 11
+    real_start = Egx.on_start
+
+    def on_start(self):
+        real_start(self)
+        at = pd.Timestamp(STD_T0) + pd.Timedelta(seconds=k - 0.5)
+        self.clock.set_time_alert("qa-stop", at.to_pydatetime(), callback=lambda e: _pm_stop(store))
+
+    real_bar = Egx.on_bar
+
+    def on_bar(self, bar):
+        resting = bool(self._rest)
+        real_bar(self, bar)
+        if resting and not self._rest and self._stop_frac is None:
+            # A venue-resting entry plans its exits when it is placed, as every entry does at its decision (the
+            # QA harness places the order bare); paper's own post-only entries are kept in the process instead.
+            self._stop_frac, self._tp_frac, self._stop_basis = self._plan_exits(bar.close.as_double(), 1)
+
+    monkeypatch.setattr(Egx, "on_start", on_start)
+    monkeypatch.setattr(Egx, "on_bar", on_bar)
+    plan = Plan(t0=STD_T0, tag="sr1")
+    p0 = 60_000 + 5 * 60 * 0.01
+    plan.price = lambda s: (60_000 + s * 0.01) * (1.02 if s >= k else 1.0)
+    # the strategy wants the long from the candle after the fill on (no market entry of its own before the Stop)
+    plan.windows.append((M(plan.t0, 25) + pd.Timedelta(seconds=1), M(plan.t0, plan.minutes), 1))
+    plan.rest.append((M(plan.t0, 5), 1, round(p0 * 1.01, 1), 0.05))
+    run(tmp_path, store, plan, monkeypatch)
+    assert store.sleeve(NAME).desired_state == "stopped", "set-up: the Stop never landed"
+    (entry,) = [o for o in _orders(store) if o["intent"] == "entry"]
+    fills = [f for f in _fills(store) if f["order_id"] == entry["order_id"]]
+    assert fills, f"set-up: the crossing print did not fill the resting entry: {entry}"
+    stops = [o for o in _orders(store) if o["intent"] == "stop_loss" and o["ts"] >= fills[0]["ts"]]
+    assert stops, f"the raced entry has no stop: {[(o['intent'], o['order_type'], o['status']) for o in _orders(store)]}"
+    raced = [e for e in _events(store, ("incident",)) if "filled while nothing may open" in e["message"]]
+    assert len(raced) == 1, [e["message"][:120] for e in _events(store, ("incident",))]
+    assert not [o for o in _orders(store) if o["intent"] == "exit"], "the raced entry was closed, not kept"

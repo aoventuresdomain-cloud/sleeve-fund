@@ -935,8 +935,8 @@ class LongFlatStrategy(Strategy):
         self._market_seen()
         self._note_trade(int(tick.ts_event))
         if not self._backtest and self._resting_openers():
-            # P1-SG15: a Stop (or any block) accepted between ticks cancels a resting entry before the next trade can
-            # fill it; asked only while an opening order rests, so a strategy without one reads nothing more per trade.
+            # P1-SG15: a Stop (or any block) accepted between ticks cancels a resting entry on the first trade or quote
+            # after it; asked only while an opening order rests, so a strategy without one reads nothing more per trade.
             self._cancel_resting_entries()
         if self._restore is not None:
             self._send_restore()
@@ -976,6 +976,8 @@ class LongFlatStrategy(Strategy):
             self.log.info(f"first quote: bid {bid} ask {ask}")
         self._bid, self._ask = bid, ask
         self._market_seen()
+        if not self._backtest and self._resting_openers():
+            self._cancel_resting_entries()  # P1-SG15: as on a trade (on_trade); a quote can fill a resting order too
         if self.runtime is not None:
             self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
         if self._restore is not None:
