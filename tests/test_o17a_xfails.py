@@ -1528,6 +1528,53 @@ def test_paper_the_04_00_branch_reverses_16_00_and_00_00_when_04_00_lands(tmp_pa
     _texts_ok(store)
 
 
+def test_a_restart_after_a_reversal_does_not_refund_the_settlement_twice(tmp_path, monkeypatch, binance):
+    """P1-O17a-15 (Code Reviewer, #163 at 32099ca): a paper restart while an episode is still open, after a provisional
+    baseline in it was already reversed. 4 h records (00:00, 04:00, 08:00), then 16:00 and 4 Oct 04:00 (4 Oct 00:00
+    never published). 12:00 (foreseen at 4 h) is charged at 12:15; foresight past 16:00 is 4 h (counting the
+    provisional 12:00), so 20:00 is charged at 20:15 and opens its own episode (16:00 between is stored), and 00:00 is
+    charged at 00:15 and joins it. When 04:00 lands: 08:00 -> 16:00 has s_next = 12 h >= g, so 12:00 is reversed;
+    16:00 -> 04:00 is g = 12 h > P, read by (a) with f = s_prev = 8 h from stored records, so 00:00 stays missing and
+    20:00 (not on that grid) is reversed. Paper stops at 04:45 with the episode from 20:00 still open on 00:00, and is
+    restarted at 04:55 to 05:20. On start it rebuilds its watched settlements from the journal's baseline rows; the
+    reversed 12:00 and 20:00 must not come back as owed: each keeps exactly one baseline and one reversal (net zero,
+    amended (c): at most one charge and one reversal per settlement), 00:00 keeps its one baseline and no reversal,
+    and the restart raises no new funding_stale and clears nothing while 00:00 is missing."""
+    _hub_built()
+    _fresh_hub(monkeypatch)
+    store = _restartable_journal()
+    params = win(("2025-10-03 07:52", "2025-10-05 00:00", 1))
+    rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002,
+             "2025-10-04 04:00": 0.0001}
+    run = dict(rates=rates, store=store, name="w")
+    first = _rows(paper(tmp_path, monkeypatch, binance, params, "2025-10-03 07:50", 20 * 60 + 55, **run))  # to 04:45
+    want = [("2025-10-03 08:00", S_), ("2025-10-03 12:00", B_), ("2025-10-03 12:00", R_), ("2025-10-03 16:00", S_),
+            ("2025-10-03 20:00", B_), ("2025-10-03 20:00", R_), ("2025-10-04 00:00", B_), ("2025-10-04 04:00", S_)]
+    assert [(t, k) for t, k, _ in first] == [(utc(t), k) for t, k in want], \
+        f"setup: before the restart 12:00 and 20:00 are reversed and 00:00 is still missing {_rshow(first)}"
+    _built_missing(store, "2025-10-04 00:00")
+    restart = utc("2025-10-04 04:55")
+    rows = _rows(paper(tmp_path, monkeypatch, binance, params, "2025-10-04 04:55", 25, **run))  # restarted, to 05:20
+    for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
+        at = [(k, a) for ts, k, a in rows if ts == utc(t)]
+        assert [k for k, _ in at].count(R_) == 1, \
+            (f"{t} refunded {[k for k, _ in at].count(R_)} times for one baseline charge: the restart re-watched a "
+             f"settlement already reversed and reversed it again {_rshow(rows)}")
+        assert sorted(k for k, _ in at) == [B_, R_], f"{t}: one baseline and one reversal, nothing else {_rshow(rows)}"
+    _net_zero(rows, "2025-10-03 12:00", "2025-10-03 20:00")
+    at00 = [(k, a) for ts, k, a in rows if ts == utc("2025-10-04 00:00")]
+    assert [k for k, _ in at00] == [B_], f"00:00 (still missing) keeps its one baseline, no reversal {_rshow(rows)}"
+    assert [(t, k) for t, k, _ in rows] == [(utc(t), k) for t, k in want], \
+        f"the restart changed the money rows: before {_rshow(first)}, after {_rshow(rows)}"
+    got = _events(store, *EPISODE)
+    assert not [e for e in got if e["ts"] >= restart], f"the restart raised or cleared an episode: {_show(got)}"
+    assert len([e for e in _stales(store) if _from("2025-10-03 20:00") in e["message"]]) == 1, _show(got)
+    assert not [e for e in _cleared(store) if _from("2025-10-03 20:00") in e["message"]], \
+        f"the episode from 20:00 was cleared while 00:00 in it is still missing: {_show(got)}"
+    _built_missing(store, "2025-10-04 00:00")
+    _texts_ok(store)
+
+
 @pytest.mark.parametrize("case", ["a-8h-one-missing", "default-none-of-a-to-c"])
 def test_the_collector_marks_an_inferred_settlement_and_the_backfill_replaces_it(tmp_path, monkeypatch, binance, case):
     """02:13 pins through the hub. The store holds records with a gap, as the collector kept them (a: 08:00 lost on
