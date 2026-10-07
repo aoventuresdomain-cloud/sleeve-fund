@@ -581,7 +581,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
-        else:  # the strategy's own indicators, as it read them when it decided (P1-3s)
+        elif not data["indicators"]:  # nothing recorded: the strategy's own indicators, as it read them (P1-3s)
             data["indicators"], why = charts.indicators(s, df.iloc[-720:], minutes)
             if why:
                 data["indicators_note"] = why
