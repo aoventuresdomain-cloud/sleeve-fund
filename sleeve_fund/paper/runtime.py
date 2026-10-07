@@ -364,7 +364,7 @@ class SleeveRuntime:
             mins = (now - self.liq_working_since).total_seconds() / 60
             self.incident_once(LIQ_STUCK_HEAD, f"{LIQ_STUCK_HEAD} after {mins:.0f} minutes, and the PM's "
                                f"{', '.join(waiting)} waits behind it: check the order at the venue. Stop is still "
-                               "taken, and a waiting flatten is kept through it")
+                               "taken: it runs for its exits only")
 
     def incident_once(self, head: str, message: str) -> None:
         """An incident about the position held now, written once: a restart or a deploy doesn't repeat it while no

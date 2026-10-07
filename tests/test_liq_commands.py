@@ -57,37 +57,16 @@ def _stop(c):
                   headers={"origin": "http://testserver"}, follow_redirects=False)
 
 
-@pytest.mark.parametrize("holding", [True, False])
-def test_stop_is_always_taken_and_a_waiting_flatten_is_kept_only_while_there_is_something_to_sell(client, holding):
+def test_stop_is_always_taken_even_with_a_flatten_waiting_behind_a_stuck_liquidation(client):
     c, store = client
     _holding(store)
-    if not holding:
-        store.record_fill("s1", side="SELL", qty=0.01, price=60_000.0, fee=0.3, order_id="x1", trade_id="x1")
     store.command("s1", "pause", "hold on")
     store.command("s1", "flatten", "close it")
     store.heartbeat("s1")  # the process is reporting
     r = _stop(c)
     assert "command_error" not in r.headers.get("location", ""), r.headers.get("location")
     assert store.sleeve("s1").desired_state == "stopped"
-    # The pause lapses; the flatten is kept for the exits-only run while it holds (P1-U35), else it lapses too
-    assert [x["command"] for x in store.pending_commands("s1")] == (["flatten"] if holding else [])
-
-
-def test_the_supervisor_lapses_a_kept_flatten_once_it_stops_a_flat_strategy(tmp_path, monkeypatch):
-    store = Store(f"sqlite:///{tmp_path}/t.db")
-    _holding(store)
-    store.record_fill("s1", side="SELL", qty=0.01, price=60_000.0, fee=0.3, order_id="x1", trade_id="x1")
-    store.set_desired_state("s1", "stopped")
-    store.command("s1", "flatten", "kept through a Stop")
-
-    class FakePopen:
-        pid, returncode = 4242, None
-        poll = lambda self: None  # noqa: E731
-        send_signal = wait = kill = lambda self, *a, **k: 0  # noqa: E731
-    sv = sup.Supervisor(store)
-    sv.procs["s1"] = sup.Proc(popen=FakePopen(), started_at=sup.utcnow())
-    sv.step()
-    assert sv.procs["s1"].popen is None and not store.pending_commands("s1")
+    assert not store.pending_commands("s1")  # they lapse, as on any Stop; its exits-only run watches it (P1-U35)
 
 
 def test_a_reset_asked_before_a_liquidation_is_dropped_and_the_halt_stays(tmp_path, monkeypatch):

@@ -155,11 +155,11 @@ def test_stop_while_holding_flattens_first_then_asks_to_stop(client):
     assert "Flattening first. Once it is flat, this page asks you to stop it." in waiting
     assert "Flat now. Stop it?" not in waiting
 
-    # Stop is always taken (QA P1-D23, HoE): the dialog says a stop now keeps the waiting flatten, whose exits-only
-    # run sells it (test_liq_commands), and only Flatten and stop, which would send a second flatten, is held.
+    # Stop is always taken (QA P1-D23, HoE): the dialog says a stop now drops the waiting flatten (test_liq_commands),
+    # and only Flatten and stop, which would send a second flatten, is held.
     page = c.get("/sleeves/btc-x", auth=AUTH).text
     stop = page[page.index('id="dlg-stop"'):page.index("</dialog>", page.index('id="dlg-stop"'))]
-    assert "A flatten is still waiting.</b> Stopping keeps it" in stop
+    assert "A flatten is still waiting.</b> Stopping now drops it" in stop
     assert re.search(r'value="stop"[^>]*data-needs-reason disabled>', stop)
 
     # The strategy acts on it and is flat: the page offers the stop with the same reason.

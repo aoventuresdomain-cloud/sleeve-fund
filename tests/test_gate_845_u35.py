@@ -47,6 +47,10 @@ SG5 = xf("P1-SG5 (Advisor 23:05, MAJOR): status governs entries only; a holder w
 PRE_GATE = not hasattr(__import__("sleeve_fund.paper.runtime", fromlist=["SleeveRuntime"]).SleeveRuntime, "entry_blocked")
 ON_PRE_GATE = pytest.mark.xfail(PRE_GATE, strict=True, raises=AssertionError,
                                 reason="U35 / GAP-LIQ (the gate branch) not on this head")
+# A head without GAP-LIQ (main; PE2's choke a171a12 alone): a gap through the stop books a stop_loss, not a liquidation.
+NO_GAP_LIQ = not hasattr(__import__("sleeve_fund.strategies.base", fromlist=["LongFlatStrategy"]).LongFlatStrategy,
+                         "_gap_liquidation")
+ON_NO_GAP_LIQ = pytest.mark.xfail(NO_GAP_LIQ, strict=True, raises=AssertionError, reason="GAP-LIQ not on this head")
 
 
 def _built(module: str, name: str):
@@ -123,21 +127,71 @@ def test_sg4_a_second_deploy_before_flat_writes_no_second_incident(tmp_path, who
     assert len(incidents) == 1, incidents
 
 
+# The SG4 adverse move (retuned 6 Oct ~23:45, coordinator): it must stay under EVERY profile's daily-loss limit, so that
+# a holder that keeps its risk checks (SG5, Advisor 23:05) is not flattened before the second deploy re-measures the
+# stop. At 2x, 0.5% against from 60,900 (61,204.5, drifting 0.2% to ~61,327) loses ~2.4% of the day's 10,000 opening
+# equity: under conservative's 3% (the smallest daily_loss in risk.PROFILES), balanced's 5% and aggressive's 8%. A
+# safety stop re-measured from that mark would sit ~150 higher (looser) than the first one (~75,695).
+SG4_MOVE = 0.005
+STOP_TOL = 1.0  # price units: ten ticks of BTC/USD (0.1)
+FLATTENS = ("risk_pause", "risk_halt", "pm_flatten", "liquidation")
+
+
+def _working_stops(store):
+    """Each incident's working stop, oldest first, with the mark and liquidation price it was measured from: "keeps
+    its restored stop at X" (the tighter one kept) or "works to a safety stop at L, half way from the M mark to the
+    liquidation price Q"."""
+    num = r"([\d,]+(?:\.\d+)?)"
+    out = []
+    for e in sorted((e for e in store.events(NAME, limit=10_000) if e["kind"] == "incident"), key=lambda e: e["id"]):
+        m = e["message"]
+        if (k := re.search(rf"keeps its restored stop at {num}", m)):
+            out.append((float(k[1].replace(",", "")), None, None))
+        elif (w := re.search(rf"safety stop at {num}, half way from the {num} mark to the liquidation price {num}", m)):
+            out.append(tuple(float(x.replace(",", "")) for x in w.groups()))
+    return out
+
+
 @LIFT
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="PE2: set-up only: with SG5 the 8% move flattens the "
-                   "holder at the daily-loss limit first, so nothing is held to deploy again (QA to retune the move); "
-                   "the stop never loosening is pinned in test_restart_safety_stop")
+# PE2: SG4 passes on this head (mark removed)
 def test_sg4_a_second_deploy_after_an_adverse_move_keeps_the_tighter_safety_stop(tmp_path, whole_equity):  # noqa: F811
     """U35 / R-S3: "an already resting tighter stop is kept, not doubled". The stopped holder's first safety stop
-    (half way from the 60,900 mark to liquidation: ~75,695) must not be re-measured looser after the price moved 8%
-    further against it before the second deploy. 845df4d: the second deploy sets ~78,131 (looser), with a new
-    incident."""
+    (half way from the 60,900 mark to liquidation: ~75,695) must not be re-measured looser after the price moved
+    SG4_MOVE further against it before the second deploy. Set-up asserted here: the move trips no daily pause, no
+    halt and no flatten (the short is held whole), its loss is under every profile's daily_loss, and a stop re-measured
+    from the new mark would differ from the first by more than STOP_TOL (so the pin can tell). 845df4d: the second
+    deploy re-measures it from ~61,204.5 (looser), with a new incident."""
+    from sleeve_fund import risk
+
+    store = _two_deploys(tmp_path, "stopped_holder", SG4_MOVE)
+    book = store.journal_book(NAME, 10_000)
+    kinds = set(_kinds(store))
+    flattened = [o["intent"] for o in _orders(store) if o["intent"] in FLATTENS]
+    assert not (kinds & set(FLATTENS)) and not flattened, f"setup: the move tripped {kinds & set(FLATTENS)} {flattened}"
+    assert book["qty"] == pytest.approx(-0.33253027, abs=1e-9), f"setup: the short isn't held whole: {book['qty']}"
+    worst = ENTRY * (1 + SG4_MOVE) * 1.002  # the session's drift
+    day_loss = abs(book["qty"]) * (worst - book["entry_px"]) / 10_000
+    assert day_loss < min(p.daily_loss for p in risk.PROFILES.values()), f"setup: day loss {day_loss:.2%} too big"
+    stops = _working_stops(store)
+    assert stops and stops[0][1] is not None, f"setup: no first safety stop journaled: {stops}"
+    first, mark, liq = stops[0]
+    share = (first - mark) / (liq - mark)
+    new_mark = ENTRY * (1 + SG4_MOVE)
+    remeasured = new_mark + share * (liq - new_mark)
+    assert remeasured - first > STOP_TOL, f"setup: a re-measured stop {remeasured:,.1f} can't be told from {first:,.1f}"
+    levels = [x for x, _, _ in stops]
+    assert all(x <= first + 1e-6 for x in levels), levels  # a short's stop never moves up (looser)
+
+
+@LIFT
+# PE2: SG5 passes on this head (mark removed)
+def test_sg4_xcheck_the_8pc_adverse_move_before_a_second_deploy_trips_the_daily_loss_flatten(tmp_path,  # noqa: F811
+                                                                                           whole_equity):
+    """SG5 cross-check on the SG4 set-up (coordinator ~23:45): the original 8% adverse move (~17% of equity in the day,
+    over balanced's 5% daily loss, under its 20% drawdown) on the Stopped exits-only 2x short is flattened by the
+    daily-loss pause, journaled (risk_pause) with its flatten order filled. 845df4d and main: still held."""
     store = _two_deploys(tmp_path, "stopped_holder", 0.08)
-    assert store.journal_book(NAME, 10_000)["qty"] < 0, "setup: still holding"
-    incidents = [e for e in store.events(NAME, limit=1000) if e["kind"] == "incident"]
-    levels = [float(m.replace(",", "")) for e in sorted(incidents, key=lambda e: e["id"])
-              for m in re.findall(r"safety stop at ([\d,.]+)", e["message"])]
-    assert levels and all(x <= levels[0] + 1e-6 for x in levels), levels  # a short's stop never moves up (looser)
+    _assert_flattened_by(store, "risk_pause", "stopped_holder", "daily_loss")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -189,7 +243,7 @@ def test_sg5_a_holder_whose_status_blocks_entries_is_still_flattened_at_the_risk
 
 @LIFT
 @pytest.mark.parametrize("holder", [pytest.param("stopped_holder", marks=ON_PRE_GATE),
-                                    pytest.param("pm_paused", marks=ON_PRE_GATE)])  # main: a stop_loss, no GAP-LIQ
+                                    pytest.param("pm_paused", marks=ON_NO_GAP_LIQ)])  # a stop_loss, without GAP-LIQ
 def test_sg5_a_paused_holder_still_gets_the_liquidation_check(tmp_path, whole_equity, holder):  # noqa: F811
     """Advisor 23:05: the liquidation check runs whatever the status. The price opens session 3 60% against the 2x
     short, past its safety (or 20%) stop and its ~90,490 liquidation price: the venue's liquidation is booked (a

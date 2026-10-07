@@ -255,9 +255,6 @@ class Supervisor:
                     self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
             elif action == "stop":
                 self._stop(sleeve.name, proc, "stopped by PM")
-                # A flatten kept through the PM's Stop for its exits-only run (P1-D23) lapses once there is
-                # nothing left to sell, rather than act on the next start
-                self.store.drop_pending(sleeve.name, "lapsed: the strategy was stopped before it acted")
                 if not entry_blocked(self.store, sleeve.name, starting=True)[0]:  # a halt stays through a stop (HC)
                     self.store.set_status(sleeve.name, "stopped", "stopped by PM")
             elif action == "restart_stale":

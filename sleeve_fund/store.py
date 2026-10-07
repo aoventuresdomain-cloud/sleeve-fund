@@ -1716,9 +1716,9 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def drop_pending(self, sleeve: str, why: str, keep: tuple[str, ...] = ()) -> int:
-        """Retire a strategy's waiting commands unapplied, each noted in the decision log; those in `keep` stay."""
-        pending = [c for c in self.pending_commands(sleeve) if c["command"] not in keep]
+    def drop_pending(self, sleeve: str, why: str) -> int:
+        """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
+        pending = self.pending_commands(sleeve)
         for cmd in pending:
             self.mark_applied(cmd["id"])
             if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them

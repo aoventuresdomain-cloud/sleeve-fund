@@ -51,7 +51,7 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
-from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, is_dust, utcnow
+from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
 from sleeve_fund.paper.runtime import entry_blocked
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
@@ -647,14 +647,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
-                    # weeks later; it lapses instead, and the decision log says so. Stop is always taken (QA
-                    # P1-D23): a waiting flatten is kept, as a stopped strategy still holding runs for its exits
-                    # only (P1-U35) and that process sells it.
-                    s = st().sleeve(name)
-                    book = st().journal_book(name, s.starting_balance)
-                    holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
-                    st().drop_pending(name, "lapsed: the strategy was stopped before it acted",
-                                      keep=("flatten",) if holds else ())
+                    # weeks later; it lapses instead, and the decision log says so. Stop is always taken, a
+                    # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
+                    # stop or a safety stop watching the position (P1-U35).
+                    st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and why.code != "halted"):
