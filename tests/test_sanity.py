@@ -987,7 +987,10 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
         qty += sign * f["qty"]
     assert seen and seen[0] == "risk_pause", seen  # the first day's limit was reached and checked
     if (profile, strategy) != ("aggressive", "probe_short"):  # its pauses alone keep it short of the halt
-        assert "risk_halt" in seen, seen
+        # The halt fires; when the bar that fills a pause at its worst price (P1-D13) also crosses the drawdown
+        # limit, the pause's order has already flattened and the halt leaves no order to fill (HoE OK, 7 Oct).
+        halts = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+        assert "risk_halt" in seen or (halts and f"{prof.max_drawdown:.0%} limit" in halts[0]["message"]), (seen, halts)
 
 
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():

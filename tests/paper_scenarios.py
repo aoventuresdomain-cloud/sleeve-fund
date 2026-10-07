@@ -52,15 +52,28 @@ def replay_into(store, path, name=NAME):
         store.__dict__.pop("create_sleeve", None)
 
 
-def _gap_closed(orders, side):
-    """Set-up check: the gap closed the position more than 50% past its entry (past a 2x liquidation, ~49%), by the
-    liquidation or by the stop it went through. Returns (the closing order, the entry it closed)."""
+def _gap_closed(orders, side, leverage=2.0):
+    """Set-up check: the gap closed the position past its bankruptcy price (more than 1/leverage past its entry: 50% at
+    the balanced profile's 2x), by the liquidation or by the stop it went through. A liquidation is booked at the
+    bankruptcy price (GAP-LIQ-CAP, Advisor 7 Oct 00:19), so where the market took it is read from its signal's
+    market_px, which it must carry; its avg_px is pinned to the bankruptcy price (HoE 7 Oct 02:08). Returns (the
+    closing order, the entry it closed)."""
+    from sleeve_fund import markets
+
     close = orders[-1]
     assert close["intent"] in ("liquidation", "stop_loss") and close["side"] == side, [(o["side"], o["intent"])
                                                                                        for o in orders]
     entry = [o for o in orders if o["intent"] == "entry" and o["side"] != side][-1]
-    move = close["avg_px"] / entry["avg_px"] - 1
-    assert (move if side == "BUY" else -move) > 0.5, (close["avg_px"], entry["avg_px"])
+    market = close["avg_px"]
+    if close["intent"] == "liquidation":
+        signal = close.get("signal") or {}
+        assert signal.get("market_px") is not None, ("a liquidation's signal carries the market price", signal)
+        market = signal["market_px"]
+        held = close["qty"] if side == "SELL" else -close["qty"]
+        bankrupt = markets.bankruptcy_price(held, entry["avg_px"], leverage)
+        assert abs(close["avg_px"] - bankrupt) <= 1e-6 * bankrupt, (close["avg_px"], bankrupt)
+    move = market / entry["avg_px"] - 1
+    assert (move if side == "BUY" else -move) > 1 / leverage, (market, entry["avg_px"])
     return close, entry
 
 

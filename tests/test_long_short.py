@@ -914,15 +914,15 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     what equity says."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
     res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
-    assert res.insurance and res.insurance[0]["amount"] > 0
+    # GAP-LIQ-CAP (HoE 7 Oct 01:38): booked at the bankruptcy price, so no insurance-fund credit enters the P&L
+    assert not res.insurance
     fills = res.fills.sort_values("ts_last")
     qty, entry = float(fills["filled_qty"].iloc[-1]), float(fills["avg_px"].iloc[-2])
-    before = float(res.equity[res.equity.index < pd.Timestamp(fills["ts_last"].iloc[-1])].iloc[-1])
-    lost = before - res.equity.iloc[-1]
     margin = qty * entry / 3  # aggressive: 3x
-    assert res.equity.min() > 0 and margin < lost < margin * 1.01  # the margin, plus the close's fee and funding
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
-    assert trips[-1]["insurance"] == pytest.approx(res.insurance[0]["amount"])
+    x = margin + trips[-1]["fees"]  # X: the margin plus the entry and liquidation fees
+    assert res.equity.min() > 0 and trips[-1]["pnl"] - trips[-1]["funding"] == pytest.approx(-x, abs=0.01)
+    assert trips[-1]["insurance"] == 0.0
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
     assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(res.equity.iloc[-1], abs=0.05)
@@ -1013,8 +1013,11 @@ def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stay
     _record(gap, _meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, then +60%
     orders = replay(gap, store=store)
     assert orders[-1]["intent"] == "liquidation" and orders[-1]["side"] == "BUY"
-    covered = store.insurance_total(name)
-    assert covered > 0
+    # GAP-LIQ-CAP (HoE 7 Oct 01:38): no insurance-fund row; the excess past bankruptcy is a diagnostic event
+    assert store.insurance_total(name) == 0
+    (cover,) = [e for e in store.events(name, limit=500) if e["kind"] == "insurance_fund"]
+    assert "covered by the venue's insurance fund" in cover["message"], cover
+    assert re.search(r"the [\d,]+\.\d\d beyond it", cover["message"]), cover  # names the excess
     s = store.sleeve(name)
     assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): "), s.status_reason
     assert "insurance fund covers the shortfall, about" in s.status_reason  # halted while open: an estimate (mF-1)
@@ -1036,7 +1039,6 @@ def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stay
     assert len(replay(restart, store=store)) == len(orders)  # no new order
     s = store.sleeve(name)
     assert s.status == "halted", (s.status, s.status_reason)
-    assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
     marks = store.equity_series(name)[seen:]
     assert marks and all(m["qty"] == 0.0 and m["equity"] == pytest.approx(left, abs=0.01) for m in marks)
     events = store.events(name, limit=500)

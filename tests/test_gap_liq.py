@@ -54,10 +54,12 @@ def test_a_backtest_stop_gapped_through_liquidation_books_a_liquidation_at_the_d
     entry, close = fills[opened], fills[oid]
     margin = entry["qty"] * entry["price"] / 3  # aggressive: 3x
     assert close["qty"] == pytest.approx(entry["qty"]) and close["side"] == "BUY"
-    # The D3 loss: the short's price loss less what the insurance fund took is its isolated margin, to the cent; the
-    # fees are charged as filled, so the trade loses the margin and both fees, never more.
-    (covered,) = res.insurance
-    assert (close["price"] - entry["price"]) * entry["qty"] - covered["amount"] == pytest.approx(margin, abs=0.01)
+    # The D3 loss: filled at the bankruptcy price (GAP-LIQ-CAP, HoE 7 Oct 01:38), the short's price loss is its
+    # isolated margin, to the cent, with no insurance-fund row; the fees are charged as filled, so the trade loses the
+    # margin and both fees, never more.
+    assert not res.insurance
+    assert close["price"] == pytest.approx(entry["price"] * (1 + 1 / 3), rel=1e-9)  # the 3x short's bankruptcy price
+    assert (close["price"] - entry["price"]) * entry["qty"] == pytest.approx(margin, abs=0.01)
     assert res.exposure.iloc[-1] == pytest.approx(0, abs=1e-9)  # halted: nothing reopened
 
 
