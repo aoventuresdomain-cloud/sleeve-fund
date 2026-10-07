@@ -31,7 +31,7 @@ _TYPES = {"CurrencyPair": CurrencyPair, "CryptoPerpetual": CryptoPerpetual}
 
 
 def clone_venue(base: Venue | str, index: int) -> Venue:
-    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: KRAKEN -> KRAKEN_P1.
+    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: VENUE -> VENUE_P1.
 
     No hyphen: an account id is venue-number, split on its hyphen."""
     return Venue(f"{base}_P{index}")
