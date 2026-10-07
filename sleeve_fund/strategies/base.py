@@ -1536,6 +1536,13 @@ class LongFlatStrategy(Strategy):
         w = self.target_weight(bar)
         return None if w is None else abs(float(w))
 
+    def _at_exit_level(self, stop: float, close: float) -> bool:
+        """P2-1b (Advisor 7 Oct 02:10): a converted model's entry or add is skipped when its own stop sits within
+        max(the stop floor, 0.5 x ATR(14)) of the close: the model is at its exit, and 1% risked to so near a stop
+        would size the trade several times its normal notional."""
+        atr = self._atr.value / close if self._atr.initialized and close > 0 else 0.0
+        return stop <= max(MIN_STOP, 0.5 * atr) + 1e-12
+
     def _band(self, bar: Bar, side: int) -> None:
         """P2-1b rule 4, the band variant, on a bar the model stays on its side: the target is central sizing at this
         close x the weight (ruling 5), traded only when more than resize_band of the size held away. A reduction is
@@ -1578,6 +1585,10 @@ class LongFlatStrategy(Strategy):
             return
         if self._late_entry(bar, f"{_side_word(side)} add"):
             return
+        if self._at_exit_level(plan[0], close):
+            self._note("add_at_exit", f"Add skipped: at exit level, its own stop ({plan[2]}) is {plan[0]:.2%} from the "
+                       f"{close:,.6g} close, within the larger of the {MIN_STOP:.1%} floor and half an ATR", level="info")
+            return
         # The room left under the margin cap: (cap x equity - posted margin) x leverage (Advisor 22:23).
         posted = float(held) * close / lev if lev else float(held) * close
         room = (self.runtime.position_budget(equity, posted) if self.runtime is not None
@@ -1615,7 +1626,7 @@ class LongFlatStrategy(Strategy):
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(total * close / equity, 4)
         self._add_level = level
-        for kind in ("add_capped", "add_refused_open_risk", "entry_refused_liquidation"):
+        for kind in ("add_capped", "add_refused_open_risk", "entry_refused_liquidation", "add_at_exit"):
             self._noted.discard(kind)
         self._submit(entry_side, qty, "entry", f"Band: add {qty.normalize():f} toward the {target.normalize():f} target "
                      f"(central sizing x the model's {w:.0%}), more than {self._cfg.resize_band:.0%} above the "
@@ -1626,7 +1637,7 @@ class LongFlatStrategy(Strategy):
         smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
         trade and the bar's volume; refused when its stop would sit too near the liquidation price."""
         self._add_level = None  # an add that never filled leaves nothing for this entry
-        for kind in ("add_capped", "add_refused_open_risk"):
+        for kind in ("add_capped", "add_refused_open_risk", "add_at_exit"):
             self._noted.discard(kind)  # a new position says once again why its adds are held back
         if self._exit_lock == side:
             return
@@ -1660,6 +1671,12 @@ class LongFlatStrategy(Strategy):
             return
         if self._stop_frac and self._cfg.sizing == "central":
             w = self._converted_weight(bar)
+            if w is not None and self._at_exit_level(self._stop_frac, close):
+                self._note("entry_at_exit", f"Entry skipped: at exit level, its own stop ({self._stop_basis}) is "
+                           f"{self._stop_frac:.2%} from the {close:,.6g} close, within the larger of the {MIN_STOP:.1%} "
+                           "floor and half an ATR", level="info")
+                return
+            self._noted.discard("entry_at_exit")
             fixed = w is not None and self._cfg.resize_band is None
             sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share,
                                 vol_notional=w * equity if fixed else None)

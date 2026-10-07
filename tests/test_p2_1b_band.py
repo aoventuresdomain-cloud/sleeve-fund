@@ -50,3 +50,16 @@ def test_an_add_the_margin_cap_holds_back_is_said_once_per_position_and_never_se
     # Unbound, this path adds on several bars of the second position; held back, each position says so once.
     assert 1 <= len(capped) <= len(entries), (len(capped), len(entries))
     assert len({e["ts"] for e in capped}) == len(capped)
+
+
+def test_an_add_whose_own_stop_is_at_the_close_is_skipped_and_said_once_per_position():
+    # On this path the ensemble's falling leg makes the bar just closed the channel's low: the add's own stop would sit
+    # at the close, floored to 0.2% (Advisor 7 Oct 02:10: skip it, never size 1% to it).
+    res = _run("donchian", DONCHIAN)
+    for d in res.decisions.values():
+        if d["intent"] == "entry":
+            assert d["signal"]["stop_frac"] > 0.002 + 1e-12, d["signal"]
+    skipped = [e for e in res.journal.events(None, limit=100_000) if e["kind"] == "add_at_exit"]
+    opened = [d for d in res.decisions.values() if d["intent"] == "entry" and "band add" not in d["signal"]["sized_by"]]
+    assert 1 <= len(skipped) <= len(opened), skipped  # once per position at most, never once per bar
+    assert all(e["message"].startswith("Add skipped: at exit level") for e in skipped), skipped

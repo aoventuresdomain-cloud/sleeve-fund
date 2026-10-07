@@ -2180,8 +2180,11 @@ def _form_params(form, strategy: str) -> dict:
             raise ValueError("go to market after: a whole number of minutes") from None
     # P2-1 (Head of Engineering and Advisor, 6 Oct 2026): a strategy made, or a backtest run, from this form from now
     # on is centrally sized, so a backtest sizes as the strategy made from it will. Strategies already running keep
-    # the sizing they were made with; the benchmark sizes its own way.
-    if strategy in REGISTRY and not REGISTRY[strategy][1].BENCHMARK and params.get("rebalance_band") is None:
+    # the sizing they were made with; the benchmark sizes its own way. A weight model stays legacy here: its P2-1b
+    # conversion is a research variant until the Head of Engineering puts it on the form, so on a perp it is still
+    # refused (check_perp_sizing).
+    if strategy in REGISTRY and not REGISTRY[strategy][1].BENCHMARK and params.get("rebalance_band") is None \
+            and not REGISTRY[strategy][0].weight_sized(params):
         params["sizing"] = "central"
     return params
 
