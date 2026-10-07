@@ -1319,9 +1319,22 @@ class Store:
             rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
                                                     restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
             # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
-            if s.status in ("paused", "halted"):
-                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
-                                                       paused_until=s.paused_until))
+            hold = ({"status": s.status, "status_reason": s.status_reason or "", "paused_until": s.paused_until}
+                    if s.status in ("paused", "halted") else None)
+            if s.status != "halted":  # never downgrade a halt, as the paper process doesn't
+                # P1-KR-2: a PM pause or flatten (the kill switch) pressed just before the reset, which the paper
+                # process has not applied yet, is kept as the pause it would have set (paper.runtime): the reset
+                # puts its pending commands away with the old run. The system's own flattens (a clean slate's) aren't.
+                system = {r for (r,) in c.execute(select(decisions_t.c.reason).where(
+                    decisions_t.c.sleeve == sleeve, decisions_t.c.actor == "system"))}
+                asked = [r for r in c.execute(select(commands_t.c.command, commands_t.c.reason).where(
+                    commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                    commands_t.c.command.in_(("pause", "flatten"))).order_by(commands_t.c.id)) if r.reason not in system]
+                if asked:
+                    words = "flattened by PM" if asked[-1].command == "flatten" else "paused by PM"
+                    hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
+            if hold:
+                c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:

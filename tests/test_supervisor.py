@@ -466,6 +466,29 @@ def test_a_reset_keeps_a_pause_or_halt_and_restarts_a_running_strategy(store):
     # The fresh paper process reads that status and keeps it until a resume (review round 10, B10-3).
 
 
+def test_a_kill_switch_pressed_just_before_a_reset_and_not_yet_applied_is_kept_on_the_fresh_run(store):
+    """P1-KR-2 (Head of QA): the PM's "flatten everything, then reset". The paper process applies a pause or flatten on
+    its next tick, so one pressed just before the reset was still pending when the reset was asked for; the reset put it
+    away with the old run and the fresh run traded. It is kept as the pause the paper process would have set. A system
+    flatten pending then (a clean slate's) is not a PM pause."""
+    from sleeve_fund.supervisor import Supervisor
+
+    for name in ("bn-killed", "bn-slate"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp"}, venue="binance")
+        store.set_status(name, "running")
+    store.command("bn-killed", "flatten", "Book kill switch: drawdown")  # pressed, not yet applied by the process
+    store.command("bn-slate", "flatten", "Clean slate: flattened so it can be archived", actor="system",
+                  holds_through_reset=False)
+    for name in ("bn-killed", "bn-slate"):
+        store.request_reset(name, "Test finished")  # flat: the supervisor completes it on its next pass
+    Supervisor(store, python="true").reset_pending()
+    assert store.pending_resets() == []
+    killed, slate = store.sleeve("bn-killed"), store.sleeve("bn-slate")
+    assert killed.status == "paused" and "flattened by PM: Book kill switch: drawdown" in killed.status_reason
+    assert slate.status == "stopped" and slate.desired_state == "running"
+
+
 @pytest.fixture
 def pg_store():
     import os
