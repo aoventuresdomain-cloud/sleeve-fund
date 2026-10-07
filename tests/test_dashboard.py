@@ -2380,6 +2380,39 @@ def test_a_trailing_stop_is_not_unbounded_and_open_risk_says_what_it_leaves_out(
     assert "nostop: no stop, so unbounded · rp: trailing stop, level not shown, not counted" in risk
 
 
+def test_open_risk_tile_with_only_a_trailing_position_shows_plus_warn_and_count(client):
+    """P1-U24-1 (QA probe, Advisor S9): whenever a position is left out of the Open risk sum (no stop, or a
+    trailing stop whose level isn't shown) the tile carries the "+", the warn colour and a visible count; a
+    hover-only note isn't enough. Home, Risk and Trades agree."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+
+    def tiles():
+        out = {}
+        for url in ("/", "/risk", "/trades"):
+            html = c.get(url, auth=AUTH).text
+            m = re.search(r'<div class="k">Open risk</div><div class="v([^"]*)">([^<]*)', html)
+            out[url] = (m.group(1), m.group(2)) if m else None
+        return out
+
+    for url, got in tiles().items():
+        assert got is not None, url
+        assert "warn" in got[0], url
+        assert got[1].strip().endswith("0.00+ · 1 not counted"), (url, got)
+    # A stopless position joins it: both are left out, so the count is 2.
+    store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={})
+    store.record_order("nostop", order_id="E-2", side="BUY", qty=0.05, intent="entry", reason="start")
+    store.record_fill("nostop", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-2", trade_id="t2")
+    store.record_equity("nostop", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    for url, got in tiles().items():
+        assert "warn" in got[0] and got[1].strip().endswith("+ · 2 not counted"), (url, got)
+
+
 def test_resuming_after_a_liquidation_says_it_stays_halted(client):
     """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
     resume until the PM resets it after liquidation; other halts keep their wording. Read from the journal,
