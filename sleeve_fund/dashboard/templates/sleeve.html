@@ -42,6 +42,29 @@
   {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
+{% if ral %}
+<section class="panel" aria-labelledby="ral-h">
+  <h2 id="ral-h">Reset after liquidation</h2>
+  {% if ral.incident %}
+  <p>Incident #{{ ral.incident.id }}: {{ ral.incident.message }}</p>
+  <form method="post" action="/sleeves/{{ s.name }}/incident-note">
+    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
+    <label>Why the half-liquidation stop did not protect the position <textarea name="why_stop_did_not_protect" required>{{ ral.note.message.split(': ', 2)[2] if ral.note else '' }}</textarea></label>
+    <label>Author <input name="author" required value="{{ ral.note.author if ral.note else '' }}"></label>
+    <button type="submit" class="secondary">{{ 'Update the note' if ral.note else 'Save the note' }}</button>
+  </form>
+  <form method="post" action="/sleeves/{{ s.name }}/command">
+    <input type="hidden" name="command" value="reset_after_liquidation">
+    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
+    <label>Reason <input name="reason" required></label>
+    <button type="submit" {% if not ral.note %}disabled title="Write the incident note first"{% endif %}>Reset after liquidation</button>
+    <p class="muted">It starts a new high-water mark and day baseline at the remaining equity. The book's own limits and the track record are not reset.</p>
+  </form>
+  {% else %}
+  <p>No incident has been written for this liquidation yet, so it can't be reset.</p>
+  {% endif %}
+</section>
+{% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
 {% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
 {% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}

@@ -2558,20 +2558,31 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
     assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
 
 
-def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
-    """Code review on #164 (HoE): Setup's Reset book must not put a liquidation away unanswered either. The
-    liquidated strategy is left for Reset after liquidation and named; the others reset as before."""
+def test_a_book_reset_names_a_liquidated_strategy_and_resets_only_once_the_pm_confirms_it(client):
+    """Code review on #164 (HoE), then the Advisor's U27 (6 Oct 20:41): Setup's Reset book must not put a liquidation
+    away unanswered. While a strategy is liquidated it resets nothing and names it; the PM's confirmation of that
+    list resets the whole book, writing one liquidation_reset for the liquidated strategy."""
+    from sleeve_fund.store import LIQUIDATION_RESET
+
     c, store = client
     _new(c)
     _new(c, name="btc-other")
     store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
     r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
-    assert "not_reset=btc-test" in r.headers["location"]
-    assert {x["sleeve"] for x in store.pending_resets()} == {"btc-other"}
+    assert "confirm_liquidated=btc-test" in r.headers["location"]
+    assert store.pending_resets() == []
     setup = c.get(r.headers["location"], auth=AUTH).text
-    assert "Not reset: btc-test. Its position margin was lost (liquidated)" in setup
-    assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
+    assert "These strategies lost their position margin (liquidated): btc-test" in setup
+    assert 'action="/book/reset/confirm"' in setup and 'name="liquidated" value="btc-test"' in setup
+    r = c.post("/book/reset/confirm", data={"reason": "Test finished; starting a clean run", "liquidated": "btc-other"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "reset_error" in r.headers["location"] and store.pending_resets() == []  # not the list it named
+    r = c.post("/book/reset/confirm", data={"reason": "Test finished; starting a clean run", "liquidated": "btc-test"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "reset=1" in r.headers["location"]
+    assert {x["sleeve"] for x in store.pending_resets()} == {"btc-test", "btc-other"}
+    assert [e["kind"] for e in store.events("btc-test", limit=10)].count(LIQUIDATION_RESET) == 1
 
 
 def test_a_funding_alert_tag_names_the_pair_and_no_venue(client):

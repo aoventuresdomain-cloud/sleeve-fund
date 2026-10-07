@@ -74,7 +74,7 @@ def _confirmed_book_reset(store, client, monkeypatch):
 
 # --- (1) an ordinary per-strategy Reset is refused while liquidated [U27] -----------------------------------------
 
-@pytest.mark.parametrize("via", ["dashboard", pytest.param("store", marks=xf)])
+@pytest.mark.parametrize("via", ["dashboard", "store"])
 def test_an_ordinary_reset_is_refused_while_liquidated_naming_reset_after_liquidation(store, tmp_path, client, via):
     """[U27] "an ordinary per-strategy Reset is REFUSED while a strategy is liquidated (points to reset-after-
     liquidation)": from the strategy page or the store, refused in words naming reset after liquidation; nothing is
@@ -95,7 +95,6 @@ def test_an_ordinary_reset_is_refused_while_liquidated_naming_reset_after_liquid
 
 # --- (2) a whole-book clean slate clears it only after the PM confirms the named list [U27] -----------------------
 
-@xf
 def test_a_book_reset_clears_a_liquidated_strategy_only_after_the_pm_confirms_the_named_list(store, tmp_path, client,
                                                                                              monkeypatch):
     """[U27] "A whole-book clean slate may clear it only after the PM confirms the named list of liquidated
@@ -126,7 +125,6 @@ def test_a_book_reset_clears_a_liquidated_strategy_only_after_the_pm_confirms_th
 
 # --- (3) the book reset leaves the liquidation incident open until the note [U27] ---------------------------------
 
-@xf
 def test_after_a_book_reset_the_liquidation_incident_stays_open_until_the_why_note_is_written(store, tmp_path, client,
                                                                                               monkeypatch):
     """[U27] Guard: "the book reset clears the halt but does NOT close the liquidation incident; it stays open until
@@ -142,7 +140,6 @@ def test_after_a_book_reset_the_liquidation_incident_stays_open_until_the_why_no
 
 # --- [RAL7/8] the incident closes only on the note AND the PM's acknowledgement --------------------------------------
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON78)
 @pytest.mark.parametrize("done", ["reset_after_liquidation_alone", "note_alone", "pm_ack_alone", "book_reset_and_pm_ack",
                                   "note_then_pm_ack", "pm_ack_then_note"])
 def test_the_incident_closes_only_on_the_note_and_the_pm_acknowledgement(store, tmp_path, client, monkeypatch, done):
@@ -174,7 +171,6 @@ def test_the_incident_closes_only_on_the_note_and_the_pm_acknowledgement(store, 
 
 # --- a reset pending from before a liquidation does not outlive the reset after liquidation (#167 round) -----------
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="RAL")
 def test_a_reset_pending_from_before_the_liquidation_does_not_run_after_the_reset_after_liquidation(store, tmp_path,
                                                                                                    monkeypatch):
     """Found in the #167 round (quant-review/v2-p1/ui-v2-152.md:601, on 5afb6a7): a reset pending from before a
