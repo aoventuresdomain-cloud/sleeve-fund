@@ -57,3 +57,24 @@ def test_one_fail_among_acknowledged_gaps_still_fails():
     verdict, failed, _ = _check([_liq("gapped past the stop"), _liq("missing", later)],
                                 {TS: {"note": "seen"}, later: {"note": "seen"}})
     assert verdict == "FAIL" and failed == [LIQUIDATION_CHECK]
+
+
+def test_what_a_liquidation_lost_leaves_out_a_part_of_the_position_closed_before_it():
+    """CR minor on #189 (HoE: must fix): x is the loss on the quantity the liquidation closed, at the average entry
+    with its share of the entry fee, plus its own fee; a trim taken at a profit before it is not in it."""
+    from sleeve_fund.research.study import _liquidations
+
+    t = lambda h: TS + pd.Timedelta(hours=h)  # noqa: E731
+    orders = [{"order_id": "E", "intent": "entry", "side": "BUY", "ts": t(0), "signal": {"liquidation_px": 66.6}},
+              {"order_id": "S", "intent": "stop_loss", "side": "SELL", "ts": t(0), "signal": {"trigger": 90.0}},
+              {"order_id": "T", "intent": "exit", "side": "SELL", "ts": t(1), "signal": {}},
+              {"order_id": "L", "intent": "liquidation", "side": "SELL", "ts": t(2), "signal": {}}]
+    fills = [{"id": 1, "order_id": "E", "side": "BUY", "qty": 1.0, "price": 100.0, "fee": 0.1, "ts": t(0)},
+             {"id": 2, "order_id": "T", "side": "SELL", "qty": 0.5, "price": 110.0, "fee": 0.055, "ts": t(1)},
+             {"id": 3, "order_id": "L", "side": "SELL", "qty": 0.5, "price": 67.0, "fee": 0.05, "ts": t(2)}]
+    journal = SimpleNamespace(sleeve_row=SimpleNamespace(name="s"), orders=lambda name, limit: orders,
+                              fills=lambda name, limit: fills)
+    (liq,) = _liquidations(SimpleNamespace(journal=journal), t(0), t(3), "holdout")
+    # 0.5 x (100 - 67) lost on the half liquidated, its half of the 0.1 entry fee, and the 0.05 liquidation fee;
+    # the whole position's cash flows would read 11.71, the trim's 5.00 profit netted in
+    assert liq["x"] == pytest.approx(16.6) and liq["stop_px"] == 90.0

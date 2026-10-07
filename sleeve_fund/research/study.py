@@ -20,6 +20,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.instruments import FeeSchedule, pair_of
+from sleeve_fund import markets
 from sleeve_fund.markets import PERP
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
@@ -49,7 +50,7 @@ class Fold:
     chosen: dict
     train_sharpe: float
     test: dict
-    benchmark_test: dict
+    benchmark_test: dict | None  # None: the perp hold isn't priced over this window (its funding isn't all known)
     # Round trips opened and closed inside the test window: what out-of-sample is judged on. A trip carried in
     # from training, or still open when the window ends, is left out and counted (Advisor, 5 Oct 2026).
     test_trades: int = 0
@@ -96,6 +97,7 @@ class StudyResult:
     holdout: dict | None = None
     holdout_benchmark: dict | None = None
     fee_note: str = ""
+    fee_basis: FeeSchedule | None = None  # the schedule the strategy's runs paid: its market's, or the instrument's
     notes: list[str] = field(default_factory=list)
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
     bar_minutes: int = 1440
@@ -121,6 +123,21 @@ class StudyResult:
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
+    # The buy and hold G1 compares with (Advisor, 7 Oct 2026, RE-COST): on a perpetual, a 1x long perp hold paying the
+    # perp's fees and funding, through the same engine, priced only over windows whose funding is all known.
+    # oos_compare_returns: the strategy's out-of-sample days the hold covers, what the benchmark checks compare.
+    hold_market: str = "spot"
+    hold_note: str = ""  # what the hold pays for funding, and how much of out-of-sample it covers
+    hold_insufficient: bool = False  # covers under HOLD_COVERAGE_FLOOR of the out-of-sample days: no verdict
+    hold_full_period: bool = True  # the hold covers the whole research period (the parameter-robustness check)
+    oos_compare_returns: pd.Series | None = None
+    spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
+    funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+
+    @property
+    def compare_returns(self) -> pd.Series:
+        return self.oos_returns if self.oos_compare_returns is None else self.oos_compare_returns
+
     # Every liquidation in out-of-sample (the folds' test windows) or the opened holdout, as _liquidations gives
     # them: each a G1 finding whatever the P&L (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19 (5)).
     holdout_liquidations: list = field(default_factory=list)
@@ -208,6 +225,10 @@ class LadderRung:
     sharpe: float
     round_trips: int
     fees_paid: float
+    # The random-entry benchmark at this rung's own cost (RE-COST): the strategy's out-of-sample trips priced on the
+    # bars' closes, and the median of the random draws, both paying this fee plus the rung's spread and slippage.
+    oos_timing_return: float | None = None
+    random_return: float | None = None
 
 
 def _log_growth(total_return: float) -> float:
@@ -356,6 +377,13 @@ def run_study(
         half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
     spread_used = half_spread
 
+    def paid(params: dict) -> FeeSchedule:
+        """The schedule a run with these settings pays (runner.run_backtest's own default: its market's, or the
+        instrument's). The benchmarks, the fee note and the variant's key take it too, so a perp study's strategy and
+        its random entries pay the same fee on the same trades (RE-COST)."""
+        return markets.fees_for({**params, **market}, FeeSchedule(instrument.maker_fee, instrument.taker_fee),
+                                str(instrument.id.venue))
+
     exec_minutes = bar_minutes_of(exec_prices) if exec_prices is not None and len(exec_prices) else None
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
         raise ValueError(f"{exec_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
@@ -400,7 +428,7 @@ def run_study(
         # counter line's, so folding the counter in later doesn't count it twice.
         from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash, line_id, run_setup
 
-        setup = run_setup(risk_profile=risk_profile, fee=float(instrument.taker_fee) + spread_used,
+        setup = run_setup(risk_profile=risk_profile, fee=float(paid(params).taker) + spread_used,
                           windows=(train_days, test_days, holdout_days))
         return register.record(
             definition_hash=legacy_definition_hash(spec.name, full, setup), idea_hash=legacy_idea_hash(spec.name),
@@ -411,6 +439,43 @@ def run_study(
     # Benchmark over the research period; sliced for every comparison below.
     bench = bt("buy_and_hold", research, {}, benchmark=True)
     bench_ret = daily_returns(bench.equity)
+    # A strategy on a perpetual is compared with holding that perpetual at 1x, its fees and funding paid through the
+    # same engine (Advisor, 7 Oct 2026), and only over windows whose funding is all known; holding spot is shown
+    # beside it where the venue lists spot. A perp venue's own buy and hold above is already a perp.
+    hold_market = markets.market_of({**default_params, **market})
+    perp_hold = hold_market != markets.SPOT
+
+    def hold_returns(first, last) -> pd.Series | None:
+        """The perp hold's daily returns over the bars closing first..last, or None when a funding settlement in it
+        has no known rate."""
+        if missing_funding({"market": hold_market}, instrument, first - bar, last):
+            return None
+        window = prices[(prices.index >= first - bar) & (prices.index <= last)]
+        run = bt("buy_and_hold", window, {"market": hold_market}, benchmark=True)
+        return whole_days(daily_returns(run.equity), first, bar)
+
+    hold_full_period = not perp_hold or not missing_funding({"market": hold_market}, instrument, research.index[0],
+                                                           research.index[-1])
+    if perp_hold and hold_full_period and not market:  # a spot venue: the research period's hold is the perp's too
+        bench = bt("buy_and_hold", research, {"market": hold_market}, benchmark=True)
+        bench_ret = daily_returns(bench.equity)
+    spot_ret = daily_returns(bt("buy_and_hold", research, {}, benchmark=True).equity) \
+        if perp_hold and not (profile is not None and profile.perpetual) else None
+    compare_parts, spot_parts, oos_days = [], [], [0]
+
+    def fold_benchmark(test_ret: pd.Series, first, last) -> pd.Series:
+        oos_days[0] += len(test_ret)
+        if spot_ret is not None:
+            spot_parts.append(spot_ret.reindex(test_ret.index).dropna())
+        if not perp_hold:
+            compare_parts.append(test_ret)
+            return bench_ret.reindex(test_ret.index).dropna()
+        held = hold_returns(first, last)
+        if held is None:
+            return pd.Series(dtype=float)
+        held = held.reindex(test_ret.index).dropna()
+        compare_parts.append(test_ret.reindex(held.index))
+        return held
 
     # 1. Sensitivity over the full research period.
     # The cost ladder: a variant over the research period at each fee. Not logged as variants, since the
@@ -486,17 +551,18 @@ def run_study(
             test_ret = pd.Series(0.0, index=days.index[days.index <= test_idx[-1]])
             folds.append(Fold(train_start=train.index[0], train_end=train.index[-1], test_end=test_idx[-1], chosen={},
                               train_sharpe=float("nan"), test=summary(test_ret),
-                              benchmark_test=summary(bench_ret.reindex(test_ret.index).dropna()),
+                              benchmark_test=_summary_or_none(b_ret := fold_benchmark(test_ret, test_idx[0],
+                                                                                      test_idx[-1])),
                               window_bars=len(test_idx), unscored=True, grid=pd.DataFrame(surface)))
             oos_parts.append(test_ret)
-            bench_parts.append(bench_ret.reindex(test_ret.index).dropna())
+            bench_parts.append(b_ret)
             start += test_bars
             continue
         # Trade the chosen params continuously through the test window so the
         # position carried in from training is realistic, then score only the test days.
         run = bt(spec.name, through_test, best)
         test_ret = whole_days(daily_returns(run.equity), test_idx[0], bar)  # the test window's days, not the train's
-        b_ret = bench_ret.reindex(test_ret.index).dropna()
+        b_ret = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
         folds.append(
             Fold(
                 train_start=train.index[0],
@@ -505,7 +571,7 @@ def run_study(
                 chosen=best,
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
-                benchmark_test=summary(b_ret),
+                benchmark_test=_summary_or_none(b_ret),
                 **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0]),
                 window_bars=len(test_idx),
                 in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
@@ -520,6 +586,20 @@ def run_study(
         bench_parts.append(b_ret)
         start += test_bars
 
+    run_fees = paid(chosen)
+    covered = len(pd.concat(compare_parts)) if compare_parts else 0
+    hold_insufficient = perp_hold and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
+    if perp_hold:
+        terms = markets.terms({"market": hold_market}, str(instrument.id.venue))
+        paying = (f"assumed funding of {terms.funding_rate:.2%} every settlement, as the strategy's runs pay"
+                  if terms.funding_venue is None else "the venue's settled funding")
+        hold_note = (f"buy and hold is a 1x long perpetual paying its fees and {paying}; it covers {covered} of "
+                     f"{oos_days[0]} out-of-sample days, the windows whose funding is all known")
+        if hold_insufficient:
+            hold_note += (f": insufficient funding history (under {HOLD_COVERAGE_FLOOR:.0%}), so it gives no verdict; "
+                          "random entry still judges")
+    else:
+        hold_note = ""
     result = StudyResult(
         spec=spec,
         dataset=dataset,
@@ -534,6 +614,12 @@ def run_study(
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
+        oos_compare_returns=pd.concat(compare_parts) if compare_parts else pd.Series(dtype=float),
+        spot_hold_returns=pd.concat(spot_parts) if spot_parts else None,
+        hold_market=hold_market,
+        hold_full_period=hold_full_period,
+        hold_note=hold_note,
+        hold_insufficient=hold_insufficient,
         instrument=pair_of(instrument),
         bar_minutes=minutes,
         venue=str(instrument.id.venue),
@@ -547,16 +633,35 @@ def run_study(
         ladder_slippage=slip,
         chosen_params=chosen,
         breakeven=breakeven,
-        fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
+        fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
-                  "that take liquidity"),
+                  f"that take liquidity; break-even: {breakeven}"),
+        fee_basis=run_fees,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
     leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(instrument.taker_fee) + spread_used, full_default.shorts,
+        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts,
         leverage, market.get("market"))
+    for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
+        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False, leverage,
+                                 market.get("market"))
+        if at_rung.trades:
+            rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
+    if hold_market == markets.PERP and not market:
+        # A simulated perp's funding is an assumed 0.01% a settlement, light in strong uptrends: the research period
+        # again with funding at FUNDING_STRESS_RATE, strategy and hold alike (Advisor, 7 Oct 2026).
+        def ret(name: str, params: dict, benchmark: bool = False) -> float:
+            eq = bt(name, research, params, benchmark=benchmark).equity
+            return float(eq.iloc[-1] / starting_capital - 1) if len(eq) else 0.0
+
+        stress = {"market": markets.PERP_FUNDING_STRESS}
+        result.funding_stress = {
+            "rate": markets.FUNDING_STRESS_RATE, "assumed": markets.LOW_FEE_PERP.funding_rate,
+            "strategy": (ret(spec.name, chosen), ret(spec.name, {**chosen, **stress})),
+            "hold": (ret("buy_and_hold", {"market": hold_market}, True), ret("buy_and_hold", stress, True)),
+        }
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "
@@ -636,12 +741,18 @@ def run_study(
         chosen = folds[-1].chosen
         try:
             run = bt(spec.name, prices, chosen)
-            b_all = bt("buy_and_hold", prices, {}, benchmark=True)
             h_start = prices.index[-holdout_bars]
             h_ret = whole_days(daily_returns(run.equity), h_start, bar)
-            hb_ret = whole_days(daily_returns(b_all.equity), h_start, bar)
             result.holdout = summary(h_ret)
-            result.holdout_benchmark = summary(hb_ret)
+            if perp_hold:
+                hb_ret = hold_returns(h_start, prices.index[-1])
+                result.holdout_benchmark = None if hb_ret is None else _summary_or_none(hb_ret)
+                if hb_ret is None:
+                    result.notes.append("The holdout has no buy-and-hold line: a funding settlement in it has no "
+                                        "known rate, and a missing rate is never filled in.")
+            else:
+                b_all = bt("buy_and_hold", prices, {}, benchmark=True)
+                result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
             result.holdout_liquidations = _liquidations(run, h_start, prices.index[-1], "holdout")
         except Exception:
             if locks is not None:
@@ -663,11 +774,12 @@ STOP_GAPPED = "gapped past the stop"
 
 def _liquidations(run: BacktestResult, start, end, window: str) -> list[dict]:
     """Every liquidation whose fill landed in [start, end] of this run, from its journal, as {window, ts, x,
-    stop_px, stop_ok, stop_why, needs_ack}. x: what it lost, the position's cash flows from its first fill (exactly
-    the margin plus the entry and liquidation fees, GAP-LIQ-CAP). The stop: the position's protective stop, the last
-    closing-side order with a trigger journaled while it was held. A gap past a stop within half the distance to
-    liquidation needs the PM's acknowledgement for G1; a missing stop, or one beyond half way, is a G1 FAIL with no
-    override (Independent Quant Advisor 7 Oct 00:19 (5))."""
+    stop_px, stop_ok, stop_why, needs_ack}. x: what the liquidation lost on the quantity it closed, at the average
+    entry price with that quantity's share of the entry fees, plus its own fee (exactly the margin plus the entry
+    and liquidation fees, GAP-LIQ-CAP); a part of the position closed earlier, at a profit or a loss, is not in it.
+    The stop: the position's protective stop, the last closing-side order with a trigger journaled while it was
+    held. A gap past a stop within half the distance to liquidation needs the PM's acknowledgement for G1; a missing
+    stop, or one beyond half way, is a G1 FAIL with no override (Independent Quant Advisor 7 Oct 00:19 (5))."""
     j = getattr(run, "journal", None)
     if j is None or j.sleeve_row is None:
         return []
@@ -675,23 +787,33 @@ def _liquidations(run: BacktestResult, start, end, window: str) -> list[dict]:
     orders = {o["order_id"]: o for o in j.orders(name, limit=1_000_000)}
     fills = sorted(j.fills(name, limit=1_000_000), key=lambda f: (_utc(f["ts"]), f.get("id") or 0))
     lo, hi = _utc(start), _utc(end)
-    out, held, flows, opened, entry, entry_px, seen = [], 0.0, 0.0, None, None, None, set()
+    found: dict[str, dict] = {}
+    held, avg, fee_unit, opened, entry, entry_px = 0.0, 0.0, 0.0, None, None, None
     for f in fills:
-        side = 1 if f["side"] == "BUY" else -1
+        side, qty, px, fee = (1 if f["side"] == "BUY" else -1), float(f["qty"]), float(f["price"]), float(f["fee"])
         o = orders.get(f["order_id"], {})
         if abs(held) < 1e-12:
-            opened, entry, entry_px, flows = _utc(f["ts"]), o, float(f["price"]), 0.0
-        held += side * float(f["qty"])
-        flows += -side * float(f["qty"]) * float(f["price"]) - float(f["fee"])
-        if o.get("intent") == "liquidation" and f["order_id"] not in seen and lo <= _utc(f["ts"]) <= hi:
-            seen.add(f["order_id"])
-            out.append({"window": window, "ts": _utc(f["ts"]), "order_id": f["order_id"], "opened": opened,
-                        "entry": entry, "entry_px": entry_px, "closing_side": f["side"]})
-        if abs(held) < 1e-9:
-            for liq in out:
-                if liq.get("opened") == opened and "x" not in liq:
-                    liq["x"] = round(-flows, 2)
-    return [_judged(liq, orders) for liq in out]
+            held, avg, fee_unit, opened, entry, entry_px = 0.0, 0.0, 0.0, _utc(f["ts"]), o, px
+        if held == 0 or side * held > 0:  # opening or adding: the average entry and the entry fees per unit
+            avg = (abs(held) * avg + qty * px) / (abs(held) + qty)
+            fee_unit = (abs(held) * fee_unit + fee) / (abs(held) + qty)
+            held += side * qty
+            continue
+        closed = min(qty, abs(held))  # reducing, at most to flat (a fill past flat opens the rest the other way)
+        if o.get("intent") == "liquidation" and lo <= _utc(f["ts"]) <= hi:
+            liq = found.setdefault(f["order_id"], {"window": window, "ts": _utc(f["ts"]), "order_id": f["order_id"],
+                                                   "opened": opened, "entry": entry, "entry_px": entry_px,
+                                                   "closing_side": f["side"], "x": 0.0})
+            held_sign = 1 if held > 0 else -1
+            liq["x"] += held_sign * closed * (avg - px) + closed * fee_unit + fee * closed / qty
+        held += side * qty
+        if abs(held) < 1e-12 or side * held > 0:  # flat, or reversed: the rest is a new position from this fill
+            rest = abs(held) if side * held > 0 else 0.0
+            held, avg, fee_unit = side * rest, px, (fee / qty if rest else 0.0)
+            opened, entry, entry_px = (_utc(f["ts"]), o, px) if rest else (None, None, None)
+    for liq in found.values():
+        liq["x"] = round(liq["x"], 2)
+    return [_judged(liq, orders) for liq in found.values()]
 
 
 def _judged(liq: dict, orders: dict) -> dict:
@@ -772,6 +894,33 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_pe
     entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
     side = random_side(closes, placed, windows, cost_per_side) if shorts else None
     return entry, side
+
+
+HOLD_COVERAGE_FLOOR = 0.5  # the share of out-of-sample days a perp hold must cover to judge (Advisor, 7 Oct 2026)
+
+
+def _summary_or_none(returns: pd.Series) -> dict | None:
+    return summary(returns) if len(returns.dropna()) >= 2 else None
+
+
+def missing_funding(params: dict, instrument, after: pd.Timestamp, until: pd.Timestamp, root=None) -> int | None:
+    """How many funding settlements in (after, until] a perpetual hold on the strategy's market has no settled rate
+    for: None when the market is spot, 0 for a simulated perp, which charges its terms' fixed rate as its runs do.
+    The perp buy and hold is priced only over a window with none missing; a missing rate is never filled in
+    (Advisor, 7 Oct 2026)."""
+    from datetime import timedelta
+
+    from sleeve_fund import funding
+
+    terms = markets.terms(params, str(instrument.id.venue))
+    if terms is None:
+        return None
+    if terms.funding_venue is None:
+        return 0
+    series = funding.rates(terms.funding_venue, pair_of(instrument), root)
+    due = markets.funding_times(_utc(after).to_pydatetime(), _utc(until).to_pydatetime(),
+                                terms.funding_hours)
+    return sum(funding.rate_at(series, pd.Timestamp(t)) is None for t in due)
 
 
 def _utc(ts) -> pd.Timestamp:

@@ -369,6 +369,11 @@ window.Console = (() => {
     const candles = chart.addCandlestickSeries({upColor: css("--gain"), downColor: css("--loss"), borderVisible: false, wickUpColor: css("--gain"), wickDownColor: css("--loss")});
     // Candles built from the sleeve's own marks have no range inside the bar, so they draw as a line instead.
     const area = chart.addAreaSeries({lineColor: accent, topColor: rgba(accent, 0.22), bottomColor: rgba(accent, 0), lineWidth: 2, visible: false});
+    // Candles before the model's indicators have settled are shaded, drawn from the recorded points; trades there are marked unsettled.
+    const warmBand = chart.addAreaSeries({priceScaleId: "warm", lineColor: rgba(css("--muted"), 0), lineWidth: 1, topColor: rgba(css("--muted"), 0.16),
+      bottomColor: rgba(css("--muted"), 0.16), lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+      autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
+    chart.priceScale("warm").applyOptions({scaleMargins: {top: 0, bottom: 0}, visible: false});
     const vol = chart.addHistogramSeries({priceScaleId: "vol", color: rgba(css("--muted"), 0.3), priceFormat: {type: "volume"}, lastValueVisible: false, priceLineVisible: false});
     chart.priceScale("vol").applyOptions({scaleMargins: {top: 0.86, bottom: 0}});
     let main = candles;
@@ -376,10 +381,14 @@ window.Console = (() => {
 
     // Indicators: config is the saved list; built holds each one's series and, for oscillators, its strip.
     let config = loadInd(), built = [];
+    // The strategy's own indicator values (P1-3s): drawn as the platform recorded them, never recomputed here.
+    // Each is a synthetic LIB entry reading the latest payload, so the legend, strips and crosshair are the menu's.
+    let strat = [], stratData = {}, built_sig = "";
+    const off = new Set(), extra = new Set();  // lines hidden by the PM; lines the platform didn't show by default but the PM asked for
     let syncing = false, mirroring = false;
     const quiet = {priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false};
     const colorOf = (c) => (c.color && /^#[0-9a-f]{6}$/i.test(c.color) ? c.color : css(PALETTE[0]));
-    const labelOf = (c) => `${LIB[c.type].short} ${c.p.join(", ")}`;
+    const labelOf = (c) => `${LIB[c.type].short} ${c.p.join(", ")}`.trim();
     const strips = () => built.filter((b) => b.chart !== chart);
     const teardown = () => {
       built.forEach((b) => { if (b.chart === chart) b.series.forEach((s) => chart.removeSeries(s)); else { b.chart.remove(); b.box.remove(); } });
@@ -387,7 +396,7 @@ window.Console = (() => {
     };
     const build = () => {
       teardown();
-      config.forEach((c) => {
+      config.concat(strat).forEach((c) => {
         const def = LIB[c.type], color = colorOf(c);
         let target = chart, wrap = null, legend = null;
         if (def.pane) {
@@ -402,6 +411,7 @@ window.Console = (() => {
         const series = shape.map((ln) => (ln.hist
           ? target.addHistogramSeries({...quiet, priceFormat: {type: "price", precision: def.pane?.digits ?? 2, minMove: 0.01}})
           : target.addLineSeries({...quiet, color: rgba(color, ln.alpha ?? 1), lineWidth: def.pane ? 1.5 : 1.5, lineStyle: ln.style || 0,
+              ...(ln.steps ? {lineType: 1} : {}),  // a recorded value holds from one close to the next; never a line between closes the model didn't see
               ...(def.pane && def.pane.min != null ? {autoscaleInfoProvider: () => ({priceRange: {minValue: def.pane.min, maxValue: def.pane.max}})} : {})})));
         if (def.pane) (def.pane.guides || []).forEach((g) => series[series.length - 1].createPriceLine({price: g, color: css("--line-strong"), lineWidth: 1, lineStyle: 2, axisLabelVisible: false}));
         built.push({c, def, color, series, chart: target, box: wrap, legend, vals: []});
@@ -433,6 +443,76 @@ window.Console = (() => {
       if (!r || syncing) return;
       syncing = true; strips().forEach((b) => b.chart.timeScale().setVisibleLogicalRange(r)); syncing = false;
     });
+    // The recorded points (t = the bar's close, UTC seconds) laid on this chart's candles. A candle on the strategy's
+    // own size takes the point stamped at its close; a slower filter (tf) steps forward from its last point.
+    const stratLines = (key) => {
+      const ind = stratData[key], none = [{vals: [], steps: true}, {vals: [], style: 2, alpha: 0.45, steps: true}];
+      if (!ind || !data) return none;
+      const iv = data.interval * 60, pts = ind.points.filter((p) => typeof p[1] === "number").sort((a, b) => a[0] - b[0]);
+      const exact = new Map(pts.map((p) => [p[0], p[1]]));
+      let j = -1, last = null;
+      const at = data.candles.map((c) => {
+        const close = c.time + iv;
+        if (!ind.tf) return exact.has(close) ? [close, exact.get(close)] : null;
+        while (j + 1 < pts.length && pts[j + 1][0] <= close) { j++; last = pts[j]; }
+        return last;
+      });
+      const from = ind.settled_from == null ? -Infinity : ind.settled_from;
+      const warm = at.map((p) => (p && p[0] < from ? p[1] : null));
+      // The dashed part reaches the first settled point, so the two parts join with no gap at the seam.
+      const seam = at.findIndex((p) => p && p[0] >= from);
+      if (seam > 0 && warm[seam - 1] != null) warm[seam] = at[seam][1];
+      return [{vals: at.map((p) => (p && p[0] >= from ? p[1] : null)), steps: true}, {vals: warm, style: 2, alpha: 0.45, steps: true}];
+    };
+    const syncStrategy = (d) => {
+      const all = (d.indicators || []).filter((i) => i.kind !== "marker");
+      // The platform marks what the strategy's rules read (shown); the rest are listed and drawn only when asked for.
+      const list = all.filter((i) => i.shown !== false || extra.has(i.key));
+      const more = all.filter((i) => i.shown === false && !extra.has(i.key));
+      stratData = Object.fromEntries(list.map((i) => [i.key, i]));
+      // What the panes were built from: a settings change keeps the keys but changes labels, levels and groups.
+      const sig = (i) => `${i.key}|${i.pane}|${i.label}|${i.group || ""}|${JSON.stringify(i.levels || [])}`;
+      const keys = list.map(sig).join(",");
+      if (keys !== built_sig) {
+        built_sig = keys;
+        strat.forEach((s) => delete LIB["s:" + s.key]);
+        // Lines of one group (Bollinger's mid, upper and lower) share a colour, so they read as one indicator.
+        const hues = new Map();
+        const hue = (i, n) => (i.group ? (hues.has(i.group) ? hues.get(i.group) : (hues.set(i.group, n), n)) : n);
+        strat = list.map((i, n) => {
+          LIB["s:" + i.key] = {name: i.label, short: i.label, params: [], lines: () => stratLines(i.key),
+            ...(i.pane === "lower" ? {pane: {digits: 2, guides: i.levels || []}} : {})};
+          return {type: "s:" + i.key, key: i.key, pane: i.pane, p: [], color: css(PALETTE[(hue(i, n) + 3) % PALETTE.length])};
+        });
+        build();
+      }
+      // The span before the model's own lines (not ones the PM added) have settled is shaded; trades there are marked unsettled.
+      const iv = d.interval * 60, settled = list.filter((i) => i.shown !== false).map((i) => i.settled_from).filter(Number.isFinite);
+      const until = settled.length ? Math.max(...settled) : null;
+      const shaded = until == null ? [] : d.candles.filter((c) => c.time + iv < until).map((c) => ({time: c.time, value: 1}));
+      warmBand.setData(shaded); $(".pc-canvas").dataset.warm = String(shaded.length);
+      // Plain words about what is drawn: warm-up, a candle size the points don't sit on, and the lines left off.
+      const note = $(".pc-strat-note"), offered = $(".pc-strat-more");
+      if (!note) return;
+      const said = [];
+      list.forEach((i) => {
+        // The candle size the points sit on is their commonest gap (a trimmed or gappy series still has one).
+        const ts = i.points.map((p) => p[0]).filter(Number.isFinite), gaps = ts.slice(1).map((x, k) => x - ts[k]).sort((a, b) => a - b);
+        const gap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+        if (gap && !i.tf && gap !== d.interval * 60) said.push(`${i.label} is recorded on ${Math.round(gap / 60)}-minute candles, so it shows only on that interval.`);
+      });
+      if (until != null && d.candles.some((c) => c.time + iv < until)) said.push("Shaded: the model's indicators were still warming up; any trade here is marked unsettled. Dashed lines were not settled.");
+      if (d.indicators_note) said.unshift(d.indicators_note);  // the platform's own sentence when it has nothing to draw
+      note.textContent = said.join(" "); note.hidden = !said.length;
+      if (offered) {
+        offered.replaceChildren(...(more.length ? [el("span", null, "Also recorded, not drawn: ")] : []), ...more.map((i) => {
+          const b = el("button", "secondary", i.label); b.type = "button";
+          b.addEventListener("click", () => { extra.add(i.key); syncStrategy(data); fill(); });
+          return b;
+        }));
+        offered.hidden = !more.length;
+      }
+    };
     const fill = () => {
       const t = data.candles.map((c) => c.time);
       const k = {close: data.candles.map((c) => c.close), high: data.candles.map((c) => c.high), low: data.candles.map((c) => c.low),
@@ -446,6 +526,7 @@ window.Console = (() => {
             : ln.vals.map((v, i) => (v == null ? {time: t[i]} : ln.hist ? {time: t[i], value: v, color: rgba(v >= 0 ? css("--gain") : css("--loss"), 0.5)} : {time: t[i], value: v}));
           b.series[j].setData(pts);
         });
+        if (b.c.key) b.series.forEach((s) => s.applyOptions({visible: !off.has(b.c.key)}));
         if (b.chart !== chart) b.chart.applyOptions({timeScale: {timeVisible: data.interval < 1440, secondsVisible: false}});
       });
       const r = chart.timeScale().getVisibleLogicalRange();
@@ -464,6 +545,10 @@ window.Console = (() => {
     };
     const tag = (b, i) => {
       const sp = el("span"), sw = el("i"); sw.style.background = b.color;
+      if (b.c.key) {  // a recorded line: click its legend entry to hide or show it
+        sp.style.cursor = "pointer"; sp.title = "Click to hide or show"; sp.style.opacity = off.has(b.c.key) ? "0.4" : "1";
+        sp.addEventListener("click", () => { off.has(b.c.key) ? off.delete(b.c.key) : off.add(b.c.key); b.series.forEach((s) => s.applyOptions({visible: !off.has(b.c.key)})); legends(-1); });
+      }
       sp.append(sw, labelOf(b.c) + "  ", el("b", null, valueText(b, i)));
       return sp;
     };
@@ -540,6 +625,56 @@ window.Console = (() => {
     document.addEventListener("click", (e) => pops.forEach((p) => { if (!p.pop.hidden && !p.pop.contains(e.target) && !p.btn.contains(e.target)) p.set(false); }));
     box.addEventListener("keydown", (e) => { if (e.key === "Escape") pops.forEach((p) => { if (!p.pop.hidden) { p.set(false); p.btn.focus(); } }); });
 
+    // Decisions the strategy recorded (P1-3m): a thin link from each fill back to the candle whose close made the
+    // decision, and a hollow circle where the conditions held but nothing was entered. Drawn only on candles that
+    // have closed, from the recorded rows, never inferred.
+    const decide = {rows: [], iv: 0, drawn: {fills: 0, missed: 0}};
+    const decisionView = (series) => ({
+      zOrder: () => "top",
+      renderer: () => ({draw: (target) => target.useMediaCoordinateSpace(({context: g}) => {
+        if (main !== series || !data) return;
+        const ts = chart.timeScale(), by = new Map(data.candles.map((c) => [c.time, c]));
+        const opens = data.candles.map((c) => c.time);
+        const x = (t) => ts.timeToCoordinate(t), y = (v) => series.priceToCoordinate(v);
+        g.save(); g.lineWidth = 1.5;
+        decide.rows.forEach((r) => {
+          const sig = by.get(r.signal_t - decide.iv); if (!sig) return;
+          const sx = x(sig.time), sy = y(sig.close);
+          if (sx == null || sy == null) return;
+          if (r.kind === "fill") {
+            const open = opens.filter((o) => o <= r.t).pop(), fx = open == null ? null : x(open), fy = y(r.price);
+            if (fx == null || fy == null) return;
+            g.strokeStyle = rgba(css("--muted"), 0.8); g.setLineDash([3, 3]);
+            g.beginPath(); g.moveTo(sx, sy); g.lineTo(fx, fy); g.stroke();
+          } else {
+            const up = r.side === "sell", py = up ? y(sig.high) - 12 : y(sig.low) + 12;
+            g.setLineDash([]); g.strokeStyle = css(up ? "--loss" : "--gain");
+            g.beginPath(); g.arc(sx, py, 5, 0, Math.PI * 2); g.stroke();
+          }
+        });
+        g.restore();
+      })}),
+    });
+    const decisionPrim = (series) => { const v = decisionView(series); let req = null;
+      return {attached: (p) => { req = p.requestUpdate; decide.redraw = () => req && req(); }, detached: () => {}, paneViews: () => [v], updateAllViews: () => {}}; };
+    candles.attachPrimitive(decisionPrim(candles)); area.attachPrimitive(decisionPrim(area));
+    const syncDecisions = (d) => {
+      const iv = d.interval * 60, last = d.candles.length ? d.candles[d.candles.length - 1].time : 0;
+      const opens = new Set(d.candles.map((c) => c.time)), now = Date.now() / 1000;
+      decide.iv = iv;
+      decide.rows = (d.decisions || []).filter((r) => r && Number.isFinite(r.signal_t) && r.signal_t <= now && opens.has(r.signal_t - iv)
+        && (r.kind === "missed" || (r.kind === "fill" && Number.isFinite(r.t) && Number.isFinite(r.price) && r.t <= now)));
+      decide.drawn = {fills: decide.rows.filter((r) => r.kind === "fill").length, missed: decide.rows.filter((r) => r.kind === "missed").length};
+      $(".pc-canvas").dataset.decisions = JSON.stringify(decide.drawn);
+      // Recorded on the strategy's own candles: on another size they don't line up, so say why none show.
+      if (d.decisions && d.decisions.length && !decide.rows.length) {
+        const note = $(".pc-strat-note");
+        note.textContent = `${note.textContent} Entries and missed entries were recorded on the strategy's own candles, so they show only on that interval.`.trim();
+        note.hidden = false;
+      }
+      if (decide.redraw) decide.redraw();
+    };
+
     const showNote = (ids) => {
       const note = $(".pc-note");
       note.replaceChildren();
@@ -558,6 +693,18 @@ window.Console = (() => {
       });
       note.hidden = !note.childElementCount;
     };
+    // The reason for each entry that did not happen on a candle, in the platform's words.
+    const showMissed = (rows) => {
+      const note = $(".pc-note");
+      note.replaceChildren();
+      rows.forEach((r) => {
+        const block = el("div", "why-block");
+        block.append(el("div", "k", `No ${r.side} entry · ${new Date(r.signal_t * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC`));
+        block.append(el("p", null, r.reason || "Not recorded."));
+        note.append(block);
+      });
+      note.hidden = !rows.length;
+    };
     let current = "", pair = "";
     const marksNote = $(".pc-source").textContent;
     const render = (d, keepView = false) => {
@@ -575,7 +722,13 @@ window.Console = (() => {
       vol.setData(hasVol ? d.volume : []);
       // Keep the candles clear of the volume band when there is one.
       chart.priceScale("right").applyOptions({scaleMargins: {top: 0.08, bottom: hasVol ? 0.18 : 0.06}});
-      main.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")})));
+      // Markers the strategy recorded (an RSI divergence), at the candle its bar closed on, beside the trades' arrows.
+      const iv = d.interval * 60, opens = new Set(d.candles.map((c) => c.time));
+      const recorded = (d.indicators || []).filter((i) => i.kind === "marker").flatMap((i) => i.points
+        .filter(([ts]) => opens.has(ts - iv)).map(([ts, v]) => ({time: ts - iv, position: v === "bull" ? "belowBar" : "aboveBar", shape: "circle",
+          color: v === "bull" ? css("--gain") : css("--loss"), text: i.label})));
+      main.setMarkers(d.markers.map((m) => ({...m, color: m.position === "belowBar" ? css("--gain") : css("--loss")}))
+        .concat(recorded).sort((a, b) => a.time - b.time));
       lines.forEach((l) => main.removePriceLine(l));
       lines = d.lines.map((l) => main.createPriceLine({price: l.price, title: l.title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
         color: l.kind === "stop" ? css("--loss") : l.kind === "target" ? css("--gain") : accent}));
@@ -587,6 +740,8 @@ window.Console = (() => {
         return r;
       }});
       if (!keepView) chart.timeScale().fitContent();
+      syncStrategy(d);
+      syncDecisions(d);
       fill();
       $(".pc-source").hidden = d.source !== "marks" && !d.note;
       $(".pc-source").textContent = d.note || marksNote;
@@ -680,7 +835,9 @@ window.Console = (() => {
       if (!data || !p.time) return;
       const ids = p.hoveredObjectId && data.notes[p.hoveredObjectId] ? [p.hoveredObjectId]
         : data.markers.filter((m) => m.time === p.time).map((m) => m.id);
-      if (ids.length) showNote(ids);
+      if (ids.length) { showNote(ids); return; }
+      const missed = decide.rows.filter((r) => r.kind === "missed" && r.signal_t - decide.iv === p.time);
+      if (missed.length) showMissed(missed);
     });
     build();
     load("");
