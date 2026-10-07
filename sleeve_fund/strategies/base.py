@@ -2547,7 +2547,14 @@ class LongFlatStrategy(Strategy):
         """Paper: a replay found the venue's order closed the position at `closed`, but a settlement after it was
         already charged (held past FUNDING_DEFER_MAX). Journal it as funding_charged_while_flat, which fills-against-
         model counts, and reverse it with a separate correcting entry at the same settlement time; the original row is
-        never edited (Advisor 7 Oct 00:40). A settlement already corrected nets to zero and is left alone."""
+        never edited (Advisor 7 Oct 00:40). A settlement already corrected nets to zero and is left alone. Only a
+        perp whose funding was settled past `closed` (this process, or the journal's last row before a restart) can
+        have one."""
+        since = self._funding_since
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        if not self._margin or since is None or since <= closed:
+            return
         store = self.runtime.store
         net: dict = {}
         for r in store.funding(self.runtime.name):
