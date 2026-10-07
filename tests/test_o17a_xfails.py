@@ -93,6 +93,24 @@ from sleeve_fund import funding
 # (QA 7 Oct 08:15, DA). The open-risk limit has its own pins in the gate 5 masters.
 pytestmark = pytest.mark.no_open_risk_limit(reason="funding mechanics with a stopless perp; open-risk limit pinned in gate 5")
 
+
+@pytest.fixture(autouse=True)
+def _no_1m_lifted(monkeypatch):
+    """#178 (D13): a daily-bars perp study has a resting exit (the liquidation price), so G1 marks it NOT JUDGED for
+    "no 1-minute execution data" and its funding verdicts are never read. Lift only that reason, so these cells judge
+    funding alone; every other not-judged reason stands. A no-op before #178."""
+    try:
+        from sleeve_fund.research import study
+    except Exception:
+        return
+    no_1m = getattr(study, "NO_1M", None)
+    prop = getattr(getattr(study, "StudyResult", None), "not_judged", None)
+    if no_1m and isinstance(prop, property):
+        def _not_judged(self, _get=prop.fget):
+            why = _get(self)
+            return "" if why.startswith(no_1m) else why
+        monkeypatch.setattr(study.StudyResult, "not_judged", property(_not_judged))
+
 REASON = "QA O17a: not built yet (Advisor 17:52)"
 REASON_EPISODE = "O17a-EPISODE follow-up (Advisor 06:28/06:30 episode rulings; HoE 06:30): not in #163"
 xfail = pytest.mark.xfail(strict=True, reason=REASON)

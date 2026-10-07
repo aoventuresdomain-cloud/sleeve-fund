@@ -45,6 +45,8 @@ OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces 
 EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
 # Exits after which the side they closed isn't entered again until the signal has moved off it (_exit_lock).
 LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
+# The resting stops a backtest keeps: the model's own, and the risk guard's (_rest_risk_stop).
+STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liquidation")
 MINUTE_NS = 60_000_000_000
 DAY_NS = 86_400_000_000_000
 SAFETY_STOP_SHARE = 0.5  # of the way from the mark to the liquidation price (_safety_stop_on_restore)
@@ -342,6 +344,7 @@ class LongFlatConfig(StrategyConfig):
         market: str = markets.SPOT,
         allow_short: bool = False,
         demo_mirror: bool = False,
+        trade_from: int | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -420,6 +423,10 @@ class LongFlatConfig(StrategyConfig):
                                  f"({cost:.2%}), so every target hit would lose money")
         self.instrument_id = instrument_id
         self.bar_type = bar_type
+        # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
+        # flat (Advisor, P1-D13 19:00 and 19:16). The bars before it only warm the model up: its indicators and its own
+        # state move on, so a crossover rule still waits for its next cross after it.
+        self.trade_from = trade_from
         # Leave room for the taker fee and rounding so a full-size buy never rejects.
         self.cash_buffer = cash_buffer
         # Hard cap on the quote-currency value of any single buy (sleeve budget).
@@ -656,6 +663,13 @@ class LongFlatStrategy(Strategy):
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
         self.fee_model = None
+        # Backtests on bars only, or on execution bars longer than a minute: what traded first inside a bar is unknown,
+        # so resting exits are booked pessimistically (ScheduleFeeModel.exit_price) and the result is labelled when that
+        # was relied on (P1-D13). Set by the runner.
+        self.pessimistic = False
+        self._entry_fill_ns = None  # when the position last opened or added (a resting entry may fill inside a bar)
+        self._book_stop_at = None  # an entry stopped out inside its own bar: the price its stop-out is booked at
+        self._book_at: dict[str, float] = {}  # those stop-outs' orders and their prices, for the fee model
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -1062,6 +1076,10 @@ class LongFlatStrategy(Strategy):
         daily-loss pause fires within the decision bar, as paper's 30-second ticks would."""
         self._snap_settlements(bar.ts_event, bar.close.as_double())
         self._last_close = bar.close.as_double()
+        if self.pessimistic:
+            self._levels_in_bar(bar)
+            if self._stopped_in_entry_bar(bar):
+                return
         if self._margin:
             self._intrabar_guard(bar)
         if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
@@ -2436,6 +2454,13 @@ class LongFlatStrategy(Strategy):
             self._end_late_run()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        if self.pessimistic and self._exec_type is None:
+            self._levels_in_bar(bar)
+            if self._stopped_in_entry_bar(bar):
+                return
+        if self._cfg.trade_from is not None and bar.ts_event < self._cfg.trade_from:
+            self.want_side(bar) if self._margin else self.target_weight(bar)  # seen, never traded
+            return
         if self._margin and self._backtest and self._exec_type is None:
             # Fed only the bars it decides on, a backtest on a perp still judges each bar at its worst price
             # (_on_exec_bar does it for every shorter execution bar), as paper judges every trade.
@@ -2829,6 +2854,9 @@ class LongFlatStrategy(Strategy):
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
+        if intent == "stop_loss" and self._book_stop_at is not None and not maker:
+            self._book_at[coid], self._book_stop_at = self._book_stop_at, None
+            signal["booked_at"] = round(self._book_at[coid], 8)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self._unsettled():
             # Decided before the model's indicators could have settled: kept as the model trades it, and flagged.
@@ -3921,7 +3949,9 @@ class LongFlatStrategy(Strategy):
                     "liquidation_cut": "the cut before liquidation"}[intent]
             d.update(journaled=True, signal={"trigger": round(level, 8), "kind": intent},
                      reason=(f"Risk stop: rested a {word} at {level:,.6g}, where {what} acts on the open {held} "
-                             "(re-priced each bar); fills at that level, or the open if the price gaps through"))
+                             "(re-priced each bar); fills at that level, or the open if the price gaps through"
+                             + ("; on bars that can't show what traded first, at the bar's worst price"
+                                if self.pessimistic else "")))
         intent = d["intent"]
         self.runtime.on_order(order_id=str(order.client_order_id), side=word.upper(), qty=float(order.quantity),
                               intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP")
@@ -4675,6 +4705,14 @@ class LongFlatStrategy(Strategy):
             charged, fee = fee, (fee * book / px if px else fee)
             self._cash_adj += sign * qty * (px - book) + (charged - fee)  # the fee too, as journaled (QA P1-D25)
             px = book
+        queued = self.fee_model.booked_fills.get(coid) if self.fee_model is not None else None
+        booked = queued.pop(0) if queued else None
+        if booked is not None and not book:
+            # A backtest's taker fill, booked by the fee model at the ask or bid, or a resting stop with its slippage
+            # (ScheduleFeeModel.exit_price): the journal keeps the price it was booked at and the rest of the charge as
+            # the fee (the venue's, with the rounding carried from earlier fees), as the fills report does
+            # (runner._spread_into_prices).
+            px, fee = booked[0], fee - booked[1]
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
@@ -4707,6 +4745,13 @@ class LongFlatStrategy(Strategy):
         if opening:  # minutes before this fill are no one's to replay for this position
             self._replayed_to = max(self._replayed_to, int(event.ts_event))
         if opening:
+            self._entry_fill_ns = self.clock.timestamp_ns()
+            if self._has_exits and self._stop_frac is None and not self._tp_frac:
+                # A resting entry (not sent by _open, which plans before it sends): its exits are planned from its fill,
+                # so its stop rests the moment it fills, as an entry at market's does.
+                plan = self._plan_exits(px, self._entry_side or sign)
+                if plan is not None:
+                    self._stop_frac, self._tp_frac, self._stop_basis = plan
             self._gated_fill(coid, qty, px)
         self._sync_watched_stop()  # an add or a partial close resizes the journal's stop in the same step (QA)
         if self._backtest:
@@ -4810,7 +4855,9 @@ class LongFlatStrategy(Strategy):
         gaps through it. A flatten cancels it first (_sell_all). The target doesn't rest: within a bar the adverse
         side trades first (Advisor NA-2), so the venue takes the stop on the bar and the target is judged after it,
         on what the bar left (_bar_target). The open trades before either: a stop filled in a bar that opened through
-        the target is booked as the target (ScheduleFeeModel.open_targets, _rebook_as_target)."""
+        the target is booked as the target (ScheduleFeeModel.open_targets, _rebook_as_target). The fee model books the
+        stop with its slippage, and on bars that can't show what traded first inside them, at the bar's worst price
+        (ScheduleFeeModel.exit_price, P1-D13)."""
         cfg = self._cfg
         plan = {"stop_loss": self._stop_frac}
         # A stop moved from the market can sit at the entry price (0) or past it, in profit (below 0).
@@ -4850,7 +4897,8 @@ class LongFlatStrategy(Strategy):
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
                 f"the {self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
-                + "; fills at that level, or the open if the price gaps through",
+                + "; fills at that level, or the open if the price gaps through"
+                + ("; on bars that can't show what traded first, at the bar's worst price" if self.pessimistic else ""),
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8),
                  **self._liq_signal()}))
         for order, intent, kind, reason, signal in orders:
@@ -4862,6 +4910,83 @@ class LongFlatStrategy(Strategy):
             self._open_target(str(order.client_order_id))
             self._sent.append(order.client_order_id)
             self.submit_order(order)
+
+    def submit_order(self, order, *args, **kwargs) -> None:
+        """Nothing reaches the venue before trade_from, whatever sends it (a model's own resting entry too): a study's
+        out-of-sample window starts flat."""
+        if self._cfg.trade_from is not None and self.clock.timestamp_ns() < self._cfg.trade_from:
+            self.decisions.pop(str(order.client_order_id), None)
+            return
+        super().submit_order(order, *args, **kwargs)
+
+    def _exit_booking(self, order) -> dict | None:
+        """For the backtest's fee model (ScheduleFeeModel.exit_info): what a filling order is, if it is a resting stop
+        (the model's or the risk guard's) or a stop-out to be booked elsewhere (_book_at). The target is booked by
+        _bar_target."""
+        coid = str(order.client_order_id)
+        side = -1 if order.side == OrderSide.BUY else 1  # the position the exit closes
+        if coid in self._book_at:
+            return {"kind": "stop", "side": side, "base": self._book_at[coid]}
+        intent = self.decisions.get(coid, {}).get("intent")
+        mine = self.cache.order(ClientOrderId(coid)) or order
+        now = self.clock.timestamp_ns()
+        if mine.order_type == OrderType.STOP_MARKET and intent in STOP_INTENTS:
+            return {"kind": "stop", "side": side, "trigger": mine.trigger_price.as_double(), "rested": mine.ts_init < now,
+                    "liq": intent in ("liquidation_cut", "liquidation"),
+                    # A model stop carries its liquidation price in its signal (GAP-LIQ), so a gapped one is a
+                    # liquidation close to the fee model and pays no floor (D13-F2).
+                    "liq_px": (self.decisions[coid].get("liq") or (self.decisions[coid].get("signal") or {})
+                               .get("liquidation_px")) if intent != "liquidation" else None,
+                    "liquidation": intent == "liquidation"}
+        if intent == "liquidation":  # the market close at the liquidation price (_check_liquidation)
+            return {"kind": "liquidation", "side": side}
+        return None
+
+    def _levels_in_bar(self, bar: Bar) -> None:
+        """Bars too coarse to say what traded first: note whether any resting level (a stop, target or entry, or the
+        liquidation price) lay inside this bar's range, traded or not. The result is labelled when one did (P1-D13
+        19:00); the fee model notes the ones that filled."""
+        if self.fee_model is None:
+            return
+        low, high = bar.low.as_double(), bar.high.as_double()
+        for order in self._working():
+            if getattr(order, "is_post_only", False):
+                continue  # a maker order fills only on a trade through its price, at it: no order within the bar matters
+            level = (order.trigger_price if order.order_type == OrderType.STOP_MARKET else
+                     order.price if order.order_type == OrderType.LIMIT else None)
+            if level is not None and low <= level.as_double() <= high:
+                intent = self.decisions.get(str(order.client_order_id), {}).get("intent")
+                self.fee_model.intrabar.add("liq" if intent in ("liquidation_cut", "liquidation") else "fill")
+        if self._tp_frac and self._entry_px is not None and self._pos_side():
+            target = self._entry_px * (1 + (self._entry_side or 1) * self._tp_frac)  # judged on the bar (_bar_target)
+            if low <= target <= high:
+                self.fee_model.intrabar.add("fill")
+        if self._margin and self._net_position()[0]:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq(cash, qty)
+            if liq is not None and low <= liq <= high:
+                self.fee_model.intrabar.add("liq")
+
+    def _stopped_in_entry_bar(self, bar: Bar) -> bool:
+        """Bars too coarse to say what traded first: an entry that filled inside this bar (a resting entry), whose stop
+        the bar also traded through, filled and was then stopped out (Advisor 18:36), at the bar's adverse extreme
+        with the stop's slippage. The venue only saw the stop once the entry had filled, so it may not have."""
+        if self._entry_fill_ns != self.clock.timestamp_ns() or not self._stop_frac or self._entry_px is None:
+            return False
+        side = self._entry_side or 1
+        if self._pos_side() != side or self._pending_exit is not None:
+            return False
+        level = self._entry_px * (1 - side * self._stop_frac)
+        adverse = bar.low.as_double() if side > 0 else bar.high.as_double()
+        if not (adverse <= level if side > 0 else adverse >= level):
+            return False
+        self._book_stop_at = adverse
+        self._exit_lock = side if self._margin else True
+        self._sell_all("stop_loss", f"Stop-loss: the entry filled inside this bar and the bar also traded through the "
+                       f"{level:,.6g} stop, to {adverse:,.6g}; with only the bar to go on, the entry filled first and was "
+                       "then stopped out there", {"entry_px": self._entry_px, "trigger": round(level, 8),
+                                                   "stop_loss": self._stop_frac})
+        return True
 
     def _rebook_as_target(self, coid: str, level: float, book: float, px: float) -> float:
         """Backtests: the venue filled the resting stop in a bar that opened through the target. The open trades

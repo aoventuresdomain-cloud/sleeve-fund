@@ -162,7 +162,11 @@ def _execution(res, wait, matched_on) -> dict:
                  if res.decisions.get(str(coid), {}).get("signal", {}).get("order_type") == "maker"]
     sides = list(filled.loc[post_only, "liquidity_side"]) if post_only else []
     out = {"maker": bool(wait), "wait": wait, "matched_on": matched_on,
-           "maker_orders": sides.count("MAKER"), "orders": len(filled)}
+           "maker_orders": sides.count("MAKER"), "orders": len(filled), "labels": list(res.labels)}
+    if res.labels:
+        # P1-D13: a candle doesn't say what traded first inside it, so its stops were filled at its worst price.
+        out["fills_note"] = (f"{res.labels[0]}: without minute prices, a stop the price went through inside a candle "
+                             "is filled at that candle's worst price, so these results lean pessimistic.")
     if wait and matched_on is None:
         out["note"] = "No minute history here: maker orders assumed to miss, charged the taker fee."
     elif wait:

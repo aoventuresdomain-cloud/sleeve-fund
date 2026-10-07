@@ -52,10 +52,10 @@ LIQ_CAP = pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 
 @pytest.fixture(autouse=True)
 def _funding_judged(monkeypatch):
-    """Set-up only (HoQA 7 Oct, with #163; DA option A): the harness's studies run a SIMULATED perp, whose funding
-    #163 leaves NOT JUDGED (Advisor 6 Oct), which keeps the holdout closed and puts only the unjudged names in
-    g1_verdict's failed list. These cells judge liquidations alone, so funding is lifted to PASS here; its own
-    pins are in the O17 masters. A no-op on a head without study._funding_check."""
+    """Set-up only (HoQA 7 Oct, with #163; DA option A; and #178 below): the harness's studies run a SIMULATED perp,
+    whose funding #163 leaves NOT JUDGED (Advisor 6 Oct), which keeps the holdout closed and puts only the unjudged
+    names in g1_verdict's failed list. These cells judge liquidations alone, so funding is lifted to PASS here; its
+    own pins are in the O17 masters. A no-op on a head without study._funding_check."""
     try:
         from sleeve_fund.research import study
     except Exception:  # noqa: BLE001
@@ -63,6 +63,17 @@ def _funding_judged(monkeypatch):
     if hasattr(study, "_funding_check"):
         monkeypatch.setattr(study, "_funding_check",
                             lambda r: ("PASS", "funding lifted by the GAP-LIQ-CAP harness: liquidations judged alone"))
+    # Same for #178's P1-D13 rule (HoQA 7 Oct, CR): these studies run daily bars with a resting exit (the liquidation
+    # price), which D13 leaves NOT JUDGED for want of 1-minute execution data. Only that reason is lifted; every other
+    # not-judged reason (errors, a blind guard, a one-way 5-minute result) still stands.
+    no_1m = getattr(study, "NO_1M", None)
+    prop = getattr(getattr(study, "StudyResult", None), "not_judged", None)
+    if no_1m and isinstance(prop, property):
+        def _not_judged(self, _get=prop.fget):
+            why = _get(self)
+            return "" if why.startswith(no_1m) else why
+
+        monkeypatch.setattr(study.StudyResult, "not_judged", property(_not_judged))
 
 
 def _has_d3_cap() -> bool:

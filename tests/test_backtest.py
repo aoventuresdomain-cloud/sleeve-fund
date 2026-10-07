@@ -4,6 +4,8 @@ import pandas as pd
 from sleeve_fund.research.metrics import returns_from_equity
 from sleeve_fund.research.runner import run_backtest
 
+SLIP = 0.0005  # a backtest stop's slippage with no spread: the floor, max(half spread, 0.05%) (P1-D13)
+
 
 def test_buy_and_hold_pays_taker_fee(prices, instrument):
     res = run_backtest("buy_and_hold", prices, instrument, starting_capital=10_000)
@@ -91,10 +93,12 @@ def test_a_stopped_trade_loses_its_risk_budget_with_costs_and_reads_minus_one_r(
                        {"stop_loss": 0.06, "risk_per_trade": 0.01, "take_profit": 0.18}, starting_capital=10_000,
                        risk_profile="aggressive")
     assert len(res.fills) == 2
-    assert res.equity.iloc[-1] == pytest.approx(10_000 * 0.99, abs=10_000 * 0.0006)  # 1% lost, give or take
+    # Bars only, the stop is booked at the bar's low less its slippage (P1-D13), here 0.9% under its 9,400 level:
+    # 1% of risk plus that gap, so about 1.1R. On minute bars it fills at the level (test_d13 covers both).
+    assert res.equity.iloc[-1] == pytest.approx(9_889.71, abs=0.01)  # a cent moved by main's #156 fee rounding
     j = res.journal
     (trip,) = trading.trips(j.fills(limit=10), j.events(limit=100), {o["order_id"]: o for o in j.orders()})
-    assert trip["r"] == pytest.approx(-1.0, abs=0.06)
+    assert trip["r"] == pytest.approx(-1.10, abs=0.01)
     assert 2.0 < trip["planned_r"] < 3.0  # an 18% target is under 3R once costs come off both ends
 
 
@@ -130,7 +134,8 @@ def test_stop_fills_at_its_level_inside_the_bar(prices, instrument):
     res = run_backtest("buy_and_hold", _path(prices, closes), instrument, {"stop_loss": 0.05}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
     assert len(sells) == 1
-    assert float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
+    # Bars only, booked at the bar's low less the stop's slippage, never at the 95 level (P1-D13).
+    assert float(sells["avg_px"].iloc[0]) == pytest.approx(90.0 * (1 - SLIP))
     assert res.decisions[sells.index[0]]["intent"] == "stop_loss"
 
 
@@ -140,7 +145,7 @@ def test_stop_fills_at_the_open_when_price_gaps_through(prices, instrument):
     df.iloc[10, df.columns.get_loc("high")] = 85.0
     res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert float(sells["avg_px"].iloc[0]) == pytest.approx(85.0)
+    assert float(sells["avg_px"].iloc[0]) == pytest.approx(85.0 * (1 - SLIP))  # the open, less the slippage
 
 
 def test_stop_wins_when_one_bar_touches_both(prices, instrument):
@@ -149,7 +154,7 @@ def test_stop_wins_when_one_bar_touches_both(prices, instrument):
     df.iloc[10, df.columns.get_loc("low")] = 90.0
     res = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.05, "take_profit": 0.10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(95.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(90.0 * (1 - SLIP))  # at the low
 
 
 @pytest.mark.parametrize("low", [90.0, 100.0], ids=["then-the-stop", "stop-never-reached"])
@@ -259,7 +264,7 @@ def test_an_atr_stop_is_set_from_the_market_at_entry(prices, instrument):
     res = run_backtest("buy_and_hold", df, instrument, {"stop_atr": 2.0, "take_profit_r": 2.0}, half_spread=0)
     buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
     assert len(buys) == 1 and buys["ts_last"].iloc[0] >= df.index[13]  # not before 14 bars of range
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(96.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(92.0 * (1 - SLIP))  # the bar's low
     d = res.decisions[sells.index[0]]
     assert d["intent"] == "stop_loss" and "2 x the 14-bar simple average true range" in d["reason"]
     entry = res.decisions[buys.index[0]]["signal"]
@@ -295,7 +300,7 @@ def test_a_swing_low_counts_the_bar_the_entry_decides_on(prices, instrument):
     res = run_backtest("buy_and_hold", df, instrument, {"stop_swing_bars": 10}, half_spread=0)
     buys, sells = res.fills[res.fills["side"] == "BUY"], res.fills[res.fills["side"] == "SELL"]
     assert res.decisions[buys.index[0]]["signal"]["stop_basis"].startswith("at the lowest low of the last 10 bars (96)")
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(96.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(89.0 * (1 - SLIP))  # the bar's low
 
 
 def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
@@ -304,7 +309,7 @@ def test_a_swing_low_stop_sits_under_the_recent_low(prices, instrument):
     df.iloc[20, df.columns.get_loc("open")] = df.iloc[20, df.columns.get_loc("high")] = 100.0
     res = run_backtest("buy_and_hold", df, instrument, {"stop_swing_bars": 10}, half_spread=0)
     sells = res.fills[res.fills["side"] == "SELL"]
-    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(97.0)
+    assert len(sells) == 1 and float(sells["avg_px"].iloc[0]) == pytest.approx(89.0 * (1 - SLIP))  # the bar's low
     assert "lowest low of the last 10 bars (97)" in res.decisions[sells.index[0]]["reason"]
 
 
