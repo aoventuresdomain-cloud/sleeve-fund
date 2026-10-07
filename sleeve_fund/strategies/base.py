@@ -199,8 +199,6 @@ def through_liquidation(side: int, price: float, liq: float | None) -> bool:
     return liq is not None and price > 0 and (price <= liq if side > 0 else price >= liq)
 
 
-
-
 def _utc(ns: int) -> datetime:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
 
@@ -723,6 +721,7 @@ class LongFlatStrategy(Strategy):
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
+        self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): entries wait for its gate pass
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
         self._failed_handlers: set[str] = set()  # handlers already journaled as failed (see _report)
@@ -2044,7 +2043,7 @@ class LongFlatStrategy(Strategy):
             self._note("entry_refused_open_risk", f"Entry refused: {why}")
             return
         self._noted.discard("entry_refused_open_risk")
-        self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
+        self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
         self._deciding = self._deciding_bar = None
@@ -2808,7 +2807,7 @@ class LongFlatStrategy(Strategy):
             signal["tp_frac"] = round(self._tp_frac, 6)
         if self._has_exits:
             signal["stop_cfg"] = self._stop_cfg()
-        self._submit(OrderSide.BUY, qty, "entry", reason, signal)
+        self._send_entry(OrderSide.BUY, qty, reason, signal)
 
     def _loss_at_stop(self, side: int = 1) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
@@ -2848,6 +2847,37 @@ class LongFlatStrategy(Strategy):
         if self.spread_series is None:
             return self._cfg.assumed_half_spread
         return self.spread_series.at(self.clock.timestamp_ns() if ts_ns is None else ts_ns)
+
+    def join_portfolio(self, batch, name: str) -> "LongFlatStrategy":
+        """Trade as one strategy of a portfolio run (P2-7, research.portfolio): its entries wait for the run's gate
+        pass, which may trim or refuse them under the portfolio limits."""
+        self._portfolio = (batch, name)
+        return self
+
+    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict) -> None:
+        """Send an entry, or in a portfolio run post it to the run's gate pass at now + 1 ns (research.portfolio
+        .CloseBatch) and send only what that approves, never more than was sized here. Exits never wait for it."""
+        if self._portfolio is None:
+            self._submit(side, qty, "entry", reason, signal)
+            return
+        from sleeve_fund.research.portfolio import Pending
+
+        batch, name = self._portfolio
+        if self._deciding_bar is not None:
+            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
+        intent = {"side": 1 if side == OrderSide.BUY else -1, "qty": qty, "price": signal["close"],
+                  "stop_frac": self._stop_frac}
+
+        def send(intent, decision) -> None:
+            approved = min(qty, Decimal(str(decision.approved_qty))).quantize(self._lot(), rounding=ROUND_DOWN)
+            if approved < max(self._min_qty(), self._lot()):
+                self._note("entry_trimmed_below_minimum", f"Entry skipped: the portfolio limits allowed {approved}, "
+                           f"below the smallest order the venue takes ({self._min_qty()})")
+                return
+            trimmed = {} if approved == qty else {"portfolio_trimmed_from": str(qty)}
+            self._submit(side, approved, "entry", reason, {**signal, **trimmed})
+
+        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send))
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees

@@ -188,3 +188,69 @@ def test_the_gate_pass_runs_at_close_plus_one_nanosecond_after_every_bar_of_that
 def test_two_runs_are_identical(runs):
     a, b = runs
     assert a["passes"] == b["passes"] and a["fills"] == b["fills"] and a["logs"] == b["logs"]
+
+
+# --- M2: the entry deferral hook in strategies.base -----------------------------------------------------------------
+
+class _Gate:
+    """A stand-in for P2-2's gate (M3): approves each entry at `share` of its quantity, keeping what it saw."""
+
+    def __init__(self, share: D = D(1)):
+        self.share, self.seen = share, []
+
+    def __call__(self, strategy, intent, ts):
+        self.seen.append((strategy, intent["side"], intent["qty"], ts))
+        return SimpleNamespace(approved_qty=intent["qty"] * self.share)
+
+
+def _portfolio_run(model: str, params: dict, gate: _Gate | None):
+    """run_backtest of `model`, joined to a one-strategy portfolio batch with `gate` (None: an ordinary run)."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies import REGISTRY
+
+    cls, config_cls = REGISTRY[model]
+    batch = CloseBatch(order=("a",), gate=gate) if gate is not None else None
+
+    class Joined(cls):
+        def __init__(self, config):
+            super().__init__(config)
+            if batch is not None:
+                self.join_portfolio(batch, "a")
+
+    REGISTRY["portfolio_probe"] = (Joined, config_cls)
+    try:
+        inst = spot_pair("BTC", "USD", FEES, Venue("KRAKEN"))
+        result = run_backtest("portfolio_probe", synthetic_ohlcv(days=240, seed=3), inst, params=params)
+    finally:
+        del REGISTRY["portfolio_probe"]
+    return result, batch
+
+
+def _entries(result):
+    return [(o, r) for o, r in result.fills.iterrows() if result.decisions[o]["intent"] == "entry"]
+
+
+@pytest.mark.parametrize("params", [dict(), dict(market="perp", allow_short=True)], ids=["spot", "perp"])
+def test_an_approve_all_gate_trades_exactly_as_the_ordinary_run(params):
+    """M2 parity: every entry waits for the gate pass at the decision + 1 ns and fills at the same price and size."""
+    plain, _ = _portfolio_run("rsi_cross", params, None)
+    gate = _Gate()
+    joined, batch = _portfolio_run("rsi_cross", params, gate)
+    assert _entries(plain), "the model must trade for this to test anything"
+    cols = ["side", "filled_qty", "avg_px"]
+    assert joined.fills[cols].reset_index(drop=True).equals(plain.fills[cols].reset_index(drop=True))
+    assert len(gate.seen) == len(_entries(plain))  # every entry went through the gate, and only entries
+    assert all(ts == close + 1 for (close, _), (_, _, _, ts) in zip(batch.passes, gate.seen))
+
+
+def test_a_gate_that_trims_sends_only_what_it_approved_and_says_so():
+    gate = _Gate(D("0.5"))
+    joined, _ = _portfolio_run("rsi_cross", {}, gate)
+    for (oid, row), (_, _, asked, _) in zip(_entries(joined), gate.seen):
+        assert D(str(row["filled_qty"])) <= asked / 2
+        assert joined.decisions[oid]["signal"]["portfolio_trimmed_from"] == str(asked)
+
+
+def test_a_gate_that_refuses_sends_no_entry_and_no_exit():
+    joined, _ = _portfolio_run("rsi_cross", {}, _Gate(D(0)))
+    assert joined.fills is None or joined.fills.empty
