@@ -142,7 +142,7 @@
       <td data-m="right"><span class="chip {{ s.tone }}" title="{{ s.evidence }}">{{ s.word }}</span></td>
       <td class="num" data-m="hide">{{ breakeven_text(s) }}</td>
       <td data-m="hide" class="muted">{{ s.when.strftime('%d %b %Y %H:%M') }}</td>
-      <td data-m="hide" class="num"><a href="/research/{{ s.name }}/download" download>Tear sheet .md</a></td></tr>{% endfor %}</tbody></table>
+      <td data-m="hide" class="num"><a href="/results/{{ s.name }}">Guardrails</a> · <a href="/research/{{ s.name }}/download" download>Tear sheet .md</a></td></tr>{% endfor %}</tbody></table>
   {% else %}<p class="empty" style="padding:4px 18px 16px">No tear sheets yet. Each study run from Development produces one here.</p>{% endif %}
 </section>
 </div>

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import markdown
 
+from sleeve_fund.research.guardrails import MIN_OOS_TRADES
 from sleeve_fund.venues import RESEARCH_VENUE
 
 # Research's recommended settings per model, with why, the question it answers and the pre-registered kill
@@ -386,8 +387,16 @@ def banner(s: dict) -> str:
     else:
         lead = "This tear sheet has no cost ladder, so it names no break-even fee."
     if s["g1"] == "FAIL" and s.get("failed"):
-        lead += " G1 failed on: " + "; ".join(x[0].lower() + x[1:] if x[1:2].islower() else x
-                                              for x in s["failed"]) + "."
+        # Too few out-of-sample trades is "not judged", as the Results page says it, not a failed idea.
+        few = [x for x in s["failed"] if x.lower().startswith("enough out-of-sample trades")]
+        failed = [x for x in s["failed"] if x not in few]
+        if failed:
+            lead += " G1 failed on: " + "; ".join(x[0].lower() + x[1:] if x[1:2].islower() else x
+                                                  for x in failed) + "."
+        if few:
+            n = s.get("oos_trades")
+            lead += (f" Not judged: {n:,} out-of-sample trades is fewer than the {MIN_OOS_TRADES} needed."
+                     if n is not None else f" Not judged: fewer than {MIN_OOS_TRADES} out-of-sample trades.")
     elif s["g1"] == "NOT JUDGED":
         why = re.sub(r"^not judged: ", "", s.get("evidence") or "", flags=re.I).rstrip(".")
         lead += f" Not judged: {why}." if why else " The study's runs can't be judged."
