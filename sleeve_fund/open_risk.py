@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pandas as pd
+
+from sleeve_fund.money import scale
 
 LIMIT = 0.05  # of the book
 STOPLESS_FLOOR = 0.10  # the smallest move a position with no placed stop counts at
@@ -27,16 +30,21 @@ ATR_DAYS = 14
 ATR_WINDOW = ATR_DAYS * 3  # whole days the daily ATR is measured over, in paper and backtest alike
 
 
-def position_risk(qty: float, mark: float, stop: float | None = None, atr_pct: float | None = None) -> float:
-    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move."""
+def position_risk(qty, mark, stop=None, atr_pct: float | None = None):
+    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move.
+    Floats in, a float out (the interim check); Decimal qty, mark and stop in, an exact Decimal out (the portfolio
+    gate, through portfolio.holding_for): one formula for both."""
+    exact = isinstance(mark, Decimal)
     if not qty or mark <= 0:
-        return 0.0
+        return Decimal(0) if exact else 0.0
     if stop is not None and (mark - stop) * qty > 0:
         return (mark - stop) * qty  # a short (qty < 0) loses as the price rises to its stop
     # No stop, or one the price has gone through with the position still open (its exit not filled yet): it counts
     # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9).
     if atr_pct is None or not math.isfinite(atr_pct):
         raise ValueError("the daily ATR isn't known, so a position with no stop can't be measured")
+    if exact:
+        return scale(abs(qty) * mark, stopless_move(atr_pct))
     return abs(qty) * mark * stopless_move(atr_pct)
 
 
