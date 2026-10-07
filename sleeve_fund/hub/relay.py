@@ -68,6 +68,9 @@ def store_sink(history, venue: str, pairs: dict[str, str], log=print) -> Callabl
             if out.conflicts:
                 log(f"hub {venue} {pair}: {out.conflicts} {source} bar(s) differ from the stored ones; "
                     "kept the stored, the store records the difference")
+            if out.replaced:
+                log(f"hub {venue} {pair}: {out.replaced} live bar(s) replaced by the venue's candle; "
+                    "the store records both")
 
     return sink
 

@@ -1,5 +1,6 @@
 """The hub's write path into the history store: closed bars, idempotent on (venue, instrument, minute),
-refills never overwrite a stored bar silently, and holes stay holes until refilled."""
+the venue's own candle replaces a differing hub bar and both are recorded (P1-1-CANON), a live bar never replaces
+a stored one, and holes stay holes until refilled."""
 
 import numpy as np
 import pandas as pd
@@ -36,15 +37,17 @@ def test_writing_the_same_bars_again_changes_nothing(tmp_path):
     assert store.provenance(V, P) == []
 
 
-def test_a_refill_never_overwrites_a_live_bar_and_records_the_difference(tmp_path):
+def test_a_refill_replaces_a_differing_live_bar_and_records_both(tmp_path):
+    """P1-1-CANON (HoE 7 Oct, test correction): a refill is the venue's own candle, the record of the minute, so it
+    replaces a live bar that differs; the live bar's values stay in provenance."""
     store = HistoryStore(tmp_path)
     store.append_bars(V, P, _rows("2026-10-05 12:00", 3), "live")
     other = _rows("2026-10-05 12:01", 1, price=500.0)
     res = store.append_bars(V, P, other, "refill")
-    assert (res.written, res.unchanged, res.conflicts) == (0, 0, 1)
-    assert store.read(V, P, 1).loc["2026-10-05 12:02", "close"] == 101.0  # the live bar is kept
+    assert (res.written, res.unchanged, res.conflicts, res.replaced) == (0, 0, 0, 1)
+    assert store.read(V, P, 1).loc["2026-10-05 12:02", "close"] == 500.0  # the venue's candle
     (rec,) = store.provenance(V, P)
-    assert rec["kind"] == "conflict" and rec["source"] == "refill" and rec["minute"].startswith("2026-10-05T12:01")
+    assert rec["kind"] == "replaced" and rec["source"] == "refill" and rec["minute"].startswith("2026-10-05T12:01")
     assert rec["stored"][3] == 101.0 and rec["offered"][3] == 500.0
 
 
@@ -112,19 +115,21 @@ def _loader_page(start, n, price):
     return pd.DataFrame({"open": price, "high": price + 1, "low": price - 1, "close": price, "volume": 3.0}, index=idx)
 
 
-def test_the_rest_loader_fills_holes_but_never_overwrites_a_hub_bar(tmp_path):
-    # The hub runs the REST backfill in the same process: a loader page overlapping the hub's bars.
+def test_the_rest_loader_fills_holes_and_replaces_hub_bars_with_the_venues_candles(tmp_path):
+    # The hub runs the REST backfill in the same process: a loader page overlapping the hub's bars. P1-1-CANON (HoE
+    # 7 Oct, test correction): the venue's candles replace the hub's differing bars, recorded with both values.
     store = HistoryStore(tmp_path)
     store.append_bars(V, P, _rows("2026-10-05 12:00", 2), "live")
     store.append_bars(V, P, _rows("2026-10-05 12:04", 2, price=104.0), "live")  # 12:02-12:03 missed
     cov = store.append(V, P, _loader_page("2026-10-05 12:00", 7, price=500.0), cursor="next")
     one = store.read(V, P, 1)
     stamped = lambda m: pd.Timestamp(m, tz="UTC") + pd.Timedelta("1min")
-    assert one.loc[stamped("2026-10-05 12:00"), "close"] == 100.0  # the hub's bar is kept
+    assert one.loc[stamped("2026-10-05 12:00"), "close"] == 500.0  # the venue's candle replaced the hub's bar
     assert one.loc[stamped("2026-10-05 12:02"), "close"] == 500.0  # the hole is filled from the loader
     assert store.gaps(V, P) == [] and cov.cursor == "next"
     kinds = [(r["kind"], r["source"]) for r in store.provenance(V, P)]
-    assert kinds.count(("conflict", "loader")) == 4 and ("refill", "loader") in kinds
+    assert kinds.count(("replaced", "loader")) == 4 and ("refill", "loader") in kinds
+    assert ("conflict", "loader") not in kinds
     # 12:06, beyond the hub's newest closed minute, is the loader's newest and may still be forming.
     assert cov.closed == pd.Timestamp("2026-10-05 12:05", tz="UTC") and cov.last == pd.Timestamp("2026-10-05 12:06", tz="UTC")
 
