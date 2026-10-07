@@ -124,6 +124,10 @@ def clearing_action(sleeve, now: datetime | None = None, since: datetime | None 
 # A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
 BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
+# Inside an episode, which causes hold changed (one of several cleared, or another began): an info row, never an
+# alert, so the journal's gate reads the engine's holds as they are now (Advisor 00:20 (b): events follow the
+# transitions only).
+BLOCK_CHANGED = "entry_block_changed"
 REFUSED = "entry_blocked"  # the decision log's action for an order the gate refused (QA's exposure-gate master)
 RETIRED = _cause("retired", "cannot be started. Only Restore brings it back.")
 STOPPED = _cause("stopped", "only Start clears it.")
@@ -146,6 +150,15 @@ def held_causes(text: str | None) -> dict[str, str]:
             if part.startswith(LABELS[code] + ":"):
                 out[code] = part.strip()
     return out
+
+
+def block_codes(why: str | None) -> tuple[str, ...]:
+    """The causes a why lists, in CODES order: its own codes, or read from its words (a why the journal holds)."""
+    if why is None:
+        return ()
+    if isinstance(why, Why):
+        return why.codes
+    return tuple(c for c in CODES if re.search(rf"(?:^|\s){re.escape(LABELS[c])}: ", why))
 
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
@@ -219,8 +232,8 @@ def said_since_last_fill(store, name: str, head: str) -> bool:
 
 def open_block(store, name: str, now: datetime | None = None) -> str | None:
     """Why nothing opens, as the engine last journaled it in a block episode it hadn't closed by `now`, else None."""
-    last = store.last_event(name, (BLOCK_STARTED, BLOCK_CLEARED), before=now)
-    return last["message"].removeprefix(BLOCK_PREFIX) if last and last["kind"] == BLOCK_STARTED else None
+    last = store.last_event(name, (BLOCK_STARTED, BLOCK_CHANGED, BLOCK_CLEARED), before=now)
+    return last["message"].removeprefix(BLOCK_PREFIX) if last and last["kind"] != BLOCK_CLEARED else None
 
 
 def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bool = False) -> tuple[bool, str | None]:
@@ -418,8 +431,13 @@ class SleeveRuntime:
 
     def _episode(self, why: str | None) -> None:
         """Journal a block episode's start and end (Advisor 22:29): one alert when nothing may open any more, and one
-        cleared event, with the orders it refused, when it ends or gives way to another reason."""
-        if why == self._block:
+        cleared event, with the orders it refused, when the last cause clears. Not when one of several clears or
+        another joins, nor when a figure moves (stale data's age): those follow the transitions only (Advisor 00:20
+        (b)); a change in which causes hold is an info row (BLOCK_CHANGED) the journal's gate reads."""
+        if (why is None) == (self._block is None):
+            if why is not None and block_codes(why) != block_codes(self._block):
+                self.store.event(self.name, "info", BLOCK_CHANGED, BLOCK_PREFIX + why, ts=self.now())
+            self._block = why
             return
         if self._block is not None:
             self.store.event(self.name, "info", BLOCK_CLEARED,

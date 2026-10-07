@@ -809,12 +809,14 @@ class LongFlatStrategy(Strategy):
             self.runtime.refused(why or f"it is {self.runtime.status}", f"{what} would open the position")
         return True
 
-    def _entry_blocked(self, bar: Bar) -> bool:
+    def _entry_blocked(self, bar: Bar, what: str = "an entry") -> bool:
         """Whether no new entry may be decided on this bar because it is degraded; says why, once per bar."""
         if bar.ts_event != self._no_entry_ts:
             return False
         if self.runtime is not None and not self.runtime.can_open():
-            return True  # halted or paused: nothing would open anyway, so nothing was held back (QA P1-D5)
+            # Halted or paused: nothing would open anyway, so no degraded-bar note (QA P1-D5); the refusal's decision
+            # row lists every cause, the degraded candle with the halt (Advisor 00:20 (b)).
+            return self._cannot_open(what)
         minutes = bar_minutes(self._cfg.bar_type)
         missing = self._degraded_missing
         self.log.info(f"entry held back on a degraded bar: {missing} of {minutes} minutes missing")
@@ -2252,7 +2254,7 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
-                if w > self._held_w and (self._entry_blocked(bar) or self._late_entry(bar, "addition")):
+                if w > self._held_w and (self._entry_blocked(bar, "an addition") or self._late_entry(bar, "addition")):
                     return  # adding to the position is an entry; trimming it still runs
                 if w < self._held_w:
                     self._late_exit(bar)
@@ -3532,6 +3534,7 @@ class LongFlatStrategy(Strategy):
                 self._first_minute = self._last_market_ns // MINUTE_NS
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
+            self.runtime.holds.pop("stale_data", None)
         if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:
             self._noted -= {"stale_price", "feed_dead", "hub_venue_down"}
             if self.runtime is not None:
@@ -3548,6 +3551,11 @@ class LongFlatStrategy(Strategy):
         now = self.clock.timestamp_ns()
         minutes = (now - self._last_market_ns) / 60e9
         if minutes >= STALE_PRICE_WARN_MINUTES:
+            if self.runtime is not None:
+                # Stale data holds every entry and add, and cancels resting entries, until a trade or quote arrives
+                # (Advisor 22:29 (1), 00:20 (b)); stops and exits still run on the last price.
+                self.runtime.holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
+                                                    "It clears when data resumes")
             self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
                        f"risk guard are using the last price, {self._price():,.6g}")
         if minutes >= STALE_PRICE_RESTART_MINUTES and self.hub_status is not None and self.hub_status.venue_down(now):

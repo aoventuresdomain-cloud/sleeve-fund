@@ -1861,7 +1861,7 @@ def _ages(text: str) -> list[float]:
             for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?)\b", text.lower())]
 
 
-@pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('degraded_candle',) else xf(CAUSE))
+@pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('degraded_candle', 'stale_data') else xf(CAUSE))
                                    for c in ["degraded_candle", "stale_data", "funding_missing"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
 def test_cause_a_data_refusal_gives_the_figure_and_what_clears_it(tmp_path, store, monkeypatch, cause):
     """[00:20 (b): "Data stale: last price 94 s old. Clears when data resumes."; "Funding rate missing."] The engine's
@@ -1895,7 +1895,7 @@ def test_cause_a_data_refusal_gives_the_figure_and_what_clears_it(tmp_path, stor
         assert re.search(CAUSE_CLEARS[cause], text.lower()), f"the PM text does not say what clears it: {text!r}"
 
 
-@xf(CAUSE)
+# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
 def test_cause_each_refused_entry_decision_row_lists_every_cause_with_its_figure(tmp_path, store, monkeypatch):
     """[00:20 (b); 22:29 (3)] A drawdown halt at t0+25, the degraded 5-minute candle closing at t0+30, and a signal
     that wants long from that candle on: one decision row (action "entry_blocked") per refused entry, each naming the
@@ -1930,7 +1930,7 @@ EPISODES = {
 }
 
 
-@pytest.mark.parametrize("case", [pytest.param(c, marks=[] if c in ('degraded_candle_alone',) else xf(CAUSE))
+@pytest.mark.parametrize("case", [pytest.param(c, marks=[] if c in ('one_of_two_clears', 'degraded_candle_alone', 'stale_data_alone') else xf(CAUSE))
                                    for c in list(EPISODES)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
 def test_cause_block_events_follow_the_transitions_not_the_causes_or_the_ticks(tmp_path, store, monkeypatch, case):
     """[00:20 (b); 22:29 (3)] One "entry_blocked" event when a block starts and one "entry_block_cleared" when the last
