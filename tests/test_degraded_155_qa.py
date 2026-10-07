@@ -209,7 +209,12 @@ def test_d4_paper_charges_no_settlement_the_venue_never_made(tmp_path):
     st = quiet(lambda: _paper(inst, m1, {**PERP, "side": 1, "tag": "d4"}, spec="1-MINUTE-LAST-INTERNAL", profile="balanced"))
     charged = [pd.Timestamp(x["ts"]).strftime("%H:%M") for x in st.funding("P", limit=100)]
     assert "08:00" in charged
-    assert "12:00" not in charged
+    # Re-pinned with #163 (Advisor O17a-13, 7 Oct 03:13; HoE OK): a settlement foreseen at the 4-hour step with no
+    # record is missing at due + 15 min: alerted and charged the baseline once (adverse until DA-11). Only the venue's
+    # next record (16:00, after this run ends at 12:40) can show it was never made; that reversal is #163's own pin.
+    assert charged.count("12:00") == 1, charged
+    alerts = st.events_of(("funding_missing", "funding_stale"), limit=1000)  # global events (sleeve None)
+    assert any("12:00" in str(e) for e in alerts), alerts
 
 
 def _holed_bh(tmp_path):

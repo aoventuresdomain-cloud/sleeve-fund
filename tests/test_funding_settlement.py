@@ -133,8 +133,9 @@ def test_a_position_held_across_pays_rate_times_notional_once_longs_pay_shorts_r
         (ts, qty, price, amount), = fund
         assert ts == utc("2025-10-03 08:00") and np.sign(qty) == side
         assert price == pytest.approx(60_299.5)  # the last trade at or before 08:00:00 (07:59:59)
-        assert amount == pytest.approx(-qty * price * RATE)
-        assert (amount < 0) == (side > 0)  # positive rate: the long pays, the short receives
+        # A simulated perp (no venue rates) pays the baseline whichever side is held (Advisor, 6 Oct 2026; HoE OK 7 Oct)
+        assert amount == pytest.approx(-abs(qty) * price * RATE)
+        assert amount < 0
     assert [r[1:] for r in pfund] == pytest.approx([r[1:] for r in bfund])  # paper and backtest alike
 
 
@@ -217,30 +218,35 @@ def test_settlement_times_follow_the_venues_records_and_carry_its_latest_interva
 
 
 def test_a_foreseen_settlement_the_venue_skips_is_not_a_settlement_once_a_newer_record_lands():
-    """4-hourly records, then the venue goes back to 8-hourly: 04:00 was foreseen from the 4 h step, but once the
-    08:00 record is kept it is no settlement (CR minor 1: no phantom charge). A single record (a new listing)
-    falls back to the fixed hours after it."""
+    """4-hourly records, then the venue goes back to 8-hourly: 04:00 was foreseen from the 4 h step. The 08:00 record
+    alone leaves it provisionally missing (the step after the gap is unknown: the adverse side); once 16:00 is kept,
+    8 h on, it is no settlement (CR minor 1: no phantom charge; Advisor, 7 Oct 04:31, amended (c)). A single
+    record (a new listing) falls back to the fixed hours after it."""
     t = lambda s: utc(s).to_pydatetime()  # noqa: E731
     four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
     assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 05:00"), (0, 8, 16), four) == [
         t("2025-10-05 04:00")]  # foreseen: paper waits for its record
     eight = pd.concat([four, pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))])
     assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 09:00"), (0, 8, 16), eight) == [
-        t("2025-10-05 08:00")]
+        t("2025-10-05 04:00"), t("2025-10-05 08:00")]  # provisionally missing
+    back = pd.concat([eight, pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 16:00")]))])
+    assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 17:00"), (0, 8, 16), back) == [
+        t("2025-10-05 08:00"), t("2025-10-05 16:00")]
     one = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))
     assert markets.settlement_times(t("2025-10-05 07:00"), t("2025-10-06 01:00"), (0, 8, 16), one) == [
         t("2025-10-05 08:00"), t("2025-10-05 16:00"), t("2025-10-06 00:00")]
 
 
 def test_paper_waits_a_foreseen_settlement_until_a_newer_record_could_drop_it():
-    """CR minor 1: a time foreseen from the 4 h step waits one more interval than a published one, so the venue's
-    08:00 record (back to 8-hourly) lands and drops 04:00 before any baseline is charged for it."""
+    """CR minor 1, then the Advisor (7 Oct 2026, QA P1-O17a-13; HoE): a time foreseen from the 4 h step waits the
+    usual 15 minutes like a recorded one; if the venue's 08:00 record (back to 8-hourly) then drops 04:00, its
+    baseline is reversed by a correction of its own."""
     from datetime import timedelta
 
     t = lambda s: utc(s).to_pydatetime()  # noqa: E731
     four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
     wait = timedelta(minutes=15)
-    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == timedelta(hours=4, minutes=30)  # and the store's refresh after the 08:00 record
+    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == wait  # foreseen: the usual wait
     assert markets.settlement_wait(t("2025-10-05 00:00"), four, wait) == wait  # a recorded time: the usual wait
     assert markets.settlement_wait(t("2025-10-05 04:00"), None, wait) == wait  # no records: the fixed hours'
 
@@ -258,7 +264,7 @@ def test_a_fill_on_a_gap_pays_the_settlements_held_through_before_it(prices, ins
     shut = pd.Timestamp(res.fills.sort_values("ts_last")["ts_last"].iloc[-1])
     charged = {pd.Timestamp(f["ts"]): f["amount"] for f in res.funding}
     opened = shut - pd.Timedelta(days=1)
-    assert opened in charged and charged[opened] > 0  # held to the open; a short receives at a positive rate
+    assert opened in charged and charged[opened] < 0  # held to the open; a simulated perp's short pays the baseline
     assert not [ts for ts in charged if opened < ts <= shut]  # none inside the bar it gapped out in
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)

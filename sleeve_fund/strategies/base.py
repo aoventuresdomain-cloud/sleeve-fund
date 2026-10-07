@@ -494,6 +494,19 @@ def handler_error_words(handler: str, exc: BaseException | str) -> str:
     return f"handling {where}: {what or 'no message'}" + (f" ({kind})" if kind else "")
 
 
+def pd_ts(t):
+    import pandas as pd
+
+    t = pd.Timestamp(t)
+    return t.tz_localize("UTC") if t.tzinfo is None else t
+
+
+def funding_snap_note(settled, ts) -> str:
+    from sleeve_fund import funding
+
+    return funding.snap_note(settled, ts)
+
+
 class LongFlatStrategy(Strategy):
     """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
     want_long() for all-or-nothing, or target_weight() for anything in between."""
@@ -542,8 +555,21 @@ class LongFlatStrategy(Strategy):
         self._liquidated: str | None = None
         self._snap_ns: int | None = None
         self._settled = None  # backtest: the venue's settled rates, loaded once
-        self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
-        self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
+        self._settled_idx = None  # backtest: their snapped settlement times (markets.snapped), once
+        self._funding_fallback_said = False  # backtest: the baseline for a missing settled rate is said once
+        # Paper: the settlement whose rate the venue hadn't published by its check, watched until it arrives, and
+        # when it was last asked for (funding_stale / funding_stale_cleared, per instrument, once per episode).
+        self._funding_missing: set = set()  # every settlement charged the baseline whose rate hasn't come yet
+        self._funding_last_settled = None  # paper: the newest settlement charged at the venue's own rate
+        self._funding_paid: dict = {}  # paper: settlement -> (qty, price, rate, amount) charged the baseline
+        self._funding_recheck = None
+        # (time, amount, kind) for every funding payment, for a backtest's equity: kind "settled" (the venue's rate) or
+        # "baseline" (missing, charged adversely).
+        self.funding_log: list[tuple] = []
+        self.funding_notes: dict = {}  # settlement -> its audit note (a snapped record), for BacktestResult.funding
+        # (time, the venue's rate missing, a position held) for every settlement: how much of a backtest's funding is
+        # the venue's own (Advisor, 6 Oct 2026, QA P1-O17). Flat settlements are marked in backtests only.
+        self.funding_marks: list[tuple] = []
         # (time, amount) for every credit that only brought a flat book's equity back to zero (_cover_shortfall)
         self.insurance_log: list[tuple] = []
         # GAP-LIQ-CAP: each liquidation order's booking, {order id: (bankruptcy price, its liquidation fees)}, which a
@@ -959,6 +985,8 @@ class LongFlatStrategy(Strategy):
                     self._exec_type = self._cfg.bar_type.composite()
                     self.subscribe_bars(self._exec_type)
                 return
+            if self._margin:
+                self._rebuild_funding_missing()
             # Trades give a fresh price for marking and the risk guard between (daily) bars.
             self.subscribe_trades(self._cfg.instrument_id)
             # Quotes put the venue's bid and ask in the simulated book (each trade updates it too), so
@@ -3235,10 +3263,19 @@ class LongFlatStrategy(Strategy):
             if self._backtest:
                 if self._settled is None:
                     self._settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
+                    # fixed for the run, so snapped once, not every hour (QA P1-O17a-17)
+                    self._settled_idx = markets.snapped(self._settled) if self._settled is not None and len(self._settled) else None
                 settled = self._settled
             else:
                 settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
-        return markets.settlement_times(since, now, terms.funding_hours, settled), settled
+        published = None
+        if terms.funding_venue is not None:  # the venue's own interval for the instrument, where it gives one (DA-11)
+            from sleeve_fund.venues import venue
+
+            interval = getattr(venue(terms.funding_venue), "funding_interval", None)
+            published = interval(pair_of(self.instrument)) if callable(interval) else None
+        idx = getattr(self, "_settled_idx", None) if self._backtest else None
+        return markets.settlement_times(since, now, terms.funding_hours, settled, published, idx), settled
 
     # Paper rescans this far back, so a settlement the venue publishes late, at a time the schedule didn't
     # foresee (a change of interval), is still charged when its record arrives.
@@ -3253,6 +3290,8 @@ class LongFlatStrategy(Strategy):
         terms = self._cfg.perp
         if terms is None or price <= 0:
             return
+        if self._funding_missing:  # before the deferral below, so trades far apart still clear or reopen (QA P1-O17a-12)
+            self._watch_funding_recovery(terms, self.clock.utc_now())
         now = self.clock.utc_now()
         deadline = False
         if not self._backtest:
@@ -3285,6 +3324,7 @@ class LongFlatStrategy(Strategy):
             held = [(ts, self._position_at(ts, current, q if int(ts.timestamp()) * 1_000_000_000 in self._held_at
                                            else None), px) for ts, q, px in held]
         if not any(q for _, q, _ in held):
+            self._mark_flat(terms, times, now)
             self._funding_since = self._rescan_from(now)
             return
         for ts, qty, px in held:
@@ -3292,13 +3332,18 @@ class LongFlatStrategy(Strategy):
                 return  # a later settlement keeps its own deadline: held until it is that old too (CR #179)
             inside = self._intrabar is not None and self._intrabar[0] < int(ts.timestamp()) * 1_000_000_000 <= self._intrabar[1]
             if qty == 0 or (inside and self._intrabar[2]):  # a gap fill at the bar's open held nothing after it
+                self._mark_flat(terms, [ts], now)  # marked flat, so a batch mixing flat and held leaves no hole (CR)
                 self._funding_since = ts
                 continue
-            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
+            wait = markets.settlement_wait(ts, settled, self.FUNDING_WAIT, terms.funding_hours)
+            rate = self._funding_rate(terms, ts, now, wait)
             if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
                 return
+            rate, baseline = rate
             self._funding_since = ts
-            amount = -qty * px * rate
+            # A missing rate never helps a result: both sides pay the baseline, so a short isn't credited on
+            # data the venue never gave (Advisor, 6 Oct 2026, D9; QA P1-O17).
+            amount = -abs(qty) * px * abs(rate) if baseline else -qty * px * rate
             if inside and amount > 0:
                 continue  # a touch at an unknown time inside the bar: a credit it may not have been held for isn't booked
             if self._funding_skip is not None and ts > self._funding_skip[0] and (amount > 0 or
@@ -3309,7 +3354,9 @@ class LongFlatStrategy(Strategy):
                 # outcome, as the backtest of the same minutes books it (rule (c)): a cost is paid, a credit is not
                 # (QA FD-F10).
                 continue
-            self._book_funding(ts, qty, px, rate, amount)
+            self.funding_marks.append((ts, baseline, True))
+            note = "" if baseline or settled is None else funding_snap_note(settled, ts)
+            self._book_funding(ts, qty, px, rate, amount, "baseline" if baseline else "settled", note)
             if deadline and self.runtime is not None:
                 self.runtime.store.event(
                     self.runtime.name, "info", "funding_deadline_booked",
@@ -3317,6 +3364,24 @@ class LongFlatStrategy(Strategy):
                     f"though no trade had reached the strategy in the last {UNSEEN_GAP_NS // 10**9} s: a quiet market "
                     "holds funding back no longer than that", ts=self.runtime.now())
         self._funding_since = max(self._funding_since, self._rescan_from(now))
+
+    def _mark_flat(self, terms, times, now) -> None:
+        """Backtest: flat settlements still mark where the venue's rate is missing, so flat time neither breaks a
+        stretch without it nor adds to it (funding.baseline_summary; Advisor, 6 Oct 2026)."""
+        if self._backtest:
+            self.funding_marks += [(ts, self._funding_rate(terms, ts, now, held=False)[1], False) for ts in times]
+
+    def _mark_held(self, ts, baseline: bool) -> None:
+        """A settlement charged to what a bar's resting fill opened (_fund_opened_in_bar): marked held, in place of
+        the flat mark the position before the fill left, so it is counted once."""
+        for i in range(len(self.funding_marks) - 1, -1, -1):
+            if self.funding_marks[i][0] == ts:
+                if not self.funding_marks[i][2]:
+                    self.funding_marks[i] = (ts, baseline, True)
+                return
+            if self.funding_marks[i][0] < ts:
+                break
+        self.funding_marks.append((ts, baseline, True))
 
     def _position_at(self, ts: datetime, current: float, noted: float | None = None) -> float:
         """Paper: the position held at the settlement instant `ts`: `noted` when this process noted it as the
@@ -3376,16 +3441,21 @@ class LongFlatStrategy(Strategy):
                 return datetime.fromisoformat(at)
         return None
 
-    def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float) -> None:
+    def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float,
+                      kind: str = "settled", note: str = "") -> None:
         self._cash_adj += amount
-        self.funding_log.append((ts, amount))
+        self.funding_log.append((ts, amount, kind))
+        if note:
+            self.funding_notes[ts] = note.strip(" ()")  # the snapped record's own stamp, kept for the audit
+        if kind == "baseline" and not self._backtest:
+            self._funding_paid[ts] = (qty, px, rate, amount)  # reversed if the venue shows it was no settlement
         if self.runtime is not None:
             self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
-                                              amount=round(amount, 8), ts=ts)
+                                              amount=round(amount, 8), ts=ts, kind=kind)
             self.runtime.store.event(self.runtime.name, "info", "funding",
                                      f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                      f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
-                                     f"{px:,.6g} ({rate:.4%})", ts=ts)
+                                     f"{px:,.6g} ({rate:.4%}){note}", ts=ts)
 
     def _fund_opened_in_bar(self, window: tuple[int, int, bool], qty: float, low: float, high: float) -> None:
         """Rule (c) for a resting entry or add a bars-only backtest filled inside a bar (Independent Quant Advisor, 6 Oct
@@ -3403,13 +3473,19 @@ class LongFlatStrategy(Strategy):
         for ts in times:
             if not lo < int(ts.timestamp()) * 1_000_000_000 <= hi:
                 continue
-            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
+            wait = markets.settlement_wait(ts, settled, self.FUNDING_WAIT, terms.funding_hours)
+            rate = self._funding_rate(terms, ts, now, wait)
             if rate is None:
                 continue
-            px = high if qty * rate > 0 else low  # the price at which it costs most, or credits least
-            amount = -qty * px * rate
+            rate, baseline = rate
+            if baseline:  # a missing rate is paid whichever side is held, at the price where it costs most
+                px, amount = high, -abs(qty) * high * abs(rate)
+            else:
+                px = high if qty * rate > 0 else low  # the price at which it costs most, or credits least
+                amount = -qty * px * rate
             if gap or amount < 0:
-                self._book_funding(ts, qty, px, rate, amount)
+                self._mark_held(ts, baseline)
+                self._book_funding(ts, qty, px, rate, amount, "baseline" if baseline else "settled")
 
     def _intrabar_fill(self, event) -> tuple[int, int, bool] | None:
         """A bars-only backtest fills a resting order somewhere inside the bar, stamped at its close, at an unknown
@@ -3443,8 +3519,9 @@ class LongFlatStrategy(Strategy):
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
     # ...and holds a settlement back for missed minutes at most this long (DA 7 Oct): on a market that trades less often
-    # than UNSEEN_GAP_NS the hold would otherwise never end.
-    FUNDING_DEFER_MAX = timedelta(minutes=15)
+    # than UNSEEN_GAP_NS the hold would otherwise never end. The same 15 minutes, so a missing rate is alerted, charged
+    # and blocks entries at due + 15 minutes however quiet the market (Advisor, 7 Oct 03:13, QA P1-O17a-13).
+    FUNDING_DEFER_MAX = FUNDING_WAIT
 
     def _reverse_funding_after(self, closed: datetime) -> None:
         """Paper: a replay found the venue's order closed the position at `closed`, but a settlement after it was
@@ -3469,9 +3546,14 @@ class LongFlatStrategy(Strategy):
             if abs(amount) < 1e-9:
                 continue
             self._cash_adj -= amount
-            self.funding_log.append((ts, -amount))
+            # Its own kind, so O17b never trues up a reversed baseline and the books read it as a correction (QA M-1)
+            self.funding_log.append((ts, -amount, "reversal"))
             store.record_funding(self.runtime.name, qty=row["qty"], price=row["price"], rate=row["rate"],
-                                 amount=round(-amount, 8), ts=ts)
+                                 amount=round(-amount, 8), ts=ts, kind="reversal")
+            # Nothing of the strategy's is owed at it now: it leaves the watch, and the hub alone judges the rate (M-1)
+            when = pd_ts(ts)
+            self._funding_missing.discard(when)
+            self._funding_paid.pop(when, None)
             store.event(self.runtime.name, "warning", "funding_charged_while_flat",
                         f"Funding of {abs(amount):,.2f} {'paid' if amount < 0 else 'received'} at the {ts:%H:%M} "
                         f"settlement was booked before the replay found the position closed at {closed:%H:%M}: "
@@ -3485,38 +3567,257 @@ class LongFlatStrategy(Strategy):
         return bool(due) and now - due[0] >= self.FUNDING_DEFER_MAX and (
             self._trade_ns is not None and self._trade_ns > int(due[0].timestamp()) * 1_000_000_000)
 
-    def _funding_rate(self, terms, ts, now, wait: timedelta | None = None) -> float | None:
-        """The rate settled at `ts`: the venue's own where its terms name one (sleeve_fund.funding), else the
-        terms' fixed rate. A settlement the venue's records lack is charged the fixed rate as a fallback, said
-        once per run; paper first waits FUNDING_WAIT for the venue to publish it (None: not yet)."""
+    def _funding_rate(self, terms, ts, now, wait: timedelta | None = None,
+                      held: bool = True) -> tuple[float, bool] | None:
+        """The rate settled at `ts` and whether it is the baseline for a missing one: the venue's own where its
+        terms name one (sleeve_fund.funding). A settlement the venue's records lack, and every settlement of a
+        simulated perp (no venue rates), is charged the baseline (Advisor, 6 Oct 2026). Paper first waits `wait`
+        (FUNDING_WAIT by default) for the venue to publish it (None: not yet), then alerts the instrument as stale.
+        A flat settlement (`held` False, backtest only) is looked up for the record and charges nothing, so it says
+        nothing."""
         if terms.funding_venue is None:
-            return terms.funding_rate
+            return markets.baseline_rate(terms), True
         import pandas as pd
 
         from sleeve_fund import funding
 
         pair = pair_of(self.instrument)
         when = pd.Timestamp(ts)
-        series = funding.rates(terms.funding_venue, pair)
-        rate = funding.rate_at(series, when)
+        cap = funding.cap_of(terms.funding_venue, pair)
+        rate = funding.rate_at(funding.rates(terms.funding_venue, pair), when, cap)
         if rate is None and not self._backtest:
-            # Paper asks the venue directly (the history service keeps the store, which paper only reads).
-            try:
-                rate = funding.rate_at(funding.fetch(terms.funding_venue, pair, when - funding.MATCH), when)
-            except Exception as exc:  # noqa: BLE001 - the venue unreachable: wait, then the fallback
-                self.log.warning(f"funding rates unavailable: {exc!r}")
+            rate = self._venue_rate(terms, pair, when)
             if rate is None and now - ts < (wait or self.FUNDING_WAIT):
                 return None
+            if rate is None:
+                self._funding_missing.add(when)
+                self._funding_missed(terms, pair, when, f"No settled funding rate from the venue for {pair} at "
+                                     f"{when:%d %b %Y %H:%M} UTC, {int((wait or self.FUNDING_WAIT).total_seconds() // 60)} "
+                                     "minutes after it settled; charging the baseline, whichever side is held, until it "
+                                     "arrives")
+            elif rate is not None and (self._funding_last_settled is None or when > self._funding_last_settled):
+                self._funding_last_settled = when  # a settlement the venue published: earlier missing ones may be lost
         if rate is None:
-            if not self._funding_fallback_said:
+            if self._backtest and held and not self._funding_fallback_said and self.runtime is not None:
                 self._funding_fallback_said = True
-                if self.runtime is not None:
-                    self.runtime.store.event(self.runtime.name, "warning", "funding_fallback",
-                                             f"No settled funding rate from the venue for {pair} at {when:%d %b %Y %H:%M} "
-                                             f"UTC; charged the {terms.funding_rate:.4%} baseline instead (said once)",
-                                             ts=ts)
-            return terms.funding_rate
-        return rate
+                self.runtime.store.event(self.runtime.name, "warning", "funding_fallback",
+                                         f"No settled funding rate from the venue for {pair} at {when:%d %b %Y %H:%M} "
+                                         f"UTC; charged the {abs(markets.baseline_rate(terms)):.4%} baseline instead, "
+                                         "paid whichever side is held (said once)", ts=ts)
+            return markets.baseline_rate(terms), True
+        return rate, False
+
+    # Paper asks the venue at most this often whether a missing settlement's rate has arrived.
+    FUNDING_RECHECK = timedelta(minutes=1)
+
+    def _venue_rate(self, terms, pair: str, when) -> float | None:
+        """Paper asks the venue directly (the history service keeps the store, which paper only reads)."""
+        from sleeve_fund import funding
+
+        try:
+            return funding.rate_at(funding.fetch(terms.funding_venue, pair, when - funding.MATCH), when,
+                                   funding.cap_of(terms.funding_venue, pair))
+        except Exception as exc:  # noqa: BLE001 - the venue unreachable: wait, then the baseline
+            self.log.warning(f"funding rates unavailable: {exc!r}")
+            return None
+
+    def _watch_funding_recovery(self, terms, now) -> None:
+        """Paper, while settlements charged the baseline are still missing (Advisor, 7 Oct 2026; QA P1-O17a-8, -10,
+        -11): one whose rate arrives leaves the watch (O17b trues it up); one still missing a day after it was due,
+        once a later one is published, is never published (marked once; its baseline stays) and leaves it too. Every
+        one still missing is in an open episode (one closed meanwhile, or never opened, is opened again on it), and an
+        episode closes once every settlement in it, from the one it opened on, is kept or never published: so one
+        arriving while another is missing keeps it open (CR, #163), and one never published can't hold it open."""
+        if self._funding_recheck is not None and now - self._funding_recheck < self.FUNDING_RECHECK:
+            return
+        self._funding_recheck = now
+        import pandas as pd
+
+        from sleeve_fund import funding
+
+        pair, rt = pair_of(self.instrument), self.runtime
+        venue = getattr(terms, "funding_venue", None) or ""
+        asked: dict = {}
+
+        def arrived(when) -> bool:
+            if when not in asked:
+                asked[when] = self._venue_rate(terms, pair, when) is not None
+            return asked[when]
+
+        if terms is not None:
+            self._reverse_unsettled(terms)
+        came = {when for when in sorted(self._funding_missing) if arrived(when)}
+        self._funding_missing -= came
+        try:
+            state = funding.journal_state(rt.store, funding.stale_tag(venue, pair))
+        except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
+            state = None
+        tag = funding.stale_tag(venue, pair)
+        if state is None:
+            self._funding_watch_unread(pair, came)
+            return
+        stamp = pd.Timestamp(now)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp
+        later = max([t for t in (getattr(self, "_funding_last_settled", None), self._newest_kept(terms, pair))
+                     if t is not None],
+                    default=None)
+        for when in sorted(self._funding_missing):
+            if when in state["never"] or (stamp - when >= funding.NEVER_PUBLISHED_AFTER and later is not None
+                                          and later > when + funding.MATCH):
+                if when not in state["never"]:
+                    funding.mark(rt.store, tag, "funding_never_published", when, ts=rt.now())
+                    state["never"].add(when)
+                self._funding_missing.discard(when)
+        for when in sorted(self._funding_missing):
+            # Still charging the baseline: an episode closed meanwhile is opened again on it, so the inbox never reads
+            # clear while one is missing.
+            self._funding_missed(terms, pair, when, f"No settled funding rate from the venue for {pair} at "
+                                 f"{when:%d %b %Y %H:%M} UTC yet; charging the baseline, whichever side is held, "
+                                 "until it arrives", state=state)
+        # From the settlement each opened on (one written before episodes named it opened at its alert, inside the
+        # interval after it)
+        hours = getattr(terms, "funding_hours", None) or (0, 8, 16)
+        gap = pd.Timedelta(markets.funding_interval(hours)) - funding.MATCH
+        for o in sorted(k for k in state["open"] if k is not None):
+            waiting = [t for t in state["missing"] if t > o - gap and t not in state["never"]
+                       and (t in self._funding_missing or not arrived(t))
+                       and (terms is None or self._is_settlement(terms, t))]
+            if not waiting:
+                rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
+                               f"arrived from the venue for every settlement missing {funding.from_words(o)}"
+                               + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _is_settlement(self, terms, when) -> bool:
+        """Whether `when` is still one of the venue's settlements as its records now read (markets.settlement_times)."""
+        from sleeve_fund import funding
+
+        times = self._settlements(terms, when - timedelta(minutes=2), when + timedelta(minutes=2))[0]
+        return any(abs(pd_ts(t) - pd_ts(when)) <= funding.MATCH for t in times)
+
+    def _reverse_unsettled(self, terms) -> None:
+        """Paper: a settlement charged the baseline that the venue's newer records show was none (its interval
+        lengthened, so the time foreseen from the shorter step never settled) has the charge reversed by its own
+        journaled correction, kind "reversal", never by editing the original row, and leaves the watch (Advisor,
+        7 Oct 2026, QA P1-O17a-13). O17b never trues up a reversed baseline."""
+        for when in sorted(self._funding_missing):
+            if self._is_settlement(terms, when):
+                continue
+            self._funding_missing.discard(when)
+            paid = self._funding_paid.pop(when, None)
+            if paid is None:
+                continue
+            qty, px, rate, amount = paid
+            self._cash_adj -= amount
+            self.funding_log.append((when, -amount, "reversal"))
+            if self.runtime is not None:
+                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
+                                                  amount=round(-amount, 8), ts=when, kind="reversal")
+                self.runtime.store.event(self.runtime.name, "info", "funding",
+                                         f"Funding reversed: {abs(amount):,.2f} back; the venue's records show no "
+                                         f"settlement at {when:%d %b %Y %H:%M} UTC (its interval lengthened), so the "
+                                         "baseline charged for it is refunded", ts=self.runtime.now())
+
+    def _newest_kept(self, terms, pair):
+        from sleeve_fund import funding
+
+        if getattr(terms, "funding_venue", None) is None:
+            return None
+        try:
+            kept = funding.rates(terms.funding_venue, pair).index
+        except Exception:  # noqa: BLE001 - no store here: the venue's answers alone say what was published
+            return None
+        return kept[-1] if len(kept) else None
+
+    def _funding_missed(self, terms, pair: str, when, message: str, state: dict | None = None) -> None:
+        """Paper: settlement `when` is charged the baseline, its rate missing. Marked once (funding_missing), and
+        alerted unless an open episode already holds it: one opened on or before it with every settlement since then
+        missing too (funding.episode_of), so one outage alerts once and a later one after a published rate alerts
+        again (Advisor, 7 Oct 2026, QA P1-O17a-11)."""
+        from sleeve_fund import funding
+
+        rt = self.runtime
+        if rt is None:
+            return
+        tag = funding.stale_tag(getattr(terms, "funding_venue", None) or "", pair)
+        try:
+            state = state if state is not None else funding.journal_state(rt.store, tag)
+        except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
+            self._funding_episode(pair, True, message)
+            return
+        if when not in state["missing"]:
+            kept = self._newest_kept(terms, pair)
+            funding.mark(rt.store, tag, "funding_missing", when, ts=rt.now(), inferred=kept is not None)
+            state["missing"].add(when)
+        starts = [k for k in state["open"] if k is not None and k <= when]
+        due = self._settlements(terms, min(starts) - timedelta(seconds=1), when)[0] if starts and terms is not None else []
+        if funding.episode_of(state, when, due) is None:
+            event = {"kind": "funding_stale", "ts": rt.now()}
+            rt.store.event(None, "warning", "funding_stale", f"{tag} {message}; {funding.from_words(when)}",
+                           ts=event["ts"])
+            state["open"][when] = event
+
+    def _funding_watch_unread(self, pair: str, came: set) -> None:
+        """The journal unreadable: the instrument's one episode closes once nothing is missing."""
+        if came and not self._funding_missing:
+            last = max(came)
+            self._funding_episode(pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
+                                  "has arrived from the venue" + (f", with {len(came) - 1} earlier" if len(came) > 1 else ""))
+
+    def _rebuild_funding_missing(self) -> None:
+        """Paper, on start: the settlements of the instrument's open staleness episode still charged the baseline,
+        from the journal's baseline rows, so a restart keeps watching them (and the episode open) until their rates
+        arrive rather than leaving the inbox clear while one is missing (QA P1-O17a-10)."""
+        import pandas as pd
+
+        from sleeve_fund import funding
+
+        terms = self._cfg.perp
+        if terms is None or terms.funding_venue is None:
+            return
+        try:
+            state = funding.journal_state(self.runtime.store, funding.stale_tag(terms.funding_venue, pair_of(self.instrument)))
+        except Exception:  # noqa: BLE001 - no database (locally): nothing to carry on watching
+            return
+        starts = [k for k in state["open"] if k is not None]
+        if not starts:
+            return
+        # Back to the settlement the oldest opened on (an episode written before they named it opened at its alert),
+        # one of the instrument's own intervals as its stored rates show it, else the profile's (CR minor 4)
+        step = markets.latest_interval(funding.rates(terms.funding_venue, pair_of(self.instrument)))
+        opened = min(starts) - pd.Timedelta(step or markets.funding_interval(terms.funding_hours))
+        rows: dict = {}
+        for row in self.runtime.store.funding(self.runtime.name):
+            ts = pd.Timestamp(row["ts"])
+            rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
+        for ts, booked in rows.items():
+            # A settlement already reversed (its own reversal row, or rows netting to zero) is never watched again,
+            # so a restart can't refund it twice (CR, #163)
+            amounts = [r.get("amount") for r in booked]
+            if any(r.get("kind") == "reversal" for r in booked) or (
+                    None not in amounts and len(amounts) > 1 and abs(sum(amounts)) < 1e-9):
+                continue
+            row = next((r for r in booked if r.get("kind") == "baseline"), None)
+            if row is not None and ts > opened and ts not in state["never"]:
+                self._funding_missing.add(ts)
+                if row.get("amount") is not None:
+                    self._funding_paid[ts] = (row.get("qty"), row.get("price"), row.get("rate"), row["amount"])
+
+    def _funding_episode(self, pair: str, stale: bool, message: str, ts=None) -> None:
+        """Open (funding_stale, a warning) or close (funding_stale_cleared) the instrument's staleness episode, once
+        whichever strategy on it, or the collector, notices first: the journal's latest such event for the instrument
+        says whether one is open (Advisor, 6 Oct 2026: per instrument, once per episode; CR, #163)."""
+        from sleeve_fund import funding
+
+        rt = self.runtime
+        if rt is None:
+            return
+        perp = getattr(getattr(self, "_cfg", None), "perp", None)
+        tag = funding.stale_tag(getattr(perp, "funding_venue", None) or "", pair)
+        open_ = funding.stale_open(rt.store, tag)
+        if stale and open_ is not True:
+            rt.store.event(None, "warning", "funding_stale", f"{tag} {message}", ts=ts or rt.now())
+        elif not stale and open_ is not False:
+            rt.store.event(None, "info", "funding_stale_cleared", f"{tag} {message}", ts=rt.now())
 
     def _risk_level(self) -> tuple[float, str] | None:
         """Backtest on a perp: the nearest price, from here, at which the risk guard or the liquidation cut
