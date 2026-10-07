@@ -57,15 +57,16 @@ class PingPong(LongFlatStrategy):
         if self.runtime is None or self.runtime.backtest:
             return
         # After a restart, pick the cycle up from the journal: long from the average entry, or waiting to buy
-        # again from the last sell. With no fills yet it starts with a buy, as on the first start.
+        # again from the last sell. With no fills yet, or none since a reset after liquidation, it starts with a
+        # buy, as on the first start (RAL-ANCHOR).
         # On a perpetual a short is picked up from its entry the same way.
         qty, entry = self.runtime.book["qty"], self.runtime.book["entry_px"]
         if qty and entry:
             self._side, self._ref = (1 if qty > 0 else -1), float(entry)
             return
-        last = self.runtime.store.fills(self.runtime.name, limit=1)
+        last = self.runtime.last_fill_this_run()
         if last:
-            self._side, self._ref = (-1 if last[0]["side"] == "SELL" else 1), float(last[0]["price"])
+            self._side, self._ref = (-1 if last["side"] == "SELL" else 1), float(last["price"])
 
     def _leg_ends(self, leg: int, close: float) -> bool:
         """The rule that ends the leg the cycle is on, from the close it started from: the long leg once the

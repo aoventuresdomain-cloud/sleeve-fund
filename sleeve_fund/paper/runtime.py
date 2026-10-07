@@ -383,6 +383,18 @@ class SleeveRuntime:
         self.liq_working_since: datetime | None = None  # when the liquidation order now working was first seen
         self._refused = 0
 
+    def last_fill_this_run(self) -> dict | None:
+        """The newest fill a strategy may pick its cycle up from after a restart, else None: none once a reset after
+        liquidation came after it, which starts a fresh run (Advisor 15:22 UK, RAL-ANCHOR), so the first entry after
+        it follows the strategy's fresh-start rule rather than the liquidation's booked price. A reset after
+        liquidation still waiting counts too: the process applies it on its first tick, after the strategy has
+        started, and nothing trades before it does (the liquidation halt)."""
+        fills = self.store.fills(self.name, limit=1)
+        if not fills or any(c["command"] == RAL for c in self.store.pending_commands(self.name)):
+            return None
+        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+        return None if reset is not None and reset["ts"] >= fills[0]["ts"] else fills[0]
+
     def _last_liquidation(self) -> str | None:
         """The head of its liquidation halt while it is liquidated, else None (liquidation_head)."""
         return liquidation_head(self.store, self.name)
