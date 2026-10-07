@@ -1,7 +1,7 @@
 """Open interest of a perpetual venue's instruments, kept beside their price history (DA-10).
 
-The venue publishes open interest as a snapshot at the end of each fixed period (5 minutes on Binance), and keeps
-only a recent window of them (30 days on Binance). What it no longer publishes can't be fetched again, so this is
+The venue publishes open interest as a snapshot at the end of each fixed period (5 minutes on the perpetual venue
+collected from), and keeps only a recent window of them (30 days there). What it no longer publishes can't be fetched again, so this is
 a record, not a cache: snapshots are only ever added. One JSON file per venue and instrument in the history store's
 directory, topped up from the last snapshot kept. A snapshot already kept is never replaced: a later copy with
 different numbers is written to the series' own `<series>.provenance.jsonl` (never the price series' file, whose

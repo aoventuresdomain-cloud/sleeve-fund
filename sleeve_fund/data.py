@@ -22,8 +22,9 @@ KRAKEN_OHLCVT_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", 
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 
-def load_kraken_ohlcvt(path: str | Path, interval: str = "1D") -> pd.DataFrame:
-    """Load a Kraken OHLCVT CSV and return a frame indexed by bar CLOSE time (UTC)."""
+def load_ohlcvt_csv(path: str | Path, interval: str = "1D") -> pd.DataFrame:
+    """Load an OHLCVT CSV (time, open, high, low, close, volume, trades; Kraken's downloadable history is one)
+    and return a frame indexed by bar CLOSE time (UTC)."""
     raw = pd.read_csv(path, header=None, names=KRAKEN_OHLCVT_COLUMNS)
     if raw.empty:
         raise ValueError(f"{path} is empty")
@@ -32,6 +33,9 @@ def load_kraken_ohlcvt(path: str | Path, interval: str = "1D") -> pd.DataFrame:
     df.index = opened + pd.Timedelta(interval)
     df.index.name = "timestamp"
     return validate_ohlcv(df)
+
+
+load_kraken_ohlcvt = load_ohlcvt_csv
 
 
 KRAKEN_API = "https://api.kraken.com/0/public"
