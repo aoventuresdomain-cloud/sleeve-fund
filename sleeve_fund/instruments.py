@@ -233,6 +233,9 @@ class ScheduleFeeModel(FeeModel):
         # The commission carries the difference from the price the market order filled at; fee_paid keeps the
         # venue's fee apart so the report can move the rest into the price, as it does the spread.
         self.booked: dict[str, tuple[Decimal, bool]] = {}
+        # Those targets by their level, priced when the market order fills, with the half spread in force then (SPREAD-PIT:
+        # the bar it fills in, not the bar it was decided on); the price goes into booked for the strategy's journal.
+        self.booked_targets: dict[str, tuple[Decimal, bool]] = {}
         # Backtests: a resting stop's target level, by the stop's order id. A bar that opens through the target
         # takes the target before anything later in the bar can reach the stop (Advisor NA-2): if the venue fills
         # the stop in such a bar, it is booked as the target (rebooked), at target_fill_px, never the open (L12),
@@ -285,6 +288,9 @@ class ScheduleFeeModel(FeeModel):
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         shift = Decimal(0)
         booked = self.booked.get(str(order.client_order_id))
+        if booked is None and str(order.client_order_id) in self.booked_targets:
+            level, buy = self.booked_targets.pop(str(order.client_order_id))
+            booked = self.booked[str(order.client_order_id)] = (target_fill_px(level, not buy, self.half_spread), buy)
         target, since = self.open_targets.get(str(order.client_order_id), (None, None))
         if booked is None and target is not None and self.bar_open is not None and since < self.bar_seq:
             buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below

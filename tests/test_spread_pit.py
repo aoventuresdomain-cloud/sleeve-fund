@@ -176,3 +176,34 @@ def test_a_book_reset_leaves_the_spreads_untouched(tmp_path):
     Supervisor(store, python="true").reset_pending()
     assert store.pending_reset() is None and store.reset_runs()  # the reset went through
     assert store.spread_series(s.venue or "KRAKEN", s.instrument) == before
+
+
+def test_a_take_profit_books_with_the_spread_in_force_when_it_fills_not_when_it_was_decided(prices, instrument,
+                                                                                            monkeypatch):
+    """HoE 7 Oct: the target is priced by the fee model at the fill, with the half spread in force then, so a spread
+    that changes between the decision and the fill (a new bar's measurement) is the one booked."""
+    from decimal import Decimal
+
+    from sleeve_fund.instruments import target_fill_px
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    df = _path(prices, [100.0] * 10 + [100.0 * 1.01**i for i in range(1, 30)])
+    decided = {}
+    real = LongFlatStrategy._bar_target
+
+    def then_the_spread_moves(self, bar):
+        sent = real(self, bar)
+        if sent:  # the market order is out, priced at 0.1%; by its fill the spread in force is 0.3%
+            decided["book"] = self.decisions[next(reversed(self.decisions))]["signal"]["book_px"]
+            self.fee_model.half_spread = Decimal("0.003")
+        return sent
+
+    monkeypatch.setattr(LongFlatStrategy, "_bar_target", then_the_spread_moves)
+    res = run_backtest("buy_and_hold", df, instrument, {"take_profit": 0.05}, half_spread=0.001)
+    (coid, exit_px) = next((c, float(p)) for c, p, s in zip(res.fills.index, res.fills["avg_px"], res.fills["side"])
+                           if s == "SELL")
+    level = res.decisions[coid]["signal"]["target_px"]
+    assert decided["book"] == pytest.approx(float(target_fill_px(level, True, 0.001)))  # the decision's estimate
+    assert exit_px == pytest.approx(float(target_fill_px(level, True, 0.003)), rel=1e-6)  # what it booked
+    assert res.decisions[coid]["signal"]["book_px"] == pytest.approx(exit_px, rel=1e-6)  # and journaled
+    assert f"booked at {res.decisions[coid]['signal']['book_px']:,.6g}" in res.decisions[coid]["reason"]

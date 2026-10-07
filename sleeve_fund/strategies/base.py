@@ -2177,7 +2177,10 @@ class LongFlatStrategy(Strategy):
             signal["booked_at"] = round(self._book_at[coid], 8)
         self.decisions[coid] = {"intent": intent, "reason": reason, "signal": signal}
         if self._backtest and "book_px" in signal and self.fee_model is not None:
-            self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
+            if intent == "take_profit" and "target_px" in signal:  # priced at the fill, with the spread then
+                self.fee_model.booked_targets[coid] = (Decimal(str(signal["target_px"])), side == OrderSide.BUY)
+            else:
+                self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
         bar_close, bar_recv = self._deciding or (None, None)
         if self.runtime is not None:
             # A decision on a bar is timed from its order's own journal row (a risk stop or restore is not).
@@ -3147,6 +3150,8 @@ class LongFlatStrategy(Strategy):
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
         book = ((self.decisions.get(journal_id) or {}).get("signal") or {}).get("book_px")
+        if self._backtest and self.fee_model is not None and book and coid in self.fee_model.booked:
+            book = self._target_booked(coid, float(self.fee_model.booked[coid][0]))
         if self._backtest and self.fee_model is not None and coid in self.fee_model.rebooked:
             book = self._rebook_as_target(coid, *self.fee_model.rebooked.pop(coid), px)
         if book and kept_id is None and self._backtest:
@@ -3400,6 +3405,18 @@ class LongFlatStrategy(Strategy):
                        "then stopped out there", {"entry_px": self._entry_px, "trigger": round(level, 8),
                                                    "stop_loss": self._stop_frac})
         return True
+
+    def _target_booked(self, coid: str, book: float) -> float:
+        """Backtests: the price the fee model booked a target at, with the half spread in force when it filled
+        (SPREAD-PIT). Where that differs from the decision's estimate, the decision's record follows it."""
+        decision = self.decisions.get(coid) or {}
+        signal = decision.get("signal") or {}
+        was = signal.get("book_px")
+        if was is not None and round(was, 8) != round(book, 8):
+            signal["book_px"] = book
+            if decision.get("reason"):
+                decision["reason"] = decision["reason"].replace(f"booked at {was:,.6g}", f"booked at {book:,.6g}")
+        return book
 
     def _rebook_as_target(self, coid: str, level: float, book: float, px: float) -> float:
         """Backtests: the venue filled the resting stop in a bar that opened through the target. The open trades
