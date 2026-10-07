@@ -4033,7 +4033,12 @@ class LongFlatStrategy(Strategy):
             return False
         reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
                   "venue took the position first")
-        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8)})
+        # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE OK
+        # 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
+        stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8),
+                                                               "stop_relabelled": True, "stop_px": stop_px,
+                                                               "stop_fill_px": round(price, 8)})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
         self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)
