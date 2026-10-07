@@ -126,3 +126,12 @@ def test_a_rule_builder_strategys_lines_carry_their_panes_groups_levels_and_time
     assert series["trend"]["tf"] == "4h" and series["rsi"]["tf"] is None
     # At first only what the rules read: the RSI, its average, the 4h trend and the outer bands, not mid, width or %b.
     assert {k for k, s in series.items() if s["shown"]} == {"avg", "rsi", "trend", "bb.upper", "bb.lower"}
+
+
+def test_a_rule_reading_a_band_by_its_bare_id_shows_the_bands_mid(instrument):
+    """CR #174: a rule may read a multi-output block by its bare id, which reads its primary output (a band's mid);
+    that line starts shown, and the band's other outputs stay hidden."""
+    bare = {**DEFINITION, "long": {**DEFINITION["long"], "exit": {"left": "close", "op": ">=", "right": "bb"}},
+            "short": {**DEFINITION["short"], "exit": {"left": "close", "op": "<=", "right": "trend"}}}
+    series = {s["key"]: s for s in indicator_series("rules", HOURLY.iloc[:300], instrument, {"definition": bare}, 60)}
+    assert {k for k, s in series.items() if s["shown"]} == {"avg", "rsi", "trend", "bb.mid"}

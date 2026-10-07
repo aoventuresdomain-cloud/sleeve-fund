@@ -102,6 +102,12 @@ LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratio
 MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
 
 
+def _primary(outputs: tuple) -> str:
+    """The output a bare block id reads on a block with several (its `value`): the mid of a band or channel, a
+    stochastic's k."""
+    return "mid" if "mid" in outputs else outputs[0]
+
+
 def _operands(definition: dict) -> set:
     """Every block output the definition's rules and level exits read, by its key ("rsi", "bb.upper")."""
     found: set = set()
@@ -388,7 +394,8 @@ class Rules(LongFlatStrategy):
                          "levels": sorted(levels[key]) if levels.get(key) else None,
                          # only what the rules read is drawn at first: a line the model ignores invites a reader to
                          # find signals it never took (Independent Quant Advisor, 6 Oct 23:24)
-                         "shown": key in read}
+                         "shown": key in read or (o is not None and bid in read
+                                                  and o == _primary(type(self.rules.blocks[bid]).OUTPUTS))}
         return meta
 
     def indicator_values(self) -> dict[str, float | None]:
