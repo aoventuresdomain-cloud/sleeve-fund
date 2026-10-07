@@ -79,6 +79,9 @@ from test_long_short import PERP, _meta, _record
 
 REASON = "QA RAL: not built yet (Advisor 17:57)"
 xf = pytest.mark.xfail(strict=True, reason=REASON)
+# Two drawdown cells miss max_drawdown by ~8e-7: journal cash and the engine's mark differ by 0.8 cents of the
+# insurance credit's rounding (GAP-LIQ-CAP). Never loosened: the reason says it.
+xf_cap = pytest.mark.xfail(strict=True, reason=REASON + " (also needs GAP-LIQ-CAP: journal cash vs engine mark)")
 REASON78 = "QA RAL 7/8: not built yet (Advisor 21:05)"
 xf78 = pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON78)
 SIZING = "sizing_finding"  # [RAL7/8] the event a breached cap check at entry or at an add raises
@@ -165,6 +168,13 @@ def _replay_into(store, path):
         store.__dict__.pop("create_sleeve", None)
 
 
+def _gap_px(close):
+    """The price the gap reached: the liquidation signal's market_px where the head books the fill at the bankruptcy
+    price (GAP-LIQ-CAP, Advisor 00:19 (1)-(2)); otherwise the booked avg_px. A set-up input only, never asserted on."""
+    sig = close.get("signal") or {}
+    return float(sig.get("market_px") or close["avg_px"])
+
+
 def _gap_closed(orders, side):
     """Setup check (passes on every head): the gap closed the position past its liquidation price, by the liquidation
     or by the stop it went through. Returns (the closing order, the entry it closed)."""
@@ -172,8 +182,8 @@ def _gap_closed(orders, side):
     assert close["intent"] in ("liquidation", "stop_loss") and close["side"] == side, [(o["side"], o["intent"])
                                                                                        for o in orders]
     entry = [o for o in orders if o["intent"] == "entry" and o["side"] != side][-1]
-    move = close["avg_px"] / entry["avg_px"] - 1
-    assert (move if side == "BUY" else -move) > 0.5, (close["avg_px"], entry["avg_px"])  # past 2x liquidation (~49%)
+    move = _gap_px(close) / entry["avg_px"] - 1
+    assert (move if side == "BUY" else -move) > 0.5, (_gap_px(close), entry["avg_px"])  # past 2x liquidation (~49%)
     return close, entry
 
 
@@ -237,11 +247,13 @@ def _liquidate(tmp_path, store):
 
 def _restart(tmp_path, store, legs, hours, px=GAP_PX, tag="restart"):
     """The paper process starting again on the same journal: a recorded session replayed into the store. Returns the
-    orders it sent."""
-    before = len(store.orders(NAME, limit=100_000))
+    orders it sent, oldest first: the rows replay() returns whose order id the journal didn't hold before. Selected by
+    id, never by position: replay() leaves out paper's watched-stop rows (P1-U35, order_type 'STOP (watched)', no
+    venue order) while the journal holds them, so a count taken before would cut into the new orders."""
+    before = {o["order_id"] for o in store.orders(NAME, limit=100_000)}
     path = tmp_path / f"{tag}.jsonl.gz"
     _record_at(path, _meta(store.journal_book(NAME, 10_000)["cash"], PARAMS), legs, px, hours)
-    return _replay_into(store, path)[before:]
+    return [o for o in _replay_into(store, path) if o["order_id"] not in before]
 
 
 def _runtime(store, at, equity, price=GAP_PX, name=NAME):
@@ -352,6 +364,7 @@ def test_guard_after_a_liquidation_a_restart_leaves_it_halted(store, tmp_path):
     assert new == []
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 def test_after_a_liquidation_a_plain_resume_leaves_it_halted_through_a_restart(store, tmp_path):
     """[R17:57] "stays halted through resume/restart"; [HoE17:55] RAL is not a resume. A resume is refused in words,
     or is taken and leaves it halted: either way no trade, and the drawdown reference is not reset."""
@@ -368,6 +381,7 @@ def test_after_a_liquidation_a_plain_resume_leaves_it_halted_through_a_restart(s
     assert _peak(store) == pytest.approx(f.peak)
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 @pytest.mark.parametrize("margin", ["capped", "full"])
 def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_path, request, margin):
     """[R17:57] (a), [R18:17], [R20:37]: the halt reads "Position margin lost (liquidated): X, Y% of strategy equity
@@ -397,6 +411,7 @@ def test_the_liquidation_halt_says_how_much_position_margin_was_lost(store, tmp_
     assert _y_ok(y, x, f.at_entry, f.entry_fee), (y, x, f.at_entry, f.before)
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(store, tmp_path):
     """[R20:37] "with partial reductions in between keep that same entry-time equity": a 2x short of 0.11 opened at
     60,600 on 10,000 of equity; the price falls 30% and half the short is bought back (a partial reduce, equity about
@@ -432,7 +447,7 @@ def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(sto
     close = orders[-1]  # setup (passes on every head): the gap closed the rest past its liquidation price
     assert close["intent"] in ("liquidation", "stop_loss") and close["side"] == "BUY", [(o["side"], o["intent"])
                                                                                           for o in orders]
-    assert close["avg_px"] / entry_px - 1 > 0.5 and close["qty"] == pytest.approx(0.055), close
+    assert _gap_px(close) / entry_px - 1 > 0.5 and close["qty"] == pytest.approx(0.055), close
     assert store.journal_book(NAME, 10_000)["qty"] == 0
     at_entry, fee = _equity_at_entry(store, close["order_id"])
     assert at_entry == pytest.approx(10_000 - 3.33) and fee == pytest.approx(3.33)  # setup: the opening fill's
@@ -446,6 +461,7 @@ def test_y_keeps_the_equity_at_the_first_entry_fill_through_a_partial_reduce(sto
     assert _y_ok(y, x, at_entry, fee), (y, x, at_entry, at_reduce, before)
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 def test_a_stop_filled_through_the_liquidation_price_is_journalled_as_a_liquidation(store, tmp_path):
     """[R17:57] / [R18:17] (the incident's field is "why the half-liquidation stop did not protect the position"): a
     gap through the resting stop AND the liquidation price is a liquidation (the venue takes the position at its
@@ -459,6 +475,7 @@ def test_a_stop_filled_through_the_liquidation_price_is_journalled_as_a_liquidat
                                                        for e in store.events(NAME, limit=20, min_level="warning")]
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 def test_a_drawdown_halt_on_the_same_tick_as_a_liquidation_keeps_the_liquidation_halt(store, tmp_path):
     """[R17:57], [R18:17] (PE2's fix): the gap also breaches the 20% drawdown halt on the same tick. The halt must
     still be the liquidation's (the ruled text, cleared only by RAL), not an ordinary drawdown halt that a plain
@@ -479,6 +496,7 @@ def test_a_drawdown_halt_on_the_same_tick_as_a_liquidation_keeps_the_liquidation
 
 # --- the incident and its note [R17:57, HoE17:55, R18:17] ---------------------------------------------------------
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 @pytest.mark.parametrize("where", ["paper", "restart_after_an_outage"])
 def test_the_engine_opens_an_incident_on_every_liquidation(store, tmp_path, where):
     """[R18:17] "engine opens incident on every liquidation (paper + outage replay)" [B63]: one error event of kind
@@ -633,7 +651,7 @@ def test_an_add_that_breached_its_cap_check_raises_a_sizing_finding(store, tmp_p
 
 @pytest.mark.parametrize("case", [pytest.param("y_above_100_with_a_breached_add", marks=pytest.mark.xfail(
     strict=True, raises=AssertionError, reason="QA RAL 7 cross-check: not built yet (Advisor 22:23)")),
-    "y_at_or_below_100_within_every_cap"])
+    "y_at_or_below_100_within_every_cap"])  # PE2 (stop-safety, master 370303a4): this cell passes (mark removed)
 def test_on_balanced_y_above_100_coincides_with_a_recorded_cap_breach(store, tmp_path, case):
     """[ADDCAP22:23] "on balanced, Y > 100% must coincide with a recorded cap breach (else bug in Y or cap check)",
     both ways. On balanced (33% x 2x) a margin posted within the cap at every fill stays below the first-fill equity,
@@ -680,6 +698,7 @@ def test_the_engines_add_cap_check_is_on_the_margin_posted_after_the_add(store):
     assert rt.position_budget(10_000, posted=p.max_position_pct * 10_000) <= 1e-6
 
 
+# PE2 (stop-safety, master 370303a4): passes (mark removed)
 def test_the_engines_incident_records_the_equity_remaining_after_the_liquidation(store, tmp_path):
     """[R20:37] "Incident also records the equity remaining after the liquidation": the engine's incident for this
     liquidation (one, at or after it) names the strategy's equity once the position is gone ("{:,.2f}")."""
@@ -801,7 +820,7 @@ def test_ral_resets_the_day_baseline_to_the_remaining_equity(store, tmp_path):
     assert rt2.status == "paused", (rt2.status, store.sleeve(NAME).status_reason)
 
 
-@xf
+@xf_cap
 def test_ral_keeps_the_old_high_water_mark_in_history(store, tmp_path):
     """[R17:57] / [HoE17:55]: a NEW high-water mark, so the old one is kept: no mark is deleted or moved, the highest
     mark ever and the worst drawdown still show the liquidation, and the RAL's event names the old and the new
@@ -890,7 +909,7 @@ def test_ral_never_resets_the_book_level_figures(store, tmp_path):
     assert not store.archived() and not store.events_of(("book_cleared",))
 
 
-@xf
+@xf_cap
 def test_ral_never_resets_the_track_record(store, tmp_path):
     """[R18:17] "Track record never reset (Sharpe, trials, G1/G2 evidence, fills-vs-model, trade log continuous)":
     after RAL the strategy keeps its name, creation time (the G2 six-week clock), fills, orders and trades, its daily

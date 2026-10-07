@@ -85,6 +85,18 @@ def _session_one(tmp_path, store, monkeypatch, cell):  # noqa: F811
 FALL_AT = 10  # minutes into the restarted session: the price falls 3%, through the raced fill's 2% stop
 
 
+def _restart_balance(store):  # noqa: F811
+    """The account a restart opens with, as paper.node builds it from the journal (the exposure-gate master's
+    _restart_balance, a76842b): a perp's margin account opens with the cash it had when the position was opened, and the
+    restore order puts the position back. (QA's first version passed the journal's spot-style cash, which takes the
+    position's notional off twice: the "engine cash vs journal" mismatch seen after a raced fill was that, a harness
+    artefact.)"""
+    book = store.journal_book(egx.NAME, 10_000)
+    if store.sleeve(egx.NAME).params.get("market") == "perp":
+        return book["cash"] + book["qty"] * (book["entry_px"] or 0.0)
+    return book["cash"]
+
+
 def _session_two_falling(tmp_path, store, monkeypatch, reason_name, hours=2, minutes=20):  # noqa: F811
     """egx._session_two (the process starting again two hours later, its signal long throughout), with the price
     falling 3% at FALL_AT: through the raced fill's 2% stop (60,015 x 0.98 = 58,814.7), so its stop must close it."""
@@ -94,7 +106,7 @@ def _session_two_falling(tmp_path, store, monkeypatch, reason_name, hours=2, min
     plan = egx.Plan(t0=t0, minutes=minutes, tag="s2", bar=reason.bar,
                     price=lambda s: (60_000 + s * 0.01) * (0.97 if s >= k else 1.0),
                     windows=[(t0 - pd.Timedelta(minutes=10), egx.M(t0, minutes), 1)],
-                    balance=store.journal_book(egx.NAME, 10_000)["cash"])
+                    balance=_restart_balance(store))
     egx.run(tmp_path, store, plan, monkeypatch)
     return t0.to_pydatetime()
 
@@ -143,7 +155,7 @@ def test_sg7_a_raced_fill_at_a_flattening_halt_is_sold_at_once_through_the_exit_
 
 
 @pytest.mark.parametrize("cell", FLATTENING, ids=[IDS[c] for c in FLATTENING])
-# PE2: SG7 passes on this head (mark removed)
+# PE2 (stop-safety, master 26f172db): passes (mark removed)
 def test_sg7_the_raced_fill_flattened_by_a_halt_is_journaled_in_the_ruled_words(tmp_path, store, client,  # noqa: F811
                                                                                 monkeypatch, cell):
     """Advisor 23:05: journaled "raced fill flattened by halt" (any level or kind; the words are the ruling's). 845df4d

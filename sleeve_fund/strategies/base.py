@@ -501,6 +501,7 @@ class LongFlatStrategy(Strategy):
         # Perp only. A signal that turns a long short (or the other way) closes first; the new side opens
         # as soon as the close has filled, as (side, bar, reason, values).
         self._flip: tuple | None = None
+        self._last_submitted: str | None = None  # the client order id _submit last sent (_exit_at_market links it)
         # Paper on a perp: the sandbox's margin account can't be given a position at start, so a position
         # carried over a restart is bought or sold again there, at no fee and unjournaled ("restore"),
         # before anything else trades. _cash_adj then keeps the account's cash equal to the journal's:
@@ -804,7 +805,7 @@ class LongFlatStrategy(Strategy):
         refused order, one decision row each, naming why (Advisor 22:29 (3)); a backtest has no PM to read them."""
         if self.runtime is None or self.runtime.can_open():
             return False
-        if not getattr(self.runtime, "backtest", False):
+        if not self.runtime.backtest:
             why = self.runtime.entry_blocked()[1]
             self.runtime.refused(why or f"it is {self.runtime.status}", f"{what} would open the position")
         return True
@@ -2440,13 +2441,14 @@ class LongFlatStrategy(Strategy):
         """Send an exit at market. When it is the stop firing, the journal's watched stop ends "triggered", linked to
         the market stop-loss sent for it (Head of QA and HoE, 7 Oct); it ends "canceled" only when the position closes
         some other way (_sync_watched_stop)."""
-        watched = self._watched if intent == "stop_loss" and self._watched is not None and not self._backtest else None
+        watched = self._watched if intent == "stop_loss" and self.runtime is not None and not self._backtest else None
         if watched is not None:
             self._watched = None  # not the position closing some other way
-        sent = len(self._sent)
+        self._last_submitted = None
         self._sell_all(intent, reason, values)
         if watched is not None:
-            oid = str(self._sent[-1]) if len(self._sent) > sent else None
+            # The order _submit sent, by its id: _sell_all prunes _sent as it goes, so its length can't say (CR on #182).
+            oid = self._last_submitted
             self.runtime.store.update_order(
                 watched[0], status="triggered",
                 message=f"triggered at {price:,.6g}: " + (f"the market stop-loss {oid} closes the position" if oid else
@@ -2590,6 +2592,7 @@ class LongFlatStrategy(Strategy):
         if maker:
             self.clock.set_time_alert(f"maker-{coid}", self.clock.utc_now() + timedelta(minutes=wait),
                                       callback=self._maker_timeout)
+        self._last_submitted = coid
         return True
 
     def _maker_price(self, side, last: float, tick: float) -> float:
@@ -3291,6 +3294,7 @@ class LongFlatStrategy(Strategy):
         d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
+        self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)
         self._exit_lock, self._flip = held, None
         if self._entry_px is None:
             # A paper stop clears the entry as it fires (_check_exits); the liquidation's X and a later slice's
@@ -3534,7 +3538,7 @@ class LongFlatStrategy(Strategy):
                 self._first_minute = self._last_market_ns // MINUTE_NS
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
-            getattr(self.runtime, "holds", {}).pop("stale_data", None)
+            self.runtime.holds.pop("stale_data", None)
         if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:
             self._noted -= {"stale_price", "feed_dead", "hub_venue_down"}
             if self.runtime is not None:
@@ -3551,11 +3555,11 @@ class LongFlatStrategy(Strategy):
         now = self.clock.timestamp_ns()
         minutes = (now - self._last_market_ns) / 60e9
         if minutes >= STALE_PRICE_WARN_MINUTES:
-            if (holds := getattr(self.runtime, "holds", None)) is not None:
+            if self.runtime is not None:
                 # Stale data holds every entry and add, and cancels resting entries, until a trade or quote arrives
                 # (Advisor 22:29 (1), 00:20 (b)); stops and exits still run on the last price.
-                holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
-                                       "It clears when data resumes")
+                self.runtime.holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
+                                                    "It clears when data resumes")
             self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
                        f"risk guard are using the last price, {self._price():,.6g}")
         if minutes >= STALE_PRICE_RESTART_MINUTES and self.hub_status is not None and self.hub_status.venue_down(now):

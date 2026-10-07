@@ -376,7 +376,7 @@ def test_the_price_watchdog_waits_while_the_hub_is_up_but_has_lost_its_venue():
                                 bar_type=BarType.from_str(f"{inst.id}-15-MINUTE-LAST-EXTERNAL")))
     events = []
     s._last_market_ns, s._price = T0, lambda: 60_000.0
-    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False,
+    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False, holds={},
                                 store=SimpleNamespace(event=lambda *a, **k: events.append(a[2])))
     s.hub_status = HubStatus()
     s.hub_status.heartbeat_ns, s.hub_status.venue_up = now - 3 * S, False

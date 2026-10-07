@@ -608,6 +608,11 @@ def _liquidated_journal(store, t0):
     store.event(NAME, "error", "liquidation", "Liquidated: the price 89,700 reached the liquidation price 89,700",
                 ts=gone)
     store.event(NAME, "error", "risk_halt", f"{text}; PM must reset it after the liquidation", ts=gone)
+    # The engine's incident row on every liquidation (base.py _liquidation_incident, from on_fill; PE2 7 Oct 02:09:
+    # harness gap, the engine writes it): a reset after liquidation finds it.
+    store.event(NAME, "error", "incident", f"Incident, {NAME}: {WIPED_OUT}; {max(cash, 0.0):,.2f} of equity left. It "
+                "stays halted until you reset it after liquidation, which needs a note on why the half-liquidation "
+                "stop did not protect the position.", ts=gone)
     store.set_status(NAME, "halted", text)
 
 
@@ -1585,7 +1590,7 @@ def test_a_per_strategy_reset_never_clears_a_halt_or_the_daily_pause(tmp_path, s
 
 @pytest.mark.parametrize("reason_name", [pytest.param("daily_pause", id="book-reset-daily_pause", marks=xf(GATE)),
                                          pytest.param("portfolio_halt", id="book-reset-portfolio_halt", marks=xf(GATE)),
-                                         pytest.param("liquidation", id="book-reset-liquidation", marks=xf(GATE))])
+                                         pytest.param("liquidation", id="book-reset-liquidation")])  # passes on main once the set-up writes the incident (02:20)
 def test_a_book_reset_clears_the_daily_pause_and_the_portfolio_halt_but_not_a_liquidation_incident(
         tmp_path, store, client, monkeypatch, reason_name):
     """[CHOKE invariants 22:29 (4), EXCEPTION; U27 20:41] A BOOK reset re-bases the high-water mark and the day's start,

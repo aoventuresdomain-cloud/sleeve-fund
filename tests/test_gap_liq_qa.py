@@ -148,6 +148,7 @@ def _x_y(reason):
     return (float(m.group(1).replace(",", "")), m.group(2) if m.group(3) else None) if m else (None, None)
 
 
+# PE2 (stop-safety, master a476a042): passes (mark removed)
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side, profile):
     """X = margin + entry fee + liquidation fee over the whole position (grouped by order_id), to the cent; Y = X over
@@ -165,6 +166,7 @@ def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side,
     assert got == want, (got, want, out["reason"])
 
 
+# PE2 (stop-safety, master a476a042): passes (mark removed)
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_the_strategy_stays_halted_until_a_reset_after_liquidation(tmp_path, side, profile):
     """Incident opened; a PM resume, the PM's Stop and Start, and each restart after them leave it halted with the
@@ -180,6 +182,7 @@ def test_gap_liq_the_strategy_stays_halted_until_a_reset_after_liquidation(tmp_p
     assert got == want, (got, want)
 
 
+# PE2 (stop-safety, master a476a042): passes (mark removed)
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_hc_after_the_pms_stop_it_is_not_trading_still_halted_and_start_is_refused(tmp_path, side, profile):
     """HC (Advisor 18:17) on a stop gapped through liquidation: after Stop the strategy is not trading (desired state
@@ -195,3 +198,140 @@ def test_gap_liq_hc_after_the_pms_stop_it_is_not_trading_still_halted_and_start_
             "after_stop": {"desired": "stopped", "running": False, "status": "halted"},
             "start_refused": True, "desired_after_start": "stopped", "after_restart": (0, "halted", True)}
     assert got == want, (got, want)
+
+
+# --- P1-L22 restart regression pins (HoE 22:36; Advisor 22:36 "L22 liquidation basis") -------------------------------
+# P1-L22 (QA, #146 round on e07ec26): after a paper perp restart the liquidation price was worked out from the restore
+# fill (`_liq` -> `_net_position()`, the simulated venue holding the position at the restart's price), not from the
+# journal's entry. A gap past the real liquidation price then booked a stop_loss past it and the liquidation hook never
+# ran. Advisor 22:36: the liquidation price is computed ONCE from the position's own entry (average entry if there were
+# adds) and its posted margin, with the engine's formula, persisted and restored, never recomputed from the restore
+# price. HoE 22:36: fixed on #146 with the journal-entry basis GAP-LIQ shares; these pins keep it fixed on the
+# stop-safety / GAP-LIQ side.
+#
+# Harness: #146's QA hub-fed paper node (quant-review/v2-p1/hub-146-scripts/test_hub_146_qa.py: `restart`, the `probe`
+# strategy holding `side` from minute 5, a journaled position of 0.05 entered at minute 5 at ~60,000, Kraken BTC/USD
+# simulated perp). Imported read-only; nothing in that folder is changed.
+#   - "live" pins: the restarted process is up from 00:12 (nothing missed); the price is already 10% against a 3x
+#     short (30% against a 2x long) when it comes back, and the gap through the stop and the liquidation price happens
+#     LIVE at 00:15. No outage replay is involved, so they hold on any head with GAP-LIQ and the journal-entry basis
+#     (845df4d: pass; main 9ae1f8a: xfail, it books a stop_loss past liquidation from a restore-based price).
+#   - "replay" pins: HoE's exact case, restart(p, 6, 12): the minute to 00:08 opens 40% against the 3x short (55% against
+#     the 2x long, past its ~49.7% liquidation distance) while the process is down; on return the price is 10% (30%)
+#     against. They need #146's NA-3 outage replay as well, so they are strict xfail "L22" on every head today.
+import importlib  # noqa: E402
+
+from sleeve_fund.strategies.base import LongFlatStrategy as _LFS  # noqa: E402
+
+L22_HARNESS = "/mnt/project-files/sleeve-fund/quant-review/v2-p1/hub-146-scripts"
+_HAS_GAP_LIQ = hasattr(_LFS, "_gap_liquidation")  # the GAP-LIQ engine change (PE2 5e00eb2) is on this head
+L22_LIVE = pytest.mark.xfail(not _HAS_GAP_LIQ, strict=True, raises=AssertionError,
+                             reason="L22 (+GAP-LIQ): no journal-entry liquidation basis after a restart on this head")
+L22_REPLAY = pytest.mark.xfail(strict=True, raises=AssertionError,
+                               reason="L22: needs #146's NA-3 outage replay with the journal-entry liquidation basis")
+# (label, side, profile, price against the position on return, the gap, a stop restorable after the restart that the
+# return does not trip: beyond the return, inside the gap)
+L22_CASES = [pytest.param(-1, "aggressive", 0.10, 0.40, 0.15, id="3x-short"),
+             pytest.param(1, "balanced", 0.30, 0.55, 0.35, id="2x-long")]
+
+
+def _l22_harness(monkeypatch):
+    try:
+        h = importlib.import_module("test_hub_146_qa")
+    except ImportError:
+        sys.path.insert(0, L22_HARNESS)
+        try:
+            h = importlib.import_module("test_hub_146_qa")
+        finally:
+            sys.path.remove(L22_HARNESS)
+    from sleeve_fund.strategies import REGISTRY
+
+    monkeypatch.setitem(REGISTRY, "probe", h._probe_classes())
+    return h
+
+
+def _l22_run(monkeypatch, side, profile, back, gap, stop, replayed):
+    """The restart, with every liquidation price the engine works out (`_liq`) and every liquidation-hook call
+    recorded. Returns (run, expected liquidation price from the journal entry before the restart, the engine's liq
+    prices after the restart, hook calls)."""
+    from sleeve_fund import markets
+    from sleeve_fund.store import replay_book
+
+    h = _l22_harness(monkeypatch)
+    seen, hook = [], []
+    real_liq = _LFS._liq
+
+    def liq_spy(self, cash, qty):
+        v = real_liq(self, cash, qty)
+        if qty:
+            seen.append(v)
+        return v
+    monkeypatch.setattr(_LFS, "_liq", liq_spy)
+    if hasattr(_LFS, "_on_liquidation"):  # #146's L18 hook
+        real_hook = _LFS._on_liquidation
+
+        def hook_spy(self, *a, **k):
+            hook.append(a)
+            return real_hook(self, *a, **k)
+        monkeypatch.setattr(_LFS, "_on_liquidation", hook_spy)
+    p = h.flat_prices(30)
+    if replayed:  # the minute to 00:08 opens past liquidation while the process is down, back at 00:12 `back` against
+        p = h.shape(h.shape(p, 7.0, 8.0, h.adverse(side, gap)), 8.0, 30, h.adverse(side, back))
+        run = h.restart(p, 6, 12, side=side, perp=True, profile=profile, stop=0.01)
+    else:  # back at 00:12 already `back` against; the gap comes live at 00:15
+        p = h.shape(h.shape(p, 12.0, 15.0, h.adverse(side, back)), 15.0, 30, h.adverse(side, gap))
+        run = h.restart(p, 12, 12, side=side, perp=True, profile=profile, stop=stop)
+    held = [f for f in run.fills if f["order_id"] == "O-held"]
+    book = replay_book(held, 10_000)  # the journal as it stood before the restart: the entry only
+    from sleeve_fund import risk
+
+    want = markets.isolated_liquidation(book["cash"], book["qty"], book["entry_px"],
+                                        risk.profile(profile).max_leverage,
+                                        markets.terms({"market": "perp"}, "KRAKEN").maintenance_margin)
+    return run, want, seen, hook
+
+
+def _l22_assert(run, want, seen, hook, side, gap):
+    # The orders that traded (QA, 7 Oct ~00:40): the stop-safety head journals the stop it watches as an order row
+    # ("STOP (watched)", cancelled unfilled when it is replaced or the position goes), which closes nothing; "booked"
+    # means filled, as before.
+    closing = [o for o in run.orders if o["order_id"] != "O-held" and o["filled_qty"] > 0]
+    liq_events = run.kinds("liquidation")
+    first = closing[0] if closing else {}
+    got = {
+        "first_exit": first.get("intent"),
+        "liq_px_recorded": round(float((first.get("signal") or {}).get("liquidation_px", 0.0)), 1),
+        "stop_loss_orders": [round(float(o.get("avg_px") or 0.0), 1) for o in closing if o["intent"] == "stop_loss"],
+        "liq_after_restart": round(seen[0], 1) if seen else None,
+        "liquidation_events": len(liq_events),
+        "hook_calls": len(hook) if hasattr(_LFS, "_on_liquidation") else len(liq_events),
+    }
+    exp = {"first_exit": "liquidation", "liq_px_recorded": round(want, 1), "stop_loss_orders": [],
+           "liq_after_restart": round(want, 1), "liquidation_events": 1, "hook_calls": 1}
+    # set-up: the gap is past the journal-entry liquidation price (else nothing here is about L22)
+    gap_px = 60_000.0 * (1 - side * gap)
+    assert side * (gap_px - want) < 0, (gap_px, want)
+    assert got == exp, (got, exp, [(o["intent"], o["reason"][:120]) for o in closing])
+
+
+@L22_LIVE
+@pytest.mark.parametrize("side,profile,back,gap,stop", L22_CASES)
+def test_l22_after_a_restart_the_liquidation_price_is_the_journal_entrys_and_a_live_gap_books_a_liquidation(
+        monkeypatch, side, profile, back, gap, stop):
+    """Restarted 10% (3x short) / 30% (2x long) against the entry; the liquidation price the engine works out after the
+    restart equals the one from the journal's entry before it (Advisor 22:36: never recomputed from the restore price),
+    and the live gap through the stop and that price books ONE liquidation recorded at it, not a stop_loss past it."""
+    run, want, seen, hook = _l22_run(monkeypatch, side, profile, back, gap, stop, replayed=False)
+    _l22_assert(run, want, seen, hook, side, gap)
+
+
+# PE2 (stop-safety, master a476a042): passes (mark removed)
+@pytest.mark.parametrize("side,profile,back,gap,stop", L22_CASES)
+def test_l22_restart_replay_of_a_minute_past_liquidation_books_the_liquidation_at_the_entry_based_price(
+        monkeypatch, side, profile, back, gap, stop):
+    """HoE 22:36, P1-L22 as found: restart(p, 6, 12); the minute to 00:08 opened past the entry-based liquidation price
+    (3x short: ~79,604, 40% against; 2x long: ~30,152, 55% against) and the price is still 10% / 30% against on return.
+    The replay books ONE liquidation recorded at the journal-entry liquidation price (the hook called once), never the
+    e07ec26 stop_loss at ~84,045 past it; the engine's liquidation price after the restart is the journal entry's."""
+    run, want, seen, hook = _l22_run(monkeypatch, side, profile, back, gap, stop, replayed=True)
+    _l22_assert(run, want, seen, hook, side, gap)
