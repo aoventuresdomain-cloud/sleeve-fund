@@ -33,6 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
+from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
@@ -198,14 +199,6 @@ def through_liquidation(side: int, price: float, liq: float | None) -> bool:
     return liq is not None and price > 0 and (price <= liq if side > 0 else price >= liq)
 
 
-def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: float,
-                      leverage: float) -> tuple[float | None, float]:
-    """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
-    leverage as its isolated margin: markets.isolated_margin), and how far that is from close as a share of
-    it (inf when none)."""
-    notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
-    liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
-    return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
 def _utc(ns: int) -> datetime:
@@ -707,6 +700,9 @@ class LongFlatStrategy(Strategy):
         self.decisions: dict[str, dict] = {}
         # Paper (v2 P1-2): the decision bar's close and arrival (ns) while on_bar decides, for each order's timing.
         self._deciding: tuple[int, int] | None = None
+        # P1-1-CANON (Advisor): the bar a decision used, as it was then, journalled with each order's signal. The
+        # store may later replace a hub bar with the venue's candle; this record is never overwritten.
+        self._deciding_bar: dict | None = None
         self._late: Bar | None = None  # paper, m13-E3: a bar that closed while the strategy was down (late_bar)
         self._lag: int | None = None  # ns: this decision came more than LATE_DECISION_NS after its bar's close
         self._late_skips: list[int] = []  # the closes of the late bars an opening was skipped on, this run
@@ -2042,11 +2038,11 @@ class LongFlatStrategy(Strategy):
         self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
-        self._deciding = None
+        self._deciding = self._deciding_bar = None
         try:
             self._on_bar(bar)
         finally:
-            self._deciding = self._lag = None
+            self._deciding = self._deciding_bar = self._lag = None
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
 
@@ -2458,6 +2454,12 @@ class LongFlatStrategy(Strategy):
                     "The next whole candle clears it")
                 self._cancel_resting_entries()
         self._deciding = (int(bar.ts_event), int(bar.ts_init))
+        self._deciding_bar = {
+            "close_ts": _utc(int(bar.ts_event)).isoformat(),
+            "o": bar.open.as_double(), "h": bar.high.as_double(), "l": bar.low.as_double(),
+            "c": bar.close.as_double(), "v": bar.volume.as_double(),
+            # where its minutes came from: the history store (backtest), the hub's live build, or the venue feed
+            "src": "store" if self._backtest else "hub" if self.hub_fed else "feed"}
         lag = 0 if self._backtest or self.runtime is None else self._now_ns() - bar.ts_event
         self._lag = lag if lag > LATE_DECISION_NS else None
         if self._lag is None and self._late_skips:
@@ -2871,6 +2873,8 @@ class LongFlatStrategy(Strategy):
             signal, self._outage_book = {**signal, **self._outage_book}, None  # a replayed exit's booking
         signal = {k: (round(v, 8) if isinstance(v, float) else v) for k, v in signal.items()}
         signal.setdefault("price", last)
+        if self._deciding_bar is not None:
+            signal.setdefault("bar", self._deciding_bar)
         maker = bool(wait and not market and intent in MAKER_INTENTS and last > 2 * tick)
         # On a perp every exit is reduce-only: whatever the strategy's own book says, the venue never lets an
         # exit open the other side (review round 11, B11-3).
@@ -4036,7 +4040,12 @@ class LongFlatStrategy(Strategy):
             return False
         reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
                   "venue took the position first")
-        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8)})
+        # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE OK
+        # 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
+        stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8),
+                                                               "stop_relabelled": True, "stop_px": stop_px,
+                                                               "stop_fill_px": round(price, 8)})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
         self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)

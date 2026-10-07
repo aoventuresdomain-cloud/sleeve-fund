@@ -43,7 +43,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from sleeve_fund.money import EXACT, stored, to_decimal
+from sleeve_fund.exact import EXACT
+from sleeve_fund.money import stored, to_decimal
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 

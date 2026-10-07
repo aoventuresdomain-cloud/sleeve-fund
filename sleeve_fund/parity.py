@@ -5,7 +5,8 @@
 
 Reports, per instrument: minutes on both sides, minutes only on one side, minutes whose OHLC differ by more than
 the tolerance or whose volume differs by more than 0.1%, the largest differences, the minutes the hub refilled
-from the venue's REST API and any refill that disagreed with a stored bar (HistoryStore.provenance), and the
+from the venue's REST API, any refill that disagreed with a stored bar, the hub bars the venue's candle replaced
+(HistoryStore.provenance), and the
 late-trade rate when the hub supplies its counts. Reads only; nothing is written to the store.
 """
 
@@ -18,6 +19,9 @@ import pandas as pd
 from sleeve_fund.history import OHLCV, HistoryStore
 
 VOLUME_TOLERANCE = 0.001  # relative: venues revise volume by tiny amounts as late trades settle
+# Late trades (reaching the hub after their minute was built) above this share of an instrument's trades over the
+# window: the Independent Quant Advisor's trigger to widen the hub's grace (P1-1-DELAY, 17:05 UK).
+LATE_ALERT_RATE = 0.0005
 
 
 @dataclass
@@ -34,6 +38,9 @@ class Parity:
     worst_volume: float = 0.0  # the largest relative volume difference
     refilled: int = 0
     conflicts: int = 0
+    # hub live bars the venue's candle replaced (P1-1-CANON): the hub's own differences, once the store holds the
+    # venue's record. The P1-1-DELAY acceptance reads this, since the store itself then matches the venue.
+    replaced: int = 0
     late_trades: tuple[int, int] | None = None  # (late, total) from the hub, when it reports them
 
     @property
@@ -90,6 +97,8 @@ def compare(pair: str, ours: pd.DataFrame, theirs: pd.DataFrame, start: pd.Times
             p.refilled += int(rec["minutes"])
         elif rec["kind"] == "conflict" and start <= pd.Timestamp(rec["minute"]) < end:
             p.conflicts += 1
+        elif rec["kind"] == "replaced" and start <= pd.Timestamp(rec["minute"]) < end:
+            p.replaced += 1
     return p
 
 
@@ -114,14 +123,18 @@ def markdown(venue: str, results: list[Parity]) -> str:
              f"Window {start:%d %b %Y %H:%M} to {end:%d %b %Y %H:%M} UTC ({(end - start) / pd.Timedelta('1h'):.0f} hours). "
              "The store's 1-minute bars as the hub wrote them, against the venue's own 1-minute candles.", "",
              "| Instrument | Result | Both | Missing in store | Store only | OHLC diffs | Volume diffs | Worst OHLC diff | "
-             "Refilled | Refill conflicts | Late trades |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+             "Refilled | Refill conflicts | Hub bars replaced by venue | Late trades |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for p in results:
         late = "not reported" if p.late_trades is None else (
             f"{p.late_trades[0]} of {p.late_trades[1]} ({p.late_trades[0] / max(p.late_trades[1], 1):.3%})")
         lines.append(f"| {p.pair} | {'match' if p.ok else 'DIFFERS'} | {p.both} | {len(p.venue_only)} | "
                      f"{len(p.store_only)} | {p.price_diffs} | {p.volume_diffs} | {p.worst_price:g} | {p.refilled} | "
-                     f"{p.conflicts} | {late} |")
+                     f"{p.conflicts} | {p.replaced} | {late} |")
+    for p in results:
+        if p.late_trades is not None and p.late_trades[0] > LATE_ALERT_RATE * p.late_trades[1]:
+            lines += ["", (f"**{p.pair}**: LATE TRADES ABOVE {LATE_ALERT_RATE:.2%} "
+                           f"({p.late_trades[0] / p.late_trades[1]:.3%}): the trigger to widen the hub's grace.")]
     for p in results:
         if p.venue_only or p.store_only:
             lines += ["", f"**{p.pair}**: missing in store: {_runs(p.venue_only)}. Store only: {_runs(p.store_only)}."]

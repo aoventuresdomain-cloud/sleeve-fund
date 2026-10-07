@@ -206,16 +206,18 @@ def test_bars_reach_the_stores_write_path_as_open_time_and_source_a_refill_in_on
     monkeypatch.setattr(store, "append_bars", lambda *a: calls.append(a) or real(*a))
     sink = store_sink(store, "BINANCE", {BTC: "BTC/USDT"}, log=said.append)
     sink([protocol.bar_from_nautilus(_bar(BTC, T0), T0)])
-    # A refill of the same minute with another close, and the next minute: one call, the stored bar kept.
+    # A refill of the same minute with another close, and the next minute: one call. The refill is the venue's candle,
+    # so it replaces the live bar (P1-1-CANON, HoE test correction) and the hub logs that.
     sink([{**protocol.bar_from_nautilus(_bar(BTC, T0 + k * MINUTE_NS, c="60005.00"), T0), "refilled": True}
           for k in (0, 1)])
     sink([protocol.bar_from_nautilus(_bar(ETH, T0), T0)])  # not one of the hub's instruments: not stored
     bar = lambda close, c: (close - MINUTE_NS, 60000.0, 60010.0, 59990.0, c, 1.25)  # noqa: E731
     assert calls == [("BINANCE", "BTC/USDT", [bar(T0, 60000.1)], "live"),
                      ("BINANCE", "BTC/USDT", [bar(T0, 60005.0), bar(T0 + MINUTE_NS, 60005.0)], "refill")]
-    assert len(said) == 1 and "1 refill bar(s) differ from the stored" in said[0]
+    assert len(said) == 1 and "1 live bar(s) replaced by the venue's candle" in said[0]
     cov = store.coverage("BINANCE", "BTC/USDT")
-    assert cov.last == pd.Timestamp(T0, unit="ns", tz="UTC")  # both minutes stored, the first one not overwritten
+    assert cov.last == pd.Timestamp(T0, unit="ns", tz="UTC")  # both minutes stored
+    assert store.read("BINANCE", "BTC/USDT", 1)["close"].tolist() == [60005.0, 60005.0]
 
 
 def test_an_instrument_added_while_the_hub_runs_is_picked_up_on_the_next_pass():

@@ -109,7 +109,8 @@ def test_the_badge_reads_the_hubs_closed_minute_and_its_provenance(client, tmp_p
     start = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2)).floor("h").tz_localize(None)
     store.append_bars("KRAKEN", "ETH/USD", _rows(start, 30), "live")
     store.append_bars("KRAKEN", "ETH/USD", _rows(start + pd.Timedelta(minutes=30), 10), "refill")
-    store.append_bars("KRAKEN", "ETH/USD", _rows(start, 1, price=90.0), "refill")  # differs: kept out, logged
+    store.append_bars("KRAKEN", "ETH/USD", _rows(start, 1, price=90.0), "live")  # differs: kept out, logged (a refill
+    # would replace it, P1-1-CANON)
     last = start + pd.Timedelta(minutes=39)
     page = c.get("/research", auth=AUTH).text
     assert (f'title="1 refill, 1 conflict recorded">stored · last candle {last:%H:%M} · no gaps</span>' in page)

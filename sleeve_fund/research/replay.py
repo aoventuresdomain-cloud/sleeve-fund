@@ -66,7 +66,7 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
     from sleeve_fund import markets
     from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
     from sleeve_fund.paper.runtime import SleeveRuntime
-    from sleeve_fund.money import float_view
+    from sleeve_fund.exact import float_view
     from sleeve_fund.store import Store, utcnow
     from sleeve_fund.strategies import REGISTRY
 

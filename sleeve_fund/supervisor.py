@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 
 from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
-from sleeve_fund.money import float_view
+from sleeve_fund.exact import float_view
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow

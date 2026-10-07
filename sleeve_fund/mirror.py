@@ -46,7 +46,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from sleeve_fund import markets, risk
-from sleeve_fund.money import float_view
+from sleeve_fund.exact import float_view
 
 FLAG_ENV = "DEMO_MIRROR"
 KEY_ENV = "DERIBIT_TESTNET_API_KEY"
