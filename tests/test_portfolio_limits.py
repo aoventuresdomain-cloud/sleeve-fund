@@ -136,3 +136,11 @@ def test_cr208_2_float_money_into_the_book_check_halts_not_raises():
     like NaN, rather than raising past the supervisor's marking."""
     b = book_breach(PORTFOLIO, 17_000.0, D(20_000), D(20_000))
     assert b.action == "halt" and "aren't usable" in b.reason
+
+
+def test_cr208_3_a_request_under_the_venue_minimum_is_rejected_below_min_even_when_nothing_binds():
+    """Before: an order of 0.0005 against a 0.001 minimum, with room under every limit, was approved and sent."""
+    d = decide(Book(BOOK), _buy("0.0005", step="0.0001"), PORTFOLIO)
+    assert (d.outcome, d.approved_qty, d.limit_hit) == ("rejected", D("0"), "below_min")
+    assert "below the venue minimum of 0.001" in d.reason
+    assert decide(Book(BOOK), _buy("0.001"), PORTFOLIO).outcome == "approved"  # exactly the minimum passes
