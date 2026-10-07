@@ -13,6 +13,7 @@ that fired, the block values, the candles they were read from and where those ca
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from nautilus_trader.model import Bar
@@ -25,6 +26,7 @@ from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked,
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
 _hash_of = definition_hash  # RulesConfig takes a parameter of that name
+FIRST_TOUCH_RERUN = 0.05  # an ambiguous share above this re-runs G1 the other way (Advisor ~22:07)
 
 SPEC = IdeaSpec(
     listed=False,
@@ -94,6 +96,57 @@ def _iso(ns: int) -> str:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).isoformat()
 
 
+# The chart's panes (P1-3s): blocks in price units are drawn over the candles, the rest in the lower pane.
+PRICE_KINDS = frozenset({"sma", "ema", "wma", "vwap", "bollinger", "donchian", "keltner"})
+LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratios
+MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
+
+
+def _primary(outputs: tuple) -> str:
+    """The output a bare block id reads on a block with several (its `value`): the mid of a band or channel, a
+    stochastic's k."""
+    return "mid" if "mid" in outputs else outputs[0]
+
+
+def _operands(definition: dict) -> set:
+    """Every block output the definition's rules and level exits read, by its key ("rsi", "bb.upper")."""
+    found: set = set()
+
+    def walk(node) -> None:
+        if isinstance(node, str):
+            found.add(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk({k: definition.get(k) for k in ("long", "short", "exits")})
+    return found
+
+
+def _levels(definition: dict) -> dict[str, set]:
+    """Block key -> the numbers the definition's rules compare it with directly, for the lower pane's guide lines."""
+    found: dict[str, set] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            left, right = node.get("left"), node.get("right")
+            if "op" in node:
+                for a, b in ((left, right), (right, left)):
+                    if isinstance(a, str) and isinstance(b, (int, float)) and not isinstance(b, bool):
+                        found.setdefault(a, set()).add(float(b))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk({k: definition.get(k) for k in ("long", "short")})
+    return found
+
+
 class Rules(LongFlatStrategy):
     REENTER_AFTER_EXIT_LEG = True
 
@@ -101,7 +154,8 @@ class Rules(LongFlatStrategy):
         super().__init__(config)
         self.c = config
         self.rules = Compiled(config.checked)
-        self.env = Env(blocks=self.rules.blocks)
+        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"),
+                       journal=self._journal)
         by_tf: dict = {}
         for bid in config.checked.order:
             by_tf.setdefault(config.checked.blocks[bid]["timeframe"], []).append(bid)
@@ -114,6 +168,12 @@ class Rules(LongFlatStrategy):
         self._held_before: dict[int, bool] = {}  # whether each side's entry rule held on the candle before
         self._levels: dict | None = None  # the open position's level exits, by kind, set when it opened
         self._why: tuple[str, dict] | None = None  # why the leg changed on this candle, with the lineage payload
+        # first_touch: (after ns, until ns) -> the 1-minute bars closing in (after, until], as (close ns, open, high,
+        # low, close): the backtest's own minutes (research.runner), the hub's in paper (paper.node)
+        self.minute_source = None
+        # until ns -> (high, low) of the venue's own candle closing then, where the decision candle is built from the
+        # 1-minute bars and so would miss a minute they lack (a backtest on exec_prices); None: the bar is the venue's
+        self.range_source = None
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
@@ -150,12 +210,52 @@ class Rules(LongFlatStrategy):
                           bar.volume.as_double())
         self._feed.update_ohlcv(o, h, lo, c, v, bar.ts_event)
         env.ohlcv, env.ts, env.bar = (o, h, lo, c, v), int(bar.ts_event), env.bar + 1
+        if self.rules.touches:
+            env.minutes, env.minutes_due = self._minutes_of(bar), bar_minutes(self._cfg.bar_type)
+            env.span = self.range_source(env.ts) if self.range_source is not None else None
         env.closed = {tf for tf, s in self._slow.items() if s.count != self._counts[tf]}
         self._counts = {tf: s.count for tf, s in self._slow.items()}
         for side in self.rules.sides.values():  # setups arm and confirmations count on every candle
             side["entry"].tick(env)
             if side["exit"] is not None:
                 side["exit"].tick(env)
+
+    def _minutes_of(self, bar: Bar) -> list | None:
+        """The candle's own 1-minute bars, oldest first, for first_touch: never one closing after it (look-ahead) or
+        at or before the candle before's close; those to hand (paper decides without waiting for a late one)."""
+        step, end = bar_minutes(self._cfg.bar_type), int(bar.ts_event)
+        if step == 1:
+            return [(end, bar.open.as_double(), bar.high.as_double(), bar.low.as_double(), bar.close.as_double())]
+        start = end - step * MINUTE_NS
+        got = self.minute_source(start, end) if self.minute_source is not None else None
+        return sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
+
+    def _journal(self, kind: str, msg: str) -> None:
+        """An info event every time (not once, as _note is): paper only, where the minutes come from the hub."""
+        if self.runtime is not None and not self._backtest:
+            self.runtime.store.event(self.runtime.name, "info", kind, msg, ts=self.runtime.now())
+
+    def first_touch_stats(self) -> dict:
+        """For the report, per first_touch rule by its path (long.entry, long.entry[1], long.exit): candles judged,
+        resolved true, either level reached, settled by minutes, both first reached in one minute, and unknown (a
+        minute missing before the first reach, or minutes that disagree with the candle's range; `inconsistent` is the
+        latter). `ambiguous_share` is same minute + unknown over either reached, which the G1 check reads (Advisor
+        ~22:07): above 5% (`rerun_opposite_resolution`) it is re-run with first_touch_flip and judged on the worse. On
+        1-minute candles every candle reaching both is a same-minute case, so the share is the assumption's, and the
+        note says so. `incomplete` counts candles settled by minutes with one or more of them not to hand (paper
+        journals each, first_touch_incomplete); `incomplete_share` is that over judged, for fills-vs-model (R2-INC)."""
+        out = {}
+        for n in self.rules.touches:
+            st = dict(n.stats)
+            st["ambiguous_share"] = (st["same_minute"] + st["unknown"]) / st["reached"] if st["reached"] else 0.0
+            st["incomplete_share"] = st["incomplete"] / st["judged"] if st["judged"] else 0.0
+            st["rerun_opposite_resolution"] = st["ambiguous_share"] > FIRST_TOUCH_RERUN
+            st["resolved"] = ("true" if n.exit_rule != n.flip else "false") + " when ambiguous"
+            if bar_minutes(self._cfg.bar_type) == 1:
+                st["note"] = ("on 1-minute candles the order inside a candle reaching both levels is never seen: "
+                              "every such candle is assumed, so the result rests on that assumption")
+            out[n.path] = st
+        return out
 
     # --- the leg ----------------------------------------------------------------------------------------------
 
@@ -266,7 +366,68 @@ class Rules(LongFlatStrategy):
                    "blocks": blocks, "bars": bars, "data": {"source": source, "refilled_in_range": None}}  # unknown until provenance is read (DA-4)
         if armed:
             payload["armed_at"] = _iso(max(armed))
+        touched = {n.path: n.lineage() for n in self.rules.touches
+                   if n.judged_ts == self.env.ts and n.last is not None}
+        if touched:
+            payload["first_touch"] = touched
         return payload
+
+    # --- the chart's indicators (P1-3s) -----------------------------------------------------------------------
+
+    def _drawn(self) -> dict[str, tuple]:
+        """key -> (block id, output or None), keyed as the lineage payload keys them; markers left out."""
+        if getattr(self, "_drawn_keys", None) is not None:
+            return self._drawn_keys
+        out = {}
+        for bid, b in self.rules.blocks.items():
+            if self.c.checked.blocks[bid]["kind"] in MARKER_KINDS:
+                continue
+            outputs = type(b).OUTPUTS
+            for o in ((None,) if outputs == ("value",) else outputs):
+                out[bid if o is None else f"{bid}.{o}"] = (bid, o)
+        self._drawn_keys = out
+        return out
+
+    def _pane(self, bid: str, output: str | None) -> str:
+        spec = self.c.checked.blocks[bid]
+        if spec["kind"] not in PRICE_KINDS or output in LOWER_OUTPUTS:
+            return "lower"
+        src = spec["input"]  # ("field", name) or ("block", id, output): an average of an RSI is drawn with the RSI
+        if src and src[0] == "block":
+            return self._pane(src[1], src[2])
+        return "lower" if src and src[1] == "volume" else "price"
+
+    def indicator_meta(self) -> dict[str, dict]:
+        levels = _levels(self.c.definition)
+        read = _operands(self.c.definition)
+        meta = {}
+        for key, (bid, o) in self._drawn().items():
+            spec = self.c.checked.blocks[bid]
+            settings = ", ".join(f"{v}" for v in spec["settings"].values() if v is not None)
+            tf = timeframe_label(spec["timeframe"]) if spec["timeframe"] else None
+            label = f"{spec['kind'].upper()}({settings})" + (f" {o}" if o else "") + (f" {tf}" if tf else "")
+            pane = self._pane(bid, o)
+            meta[key] = {"label": label, "pane": pane, "tf": tf,
+                         "group": bid if o and pane == "price" else None,
+                         "levels": sorted(levels[key]) if levels.get(key) else None,
+                         # only what the rules read is drawn at first: a line the model ignores invites a reader to
+                         # find signals it never took (Independent Quant Advisor, 6 Oct 23:24)
+                         "shown": key in read or (o is not None and bid in read
+                                                  and o == _primary(type(self.rules.blocks[bid]).OUTPUTS))}
+        return meta
+
+    def indicator_values(self) -> dict[str, float | None]:
+        # Raw outputs, warm-up included (indicator_settled says which the rules could read): from settling on, each
+        # is block_value's, the value the rules and the lineage payload read.
+        out = {}
+        for key, (bid, o) in self._drawn().items():
+            b = self.rules.blocks[bid]
+            v = b.value if o is None else b.values.get(o)
+            out[key] = float(v) if v is not None and math.isfinite(v) else None
+        return out
+
+    def indicator_settled(self, key: str) -> bool:
+        return self.rules.blocks[self._drawn()[key][0]].settled
 
     # --- level exits ------------------------------------------------------------------------------------------
 
