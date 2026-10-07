@@ -2071,8 +2071,8 @@ class LongFlatStrategy(Strategy):
         side = self.want_side(bar)
         if side is None or int(side) != -held or (side < 0 and not self._cfg.allow_short):
             return
-        if self._late_entry(bar, f"{_side_word(int(side))} entry after the target"):
-            return
+        if self._entry_held(bar, f"{_side_word(int(side))} entry after the target"):
+            return  # an entry like any other: held while late or while the slower candles are short of history
         reason, values = self.explain(bar, int(side))
         self._flip = (int(side), bar, reason, {**values, "close": bar.close.as_double()})
 
