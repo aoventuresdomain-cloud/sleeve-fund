@@ -121,6 +121,12 @@ def test_a_backtest_charges_the_rates_the_venue_settled(tmp_path, monkeypatch):
     assert any("(0.0300%)" in m for m in paid) and any("(0.0100%)" in m for m in paid)
     fallback = [e for e in r.journal.events_ if e["kind"] == "funding_fallback"]
     assert len(fallback) == 1 and "0.0100% baseline" in fallback[0]["message"]
+    # A missing rate never credits: whichever side is held pays the baseline (Advisor, 6 Oct 2026; QA P1-O17).
+    baseline = {ts for ts, b, held in r.funding_marks if b and held}
+    assert baseline and any(not b for _, b, held in r.funding_marks if held)
+    held = [f for f in r.journal.funding_ if f["ts"] in baseline]
+    assert any(f["qty"] < 0 for f in held) and all(f["amount"] < 0 for f in held)  # a short pays it too
+    assert any(f["amount"] > 0 for f in r.funding if f["ts"] not in baseline)  # a short does receive a real rate
 
 
 @pytest.fixture

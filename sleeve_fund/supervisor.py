@@ -78,6 +78,23 @@ def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> st
     return "none"
 
 
+def check_funding_schedule(s: Sleeve) -> None:
+    """Raises ValueError when a perp's newest stored settlement step is shorter than the schedule funding is charged
+    on: the engine would skip settlements (funding.schedule_mismatch; Advisor, 6 Oct 2026), until DA-11."""
+    from sleeve_fund import funding, markets
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    try:  # the venue as from_store reads it, without building the node's config (its warm-up reads the model)
+        terms = markets.terms(s.params, getattr(s, "venue", None) or DEFAULT_VENUE)
+    except ValueError:  # a market the venue doesn't list: the node's own start refuses it, with its reason
+        return
+    if terms is None or terms.funding_venue is None:
+        return
+    why = funding.schedule_mismatch(terms.funding_venue, s.instrument, terms.funding_hours, latest=True)
+    if why:
+        raise ValueError(why)
+
+
 class Supervisor:
     def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
         self.store = store
@@ -107,6 +124,7 @@ class Supervisor:
         try:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
+            check_funding_schedule(s)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
