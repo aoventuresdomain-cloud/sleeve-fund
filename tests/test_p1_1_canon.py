@@ -96,6 +96,17 @@ def test_the_backfill_makes_the_stored_minutes_the_venues_and_leaves_the_cursor(
     assert (again["replaced"], again["written"]) == (0, 0)
 
 
+def test_a_dry_run_counts_and_writes_nothing(tmp_path):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows(T0, 3), "live")
+    store.append_bars(V, P, _rows(T0 + pd.Timedelta(minutes=5), 3, price=105.0), "live")
+    files = {p.name: p.read_bytes() for p in store._dir(V, P).iterdir() if p.is_file()}
+    out = history.canon(store, _profile(_venue(12)), P, T0, dry_run=True)
+    assert (out["replaced"], out["written"], out["dry_run"]) == (6, 2, True)
+    assert {p.name: p.read_bytes() for p in store._dir(V, P).iterdir() if p.is_file()} == files
+    assert store.provenance(V, P) == []
+
+
 def test_the_backfill_refuses_a_trade_built_venue(tmp_path):
     with pytest.raises(ValueError, match="from trades"):
         history.canon(HistoryStore(tmp_path), _profile(_venue(3), merge=True), P, T0)

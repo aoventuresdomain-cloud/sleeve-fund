@@ -197,11 +197,12 @@ class HistoryStore:
             _write_coverage(d, new_cov)
         return AppendResult(written, unchanged, conflicts, replaced)
 
-    def canonise(self, venue: str, pair: str, minutes: pd.DataFrame) -> AppendResult:
+    def canonise(self, venue: str, pair: str, minutes: pd.DataFrame, dry_run: bool = False) -> AppendResult:
         """P1-1-CANON backfill: make the stored minutes the venue's own closed 1-minute candles (indexed by open
         time, UTC; the caller leaves out a candle that may still be forming). Only minutes inside the stored span
         up to the newest closed one are touched: a differing bar is replaced and recorded (kind "replaced"), a
-        hole is filled and recorded as a refill. Coverage and the loader's cursor do not move."""
+        hole is filled and recorded as a refill. Coverage and the loader's cursor do not move. dry_run: count what
+        would be replaced and filled, and write nothing."""
         if minutes.empty:
             return AppendResult(0, 0, 0)
         df = _check_minutes(minutes)
@@ -215,8 +216,8 @@ class HistoryStore:
             if df.empty:
                 return AppendResult(0, 0, 0)
             written, unchanged, conflicts, done, replaced = _write_first_wins(d, df, cov, "canon",
-                                                                              self._settled(df.index))
-            if cov.forming is not None and cov.forming in done:  # its complete candle is stored now
+                                                                              self._settled(df.index), dry_run)
+            if not dry_run and cov.forming is not None and cov.forming in done:  # its complete candle is stored now
                 _write_coverage(d, Coverage(cov.first, cov.last, cov.cursor, cov.closed, None))
         return AppendResult(written, unchanged, conflicts, replaced)
 
@@ -418,13 +419,14 @@ def _bars_frame(rows: list) -> pd.DataFrame:
 
 
 def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None, source: str,
-                      canon: pd.DatetimeIndex | None = None) -> tuple[int, int, int, pd.DatetimeIndex, int]:
+                      canon: pd.DatetimeIndex | None = None,
+                      dry_run: bool = False) -> tuple[int, int, int, pd.DatetimeIndex, int]:
     """Write minutes nobody has stored yet (or that were still forming); keep every stored closed minute, and
     record in provenance.jsonl each offered minute that differs from it and, for a refill, what was filled.
     canon: offered minutes that are the venue's own settled candles (P1-1-CANON). One of them that differs from
     the stored bar replaces it, recorded as kind "replaced" with both values, so the hub's live bar is never lost.
     Returns (written, unchanged, conflicts, the minutes written, replaced). The caller holds _lock and writes the
-    coverage."""
+    coverage. dry_run: count only; nothing is saved or recorded."""
     written = unchanged = replaced = 0
     canon = canon if canon is not None else df.index[:0]
     stored = []
@@ -459,12 +461,16 @@ def _write_first_wins(d: Path, df: pd.DataFrame, cov: Coverage | None, source: s
         if not new.empty:
             stored.append(new.index)
         put = pd.concat([new, chunk.loc[swap]])
+        if dry_run:
+            continue
         _save(path, pd.concat([old[~old.index.isin(put.index)], put]).sort_index())
     done = stored[0].append(stored[1:]) if stored else df.index[:0]
     if source != "live" and written:
         log.append({"kind": "refill", "at": now, "source": source, "first": done.min().isoformat(),
                     "last": done.max().isoformat(), "minutes": written})
     conflicts = sum(e["kind"] == "conflict" for e in log)
+    if dry_run:
+        return written, unchanged, conflicts, done, replaced
     if conflicts:
         # The same difference offered again is one difference, recorded once (QA F7): the count is of minutes.
         seen = {(e["minute"], tuple(e["stored"]), tuple(e["offered"])) for e in _provenance(d) if e["kind"] == "conflict"}
@@ -580,11 +586,12 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
     return {"pair": pair, "pages": pages, "last": cov.last if cov else None}
 
 
-def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_pages: int = 10_000, sleep=None) -> dict:
+def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_pages: int = 10_000, sleep=None,
+          dry_run: bool = False) -> dict:
     """P1-1-CANON backfill: replace the hub's live bars stored since `since` with the venue's own 1-minute candles,
     up to the newest closed minute, each replacement recorded (HistoryStore.canonise). Reads the venue, writes only
     the history files; the loader's cursor is left alone. Not for a venue whose pages are built from trades (they
-    split minutes at their ends)."""
+    split minutes at their ends). dry_run: report the counts, write nothing (the HoE sees them before a real run)."""
     import time
 
     if profile.minute_loader is None or profile.minute_cursor_at is None:
@@ -600,13 +607,13 @@ def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_page
         bars, nxt, caught_up = profile.minute_loader(pair, cursor)
         pages += 1
         if len(bars) > 1:  # the page's newest may still be forming: the next page starts on it
-            out = store.canonise(profile.name, pair, bars.iloc[:-1])
+            out = store.canonise(profile.name, pair, bars.iloc[:-1], dry_run=dry_run)
             written, replaced = written + out.written, replaced + out.replaced
         if caught_up or bars.empty or nxt == cursor or bars.index[-1] > top:
             break
         cursor = nxt
         (sleep or time.sleep)(profile.request_interval)
-    return {"pair": pair, "pages": pages, "written": written, "replaced": replaced}
+    return {"pair": pair, "pages": pages, "written": written, "replaced": replaced, "dry_run": dry_run}
 
 
 
@@ -995,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
     can.add_argument("--venue", default=None)
     can.add_argument("--since", required=True, help="UTC time to start from, e.g. 2026-10-06")
+    can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
     args = ap.parse_args(argv)
@@ -1012,7 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "canon":
         since = pd.Timestamp(args.since, tz="UTC")
         for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
-            print(canon(store, profile, pair, since))
+            print(canon(store, profile, pair, since, dry_run=args.dry_run))
         return 0
     if args.cmd == "refresh":
         for pair, since in [(p, None) for p in args.pairs] or _pairs_in_use(profile.name):
