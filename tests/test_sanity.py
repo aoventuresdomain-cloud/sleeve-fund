@@ -341,9 +341,18 @@ def _record(path, prices, params, profile="aggressive", size=1.0, strategy="prob
     return pd.Series(np.round(prices, 1), index=pd.to_datetime(stamps, utc=True))
 
 
-def _per_order(fills, intents):
-    """(side, intent, minute, qty, all-in price, fee) per order, in fill order. The all-in price
-    includes the fee and spread: paper pays the spread in its price and the backtest with its fee."""
+def _stop_level(order):
+    """A stop's level from its order's signal, as both paths set it: the entry price less (long) or plus (short) the
+    stop distance; None for any other order."""
+    sig = (order or {}).get("signal") or {}
+    if order is None or order.get("intent") != "stop_loss" or "entry_px" not in sig:
+        return None
+    return sig["entry_px"] * (1 - sig["stop_loss"] if order["side"] == "SELL" else 1 + sig["stop_loss"])
+
+
+def _per_order(fills, intents, orders=None):
+    """(side, intent, minute, qty, all-in price, fee, fill price, stop level) per order, in fill order. The all-in
+    price includes the fee and spread: paper pays the spread in its price and the backtest with its fee."""
     out = {}
     for f in fills:
         side, qty, notional, fee, _ = out.get(f["order_id"], (f["side"], 0.0, 0.0, 0.0, None))
@@ -352,20 +361,21 @@ def _per_order(fills, intents):
     for k, (side, qty, notional, fee, ts) in out.items():
         t = pd.Timestamp(ts).tz_convert(timezone.utc)
         minute = t if t == t.floor("1min") else t.ceil("1min")
-        rows.append((side, intents[k], minute, qty, (notional + fee if side == "BUY" else notional - fee) / qty, fee))
+        rows.append((side, intents[k], minute, qty, (notional + fee if side == "BUY" else notional - fee) / qty, fee,
+                     notional / qty, _stop_level((orders or {}).get(k))))
     return rows
 
 
 def _paper_and_backtest(tmp_path, prices, params, strategy="probe", profile="aggressive"):
     trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile=profile, strategy=strategy)
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
-    paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders})
+    paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders}, {o["order_id"]: o for o in orders})
     bars = trades.resample("1min", closed="left", label="right").ohlc()
     bars["volume"] = 60 / BOOK_SHARE  # the same trades as liquidity on both paths
     res = run_backtest(strategy, bars, TICK_INST, params=params, starting_capital=10_000, risk_profile=profile,
                        bar_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
     j = res.journal
-    return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
+    return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()}, j.orders_)
 
 
 def test_paper_and_backtest_enter_and_exit_at_the_same_prices(tmp_path):
@@ -394,12 +404,22 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
     intents = {r[1] for r in paper}
     assert {"entry", "stop_loss"} <= intents or {"entry", "take_profit"} <= intents, intents
     assert [r[:2] for r in paper] == [r[:2] for r in bt]
-    # A backtest stop pays max(half spread, 0.05%) where paper sells at the bid: 4 bp more than the 1 bp half spread.
-    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-6.5, 7.0), "take_profit": (-6.0, 1.0)}
+    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "take_profit": (-6.0, 1.0)}
+    slip = max(SPREAD / 2 / 60_000, 0.0005)  # P1-D13: a backtest stop fills at its level less this
     for p, b in zip(paper, bt):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
-        lo, hi = tol[p[1]]
-        assert lo <= (b[4] / p[4] - 1) * 1e4 <= hi, (p, b)
+        if p[1] == "stop_loss":
+            # D13-STOP-PARITY, split as tests/test_hub_path_parity.py and tests/test_tick_bar_parity.py: the
+            # backtest's stop at its level less the slippage, to 0.1 bp; its all-in price never better than paper's
+            # but by paper's own trade past the level beyond that floor (a jump a minute bar can't see), nor worse
+            # by more than the floor plus 7 bp.
+            worse = -1 if p[0] == "SELL" else 1
+            assert abs(b[6] / (b[7] * (1 + worse * slip)) - 1) * 1e4 <= 0.1, (p, b)
+            past = max(0.0, (p[6] / p[7] - 1) * 1e4 * worse - slip * 1e4)
+            assert -0.3 - past <= (b[4] / p[4] - 1) * 1e4 * worse <= slip * 1e4 + 7.0, (p, b, past)
+        else:
+            lo, hi = tol[p[1]]
+            assert lo <= (b[4] / p[4] - 1) * 1e4 <= hi, (p, b)
         # Signal orders in the same minute; a stop or target in the same minute or the next (paper's
         # stop sits off its fill at the ask, the backtest's off the bar's trade price: half a spread apart).
         late = (b[2] - p[2]).total_seconds()
@@ -443,7 +463,7 @@ def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp
             assert abs(gap) <= 0.3, (p, b)
     # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
     assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
-    for side, intent, _, qty, px, fee in paper:  # paper's fee is the venue's taker fee alone
+    for side, intent, _, qty, px, fee in (r[:6] for r in paper):  # paper's fee is the venue's taker fee alone
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * TAKER, abs=CENT)
 
 
@@ -704,15 +724,19 @@ LS_CASES = {
 }
 
 
+@pytest.mark.parametrize("profile,stop", [("conservative", {}), ("balanced", {"stop_loss": 0.03})],
+                         ids=["1x-stopless", "2x-3pct-stop"])
 @pytest.mark.parametrize("strategy", list(LS_CASES))
-def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
+def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy, profile,
+                                                                                      stop):
     """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
     replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
-    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee."""
+    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee. With every guard
+    on (QA P1-S4, SG12): a stopless model at 1x, and at 2x with a 3% stop."""
     params, path = LS_CASES[strategy]
-    params = {**params, **PERP}
+    params = {**params, **PERP, **stop}
     paper, bt = _paper_and_backtest(tmp_path, path(np.arange(240 * 60)), params, strategy=strategy,
-                                    profile="balanced")
+                                    profile=profile)
     # The backtest's last bar closes on the last trade; paper's would close on a trade after it, which never
     # comes. An order on that bar alone is an edge of the recording, not a difference.
     end = pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=240)
@@ -734,7 +758,7 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
     # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
     assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     taker = float(PERP_FEES.fees.taker)
-    for side, _, _, qty, px, fee in paper:
+    for side, _, _, qty, px, fee in (r[:6] for r in paper):
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
 
 
@@ -743,7 +767,7 @@ def test_paper_sells_short_at_the_bid_and_buys_it_back_at_the_ask(tmp_path):
     of the book, which would hand the short the spread. (The recording quotes $6 either side of each trade.)"""
     params = {"period": 7, **PERP}
     prices = LS_CASES["probe_ls"][1](np.arange(180 * 60))
-    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="balanced", strategy="probe_ls")
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="conservative", strategy="probe_ls")
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
     intent = {o["order_id"]: o["intent"] for o in orders}
     shorts = [f for f in fills if intent[f["order_id"]] == "entry" and f["side"] == "SELL"]
@@ -963,7 +987,10 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
         qty += sign * f["qty"]
     assert seen and seen[0] == "risk_pause", seen  # the first day's limit was reached and checked
     if (profile, strategy) != ("aggressive", "probe_short"):  # its pauses alone keep it short of the halt
-        assert "risk_halt" in seen, seen
+        # The halt fires; when the bar that fills a pause at its worst price (P1-D13) also crosses the drawdown
+        # limit, the pause's order has already flattened and the halt leaves no order to fill (HoE OK, 7 Oct).
+        halts = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+        assert "risk_halt" in seen or (halts and f"{prof.max_drawdown:.0%} limit" in halts[0]["message"]), (seen, halts)
 
 
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():

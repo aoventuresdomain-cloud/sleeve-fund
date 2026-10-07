@@ -63,7 +63,7 @@ def _both(tmp_path, prices, strategy, params, profile):
     path = tmp_path / "s.jsonl.gz"
     trades = _record(path, prices, strategy, params, profile)
     orders, fills = replay(path, with_fills=True)
-    ticks = _by_order(fills, {o["order_id"]: o["intent"] for o in orders})
+    ticks = _by_order(fills, {o["order_id"]: o["intent"] for o in orders}, {o["order_id"]: o for o in orders})
 
     bars = trades.resample("1min", closed="left", label="right").ohlc()  # stamped at the close, as the engine's
     # The backtest shows the venue a share of each bar's volume (BOOK_SHARE); paper's simulated
@@ -72,19 +72,29 @@ def _both(tmp_path, prices, strategy, params, profile):
     res = run_backtest(strategy, bars, inst, params=params, starting_capital=10_000, risk_profile=profile,
                        bar_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
     j = res.journal
-    return ticks, _by_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
+    return ticks, _by_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()}, j.orders_)
 
 
-def _by_order(fills, intents):
+def _level(order):
+    """A stop's level from its order's signal, as both paths set it: the entry price less (long) or plus (short) the
+    stop distance; None for any other order."""
+    sig = (order or {}).get("signal") or {}
+    if order is None or order.get("intent") != "stop_loss" or "entry_px" not in sig:
+        return None
+    return sig["entry_px"] * (1 - sig["stop_loss"] if order["side"] == "SELL" else 1 + sig["stop_loss"])
+
+
+def _by_order(fills, intents, orders=None):
     """One row per order, in fill order: an order can fill in parts, against trades one at a time.
     The price is what each unit really cost or brought in, fee included: paper pays the spread in its
-    fill price (the ask or the bid) and the backtest with the fee, so only the total compares."""
+    fill price (the ask or the bid) and the backtest with the fee, so only the total compares. Then the
+    fill price alone and, for a stop, its level (D13-STOP-PARITY)."""
     out = {}
     for f in fills:
         side, qty, notional, fee, _ = out.get(f["order_id"], (f["side"], 0.0, 0.0, 0.0, None))
         out[f["order_id"]] = (side, qty + f["qty"], notional + f["qty"] * f["price"], fee + f["fee"], f["ts"])
-    return [(side, intents[k], _minute(ts), qty, (notional + fee if side == "BUY" else notional - fee) / qty)
-            for k, (side, qty, notional, fee, ts) in out.items()]
+    return [(side, intents[k], _minute(ts), qty, (notional + fee if side == "BUY" else notional - fee) / qty,
+             notional / qty, _level((orders or {}).get(k))) for k, (side, qty, notional, fee, ts) in out.items()]
 
 
 def _minute(ts: datetime) -> datetime:
@@ -100,9 +110,23 @@ def _minute(ts: datetime) -> datetime:
 # -1.7 to +5.1 bp on stops and -4.7 to -2.1 bp on targets. A stop 5% further away (0.05R, 5 bp here)
 # or a target 3% further fails. Since Advisor L12 FINAL the backtest books a target at its level less
 # max(half spread, 5 bp), the taker's slippage, so its targets sit up to that much lower again (-6.8 bp measured).
-# A backtest stop pays the same slippage where paper sells at the bid (P1-D13): 4 bp more than the 1 bp half spread,
-# so its lower bound sits 4 bp under the -2.5 it had.
-TOL_BP = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-6.5, 7.0), "take_profit": (-10.0, 1.0)}
+# Stops are checked apart, by _same_stop.
+TOL_BP = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "take_profit": (-10.0, 1.0)}
+# P1-D13: a backtest stop on minute bars fills at its level less max(half spread, 0.05%).
+STOP_SLIP = max(SPREAD / 2 / 60_000, 0.0005)
+
+
+def _same_stop(t, b):
+    """D13-STOP-PARITY (Advisor 7 Oct 00:20), split as tests/test_hub_path_parity.py: the backtest's stop fills at
+    its level less STOP_SLIP, to 0.1 bp, and its all-in price is never better than paper's (0.3 bp of rounding),
+    nor worse by more than the floor plus 7 bp. One exception, measured: paper sells on the trade through the
+    level, and a trade can land past it by more than the floor (prices here move up to 7 bp a second); a minute
+    bar can't see that jump (01:55 INTRAMINUTE-JUMP), so the backtest may be better by that excess and no more."""
+    worse = -1 if t[0] == "SELL" else 1  # the direction a worse price moves
+    assert abs(b[5] / (b[6] * (1 + worse * STOP_SLIP)) - 1) * 1e4 <= 0.1, (t, b)
+    past = max(0.0, (t[5] / t[6] - 1) * 1e4 * worse - STOP_SLIP * 1e4)  # paper's fill beyond level and floor, bp
+    gap = (b[4] / t[4] - 1) * 1e4 * worse  # bp the backtest's all-in price is worse
+    assert -0.3 - past <= gap <= STOP_SLIP * 1e4 + 7.0, (t, b, past)
 
 
 def _same_trades(ticks, bar, tol_bp=None):
@@ -115,6 +139,9 @@ def _same_trades(ticks, bar, tol_bp=None):
         late = (b[2] - t[2]).total_seconds()
         assert late == 0 if t[1] in ("entry", "exit") else 0 <= late <= 60, (t, b)
         assert b[3] == pytest.approx(t[3], rel=2e-3), (t, b)  # sizes follow equity, a few bp apart
+        if t[1] == "stop_loss" and "stop_loss" not in tol:
+            _same_stop(t, b)
+            continue
         lo, hi = tol[t[1]]
         assert lo <= (b[4] / t[4] - 1) * 1e4 <= hi, (t, b)
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 from nautilus_trader.model import Bar
 
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import Rsi, Sma, settle_bars
+from sleeve_fund.strategies.indicators import Rsi, Sma, settle_bars, warmup_for
 
 SPEC = IdeaSpec(
     summary="Buys when RSI({rsi_period}) crosses back above {long_entry:g} and sells at {long_exit:g} or after "
@@ -69,7 +69,8 @@ class RsiCross(LongFlatStrategy):
         self.c = config
         self.rsi = Rsi(config.rsi_period)
         self.trend = Sma(config.trend_sma) if config.trend_sma else None
-        self._trend_close: float | None = None  # the last closed trend candle's close
+        # The trend candles, closed ones only (v2 P1-4): the average of their closes and the last one's close.
+        self._trend_candles = self.slower(config.trend_minutes, self.trend) if self.trend is not None else None
         self._prev: float | None = None  # RSI on the bar before
         self._side = 0  # the leg the rules are on: +1 long, -1 short, 0 flat
         self._held = 0  # decision bars the leg has run
@@ -83,17 +84,22 @@ class RsiCross(LongFlatStrategy):
             need = max(need, sma * int(params.get("trend_minutes", 240)) // max(bar_minutes, 1))
         return need
 
+    @classmethod
+    def slower_needs(cls, params: dict) -> dict[int, int]:
+        sma = int(params.get("trend_sma", 0) or 0)
+        return {int(params.get("trend_minutes", 240)): warmup_for([Sma(sma)])} if sma else {}
+
     def resume_leg(self, side: int, held: int) -> None:
         self._side, self._held = side, held  # after a restart: the leg, and its time stop, from the journal's entry
 
     def update_indicators(self, bar: Bar) -> None:
         self._prev = self.rsi.value if self.rsi.initialized else None
         self.rsi.handle_bar(bar)
-        if self.trend is not None and bar.ts_event % (self.c.trend_minutes * 60_000_000_000) == 0:
-            # Bars are stamped at their close: this one closes a trend candle.
-            close = bar.close.as_double()
-            self.trend.update_raw(close)
-            self._trend_close = close
+
+    @property
+    def _trend_close(self) -> float | None:
+        last = self._trend_candles.last if self._trend_candles is not None else None
+        return last.close if last is not None else None
 
     def _trend_allows(self, side: int) -> bool | None:
         """Whether the larger trend allows a leg on this side; None while the trend average is still filling."""
@@ -105,9 +111,10 @@ class RsiCross(LongFlatStrategy):
 
     def target_side(self, rsi: float, prev: float | None) -> int:
         """The side the rules want from this bar's RSI and the bar before's: +1 long, -1 short, 0 flat."""
-        c, ended = self.c, False
+        c, ended = self.c, 0
         if self._side:
             self._held += 1
+            leg_side = self._side
             if self._side == 1 and rsi >= c.long_exit:
                 self._side, self._why = 0, (f"RSI {rsi:.1f} reached {c.long_exit:g}: the long ends", {})
             elif self._side == -1 and rsi <= c.short_exit:
@@ -118,10 +125,15 @@ class RsiCross(LongFlatStrategy):
                                             "time stop", {})
             if self._side:
                 return self._side
-            ended = True
+            ended = leg_side
         cross = 1 if prev is not None and prev < c.long_entry <= rsi else (
             -1 if prev is not None and prev > c.short_entry >= rsi else 0)
-        if cross:
+        if cross and cross == ended:
+            # LEG-RE (Advisor 22:37): a leg closed on this candle's close is not re-entered on the same side on that
+            # candle; the earliest re-entry is the next one, on a fresh cross. The opposite side is a declared
+            # reversal and stays.
+            self._why = (f"{self._why[0]}; a new {'long' if cross > 0 else 'short'} waits for the next candle", {})
+        elif cross:
             allowed = self._trend_allows(cross)
             words = (f"RSI crossed back above {c.long_entry:g} ({prev:.1f} to {rsi:.1f})" if cross > 0 else
                      f"RSI crossed back below {c.short_entry:g} ({prev:.1f} to {rsi:.1f})")

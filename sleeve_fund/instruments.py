@@ -227,6 +227,9 @@ class ScheduleFeeModel(FeeModel):
         # Paper on a perp: the order that puts a position carried over a restart back at the simulated
         # venue (LongFlatStrategy._send_restore). Not a trade, so it pays nothing.
         self.free_orders: set[str] = set()
+        # Backtests only: extra slippage on an order, as a share of its price, by client order id (a rule-builder
+        # entry on a breakout candle, LongFlatStrategy._submit). Charged and reported as the half spread is.
+        self.slippage: dict[str, Decimal] = {}
         # Backtests: a target the strategy judged on a bar the venue had matched, adverse side first (Advisor NA-2,
         # LongFlatStrategy._bar_target), sent at market and booked at its level less the taker's slippage
         # (target_fill_px, Advisor L12), with that price and side.
@@ -308,15 +311,16 @@ class ScheduleFeeModel(FeeModel):
             if info is not None:
                 return self._exit_commission(order, info, fill_quantity, fill_px, instrument)
         coid = str(order.client_order_id)
-        taker_spread = booked is None and self.half_spread and not getattr(order, "is_post_only", False)
+        paid = self.half_spread + self.slippage.get(coid, 0)  # with a rule-builder order's extra slippage
+        taker_spread = booked is None and paid and not getattr(order, "is_post_only", False)
         if taker_spread:
             # Filled at the ask or the bid, mid plus or minus half the spread, in the price (Advisor 20:55): the venue's
             # fee is on that price, the journal and every level derived from the fill take it, and the spread is
-            # never charged again as a cost of its own.
+            # never charged again as a cost of its own. Any extra slippage the order carries goes the same way.
             filled, buy = float(fill_px.as_decimal()), order.side == OrderSide.BUY
-            half = float(self.half_spread)
+            half = float(paid)
             px = filled * (1 + half) if buy else filled * (1 - half)
-            spread = notional * self.half_spread
+            spread = notional * paid
             charge = (notional + spread) * self.rate_for(order) if buy else (notional - spread) * self.rate_for(order)
             self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)

@@ -271,6 +271,61 @@ def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_with
     assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False
 
 
+def test_a_reset_asked_for_before_a_liquidation_is_not_carried_out(store):
+    """QA P1-U33: a reset already waiting when the liquidation lands would put it away unanswered. The supervisor
+    closes it unrun, says why, and leaves the strategy for Reset after liquidation; one asked after that runs."""
+    from sleeve_fund import liquidation
+    from sleeve_fund.store import LIQUIDATION_RESET
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert not store.pending_commands("bn-ls")  # not flattened for the reset, nor started to
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    assert store.decisions("bn-ls")[0]["reason"] == f"Not reset: {liquidation.REFUSAL}"
+    assert store.last_event("bn-ls", ("reset_refused",))["message"].endswith("asks for an incident note")
+    # After Reset after liquidation, a new reset is carried out as usual.
+    store.event("bn-ls", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    store.record_fill("bn-ls", side="SELL", qty=0.076, price=80_000.0, fee=3.0, order_id="o2", trade_id="t2")
+    store.request_reset("bn-ls", "Again")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and len(store.reset_runs()) == 1
+
+
+def test_a_reset_refused_mid_flatten_leaves_a_stopped_strategy_stopped(store):
+    """Code review on #167: the first pass queues the reset's flatten and starts a stopped, holding strategy so
+    it can trade; if a liquidation lands before the second pass, the refusal takes both back."""
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    sup = Supervisor(store, python="true")
+    req = store.pending_reset("bn-ls")
+    sup.reset_pending()  # pass 1: flatten queued, started so it can trade
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["flatten"]
+    assert store.sleeve("bn-ls").desired_state == "running"
+    store.command("bn-ls", "pause", "PM paused it", actor="PM")  # not the reset's: stays
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup.reset_pending()  # pass 2: refused
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["pause"]
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    refusals = [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"]
+    assert len(refusals) == 1
+    store.refuse_reset(req, "again")  # a second close of the same request journals nothing
+    assert [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"] == refusals
+
+
 @pytest.mark.sanity
 def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_capital(store):
     """PM, 5 Oct 2026. Nothing is deleted: the run so far moves to its own archived name under Previous book."""
@@ -348,6 +403,33 @@ def test_a_clean_slate_that_cant_flatten_stops_asking_too(store, sleeve, tmp_pat
     assert "s" not in store.archived()
 
 
+@pytest.mark.sanity
+def test_a_kill_switch_pressed_while_a_reset_is_under_way_is_kept_on_the_fresh_run(store):
+    """Round 13, m13-U5: a reset waits for its flatten to fill, and a PM pause or flatten (the kill switch) asked for
+    in that window was dropped with the other pending commands, so the fresh run started trading. It is kept, as a
+    pause in force before the reset is; the reset's own flatten still restarts the strategy as it was."""
+    from sleeve_fund.supervisor import Supervisor
+
+    for name in ("bn-killed", "bn-plain"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp", "allow_short": True}, venue="binance")
+        store.set_status(name, "running")
+        store.record_fill(name, side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+        store.request_reset(name, "Test finished")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()  # both still long: the reset's flatten is sent
+    store.command("bn-killed", "flatten", "Book kill switch: drawdown")  # pressed before the reset completes
+    for name in ("bn-killed", "bn-plain"):
+        for cmd in store.pending_commands(name):
+            store.mark_applied(cmd["id"])
+        store.record_fill(name, side="SELL", qty=0.076, price=86_100.0, fee=3.27, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_reset() is None
+    killed, plain = store.sleeve("bn-killed"), store.sleeve("bn-plain")
+    assert killed.status == "paused" and "kill switch" in killed.status_reason and "kept through a reset" in killed.status_reason
+    assert plain.status == "stopped" and plain.desired_state == "running"  # its own flatten doesn't pause it
+
+
 def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):
     from sleeve_fund.supervisor import Supervisor
 
@@ -382,3 +464,100 @@ def test_a_reset_keeps_a_pause_or_halt_and_restarts_a_running_strategy(store):
     assert halted.status == "halted" and "20% limit" in halted.status_reason
     assert running.status == "stopped" and running.desired_state == "running"  # starts afresh and runs
     # The fresh paper process reads that status and keeps it until a resume (review round 10, B10-3).
+
+
+def test_a_kill_switch_pressed_just_before_a_reset_and_not_yet_applied_is_kept_on_the_fresh_run(store):
+    """P1-KR-2 (Head of QA): the PM's "flatten everything, then reset". The paper process applies a pause or flatten on
+    its next tick, so one pressed just before the reset was still pending when the reset was asked for; the reset put it
+    away with the old run and the fresh run traded. It is kept as the pause the paper process would have set. A system
+    flatten pending then (a clean slate's) is not a PM pause."""
+    from sleeve_fund.supervisor import Supervisor
+
+    for name in ("bn-killed", "bn-slate"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params={"market": "perp"}, venue="binance")
+        store.set_status(name, "running")
+    store.command("bn-killed", "flatten", "Book kill switch: drawdown")  # pressed, not yet applied by the process
+    store.command("bn-slate", "flatten", "Clean slate: flattened so it can be archived", actor="system",
+                  holds_through_reset=False)
+    for name in ("bn-killed", "bn-slate"):
+        store.request_reset(name, "Test finished")  # flat: the supervisor completes it on its next pass
+    Supervisor(store, python="true").reset_pending()
+    assert store.pending_resets() == []
+    killed, slate = store.sleeve("bn-killed"), store.sleeve("bn-slate")
+    assert killed.status == "paused" and "flattened by PM: Book kill switch: drawdown" in killed.status_reason
+    assert slate.status == "stopped" and slate.desired_state == "running"
+
+
+@pytest.fixture
+def pg_store():
+    import os
+
+    from sleeve_fund.store import make_engine, metadata
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("row locks need Postgres: CI runs these against it (TEST_DATABASE_URL)")
+    engine = make_engine(url)
+    metadata.drop_all(engine)
+    return Store(engine=engine)
+
+
+def _reset_requested(store, name="bn-race"):
+    store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp"}, venue="binance")
+    store.request_reset(name, "Test finished")
+    return store.pending_reset(name)
+
+
+def _waits(fn, *args, **kw):
+    """fn run on its own connection; True while it is still blocked half a second later."""
+    import threading
+
+    t = threading.Thread(target=fn, args=args, kwargs=kw, daemon=True)
+    t.start()
+    t.join(0.5)
+    return t
+
+
+def test_a_kill_switch_pressed_while_the_reset_completes_waits_for_it_and_stays_pending(pg_store):
+    """Code Reviewer on #188: a press landing while split_run's transaction is in flight wrote its hold to a reset
+    already done, and the fresh run started unpaused. It now waits for the reset's row and, finding it done, stays a
+    pending command of the fresh run, which the paper process applies."""
+    from sqlalchemy import select, update
+
+    from sleeve_fund.store import reset_holds_t, resets_t
+
+    store = pg_store
+    req = _reset_requested(store)
+    with store.engine.connect() as c, c.begin():  # split_run, part way through: the reset row locked, not yet done
+        c.execute(select(resets_t.c.id).where(resets_t.c.id == req["id"]).with_for_update())
+        press = _waits(store.command, "bn-race", "flatten", "Book kill switch: drawdown")
+        assert press.is_alive()  # it waits for the reset to finish
+        c.execute(update(resets_t).where(resets_t.c.id == req["id"]).values(done_at=utcnow(), run="bn-race--old"))
+    press.join(10)
+    assert not press.is_alive()
+    with store.engine.connect() as c:
+        assert c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == req["id"])).all() == []
+    assert [cmd["command"] for cmd in store.pending_commands("bn-race")] == ["flatten"]
+
+
+def test_a_reset_completing_while_a_kill_switch_is_pressed_waits_and_keeps_its_hold(pg_store):
+    """The other order: split_run waits for a press already under way, then reads the hold it wrote, so the fresh run
+    starts paused."""
+    from sqlalchemy import insert, select
+
+    from sleeve_fund.store import reset_holds_t, resets_t
+
+    store = pg_store
+    req = _reset_requested(store)
+    with store.engine.connect() as c, c.begin():  # Store.command, part way through: the reset row locked
+        c.execute(select(resets_t.c.id).where(resets_t.c.id == req["id"]).with_for_update())
+        c.execute(insert(reset_holds_t).values(reset_id=req["id"], status="paused", paused_until=None,
+                                               status_reason="flattened by PM: Book kill switch: drawdown"))
+        reset = _waits(store.split_run, req)
+        assert reset.is_alive()  # it waits for the press to commit
+    reset.join(10)
+    assert not reset.is_alive()
+    s = store.sleeve("bn-race")
+    assert s.status == "paused" and "kill switch" in s.status_reason and "kept through a reset" in s.status_reason
