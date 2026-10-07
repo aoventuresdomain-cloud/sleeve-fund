@@ -34,6 +34,7 @@ from sleeve_fund.research.metrics import (
     whole_days,
 )
 from sleeve_fund.research.runner import BacktestResult, run_backtest
+from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import STOP_INTENTS, IdeaSpec
 
@@ -321,7 +322,7 @@ def run_study(
     position_cap: float | None = None,
     risk_profile: str | None = None,
     exec_prices: pd.DataFrame | None = None,
-    half_spread: float | None = None,
+    half_spread: float | SpreadSeries | None = None,
     progress=None,
     oos_exec_prices: pd.DataFrame | None = None,
     minute_loader=None,
@@ -341,8 +342,8 @@ def run_study(
     oos_exec_prices: the bars the out-of-sample windows and the holdout run on instead, 1-minute ones for G1 (P1-D13);
     None runs them on exec_prices too. Each window and the holdout starts flat.
     minute_loader: (start, end) -> 1-minute bars over that span, for the spot check of a 5-minute pass.
-    half_spread: the spread charged on orders that take liquidity (sleeve_fund.spreads.resolve gives
-    the measured one); None uses the venue's assumption.
+    half_spread: the spread charged on orders that take liquidity: sleeve_fund.spreads.series gives the measured
+    ones, each run charging the one in force at each time (SPREAD-PIT); None uses the venue's assumption.
     progress: called with the share of the study's backtests done, 0 to 1."""
     from sleeve_fund.venues import VENUES
 
@@ -386,7 +387,12 @@ def run_study(
         from sleeve_fund.venues import venue as venue_profile
 
         half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
-    spread_used = half_spread
+    series = half_spread if isinstance(half_spread, SpreadSeries) else None
+    # One figure where a single value is needed (the setup's cost, the random-entry benchmarks): the spread in force
+    # at the end of the data, as the latest measurement was before SPREAD-PIT. The runs charge each in its time.
+    spread_used = series.at(int(prices.index[-1].value)) if series is not None else half_spread
+    spread_words = (series.text(int((prices.index[0] - bar).value), int(prices.index[-1].value))
+                    if series is not None else f"{spread_used:.3%} of the price as half the bid-ask spread")
 
     exec_minutes = bar_minutes_of(exec_prices) if exec_prices is not None and len(exec_prices) else None
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
@@ -429,8 +435,8 @@ def run_study(
             fine = source[(source.index > df.index[0] - bar) & (source.index <= df.index[-1])]
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                           exec_minutes=bar_minutes_of(source) if fine is not None else 1,
-                           half_spread=half_spread + slippage, fees=fees)
+                           exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
+                           half_spread=series.plus(slippage) if series is not None else half_spread + slippage)
         if not benchmark:
             labels.extend(x for x in res.labels if x not in labels)
             resting[0] = resting[0] or any(d.get("intent") in RESTING_INTENTS for d in res.decisions.values())
@@ -601,8 +607,7 @@ def run_study(
         oos_exec_minutes=oos_minutes,
         fill_labels=labels,
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
-                  f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
-                  "that take liquidity"),
+                  f"on every other order, plus {spread_words} on orders that take liquidity"),
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     result.random_entry, result.random_side = _benchmarks(

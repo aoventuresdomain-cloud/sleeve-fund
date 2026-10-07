@@ -77,6 +77,9 @@ class SleeveRuntime:
         self._feed_written = None
         self._spreads: list[float] = []
         self._spread_since = None
+        # Paper: loads the instrument's spread measurements (sleeve_fund.spreads.series), reloaded each hour on_quote
+        # closes a sampling window, so a new measurement (this strategy's or another's) is in force within the hour.
+        self.spread_loader = None
         # Why the last tick asked for a flatten, as (intent, reason), so the sell order records it.
         self.flatten_why: tuple[str, str] | None = None
         # A flatten the last process sent but may not have seen filled, owed on the first tick (sanity S-3).
@@ -331,11 +334,12 @@ class SleeveRuntime:
             self.store.feed_seen(self.name, now)
             self._feed_written = now
 
-    def on_quote(self, bid: float, ask: float, venue: str) -> None:
-        """Sample the half spread; once an hour record its median, which backtests then charge."""
+    def on_quote(self, bid: float, ask: float, venue: str):
+        """Sample the half spread; once an hour record its median, which backtests then charge, and return the
+        measurements reloaded (spread_loader) for the strategy to read from then on (SPREAD-PIT); else None."""
         mid = (bid + ask) / 2
         if mid <= 0 or ask < bid:
-            return
+            return None
         now = self.now()
         if self._spread_since is None:
             self._spread_since = now
@@ -347,6 +351,14 @@ class SleeveRuntime:
                     instrument = self.store.sleeve(self.name).instrument
                     self.store.record_spread(venue, instrument, half, samples=len(self._spreads), ts=now)
             self._spreads, self._spread_since = [], now
+            if self.spread_loader is not None:
+                try:
+                    return self.spread_loader()
+                except Exception as e:  # noqa: BLE001 - keep the series it has; the next hour tries again
+                    self.store.event(self.name, "warning", "spreads_not_reloaded",
+                                     f"the spread measurements could not be reloaded ({type(e).__name__}); "
+                                     "the last ones loaded stay in force", ts=now)
+        return None
 
     # --- orders -------------------------------------------------------------------
 

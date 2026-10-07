@@ -210,6 +210,9 @@ class ScheduleFeeModel(FeeModel):
         # with the commission on fills that take liquidity, and kept apart per order so reports can
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
+        # Backtests with measured spreads (SPREAD-PIT): the series BarOpens reads half_spread from at each bar's open,
+        # so a fill pays the spread in force when its bar began, never a later measurement.
+        self.spread_series = None
         self.spread_paid: dict[str, float] = {}
         # The venue's own fee on those same orders, unrounded, so a report can show it alone to the cent and put
         # what rounding left in the charged commission into the price with the spread (QA m-G7).
@@ -346,15 +349,22 @@ class ScheduleFeeModel(FeeModel):
 
 class BarOpens(SimulationModule):
     """Backtests: hands the fee model the open of each bar before the simulated venue matches it, so a resting
-    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets)."""
+    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets), and
+    the half spread in force when the bar opened (ScheduleFeeModel.spread_series)."""
 
     def __init__(self, fee_model: ScheduleFeeModel) -> None:
         self.fee_model = fee_model
 
     def pre_process(self, data) -> None:
         if isinstance(data, Bar):
-            self.fee_model.bar_open = data.open.as_decimal()
-            self.fee_model.bar_seq += 1
+            fm = self.fee_model
+            fm.bar_open = data.open.as_decimal()
+            fm.bar_seq += 1
+            if fm.spread_series is not None:
+                opened = int(data.ts_event) - int(data.bar_type.spec.timedelta.total_seconds()) * 1_000_000_000
+                now = fm.spread_series.at(opened)
+                if now != float(fm.half_spread):
+                    fm.half_spread = Decimal(str(now))
 
     def process(self, ts_now, context):
         return None

@@ -272,7 +272,7 @@ def _fee_view(params: dict, inst, quote_fees) -> dict:
 
 def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetch=None, days: int | None = None,
         detail: bool = False, cap: float | None = None, venue: str | None = None, fee_quote=None,
-        risk_profile: str | None = None, spread_quote=None, minutes: int = 1440, progress=None,
+        risk_profile: str | None = None, spread_quote=None, spread_series=None, minutes: int = 1440, progress=None,
         keep: dict | None = None) -> dict:
     """Backtest these settings on the venue's history, deciding on bars of `minutes` (daily by default). days trims to the most recent N days;
     detail adds every trade with its journaled reason, drawdown and fill markers (the backtest page).
@@ -280,7 +280,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
     and the buy-and-hold benchmark is held at the same exposure. risk_profile runs the paper runtime
     itself (cap, drawdown halt, daily-loss pause, journal) and sets cap from the profile. spread_quote
     (sleeve_fund.spreads.resolve) is the spread charged on orders that take liquidity; without one,
-    the venue's assumption. progress(fraction done) is called as the run goes; keep, when given,
+    the venue's assumption. spread_series (sleeve_fund.spreads.series), when given, is charged instead: each fill
+    the measurement in force at its time (SPREAD-PIT). progress(fraction done) is called as the run goes; keep, when given,
     receives the run's journal under "journal" (with a risk profile), for Store.save_backtest."""
     from sleeve_fund import spreads
     from sleeve_fund.fees import resolve
@@ -322,7 +323,7 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
 
     res = run_backtest(strategy, prices, inst, params=params, starting_capital=starting, exec_prices=exec_prices,
                        exec_minutes=exec_step if exec_prices is not None else 1, risk_profile=risk_profile,
-                       half_spread=spread.half_spread, bar_minutes=minutes, progress=tick)
+                       half_spread=spread_series or spread.half_spread, bar_minutes=minutes, progress=tick)
     if keep is not None:
         keep["journal"] = res.journal
     fee_view = _fee_view(params, inst, quote_fees)
@@ -375,7 +376,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
         "errors": _errors(res.handler_errors, res.handler_error_count),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
-                   "short": spread.short, "source": spread.source},
+                   "short": spread.short, "source": spread.source, "used": res.spreads_used,
+                   "used_text": res.spread_text},
         "fee_schedule": fee_view,
     }
     if detail:

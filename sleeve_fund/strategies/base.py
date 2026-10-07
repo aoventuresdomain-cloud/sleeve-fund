@@ -569,6 +569,9 @@ class LongFlatStrategy(Strategy):
         self._entry_fill_ns = None  # when the position last opened or added (a resting entry may fill inside a bar)
         self._book_stop_at = None  # an entry stopped out inside its own bar: the price its stop-out is booked at
         self._book_at: dict[str, float] = {}  # those stop-outs' orders and their prices, for the fee model
+        # The measured half spread in force at each time (sleeve_fund.spreads.SpreadSeries, SPREAD-PIT), read where the
+        # run has no quotes; None reads the configured assumed_half_spread. Paper's runtime refreshes it hourly.
+        self.spread_series = None
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -791,7 +794,9 @@ class LongFlatStrategy(Strategy):
         self._bid, self._ask = bid, ask
         self._market_seen()
         if self.runtime is not None:
-            self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            fresh = self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            if fresh is not None:  # the hour's spread measurements, reloaded (SPREAD-PIT)
+                self.spread_series = fresh
         if self._restore is not None:
             self._send_restore()
 
@@ -1700,14 +1705,16 @@ class LongFlatStrategy(Strategy):
                       for b in bars if int(b.ts_event) > after)
         if rows:
             self._replayed_to = max(self._replayed_to, rows[-1][0])
-        # The half spread a backtest charges (the run's measured or assumed one), not the quotes at return: replay ==
-        # backtest (Advisor 22:36). The spread at return goes in the journal beside it, as a diagnostic only.
-        spread = self._cfg.assumed_half_spread
-        book = float(target_fill_px(target, side > 0, spread)) if target is not None else None
-        hit = replay_missed(rows, side, venue, guards, target, book)
+        hit = replay_missed(rows, side, venue, guards, target)
         if hit is None:
             return False
         intent, px, level, at, worst = hit
+        # The half spread a backtest charges (the measurement in force when that minute opened, else the assumed one;
+        # SPREAD-PIT), not the quotes at return: replay == backtest (Advisor 22:36). The spread at return goes in the
+        # journal beside it, as a diagnostic only.
+        spread = self._spread_in_force(at - MINUTE_NS)
+        if intent == "take_profit":
+            px = float(target_fill_px(target, side > 0, spread))
         gapped = px != level  # the minute opened past the level (replay_missed books the open), not a touch
         if intent == "stop_loss":
             # Advisor 20:42 (NA-1 replay slippage): a replayed stop is a modelled fill, as the backtest's: its level
@@ -2111,7 +2118,30 @@ class LongFlatStrategy(Strategy):
     def _half_spread(self) -> float:
         if self._bid is not None and self._ask is not None and self._bid > 0 and self._ask >= self._bid:
             return (self._ask - self._bid) / (self._ask + self._bid)
-        return self._cfg.assumed_half_spread
+        return self._assumed_spread()
+
+    def _spread_in_force(self, ts_ns: int) -> float:
+        """The measured half spread in force at a past minute, for a replay: paper reads its store, so a measurement
+        that landed after the node started is used (SPREAD-PIT); otherwise, or if the read fails, _assumed_spread."""
+        if self.runtime is not None and not self.runtime.backtest:
+            try:
+                from sleeve_fund import spreads
+
+                pair = self.runtime.store.sleeve(self.runtime.name).instrument
+                at = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+                return spreads.resolve(str(self._cfg.instrument_id.venue), pair, self.runtime.store, at=at,
+                                       strict=True).half_spread
+            except Exception as e:  # noqa: BLE001 - the replay goes on with the series it has
+                self.log.warning(f"spread at {_hhmm(ts_ns)} not read from the store ({type(e).__name__}); "
+                                 "using the one loaded")
+        return self._assumed_spread(ts_ns)
+
+    def _assumed_spread(self, ts_ns: int | None = None) -> float:
+        """The half spread the run assumes where it has no quotes: the measurement in force at ts_ns (default now) when
+        the run has a series (SPREAD-PIT, never a later measurement), else the configured assumed_half_spread."""
+        if self.spread_series is None:
+            return self._cfg.assumed_half_spread
+        return self.spread_series.at(self.clock.timestamp_ns() if ts_ns is None else ts_ns)
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> None:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
@@ -2179,7 +2209,7 @@ class LongFlatStrategy(Strategy):
         trade, nearer than paper's bid, and filled up to 34 points more often (review round 9, M9-3)."""
         if self._bid is not None and self._ask is not None:
             return self._bid if side == OrderSide.BUY else self._ask
-        away = max(tick, last * self._cfg.assumed_half_spread)
+        away = max(tick, last * self._assumed_spread())
         steps = math.ceil(away / tick - 1e-9)  # whole ticks, never nearer than the half spread
         return last - steps * tick if side == OrderSide.BUY else last + steps * tick
 

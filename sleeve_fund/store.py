@@ -1081,12 +1081,23 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def latest_spread(self, venue: str, instrument: str) -> dict | None:
+    def latest_spread(self, venue: str, instrument: str, at: datetime | None = None) -> dict | None:
+        """The latest measurement, or with `at` the one in force then (measured_at, its effective-from, at or before
+        it; equal times go to the later row: SPREAD-PIT)."""
         q = (select(spreads_t).where(spreads_t.c.venue == venue.upper(), spreads_t.c.instrument == instrument)
              .order_by(spreads_t.c.measured_at.desc(), spreads_t.c.id.desc()).limit(1))
+        if at is not None:
+            q = q.where(spreads_t.c.measured_at <= at)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
+
+    def spread_series(self, venue: str, instrument: str) -> list[dict]:
+        """Every measurement of an instrument's spread, oldest first (ties by id), for SpreadSeries."""
+        q = (select(spreads_t).where(spreads_t.c.venue == venue.upper(), spreads_t.c.instrument == instrument)
+             .order_by(spreads_t.c.measured_at, spreads_t.c.id))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
         """The most recent fetched schedule for a venue (or one account), or None."""

@@ -127,7 +127,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if prices.empty:
         raise ValueError(f"the stored history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
-    spread = spreads.resolve(profile.name, req.pair, store)
+    spread = spreads.series(profile.name, req.pair, store)  # each run charges the one in force at each time
     base, quote = req.pair.split("/")
     # Price decimals from the stored prices, as the backtest page does: the default 2 rounded every
     # sub-$10 instrument to the cent (review round 9, B9-2).
@@ -153,10 +153,11 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
         train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
         exits=req.exits(),
-        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress,
+        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
         oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
         locks=HoldoutLocks(store) if store is not None else None)
-    result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
+    span = int((prices.index[0] - pd.Timedelta(minutes=req.minutes)).value), int(prices.index[-1].value)
+    result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text(*span)}"
     cov = history.coverage(profile.name, req.pair)
     if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last > STALE_HISTORY:
         result.notes.append(f"The stored history ends {cov.last:%d %b %Y %H:%M} UTC: the collector is still catching "
