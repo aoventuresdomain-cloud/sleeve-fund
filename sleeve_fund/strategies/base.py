@@ -745,7 +745,8 @@ class LongFlatStrategy(Strategy):
         """Bars, by close time in ns, built with some of their minutes missing, degraded or not, with how many: the
         slower candles built from them add these up (v2 P1-4, Advisor 4.2). Entries are held only on the degraded
         ones (mark_degraded)."""
-        self._bar_missing.update({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
+        if self._slower:  # only slower candles read them
+            self._bar_missing.update({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
 
     def expect_bars(self, closes) -> "LongFlatStrategy":
         """Backtest on execution bars: the close times (ns) of the decision bars they build. The engine makes up any
@@ -798,7 +799,8 @@ class LongFlatStrategy(Strategy):
             self._degraded.update(self.hub_status.degraded)
             self.hub_status.degraded.clear()
         if self.hub_status is not None and self.hub_status.missing:
-            self._bar_missing.update(self.hub_status.missing)
+            if self._slower:
+                self._bar_missing.update(self.hub_status.missing)
             self.hub_status.missing.clear()
         if str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
             return False
@@ -819,7 +821,7 @@ class LongFlatStrategy(Strategy):
             self.log.info(f"bar {bar} dropped: no data in any of its minutes, so it isn't built (board 5a)")
             return True
         missing = minutes - seen
-        if missing > 0:
+        if missing > 0 and self._slower:
             self._bar_missing.setdefault(bar.ts_event, missing)
         if bar_rule.degraded(missing, minutes):
             self._degraded.setdefault(bar.ts_event, missing)
@@ -1051,8 +1053,10 @@ class LongFlatStrategy(Strategy):
         if self._lows is not None:
             self._lows.append(bar.low.as_double())
             self._highs.append(bar.high.as_double())
+        missing = self._bar_missing.pop(bar.ts_event, None)
+        if self._bar_missing and min(self._bar_missing) < bar.ts_event:  # bars never decided on (dropped): forgotten
+            self._bar_missing = {t: m for t, m in self._bar_missing.items() if t > bar.ts_event}
         if self._slower:
-            missing = self._bar_missing.pop(bar.ts_event, None)
             missing = self._degraded.get(bar.ts_event, 0) if missing is None else missing
             for s in self._slower:
                 s.handle_bar(bar, missing)
@@ -2047,14 +2051,6 @@ class LongFlatStrategy(Strategy):
         """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
         (v2 P1-4), the latest closed slower candle is degraded (over 10% of its minutes missing: Advisor 6 Oct
         16:40, 4.1), or the decision is late (_late_entry). Exits and reductions are never held."""
-        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
-        if thin is not None:
-            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
-                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
-                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
-                       level="info")
-            return True
-        self._noted.discard("slower_degraded")
         if self._short_history is not None:
             if any(s.count < s.need for s in self._slower):
                 self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "
@@ -2065,6 +2061,14 @@ class LongFlatStrategy(Strategy):
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "info", "warmup_met",
                                          "Entries open again: its slower candles now have the closed ones they need")
+        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
+        if thin is not None:
+            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
+                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
+                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
+                       level="info")
+            return True
+        self._noted.discard("slower_degraded")
         return self._late_entry(bar, what)
 
     def _late_entry(self, bar: Bar, what: str) -> bool:
