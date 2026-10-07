@@ -22,6 +22,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import funding, markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
+from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 from sleeve_fund.strategies.definitions import uses_first_touch
@@ -42,7 +43,10 @@ class BacktestResult:
     risk_events: list = field(default_factory=list)
     # Half the bid-ask spread paid on orders that took liquidity (already in the fills' prices).
     spread_paid: float = 0.0
-    half_spread: float = 0.0
+    half_spread: float = 0.0  # the one in force when the run began
+    # Which spreads the run charged, measured or assumed, and from when (sleeve_fund.spreads.SpreadSeries.report).
+    spreads_used: dict = field(default_factory=dict)
+    spread_text: str = ""
     # With a risk profile: the runtime's journal (orders, fills, marks, events), for Store.save_backtest.
     journal: object = None
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
@@ -150,7 +154,7 @@ def run_backtest(
     exec_prices: pd.DataFrame | None = None,
     exec_minutes: int = 1,
     risk_profile: str | None = None,
-    half_spread: float | None = None,
+    half_spread: float | SpreadSeries | None = None,
     progress=None,
     fees: FeeSchedule | None = None,
     warmup_prices: pd.DataFrame | None = None,
@@ -172,7 +176,9 @@ def run_backtest(
     half_spread: half the bid-ask spread, as a fraction of the price, paid by every order that takes
     liquidity (bars carry trade prices; a real market order buys at the ask and sells at the bid).
     None uses the venue profile's cautious assumption; sleeve_fund.spreads.resolve gives a measured
-    one. The fills report shows the prices after the spread, as paper fills on the bid or ask would.
+    one. The fills report shows the prices after the spread, as paper fills on the bid or ask would. A
+    SpreadSeries (sleeve_fund.spreads.series, SPREAD-PIT) charges each fill the measurement in force when its bar
+    opened, never a later one, and the venue's assumption before the first; the result says which it charged.
 
     progress: with a risk profile, called with the simulated time at every bar, to report how far a
     long run has got.
@@ -209,8 +215,15 @@ def run_backtest(
 
         half_spread = markets.half_spread_for(params, venue_profile(str(instrument.id.venue)).assumed_half_spread,
                                               str(instrument.id.venue))
-    if not 0 <= half_spread < 0.05:
-        raise ValueError(f"half spread {half_spread} outside [0, 5%)")
+    series = half_spread if isinstance(half_spread, SpreadSeries) else SpreadSeries.constant(half_spread, "given")
+    for q in [series.assumed] + [q for _, q in series.points]:
+        if not 0 <= q.half_spread < 0.05:
+            raise ValueError(f"half spread {q.half_spread} outside [0, 5%)")
+    fine = exec_prices is not None and not exec_prices.empty
+    first = exec_prices if fine else prices
+    start_ns = int(first.index[0].value) - (exec_minutes if fine else bar_minutes) * 60_000_000_000 if len(first) else 0
+    end_ns = int(first.index[-1].value) if len(first) else 0
+    half_spread = series.at(start_ns)
     if risk_profile is not None:
         if runtime is not None:
             raise ValueError("pass a runtime or a risk profile, not both")
@@ -257,7 +270,7 @@ def run_backtest(
             bar_adaptive_high_low_ordering=True,
         )
         engine.add_instrument(instrument)
-        if exec_prices is not None and not exec_prices.empty:
+        if fine:
             bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
             feed, feed_type = exec_prices, bar_type_for(instrument, exec_minutes)
             coarse = exec_minutes > 1
@@ -271,7 +284,7 @@ def run_backtest(
             instrument_id=instrument.id,
             bar_type=bar_type,
             assumed_taker_fee=float(fees.taker),
-            assumed_half_spread=half_spread,
+            assumed_half_spread=half_spread,  # the value at the start: a series then gives the one in force
             volume_scale=BOOK_SHARE,
             **params,
         )
@@ -282,6 +295,8 @@ def run_backtest(
             node.flip = first_touch_flip
             node.count_from = None if first_touch_count_from is None else int(pd.Timestamp(first_touch_count_from).value)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
+        if series.points:  # each bar's fills charge the measurement in force when it opened (BarOpens)
+            fee_model.spread_series = strategy.spread_series = series
         # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
         spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
         strategy.settle_bars_needed = strategy_cls.warmup_needed(
@@ -350,6 +365,8 @@ def run_backtest(
             risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
+            spreads_used=series.report(start_ns, end_ns),
+            spread_text=series.text(start_ns, end_ns),
             journal=runtime.store if risk_profile is not None else None,
             funding=[_funding_row(strategy, ts, a, k) for ts, a, k in strategy.funding_log],
             funding_marks=list(strategy.funding_marks),

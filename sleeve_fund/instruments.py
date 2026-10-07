@@ -210,6 +210,9 @@ class ScheduleFeeModel(FeeModel):
         # with the commission on fills that take liquidity, and kept apart per order so reports can
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
+        # Backtests with measured spreads (SPREAD-PIT): the series BarOpens reads half_spread from at each bar's open,
+        # so a fill pays the spread in force when its bar began, never a later measurement.
+        self.spread_series = None
         self.spread_paid: dict[str, float] = {}
         # The venue's own fee on those same orders, unrounded, so a report can show it alone to the cent and put
         # what rounding left in the charged commission into the price with the spread (QA m-G7).
@@ -233,6 +236,9 @@ class ScheduleFeeModel(FeeModel):
         # The commission carries the difference from the price the market order filled at; fee_paid keeps the
         # venue's fee apart so the report can move the rest into the price, as it does the spread.
         self.booked: dict[str, tuple[Decimal, bool]] = {}
+        # Those targets by their level, priced when the market order fills, with the half spread in force then (SPREAD-PIT:
+        # the bar it fills in, not the bar it was decided on); the price goes into booked for the strategy's journal.
+        self.booked_targets: dict[str, tuple[Decimal, bool]] = {}
         # Backtests: a resting stop's target level, by the stop's order id. A bar that opens through the target
         # takes the target before anything later in the bar can reach the stop (Advisor NA-2): if the venue fills
         # the stop in such a bar, it is booked as the target (rebooked), at target_fill_px, never the open (L12),
@@ -285,6 +291,9 @@ class ScheduleFeeModel(FeeModel):
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         shift = Decimal(0)
         booked = self.booked.get(str(order.client_order_id))
+        if booked is None and str(order.client_order_id) in self.booked_targets:
+            level, buy = self.booked_targets.pop(str(order.client_order_id))
+            booked = self.booked[str(order.client_order_id)] = (target_fill_px(level, not buy, self.half_spread), buy)
         target, since = self.open_targets.get(str(order.client_order_id), (None, None))
         if booked is None and target is not None and self.bar_open is not None and since < self.bar_seq:
             buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below
@@ -368,15 +377,22 @@ class ScheduleFeeModel(FeeModel):
 
 class BarOpens(SimulationModule):
     """Backtests: hands the fee model the open of each bar before the simulated venue matches it, so a resting
-    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets)."""
+    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets), and
+    the half spread in force when the bar opened (ScheduleFeeModel.spread_series)."""
 
     def __init__(self, fee_model: ScheduleFeeModel) -> None:
         self.fee_model = fee_model
 
     def pre_process(self, data) -> None:
         if isinstance(data, Bar):
-            self.fee_model.bar_open = data.open.as_decimal()
-            self.fee_model.bar_seq += 1
+            fm = self.fee_model
+            fm.bar_open = data.open.as_decimal()
+            fm.bar_seq += 1
+            if fm.spread_series is not None:
+                opened = int(data.ts_event) - int(data.bar_type.spec.timedelta.total_seconds()) * 1_000_000_000
+                now = fm.spread_series.at(opened)
+                if now != float(fm.half_spread):
+                    fm.half_spread = Decimal(str(now))
 
     def process(self, ts_now, context):
         return None

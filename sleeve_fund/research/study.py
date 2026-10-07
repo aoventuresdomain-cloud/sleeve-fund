@@ -36,6 +36,7 @@ from sleeve_fund.research.metrics import (
     whole_days,
 )
 from sleeve_fund.research.runner import BacktestResult, run_backtest
+from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import STOP_INTENTS, IdeaSpec
 from sleeve_fund.strategies.rules import FIRST_TOUCH_RERUN
@@ -491,7 +492,7 @@ def run_study(
     position_cap: float | None = None,
     risk_profile: str | None = None,
     exec_prices: pd.DataFrame | None = None,
-    half_spread: float | None = None,
+    half_spread: float | SpreadSeries | None = None,
     progress=None,
     oos_exec_prices: pd.DataFrame | None = None,
     minute_loader=None,
@@ -511,8 +512,8 @@ def run_study(
     oos_exec_prices: the bars the out-of-sample windows and the holdout run on instead, 1-minute ones for G1 (P1-D13);
     None runs them on exec_prices too. Each window and the holdout starts flat.
     minute_loader: (start, end) -> 1-minute bars over that span, for the spot check of a 5-minute pass.
-    half_spread: the spread charged on orders that take liquidity (sleeve_fund.spreads.resolve gives
-    the measured one); None uses the venue's assumption.
+    half_spread: the spread charged on orders that take liquidity: sleeve_fund.spreads.series gives the measured
+    ones, each run charging the one in force at each time (SPREAD-PIT); None uses the venue's assumption.
     progress: called with the share of the study's backtests done, 0 to 1."""
     from sleeve_fund.venues import VENUES
 
@@ -556,7 +557,12 @@ def run_study(
         from sleeve_fund.venues import venue as venue_profile
 
         half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
-    spread_used = half_spread
+    series = half_spread if isinstance(half_spread, SpreadSeries) else None
+    # One figure where a single value is needed (the setup's cost, the random-entry benchmarks): the spread in force
+    # at the end of the data, as the latest measurement was before SPREAD-PIT. The runs charge each in its time.
+    spread_used = series.at(int(prices.index[-1].value)) if series is not None else half_spread
+    spread_words = (series.text(int((prices.index[0] - bar).value), int(prices.index[-1].value))
+                    if series is not None else f"{spread_used:.3%} of the price as half the bid-ask spread")
 
     def paid(params: dict) -> FeeSchedule:
         """The schedule a run with these settings pays (runner.run_backtest's own default: its market's, or the
@@ -609,8 +615,8 @@ def run_study(
             fine = source[(source.index > df.index[0] - bar) & (source.index <= df.index[-1])]
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                           exec_minutes=bar_minutes_of(source) if fine is not None else 1,
-                           half_spread=half_spread + slippage, fees=fees,
+                           exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
+                           half_spread=series.plus(slippage) if series is not None else half_spread + slippage,
                            first_touch_flip=flip, first_touch_count_from=count_from)
         if not benchmark:
             labels.extend(x for x in res.labels if x not in labels)
@@ -878,19 +884,18 @@ def run_study(
         oos_exec_minutes=oos_minutes,
         fill_labels=labels,
         fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
-                  f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
-                  f"that take liquidity; break-even: {breakeven}"),
+                  f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
     leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts,
-        leverage, market.get("market"))
+        research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
+        full_default.shorts, leverage, market.get("market"))
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
-        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False, leverage,
-                                 market.get("market"))
+        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
+                                 series if series is not None else spread_used, False, leverage, market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1169,15 +1174,17 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
     return int((inside.abs() > 1e-9).sum())
 
 
-def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool,
+def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
                 leverage: float | None = None, market: str | None = None):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
-    are priced on those bars' closes, so the benchmark compares timing, not fills. leverage: the risk profile's cap,
-    for a fold that traded the perpetual (its chosen market, else `market`): its trips and their draws are
-    liquidated as the engine books one, losing the margin and fees, never the move past it (Independent Quant
-    Advisor 7 Oct 00:19 (4))."""
+    are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
+    SpreadSeries whose value in force at each bar's close is charged there, for the strategy's trips and the draws
+    alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
+    else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
+    never the move past it (Independent Quant Advisor 7 Oct 00:19 (4))."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
+    cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
 
     def bar(ts) -> int:
         return max(int(index.searchsorted(ts, side="right")) - 1, 0)

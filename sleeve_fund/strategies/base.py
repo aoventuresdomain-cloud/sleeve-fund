@@ -670,6 +670,9 @@ class LongFlatStrategy(Strategy):
         self._entry_fill_ns = None  # when the position last opened or added (a resting entry may fill inside a bar)
         self._book_stop_at = None  # an entry stopped out inside its own bar: the price its stop-out is booked at
         self._book_at: dict[str, float] = {}  # those stop-outs' orders and their prices, for the fee model
+        # The measured half spread in force at each time (sleeve_fund.spreads.SpreadSeries, SPREAD-PIT), read where the
+        # run has no quotes; None reads the configured assumed_half_spread. Paper's runtime refreshes it hourly.
+        self.spread_series = None
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
@@ -1067,7 +1070,9 @@ class LongFlatStrategy(Strategy):
         if not self._backtest and self._resting_openers():
             self._cancel_resting_entries()  # P1-SG15: as on a trade (on_trade); a quote can fill a resting order too
         if self.runtime is not None:
-            self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            fresh = self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            if fresh is not None:  # the hour's spread measurements, reloaded (SPREAD-PIT)
+                self.spread_series = fresh
         if self._restore is not None:
             self._send_restore()
 
@@ -2355,14 +2360,16 @@ class LongFlatStrategy(Strategy):
                       for b in bars if int(b.ts_event) > after)
         if rows:
             self._replayed_to = max(self._replayed_to, rows[-1][0])
-        # The half spread a backtest charges (the run's measured or assumed one), not the quotes at return: replay ==
-        # backtest (Advisor 22:36). The spread at return goes in the journal beside it, as a diagnostic only.
-        spread = self._cfg.assumed_half_spread
-        book = float(target_fill_px(target, side > 0, spread)) if target is not None else None
-        hit = replay_missed(rows, side, venue, guards, target, book)
+        hit = replay_missed(rows, side, venue, guards, target)
         if hit is None:
             return False
         intent, px, level, at, worst = hit
+        # The half spread a backtest charges (the measurement in force when that minute opened, else the assumed one;
+        # SPREAD-PIT), not the quotes at return: replay == backtest (Advisor 22:36). The spread at return goes in the
+        # journal beside it, as a diagnostic only.
+        spread = self._spread_in_force(at - MINUTE_NS)
+        if intent == "take_profit":
+            px = float(target_fill_px(target, side > 0, spread))
         gapped = px != level  # the minute opened past the level (replay_missed books the open), not a touch
         if intent == "stop_loss":
             # Advisor 20:42 (NA-1 replay slippage): a replayed stop is a modelled fill, as the backtest's: its level
@@ -2819,7 +2826,30 @@ class LongFlatStrategy(Strategy):
     def _half_spread(self) -> float:
         if self._bid is not None and self._ask is not None and self._bid > 0 and self._ask >= self._bid:
             return (self._ask - self._bid) / (self._ask + self._bid)
-        return self._cfg.assumed_half_spread
+        return self._assumed_spread()
+
+    def _spread_in_force(self, ts_ns: int) -> float:
+        """The measured half spread in force at a past minute, for a replay: paper reads its store, so a measurement
+        that landed after the node started is used (SPREAD-PIT); otherwise, or if the read fails, _assumed_spread."""
+        if self.runtime is not None and not getattr(self.runtime, "backtest", False):
+            try:
+                from sleeve_fund import spreads
+
+                pair = self.runtime.store.sleeve(self.runtime.name).instrument
+                at = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+                return spreads.resolve(str(self._cfg.instrument_id.venue), pair, self.runtime.store, at=at,
+                                       strict=True).half_spread
+            except Exception as e:  # noqa: BLE001 - the replay goes on with the series it has
+                self.log.warning(f"spread at {_hhmm(ts_ns)} not read from the store ({type(e).__name__}); "
+                                 "using the one loaded")
+        return self._assumed_spread(ts_ns)
+
+    def _assumed_spread(self, ts_ns: int | None = None) -> float:
+        """The half spread the run assumes where it has no quotes: the measurement in force at ts_ns (default now) when
+        the run has a series (SPREAD-PIT, never a later measurement), else the configured assumed_half_spread."""
+        if self.spread_series is None:
+            return self._cfg.assumed_half_spread
+        return self.spread_series.at(self.clock.timestamp_ns() if ts_ns is None else ts_ns)
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
@@ -2865,7 +2895,10 @@ class LongFlatStrategy(Strategy):
             # A backtest's fills are at the candle's price; a breakout entry pays this much more (P1-5, board 9b B3).
             self.fee_model.slippage[coid] = Decimal(str(signal["breakout_slippage_bp"])) / 10_000
         if self._backtest and "book_px" in signal and self.fee_model is not None:
-            self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
+            if intent == "take_profit" and "target_px" in signal:  # priced at the fill, with the spread then
+                self.fee_model.booked_targets[coid] = (Decimal(str(signal["target_px"])), side == OrderSide.BUY)
+            else:
+                self.fee_model.booked[coid] = (Decimal(str(signal["book_px"])), side == OrderSide.BUY)
         bar_close, bar_recv = self._deciding or (None, None)
         if self.runtime is not None:
             # A decision on a bar is timed from its order's own journal row (a risk stop or restore is not).
@@ -2904,7 +2937,7 @@ class LongFlatStrategy(Strategy):
         trade, nearer than paper's bid, and filled up to 34 points more often (review round 9, M9-3)."""
         if self._bid is not None and self._ask is not None:
             return self._bid if side == OrderSide.BUY else self._ask
-        away = max(tick, last * self._cfg.assumed_half_spread)
+        away = max(tick, last * self._assumed_spread())
         steps = math.ceil(away / tick - 1e-9)  # whole ticks, never nearer than the half spread
         return last - steps * tick if side == OrderSide.BUY else last + steps * tick
 
@@ -4692,6 +4725,8 @@ class LongFlatStrategy(Strategy):
             fee = qty * px * float(self.fee_model.fees.maker) if self.fee_model is not None else fee
         sign = 1 if event.is_buy else -1
         book = ((self.decisions.get(journal_id) or {}).get("signal") or {}).get("book_px")
+        if self._backtest and self.fee_model is not None and book and coid in self.fee_model.booked:
+            book = self._target_booked(coid, float(self.fee_model.booked[coid][0]))
         if self._backtest and self.fee_model is not None and coid in self.fee_model.rebooked:
             book = self._rebook_as_target(coid, *self.fee_model.rebooked.pop(coid), px)
         if book and kept_id is None and self._backtest:
@@ -4987,6 +5022,18 @@ class LongFlatStrategy(Strategy):
                        "then stopped out there", {"entry_px": self._entry_px, "trigger": round(level, 8),
                                                    "stop_loss": self._stop_frac})
         return True
+
+    def _target_booked(self, coid: str, book: float) -> float:
+        """Backtests: the price the fee model booked a target at, with the half spread in force when it filled
+        (SPREAD-PIT). Where that differs from the decision's estimate, the decision's record follows it."""
+        decision = self.decisions.get(coid) or {}
+        signal = decision.get("signal") or {}
+        was = signal.get("book_px")
+        if was is not None and round(was, 8) != round(book, 8):
+            signal["book_px"] = book
+            if decision.get("reason"):
+                decision["reason"] = decision["reason"].replace(f"booked at {was:,.6g}", f"booked at {book:,.6g}")
+        return book
 
     def _rebook_as_target(self, coid: str, level: float, book: float, px: float) -> float:
         """Backtests: the venue filled the resting stop in a bar that opened through the target. The open trades

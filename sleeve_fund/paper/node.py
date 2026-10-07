@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
@@ -273,6 +274,11 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     )
     if profile.ohlc_history is not None and hub is None:
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
+    if runtime is not None:
+        # The measured spread in force at each time, read where there are no quotes yet and by a replay after an
+        # outage; refreshed hourly as new measurements land (SPREAD-PIT).
+        runtime.spread_loader = partial(spreads.series, profile.name, sleeve.instrument, runtime.store, strict=True)
+        strategy.spread_series = spreads.series(profile.name, sleeve.instrument, runtime.store)
     if hub is None:  # its first bar after a start is built from the stored minutes, as the hub client's is (R1)
         strategy.attach_minutes(stored_minutes(profile.name, sleeve.instrument))
     strategy.hub_fed = hub is not None

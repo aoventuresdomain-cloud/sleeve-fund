@@ -38,6 +38,7 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
+from sleeve_fund.spreads import series as spread_series
 from sleeve_fund.paper.config import (
     ALLOWED_BAR_SPECS,
     VENUE_WARMUP_BARS,
@@ -1595,6 +1596,7 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          days=args["days"], detail=True, minutes=args["minutes"], risk_profile=args["risk_profile"],
                          venue=args["venue"], fee_quote=resolve_fees(args["venue"], store),
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
+                         spread_series=spread_series(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     trial, uncounted = _trial(_backtest_trial_metrics, store, args, result, run_id,
