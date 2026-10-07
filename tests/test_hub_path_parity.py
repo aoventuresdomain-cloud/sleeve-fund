@@ -242,8 +242,7 @@ def test_c2_c5_hub_paper_sends_the_same_orders_and_fills_as_own_feed_paper_and_t
         assert h[5] == pytest.approx(p[5], abs=0.0100001)
     # and against the backtest: same minute, size and all-in price to 0.3 bp (test_sanity.py's bar)
     _assert_same(hub, bt)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in hub), rel=0.005)
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in hub), rel=0.005)
     assert _final_qty(f) == pytest.approx(_final_qty(bf), abs=1e-8)
 
 
