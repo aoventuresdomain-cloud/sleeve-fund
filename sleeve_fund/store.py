@@ -1925,26 +1925,89 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
         self.sleeve(sleeve)  # raises if unknown
+        here = None  # a reset after liquidation applied here, as no process will apply it
         if command == RAL:
             from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
 
             if (why := ral_refusal(self, sleeve, incident, actor)) is not None:
                 raise ValueError(why)
             reason = f"{reason.strip()} (incident #{incident})"
+            here = self._ral_here(sleeve, reason, incident)
         elif incident is not None:
             raise ValueError("only a reset after liquidation names an incident")
+        now = utcnow()
         try:
             with self.engine.begin() as c:
-                c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
-                                                    created_at=utcnow(), incident=incident))
+                cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
+                                                          created_at=now, incident=incident)).inserted_primary_key[0]
                 if holds_through_reset and command in ("pause", "flatten"):
                     self._hold_on_reset(c, sleeve, command, reason)
+                if here:
+                    self._apply_ral(c, sleeve, cid, here, now)
         except IntegrityError:
             if incident is None:
                 raise
             raise ValueError(f"already reset for this liquidation: incident #{incident} has its reset after "
                              "liquidation") from None
+        if here:
+            self._lapse_resets_before(sleeve, now)
         self.decide(actor, command, reason, sleeve)
+
+    def apply_waiting_ral(self, sleeve: str) -> bool:
+        """A reset after liquidation still waiting when its strategy was stopped (QA RAL-F2: Stop after the RAL): no
+        process will apply it once the strategy is stopped and flat, so it is applied here as Store.command applies
+        one sent to a stopped strategy. True if one was applied; a process that got there first wins."""
+        waiting = [c for c in self.pending_commands(sleeve) if c["command"] == RAL]
+        if not waiting or (here := self._ral_here(sleeve, waiting[-1]["reason"], waiting[-1]["incident"])) is None:
+            return False
+        now = utcnow()
+        with self.engine.begin() as c:
+            if not self._apply_ral(c, sleeve, waiting[-1]["id"], here, now):
+                return False
+        self._lapse_resets_before(sleeve, now)
+        return True
+
+    def _apply_ral(self, c, sleeve: str, command_id: int, here: dict, now: datetime) -> bool:
+        """Apply a reset after liquidation in the caller's transaction, as the engine's _reset_after_liquidation does:
+        the command applied, the liquidation_reset event, a mark at the remaining equity (which a Start's restored
+        high-water mark and day baseline read) and the strategy stopped, no longer halted. False (nothing written)
+        when the command was applied already."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIQUIDATION_RESET,
+                                          message=here["words"]))
+        if here["mark"] is not None:
+            c.execute(insert(equity_t).values(sleeve=sleeve, ts=now, **here["mark"]))
+        c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
+            status="stopped", status_reason="stopped: reset after liquidation", paused_until=None))
+        return True
+
+    def _lapse_resets_before(self, sleeve: str, now: datetime) -> None:
+        for request in self.pending_resets():  # as the engine does: a reset asked before the RAL lapses
+            if request["sleeve"] == sleeve and request["created_at"] <= now:
+                self.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
+                                  "liquidation answered")
+
+    def _ral_here(self, sleeve: str, reason: str, incident: int) -> dict | None:
+        """A reset after liquidation for a strategy no process will apply it for (CR on #193): stopped and flat, so
+        the supervisor runs nothing, and Start is refused while it is liquidated. Returns what Store.command journals
+        for it in the command's own transaction (the engine's words, and a mark at the remaining equity, so a later
+        Start restores the new high-water mark and day baseline from it), else None for the process to apply."""
+        from sleeve_fund.paper.runtime import SleeveRuntime, liquidation_event, ral_words
+
+        s = self.sleeve(sleeve)
+        book = self.journal_book(sleeve, s.starting_balance)
+        if s.desired_state == "running" or abs(book["qty"]) > 1e-12:
+            return None
+        equity = book["cash"]
+        last = self.equity_at_or_before(sleeve, utcnow())
+        cmd = {"incident": incident, "reason": reason}
+        words = ral_words(self, sleeve, cmd, liquidation_event(self, sleeve), SleeveRuntime(self, sleeve).peak, equity)
+        mark = (None if last is None else
+                {"equity": equity, "cash": equity, "qty": 0.0, "price": last["price"], "benchmark": last["benchmark"]})
+        return {"words": words, "mark": mark}
 
     def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
         """A PM control on a strategy whose reset is under way, kept on the fresh run without a command for its
@@ -2016,7 +2079,9 @@ class Store:
 
     def drop_pending(self, sleeve: str, why: str) -> int:
         """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
-        pending = self.pending_commands(sleeve)
+        # A reset after liquidation doesn't lapse: its incident can't be answered twice, so it is applied instead
+        # (apply_waiting_ral, or the process still running for its exits) (QA RAL-F2).
+        pending = [c for c in self.pending_commands(sleeve) if c["command"] != RAL]
         for cmd in pending:
             self.mark_applied(cmd["id"])
             if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them

@@ -769,17 +769,16 @@ def test_ral_with_an_incident_that_is_not_about_this_liquidation_is_refused(stor
 
 # --- RAL with the note [R17:57, HoE17:55, R18:17] -----------------------------------------------------------------
 
-# PE2 (P1-RAL): mark kept. RAL lifts the halt, but on main since GAP-LIQ-CAP (#189) the liquidation is booked at
-# the bankruptcy price, so ping_pong picks its cycle up there and its first trade after the restart is a short, not
-# the buy the set-up expects (a set-up question for QA, not RAL's)
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_with_the_note_sets_it_running_and_it_trades_again(store, tmp_path):
     """[R17:57] the PM's explicit RAL lifts the halt: the next process runs it and it trades on its next signal
     (ping_pong buys on the first bar). The recorded session then ends, so its process stops ("process stopped"):
     the status is read as not halted here, and as running in the tests that tick a runtime."""
     f = _liquidate(tmp_path, store)
     _ral(store, incident=_noted(store, f.liq))
-    new = _restart(tmp_path, store, [(5, 0.0)], hours=25)
+    # Set-up (HoQA re-pin, RAL-ANCHOR): the restart's prices start where the liquidation was booked (the bankruptcy
+    # price since GAP-LIQ-CAP), so ping_pong's cycle, picked up from that fill or started afresh, buys first.
+    new = _restart(tmp_path, store, [(5, 0.0)], hours=25, px=float(f.close["avg_px"]))
     assert [(o["side"], o["intent"]) for o in new][:1] == [("BUY", "entry")], new
     s = store.sleeve(NAME)
     assert s.status != "halted" and s.desired_state == "running", (s.status, s.status_reason)
@@ -1029,10 +1028,7 @@ def test_a_second_ral_on_the_same_liquidation_is_a_no_op(store, tmp_path):
     assert store.sleeve(NAME).status == "running"
 
 
-# PE2 (P1-RAL): mark kept. RAL lifts the halt, but on main since GAP-LIQ-CAP (#189) the liquidation is booked at
-# the bankruptcy price, so ping_pong picks its cycle up there and its first trade after the restart is a short, not
-# the buy the set-up expects (a set-up question for QA, not RAL's)
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_a_second_liquidation_after_a_reset_needs_a_new_note(store, tmp_path):
     """[R17:57] the note is per liquidation: reset after the first, liquidated again (a long, a 60% gap down), the
     first note no longer serves; a note on the second liquidation's incident does, and the new mark is the second
@@ -1040,7 +1036,9 @@ def test_a_second_liquidation_after_a_reset_needs_a_new_note(store, tmp_path):
     f = _liquidate(tmp_path, store)
     first = _noted(store, f.liq)
     _ral(store, incident=first)
-    new = _restart(tmp_path, store, [(5, 0.0), (0, -0.6), (5, 0.0)], hours=25, tag="second")
+    # Set-up (HoQA re-pin, RAL-ANCHOR): as above, from the booked liquidation price, so the long is opened first.
+    new = _restart(tmp_path, store, [(5, 0.0), (0, -0.6), (5, 0.0)], hours=25, tag="second",
+                   px=float(f.close["avg_px"]))
     _gap_closed(new, "SELL")  # a long this time
     assert store.sleeve(NAME).status == "halted"
     liq2 = _gap_event(store, after_id=f.liq["id"])
