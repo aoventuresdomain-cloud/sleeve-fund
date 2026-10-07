@@ -89,6 +89,10 @@ from o17_harness import (  # noqa: F401  (fixtures are used by name)
 )
 from sleeve_fund import funding
 
+# Funding mechanics with the harness's stopless 1x perp: #182's interim 5% open-risk limit would refuse the entries
+# (QA 7 Oct 08:15, DA). The open-risk limit has its own pins in the gate 5 masters.
+pytestmark = pytest.mark.no_open_risk_limit(reason="funding mechanics with a stopless perp; open-risk limit pinned in gate 5")
+
 REASON = "QA O17a: not built yet (Advisor 17:52)"
 REASON_EPISODE = "O17a-EPISODE follow-up (Advisor 06:28/06:30 episode rulings; HoE 06:30): not in #163"
 xfail = pytest.mark.xfail(strict=True, reason=REASON)

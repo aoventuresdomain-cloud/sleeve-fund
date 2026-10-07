@@ -25,6 +25,9 @@ from o17_harness import (  # noqa: F401  (fixtures are used by name)
     write_rates,
 )
 
+# Funding mechanics with the harness's stopless 1x perp: #182's interim 5% open-risk limit would refuse the entries.
+pytestmark = pytest.mark.no_open_risk_limit(reason="funding mechanics with a stopless perp; open-risk limit pinned in gate 5")
+
 
 def test_a_second_missing_settlement_keeps_the_episode_open_when_the_first_arrives(tmp_path, monkeypatch, binance):
     """08:00 never arrives, 16:00 arrives at 16:30: one funding_stale for the whole stretch and no
