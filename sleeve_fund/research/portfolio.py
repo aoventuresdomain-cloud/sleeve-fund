@@ -22,16 +22,18 @@ from nautilus_trader.model import CryptoPerpetual, CurrencyPair, InstrumentId, V
 from sleeve_fund.money import money, scale
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
-# ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the close.
-# No drift is modelled until the parity report shows mean adverse drift above 2.5 bp over 200 or more fills; then this
-# fixed figure is set, and every portfolio fill pays it through fill_price(), the one hook.
+# ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the
+# close. No drift is modelled until the parity report shows mean adverse drift above 2.5 bp over 200 or more fills;
+# then this fixed figure is set, and every portfolio fill pays it through fill_price(), the one hook.
 ACT_DRIFT_BP = 0.0
 
 _TYPES = {"CurrencyPair": CurrencyPair, "CryptoPerpetual": CryptoPerpetual}
 
 
 def clone_venue(base: Venue | str, index: int) -> Venue:
-    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: KRAKEN -> KRAKEN_P1 (no hyphen: an account id is venue-number, split on its hyphen)."""
+    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: KRAKEN -> KRAKEN_P1.
+
+    No hyphen: an account id is venue-number, split on its hyphen."""
     return Venue(f"{base}_P{index}")
 
 
@@ -90,7 +92,8 @@ class CloseBatch:
         if first:
             # set_time_alert_ns, never set_time_alert(datetime): a datetime keeps microseconds only, so the extra
             # nanosecond is lost and the alert lands on the close itself (P2-7a spike, trap 1).
-            clock.set_time_alert_ns(f"portfolio-gate-{ts}", ts + BATCH_DELAY_NS, callback=lambda event, t=ts: self.run(t))
+            clock.set_time_alert_ns(
+                f"portfolio-gate-{ts}", ts + BATCH_DELAY_NS, callback=lambda event, t=ts: self.run(t))
 
     def run(self, ts: int) -> list[tuple[Pending, Any]]:
         """The gate pass for the close `ts`: each intent in strategy order, then in the order it was posted."""
