@@ -11,9 +11,10 @@ from __future__ import annotations
 import itertools
 from datetime import datetime
 
-from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, exact_sum, utcnow
+from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
+                                _check_rebook, _rebook_words, exact_sum, utcnow)
 
-_FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
+_FINISHED = FINISHED_ORDER_STATUSES
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
 
 
@@ -28,6 +29,7 @@ class MemoryJournal:
         self.insurance_: list[dict] = []
         self.orders_: dict[str, dict] = {}
         self.events_: list[dict] = []
+        self.decisions_: list[dict] = []
         self.exit_plans_: dict[str, list[dict]] = {}
         self._ids = itertools.count(1)
         self._peak: float | None = None
@@ -114,6 +116,15 @@ class MemoryJournal:
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
 
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        row = self.orders_.get(order_id)
+        _check_rebook(order_id, row)
+        row.update(intent="liquidation", reason=reason, signal=signal)
+        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+
+    def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
+        rows = [o for o in self.orders_.values() if o["intent"] in intents]
+        return max(rows, key=lambda o: (o["ts"], o["id"])) if rows else None
     def record_timing(self, sleeve: str, order_id: str, **stamps) -> None:
         """A backtest keeps no order timings: its stamps are its replay clock."""
 
@@ -150,17 +161,24 @@ class MemoryJournal:
         self.events_.append({"id": next(self._ids), "sleeve": sleeve, "ts": ts or utcnow(), "level": level,
                              "kind": kind, "message": message})
 
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None, ts=None) -> None:
+        self.decisions_.append({"ts": ts or utcnow(), "actor": actor, "action": action, "sleeve": sleeve,
+                                "reason": reason.strip()})
+
     # --- reads, newest first like Store -------------------------------------------------
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         levels = LEVELS[LEVELS.index(min_level):]
         return [e for e in reversed(self.events_) if e["level"] in levels][:limit]
 
-    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
-        return next((e for e in reversed(self.events_) if e["kind"] in kinds), None)
+    def last_event(self, sleeve: str, kinds: tuple[str, ...], before: datetime | None = None) -> dict | None:
+        return next((e for e in reversed(self.events_)
+                     if e["kind"] in kinds and (before is None or e["ts"] <= before)), None)
 
-    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
-        return [e for e in self.events_ if e["kind"] in kinds and e["id"] > after_id]
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0,
+                            since: datetime | None = None) -> list[dict]:
+        return [e for e in self.events_
+                if e["kind"] in kinds and e["id"] > after_id and (since is None or e["ts"] >= since)]
 
     # Exit plans set after entry (see Store.set_exit_plan). A backtest starts flat and its settings don't
     # change mid-run, so it rarely has any; they are kept for the same calls.

@@ -149,7 +149,7 @@
   <table class="responsive" data-hide-md="3 6">
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Fee</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody id="ord-list">{% for o in orders %}
-    <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
+    <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else 'filled' if o.status == 'triggered' else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="hide">{{ o.qty|qty }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
       <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td></tr>
     {% endfor %}<tr data-none hidden><td colspan="8" class="muted">No orders match.</td></tr></tbody>
@@ -345,15 +345,15 @@
   <form method="post" action="/sleeves/{{ s.name }}/{{ 'archive' if cmd in ['archive', 'restore'] else 'command' }}">
     <h2 id="dlg-{{ cmd }}-h">{{ title }}</h2>
     <p>{{ effect }}</p>
-    {% if cmd == 'stop' and x.qty %}<div class="warnbox"><b>The position stays open.</b> Once stopped, nothing manages it except {% if risk.stop_px %}the stop at {{ risk.stop_px|px }}{% else %}nothing at all: it has no stop{% endif %}. Usually you want Flatten and stop: it closes the position first, then asks you to stop it once it is flat.</div>{% endif %}
-    {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now would drop it, so Stop is off until the strategy is flat.</div>{% endif %}
+    {% if cmd == 'stop' and x.qty %}<div class="warnbox"><b>The position stays open.</b> Once stopped, it runs for its exits only: {% if risk.stop_px %}the stop at {{ risk.stop_px|px }} still closes it{% else %}it has no stop, so a safety stop is set from the current price{% endif %}, nothing new opens, and it stops once it is flat. Usually you want Flatten and stop: it closes the position first, then asks you to stop it once it is flat.</div>{% endif %}
+    {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now drops it: while it still holds, the strategy runs for its exits only, its stop still closing the position.</div>{% endif %}
     {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
     {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
     {% set refused = cmd in ['resume', 'start'] and liquidated %}{# nothing to offer: the server refuses it (QA P1-U25, U31) #}
     {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}
     <div class="dlg-actions"><button type="button" class="secondary" data-close>{{ 'Close' if refused else 'Cancel' }}</button>
       {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
-      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled{% if cmd == 'stop' and flatten_waits %} data-blocked{% endif %}>{{ label }}</button>{% endif %}</div>
+      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled>{{ label }}</button>{% endif %}</div>
   </form>
 </dialog>
 {% endfor %}
