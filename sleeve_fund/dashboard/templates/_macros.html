@@ -13,13 +13,34 @@
 {# A model that trails its own stop (rsi_pullback): its level isn't journaled yet, so no line or price is shown
    for it rather than an estimate (Advisor, atr-149 A2; the journal is board item A2-T). #}
 {% macro trail_words(s) %}{% if s.strategy == 'rsi_pullback' %}Trailing stop, {{ '%g'|format(s.params.get('atr_mult', 3.0)) }} simple ATR below the highest close since entry{% endif %}{% endmacro %}
-{# What a position's Risk to stop reads when its stop trails and its level isn't journaled yet (P1-U24). #}
-{% macro trailing_risk() %}<span class="faint" title="Its stop trails the highest close since entry, and the level isn't journaled yet, so its risk to the stop isn't shown or counted in Open risk">trailing · level not shown</span>{% endmacro %}
-{# The Open risk figure itself: when any position is left out of the sum (no stop, or a trailing stop whose level
-   isn't shown) it carries the "+", the warn colour and a visible count, so the total never reads as complete. #}
-{% macro open_risk_text(amount, left_out) %}{{ amount|money }}{% if left_out %}+ · {{ left_out }} not counted{% endif %}{% endmacro %}
-{# The hover on an Open risk figure: the unbounded and trailing positions it leaves out of the sum. #}
-{% macro open_risk_hint(unbounded, trailing) %}{% if unbounded %}{{ unbounded|join(', ') }}: no stop, so unbounded{% endif %}{% if unbounded and trailing %} · {% endif %}{% if trailing %}{{ trailing|join(', ') }}: trailing stop, level not shown, not counted{% endif %}{% if not unbounded and not trailing %}Money lost if every stop is hit{% endif %}{% endmacro %}
+{# The Open risk figure: the 5% open-risk limit's figure, perpetuals only, so it equals the gate (trading.open_risk;
+   QA R200-1). A part measured at the stopless estimate is counted and named; anything the limit can't measure is
+   left out, with the "+", and named; with nothing measured it reads "–", never 0. Either way the figure is in the
+   warn colour and says so, never reading as complete (P1-U24-1). Spot has its own line (spot_risk_text). #}
+{% macro open_risk_warn(r) %}{{ 'warn' if r.estimated or r.through or r.left_out or r.spot_left_out }}{% endmacro %}
+{% macro open_risk_text(r) %}{% set est = (r.estimated|length) + (r.through|length) %}{% if r.open_risk is none %}–{% else %}{{ r.open_risk|money }}{% if r.left_out %}+{% endif %}{% endif %}{% if est %} · {{ est }} estimated{% endif %}{% if r.left_out %} · {{ r.left_out|length }} not counted{% endif %}{% endmacro %}
+{# The headroom left under the 5% open-risk limit at this book (HoE, Advisor 7 Oct 20:20 UK): "at most" when a part
+   is left out; over the limit reads red (plain: for a hover). Nothing when nothing could be measured or the book is empty. #}
+{% macro open_risk_room(r, equity, plain=False) %}{% if r.open_risk is not none and equity and equity > 0 %}{% set room = open_risk_limit * equity - r.open_risk %}{% if room >= 0 %}{{ 'at most ' if r.left_out }}{{ room|money }} headroom to the {{ open_risk_limit|pct0 }} limit · {{ (r.open_risk / equity)|pct1 }} of book{% else %}{% if not plain %}<span class="loss">{% endif %}over the {{ open_risk_limit|pct0 }} limit by {{ (-room)|money }}{% if not plain %}</span>{% endif %} · {{ (r.open_risk / equity)|pct1 }} of book{% endif %}{% endif %}{% endmacro %}
+{# Spot, outside the 5% limit: its own line, the risk to its stops, with the same "+" and count for what it leaves out. #}
+{% macro spot_risk_text(r) %}spot, outside the limit: {% if r.spot_risk is none %}–{% else %}{{ r.spot_risk|money }}{% if r.spot_left_out %}+{% endif %}{% endif %} to stop{% if r.spot_left_out %} · {{ r.spot_left_out|length }} not counted{% endif %}{% endmacro %}
+{# The hover on an Open risk figure: each strategy whose part is estimated or left out, and why (trading.open_risk). #}
+{% macro open_risk_hint(r) %}{{ r.hint }}{% if r.spot %} · Spot ({{ r.spot|join(', ') }}) is outside the 5% limit: {{ r.spot_hint }}{% endif %}{% endmacro %}
+{# A position's Risk cell (trading.risk_cell): what the open-risk limit counts for it. #}
+{% macro risk_cell(p) %}{% set c = p.risk %}
+{%- if c.kind == 'stop' %}{{ c.amount|money }}
+{%- elif c.kind == 'estimated' %}<span class="warn" title="{{ 'Trailing stop checked at the close' if c.trailing else 'No stop' }}: counted at the larger of 10% and 3 daily ATRs, as the open-risk limit counts it">{{ c.amount|money }} est.</span>
+{%- elif c.kind == 'through' %}<span class="warn" title="The price has gone through its stop and the position is still open: counted at the larger of 10% and 3 daily ATRs">{{ c.amount|money }} est. · past stop</span>
+{%- elif c.kind == 'unknown' %}<span class="warn" title="{{ 'The price has gone through its stop' if c.through else 'No stop' }} and its daily ATR isn't known yet, so it can't be measured and isn't counted">{{ 'past stop · ' if c.through }}not counted</span>
+{%- elif c.kind == 'trailing' %}<span class="faint" title="Its stop trails the highest close since entry, and the level isn't journaled yet, so its risk to the stop isn't shown or counted in Open risk">trailing · level not shown</span>
+{%- elif c.kind == 'spot_through' %}<span class="warn" title="The price has gone through its stop and the position is still open">past stop</span>
+{%- elif c.kind == 'unbounded' %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>
+{%- else %}<span class="faint" title="Not counted by the open-risk limit (archived)">–</span>{% endif %}{% endmacro %}
+{# How far the stop sits from the mark towards liquidation (trading.stop_to_liquidation). Over half way breaks the
+   half-way rule; at or past liquidation the venue would liquidate first (Advisor 7 Oct 18:50 UK). #}
+{# The stop's distance towards liquidation (trading.stop_to_liquidation), in words: faint within the half-way rule,
+   amber past it, red at or past liquidation (Advisor 7 Oct 18:50 UK). The share goes in the title, never the cell. #}
+{% macro stop_liq(share) %}{% if share is not none %}<span class="{{ 'loss' if share >= 1 else ('warn' if share > 0.5 else 'faint') }}" title="From the current price, the stop is {{ share|pct0 }} of the way to liquidation: {% if share >= 1 %}the venue would liquidate first{% elif share > 0.5 %}past the half-way rule, a stop must sit no more than half way to liquidation{% else %}within the half-way rule{% endif %}">{% if share >= 1 %}stop at or past liquidation{% elif share > 0.5 %}stop past half way to liquidation{% else %}stop within half way to liquidation{% endif %}</span>{% endif %}{% endmacro %}
 {% macro tag(text, kind='') %}<span class="tag {{ kind }}">{{ text }}</span>{% endmacro %}
 {% macro why(label, text, items) %}<div class="why-block"><div class="k">{{ label }}</div>{% if text %}<p>{{ text }}</p>{% if items %}<dl class="sig">{% for k, v in items %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}</dl>{% endif %}{% else %}<p class="muted">Not recorded. This trade predates the order journal, which logs the reason when the order is sent.</p>{% endif %}</div>{% endmacro %}
 {% macro why_toggle(id) %}<button type="button" class="why-btn" aria-expanded="false" aria-controls="{{ id }}" data-why="{{ id }}">Why</button>{% endmacro %}

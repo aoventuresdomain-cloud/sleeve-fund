@@ -40,14 +40,15 @@ def record_at(path, meta, legs, px, hours):
         test_replay.START = start
 
 
-def replay_into(store, path, name=NAME):
-    """The recorded session replayed through the paper runtime into `store`; the strategy may exist already."""
+def replay_into(store, path, name=NAME, history=None):
+    """The recorded session replayed through the paper runtime into `store`; the strategy may exist already.
+    history: a recording of the market the hub saw, which a restart warms up from (research.replay.replay)."""
     from sleeve_fund.research.replay import replay
 
     if any(s.name == name for s in store.sleeves()):
         store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
     try:
-        return replay(path, store=store)
+        return replay(path, store=store, history=history)
     finally:
         store.__dict__.pop("create_sleeve", None)
 

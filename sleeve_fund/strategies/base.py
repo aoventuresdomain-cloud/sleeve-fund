@@ -210,8 +210,7 @@ def _aware(ts: datetime) -> datetime:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
-# A decision this long after its bar's close (a bar missed over a restart, m13-E3) opens or adds to nothing: the
-# price has moved on from the signal. Exits and reductions always run, however late (Independent Quant Advisor,
+# A decision this long after its bar's close opens or adds to nothing: the price has moved on from the signal. Exits and reductions always run, however late (Independent Quant Advisor,
 # 5 Oct 2026). The same limit the hub client puts on a refilled bar.
 LATE_DECISION_NS = 90 * 1_000_000_000
 # Paper: this long with no trade while in a position is venue time no price reached the strategy for (QA P1-L1).
@@ -219,23 +218,6 @@ LATE_DECISION_NS = 90 * 1_000_000_000
 UNSEEN_GAP_NS = 15 * 1_000_000_000
 MISSING_KEEP_NS = 6 * 60 * 60_000_000_000  # how long a minute the feed missed is still replayed if it lands
 HOLD_NS = 20 * 1_000_000_000  # hub_client.HOLD_SECONDS: a minute this late was held for a refill that didn't come
-
-
-def late_bar(bars: list, now_ns: int, step_ns: int, last_alive: datetime | None, last_order_at: datetime | None):
-    """m13-E3: the latest warm-up bar, when it closed while the strategy was down and is still the latest
-    closed bar, so it is decided on once rather than only warmed up on. last_alive: the previous process's last
-    heartbeat. None (warm-up only) for a first start, when that process was still alive at the close (it saw
-    the bar), when an order was journaled at or after the close (it acted on it), or when the bar is a bar or
-    more old (a newer bar decides instead). Decided more than LATE_DECISION_NS after its close, it can only
-    exit or reduce (_late_entry)."""
-    if not bars or last_alive is None:
-        return None
-    last = bars[-1]
-    if now_ns - last.ts_event >= step_ns or _ns(last_alive) >= last.ts_event:
-        return None
-    if last_order_at is not None and _ns(last_order_at) >= last.ts_event:
-        return None
-    return last
 
 
 def outage_fill_note(decision: dict | None, px: float) -> str | None:
@@ -604,6 +586,11 @@ class LongFlatStrategy(Strategy):
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
         self._resume_entry_ns: int | None = None  # set by _plan_resume
+        # R-I5-2 (Advisor 7 Oct 21:15 UK): candles that closed after the journal's last decided one were missed while
+        # the strategy was down. The first of them the model says exit on (its close, ns) closes the position once, at
+        # market, on the first trade (_exit_missed). Entries are never caught up: the next waits for a live close.
+        self._missed_after: int | None = None  # ns: candles closing after this were missed (_plan_resume)
+        self._missed_exit: int | None = None
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
@@ -703,7 +690,6 @@ class LongFlatStrategy(Strategy):
         # P1-1-CANON (Advisor): the bar a decision used, as it was then, journalled with each order's signal. The
         # store may later replace a hub bar with the venue's candle; this record is never overwritten.
         self._deciding_bar: dict | None = None
-        self._late: Bar | None = None  # paper, m13-E3: a bar that closed while the strategy was down (late_bar)
         self._lag: int | None = None  # ns: this decision came more than LATE_DECISION_NS after its bar's close
         self._late_skips: list[int] = []  # the closes of the late bars an opening was skipped on, this run
         self._last_alive: datetime | None = None  # paper: the previous process's last heartbeat
@@ -959,6 +945,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
+        self.resume_cycle()  # before the warm-up, which decides the candles since on the model's own state
         self._plan_resume()
         if self.preload:
             preload, self.preload = self.preload, None
@@ -1031,10 +1018,10 @@ class LongFlatStrategy(Strategy):
         if self._outage_check:
             self._outage_check = False
             if self._check_outage_exits():
-                self._late = None  # out of the position: the missed bar is warm-up only, nothing to exit
+                self._missed_exit = None  # out of the position: the missed candles' exit has nothing to close
                 return
-        if self._late is not None:
-            self._decide_late()
+        if self._missed_exit is not None:
+            self._exit_missed()
         if self._kept:
             self._tape(tick)
         if self._still_awaiting():
@@ -1584,20 +1571,30 @@ class LongFlatStrategy(Strategy):
         clears where they would have without the restart (review round 13, E13-3/E13-4). Models whose rules
         keep a leg override this; for any other model a restart rebuilds nothing beyond its indicators."""
 
+    def resume_cycle(self) -> None:
+        """After a restart, before the warm-up: put back the state a model keeps from the journal itself (ping_pong's
+        cycle), so the warm-up bars decided again (_replay), and any candle missed while it was down, are decided on
+        it rather than on a blank one (CR203-1). Most models keep none."""
+
     def _plan_resume(self) -> None:
         """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first
         exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
         self._resume = None
         self._resume_entry_ns = None  # the close of the candle the journal's last entry was decided on
-        if (self.runtime is None or self.runtime.backtest
-                or type(self).resume_leg is LongFlatStrategy.resume_leg):
+        self._missed_after = self._missed_exit = None
+        if self.runtime is None or self.runtime.backtest:
             return
         step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
         orders = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first
                   if not (o.get("signal") or {}).get("watched")]  # paper's watched stop is no venue order
+        if self._last_alive is not None:
+            # The last candle the journal shows decided: the previous process saw every close up to its last heartbeat,
+            # and an order sent after a close was decided on it. A first start missed nothing.
+            self._missed_after = max([_ns(self._last_alive)] + [_ns(o["ts"]) for o in orders[:1]])
         at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
         qty = self.runtime.book["qty"]
-        held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False} if qty else None
+        held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False,
+                "held": 1 if qty > 0 else -1} if qty else None
         if at is None:  # held with no entry in the journal's recent orders: that leg is on, from now
             self._resume = held
             return
@@ -1612,8 +1609,9 @@ class LongFlatStrategy(Strategy):
             return
         # Orders are stamped when sent, to the second, just after the close of the bar that decided them.
         self._resume_entry_ns = _ns(entry["ts"]) // step * step
-        self._resume = {"side": side, "bar": self._resume_entry_ns,
-                        "step": step, "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False}
+        self._resume = {"side": side, "bar": self._resume_entry_ns, "step": step,
+                        "lock_ns": _ns(lock["ts"]) if lock is not None else None, "on": False,
+                        "held": 1 if qty > 0 else -1 if qty < 0 else 0}
 
     def _replay(self, bar: Bar) -> None:
         """A warm-up bar after a restart, closed since the journal's last entry: decide on it as the run did, for
@@ -1636,9 +1634,29 @@ class LongFlatStrategy(Strategy):
             raw = self.target_weight(bar)
             if raw is None:
                 return
-            if min(max(float(raw), 0.0), 1.0, self._cap_pct()) == 0:
+            side = 1 if min(max(float(raw), 0.0), 1.0, self._cap_pct()) > 0 else 0
+            if not side:
                 self._exit_lock = False
         r["on"] = True
+        if (r["held"] and side != r["held"] and self._missed_exit is None and self._missed_after is not None
+                and bar.ts_event > self._missed_after):
+            self._missed_exit = int(bar.ts_event)  # R-I5-2: a missed candle said exit; the first trade sends it
+
+    def _exit_missed(self) -> None:
+        """R-I5-2: a candle that closed while the strategy was down said exit, and the position it held is still on:
+        exit once, now, at market. A stop or target the outage replay sent first has closed it already."""
+        t, self._missed_exit = self._missed_exit, None
+        if (t is None or self._entry_px is None or self._pending_exit is not None or self._busy()
+                or self._pos_side() == 0):
+            return
+        reason = f"Late exit, missed candle {_hhmm(t)}"
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "warning", "late_exit",
+                                     f"{reason}: the {_hhmm(t)} candle closed while the strategy was down and its "
+                                     f"signal was to exit, so the position is closed at market now (price "
+                                     f"{self._price():,.6g})")
+        self._sell_all("exit", reason, {"missed_candle": _utc(t).isoformat(), "close": self._last_close})
+        self._held_w = 0.0
 
     def _lock_exit_leg(self, lock) -> None:
         """A stop or target closed the position inside a candle: the side it closed waits for its signal to move
@@ -1717,12 +1735,6 @@ class LongFlatStrategy(Strategy):
         else:
             why = "the history store has none"
         level = "info" if bars else "warning"
-        if bars and self.runtime is not None and not self.runtime.backtest:
-            last = self.runtime.store.orders(self.runtime.name, limit=1)
-            self._late = late_bar(bars, time.time_ns(), bar_minutes(self._cfg.bar_type) * 60_000_000_000,
-                                  self._last_alive, last[0]["ts"] if last else None)
-            if self._late is not None:  # decided on with the first trade, once the position is back (_decide_late)
-                bars = bars[:-1]
         if bars:
             self.on_historical_bars(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
@@ -2134,19 +2146,6 @@ class LongFlatStrategy(Strategy):
             return
         self._replay_missed([bar], "while the market data feed was away", since=0)
 
-    def _decide_late(self) -> None:
-        """m13-E3: decide on the bar that closed while the strategy was down, once, if it is still the latest.
-        A bar since makes it warm-up only. Past LATE_DECISION_NS it only exits or reduces (_late_entry)."""
-        late, self._late = self._late, None
-        lag = self._now_ns() - late.ts_event
-        if lag >= bar_minutes(self._cfg.bar_type) * 60_000_000_000:
-            self.on_historical_bars([late])
-            return
-        self.runtime.store.event(self.runtime.name, "info", "late_bar",
-                                 f"Decided on the {_hhmm(late.ts_event)} candle {lag / 1e9:.0f} s after its close: it "
-                                 "closed while the strategy was down")
-        self.on_bar(late)
-
     def _now_ns(self) -> int:
         return self.clock.timestamp_ns()
 
@@ -2414,9 +2413,6 @@ class LongFlatStrategy(Strategy):
         return True
 
     def _on_bar(self, bar: Bar) -> None:
-        if self._late is not None and bar.ts_event > self._late.ts_event:  # a newer bar first: warm-up only
-            late, self._late = self._late, None
-            self.on_historical_bars([late])
         self._snap_settlements(bar.ts_event, bar.close.as_double())
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
@@ -4372,7 +4368,7 @@ class LongFlatStrategy(Strategy):
         if self._restore is not None:
             # The carried-over position isn't back at the simulated venue yet: nothing to mark or guard
             # against the journal until it is, but the strategy is alive.
-            self.runtime.store.heartbeat(self.runtime.name)
+            self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
             return
         try:
             if self._margin:
@@ -4392,7 +4388,7 @@ class LongFlatStrategy(Strategy):
                     and (self.runtime.wiped_out or self._liquidated is not None))
             if price <= 0 or (equity <= 0 and not underwater and not ruined):
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
-                self.runtime.store.heartbeat(self.runtime.name)
+                self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
                 if not self._mark_warned:
                     self._mark_warned = True
                     acct = self._account()
