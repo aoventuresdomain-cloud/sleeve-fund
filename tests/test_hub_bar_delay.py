@@ -125,3 +125,35 @@ def test_bars_built_from_trades_arriving_up_to_the_grace_late_match_the_venues_c
     built += m.close(T0 + 30 * MINUTE_NS + GRACE, GRACE)
     assert {b[1]: [str(x) for x in b[2:]] for b in built} == {c: [str(x) for x in b] for c, b in venue.items()}
     assert len(built) == 30 and pd.Series([b[1] for b in built]).is_monotonic_increasing
+
+
+def test_no_bar_reaches_a_strategy_before_its_minute_ends_plus_the_grace():
+    """Advisor 17:05 UK: decisions on a hub bar act at boundary + grace at the earliest. Bars leave the hub only
+    from _build, so every bar built at `now` must close no later than now - grace, however early, late or often the
+    build timer fires."""
+    rng = random.Random(11)
+    m = Minutes()
+    for ts in sorted(T0 + rng.randrange(0, 20 * MINUTE_NS) for _ in range(500)):
+        m.add(BTC, ts, Price(60000, 2), Quantity(1, 3))
+    now, closes = T0, []
+    while now < T0 + 22 * MINUTE_NS:
+        now += rng.choice([1, GRACE - 1, GRACE, MINUTE_NS - 1, MINUTE_NS, MINUTE_NS + 5 * GRACE])
+        for _, close, *_ in m.close(now, GRACE):
+            assert close + GRACE <= now
+            closes.append(close)
+    # Every minute up to the last one over by the grace is built, once each and in order (quiet ones flat).
+    assert closes == list(range(T0 + MINUTE_NS, (now - GRACE) // MINUTE_NS * MINUTE_NS + 1, MINUTE_NS))
+
+
+def test_the_parity_report_flags_an_instrument_whose_late_trades_pass_the_widen_the_grace_trigger():
+    """The Advisor's trigger: late trades above 0.05% of an instrument's trades over the window."""
+    from sleeve_fund.parity import LATE_ALERT_RATE, Parity, markdown
+
+    start = pd.Timestamp("2026-10-05 12:00", tz="UTC")
+    at = Parity("BTC/USDT", start, start + pd.Timedelta("24h"), late_trades=(5, 10_000))  # exactly 0.05%: no alert
+    over = Parity("ETH/USDT", start, start + pd.Timedelta("24h"), late_trades=(6, 10_000))
+    quiet = Parity("SOL/USDT", start, start + pd.Timedelta("24h"))  # the hub sent no counts
+    md = markdown("the venue", [at, over, quiet])
+    assert LATE_ALERT_RATE == 0.0005
+    assert "**ETH/USDT**: LATE TRADES ABOVE 0.05% (0.060%)" in md
+    assert "**BTC/USDT**: LATE" not in md and "**SOL/USDT**: LATE" not in md

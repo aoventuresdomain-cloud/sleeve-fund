@@ -18,6 +18,9 @@ import pandas as pd
 from sleeve_fund.history import OHLCV, HistoryStore
 
 VOLUME_TOLERANCE = 0.001  # relative: venues revise volume by tiny amounts as late trades settle
+# Late trades (reaching the hub after their minute was built) above this share of an instrument's trades over the
+# window: the Independent Quant Advisor's trigger to widen the hub's grace (P1-1-DELAY, 17:05 UK).
+LATE_ALERT_RATE = 0.0005
 
 
 @dataclass
@@ -122,6 +125,10 @@ def markdown(venue: str, results: list[Parity]) -> str:
         lines.append(f"| {p.pair} | {'match' if p.ok else 'DIFFERS'} | {p.both} | {len(p.venue_only)} | "
                      f"{len(p.store_only)} | {p.price_diffs} | {p.volume_diffs} | {p.worst_price:g} | {p.refilled} | "
                      f"{p.conflicts} | {late} |")
+    for p in results:
+        if p.late_trades is not None and p.late_trades[0] > LATE_ALERT_RATE * p.late_trades[1]:
+            lines += ["", (f"**{p.pair}**: LATE TRADES ABOVE {LATE_ALERT_RATE:.2%} "
+                           f"({p.late_trades[0] / p.late_trades[1]:.3%}): the trigger to widen the hub's grace.")]
     for p in results:
         if p.venue_only or p.store_only:
             lines += ["", f"**{p.pair}**: missing in store: {_runs(p.venue_only)}. Store only: {_runs(p.store_only)}."]
