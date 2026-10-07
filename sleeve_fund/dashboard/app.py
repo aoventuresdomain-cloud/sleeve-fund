@@ -1053,6 +1053,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such tear sheet")
         return path
 
+    from sleeve_fund.dashboard import results
+    results.register(app, page=page, sheet_path=_sheet_path, require_pm=require_pm)
+
     @app.get("/research/run")
     @app.get("/research/history")
     def research_form_reloaded(request: Request, venue: str = "", _: str = Depends(require_pm)):

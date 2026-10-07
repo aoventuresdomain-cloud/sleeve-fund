@@ -497,3 +497,67 @@ def test_decisions_that_do_not_line_up_with_this_candle_size_say_so(site, browse
     assert "show only on that interval" in page.inner_text(".pc-strat-note")
     assert page.get_attribute(".pc-canvas", "data-decisions") == '{"fills":0,"missed":0}'
     ctx.close()
+
+
+def _results_sheet(trades: int) -> str:
+    from sleeve_fund.research.guardrails import G1_RULES
+
+    verdict = "PASS" if trades >= 100 else "FAIL"
+    return f"""# Tear sheet: rsi_pullback
+
+Tested on `BTC/USDT` at 60-minute bars on `binance`
+
+Settings: balanced risk profile
+
+G1 rules: {G1_RULES}
+
+Dataset `store-real` · research period 01 Jan 2025 to 01 Oct 2026 · holdout: last 90 days (untouched) · fees: 0.05% taker
+
+## G1 checks
+
+**G1: {'PASS' if trades >= 100 else 'FAIL'}** (x)
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| G1 test: out-of-sample Sharpe clearly beats benchmark after fees | PASS | Sharpe 1.2 vs 0.4 |
+| Holds at nearby settings | PASS | all 4 neighbours of the chosen settings still beat buy and hold |
+| Break-even fee (shown, not a test) | INFO | about 0.12% per side |
+| Enough out-of-sample trades to judge | {verdict} | {trades} closed in the 5 walk-forward test windows, opened there too (bar: 100); 300 over the full research period |
+
+**Break-even fee:** about 0.12% per side.
+
+## Idea counter
+
+- 12 distinct variants of this idea tried so far, in studies, backtests and paper strategies (40 evaluations including walk-forward refits): the N its results are judged by.
+- 3 ideas and 20 distinct variants tested so far across the project (60 evaluations), shown for awareness. By family: trend 2
+- Deflated Sharpe: 97% probability the out-of-sample Sharpe is real rather than the best of many tries (higher is better; 95% is a strong bar).
+"""
+
+
+def test_results_page_shows_the_guardrail_figures_and_says_not_judged_under_100_trades(site, browser):
+    """P1-6: the Results page reads the study's tear sheet. A study under 100 out-of-sample trades says not judged."""
+    from sleeve_fund.dashboard import app as app_mod
+
+    (app_mod.TEARSHEETS / "rsi_pullback_20261007-100000.md").write_text(_results_sheet(84), encoding="utf-8")
+    (app_mod.TEARSHEETS / "rsi_pullback_20261007-110000.md").write_text(_results_sheet(150), encoding="utf-8")
+    page, errors = _open(browser, site + "/results/rsi_pullback_20261007-100000")
+    text = page.locator("main").inner_text()
+    assert "12 variants of this idea" in text and "Deflated Sharpe 97%" in text, text
+    assert "0.12%" in text and "Holds" in text
+    assert "84 of 100 needed" in text and "Not judged. 84 trades is fewer than the 100 needed" in text
+    assert "Not run yet" in page.locator("#ablation").inner_text()
+    assert "UK" in text and "UTC" not in text
+    # Dark mode readable: the page sits on the desk's dark panel, text well clear of it.
+    bg, fg = page.evaluate("""() => { const p = getComputedStyle(document.querySelector('#nearby'));
+        return [p.backgroundColor, getComputedStyle(document.querySelector('#nearby p')).color]; }""")
+    def lum(c):
+        parts = c[c.index("(") + 1:-1].split(",")[:3]
+        return sum(int(x) * w for x, w in zip(parts, (0.2126, 0.7152, 0.0722)))
+
+    assert lum(fg) - lum(bg) > 90, (bg, fg)
+    assert errors == []
+    page.context.close()
+    page, errors = _open(browser, site + "/results/rsi_pullback_20261007-110000")
+    text = page.locator("main").inner_text()
+    assert "150 of 100 needed" in text and "Not judged. 150" not in text and errors == []
+    page.context.close()
