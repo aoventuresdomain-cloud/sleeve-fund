@@ -334,3 +334,21 @@ def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_prin
     assert len([m for m in incidents if "filled while nothing may open" in m]) == 1, incidents
     assert not [o for o in _orders(store) if o["intent"] == "exit"], "the raced entry was closed, not kept"
     assert len(raced) == 1 and " 250 ms after nothing could open any more (stopped" in raced[0], raced
+
+
+def test_a_restart_holding_a_position_raises_no_incident_before_its_first_quote(tmp_path, store, monkeypatch):  # noqa: F811
+    """P1-SG21's hold from a process's first moment is not a block the position was held under: a plain restart with a
+    position, its first quote 20 s in (as on every deploy), keeps the model's restored stop and raises no incident
+    (CI e2e on c3793ea: a safety stop and an error incident on each restart)."""
+    from test_exposure_gate_xfails import _events, _restart_balance
+
+    one = Plan(t0=STD_T0, minutes=10, tag="r1", windows=[(M(STD_T0, 2), M(STD_T0, 10), 1)])
+    run(tmp_path, store, one, monkeypatch)
+    assert any(o["intent"] == "entry" for o in _orders(store)), "set-up: no position before the restart"
+    t1 = STD_T0 + pd.Timedelta(hours=1)
+    two = Plan(t0=t1, minutes=5, tag="r2", windows=[(t1 - pd.Timedelta(minutes=10), M(t1, 5), 1)],
+               holes=[(0, 20)], balance=_restart_balance(store))
+    run(tmp_path, store, two, monkeypatch)
+    after = [e["message"][:160] for e in _events(store, ("incident",)) if e["ts"] >= t1]
+    assert not after, after
+    assert not [o for o in _orders(store) if o["ts"] >= t1 and o["intent"] in ("exit", "pm_flatten")], "set-up: sold"

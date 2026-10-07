@@ -1185,8 +1185,8 @@ def test_a_raced_fill_under_a_flattening_block_is_sold_at_once(tmp_path, store, 
 
 
 @pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}",
-                                                             marks=[] if st != "portfolio_pause" else xf(CHOKE))
-                                                for st, r in U35_KEEP])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass (stopped, retired; SG15/SG21: stopped_reset_flatten_lapsed, stale_data, funding_missing)
+                                                             marks=[] if st in ("stopped", "retired") else xf(CHOKE))
+                                                for st, r in U35_KEEP])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass (stopped, retired)
 def test_a_raced_fill_under_a_block_that_does_not_flatten_is_kept_with_its_stop_and_one_incident(
         tmp_path, store, client, monkeypatch, status, reason_name):
     """P1-U35 [R113 Advisor 20:56 "fills racing cancel accepted and stopped, never unwatched"; Advisor 20:52 via the

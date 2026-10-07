@@ -1247,6 +1247,11 @@ class LongFlatStrategy(Strategy):
         # Held while nothing may open (halted, paused, stopped, liquidated: a fill that raced the block's cancel):
         # never left unwatched (P1-U35, Advisor 20:56), so it gets the safety stop and an incident too.
         orphan, held = self.runtime.entry_blocked()
+        if orphan and set(block_codes(held)) <= {"stale_data"}:
+            # Stale data alone is not a block a position was held under: a process holds entries from its first moment
+            # until its first trade or quote (P1-SG21), so every restart would otherwise swap the model's restored stop
+            # for a safety stop and raise an incident before the feed has had a second to arrive.
+            orphan = False
         if not (unrestored or self._exits_only or orphan):
             return
         self._safety_why = ("its stop couldn't be restored after the restart" if unrestored else
