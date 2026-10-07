@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sleeve_fund import accounts
+from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
@@ -202,17 +202,14 @@ class Supervisor:
         the paper margin terms) before it trades again."""
         for req in self.store.pending_resets():
             name = req["sleeve"]
-            s = self.store.sleeve(name)
             if liquidation_head(self.store, name) is not None:
-                # Asked before a liquidation that landed while it waited (its flatten parked on the liquidating
-                # tick): an ordinary reset would put the liquidation away unanswered (U27), so it is dropped and the
-                # halt stays until a reset after liquidation (QA P1-D24)
-                self.store.drop_reset(req, "dropped: the strategy was liquidated before the reset was carried out; "
-                                      "only a reset after liquidation clears that")
-                self.store.event(name, "warning", "reset_dropped",
-                                 f"The reset asked for ({req['reason']}) was not carried out: the strategy was "
-                                 "liquidated first, and only a reset after liquidation clears that")
+                # Asked for before the liquidation landed (its flatten maybe parked on the liquidating tick):
+                # carried out now, it would put the liquidation away unanswered (U27, QA P1-U33, P1-D24). It is
+                # closed unrun, its flatten and start taken back, and the halt waits for Reset after liquidation.
+                self.store.refuse_reset(req, liquidation.REFUSAL)
+                self._undo_reset_start(req)
                 continue
+            s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
             book = self.store.journal_book(name, s.starting_balance)
             qty = book["qty"]
@@ -240,6 +237,19 @@ class Supervisor:
                              f"{run}; starting again at {s.starting_balance:,.0f}")
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
+
+    def _undo_reset_start(self, req: dict) -> None:
+        """A reset refused after its first pass has already queued its flatten and, for a strategy the PM had
+        stopped, started it so the flatten could trade. Take both back: the flatten lapses, and the Stop the
+        PM chose stands (Code review on #167)."""
+        name = req["sleeve"]
+        for cmd in self.store.pending_commands(name):
+            if cmd["command"] == "flatten" and cmd["reason"].startswith("Reset strategy:"):
+                self.store.mark_applied(cmd["id"])
+                self.store.decide("system", "drop flatten", "lapsed: the reset it was for was not carried out "
+                                  f"({cmd['reason']})", name)
+        if not req["restart"] and self.store.sleeve(name).desired_state == "running":
+            self.store.set_desired_state(name, "stopped")
 
     def step(self) -> None:
         self.reset_pending()

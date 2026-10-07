@@ -1333,17 +1333,20 @@ class Store:
             return _rows(c.execute(select(resets_t).where(resets_t.c.done_at.is_(None)).order_by(resets_t.c.id)))
 
     def reset_runs(self) -> dict[str, datetime]:
-        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's. A dropped
-        reset (drop_reset) put nothing away."""
+        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's. A refused
+        reset (refuse_reset) put nothing away."""
         with self.engine.connect() as c:
             return {r.run: _aware(r.done_at) for r in c.execute(
                 select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
 
-    def drop_reset(self, request: dict, why: str) -> None:
-        """Close a reset request unapplied (no run put away), noted in the decision log."""
+    def refuse_reset(self, request: dict, why: str) -> None:
+        """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
         with self.engine.begin() as c:
-            c.execute(update(resets_t).where(resets_t.c.id == request["id"]).values(done_at=utcnow(), run=""))
-        self.decide("system", "drop reset", f"{why} ({request['reason']})", request["sleeve"])
+            closed = c.execute(update(resets_t).where(resets_t.c.id == request["id"], resets_t.c.done_at.is_(None))
+                               .values(done_at=utcnow(), run="")).rowcount
+        if closed:  # journaled once, whoever asks twice
+            self.decide("system", "reset_refused", f"Not reset: {why}", request["sleeve"])
+            self.event(request["sleeve"], "warning", "reset_refused", f"Reset not carried out: {why}")
 
     def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its

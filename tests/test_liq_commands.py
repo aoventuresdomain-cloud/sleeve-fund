@@ -1,6 +1,6 @@
 """PM commands around a liquidation (Head of QA, 6 Oct 23:46; HoE Done-when for the stop-safety PR).
 P1-D23: a liquidation order that hangs never blocks Stop, and the commands waiting behind it raise one incident.
-P1-D24: a reset asked before a liquidation that lands while it waits is dropped; the liquidation halt stays."""
+P1-D24: a reset asked before a liquidation that lands while it waits is not carried out; the liquidation halt stays."""
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -83,9 +83,10 @@ def test_a_reset_asked_before_a_liquidation_is_dropped_and_the_halt_stays(tmp_pa
     store.event("s1", "error", "risk_halt", halt)
     store.set_status("s1", "halted", halt)
     sv.reset_pending()
-    assert not store.pending_resets() and not store.reset_runs()  # dropped, nothing put away
+    assert not store.pending_resets() and not store.reset_runs()  # closed unrun, nothing put away
+    assert not store.pending_commands("s1")  # the reset's flatten is taken back (#167)
     s = store.sleeve("s1")
     assert (s.status, s.status_reason) == ("halted", halt) and liquidation_head(store, "s1") == halt
-    (ev,) = [e for e in store.events("s1", limit=100) if e["kind"] == "reset_dropped"]
-    assert "only a reset after liquidation clears that" in ev["message"]  # the supervisor's own words
-    assert [d for d in store.decisions("s1") if d["action"] == "drop reset"]
+    (ev,) = [e for e in store.events("s1", limit=100) if e["kind"] == "reset_refused"]
+    assert ev["message"].endswith("asks for an incident note")  # the one refusal's words (liquidation.REFUSAL)
+    assert [d for d in store.decisions("s1") if d["action"] == "reset_refused"]
