@@ -34,6 +34,7 @@ from sleeve_fund.risk import PortfolioProfile, trading_day
 
 MARK_STALE = timedelta(seconds=60)  # a book mark older than this blocks new entries (PM yes, 6 Oct)
 RESERVATION_TTL = timedelta(minutes=10)  # past this, a reservation is checked for an orphan (sweep)
+CANCEL_CONFIRM = timedelta(seconds=60)  # a sweep's cancel unconfirmed this long is sent again, with an alert
 NEVER = datetime(1970, 1, 1, tzinfo=timezone.utc)  # the "mark" of a book never marked, for the stale alert
 RELEASE_REASONS = ("fill", "reject", "cancel", "ttl")  # the DA's release_reason values
 
@@ -75,6 +76,7 @@ class Reservation:
     at: datetime
     qty: Decimal | None = None
     order_id: str | None = None
+    cancel_sent: datetime | None = None  # when the sweep last asked for its order's cancel
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class Ledger(Protocol):
     def reservations(self) -> list[Reservation]: ...
     def reserve(self, strategy: str, holding: Holding, at: datetime, qty: Decimal | None = None) -> int: ...
     def attach_order(self, reservation_id: int, order_id: str) -> None: ...
+    def cancel_sent(self, reservation_id: int, at: datetime) -> None: ...
     def reduce(self, reservation_id: int, filled_qty: Decimal) -> None: ...
     def release(self, reservation_id: int, reason: str) -> None: ...
     def record(self, strategy: str, at: datetime, intent: Intent, decision: Decision, version: int) -> int: ...
@@ -143,6 +146,11 @@ class MemoryLedger:
         r = self.reserved.get(reservation_id)
         if r is not None:
             self.reserved[reservation_id] = replace(r, order_id=order_id)
+
+    def cancel_sent(self, reservation_id, at):
+        r = self.reserved.get(reservation_id)
+        if r is not None:
+            self.reserved[reservation_id] = replace(r, cancel_sent=at)
 
     def reduce(self, reservation_id, filled_qty):
         r = self.reserved.get(reservation_id)
@@ -295,21 +303,28 @@ def apply_flow(ledger: Ledger, amount) -> None:
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None],
           ttl: timedelta = RESERVATION_TTL) -> list[Reservation]:
-    """Orphans only (Advisor MUST FIX, 17:20 UK): a reservation lives as long as its order. Past `ttl`, one whose
-    order is still live has that order cancelled and keeps its reservation until the cancel (or a fill that beat it)
-    releases it, so an order never rests or fills without its reservation. One with no order, or whose order is gone,
-    is released as "ttl" with an alert: its process died before releasing it. Returns those released."""
+    """Orphans only (Advisor MUST FIX, 17:20 UK; refined 20:25 UK): a reservation lives as long as its order. Past
+    `ttl`, one whose order is still live has that order cancelled and keeps its reservation until the cancel is
+    confirmed: the order's own cancel releases it, or, if the order filled first, its fill converts the reservation
+    into the position once (reduce, in the same transaction as the fill). An unconfirmed cancel is never released
+    blind: every CANCEL_CONFIRM it is sent again with an alert, the reservation kept. A reservation with no order, or
+    whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those."""
     gone = []
     with ledger.lock():
         for r in ledger.reservations():
             if now - r.at <= ttl:
                 continue
             if r.order_id is not None and is_live(r.order_id):
+                if r.cancel_sent is not None and now - r.cancel_sent <= CANCEL_CONFIRM:
+                    continue  # asked; waiting for the venue's answer
+                kind = "reservation_order_cancelled" if r.cancel_sent is None else "reservation_cancel_unconfirmed"
+                ledger.cancel_sent(r.id, now)
                 try:
                     cancel(r.order_id)
-                    ledger.alert("reservation_order_cancelled",
-                                 f"{r.strategy}: order {r.order_id} rested past {ttl} on its portfolio reservation; "
-                                 "cancelled, and the reservation holds until the cancel lands", now)
+                    what = ("rested past its reservation's TTL; cancel sent" if r.cancel_sent is None else
+                            f"cancel not confirmed after {CANCEL_CONFIRM.seconds} s; sent again")
+                    ledger.alert(kind, f"{r.strategy}: order {r.order_id} {what}, and the reservation holds until "
+                                       "the cancel or a fill lands", now)
                 except Exception as e:  # noqa: BLE001 - the reservation stays while its order may still fill
                     ledger.alert("reservation_cancel_failed", f"{r.strategy}: couldn't cancel order {r.order_id} "
                                                               f"({type(e).__name__}: {e}); its reservation stays", now)

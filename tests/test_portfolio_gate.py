@@ -10,6 +10,7 @@ import pytest
 
 from sleeve_fund.portfolio import Holding, Intent
 from sleeve_fund.portfolio.gate import (
+    CANCEL_CONFIRM,
     MARK_STALE,
     RESERVATION_TTL,
     MemoryLedger,
@@ -206,3 +207,48 @@ def test_a_deposit_is_not_a_gain_and_a_withdrawal_not_a_loss():
     apply_flow(ledger, D(-1_000))
     assert mark_book(ledger, D(19_000), T0 + timedelta(seconds=5), PORTFOLIO) is None  # not a 5% day loss
     assert ledger.state().hwm == D(19_000) and ledger.state().day_start_equity == D(19_000)
+
+
+def test_g11_an_unconfirmed_cancel_is_sent_again_and_never_released_blind():
+    """Advisor MUST FIX (20:25 UK) (b): with no answer to the cancel, the reservation stays and an alert is raised
+    every CANCEL_CONFIRM; it is never released while the order is live."""
+    ledger = _marked()
+    a = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    ledger.attach_order(a.reservation, "O-1")
+    cancelled = []
+    late = T0 + RESERVATION_TTL + timedelta(seconds=1)
+    assert sweep(ledger, late, lambda o: True, cancelled.append) == []
+    assert sweep(ledger, late + CANCEL_CONFIRM, lambda o: True, cancelled.append) == []  # waiting: nothing more
+    assert cancelled == ["O-1"] and [k for k, *_ in ledger.alerts] == ["reservation_order_cancelled"]
+    for n in (1, 2, 3):
+        assert sweep(ledger, late + n * (CANCEL_CONFIRM + timedelta(seconds=1)), lambda o: True,
+                     cancelled.append) == []
+    assert cancelled == ["O-1"] * 4 and a.reservation in ledger.reserved and not ledger.released
+    assert [k for k, *_ in ledger.alerts][1:] == ["reservation_cancel_unconfirmed"] * 3
+
+
+def test_g11_a_cancel_answered_already_filled_converts_the_reservation_once():
+    """Advisor MUST FIX (20:25 UK) (a): the order filled before the cancel reached it. The fill adds the position and
+    reduces the reservation away in one transaction, so the book counts it exactly once, with no gap; the cancel's
+    own release afterwards is a no-op."""
+    ledger = _marked()
+    a = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    ledger.attach_order(a.reservation, "O-1")
+    reserved = ledger.reserved[a.reservation].holding
+    gross = lambda: sum(abs(h.notional) for h in ledger.held) + sum(
+        abs(r.holding.notional) for r in ledger.reservations())
+    before = gross()
+
+    def already_filled(order_id):
+        raise RuntimeError("order already filled")
+
+    late = T0 + RESERVATION_TTL + timedelta(seconds=1)
+    assert sweep(ledger, late, lambda o: True, already_filled) == []
+    assert a.reservation in ledger.reserved and gross() == before  # no gap while the fill is on its way
+    with ledger.lock():  # the fill: position in, reservation out, together
+        ledger.held.append(reserved)
+        ledger.reduce(a.reservation, D("0.1"))
+    assert gross() == before == D(6000)  # once, not twice
+    ledger.release(a.reservation, "cancel")  # the cancel's late answer
+    assert ledger.released == [(a.reservation, "fill")]
+    assert sweep(ledger, late + 2 * CANCEL_CONFIRM, _nothing_live, _no_cancel) == []
