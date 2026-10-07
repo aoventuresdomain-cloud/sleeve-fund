@@ -9,6 +9,7 @@ import pytest
 from sleeve_fund.open_risk import position_risk
 from sleeve_fund.portfolio import Position, holding_for
 from sleeve_fund.portfolio.book import backtest_book, book_equity
+from sleeve_fund.portfolio.holding import ALIASES
 
 
 def _long(qty="2", stop=None, lev=5.0, instrument="BTC/USDT"):
@@ -68,3 +69,21 @@ def test_the_book_is_the_whole_fund_and_a_backtests_is_over_its_share():
     assert book == D("10000") and "others flat" in label
     with pytest.raises(TypeError):
         book_equity([3_000.0], D("4000"))
+
+
+def test_the_alias_map_matches_the_research_one():
+    from sleeve_fund.research.holdout import _ALIASES
+
+    assert ALIASES == _ALIASES
+
+
+def test_importing_the_gate_core_loads_no_engine_or_store():
+    """The P2-2 core stays pure like the sizing core (Q199-1): importing it loads no engine, database or paper code."""
+    import subprocess
+    import sys
+
+    code = ("import sys, sleeve_fund.portfolio, sleeve_fund.portfolio.gate, sleeve_fund.portfolio.book; "
+            "print([m for m in sys.modules if m.startswith(('nautilus', 'sqlalchemy', 'sleeve_fund.store', "
+            "'sleeve_fund.strategies', 'sleeve_fund.paper', 'sleeve_fund.research'))])")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]"

@@ -14,14 +14,17 @@ from decimal import Decimal
 from sleeve_fund.money import money
 from sleeve_fund.open_risk import position_risk
 from sleeve_fund.portfolio.limits import Holding
-from sleeve_fund.research.holdout import _ALIASES, underlying_of
+
+# A venue's own code for an asset, mapped to the common one: the same map as research.holdout's, kept here so the core
+# imports nothing heavy (Q199-1); a test keeps the two equal.
+ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 
 def underlying(instrument: str) -> str:
     """The underlying an instrument's net counts in, across venues and contract types: the base of BASE/QUOTE, with
     a venue's own code for it mapped to the common one."""
-    base = underlying_of(instrument)
-    return _ALIASES.get(base, base)
+    base = instrument.split("/")[0].strip().upper()
+    return ALIASES.get(base, base)
 
 
 @dataclass(frozen=True)
