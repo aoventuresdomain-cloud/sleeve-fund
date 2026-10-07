@@ -941,7 +941,7 @@ class FirstTouch(Node):
         st["inconsistent"] += t.unknown == "inconsistent"
         st["incomplete"] += bool(t.absent)
         if t.absent and env.journal is not None:  # paper: every such decision, for fills-vs-model (R2-INC)
-            gone = ", ".join(datetime.fromtimestamp(ts / 1e9, tz=timezone.utc).strftime("%H:%M") for ts in t.absent)
+            gone = ", ".join(_iso(ts) for ts in t.absent)  # the full time: 23:30 in a candle to 00:00 (R2INC-F1)
             env.journal("first_touch_incomplete", f"{self.path}: decided on incomplete minutes for the candle to "
                         f"{_iso(env.ts)}: {len(t.absent)} of {env.minutes_due} minutes missing ({gone}); taken as "
                         f"{str(self.result).lower()}")

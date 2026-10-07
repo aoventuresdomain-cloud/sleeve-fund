@@ -293,7 +293,7 @@ def test_paper_journals_every_decision_on_incomplete_minutes_and_a_backtest_none
         node.tick(env)
     assert [k for k, _ in said] == ["first_touch_incomplete"] * 2
     assert said[0][1] == ("long.entry: decided on incomplete minutes for the candle to 1970-01-01T00:05:00+00:00: "
-                          "1 of 5 minutes missing (00:02); taken as true")
+                          "1 of 5 minutes missing (1970-01-01T00:02:00+00:00); taken as true")
 
     events = []
     runtime = SimpleNamespace(name="s", backtest=False, now=lambda: None,
