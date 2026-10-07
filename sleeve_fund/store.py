@@ -109,6 +109,10 @@ fills_t = Table(
     Column("order_id", String(64), nullable=False),
     Column("trade_id", String(64), nullable=False),
     Index("fills_sleeve_ts", "sleeve", "ts"),
+    # DA-2: a fill is booked once. Keyed with its order: the paper venue's trade ids are deterministic per process
+    # (Nautilus sandbox), so after a restart a new order's fill can carry an earlier trade id; the client order id
+    # is unique (orders.order_id), so (order, trade) is not.
+    Index("fills_sleeve_order_trade", "sleeve", "order_id", "trade_id", unique=True),
 )
 
 # A perpetual's funding, exchanged at each funding time while a position is held (sleeve_fund.markets):
@@ -842,10 +846,46 @@ class Store:
                                               qty=qty, price=price, benchmark=benchmark))
 
     def record_fill(self, sleeve: str, *, side: str, qty: float, price: float, fee: float,
-                    order_id: str, trade_id: str, ts: datetime | None = None) -> None:
-        with self.engine.begin() as c:
-            c.execute(insert(fills_t).values(sleeve=sleeve, ts=ts or utcnow(), side=side, qty=qty, price=price,
-                                             fee=fee, order_id=order_id, trade_id=trade_id))
+                    order_id: str, trade_id: str, ts: datetime | None = None) -> str:
+        """Book a fill once (DA-2). Returns "new"; "same" for the same fill again (a replay after a reconnect or a
+        restart: nothing changes); or "differs" when a fill with this (strategy, order, trade) is already booked
+        with other values: the booked one is kept, nothing else is written, and an error event (alerts inbox) asks a
+        person to check it."""
+        booked = self._book(sleeve, side, qty, price, fee, order_id, trade_id, ts, with_order=False)
+        if booked == "differs":
+            self.event(sleeve, "error", "fill_conflict", _conflict_words(order_id, trade_id, side, qty, price, fee), ts=ts)
+        return booked
+
+    def book_fill(self, sleeve: str, *, side: str, qty: float, price: float, fee: float, order_id: str,
+                  trade_id: str, ts: datetime | None = None) -> str:
+        """A fill as the runtime books it (DA-2): the fill row and its order's filled quantity, price and fee in ONE
+        transaction, so a replayed fill can never move the order twice, and the fill event. The same fill again
+        changes nothing; a different fill under a booked (strategy, order, trade) is kept out and raised as an
+        error event (alerts inbox) for a person to check. Returns as record_fill."""
+        booked = self._book(sleeve, side, qty, price, fee, order_id, trade_id, ts, with_order=True)
+        if booked == "new":
+            self.event(sleeve, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
+        elif booked == "differs":
+            self.event(sleeve, "error", "fill_conflict", _conflict_words(order_id, trade_id, side, qty, price, fee), ts=ts)
+        return booked
+
+    def _book(self, sleeve, side, qty, price, fee, order_id, trade_id, ts, with_order: bool) -> str:
+        key = (fills_t.c.sleeve == sleeve) & (fills_t.c.order_id == order_id) & (fills_t.c.trade_id == trade_id)
+        for _ in range(2):  # a concurrent writer of the same fill: the second pass reads its row
+            try:
+                with self.engine.begin() as c:
+                    row = c.execute(select(fills_t.c.side, fills_t.c.qty, fills_t.c.price, fills_t.c.fee)
+                                    .where(key)).first()
+                    if row is not None:
+                        return "same" if _same_fill(row, side, qty, price, fee) else "differs"
+                    c.execute(insert(fills_t).values(sleeve=sleeve, ts=ts or utcnow(), side=side, qty=qty,
+                                                     price=price, fee=fee, order_id=order_id, trade_id=trade_id))
+                    if with_order:
+                        self._update_order(c, order_id, fill_qty=qty, fill_px=price, fee=fee)
+                    return "new"
+            except IntegrityError:
+                continue
+        raise RuntimeError(f"fill {order_id}/{trade_id} of {sleeve} could not be booked or read")
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
                      signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
@@ -900,25 +940,33 @@ class Store:
         if intent is not None and intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         with self.engine.begin() as c:
-            row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
-            if row is None:
-                return
-            values = {"updated_at": utcnow()}
-            if qty is not None:  # resized at the venue (a backtest's resting stop growing with its entry)
-                values["qty"] = qty
-            if fill_qty:
-                filled = exact_sum(row.filled_qty, fill_qty)
-                values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
-                values["filled_qty"] = filled
-                values["fee"] = row.fee + fee
-                values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
-            if status is not None and row.status not in FINISHED_ORDER_STATUSES:
-                values["status"] = status  # a late "accepted" never reopens a finished order
-            if message:
-                values["message"] = message
-            if intent is not None:
-                values["intent"] = intent
-            c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
+            self._update_order(c, order_id, status=status, message=message, fill_qty=fill_qty, fill_px=fill_px,
+                               fee=fee, qty=qty, intent=intent)
+
+    @staticmethod
+    def _update_order(c, order_id: str, *, status: str | None = None, message: str | None = None,
+                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
+                      qty: float | None = None, intent: str | None = None) -> None:
+        """update_order's change, inside the caller's transaction."""
+        row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
+        if row is None:
+            return
+        values = {"updated_at": utcnow()}
+        if qty is not None:  # resized at the venue (a backtest's resting stop growing with its entry)
+            values["qty"] = qty
+        if fill_qty:
+            filled = exact_sum(row.filled_qty, fill_qty)
+            values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
+            values["filled_qty"] = filled
+            values["fee"] = row.fee + fee
+            values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
+        if status is not None and row.status not in FINISHED_ORDER_STATUSES:
+            values["status"] = status  # a late "accepted" never reopens a finished order
+        if message:
+            values["message"] = message
+        if intent is not None:
+            values["intent"] = intent
+        c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
@@ -2123,3 +2171,15 @@ class Store:
             q = q.where(decisions_t.c.ts < until)
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(decisions_t.c.id.desc()).limit(limit)))
+
+
+def _same_fill(row, side: str, qty: float, price: float, fee: float) -> bool:
+    """The booked fill and the offered one are the same fill: side equal, figures equal to 12 significant figures."""
+    return row.side == side and all(math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=1e-15)
+                                    for a, b in ((row.qty, qty), (row.price, price), (row.fee, fee)))
+
+
+def _conflict_words(order_id: str, trade_id: str, side: str, qty: float, price: float, fee: float) -> str:
+    return (f"A fill for order {order_id} (trade {trade_id}) arrived again with different figures: {side} {qty:g} @ "
+            f"{price:,.2f}, fee {fee:,.2f}. The booked fill is kept and nothing moved; check the venue's record before "
+            "trusting this strategy's book")
