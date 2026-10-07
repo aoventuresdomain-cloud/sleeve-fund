@@ -21,7 +21,7 @@
   <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
   <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ h.margin|money }}</div></div>
-  <div title="{{ open_risk_hint(h) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(h) }}">{{ open_risk_text(h) }}</div>{% if open_risk_room(h, book_equity)|trim %}<div class="s">{{ open_risk_room(h, book_equity) }}</div>{% endif %}{% if h.spot %}<div class="s{{ ' warn' if h.spot_left_out }}">{{ spot_risk_text(h) }}</div>{% endif %}</div>
+  <div title="{{ open_risk_hint(h) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(h) }}">{{ open_risk_text(h) }}</div>{# Headroom is the whole book's: filtered to one strategy, its risk alone would overstate it (CR200-2). #}{% if not sleeve and open_risk_room(h, book_equity)|trim %}<div class="s">{{ open_risk_room(h, book_equity) }}</div>{% endif %}{% if h.spot %}<div class="s{{ ' warn' if h.spot_left_out }}">{{ spot_risk_text(h) }}</div>{% endif %}</div>
   <div><div class="k">Closed trades</div><div class="v">{{ st.trades }}</div><div class="s">{{ st.wins }} won, {{ st.losses }} lost</div></div>
   <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>
   <div><div class="k">Realised P&amp;L {{ help('realised') }}</div><div class="v">{{ money_signed(st.pnl) }}</div><div class="s">after {{ st.fees|money }} fees</div></div>

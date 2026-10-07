@@ -223,3 +223,12 @@ def test_a_book_over_the_limit_reads_red(client):
     for url in ("/risk", "/trades"):
         assert '<span class="loss">over the 5% limit by 5,500.00</span> · 60.0% of book' in c.get(url, auth=AUTH).text, url
     assert "over the 5% limit by 5,500.00 · 60.0% of book" in c.get("/", auth=AUTH).text  # the KPI's hover
+
+
+def test_trades_filtered_to_one_strategy_shows_no_headroom(client):
+    """CR200-2: headroom is the whole book's, so a page filtered to one strategy doesn't show it."""
+    c, store = client
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)
+    _hold(store, "b", 0.1)
+    assert "headroom to the 5% limit" in c.get("/trades", auth=AUTH).text
+    assert "headroom to the 5% limit" not in c.get("/trades?sleeve=a", auth=AUTH).text
