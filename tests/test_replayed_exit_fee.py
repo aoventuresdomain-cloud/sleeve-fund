@@ -9,7 +9,7 @@ import test_hub_146_qa as qa
 from test_hub_146_qa import _probe  # noqa: F401 - registers the probe strategy
 
 
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", [pytest.param("reconnect", marks=pytest.mark.no_open_risk_limit), "restart"])
 @pytest.mark.parametrize("setup", [0, 2], ids=["perp-2x-long", "perp-3x-short"])
 def test_a_replayed_liquidation_leaves_the_equity_the_journal_does(path, setup):
     _, perp, profile, side = qa.LIQ_SETUPS[setup]
