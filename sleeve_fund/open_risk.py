@@ -21,7 +21,6 @@ from decimal import Decimal
 
 import pandas as pd
 
-from sleeve_fund.money import scale
 
 LIMIT = 0.05  # of the book
 STOPLESS_FLOOR = 0.10  # the smallest move a position with no placed stop counts at
@@ -43,8 +42,9 @@ def position_risk(qty, mark, stop=None, atr_pct: float | None = None):
     # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9).
     if atr_pct is None or not math.isfinite(atr_pct):
         raise ValueError("the daily ATR isn't known, so a position with no stop can't be measured")
-    if exact:
-        return scale(abs(qty) * mark, stopless_move(atr_pct))
+    if exact:  # the move from its terms exactly, so 3 x 5% is 15%, not 0.15000000000000002
+        move = max(Decimal(repr(STOPLESS_FLOOR)), Decimal(repr(STOPLESS_ATRS)) * Decimal(repr(float(atr_pct))))
+        return abs(qty) * mark * move
     return abs(qty) * mark * stopless_move(atr_pct)
 
 
