@@ -132,7 +132,7 @@ insurance_t = Table(
     Index("insurance_sleeve_ts", "sleeve", "ts"),
 )
 
-# The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
+# The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
 # failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
 mirror_t = Table(
     "demo_mirror",
@@ -476,12 +476,31 @@ TRIAL_STATUSES = ("ok", "failed")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
+# The event a PM's "Reset after liquidation" journals (item RAL): the one thing that ends a liquidation halt.
+# The engine (#155) and the dashboard both read it from here.
+LIQUIDATION_RESET = "liquidation_reset"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
-ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
+# "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
+ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
+                  "triggered")
+FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
+
+
+def _check_rebook(order_id: str, row) -> None:
+    """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
+    if row is None:
+        raise ValueError(f"no order {order_id!r} to re-book")
+    if row["intent"] != "stop_loss" or not row["filled_qty"]:
+        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled stop-loss can "
+                         f"(it is {row['intent']}, {row['filled_qty']:g} filled)")
+
+
+def _rebook_words(order_id: str, reason: str) -> str:
+    return f"Order {order_id} re-booked from stop_loss to liquidation: {reason}"
 
 
 def exact_sum(a: float, b: float) -> float:
@@ -491,6 +510,16 @@ def exact_sum(a: float, b: float) -> float:
 
 
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
+
+
+# A position worth less than this (in the quote currency) is below every venue's smallest order, so no flatten can
+# close it: a reset treats it as flat (QA P1-D6). Venues' minimums are a few units (5 on the perpetuals).
+DUST_NOTIONAL = 1.0
+
+
+def is_dust(book: dict) -> bool:
+    """A journal book (replay_book) holding a position too small for any venue to take an order for."""
+    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0.0) < DUST_NOTIONAL
 
 
 def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
@@ -503,8 +532,9 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     fill that crosses through flat opens the remainder at its own price. The position is summed in
     Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
-    goes negative; if it does, the negative stays visible so reconciliation catches it."""
-    cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    goes negative; if it does, the negative stays visible so reconciliation catches it. entry_fees: the fees paid
+    to open the position still held, pro-rated to what is left of it after a reduction."""
+    cash, qty, entry, n, fees = float(starting_balance), Decimal(0), None, 0, 0.0
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
@@ -521,14 +551,18 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
             new = Decimal(0)
         if new == 0:
             legs = 0
-            entry = None
+            entry, fees = None, 0.0
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
+            fees += float(f["fee"])
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
+            fees = float(f["fee"]) * float(abs(new)) / float(q)
+        else:  # reducing
+            fees *= float(abs(new)) / float(abs(qty))
         qty = new
     return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding), "insurance": float(insurance)}
+            "funding": float(funding), "insurance": float(insurance), "entry_fees": fees}
 
 
 def is_backtest(name: str | None) -> bool:
@@ -835,7 +869,7 @@ class Store:
                 values["filled_qty"] = filled
                 values["fee"] = row.fee + fee
                 values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
-            if status is not None and row.status not in ("filled", "canceled", "rejected", "denied", "expired"):
+            if status is not None and row.status not in FINISHED_ORDER_STATUSES:
                 values["status"] = status  # a late "accepted" never reopens a finished order
             if message:
                 values["message"] = message
@@ -843,13 +877,43 @@ class Store:
                 values["intent"] = intent
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
+        liquidation it was. The only intent change the journal allows (Data Architect): stop_loss to liquidation, on
+        an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
+            _check_rebook(order_id, row and row._mapping)
+            c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                      .values(intent="liquidation", reason=reason, signal=signal, updated_at=utcnow()))
+        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+    def merge_order_signal(self, order_id: str, values: dict) -> None:
+        """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
+        are ignored, as in update_order."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id).with_for_update()).first()
+            if row is not None:
+                c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                          .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))
+
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         if statuses:
             q = q.where(orders_t.c.status.in_(statuses))
+        if intents:
+            q = q.where(orders_t.c.intent.in_(intents))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
+
+    def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
+        """A sleeve's newest order with one of these intents, or None."""
+        q = (select(orders_t).where(orders_t.c.sleeve == sleeve, orders_t.c.intent.in_(intents))
+             .order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
@@ -1185,10 +1249,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def funding_total(self, sleeve: str) -> float:
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
+        q = select(func.coalesce(func.sum(funding_t.c.amount), 0.0)).where(funding_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(funding_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
-                                   .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
@@ -1199,10 +1266,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def insurance_total(self, sleeve: str) -> float:
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
+        q = select(func.coalesce(func.sum(insurance_t.c.amount), 0.0)).where(insurance_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(insurance_t.c.amount), 0.0))
-                                   .where(insurance_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -1249,9 +1319,22 @@ class Store:
             rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
                                                     restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
             # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
-            if s.status in ("paused", "halted"):
-                c.execute(insert(reset_holds_t).values(reset_id=rid, status=s.status, status_reason=s.status_reason or "",
-                                                       paused_until=s.paused_until))
+            hold = ({"status": s.status, "status_reason": s.status_reason or "", "paused_until": s.paused_until}
+                    if s.status in ("paused", "halted") else None)
+            if s.status != "halted":  # never downgrade a halt, as the paper process doesn't
+                # P1-KR-2: a PM pause or flatten (the kill switch) pressed just before the reset, which the paper
+                # process has not applied yet, is kept as the pause it would have set (paper.runtime): the reset
+                # puts its pending commands away with the old run. The system's own flattens (a clean slate's) aren't.
+                system = {r for (r,) in c.execute(select(decisions_t.c.reason).where(
+                    decisions_t.c.sleeve == sleeve, decisions_t.c.actor == "system"))}
+                asked = [r for r in c.execute(select(commands_t.c.command, commands_t.c.reason).where(
+                    commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                    commands_t.c.command.in_(("pause", "flatten"))).order_by(commands_t.c.id)) if r.reason not in system]
+                if asked:
+                    words = "flattened by PM" if asked[-1].command == "flatten" else "paused by PM"
+                    hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
+            if hold:
+                c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
         self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
@@ -1263,23 +1346,41 @@ class Store:
             return _rows(c.execute(select(resets_t).where(resets_t.c.done_at.is_(None)).order_by(resets_t.c.id)))
 
     def reset_runs(self) -> dict[str, datetime]:
-        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's."""
+        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's. A refused
+        reset (refuse_reset) put nothing away."""
         with self.engine.connect() as c:
-            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
+            return {r.run: _aware(r.done_at) for r in c.execute(
+                select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
 
-    def split_run(self, request: dict, now: datetime | None = None) -> str:
+    def refuse_reset(self, request: dict, why: str) -> None:
+        """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
+        with self.engine.begin() as c:
+            closed = c.execute(update(resets_t).where(resets_t.c.id == request["id"], resets_t.c.done_at.is_(None))
+                               .values(done_at=utcnow(), run="")).rowcount
+        if closed:  # journaled once, whoever asks twice
+            self.decide("system", "reset_refused", f"Not reset: {why}", request["sleeve"])
+            self.event(request["sleeve"], "warning", "reset_refused", f"Reset not carried out: {why}")
+
+    def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
         journal (fills, marks, orders, events, decisions, mirror record) moves to the run, archived, and the
         strategy keeps its name and settings with an empty journal, so it replays to its starting capital.
-        Nothing is deleted. Returns the run's name."""
+        Nothing is deleted. Returns the run's name. dust_ok: a position too small for any order (is_dust) goes with
+        the run."""
         name, now = request["sleeve"], now or utcnow()
         s = self.sleeve(name)
-        if abs(self.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+        book = self.journal_book(name, s.starting_balance)
+        if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
                  insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
+            # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
+            # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
+            locked = c.execute(select(resets_t.c.restart).where(resets_t.c.id == request["id"]).with_for_update()).first()
+            if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
+                request["restart"] = locked.restart
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
@@ -1291,6 +1392,8 @@ class Store:
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
@@ -1368,10 +1471,13 @@ class Store:
         with self.engine.connect() as c:
             return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
 
-    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
-        """One sleeve's events of these kinds newer than an id, oldest first."""
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0,
+                            since: datetime | None = None) -> list[dict]:
+        """One sleeve's events of these kinds newer than an id (and at or after `since`), oldest first."""
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds), events_t.c.id > after_id)
              .order_by(events_t.c.id))
+        if since is not None:
+            q = q.where(events_t.c.ts >= since)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
@@ -1399,9 +1505,12 @@ class Store:
         with self.engine.connect() as c:
             return {r["entry_order"]: r for r in _rows(c.execute(q))}
 
-    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
-        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
-             .order_by(events_t.c.id.desc()).limit(1))
+    def last_event(self, sleeve: str, kinds: tuple[str, ...], before: datetime | None = None) -> dict | None:
+        """The newest event of these kinds, or the newest at or before `before`."""
+        q = select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
+        if before is not None:
+            q = q.where(events_t.c.ts <= before)
+        q = q.order_by(events_t.c.id.desc()).limit(1)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
@@ -1647,7 +1756,9 @@ class Store:
 
     # --- PM commands and decisions ----------------------------------------------
 
-    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:
+    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True) -> None:
+        """holds_through_reset: a pause or flatten asked for while a reset is under way is kept on the fresh run, as
+        one in force before the reset is (m13-U5); the reset's own flatten passes False."""
         if command not in COMMANDS:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
@@ -1658,7 +1769,36 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
+            if holds_through_reset and command in ("pause", "flatten"):
+                self._hold_on_reset(c, sleeve, command, reason)
         self.decide(actor, command, reason, sleeve)
+
+    def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
+        """A PM control on a strategy whose reset is under way, kept on the fresh run without a command for its
+        process (Advisor, 7 Oct, P1-KR-1/3): a Pause or Flatten (the kill switch) whose sale the reset's own flatten
+        already makes becomes the reset's hold; a Stop keeps the fresh run stopped. False when no reset is open."""
+        with self.engine.begin() as c:
+            return self._hold_on_reset(c, sleeve, command, reason)
+
+    def _hold_on_reset(self, c, sleeve: str, command: str, reason: str) -> bool:
+        # Locked as split_run locks it, so a press while the reset completes waits for it: it then finds the reset
+        # done and acts on the fresh run as on any other, never on a run already put away.
+        req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))
+                        .with_for_update()).first()
+        if req is None:
+            return False
+        if command == "stop":
+            c.execute(update(resets_t).where(resets_t.c.id == req.id).values(restart=0))
+            return True
+        held = c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
+        if held != "halted":  # never downgrade a halt, as the paper process doesn't
+            # The reset drops pending commands and starts the run afresh, so record the pause the paper process
+            # would have set (paper.runtime) as the hold split_run carries over.
+            words = "flattened by PM" if command == "flatten" else "paused by PM"
+            c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
+            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
+                                                   status_reason=f"{words}: {reason.strip()}", paused_until=None))
+        return True
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:
         """Set one parameter a strategy has never had, without a restart (True if set). A key it already has,
@@ -1714,9 +1854,10 @@ class Store:
         with self.engine.begin() as c:
             c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
 
-    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None) -> None:
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
+               ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
-            c.execute(insert(decisions_t).values(ts=utcnow(), actor=actor, action=action, sleeve=sleeve,
+            c.execute(insert(decisions_t).values(ts=ts or utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
 
     def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,

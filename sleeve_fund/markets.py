@@ -19,6 +19,10 @@ SPOT = "spot"
 PERP = "perp"
 PERP_VENUE_FEES = "perp-venue-fees"
 MARKETS = (SPOT, PERP, PERP_VENUE_FEES)
+# Research only, never offered as a choice: the simulated perp with funding at FUNDING_STRESS_RATE, the study's
+# funding-stress line (Advisor, 7 Oct 2026: the 0.01% baseline is light in strong uptrends).
+PERP_FUNDING_STRESS = "perp-funding-stress"
+FUNDING_STRESS_RATE = 0.0003
 # The simulated venue's leverage for a perp account: above every risk profile's cap (sleeve_fund.risk), so
 # our own leverage and liquidation guards, not the simulated venue's margin check, decide.
 VENUE_LEVERAGE = 10
@@ -49,7 +53,7 @@ VENUE_FEE_PERP = PerpTerms("Perpetual at the venue's spot fees (stress)", None, 
 
 def market_of(params: dict | None) -> str:
     m = (params or {}).get("market") or SPOT
-    if m not in MARKETS:
+    if m not in MARKETS and m != PERP_FUNDING_STRESS:
         raise ValueError(f"unknown market {m!r}; choose one of {', '.join(MARKETS)}")
     return m
 
@@ -73,6 +77,11 @@ def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
             if m != PERP:
                 raise ValueError("this venue trades its own perpetuals: choose the perp market")
             return native_terms(profile)
+    if m == PERP_FUNDING_STRESS:
+        from dataclasses import replace
+
+        return replace(LOW_FEE_PERP, label=f"{LOW_FEE_PERP.label}, funding at {FUNDING_STRESS_RATE:.2%}",
+                       funding_rate=FUNDING_STRESS_RATE)
     return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
 
@@ -116,6 +125,52 @@ def funding_times(after: datetime, until: datetime, hours: tuple[int, ...]) -> l
     return out
 
 
+def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], settled=None) -> list[datetime]:
+    """The funding settlements in (after, until], oldest first, to the minute. With the venue's settled rates
+    (`settled`, indexed by settlement time), its own times: a symbol moved from 8-hourly to 4- or 1-hourly
+    settlements pays every one (QA P1-O1). Past the newest record, the venue's latest interval carries on from
+    it (paper, before the venue publishes the next rate); before the first record, and with no records, the
+    venue profile's fixed `hours`."""
+    if settled is None or len(settled) == 0:
+        return funding_times(after, until, hours)
+    idx = settled.index.round("min")
+    first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
+    out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
+    out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
+    if until > last:
+        step = latest_interval(settled)
+        if step is None:  # a single record (a new listing): the fixed hours after it
+            out += funding_times(max(after, last), until, hours)
+        else:
+            t = last + step
+            while t <= until:
+                if t > after:
+                    out.append(t)
+                t += step
+    return sorted(set(out))
+
+
+def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
+    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
+    `wait`; for a settlement foreseen past its newest record, one of the venue's latest intervals more, plus `wait`
+    again for the store's refresh to bring in the next record. If the venue has lengthened its interval, the newer
+    record that skips the foreseen time lands within that, and the time is then no settlement at all
+    (settlement_times), so it is never charged (no phantom baseline charge)."""
+    step = latest_interval(settled)
+    if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
+        return wait
+    return 2 * wait + step
+
+
+def latest_interval(settled) -> timedelta | None:
+    """The venue's settlement interval as its two newest records show it, or None with fewer than two."""
+    if settled is None or len(settled) < 2:
+        return None
+    idx = settled.index.round("min")
+    step = (idx[-1] - idx[-2]).to_pytimedelta()
+    return step if step > timedelta(0) else None
+
+
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
     """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
     opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the
@@ -123,6 +178,13 @@ def isolated_margin(qty: float, entry: float, leverage: float, balance: float | 
     backtest, the dashboard and the demo copy (set to isolated at the same leverage)."""
     margin = abs(qty) * entry / max(leverage, 1e-9)
     return min(margin, max(balance, 0.0)) if balance is not None else margin
+
+
+def gap_loss_cap(qty: float, entry: float, leverage: float, balance: float, taker: float, liq: float | None) -> float:
+    """The most an isolated perpetual position can lose however far the price gaps (Independent Quant Advisor, QA
+    P1-D3): its whole isolated margin, plus the taker fee on the close at its liquidation price. The engine books a
+    gap past the bankruptcy price at this (the insurance fund takes the rest), and the Risk page's stress rows use it."""
+    return isolated_margin(qty, entry, leverage, balance) + taker * abs(qty) * (liq or 0.0)
 
 
 def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:
@@ -133,6 +195,45 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
         return None
     margin = isolated_margin(qty, entry, leverage, cash + qty * entry)
     return liquidation_price(margin - qty * entry, qty, maintenance)
+
+
+@dataclass(frozen=True)
+class LiquidationBooking:
+    """What an isolated-margin liquidation books (GAP-LIQ-CAP, Independent Quant Advisor 6 Oct 23:42 and 7 Oct 00:19).
+
+    fill_px: the bankruptcy price, where the fill is booked, gapped or not: there the price move loses exactly the
+    posted margin. loss: X, that margin plus the entry and liquidation fees, the one figure the strategy books (the
+    same X as the RAL halt's). market_px: where the market actually closed it. insurance: how far the market went past
+    bankruptcy, in money, which the venue's insurance fund covers; forfeited: the margin the venue kept when it closed
+    short of bankruptcy. Both are journal diagnostics only, never in any P&L line, equity mark or trip."""
+
+    fill_px: float
+    loss: float
+    market_px: float
+    insurance: float
+    forfeited: float
+
+
+def bankruptcy_price(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
+    """The price at which an isolated position of signed qty has lost exactly its posted margin (never below 0)."""
+    return max(entry - isolated_margin(qty, entry, leverage, balance) / qty, 0.0)
+
+
+def liquidation_booking(qty: float, entry: float, exit_px: float, leverage: float, entry_fee: float,
+                        liquidation_fee: float, balance: float | None = None) -> LiquidationBooking:
+    """The booking for a position of signed qty at average entry `entry`, liquidated by the market at an average
+    exit_px, on isolated margin at this leverage (balance: what there was to put up, as isolated_margin). The fees are
+    the money charged (entry: on the whole liquidated qty, adds included; liquidation: qty x the liquidation trigger
+    price x the rate, never on the booked fill (Advisor 7 Oct 00:19))."""
+    if qty == 0 or entry <= 0 or exit_px <= 0 or leverage <= 0:
+        raise ValueError("a liquidation needs a position, positive prices and a positive leverage")
+    if entry_fee < 0 or liquidation_fee < 0:
+        raise ValueError("fees are money charged, never negative")
+    margin = isolated_margin(qty, entry, leverage, balance)
+    bankrupt = bankruptcy_price(qty, entry, leverage, balance)
+    past = -qty * (exit_px - bankrupt)  # > 0: the market went past bankruptcy; < 0: it closed short of it
+    return LiquidationBooking(fill_px=bankrupt, loss=margin + entry_fee + liquidation_fee, market_px=exit_px,
+                              insurance=max(past, 0.0), forfeited=max(-past, 0.0))
 
 
 def liquidation_price(cash: float, qty: float, maintenance: float) -> float | None:

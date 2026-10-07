@@ -4,7 +4,11 @@ Trading (the same linear perpetual; Binance's own demo is closed to the PM's acc
 Deribit testnet, the fallback. Demo money is not real and the paper journal
 stays the record of truth: the mirror never feeds anything back into a strategy, and a mirror order that fails
 is noted, not retried, so it can never trade twice. Before copying to Bybit Demo it sets isolated margin at the
-paper leverage (prepare_margin), so margin and liquidation price match the paper book too. On Bybit Demo, where
+paper leverage (prepare_margin). Paper's isolated margin is the notional over that leverage (U13-2), so for one
+strategy on a symbol the demo position's margin and liquidation price match the paper book. Strategies that share
+a Bybit symbol share one demo position (one-way mode): it holds their net quantity at the lowest of their
+leverages, so its quantity and P&L in total match the paper books but its margin and liquidation price match
+neither; compare those per strategy on the paper book (m13-E8). On Bybit Demo, where
 the quantity is the paper quantity, a catch-up then brings the account back to the paper position (catch_up),
 only for a gap seen twice in a row and only as far as the account itself is short of it.
 
@@ -140,7 +144,7 @@ class Testnet:
         out = self._get(f"{self.url}/api/v2/{method}?{urllib.parse.urlencode(params)}", headers)
         if "error" in out:
             err = out["error"]
-            raise RuntimeError(f"the demo account {method}: {err.get('message', err)} ({err.get('data', '')})")
+            raise RuntimeError(f"refused ({method}): {err.get('message', err)} ({err.get('data', '')})")
         return out["result"]
 
     def _auth(self) -> str:
@@ -233,7 +237,7 @@ class BybitDemo:
         if not isinstance(out, dict) or out.get("retCode") != 0:
             msg = out.get("retMsg", out) if isinstance(out, dict) else out
             code = out.get("retCode", "") if isinstance(out, dict) else ""
-            raise RuntimeError(f"the demo account {path}: {msg} ({code})")
+            raise RuntimeError(f"refused ({path}): {msg} ({code})")
         return out.get("result") or {}
 
     @staticmethod
@@ -344,9 +348,18 @@ def target_for(sleeve) -> str:
     return "BYBIT" if (sleeve.venue or "").upper() == "BINANCE" else "DERIBIT"
 
 
+def exact_copy(sleeve) -> str | None:
+    """The demo account holding a mirrored strategy's own quantity, by its label, so its page can show the copy
+    beside the paper position: Bybit Demo Trading. None for one not mirrored, or copied to the Deribit
+    testnet, sized in dollars at each fill's price."""
+    return "Bybit Demo Trading" if sleeve.params.get("demo_mirror") and target_for(sleeve) == "BYBIT" else None
+
+
 def mirrored(store) -> list:
-    """The strategies whose params ask for the demo mirror."""
-    return [s for s in store.sleeves() if s.params.get("demo_mirror")]
+    """The strategies whose params ask for the demo mirror. A run archived by a reset is not one: it trades no
+    more, and its risk profile mustn't set the leverage of a symbol it once shared (m13-E5)."""
+    archived = store.archived()
+    return [s for s in store.sleeves() if s.params.get("demo_mirror") and s.name not in archived]
 
 
 def mirror_once(store, targets: dict) -> int:

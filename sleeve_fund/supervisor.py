@@ -23,12 +23,14 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sleeve_fund import accounts
+from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import Sleeve, Store, utcnow
-from sleeve_fund.strategies import check_perp_sizing
+from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
+from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
+from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
+from sleeve_fund.strategies.base import EXITS_ONLY
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -38,6 +40,12 @@ CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten:
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
+# Flattens a reset or a clean slate queues for one strategy before it stops asking and says the PM must close
+# it: a position below the venue's smallest order can't be closed by an order, and asking again every step
+# only piled up commands (review round 13, m13-E1).
+SYSTEM_FLATTENS = 3
+# The exits-only reason of a stopped strategy that still holds a position (P1-U35): its process runs for its exits.
+STOPPED_HOLDING = "it was stopped while it still holds a position"
 
 
 @dataclass
@@ -45,6 +53,8 @@ class Proc:
     popen: subprocess.Popen | None = None
     started_at: datetime | None = None
     crashes: int = 0
+    holds: bool | None = None  # a stopped strategy's journal holds a position (not dust); None: not read yet
+    watched: bool = False  # the incident for a stopped strategy still holding is written (_watch_stopped_holder)
     next_start: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=utcnow().tzinfo))
 
     @property
@@ -52,9 +62,10 @@ class Proc:
         return self.popen is not None and self.popen.poll() is None
 
 
-def decide(sleeve: Sleeve, proc: Proc, now: datetime) -> str:
-    """One of: start, stop, restart_stale, crashed, wait, none."""
-    want = sleeve.desired_state == "running"
+def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> str:
+    """One of: start, stop, restart_stale, crashed, wait, none. A stopped strategy that still `holds` a position is
+    wanted running too, for its exits only (P1-U35)."""
+    want = sleeve.desired_state == "running" or holds
     if want and not proc.alive:
         if proc.popen is not None:
             return "crashed"
@@ -78,8 +89,10 @@ class Supervisor:
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
         rather than started into a crash loop. A start that only sells a position it holds (a flatten waiting:
-        the kill switch, a PM close) still goes ahead. One saved on the venue's own candles where the market data
-        hub feeds the venue (check_hub_bar_spec, QA P1-C10) can't start at all, so it is refused even then."""
+        the kill switch, a PM close) still goes ahead. So does one still holding a position (Independent Quant
+        Advisor, NA-4, QA P1-S7): it is never left unwatched, but started for its exits only (_exits_only). One saved
+        on the venue's own candles where the market data hub feeds the venue (check_hub_bar_spec, QA P1-C10) can't
+        start at all, so it is refused even then."""
         s = self.store.sleeve(name)
         try:
             check_hub_bar_spec(s.venue, s.bar_spec)
@@ -93,10 +106,13 @@ class Supervisor:
             return True
         try:
             check_perp_sizing(s.strategy, s.params)
+            check_perp_stop(s.strategy, s.params, s.risk_profile)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
                                  "flatten pauses it, and it can't be started to trade")
+                return False
+            if self._exits_only(s, str(exc)):
                 return False
             self.store.set_desired_state(name, "stopped")
             self.store.set_status(name, "stopped", f"not started: {exc}")
@@ -104,8 +120,58 @@ class Supervisor:
             return True
         return False
 
+    def _exits_only(self, s: Sleeve, why: str) -> bool:
+        """A refused start still holding a position (not dust) is started anyway, paused with the EXITS_ONLY
+        reason: its exits run, a safety stop is set from the mark, no entry or add opens, and an incident is raised
+        (LongFlatStrategy._safety_stop_on_restore). Any refusal can use it, so a position is never left without a
+        process watching it. True when it applies."""
+        book = self.store.journal_book(s.name, s.starting_balance)
+        if abs(book["qty"]) <= 1e-12 or is_dust(book):
+            return False
+        reason = f"{EXITS_ONLY}: {why}"
+        if s.status != "paused" or s.status_reason != reason:
+            self.store.set_status(s.name, "paused", reason)
+            self.store.event(s.name, "error", "start_refused", f"Not started to trade: {why}. It still holds a "
+                             "position, so it is started for its exits only, with a safety stop")
+            self.store.event(s.name, "error", "incident",
+                             f"Incident, {s.name}: not started to trade ({why}), but it holds {book['qty']:.12g}, so it "
+                             "runs for its exits only, with a safety stop from the current price and no new entries")
+        return True
+
+    def _holds(self, s: Sleeve, proc: Proc) -> bool:
+        """Whether a stopped strategy still holds a position (not dust). Without a process its journal can't change,
+        so that is read once per stop; while its exits-only process runs, every step, so it stops once flat."""
+        if s.desired_state == "running":
+            return False
+        if proc.holds is None or proc.alive:
+            book = self.store.journal_book(s.name, s.starting_balance)
+            proc.holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
+        return proc.holds
+
+    def _watch_stopped_holder(self, s: Sleeve, proc: Proc, starting: bool = False) -> None:
+        """P1-U35 (Advisor 20:56, HoE): a stopped strategy still holding a position (the PM's Stop on a holder, or a
+        fill that raced the stop) is never left unwatched. It runs for its exits only: its own stop, or a safety stop
+        from the mark where it has none (_safety_stop_on_restore), and nothing opens, with an incident. A halt or a
+        pause keeps its own status, which already holds every entry and is cleared only by its own action (HC)."""
+        book = self.store.journal_book(s.name, s.starting_balance)
+        proc.watched = True
+        if s.status not in ("halted", "paused"):
+            self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
+        if starting:
+            return  # the process it starts sets the safety stop and writes the incident, once per position
+        head = f"Incident, {s.name}: stopped, but it still holds "
+        if said_since_last_fill(self.store, s.name, head):
+            return  # already said for this position: a deploy or a crash restarts it without a second incident
+        self.store.event(s.name, "error", "incident",
+                         f"{head}{book['qty']:.12g}, so it runs for its exits only: its stop (or a safety stop from the "
+                         "current price) still closes it, and nothing new opens. Flatten closes it; once it is flat it "
+                         "stops.")
+
     def _start(self, name: str, proc: Proc) -> None:
-        if self._refused(name):
+        s = self.store.sleeve(name)
+        if s.desired_state != "running":  # a stopped strategy still holding: its exits only (P1-U35)
+            self._watch_stopped_holder(s, proc, starting=True)
+        elif self._refused(name):
             return
         # Paper processes never need a venue key, so they don't inherit one.
         env = {k: v for k, v in os.environ.items() if not credential_var(k)}
@@ -125,28 +191,45 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 proc.popen.kill()
                 proc.popen.wait()
-        proc.popen = None
+        proc.popen, proc.holds, proc.watched = None, None, False
         self.store.event(name, "info", "process_stop", why)
 
     def reset_pending(self) -> None:
         """Carry each PM reset forward (5 Oct 2026): a strategy still holding is flattened first (a PM flatten,
         which pauses it; started if stopped so the flatten can trade); once flat its process is stopped, the run
         so far is put away under its own name (Store.split_run), and the strategy starts again at its starting
-        capital if it was running. A strategy copied to Bybit Demo then has its demo copy resynced (flat, on
+        capital if it was running. A strategy copied to a demo account by quantity then has its demo copy resynced (flat, on
         the paper margin terms) before it trades again."""
         for req in self.store.pending_resets():
             name = req["sleeve"]
+            if liquidation_head(self.store, name) is not None:
+                # Asked for before the liquidation landed (its flatten maybe parked on the liquidating tick):
+                # carried out now, it would put the liquidation away unanswered (U27, QA P1-U33, P1-D24). It is
+                # closed unrun, its flatten and start taken back, and the halt waits for Reset after liquidation.
+                self.store.refuse_reset(req, liquidation.REFUSAL)
+                self._undo_reset_start(req)
+                continue
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
-            if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
-                if not any(c["command"] == "flatten" for c in pending):
-                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"])
+            book = self.store.journal_book(name, s.starting_balance)
+            qty = book["qty"]
+            dust = is_dust(book)
+            if abs(qty) > 1e-12 and not dust:
+                why = f"Reset strategy: {req['reason']}"
+                if not any(c["command"] == "flatten" for c in pending) and _flatten_again(self.store, name, why,
+                                                                                         req["created_at"], qty):
+                    self.store.command(name, "flatten", why, actor=req["actor"], holds_through_reset=False)
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue
+            if dust:
+                self.store.event(name, "warning", "reset_dust",
+                                 f"The {qty:.12g} still held is worth under {DUST_NOTIONAL:g}, below any venue's smallest "
+                                 "order, so no flatten can close it: the reset treats it as flat and it stays with the "
+                                 "run put away")
             self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
             self.store.drop_pending(name, "lapsed: the strategy was reset")
-            run = self.store.split_run(req)
+            run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)
@@ -155,12 +238,27 @@ class Supervisor:
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
 
+    def _undo_reset_start(self, req: dict) -> None:
+        """A reset refused after its first pass has already queued its flatten and, for a strategy the PM had
+        stopped, started it so the flatten could trade. Take both back: the flatten lapses, and the Stop the
+        PM chose stands (Code review on #167)."""
+        name = req["sleeve"]
+        for cmd in self.store.pending_commands(name):
+            if cmd["command"] == "flatten" and cmd["reason"].startswith("Reset strategy:"):
+                self.store.mark_applied(cmd["id"])
+                self.store.decide("system", "drop flatten", "lapsed: the reset it was for was not carried out "
+                                  f"({cmd['reason']})", name)
+        if not req["restart"] and self.store.sleeve(name).desired_state == "running":
+            self.store.set_desired_state(name, "stopped")
+
     def step(self) -> None:
         self.reset_pending()
         now = utcnow()
         for sleeve in self.store.sleeves():
             proc = self.procs.setdefault(sleeve.name, Proc())
-            action = decide(sleeve, proc, now)
+            holds = self._holds(sleeve, proc)
+            action = decide(sleeve, proc, now, holds)
+            exits_only = sleeve.status == "paused" and sleeve.status_reason == f"{EXITS_ONLY}: {STOPPED_HOLDING}"
             if action == "start":
                 self._start(sleeve.name, proc)
             elif action == "crashed":
@@ -179,10 +277,23 @@ class Supervisor:
                     self.store.event(sleeve.name, "error", "process_crash", f"exit code {code}; restart in {delay}s")
             elif action == "stop":
                 self._stop(sleeve.name, proc, "stopped by PM")
-                self.store.set_status(sleeve.name, "stopped", "stopped by PM")
+                if not entry_blocked(self.store, sleeve.name, starting=True)[0]:  # a halt stays through a stop (HC)
+                    self.store.set_status(sleeve.name, "stopped", "stopped by PM")
             elif action == "restart_stale":
                 self.store.event(sleeve.name, "error", "heartbeat_stale", "no heartbeat for 3 minutes; restarting")
                 self._stop(sleeve.name, proc, "restart after stale heartbeat")
+                self._start(sleeve.name, proc)
+            elif action == "none" and holds and sleeve.status not in ("halted", "paused"):
+                # The PM's Stop on a strategy that still holds: restarted for its exits only (P1-U35)
+                self._stop(sleeve.name, proc, "stopped by PM: restarted for its exits only, as it still holds a position")
+                self._start(sleeve.name, proc)
+            elif action == "none" and holds and not proc.watched:
+                # Stopped while halted or paused and still holding: its process keeps running, as it is (P1-U35)
+                self._watch_stopped_holder(sleeve, proc)
+            elif action == "none" and exits_only and sleeve.desired_state == "running":
+                # Started again by the PM after a stop that left it running for its exits only: it trades again
+                self._stop(sleeve.name, proc, "started by PM: restarted to trade")
+                self.store.set_status(sleeve.name, "stopped", "started by PM")
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and self.store.pending_reload(sleeve.name):
                 self._stop(sleeve.name, proc, "restart for changed settings")
@@ -254,8 +365,8 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
     `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard.
     One exception for a strategy already there: a file asking for the demo mirror turns it on when the strategy
-    has never had that setting (the Binance strategies were added before the mirror could copy them, 5 Oct
-    2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
+    has never had that setting (the first perpetual strategies were added before the mirror could copy them,
+    5 Oct 2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:
@@ -265,6 +376,8 @@ def seed(store: Store, paths: list[str]) -> list[str]:
                 store.decide("system", "mirror", f"demo mirror turned on from {path}", cfg.name)
             continue
         check_perp_sizing(cfg.strategy, cfg.params)
+        # A stopless perp above 1x is seeded as written and refused when started (_refused), with the reason: a
+        # shipped file must not stop the supervisor from coming up.
         with open(path, "rb") as fh:
             start = tomllib.load(fh).get("sleeve", {}).get("start", True)
         store.create_sleeve(**to_store_kwargs(cfg), desired_state="running" if start else "stopped")
@@ -272,6 +385,22 @@ def seed(store: Store, paths: list[str]) -> list[str]:
                      cfg.name)
         added.append(cfg.name)
     return added
+
+
+def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool:
+    """Whether a reset or a clean slate may queue another flatten (`why`) for a strategy still holding qty: at
+    most SYSTEM_FLATTENS since `since` (the reset's request, or the last clean slate finished, so an earlier slate
+    with the same reason doesn't count). The last refusal says once what is left and that the PM must close it."""
+    asked = sum(1 for d in store.decisions(name, limit=1_000, action="flatten", since=since)
+                if d["reason"] == why.strip())
+    if asked < SYSTEM_FLATTENS:
+        return True
+    if not any(e["kind"] == "flatten_gave_up" and e["message"].endswith(why)
+               for e in store.events(name, limit=200)):
+        store.event(name, "error", "flatten_gave_up",
+                    f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the venue's smallest "
+                    f"order; the PM must close it before this can finish: {why}")
+    return False
 
 
 def clear(store: Store, path: str) -> list[str]:
@@ -306,8 +435,10 @@ def clear(store: Store, path: str) -> list[str]:
             # flattened like any other holder: until it is flat it stays in the book's figures.
             if abs(qty) > 1e-12:
                 holding.append(s.name)
-                if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
-                    store.command(s.name, "flatten", f"{reason}: flattened so it can be archived", actor="system")
+                why = f"{reason}: flattened so it can be archived"
+                if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
+                        and _flatten_again(store, s.name, why, store.book_start(), qty)):
+                    store.command(s.name, "flatten", why, actor="system", holds_through_reset=False)
                 if s.desired_state != "running":
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)

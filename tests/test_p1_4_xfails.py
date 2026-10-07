@@ -11,6 +11,13 @@ Sources (every trading-behaviour expectation below cites one of these):
 - [5a] eng-board.md row 5a, HoE 20:00: every path builds longer bars via one shared pure function: from minutes
        present, carries `missing`; >10% missing = degraded (indicators update, no new entries, exits run). Parity
        test: hole inside a slower candle -> identical bar + decisions backtest vs paper.
+- [R]  Advisor rulings 6 Oct 16:40 (via the coordinator; README "Advisor rulings"): 4.1 a degraded slower candle
+       blocks entries and adds while it is the latest closed one, never exits; 4.2 `missing` counts underlying
+       minutes, including those recorded missing inside decision candles that exist, against the slower candle's
+       total minutes (a candle of unknown completeness counts as complete); 4.3 the short-warm-up entry block ends
+       once enough slower candles closed live and the settled rule passes, no restart needed; 4.4 a non-00:00 daily
+       anchor is allowed, fixed per venue (and part of the definition hash: P1-5 file); 4.5 "recorded as missing" =
+       a journal event (source of truth), also shown on the Signals tab.
 
 Assumed interface (what the branch claude/platform-z3xxr9-mtf at ec9c42f/9abbab6 and PR #155 already name; the
 assertions do not depend on any other name):
@@ -23,8 +30,11 @@ assertions do not depend on any other name):
   A degraded flag is read from the candle (`degraded` attribute or method) or else from bars.degraded(missing).
 - LongFlatStrategy.slower(minutes, *blocks) registers slower candles for a model (branch).
 - A VenueProfile field whose name contains "anchor" holds the daily anchor (any of 0, "00:00", time(0),
-  timedelta(0)).
-- An empty slower candle is "recorded" if the slower-candle builder keeps its close stamp in any attribute.
+  timedelta(0); an int or float is minutes after 00:00 UTC), and the strategy's slower candles follow it.
+- The minutes missing inside a decision candle reach the strategy as #155 records them (run_backtest passes the
+  frame's `missing`/`degraded` columns to LongFlatStrategy.mark_degraded); the slower candle adds them up.
+- An empty slower candle is journaled as an event whose message says "missing", names the timeframe ("15-minute")
+  and the candle's time (HH:MM, open or close); the Signals tab payload (runtime.publish_signals) says "missing".
 
 Every import of P1-4 / #155 code is inside a test body, so on main the tests XFAIL rather than error."""
 
@@ -93,33 +103,8 @@ def _ohlcvm(c):
     return (c.open, c.high, c.low, c.close, c.volume, c.missing)
 
 
-def _mentions(obj, ns: int, depth: int = 0) -> bool:
-    """Whether `obj` keeps the instant `ns` anywhere in its attributes (ints, timestamps, containers)."""
-    if depth > 4:
-        return False
-    if isinstance(obj, bool):
-        return False
-    if isinstance(obj, (int, np.integer)):
-        return int(obj) == ns
-    if isinstance(obj, pd.Timestamp):
-        return obj.value == ns
-    if isinstance(obj, datetime):
-        return obj.tzinfo is not None and pd.Timestamp(obj).value == ns
-    if isinstance(obj, dict):
-        return any(_mentions(k, ns, depth + 1) or _mentions(v, ns, depth + 1) for k, v in obj.items())
-    if isinstance(obj, (list, tuple, set, frozenset)) or type(obj).__name__ == "deque":
-        return any(_mentions(v, ns, depth + 1) for v in obj)
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return any(_mentions(getattr(obj, f.name), ns, depth + 1) for f in dataclasses.fields(obj))
-    if hasattr(obj, "__dict__") and depth == 0:
-        return any(_mentions(v, ns, depth + 1) for k, v in vars(obj).items() if k != "blocks")
-    return False
-
-
 # ---- rule 5a: one shared pure bar-build function ---------------------------------------------------------------
 
-@_xf("P1-4 / board 5a", "every path (store resample, hub client, P1-4 slower candle, m13-E6) builds longer bars via "
-     "one shared pure function, from minutes present, carrying `missing`.")
 def test_slower_candles_are_built_by_the_one_shared_bar_function():
     """[5a] The slower-candle path calls the shared function (#155 sleeve_fund.bars) and gets the same bar from
     the same minutes, `missing` included, on a candle with interior holes."""
@@ -148,8 +133,6 @@ def test_slower_candles_are_built_by_the_one_shared_bar_function():
     assert closed.missing == 7
 
 
-@_xf("P1-4 / board 5a", "a longer bar carries `missing`; more than 10% missing = degraded (indicators update, no "
-     "new entries, exits run).")
 @pytest.mark.parametrize("skip, missing, degraded", [
     (set(), 0, False),
     ({10, 11, 12, 13, 14, 15}, 6, False),  # 6 of 60 = exactly 10%: not MORE than 10%, a normal bar
@@ -166,8 +149,47 @@ def test_a_slower_candle_carries_missing_and_is_degraded_only_above_ten_percent(
     assert _is_degraded(out[0], 60) is degraded
 
 
-@_xf("P1-4 / board 5a + design Done-when", "store-resampled and strategy-built slower candles match on recorded "
-     "data, including a gap; the store calls the same function, so `missing` and `degraded` match too.")
+def test_missing_counts_minutes_when_slower_candles_are_built_from_15_minute_candles():
+    """[R 4.2] An hour built from 15-minute candles: one absent interior candle is 15 minutes missing (25% of 60:
+    degraded), not "1"; an hour whose four candles are all there and carry no completeness record is complete."""
+    from sleeve_fund.strategies.timeframes import SlowerCandles
+
+    s = SlowerCandles(60, 15)
+    out = []
+    for k in range(8):  # 12:15 to 14:00
+        if k == 1:
+            continue  # 12:30 never came
+        ts = T0 + (k + 1) * 15 * M
+        out.append(s.update(*_candle(100.0 + k), ts))
+    first, second = [c for c in out if c is not None]
+    assert (first.end, first.missing, _is_degraded(first, 60)) == (T0 + H, 15, True)
+    assert (second.end, second.missing, _is_degraded(second, 60)) == (T0 + 2 * H, 0, False)
+
+
+def test_minutes_recorded_missing_inside_decision_candles_add_up_in_the_slower_candle(monkeypatch, instrument):
+    """[R 4.2] 15-minute decision bars as the store builds them (#155: `missing`/`degraded` columns, passed to the
+    strategy by run_backtest). The 00:15-00:30 bar is missing 7 of its minutes and the 01:15-01:30 bar 2: the
+    hourly candles read 7 (degraded: 7 of 60 > 10%), 2 (normal) and 0."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies import REGISTRY
+    from test_replay import START
+
+    seen: list = []
+    monkeypatch.setitem(REGISTRY, "qa_slow_reader", _slow_reader_model(60, capture=seen))
+    idx = pd.date_range(pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=15), periods=12, freq="15min")
+    c = 100 + 0.01 * np.sin(np.arange(len(idx)))
+    df = pd.DataFrame({"open": c, "high": c + 0.01, "low": c - 0.01, "close": c, "volume": 1e6,
+                       "missing": 0, "degraded": False}, index=idx)
+    df.loc[idx[1], ["missing", "degraded"]] = [7, True]
+    df.loc[idx[5], ["missing", "degraded"]] = [2, True]  # 2 of 15 is over 10% of the 15-minute bar: recorded
+    run_backtest("qa_slow_reader", df, instrument, half_spread=0, bar_minutes=15)
+    t = lambda h: (pd.Timestamp(START, tz="UTC") + pd.Timedelta(hours=h)).value  # noqa: E731
+    assert seen == [(t(1), 7), (t(2), 2), (t(3), 0)]
+    from sleeve_fund import bars
+
+    assert [bars.degraded(m, 60) for _, m in seen] == [True, False, False]
+
+
 def test_store_resample_and_strategy_built_candles_agree_on_missing_and_degraded(tmp_path):
     """[D] Done when (store = strategy-built, including a gap) + [5a] (one function on every path): a 7-minute
     hole inside one hour and a wholly empty hour. Both paths give the same hours, with the same `missing`, and
@@ -197,9 +219,9 @@ def test_store_resample_and_strategy_built_candles_agree_on_missing_and_degraded
     assert sorted({b.missing for b in built}) == [0, 7]
 
 
-def test_an_empty_slower_candle_is_recorded_missing_and_never_filled():
+def test_an_empty_slower_candle_is_never_filled():
     """[A] An hour with no decision candles at all: no candle is made up for it (no block is fed one, `last` never
-    is one), and the builder keeps a record that it is missing."""
+    is one). Where it is recorded [R 4.5] is test_an_empty_slower_candle_is_journaled_missing_and_shown_on_signals."""
     from sleeve_fund.strategies.indicators import Sma
     from sleeve_fund.strategies.timeframes import SlowerCandles
 
@@ -210,7 +232,35 @@ def test_an_empty_slower_candle_is_recorded_missing_and_never_filled():
     assert [c.end for c in out] == [T0 + H, T0 + 2 * H, T0 + 4 * H]
     assert sma.count == s.count == 3 and s.last.end == T0 + 4 * H
     assert all(np.isfinite([c.open, c.high, c.low, c.close, c.volume]).all() for c in out)
-    assert _mentions(s, T0 + 3 * H), "the empty 14:00-15:00 candle must be recorded as missing"
+
+
+def test_an_empty_slower_candle_is_journaled_missing_and_shown_on_the_signals_tab(tmp_path, monkeypatch):
+    """[A] + [R 4.5] Paper (a recorded session replayed through the paper runtime): rsi_cross on 1-minute candles
+    with a 15-minute trend filter, and no trade at all from 03:15 to 03:30, so that 15-minute candle is empty."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.research.replay import replay
+
+    published: list = []
+    publish = SleeveRuntime.publish_signals
+
+    def recording(self, state):
+        published.append((self.now(), state))
+        return publish(self, state)
+
+    monkeypatch.setattr(SleeveRuntime, "publish_signals", recording)
+    s = np.arange(4 * 60 * 60)
+    prices = 60_000 * (1 + 0.03 * np.sin(s / 4000) + 0.004 * np.sin(s / 110))
+    hole = (s >= 195 * 60) & (s < 210 * 60)
+    params = {"rsi_period": 5, "trend_sma": 3, "trend_minutes": 15, "time_stop_bars": 20}
+    _record_with_hole(tmp_path / "s.jsonl.gz", prices, hole, "rsi_cross", params)
+    store = _store(tmp_path)
+    replay(tmp_path / "s.jsonl.gz", store=store)
+    events = store.events("parity", limit=1000)
+    said = [e for e in events if "missing" in e["message"].lower() and "15-minute" in e["message"]
+            and ("03:15" in e["message"] or "03:30" in e["message"])]
+    assert said, "the empty 03:15-03:30 candle must be journaled as missing"
+    after = [state for at, state in published if pd.Timestamp(at) >= pd.Timestamp("2025-10-03 03:30", tz="UTC")]
+    assert any("missing" in str(state).lower() for state in after), "the Signals tab must show it"
 
 
 # ---- visibility: same instant, never before, no look-ahead -------------------------------------------------------
@@ -278,12 +328,51 @@ def test_every_venue_carries_its_daily_anchor_at_00_utc_and_daily_candles_close_
     assert [c.end % DAY for c in out] == [0, 0, 0] and out[0].end == start + DAY
 
 
+def test_a_venue_with_an_08_00_anchor_closes_its_daily_candles_at_08_00(monkeypatch, instrument):
+    """[R 4.4] The instrument's venue (KRAKEN) given an 08:00 UTC daily anchor: a model reading daily candles under
+    hourly decisions sees them close at 08:00, and the part day from 00:00 to 08:00 is dropped ([D] rule 4)."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.venues import VENUES
+    from test_replay import START
+
+    profile = VENUES[str(instrument.id.venue)]
+    names = [f.name for f in dataclasses.fields(profile) if "anchor" in f.name.lower()]
+    assert names, "no daily anchor property"
+    now = getattr(profile, names[0])
+    eight = (timedelta(hours=8) if isinstance(now, timedelta) else time(8, 0) if isinstance(now, time)
+             else "08:00" if isinstance(now, str) else type(now)(480))
+    monkeypatch.setattr(profile, names[0], eight)
+    seen: list = []
+    monkeypatch.setitem(REGISTRY, "qa_slow_reader", _slow_reader_model(1440, capture=seen))
+    idx = pd.date_range(pd.Timestamp(START, tz="UTC") + pd.Timedelta(hours=1), periods=72, freq="1h")
+    c = 100 + 0.01 * np.sin(np.arange(len(idx)))
+    df = pd.DataFrame({"open": c, "high": c + 0.01, "low": c - 0.01, "close": c, "volume": 1e6}, index=idx)
+    run_backtest("qa_slow_reader", df, instrument, half_spread=0, bar_minutes=60)
+    day8 = lambda d: (pd.Timestamp(START, tz="UTC") + pd.Timedelta(days=d, hours=8)).value  # noqa: E731
+    assert [end for end, _ in seen] == [day8(1), day8(2)]
+
+
 # ---- warm-up short at start (Advisor 19:48) ----------------------------------------------------------------------
+
+# Set-up only (HoQA, 7 Oct, CR on the trial merge with main a83de76): since #182 a perp restored without a stop runs
+# "for its exits only" (an incident, and entries held as entry_held_safety_stop), which would hold the entries these
+# cells test for a reason other than the warm-up. So the restart's model carries a stop that never triggers on these
+# prices. The longest price path used below (cell "...lifts once the slower candles have closed live") moves at most
+# 4.09% down from any earlier point (1.0148 at 00:24 to 0.9733 at 00:53) and at most 5.00% up from any earlier point
+# (0.9733 at 00:53 to 1.0220 at 01:13); the other cells' paths are prefixes of it or move less (cell 11's own 2% stop
+# is kept: it is the stop under test). The half spread is 0.5 on ~60,000 (under 0.001%). A stop 6% away therefore can't
+# be reached by a long or a short entered at any minute of any of these paths. It must also stay inside gate 5's open
+# risk cap (5% of the book): the entry here is ~6,600 notional, so 6% is ~396 of open risk against a cap of ~500
+# (8% was refused at 00:55 as entry_refused_open_risk, 528 > 500).
+FAR_STOP = 0.06
+
 
 def _restart_holding_a_long(tmp_path, monkeypatch, legs, params):
     """A paper restart (recorded session, replayed through the paper runtime) of rsi_cross on 1-minute candles
     with a 15-minute trend filter, holding a long of 0.05 entered at 60,000, whose slower-candle warm-up the
-    history store can't meet (it loads nothing). Returns the orders sent and the journal's events."""
+    history store can't meet (it loads nothing). Returns the orders sent and the journal's events. The model has a
+    stop (FAR_STOP unless the cell sets its own) so the restore is not stopless (see FAR_STOP)."""
     from sleeve_fund.research.replay import replay
     from sleeve_fund.store import replay_book
     from sleeve_fund.strategies.base import LongFlatStrategy
@@ -312,7 +401,8 @@ def _restart_holding_a_long(tmp_path, monkeypatch, legs, params):
     meta = {"balances": [f"{book['cash'] + book['qty'] * book['entry_px']:.2f} USD"],
             "sleeve": {"name": "mtf-restart", "strategy": "rsi_cross", "instrument": "BTC/USD",
                        "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": "balanced",
-                       "params": {**PERP, "trend_sma": 3, "trend_minutes": 15, **params}, "maker_fee": "0.0002",
+                       "params": {**PERP, "trend_sma": 3, "trend_minutes": 15, "stop_loss": FAR_STOP, **params},
+                       "maker_fee": "0.0002",
                        "taker_fee": "0.0005", "tick_seconds": 30}}
     path = tmp_path / "restart.jsonl.gz"
     _record(path, meta, legs)
@@ -346,6 +436,19 @@ def test_a_short_slower_warm_up_blocks_new_entries_but_the_models_own_exit_still
     assert not [o for o in orders if o["intent"] == "entry"]
 
 
+def test_the_short_warm_up_entry_block_lifts_once_the_slower_candles_have_closed_live(tmp_path, monkeypatch):
+    """[R 4.3] The same restart with nothing loaded: the 15-minute SMA(3) is settled once three 15-minute candles
+    have closed live (00:15, 00:30, 00:45). No entry before 00:45; the RSI cross after it (the trend allowing a
+    long: measured on main, which has no warm-up gate, at 00:55) opens one in the same run."""
+    orders, events = _restart_holding_a_long(
+        tmp_path, monkeypatch, [(12, -0.01), (12, 0.025), (8, -0.03), (8, 0.03), (5, 0.0), (8, -0.04), (20, 0.05)],
+        {"time_stop_bars": 0})
+    assert _says_short(events)
+    filled_at = pd.Timestamp("2025-10-03 00:45", tz="UTC")
+    entries = [pd.Timestamp(o["ts"]) for o in orders if o["intent"] == "entry"]
+    assert entries and all(t >= filled_at for t in entries)
+
+
 # ---- degraded slower candles (rule 5a) ---------------------------------------------------------------------------
 
 def test_a_degraded_slower_candle_still_feeds_its_blocks():
@@ -359,9 +462,10 @@ def test_a_degraded_slower_candle_still_feeds_its_blocks():
     assert sma.count == 2 and sma.value == out[1].close == 219.0
 
 
-def _slow_reader_model():
-    """A test model reading 15-minute candles under 1-minute decisions: long from the first closed 15-minute
-    candle until the third has closed."""
+def _slow_reader_model(minutes=15, capture=None, weights=False):
+    """A test model reading `minutes` candles: long from the first closed one until the third has closed. With
+    `weights`, half in on the first and all in from the second (an add). `capture` collects (close ns, missing) of
+    each slower candle as the model first sees it."""
     from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
     from sleeve_fund.strategies.indicators import Sma
 
@@ -371,11 +475,22 @@ def _slow_reader_model():
     class SlowReader(LongFlatStrategy):
         def __init__(self, config):
             super().__init__(config)
-            self.slow = self.slower(15, Sma(1))
+            self.slow = self.slower(minutes, Sma(1))
+
+        def update_indicators(self, bar):
+            last = self.slow.last
+            if capture is not None and last is not None and (not capture or capture[-1][0] != last.end):
+                capture.append((last.end, getattr(last, "missing", None)))
 
         def want_long(self, bar):
             n = self.slow.count
             return None if n == 0 else n < 3
+
+        def target_weight(self, bar):
+            if not weights:
+                return super().target_weight(bar)
+            n = self.slow.count
+            return None if n == 0 else (0.5 if n == 1 else 1.0)
 
         def explain(self, bar, target):
             return (f"{self.slow.count} closed 15-minute candles", {})
@@ -383,13 +498,10 @@ def _slow_reader_model():
     return SlowReader, SlowReaderConfig
 
 
-@_xf("P1-4 / board 5a", ">10% missing = degraded: no new entries, exits run (on the slower-candle path too).")
-def test_no_entry_on_the_decision_that_closes_a_degraded_slower_candle_and_its_exit_still_runs(monkeypatch,
-                                                                                             instrument):
-    """[5a] names the P1-4 slower candle as one of the paths. The 00:00-00:15 candle misses 2 of its 15 minutes
-    (13%), so the decision at 00:15 that first sees it opens nothing; the 00:30-00:45 candle is degraded too and
-    the exit on it still runs. Whether entries stay blocked until the next whole slower candle is for the Advisor
-    (README), so the entry is only required to come after 00:15 and before the exit."""
+def test_no_entry_while_a_degraded_slower_candle_is_the_latest_and_its_exit_still_runs(monkeypatch, instrument):
+    """[5a] + [R 4.1]. The 00:00-00:15 candle misses 2 of its 15 minutes (13%): no entry from 00:15 to 00:29 while
+    it is the latest closed slower candle; the entry comes at 00:30 when the whole 00:15-00:30 candle closes. The
+    00:30-00:45 candle is degraded too, and the exit on it still runs at 00:45."""
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.strategies import REGISTRY
     from test_replay import START
@@ -408,14 +520,34 @@ def test_no_entry_on_the_decision_that_closes_a_degraded_slower_candle_and_its_e
     whole = run(df)
     assert whole == [("entry", t(15)), ("exit", t(45))]
     thin = run(df.drop([t(4), t(5), t(34), t(35)]))
-    assert [i for i, _ in thin] == ["entry", "exit"]
-    assert t(15) < thin[0][1] < t(45)  # nothing opened on the decision that closed the degraded candle
-    assert thin[1][1] == t(45)  # the exit on the degraded 00:45 candle still ran
+    assert thin == [("entry", t(30)), ("exit", t(45))]
+
+
+def test_no_add_while_a_degraded_slower_candle_is_the_latest(monkeypatch, instrument):
+    """[R 4.1] A weight-sized test model: half in on the first 15-minute candle, all in from the second. With the
+    00:15-00:30 candle missing 2 of its minutes, the add waits from 00:30 until the whole 00:30-00:45 candle closes."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies import REGISTRY
+    from test_replay import START
+
+    monkeypatch.setitem(REGISTRY, "qa_slow_reader", _slow_reader_model(weights=True))
+    idx = pd.date_range(pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=1), periods=60, freq="1min")
+    c = 100 + 0.01 * np.sin(np.arange(len(idx)))
+    df = pd.DataFrame({"open": c, "high": c + 0.01, "low": c - 0.01, "close": c, "volume": 1e6}, index=idx)
+    t = lambda m: pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=m)  # noqa: E731
+
+    def buys(frame):
+        res = run_backtest("qa_slow_reader", frame, instrument, {"rebalance_band": 0.1}, half_spread=0,
+                           bar_minutes=1)
+        f = res.fills.sort_values("ts_last")
+        return [ts for side, ts in zip(f["side"], f["ts_last"]) if side == "BUY"]
+
+    assert buys(df) == [t(15), t(30)]
+    assert buys(df.drop([t(19), t(20)])) == [t(15), t(45)]
 
 
 # ---- parity with a hole (rule 5a) --------------------------------------------------------------------------------
 
-@_xf("P1-4 / board 5a", "parity test: hole inside a slower candle -> identical bar + decisions backtest vs paper.")
 def test_a_hole_inside_a_slower_candle_gives_the_same_candle_and_the_same_trades_in_backtest_and_paper(tmp_path,
                                                                                                      monkeypatch):
     """[5a] parity line, on the design's own parity set-up (1-minute RSI under a 15-minute trend average, the

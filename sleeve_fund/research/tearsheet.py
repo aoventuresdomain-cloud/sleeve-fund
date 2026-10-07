@@ -34,6 +34,9 @@ NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
 RANDOM_ENTRY_CHECK = "Beats random entry times"
 RANDOM_SIDE_CHECK = "Beats random long or short"
+LIQUIDATION_CHECK = "Liquidations"
+# A G1 check that a person's acknowledgement can clear: shown, and it stops a pass until acknowledged.
+NEEDS_ACK = "ACK"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
               RANDOM_ENTRY_CHECK, RANDOM_SIDE_CHECK)
 # More of the test windows' trades than this left out at the edges, and the trade count is flagged.
@@ -73,7 +76,17 @@ def _num(x: float) -> str:
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.2f}"
 
 
-def _row(label: str, s: dict, b: dict) -> str:
+# A benchmark with no days to summarise: a perp hold whose funding isn't known over the window (RE-COST).
+_NO_BENCHMARK = {"cagr": math.nan, "sharpe": math.nan, "max_drawdown": math.nan, "sortino": math.nan,
+                 "calmar": math.nan, "volatility": math.nan, "days": 0}
+
+
+def _bench(returns) -> dict:
+    return summary(returns) if returns is not None and len(returns.dropna()) >= 2 else _NO_BENCHMARK
+
+
+def _row(label: str, s: dict, b: dict | None) -> str:
+    b = b or _NO_BENCHMARK
     return (
         f"| {label} | {_pct(s['cagr'])} | {_pct(b['cagr'])} | {_num(s['sharpe'])} | {_num(b['sharpe'])} "
         f"| {_pct(s['max_drawdown'])} | {_pct(b['max_drawdown'])} |"
@@ -142,17 +155,23 @@ def _nearby(r: StudyResult) -> tuple[str, str]:
     return ("FAIL" if final[0] == "FAIL" or failed else "PASS"), words
 
 
-def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
+def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
+              liquidation_ack: str | dict | None = None) -> list[tuple[str, str, str]]:
     """register: the trials register, when the study ran against the database. Its count of variants, which
-    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
-    oos = summary(r.oos_returns)
-    bench = summary(r.oos_benchmark_returns)
+    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's.
+    liquidation_ack: the PM's acknowledgement of the study's liquidations after gaps past correctly placed stops: a
+    note for all of them, or Store.g1_acks' rows by liquidation time. Never read for any other liquidation."""
+    # On a perpetual the benchmark is the perp hold, priced only on the out-of-sample days its funding is known for,
+    # and the strategy is compared on those same days (Advisor, 7 Oct 2026, RE-COST).
+    insufficient = getattr(r, "hold_insufficient", False)
+    oos = _bench(r.compare_returns)
+    bench = _bench(r.oos_benchmark_returns)
     bench_sharpe_full = summary(daily_returns(r.full_period_benchmark.equity))["sharpe"]
     share_beating = float((r.sensitivity["sharpe"] > bench_sharpe_full).mean()) if len(r.sensitivity) else 0.0
     trips = r.oos_trades
     counts = _counts(r, ledger, register)
-    beats, hurdle = sharpe_beats_probability(r.oos_returns, r.oos_benchmark_returns, counts["variants"],
-                                             trial_spread=_trial_spread(r, register))
+    beats, hurdle = (math.nan, math.nan) if insufficient else sharpe_beats_probability(
+        r.compare_returns, r.oos_benchmark_returns, counts["variants"], trial_spread=_trial_spread(r, register))
     unjudged = math.isnan(beats)
     if unjudged:
         beats = 0.0  # too short, or too few independent days, to judge
@@ -165,7 +184,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
             "INFO",
             f"CAGR {_pct(oos['cagr'])} vs {_pct(bench['cagr'])}",
         ),
-        (
+        (SHARPE_CHECK, NOT_APPLICABLE, f"no verdict: {r.hold_note}") if insufficient else (
             SHARPE_CHECK,
             "PASS" if oos["sharpe"] > bench["sharpe"] and beats >= G1_CONFIDENCE else "FAIL",
             f"Sharpe {_num(oos['sharpe'])} vs {_num(bench['sharpe'])}; " + (
@@ -177,7 +196,9 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
         (RANDOM_SIDE_CHECK, *((NOT_APPLICABLE, "long only: there is no side to draw") if r.random_side is None else
                               (NOT_APPLICABLE if r.random_side.verdict == "N/A" else r.random_side.verdict,
                                r.random_side.words))),
-        (
+        ("Holds up when parameters move", NOT_APPLICABLE,
+         "no verdict: the perpetual buy and hold isn't priced over the whole research period, since a funding "
+         "settlement in it has no known rate") if not getattr(r, "hold_full_period", True) else (
             "Holds up when parameters move",
             "PASS" if share_beating >= ROBUST_SHARE else "FAIL",
             f"{share_beating:.0%} of {len(r.sensitivity)} grid points beat the benchmark Sharpe (bar: {ROBUST_SHARE:.0%})",
@@ -186,6 +207,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
         (NEARBY_CHECK, *_nearby(r)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
+        *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         (
             "Holdout not used for tuning",
             "PASS",
@@ -205,6 +227,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
             + _excluded_words(r) +
             f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
+        _liquidation_check(r, liquidation_ack),
     ]
     if why_not:
         # Under a NOT JUDGED headline these can't fail: they measure the out-of-sample the study didn't get,
@@ -213,6 +236,64 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
                    f"not judged: {ev}" if verdict == "FAIL" and name in OOS_CHECKS else ev)
                   for name, verdict, ev in checks]
     return checks
+
+
+def _liquidation_check(r: StudyResult, ack: str | dict | None) -> tuple[str, str, str]:
+    """GAP-LIQ-CAP (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19 (5)): any liquidation in out-of-sample or
+    the holdout is a G1 finding, whatever the P&L. A gap past a stop placed within half the distance to liquidation
+    stops a pass until the PM acknowledges it; with no stop, or one beyond half way, it is a FAIL no acknowledgement
+    clears."""
+    liqs = getattr(r, "liquidations", None) or []
+    if not liqs:
+        return LIQUIDATION_CHECK, "PASS", "none in out-of-sample or the holdout"
+    words, waiting = [], False
+    for liq in liqs:
+        lost = f"{liq['x']:,.2f} lost" if liq.get("x") is not None else "its margin lost"
+        if not liq["stop_ok"]:
+            # An acknowledgement is never read here: it records that the PM has seen it, never a pass (DA, HoE).
+            why = ("no stop" if liq["stop_why"] == "missing" else f"its stop was {liq['stop_why']}") + \
+                ": a G1 FAIL the PM's acknowledgement can't clear"
+        elif (note := _ack_for(ack, liq)) is not None:
+            why = f"a gap past a correctly placed stop at {liq['stop_px']:,.6g}, acknowledged by the PM: {note}"
+        else:
+            waiting = True
+            why = f"a gap past a correctly placed stop at {liq['stop_px']:,.6g}: needs the PM's acknowledgement"
+        words.append(f"liquidated in the {liq['window']} on {pd.Timestamp(liq['ts']):%d %b %Y} ({lost}); {why}")
+    verdict = "FAIL" if any(not liq["stop_ok"] for liq in liqs) else NEEDS_ACK if waiting else "PASS"
+    return LIQUIDATION_CHECK, verdict, "; ".join(words)
+
+
+def _ack_for(ack, liq: dict) -> str | None:
+    """The PM's acknowledgement of one liquidation: a note covering every one, or the store's acknowledgements by
+    liquidation time (Store.g1_acks: {liquidation_ts: row}); None when it isn't acknowledged."""
+    if ack is None or isinstance(ack, str):
+        return ack or None
+    row = next((v for ts, v in ack.items() if pd.Timestamp(ts) == pd.Timestamp(liq["ts"])), None)
+    if row is None:
+        return None
+    return (row.get("note") if isinstance(row, dict) else None) or "acknowledged"
+
+
+FIRST_TOUCH_CHECK = "First-touch candles resolved by rule (shown, not a test)"
+
+
+def first_touch_words(r: StudyResult) -> str:
+    """R2-G1: how many out-of-sample candles a first_touch rule settled by its fixed resolution, and over the
+    threshold, both resolutions' results and which one G1 judged."""
+    ft = r.first_touch
+    words = (f"{ft['ambiguous']} of {ft['reached']} out-of-sample level-reaching candles ({ft['share']:.1%}) were "
+             f"same-minute ambiguous (threshold {ft['threshold']:.0%} pooled or in any fold, or under "
+             f"{ft['min_reached']} candles)")
+    if not ft["flipped"]:
+        return words + ": judged as ruled"
+    ruled, opposite = ft["as_ruled"], ft["opposite"]
+    words += (f": re-run the opposite way. As ruled ({ft['resolved']}): Sharpe {_num(ruled['sharpe'])}, CAGR "
+              f"{_pct(ruled['cagr'])}; opposite ({ft['opposite_resolved']}): Sharpe {_num(opposite['sharpe'])}, CAGR "
+              f"{_pct(opposite['cagr'])}. "
+              f"Judged on the worse, {'the opposite' if ft['judged_on'] == 'opposite' else 'as ruled'}")
+    if "holdout_judged_on" in ft:
+        words += f"; the holdout on {'the opposite' if ft['holdout_judged_on'] == 'opposite' else 'as ruled'}"
+    return words
 
 
 def _random_entry_check(r: StudyResult) -> tuple[str, str, str]:
@@ -286,10 +367,10 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
-    oos_b = summary(r.oos_benchmark_returns)
+    oos_b = _bench(r.oos_benchmark_returns)
     full = summary(daily_returns(r.full_period.equity))
     full_b = summary(daily_returns(r.full_period_benchmark.equity))
     counts = _counts(r, ledger, register)
@@ -339,7 +420,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
-    checks = g1_checks(r, ledger, register)
+    checks = g1_checks(r, ledger, register, liquidation_ack)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
@@ -373,8 +454,24 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     out.append("")
     out.append(f"Out-of-sample Sortino {_num(oos['sortino'])} vs {_num(oos_b['sortino'])}; "
                f"Calmar {_num(oos['calmar'])} vs {_num(oos_b['calmar'])}; "
-               f"volatility {oos['volatility']:.0%} vs {oos_b['volatility']:.0%}.")
+               f"volatility {oos['volatility']:.0%} vs {'n/a' if math.isnan(oos_b['volatility']) else f"{oos_b['volatility']:.0%}"}.")
     out.append("")
+    if getattr(r, "hold_note", ""):
+        out.append(f"Benchmark: {r.hold_note}.")
+        out.append("")
+    spot = getattr(r, "spot_hold_returns", None)
+    if spot is not None and len(spot.dropna()) >= 2:
+        s_ = summary(spot)
+        out.append(f"Holding spot instead, out-of-sample: CAGR {_pct(s_['cagr'])}, Sharpe {_num(s_['sharpe'])}, "
+                   f"max drawdown {_pct(s_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    stress = getattr(r, "funding_stress", None)
+    if stress:
+        (s0, s1), (h0, h1) = stress["strategy"], stress["hold"]
+        out.append(f"Funding stress, full research period: at {stress['rate']:.2%} a settlement instead of the assumed "
+                   f"{stress['assumed']:.2%}, the strategy returns {_pct(s1)} (from {_pct(s0)}) and the perpetual buy "
+                   f"and hold {_pct(h1)} (from {_pct(h0)}). The assumed rate is light in strong uptrends.")
+        out.append("")
     out.append("## Trading and costs (full research period, default params)")
     out.append("")
     out.append("| Closed trades | Win rate | Net P&L | Avg win | Avg loss | Expectancy per trade | Profit factor | Best | Worst |")
@@ -396,11 +493,14 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
         out.append("")
         out.append(f"**Break-even fee:** {_breakeven_words(r)}.")
         out.append("")
-        out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid |")
-        out.append("| --- | --- | --- | --- | --- |")
+        out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid | Out-of-sample timing "
+                   "| Random entry (median) |")
+        out.append("| --- | --- | --- | --- | --- | --- | --- |")
         for rung in r.cost_ladder:
+            timing, rand = getattr(rung, "oos_timing_return", None), getattr(rung, "random_return", None)
             out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
-                       f"| {rung.fees_paid:,.0f} |")
+                       f"| {rung.fees_paid:,.0f} | {'—' if timing is None else _pct(timing)} "
+                       f"| {'—' if rand is None else _pct(rand)} |")
         out.append("")
         out.append("The settings tuning on the whole research period picks (best in-sample Sharpe on the grid), at "
                    "each fee, charged per side on maker and taker fills alike, so for a post-only strategy it mixes "
@@ -408,7 +508,9 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
                    f"bid-ask spread as above plus {r.ladder_slippage:.2%} slippage on orders that take liquidity. 0.02% and "
                    "0.05% are a low-fee perpetual venue's maker and taker rates, 0.10-0.40% typical spot taker rates, "
                    "0.80% a high-fee spot venue's taker rate. The break-even interpolates log(1 + return) between "
-                   "rungs, then re-runs at that fee to verify it.")
+                   "rungs, then re-runs at that fee to verify it. The last two columns are the random-entry benchmark "
+                   "at the rung's cost: the strategy's out-of-sample trips priced on the bars' closes, and the median "
+                   "of the same number of random trips held as long.")
         out.append("")
     out.append("## Walk-forward folds")
     out.append("")
@@ -418,7 +520,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
         out.append(
             f"| {f.train_start:%b %Y} to {f.train_end:%b %Y} | {f.test_end:%b %Y} | {json.dumps(f.chosen)} "
             f"| {_num(f.train_sharpe)} | {f.closed_in_window}{_halted_on(f.halted)} | {_pct(f.test['cagr'])} "
-            f"| {_pct(f.benchmark_test['cagr'])} | {_num(f.test['sharpe'])} | {_num(f.benchmark_test['sharpe'])} |"
+            f"| {_pct((f.benchmark_test or _NO_BENCHMARK)['cagr'])} | {_num(f.test['sharpe'])} "
+            f"| {_num((f.benchmark_test or _NO_BENCHMARK)['sharpe'])} |"
         )
     out.append("")
     out.append("## Parameter sensitivity (full research period, in-sample)")

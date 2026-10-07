@@ -1,4 +1,4 @@
-"""Run a venue's market data hub (v2 P1-1): python -m sleeve_fund.hub run --venue binance [--port 7700].
+"""Run a venue's market data hub (v2 P1-1): python -m sleeve_fund.hub run --venue <venue> [--port 7700].
 
 The hub is its venue's one history-store writer: besides the closed bars it relays, it runs the store's REST
 backfill and funding refresh (python -m sleeve_fund.history run) on a thread of its own, so no second process

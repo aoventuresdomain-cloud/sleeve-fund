@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund import backups
+from sleeve_fund import backups, markets
 from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store, utcnow
+from sleeve_fund.venues import venue as venue_profile
 
 FEED_FRESH_SECONDS = 60  # past this a strategy's price feed reads as stale, here and on its page
 
@@ -29,11 +30,10 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     for x in summaries:
         s, p = x["sleeve"], x["profile"]
         peak = store.peak_equity(s.name) or s.starting_balance
-        shocks = []
+        shocks, at_stake = [], most_it_can_lose(x)
         for shock in SHOCKS:
-            # Signed: a long loses in a fall, a short in a rally. An isolated-margin strategy is liquidated
-            # before it loses more than its equity, so that is the most it can lose.
-            loss = min(x["position_value"] * -shock, max(x["equity"], 0.0))
+            # Signed: a long loses in a fall, a short in a rally, at most what it has at stake (most_it_can_lose).
+            loss = min(x["position_value"] * -shock, at_stake)
             after = x["equity"] - loss
             dd_after = 1 - after / max(peak, x["equity"]) if peak else 0.0
             # A strategy with nothing left (wiped out) can't breach again: it is already halted (m12 fix re-check, mF-3).
@@ -61,9 +61,26 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
             "margin": held["margin"], "open_risk": held["open_risk"], "unbounded": held["unbounded"],
+            "trailing": held["trailing"],
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
+
+
+def most_it_can_lose(x: dict) -> float:
+    """The most a strategy's open position can lose from the mark, however far the market moves. A perpetual
+    on isolated margin is liquidated before it loses more than its margin (notional at entry over the profile's
+    leverage cap, markets.isolated_margin) and what it has made or lost since entry, plus the fee on the
+    liquidation; the rest of its equity is not at risk (m13-U6). Anything else can lose at most its equity."""
+    equity, s, qty = max(x["equity"], 0.0), x["sleeve"], x.get("qty") or 0.0
+    t = markets.terms(s.params, s.venue) if qty else None
+    if t is None:
+        return equity
+    entry, lev = x.get("entry_px") or x["price"], x["profile"].max_leverage
+    liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
+    taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
+    cap = markets.gap_loss_cap(qty, entry, lev, x["cash"] + qty * entry, taker, liq)  # what the engine books (P1-D3)
+    return min(max(cap + x.get("unrealised", 0.0), 0.0), equity)
 
 
 def largest_asset(allocation: list[dict], equity: float) -> dict | None:

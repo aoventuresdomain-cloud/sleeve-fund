@@ -684,15 +684,19 @@ LS_CASES = {
 }
 
 
+@pytest.mark.parametrize("profile,stop", [("conservative", {}), ("balanced", {"stop_loss": 0.03})],
+                         ids=["1x-stopless", "2x-3pct-stop"])
 @pytest.mark.parametrize("strategy", list(LS_CASES))
-def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy):
+def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp_path, strategy, profile,
+                                                                                      stop):
     """The PM's two test strategies and the probe, long and short on the simulated low-fee perpetual: paper
     replayed tick by tick and the backtest on minute bars send the same orders (shorts included) in the
-    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee."""
+    same minute, at the same size and all-in price to within 0.3 bp, and pay the perp's taker fee. With every guard
+    on (QA P1-S4, SG12): a stopless model at 1x, and at 2x with a 3% stop."""
     params, path = LS_CASES[strategy]
-    params = {**params, **PERP}
+    params = {**params, **PERP, **stop}
     paper, bt = _paper_and_backtest(tmp_path, path(np.arange(240 * 60)), params, strategy=strategy,
-                                    profile="balanced")
+                                    profile=profile)
     # The backtest's last bar closes on the last trade; paper's would close on a trade after it, which never
     # comes. An order on that bar alone is an edge of the recording, not a difference.
     end = pd.Timestamp(START, tz="UTC") + pd.Timedelta(minutes=240)
@@ -723,7 +727,7 @@ def test_paper_sells_short_at_the_bid_and_buys_it_back_at_the_ask(tmp_path):
     of the book, which would hand the short the spread. (The recording quotes $6 either side of each trade.)"""
     params = {"period": 7, **PERP}
     prices = LS_CASES["probe_ls"][1](np.arange(180 * 60))
-    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="balanced", strategy="probe_ls")
+    trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile="conservative", strategy="probe_ls")
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
     intent = {o["order_id"]: o["intent"] for o in orders}
     shorts = [f for f in fills if intent[f["order_id"]] == "entry" and f["side"] == "SELL"]
@@ -1064,17 +1068,19 @@ def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no
     liq = opened["signal"]["liquidation_px"]
     assert (gap > liq) if opened["side"] == "SELL" else (gap < liq)  # the gap went past it
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
-    # Isolated margin: what the gap lost past the strategy's equity is the venue's insurance fund's, booked
-    # once, to the cent, in the journal as in the result, and the strategy ends at zero, not below.
+    # Isolated margin: what the gap lost past the position's margin is the venue's insurance fund's (Independent
+    # Quant Advisor, QA P1-D3), booked once, to the cent, in the journal as in the result; the rest is kept.
     cash = 10_000.0 + sum(f["amount"] for f in j.funding_)
     for f in j.fills_:
         cash -= (1 if f["side"] == "BUY" else -1) * f["qty"] * f["price"] + f["fee"]
-    shortfall = max(0.0, -cash)
-    if shortfall:
+    sign = 1 if opened["side"] == "BUY" else -1
+    margin = opened["filled_qty"] * opened["avg_px"] / risk.profile(profile).max_leverage
+    past = sign * (opened["avg_px"] - closed["avg_px"]) * opened["filled_qty"] - margin
+    if past > 0:
         assert len(res.insurance) == len(j.insurance_) == 1, (res.insurance, j.insurance_)
-        assert res.insurance[0]["amount"] == pytest.approx(shortfall, abs=0.011)
+        assert res.insurance[0]["amount"] == pytest.approx(past, abs=0.011)
         assert j.insurance_[0]["amount"] == pytest.approx(res.insurance[0]["amount"], abs=1e-8)
-        assert 0 <= res.equity.iloc[-1] < 0.02, res.equity.iloc[-1]
+        assert res.equity.iloc[-1] == pytest.approx(cash + past, abs=0.02), res.equity.iloc[-1]
     else:
         assert not res.insurance and not j.insurance_
 

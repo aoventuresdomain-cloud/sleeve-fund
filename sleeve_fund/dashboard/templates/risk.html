@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, usage, help, stop_words %}
+{% from "_macros.html" import chip, usage, help, stop_words, trail_words, trailing_risk, open_risk_hint, open_risk_text %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
 {# The stop a row shows: an open position's own, as Risk to stop prices it (P1-U14); else the model's setting. #}
-{% macro live_stop_title(r) %}{% if r.stop_dist is not none %}The position's stop at {{ r.position.stop_px|px }}, {{ r.stop_dist|pct1 }} from its entry{% else %}{{ stop_words(r.x.sleeve.params) }}{% endif %}{% endmacro %}
+{% macro live_stop_title(r) %}{% if r.stop_dist is not none %}The position's stop at {{ r.position.stop_px|px }}, {{ r.stop_dist|pct1 }} from its entry{% if r.position.stop_basis %}, {{ r.position.stop_basis }}{% endif %}{% else %}{{ stop_words(r.x.sleeve.params) }}{% endif %}{% endmacro %}
 {% macro tone_of(status) %}{{ {'running': 'ok', 'paused': 'warn', 'starting': 'warn', 'halted': 'bad', 'error': 'bad'}.get(status, 'off') }}{% endmacro %}
 {% macro flatten_button(cls) %}{% if kill.all %}<button type="button" class="ghost-danger {{ cls }}" data-open="dlg-kill">Flatten everything</button>{% elif kill.flattening %}<button type="button" class="ghost-danger {{ cls }}" disabled title="Every strategy is already selling">Selling to cash…</button>{% endif %}{% endmacro %}
 {% block title %}Risk &amp; health · Multi-Strategy Fund{% endblock %}
@@ -71,7 +71,7 @@
         <div class="rh-bar"><i class="{{ 'b' if r.dd_used > 0.8 else ('w' if r.dd_used > 0.5) }}" style="width:{{ (r.dd_used * 100)|round(1) }}%"></i></div>
         <span>{% if s.status == 'halted' %}Halted{% else %}{{ left|pct1 }} left<span class="rh-wide"> before halt</span>{% endif %}</span>
       </div>
-      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
+      <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span class="rh-chip" title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
     </div>{% else %}<p class="empty" style="padding:4px 18px 16px">No strategies in the book yet.</p>{% endfor %}
   </section>
 
@@ -97,7 +97,7 @@
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
   {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
   <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ risk.margin|money }}</div></div>
-  <div{% if risk.unbounded %} title="{{ risk.unbounded|join(', ') }}: no stop, so unbounded"{% else %} title="Money lost if every stop is hit"{% endif %}><div class="k">Open risk</div><div class="v{{ ' warn' if risk.unbounded }}">{{ risk.open_risk|money }}{{ '+' if risk.unbounded }}</div></div>
+  <div title="{{ open_risk_hint(risk.unbounded, risk.trailing) }}"><div class="k">Open risk</div><div class="v{{ ' warn' if risk.unbounded or risk.trailing }}">{{ open_risk_text(risk.open_risk, (risk.unbounded|length) + (risk.trailing|length)) }}</div></div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
 
@@ -113,11 +113,11 @@
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
-      <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% else %}<span class="warn">None</span>{% endif %}</td>
+      <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="warn">None</span>{% endif %}</td>
       {% set pos = r.position %}
       <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
       <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>
-      <td class="num" data-m="hide">{% if not pos %}<span class="faint">–</span>{% elif not pos.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ pos.risk_to_stop|money }}{% endif %}</td>
+      <td class="num" data-m="hide">{% if not pos %}<span class="faint">–</span>{% elif pos.trailing %}{{ trailing_risk() }}{% elif not pos.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ pos.risk_to_stop|money }}{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table>
 </section>
@@ -131,7 +131,7 @@
       <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
-  <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact.</p>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact, and at 3x, a gap through liquidation loses the whole position margin.</p>
 </section>
 {# How the strategies move together: moved here from the Portfolio's Allocation tab (UI v2), as a risk tool. #}
 <section class="panel" aria-labelledby="corr-h">

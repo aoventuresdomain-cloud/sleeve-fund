@@ -166,6 +166,7 @@ def test_a_position_held_across_a_restart_with_a_short_slower_warm_up_still_exit
     s._slower[0].need = 5
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac, s._restore = 100.0, 1, 0.02, 0.05, None
     s.runtime.backtest, s.runtime.now = False, lambda: None
+    s._mark = lambda: (0.0, 0.0, 0.0, 97.5)  # no engine behind this fake: a stop reads the account (#182)
     assert s._check_exits(97.5)  # past the 2% stop: it sells
     assert sold[-1][0] == "stop_loss"
     s, bar, events, sold, opened = _late_strategy(side_now=0, wants=1)
@@ -247,3 +248,69 @@ def test_a_hole_inside_a_slower_candle_gives_the_same_candle_and_decisions_in_a_
     assert holed.volume == 9 * 60.0  # built from the nine minutes present, nothing made up for the six missing
     assert len(hub) >= 6 and dec.late == 0
     _assert_same(hub, bt)
+
+
+def _hourly(n=24 * 60, seed=3):
+    from sleeve_fund.data import synthetic_ohlcv
+
+    hourly = synthetic_ohlcv(days=n, seed=seed, vol=0.012, drift=0.0)
+    hourly.index = pd.date_range("2026-01-01 01:00", periods=n, freq="1h", tz="UTC")  # stamped at each close
+    return hourly
+
+
+_TRENDED = {"rsi_period": 14, "long_entry": 45, "long_exit": 60, "trend_sma": 3, "trend_minutes": 240}
+
+
+def test_no_future_data_a_slower_candle_is_read_only_once_it_has_closed(instrument, monkeypatch):
+    """Advisor (7 Oct, a merge condition for P1-4): a higher-timeframe candle may be used only after it has closed.
+    On a backtest of hourly decisions under a 4-hour trend filter, every read of the filter sees the latest 4-hour
+    candle closed at or before the decision candle, never one still forming."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies.rsi_cross import RsiCross
+
+    reads, now = [], {}
+    update, allows = RsiCross.update_indicators, RsiCross._trend_allows
+
+    def spy_update(self, bar):
+        now["ts"] = bar.ts_event
+        return update(self, bar)
+
+    def spy_allows(self, side):
+        last = self._trend_candles.last
+        reads.append((now["ts"], last.end if last is not None else None))
+        return allows(self, side)
+
+    monkeypatch.setattr(RsiCross, "update_indicators", spy_update)
+    monkeypatch.setattr(RsiCross, "_trend_allows", spy_allows)
+    params = _TRENDED
+    run_backtest("rsi_cross", _hourly(), instrument, params, bar_minutes=60)
+    judged = [(ts, end) for ts, end in reads if end is not None]
+    assert len(judged) >= 20  # the filter was read often enough for this to mean something
+    for ts, end in judged:
+        assert end <= ts, "a 4-hour candle was read before its close"
+        assert end == ts - ts % H4, "the filter lagged the latest closed 4-hour candle"
+
+
+def test_no_future_data_changing_prices_after_a_cut_inside_a_slower_candle_changes_nothing_before_it(instrument):
+    """Advisor (7 Oct): the same rule seen from outside. Every price from a cut two hours into a 4-hour candle is
+    tripled, so that candle's close, the next filter value, is changed; every fill and equity point before the cut
+    must be unchanged. The filter is shown to decide trades before the cut, so the check is not vacuous."""
+    from sleeve_fund.research.runner import run_backtest
+
+    prices = _hourly()
+    cut = next(k for k in range(len(prices) * 2 // 3, len(prices)) if prices.index[k].hour % 4 == 2)
+    altered = prices.copy()
+    altered.iloc[cut:, :4] = altered.iloc[cut:, :4] * 3
+    params = _TRENDED
+    a = run_backtest("rsi_cross", prices, instrument, params, bar_minutes=60)
+    b = run_backtest("rsi_cross", altered, instrument, params, bar_minutes=60)
+    unfiltered = run_backtest("rsi_cross", prices, instrument, {**params, "trend_sma": 0}, bar_minutes=60)
+    before = prices.index[cut]
+
+    def fills(res):
+        f = res.fills
+        return f[pd.to_datetime(f["ts_last"], utc=True) < before][["side", "filled_qty", "avg_px", "ts_last"]].astype(str)
+
+    assert len(fills(a)) >= 4 and not fills(a).reset_index(drop=True).equals(fills(unfiltered).reset_index(drop=True))
+    assert fills(a).reset_index(drop=True).equals(fills(b).reset_index(drop=True))
+    assert a.equity.iloc[:cut].equals(b.equity.iloc[:cut])

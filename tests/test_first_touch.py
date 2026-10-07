@@ -112,7 +112,7 @@ def test_reached_x_first_inside_the_candle_enters_on_its_close_and_says_when(ins
     ft = entry["signal"]["first_touch"]["long.entry"]
     assert ft == {"x": 101.0, "y": 99.0, "x_minute": "2025-10-03T00:18:00+00:00",
                   "y_minute": "2025-10-03T00:25:00+00:00", "same_minute": False, "held": True, "by": "minutes",
-                  "unknown": None}
+                  "unknown": None, "missing_minutes": [], "judged": 1, "incomplete": 0}
     stats = res.first_touch["long.entry"]
     assert stats["true"] == 1 and stats["same_minute"] == 0
 
@@ -229,3 +229,76 @@ def test_minutes_that_miss_part_of_the_first_or_last_decision_candle_are_refused
     with pytest.raises(ValueError, match="1-minute bars of every decision candle"):
         run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
                      exec_prices=minutes, exec_minutes=1)
+
+
+def test_levels_equal_by_arithmetic_order_are_refused_as_the_same_level():
+    """QA R2 round 1 F1: close + 1 and 1 + close are one level; neither can come first."""
+    rule = {"first_touch": {"reach": {"add": ["close", 1]}, "before": {"add": [1, "close"]}}}
+    with pytest.raises(ValueError, match="same level"):
+        check_definition({**DEFN, "long": {"entry": rule}}, bar_spec="15-MINUTE-LAST-INTERNAL")
+    check_definition({**DEFN, "long": {"entry": {"first_touch": {"reach": {"sub": ["close", 1]},
+                                                                  "before": {"sub": [1, "close"]}}}}},
+                     bar_spec="15-MINUTE-LAST-INTERNAL")  # subtraction doesn't commute: two levels
+
+
+# --- R2-INC: decisions on incomplete minutes ---------------------------------------------------------------------
+
+def test_a_candle_its_minutes_settle_names_the_ones_not_to_hand_and_the_range_never_does():
+    """Minutes 2 and 4 of a 5-minute candle are absent. X is reached in minute 1, so the order is known and X holds,
+    but the decision was made on incomplete minutes. A candle the range settles reads no minutes, so none is absent."""
+    have = [m for m in _m((101.2, 100.0), (100.5, 99.5), (100.5, 99.5), (100.5, 99.5), (100.0, 98.8))
+            if m[0] not in (2 * M, 4 * M)]
+    t = first_touch(have, 101.0, 99.0, 100.0, high=101.2, low=98.8, start=0, step=5)
+    assert t.holds and t.unknown is None and t.absent == (2 * M, 4 * M)
+    assert first_touch(have, 101.0, 99.0, 100.0, high=101.2, low=99.5, start=0, step=5).absent == ()
+
+
+@pytest.mark.parametrize("drop, entered, missing", [(18, False, 1), (22, True, 0)], ids=["before-x", "after-x"])
+def test_a_decision_on_incomplete_minutes_is_counted_with_its_share_and_named_in_the_lineage(instrument, drop,
+                                                                                              entered, missing):
+    """X at candle B's 5th minute, Y at its 10th. Its 3rd minute missing: unknown, no entry. Its 7th: X still came
+    first and it enters. Both are decisions on incomplete minutes; the entry's lineage names the minute."""
+    b = FLAT * 4 + [(101.2, 100.0)] + FLAT * 4 + [(100.0, 98.8)] + FLAT * 5
+    res = _run(instrument, b, drop=[drop])
+    stats = res.first_touch["long.entry"]
+    assert _entered(res) is entered and stats["missing"] == missing and stats["incomplete"] == 1
+    assert stats["incomplete_share"] == pytest.approx(1 / stats["judged"])
+    if entered:
+        entry = next(d for d in res.decisions.values() if d["intent"] == "entry")
+        ft = entry["signal"]["first_touch"]["long.entry"]
+        assert ft["missing_minutes"] == ["2025-10-03T00:22:00+00:00"] and ft["incomplete"] == 1
+
+
+def test_complete_minutes_are_never_counted_incomplete(instrument):
+    res = _run(instrument, FLAT * 4 + [(101.2, 100.0)] + FLAT * 4 + [(100.0, 98.8)] + FLAT * 5)
+    assert res.first_touch["long.entry"]["incomplete"] == 0 and res.first_touch["long.entry"]["incomplete_share"] == 0
+
+
+def test_paper_journals_every_decision_on_incomplete_minutes_and_a_backtest_none():
+    """One info event per such candle, every time (not once), naming the minutes; nothing outside paper."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.definitions import FirstTouch
+    from sleeve_fund.strategies.rules import Rules
+
+    said = []
+    node = FirstTouch("x", "y", "c", None, path="long.entry")
+    have = [m for m in _m((101.2, 100.0), (100.5, 99.5), (100.5, 99.5), (100.5, 99.5), (100.0, 98.8))
+            if m[0] != 2 * M]
+    for k in range(2):  # the same gap on two candles: said twice
+        shift = k * 5 * M
+        env = SimpleNamespace(ts=5 * M + shift, prev={"x": 101.0, "y": 99.0, "c": 100.0}, span=(101.2, 98.8),
+                              ohlcv=None, minutes=[(m[0] + shift, *m[1:]) for m in have], minutes_due=5, note=None,
+                              journal=lambda kind, msg: said.append((kind, msg)))
+        node.tick(env)
+    assert [k for k, _ in said] == ["first_touch_incomplete"] * 2
+    assert said[0][1] == ("long.entry: decided on incomplete minutes for the candle to 1970-01-01T00:05:00+00:00: "
+                          "1 of 5 minutes missing (1970-01-01T00:02:00+00:00); taken as true")
+
+    events = []
+    runtime = SimpleNamespace(name="s", backtest=False, now=lambda: None,
+                              store=SimpleNamespace(event=lambda *a, **kw: events.append(a)))
+    Rules._journal(SimpleNamespace(runtime=runtime, _backtest=False), "first_touch_incomplete", "m")
+    Rules._journal(SimpleNamespace(runtime=runtime, _backtest=True), "first_touch_incomplete", "m")
+    Rules._journal(SimpleNamespace(runtime=None, _backtest=True), "first_touch_incomplete", "m")
+    assert events == [("s", "info", "first_touch_incomplete", "m")]

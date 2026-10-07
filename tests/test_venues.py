@@ -74,16 +74,29 @@ def test_a_second_venue_backtests_without_engine_changes(test_venue):
     assert cfg.instrument_id == "ABC/USD.TESTX" and cfg.fees == test_venue.fees
 
 
-def test_engine_code_names_no_venue():
-    """Strategies, runtime, research and the backtest path read the sleeve's venue profile; only
-    venues.py (and the venue's own data loaders) may name a venue."""
-    paths = [*(ROOT / "sleeve_fund" / "strategies").glob("*.py"), *(ROOT / "sleeve_fund" / "research").glob("*.py"),
-             *(ROOT / "sleeve_fund" / "paper").glob("*.py"), ROOT / "sleeve_fund" / "dashboard" / "preview.py",
-             ROOT / "sleeve_fund" / "dashboard" / "charts.py", ROOT / "sleeve_fund" / "instruments.py",
-             ROOT / "sleeve_fund" / "markets.py", ROOT / "sleeve_fund" / "funding.py"]
-    offenders = [p.name for p in paths if re.search(r"kraken|binance", p.read_text(), re.I)]
-    # safety.py lists venue credential prefixes so it can refuse any of them; that is the point of it.
-    assert offenders == ["safety.py"]
+# The only modules that may name a venue, each for its own reason (QA round 13, v13-5).
+MAY_NAME_A_VENUE = {
+    "venues.py": "the venue profiles themselves",
+    "data.py": "the venues' own data loaders, which their profiles call",
+    "mirror.py": "the demo mirror talks to named demo hosts only, by design (routing parked for v2, v13-2)",
+    "safety.py": "lists venue credential prefixes so it can refuse every one of them",
+    "accounts.py": "recognises the note older versions saved, so it can replace it on read",
+    "wording.py": "turns a venue name into what it is (\"the demo account\") in what the PM reads, so it names each one",
+}
+
+
+def test_only_the_venue_modules_name_a_venue():
+    """Everything else reads the strategy's venue profile: no Python module outside MAY_NAME_A_VENUE names a
+    registered venue or a demo target, in code or comments (round 13 audit, v13-4/v13-5). Templates wait for UI
+    v2's copy."""
+    from sleeve_fund.venues import VENUES
+
+    names = sorted({*(v.lower() for v in VENUES), "bybit", "deribit", "coinbase", "okx"})
+    pattern = re.compile("|".join(names), re.I)
+    offenders = sorted(str(p.relative_to(ROOT)) for p in (ROOT / "sleeve_fund").rglob("*.py")
+                       if p.name not in MAY_NAME_A_VENUE and pattern.search(p.read_text()))
+    assert offenders == []
+    assert {"kraken", "binance"} <= set(names)  # the guard covers the registered venues
 
 
 def test_accounts_and_g2_name_no_venue_but_from_data():

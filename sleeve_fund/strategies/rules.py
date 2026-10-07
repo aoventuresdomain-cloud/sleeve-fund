@@ -148,11 +148,14 @@ def _levels(definition: dict) -> dict[str, set]:
 
 
 class Rules(LongFlatStrategy):
+    REENTER_AFTER_EXIT_LEG = True
+
     def __init__(self, config: RulesConfig) -> None:
         super().__init__(config)
         self.c = config
         self.rules = Compiled(config.checked)
-        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"))
+        self.env = Env(blocks=self.rules.blocks, note=lambda kind, msg: self._note(kind, msg, level="info"),
+                       journal=self._journal)
         by_tf: dict = {}
         for bid in config.checked.order:
             by_tf.setdefault(config.checked.blocks[bid]["timeframe"], []).append(bid)
@@ -227,6 +230,11 @@ class Rules(LongFlatStrategy):
         got = self.minute_source(start, end) if self.minute_source is not None else None
         return sorted({m[0]: m for m in got or () if start < m[0] <= end}.values())
 
+    def _journal(self, kind: str, msg: str) -> None:
+        """An info event every time (not once, as _note is): paper only, where the minutes come from the hub."""
+        if self.runtime is not None and not self._backtest:
+            self.runtime.store.event(self.runtime.name, "info", kind, msg, ts=self.runtime.now())
+
     def first_touch_stats(self) -> dict:
         """For the report, per first_touch rule by its path (long.entry, long.entry[1], long.exit): candles judged,
         resolved true, either level reached, settled by minutes, both first reached in one minute, and unknown (a
@@ -234,11 +242,13 @@ class Rules(LongFlatStrategy):
         latter). `ambiguous_share` is same minute + unknown over either reached, which the G1 check reads (Advisor
         ~22:07): above 5% (`rerun_opposite_resolution`) it is re-run with first_touch_flip and judged on the worse. On
         1-minute candles every candle reaching both is a same-minute case, so the share is the assumption's, and the
-        note says so."""
+        note says so. `incomplete` counts candles settled by minutes with one or more of them not to hand (paper
+        journals each, first_touch_incomplete); `incomplete_share` is that over judged, for fills-vs-model (R2-INC)."""
         out = {}
         for n in self.rules.touches:
             st = dict(n.stats)
             st["ambiguous_share"] = (st["same_minute"] + st["unknown"]) / st["reached"] if st["reached"] else 0.0
+            st["incomplete_share"] = st["incomplete"] / st["judged"] if st["judged"] else 0.0
             st["rerun_opposite_resolution"] = st["ambiguous_share"] > FIRST_TOUCH_RERUN
             st["resolved"] = ("true" if n.exit_rule != n.flip else "false") + " when ambiguous"
             if bar_minutes(self._cfg.bar_type) == 1:
@@ -271,15 +281,17 @@ class Rules(LongFlatStrategy):
             if not fired:
                 self._why = None  # nothing fired: if the position still has to follow the leg, explain() says so
                 return self._leg
-            why = fired[0][0].split(".")[1]
-            if why != "exit" and not (why == "time_stop" and self.rules.time_stop[0] == "count"):
-                # A time stop or a level ends the hold: the same side opens again only on a later candle, or the
-                # position would simply be held on. Counting candles keeps rsi_cross's way, which re-enters at once.
-                ended = self._leg
+            # A leg ended at this close (exit rule, time stop or level) opens nothing on the same candle: the same
+            # side again only from the next close, the other side only where it declares `reverse` (Advisor 22:30,
+            # #161 MAJOR: closing and reopening at one price is fee bleed). A stop or target that filled inside the
+            # candle never reaches here: the position's exit lock decides.
+            ended = self._leg
             self._leg = 0
         for sign in (1, -1):
             side = self.rules.sides.get(sign)
-            if side is not None and sign != ended and side["entry"].test(env):
+            if side is not None and ended and (sign == ended or not side["reverse"]):
+                continue
+            if side is not None and side["entry"].test(env):
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts
@@ -293,6 +305,12 @@ class Rules(LongFlatStrategy):
                 return self._leg
         self._why = ("; ".join(w for _, w in fired), self._lineage(fired)) if fired else None
         return self._leg
+
+    def exit_leg_closed(self) -> None:
+        """A stop or target closed the position inside the candle: the leg ends with it, and the entry rules are
+        read afresh at the close, so the same side may open again there (Advisor 22:30; counted by a backtest as
+        reentries_on_exit_candle). A leg ended at the close never reopens on that candle (want_side)."""
+        self._leg, self._held, self._leg_ts = 0, 0, None
 
     def _time_up(self, step: int) -> bool:
         """The time stop: wall-clock by default, so missing candles never lengthen a hold; it ends the leg on the

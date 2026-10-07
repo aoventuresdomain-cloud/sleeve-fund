@@ -18,7 +18,8 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
-from sleeve_fund import markets
+from sleeve_fund import bars as bar_rule
+from sleeve_fund import markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
@@ -47,6 +48,9 @@ class BacktestResult:
     # Exceptions the strategy's handlers raised, as (handler, repr): the engine would hide them.
     handler_errors: list = field(default_factory=list)
     handler_error_count: int = 0  # every one, where handler_errors keeps the first hundred
+    # Entries filled on a decision candle in which an exit, stop or target of the position also filled (Advisor
+    # 22:30): a stop or target inside the candle may re-enter at its close, and this says how often.
+    reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
@@ -57,6 +61,14 @@ class BacktestResult:
     # Rule-builder first_touch rules (R2), by rule path ("long.entry", "long.entry[1]", "long.exit"): judged, true,
     # reached, same_minute, unknown, ambiguous_share and the rest (Rules.first_touch_stats).
     first_touch: dict = field(default_factory=dict)
+    # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
+    # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
+    open_risk_binds: int = 0
+    # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
+    open_risk_max: float = 0.0
+    # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
+    # still goes ahead so the risk can be measured, labelled (QA P1-S8).
+    paper_refusal: str | None = None
 
     @property
     def shorts(self) -> bool:
@@ -85,6 +97,22 @@ def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
     return feed.assign(volume=shown)
 
 
+PAPER_REFUSED = "would be refused on paper (stopless above 1x)"
+
+
+def paper_refusal(strategy: str, params: dict | None, risk_profile: str | None) -> str | None:
+    """PAPER_REFUSED when paper wouldn't start these settings (strategies.check_perp_stop), else None."""
+    from sleeve_fund.strategies import check_perp_stop
+
+    if risk_profile is None:
+        return None
+    try:
+        check_perp_stop(strategy, params, risk_profile)
+    except ValueError:
+        return PAPER_REFUSED
+    return None
+
+
 def run_backtest(
     strategy_name: str,
     prices: pd.DataFrame,
@@ -102,6 +130,7 @@ def run_backtest(
     fees: FeeSchedule | None = None,
     warmup_prices: pd.DataFrame | None = None,
     first_touch_flip: bool = False,
+    first_touch_count_from: pd.Timestamp | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -129,7 +158,8 @@ def run_backtest(
     strategy's warm-up from the history store is, so the window opens on settled indicators.
 
     first_touch_flip: resolve a rule-builder first_touch the other way when a candle is ambiguous (true in an entry,
-    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07)."""
+    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07). first_touch_count_from: its
+    report counts only the candles closing from then on, so a study reads a window's test candles alone."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -221,6 +251,7 @@ def run_backtest(
             strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
         for node in getattr(getattr(strategy, "rules", None), "touches", ()):
             node.flip = first_touch_flip
+            node.count_from = None if first_touch_count_from is None else int(pd.Timestamp(first_touch_count_from).value)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
         spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
@@ -232,6 +263,21 @@ def run_backtest(
             strategy.preload = list(to_bars(_book_volume(warmup_prices, instrument), instrument,
                                             bar_type_for(instrument, bar_minutes)))
         engine.add_strategy(strategy)
+        if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
+            built = decision_bars(exec_prices, bar_minutes, exec_minutes)
+            strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
+            thin = built[built["degraded"]]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+            part = built[built["missing"] > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+        if "missing" in prices.columns:  # every bar's absent minutes, for the slower candles built from them (P1-4)
+            part = prices[prices["missing"].fillna(0).astype(int) > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+        if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
+            thin = prices[prices["degraded"].astype(bool)]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+        if perp:
+            strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):
@@ -241,11 +287,12 @@ def run_backtest(
         engine.end()
 
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
+        fills = _liquidations_booked(fills, strategy.liquidation_books)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
                                                     _opening_cash(starting_capital, runtime),
-                                                    [ts for ts, _ in strategy.insurance_log])
+                                                    list(strategy.insurance_log))
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
@@ -275,6 +322,10 @@ def run_backtest(
                                 if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
             first_touch=touched,
+            reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, bar_minutes),
+            open_risk_binds=strategy.open_risk_binds,
+            open_risk_max=strategy.open_risk_max,
+            paper_refusal=paper_refusal(strategy_name, params, risk_profile),
         )
     finally:
         if runtime is not None:
@@ -310,6 +361,35 @@ def minutes_from(df: pd.DataFrame):
     return source
 
 
+def reentries_on_exit_candle(fills: pd.DataFrame | None, decisions: dict, bar_minutes: int) -> int:
+    """Entries filled on a decision candle, (close - bar, close], in which a non-entry order also filled."""
+    if fills is None or fills.empty:
+        return 0
+    entry = np.array([decisions.get(o, {}).get("intent") == "entry" for o in fills.index], dtype=bool)
+    ts = pd.DatetimeIndex(fills["ts_last"]).as_unit("ns").asi8
+    exits = np.sort(ts[~entry])
+    at = ts[entry]
+    # an exit in (entry - bar, entry]: the count of exits at or before the entry beats those at or before its open
+    return int(np.sum(np.searchsorted(exits, at, side="right") > np.searchsorted(exits, at - bar_minutes * 60_000_000_000,
+                                                                                 side="right")))
+
+
+def decision_bars(exec_prices: pd.DataFrame, bar_minutes: int, exec_minutes: int) -> pd.DataFrame:
+    """The decision bars the engine builds from execution bars stamped at their close, by close time: how many of
+    each one's minutes are missing and whether that makes it degraded (sleeve_fund.bars). A decision bar none of
+    whose execution bars exist isn't listed: the engine would make it up flat from nothing (QA P1-D1)."""
+    idx = exec_prices.index
+    period = pd.Timedelta(minutes=bar_minutes)
+    close = (idx - pd.Timedelta(1, "ns")).floor(period) + period
+    # Each execution bar counts its own minutes: all of them, less any the store says it was built without (QA P1-D10).
+    have = exec_minutes - (exec_prices["missing"].fillna(0).astype("int64").to_numpy()
+                           if "missing" in exec_prices.columns else 0)
+    present = pd.Series(have, index=close).groupby(level=0).sum().clip(lower=0, upper=bar_minutes)
+    out = pd.DataFrame({"missing": (bar_minutes - present).astype("int64")})
+    out["degraded"] = [bar_rule.degraded(int(m), bar_minutes) for m in out["missing"]]
+    return out
+
+
 def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:
     """A sleeve runtime opens from its journal (as a paper restart does); research opens in cash. A
     margin account holds only the quote currency (its positions are not balances)."""
@@ -334,10 +414,10 @@ def _perp_mark_to_market(
     takes its payments, and equity is cash plus the signed position at the close. Exposure is the
     position's gross value over equity, signed: negative while short.
 
-    insurance: the times the strategy closed past its bankruptcy price (LongFlatStrategy._cover_shortfall).
-    Isolated margin loses no more than the strategy's equity, so at each the insurance fund brings this
-    book's cash back to zero, by this book's own arithmetic (its fill prices carry the spread, and its fees
-    round apart from the venue's by fractions of a cent)."""
+    insurance: (time, amount) for each close past the bankruptcy price (LongFlatStrategy._cover_shortfall): the
+    insurance fund takes a loss past the position's isolated margin, so the amount comes back to cash; and should
+    this book's own arithmetic still leave flat cash below zero (its fill prices carry the spread, and its fees
+    round apart from the venue's by fractions of a cent), it is brought back to zero."""
     idx = prices.index
     flows = []  # (ts, cash change, qty change)
     if fills is not None and not fills.empty:
@@ -351,11 +431,15 @@ def _perp_mark_to_market(
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
     for ts, amount in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
-    for ts in sorted(pd.Timestamp(t) for t in insurance):
+    for ts, amount in sorted((pd.Timestamp(t), float(a)) for t, a in insurance):
         before = [(c, q) for t, c, q in flows if t <= ts]
         cash_now, qty_now = opening_cash + sum(c for c, _ in before), sum(q for _, q in before)
-        if cash_now < 0 and abs(qty_now) < 1e-9:  # flat: equity is cash
-            flows.append((ts, math.ceil(-cash_now * 100) / 100, 0.0))  # to the cent, as the strategy books it
+        if abs(qty_now) < 1e-9:  # flat: equity is cash
+            # The margin-cap part as the strategy booked it; any part that only brought equity to zero, by this
+            # book's own arithmetic.
+            amount = max(amount if cash_now + amount >= 0 else 0.0, 0.0) or math.ceil(max(-cash_now, 0.0) * 100) / 100
+            if amount:
+                flows.append((ts, amount, 0.0))
     if not flows:
         return (pd.Series(opening_cash, index=idx).rename("equity"),
                 pd.Series(0.0, index=idx).rename("exposure"))
@@ -423,6 +507,23 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
         moved = float(first) - fee  # the spread, and whatever rounding left in the charge
         fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
         fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
+    return fills
+
+
+def _liquidations_booked(fills: pd.DataFrame, books: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """GAP-LIQ-CAP: each liquidation order as the strategy booked it (LongFlatStrategy._book_liquidation), at the
+    bankruptcy price with the fee on the liquidation (trigger) price, in place of the venue's fill at the market's
+    price: the same loss of exactly X as its journal, and none of the market's gap in any price, fee or trip."""
+    if fills is None or fills.empty or not books:
+        return fills
+    fills = fills.copy()
+    for coid, (px, fee) in books.items():
+        if coid not in fills.index:
+            continue
+        entry = fills.at[coid, "commissions"]
+        moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
+        fills.at[coid, "avg_px"] = str(px)
+        fills.at[coid, "commissions"] = [f"{fee:.2f} {moneys[0].split()[1]}", *moneys[1:]]
     return fills
 
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
-from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, utcnow
+from sleeve_fund.paper.runtime import liquidation_head
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
@@ -16,15 +17,17 @@ EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", 
 
 STATUS_TABS = {
     "open": ("Open", OPEN_ORDER_STATUSES),
-    "filled": ("Filled", ("filled",)),
+    "filled": ("Filled", ("filled", "triggered")),
     "canceled": ("Cancelled", ("canceled", "expired")),
     "rejected": ("Rejected", ("rejected", "denied")),
     "all": ("All", None),
 }
 STATUS_LABELS = {"submitted": "Sent", "accepted": "Working", "partially_filled": "Part filled", "filled": "Filled",
-                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired"}
+                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired",
+                 "triggered": "Triggered"}
 STATUS_TONES = {"submitted": "paused", "accepted": "paused", "partially_filled": "paused", "filled": "running",
-                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted"}
+                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted",
+                "triggered": "running"}
 
 _PX = ("close", "price", "entry_px", "peak", "trail_stop")
 _PCT = ("gap", "move", "stop_loss", "take_profit")
@@ -177,6 +180,28 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
+def liquidated_since_reset(store: Store, sleeve: str) -> bool:
+    """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
+    (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
+    return liquidation_head(store, sleeve) is not None
+
+
+def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
+    """How the open position's stop was set, in a few words, when it came from the market at entry: an ATR
+    stop is the simple ATR the models use, not the chart's Wilder ATR (Advisor, atr-149 A2), so it says so.
+    None for a fixed % stop or none. Reads the stop settings the entry, or a later plan, journaled."""
+    cfg = (plan or {}).get("stop_cfg") if plan is not None else (signal or {}).get("stop_cfg")
+    if cfg is None and plan is None and not (signal or {}).get("stop_frac"):
+        cfg = params  # an entry from before stop settings were journaled: the strategy's own
+    cfg = cfg or {}
+    if cfg.get("stop_atr"):
+        return f"{float(cfg['stop_atr']):g} simple ATR ({int(cfg.get('atr_bars') or 14)} bars) at entry"
+    if cfg.get("stop_swing_bars"):
+        return f"swing {'high' if side < 0 else 'low'} of {int(cfg['stop_swing_bars'])} bars at entry"
+    return None
+
+
 def exit_fracs(params: dict, signal: dict | None, plan: dict | None = None) -> tuple[float | None, float | None]:
     """The open position's stop and target as shares of its entry price: the plan set since entry, if
     any, else what its entry journaled (an ATR or swing-low stop is set at entry), else the strategy's
@@ -215,13 +240,20 @@ def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | Non
     return abs(qty) * max(side * (price - stop_px), 0.0)
 
 
+# Strategies whose stop trails the market inside the strategy and isn't journaled (A2-T will journal it).
+TRAILING_STOP = {"rsi_pullback"}
+
+
 def open_risk(positions: list[dict]) -> dict:
     """Margin and open risk across positions (open_position's dicts): margin put up, the sum of their Risk to
-    stop, and the strategies whose position has no stop, which leave open risk unbounded."""
+    stop, the strategies whose position has no stop of any kind, which leave open risk unbounded, and those
+    with a trailing stop, whose level isn't shown yet: they are bounded, but not counted until the engine
+    gives their risk (UI v2 P1-U24)."""
     return {
         "margin": sum(p["margin"] for p in positions),
         "open_risk": sum(p["risk_to_stop"] for p in positions if p["risk_to_stop"] is not None),
-        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None],
+        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None and not p.get("trailing")],
+        "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
     }
 
 
@@ -254,6 +286,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "opened": lot["ts"] if lot else None,
         "held": (utcnow() - lot["ts"]) if lot else None,
         "stop_px": stop_px,
+        "stop_basis": stop_basis(x["sleeve"].params, entry["signal"] if entry else None, plan, side) if stop_px else None,
         "target_px": x["entry_px"] * (1 + side * tp) if tp else None,
         "notional": abs(x["qty"]) * x["price"],
         "margin": margin,
@@ -261,6 +294,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "liq_px": liq,
         "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
         "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
+        "trailing": stop_px is None and x["sleeve"].strategy in TRAILING_STOP,
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),

@@ -195,7 +195,10 @@ def position_lines(position: dict | None) -> list[dict]:
         return []
     out = [{"price": position["entry_px"], "title": "Entry", "kind": "entry"}]
     if position.get("stop_px"):
-        out.append({"price": position["stop_px"], "title": "SL", "kind": "stop"})
+        # An ATR stop is the models' simple ATR, not the chart's Wilder ATR: the line says which (atr-149 A2).
+        basis = position.get("stop_basis") or ""
+        title = "SL · simple ATR" if "simple ATR" in basis else "SL"
+        out.append({"price": position["stop_px"], "title": title, "kind": "stop"})
     if position.get("target_px"):
         out.append({"price": position["target_px"], "title": "TP", "kind": "target"})
     return out

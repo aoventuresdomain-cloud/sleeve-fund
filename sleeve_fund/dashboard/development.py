@@ -14,6 +14,8 @@ from pathlib import Path
 
 import markdown
 
+from sleeve_fund.venues import RESEARCH_VENUE
+
 # Research's recommended settings per model, with why, the question it answers and the pre-registered kill
 # rule. rsi_cross: strategy sprint, run 1 (research/strategy-sprint/run-1-rsi-15m.md, PM 5 Oct 2026).
 PLANS: dict[str, dict] = {
@@ -23,7 +25,7 @@ PLANS: dict[str, dict] = {
         "kill_rule": "if break-even is under 0.05% per side, or it loses on 2 or more of the 4 instruments.",
         "why": ("15 minutes trades often enough to judge in a year; the sealed year is opened once, after "
                 "settings are frozen. Start with BTC/USDT: the deepest book, so a fail there kills the idea."),
-        "defaults": {"venue": "binance", "instrument": "BTC/USDT", "minutes": 15, "train_days": 730,
+        "defaults": {"venue": RESEARCH_VENUE.lower(), "instrument": "BTC/USDT", "minutes": 15, "train_days": 730,
                      "test_days": 365, "holdout_days": 365, "use_holdout": False, "risk_profile": "balanced",
                      "stop_atr": 2, "atr_bars": 14},
     },
@@ -227,34 +229,6 @@ def history_badge(h: dict | None) -> dict:
 
 def _gap_words(n: int) -> str:
     return f"{n} gap{'s' if n != 1 else ''} · backtests wait until filled"
-
-
-# Venue names in text the PM reads (mirror reasons, alerts, the decision log), longest first so "Bybit Demo
-# Trading" goes whole. Case-sensitive on purpose: account names such as "kraken-live" and env names such as
-# BYBIT_DEMO_API_KEY are the PM's own labels and stay as they are. Only Setup, Accounts names venues (QA U8).
-_VENUE_WORDS = [
-    # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
-    (re.compile(r"(?<=\S)\.(?:BINANCE|KRAKEN|BYBIT|DERIBIT)\b"), ""),
-    (re.compile(r"\bno (?:Bybit|Deribit) demo account set up\b"), "the demo account isn't set up"),
-    (re.compile(r"\b(?:Bybit|Deribit)(?: [Dd]emo(?: Trading| account)?| [Tt]estnet)?(?:'s)?\b"), "the demo account"),
-    (re.compile(r"\bBinance(?:'s)?(?: USD-M perpetuals)?\b"), "the perpetual venue"),
-    (re.compile(r"\bKraken(?:'s)?(?: spot)?\b"), "the spot venue"),
-    (re.compile(r"\b(?:BYBIT|DERIBIT)\b(?!_)"), "the demo account"),
-    (re.compile(r"\bBINANCE\b(?!_)"), "the perpetual venue"),
-    (re.compile(r"\bKRAKEN\b(?!_)"), "the spot venue"),
-    (re.compile(r"\b(?:[Tt]he|[Aa]n?) the\b"), lambda m: "The" if m.group(0)[0].isupper() else "the"),
-]
-
-
-def no_venues(text) -> str:
-    """Text the PM reads with any venue name swapped for what it is ("the demo account", "the perpetual venue",
-    "the spot venue"). For messages stored before the wording changed, and anything a venue sends back."""
-    if not text:
-        return text
-    out = str(text)
-    for pattern, words in _VENUE_WORDS:
-        out = pattern.sub(words, out)
-    return out
 
 
 def blocked_by_gaps(pair: str, gaps: list) -> str | None:

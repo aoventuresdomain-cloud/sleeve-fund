@@ -16,7 +16,7 @@ import os
 import re
 import secrets
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import markets
+from sleeve_fund import liquidation, markets
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -35,7 +35,7 @@ from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
-from sleeve_fund.history import CORE_PAIRS, REQUEST_YEARS
+from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.paper.config import (
@@ -52,15 +52,15 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.paper.runtime import RESUMABLE, entry_blocked
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
+from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
-# Suggestions only: the field accepts any instrument Kraken spot lists.
-INSTRUMENT_HINTS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD", "ADA/USD", "DOGE/USD", "BTC/GBP", "ETH/GBP"]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
@@ -113,7 +113,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["venue_choices"] = venue_choices
     templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
-    templates.env.filters["no_venues"] = dev.no_venues  # stored reasons and messages name no venue (QA U18)
+    templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
@@ -229,10 +229,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"],
-                        unbounded=len(positions["unbounded"]))
+                        unbounded=len(positions["unbounded"]), trailing=len(positions["trailing"]))
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
+                    earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(sleeves),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
@@ -320,16 +321,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?kill_error=reason", status_code=303)
         _, _, summaries = book_data()
         targets = _kill_targets(summaries)
-        if not targets["all"]:
+        # P1-KR-1: one whose reset is under way, its flatten waiting, is not skipped: the reset's flatten makes the
+        # sale, and the kill switch is kept as the fresh run's pause.
+        held = [name for name in targets["flattening"]
+                if st().hold_on_reset(name, "flatten", f"Book kill switch: {why}")]
+        if not targets["all"] and not held:
             # Fired again, or nothing to sell: no decision to log, as nothing was done (review round 9, N1).
             return RedirectResponse("/risk?killed=0", status_code=303)
+        for name in held:
+            st().decide(actor, "flatten", f"Book kill switch: {why}", name)
         for x in targets["all"]:
             name = x["sleeve"].name
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
             if x["sleeve"].desired_state != "running":
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
-        n = len(targets["all"])
+        n = len(targets["all"]) + len(held)
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
@@ -460,6 +467,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         order_total = sum(st().order_counts(name).values())
         position = trading.open_position(x, fills, orders, plans)
         perp_x = trading.perp_view(x, position, funding) if perp else None
+        # Its position's margin was lost (liquidated): no Start, Resume or Reset until the PM resets it after
+        # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.
+        liquidated = not bt_id and _liquidated(name)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -471,7 +481,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total,
+                    order_total=order_total, liquidated=liquidated,
                     positions=positions, working=working, fees_funding=fees_funding,
                     timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
@@ -496,6 +506,31 @@ def create_app(store: Store | None = None) -> FastAPI:
                     demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
+
+    def _strategy_indicators(name: str) -> list[dict]:
+        """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):
+        as the platform recorded them, passed on untouched and never recomputed here. The store gives them once
+        the Quant Developer's recording lands; until then, or if it fails, the chart has none and still draws."""
+        source = getattr(st(), "chart_indicators", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart indicators for %s", name)
+            return []
+
+    def _strategy_decisions(name: str) -> list[dict]:
+        """Fills and missed entries the strategy recorded (P1-3m): [{kind: fill|missed, side, t, signal_t, price,
+        reason, code}], passed on untouched. Empty until the platform's journal read lands, or if it fails."""
+        source = getattr(st(), "chart_decisions", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart decisions for %s", name)
+            return []
 
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
@@ -536,6 +571,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
                               limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        data["indicators"] = _strategy_indicators(name)
+        data["decisions"] = _strategy_decisions(name)
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
@@ -554,7 +591,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         try:
             return JSONResponse({"instruments": charts.instruments(), "source": "venue"})
         except (OSError, ValueError, KeyError):  # venue unreachable: the usual ones, and any other can still be typed
-            return JSONResponse({"instruments": INSTRUMENT_HINTS, "source": "fallback"})
+            return JSONResponse({"instruments": _hints(), "source": "fallback"})
 
     @app.get("/api/history/coverage")
     def history_coverage_json(venue: str | None = None, _: str = Depends(require_pm)):
@@ -625,9 +662,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = _reason(action, reason, reason_pick, reason_note)
             if not reason:
                 raise ValueError("every command needs a reason")
-            if command == "stop" and _flatten_waits(name):
-                raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
-                                 "drop it; stop it once it is flat")
+            if command in ("start", "resume") and _liquidated(name):
+                # The page says so too; a stale page or a direct post must not restart it (QA P1-U25, U31).
+                raise ValueError(liquidation.REFUSAL)
             if command == "flatten" and then == "stop":
                 then_stop = reason
             if command in ("start", "stop"):
@@ -639,19 +676,36 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if command == "start":
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
+                    check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    blocked, why = entry_blocked(st(), name, utcnow(), starting=True)  # CHOKE
+                    if blocked and not (s.status == "halted" and any(
+                            c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
+                        raise ValueError(f"not started. {why}")  # a halt is cleared only by its own action (HC)
+                # A Stop's acceptance, stamped to the microsecond just before it is committed: the time a raced fill
+                # and a resting entry's cancel are measured from (P1-SG15, Advisor 7 Oct 05:01 and 05:47).
+                accepted = datetime.now(timezone.utc) if command == "stop" else None
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
-                    # weeks later; it lapses instead, and the decision log says so.
+                    # weeks later; it lapses instead, and the decision log says so. Stop is always taken, a
+                    # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
+                    # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                st().decide(actor, command, reason, name)
+                    st().hold_on_reset(name, command, reason)  # P1-KR-3: a reset under way leaves it stopped
+                st().decide(actor, command, reason, name, ts=accepted)
+            elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
+                  and not set(why.codes) <= set(RESUMABLE)):
+                raise ValueError(f"a resume can't clear it. {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
                 raise ValueError("it is already running, so there is nothing to resume")
             elif command == "flatten" and any(c["command"] == "flatten" for c in st().pending_commands(name)):
-                # A second would sell again whatever the first left (review round 10, m5).
-                raise ValueError("a flatten is already waiting for the strategy to act on it")
+                # A second would sell again whatever the first left (review round 10, m5). With a reset under way,
+                # the reset's flatten makes the sale and the PM's is kept as the fresh run's pause (P1-KR-1).
+                if not st().hold_on_reset(name, command, reason):
+                    raise ValueError("a flatten is already waiting for the strategy to act on it")
+                st().decide(actor, command, reason, name)
             elif command == "flatten" and st().sleeve(name).desired_state != "running":
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
@@ -676,13 +730,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
         return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
 
-    def _flatten_waits(name: str) -> bool:
-        """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
-        drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
-        if not any(c["command"] == "flatten" for c in st().pending_commands(name)):
-            return False
-        hb = st().sleeve(name).heartbeat_at
-        return bool(hb and utcnow() - hb < STALE)
+    def _liquidated(name: str) -> bool:
+        """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
+        strategy's position margin was lost with no Reset after liquidation since. The routes and the page
+        both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
+        return trading.liquidated_since_reset(st(), name)
 
     @app.post("/sleeves/{name}/reset")
     def sleeve_reset(name: str, reason: str = Form(""), reason_pick: str | None = Form(None),
@@ -691,6 +743,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
+            if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
+                raise ValueError(liquidation.REFUSAL)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
@@ -711,11 +765,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             error = "a reason is required"
         if not reason:
             return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        gone = set(st().archived())
+        gone, liquidated = set(st().archived()), []
         for s in st().sleeves():
-            if s.name not in gone and not st().pending_reset(s.name):
-                st().request_reset(s.name, reason, actor=actor)
-        return RedirectResponse("/setup?reset=1", status_code=303)
+            if s.name in gone or st().pending_reset(s.name):
+                continue
+            if _liquidated(s.name):  # put away unanswered otherwise; it waits for Reset after liquidation
+                liquidated.append(s.name)
+                continue
+            st().request_reset(s.name, reason, actor=actor)
+        q = {"reset": "1", **({"not_reset": ", ".join(liquidated)} if liquidated else {})}
+        return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -954,7 +1013,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if held is not None:
             return (f"{pair} is already stored, from {held['first']:%d %b %Y} to {held['last']:%d %b %Y %H:%M} UTC "
                     f"({held['state']}); the collector keeps it current, and a study can run on it now.")
-        if pair in (profile.core_pairs or CORE_PAIRS):
+        if pair in profile.core_pairs:
             # The collector always keeps its core list from each instrument's listing (sleeve_fund.history), so
             # a request would change nothing, and its "from five years back" would misstate where it starts.
             return (f"{pair} is on the collector's core list for the venue: it is stored from its listing and "
@@ -1163,7 +1222,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             if backtest and t.half_spread is not None:
                 per_market[m]["half_spread"] = t.half_spread
         return {"taker": float(venue_fees.taker), "default_spread": default, "markets": per_market,
-                "spreads": {p: resolve_spread(None, p, st()).half_spread for p in INSTRUMENT_HINTS}}
+                "spreads": {p: resolve_spread(None, p, st()).half_spread for p in _hints()}}
 
     def backtest_form(request: Request, q, *, result=None, error="", job=None, saved=None):
         """The backtest page: the settings form, plus a result, an error, or a run in progress."""
@@ -1613,9 +1672,8 @@ def _venue_name(value) -> str:
 
 
 def _hints(venue: str | None = None) -> list[str]:
-    """The instruments a form suggests on this venue: those the history store always keeps there, else the
-    default venue's usual list."""
-    return list(_research_venue(venue).core_pairs) or INSTRUMENT_HINTS
+    """The instruments a form suggests on this venue (VenueProfile.hints); any other can still be typed."""
+    return list(_research_venue(venue).hints)
 
 
 def venue_choices() -> list[dict]:
@@ -1636,7 +1694,7 @@ def _check_listed(store: Store, venue: str | None, pair: str) -> None:
     if not PAIR_RE.fullmatch(pair):
         raise ValueError(f"instrument: write it as BASE/QUOTE, for example {_hints(profile.name)[0]}")
     listed = charts._listed.get(profile.name, (0, []))[1]
-    if pair in {*_hints(profile.name), *INSTRUMENT_HINTS, *listed} or profile.check_listed is None:
+    if pair in {*_hints(profile.name), *listed} or profile.check_listed is None:
         return
     if any(h["pair"] == pair for h in _stored_history(store, profile)):
         return
@@ -1779,11 +1837,12 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
 
 
 def _demo_copy(store, s) -> dict | None:
-    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to Bybit Demo, the
-    one demo account the mirror can trade to an exact quantity."""
+    """What the strategy page shows of its demo copy: only for a perpetual strategy copied to a demo account the
+    mirror trades to an exact quantity (mirror.exact_copy)."""
     from sleeve_fund import mirror
 
-    if not s.params.get("demo_mirror") or not markets.is_perp(s.params) or mirror.target_for(s) != "BYBIT":
+    label = mirror.exact_copy(s)
+    if label is None or not markets.is_perp(s.params):
         return None
     put_on = sum(float(r["amount"] or 0.0) for r in store.mirror_rows(s.name, limit=100_000)
                  if r["status"] == "filled")
@@ -2375,8 +2434,12 @@ def _signals_view(s, row: dict | None) -> dict:
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
-            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
-    if not view["supported"]:
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False,
+            "notes": []}
+    if not view["supported"]:  # a model that lists no conditions may still send notes on its slower candles (P1-4)
+        if row is not None and s.desired_state == "running" and \
+                (utcnow() - row["ts"]).total_seconds() <= SIGNALS_FRESH_SECONDS:
+            view["notes"] = [str(n) for n in row["payload"].get("notes") or []]
         return view
     if s.desired_state != "running":
         view["state"] = "stopped"
@@ -2400,6 +2463,7 @@ def _signals_view(s, row: dict | None) -> dict:
     view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
                      _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
     view["warming"] = not view["cards"][0]["rows"]
+    view["notes"] = [str(n) for n in p.get("notes") or []]  # slower candles degraded or recorded missing (P1-4)
     view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
     view["state"] = "live"
     # The model acts at its bar's close: the next one after the last bar it decided on.
@@ -2422,6 +2486,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     from nautilus_trader.model import BarType, InstrumentId
 
     check_perp_sizing(cfg.strategy, cfg.params)
+    check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)

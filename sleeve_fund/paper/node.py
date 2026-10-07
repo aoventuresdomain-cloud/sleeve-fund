@@ -37,7 +37,7 @@ from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.venues import venue as venue_profile
 
 
@@ -152,6 +152,8 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
     r = r.iloc[:-1]  # the newest candle is still forming
     r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
     newer = r[r.index > df.index[-1]]
+    whole = {"missing": 0, "degraded": False}  # the venue's own candles: none of their minutes absent (board 5a)
+    newer = newer.assign(**{c: v for c, v in whole.items() if c in df.columns})
     return pd.concat([df, newer[list(df.columns)]]) if len(newer) else df
 
 
@@ -271,6 +273,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     )
     if profile.ohlc_history is not None and hub is None:
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
+    if hub is None:  # its first bar after a start is built from the stored minutes, as the hub client's is (R1)
+        strategy.attach_minutes(stored_minutes(profile.name, sleeve.instrument))
     strategy.hub_fed = hub is not None
     strategy.hub_status = hub_status if hub is not None else None
     if hub is not None and hasattr(strategy, "minute_source"):
@@ -314,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sleeve = load_sleeve(args.sleeve)
         check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor
+        check_perp_stop(sleeve.strategy, sleeve.params, sleeve.risk_profile)  # QA P1-S6
     recorder = None
     if args.record:
         if runtime is None:

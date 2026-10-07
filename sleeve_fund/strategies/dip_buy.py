@@ -143,9 +143,10 @@ class DipBuy(LongFlatStrategy):
 
     def target_side(self, close: float, rsi: float, atr: float, high24: float, low24: float, exit_avg: float,
                     regime: int | None) -> int:
-        c, ended = self.c, False
+        c, ended = self.c, 0
         if self._side:
             self._held += 1
+            leg_side = self._side
             leg = "long" if self._side == 1 else "short"
             if (self._side == 1 and close >= exit_avg) or (self._side == -1 and close <= exit_avg):
                 self._side, self._why = 0, (f"The close {close:,.6g} reached the {c.exit_sma}-bar average "
@@ -155,11 +156,17 @@ class DipBuy(LongFlatStrategy):
                                             f"the {leg} ends on its time stop", {})
             if self._side:
                 return self._side
-            ended = True
+            ended = leg_side
         dip = high24 - close
         rip = close - low24
+        long_dip = regime == 1 and rsi <= c.rsi_entry and dip >= c.dip_atr * atr
+        short_rip = regime == -1 and rsi >= 100 - c.rsi_entry and rip >= c.dip_atr * atr
         if regime is None:
             self._why = ("The daily trend averages are still filling: no position", {})
+        elif (long_dip and ended == 1) or (short_rip and ended == -1):
+            # LEG-RE (Advisor 22:37): a leg closed on this candle's close is not re-entered on the same side on that
+            # candle; the earliest re-entry is the next one, if the setup still holds then.
+            self._why = (f"{self._why[0]}; a new {'long' if ended == 1 else 'short'} waits for the next candle", {})
         elif regime == 1 and rsi <= c.rsi_entry and dip >= c.dip_atr * atr:
             self._side, self._held = 1, 0
             self._why = (f"Daily up-trend, RSI {rsi:.1f} at or below {c.rsi_entry:g} and the close {dip / atr:.2f} simple ATR "

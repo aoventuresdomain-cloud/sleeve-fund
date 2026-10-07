@@ -39,6 +39,7 @@ import pytest
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.strategies.definitions import check_definition, definition_hash, to_params
 
+R2 = pytest.mark.xfail(strict=True, raises=AssertionError, reason="R2 first-touch not built")
 
 T0 = pd.Timestamp("2025-10-03 00:00", tz="UTC")
 SPEC = "15-MINUTE-LAST-INTERNAL"
@@ -79,10 +80,11 @@ def _decisions(m, tf=15):
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
 
 
-def _run(defn, m, instrument, tf=15, drop=(), exec_prices=None, **kw):
+def _run(defn, m, instrument, tf=15, drop=(), exec_prices=None, perp=False, **kw):
     ex = exec_prices if exec_prices is not None else _without(m, drop, tf)
     try:
-        return run_backtest("rules", _decisions(m, tf), instrument, params=to_params(defn), bar_minutes=tf,
+        params = {**to_params(defn), **({"market": "perp", "allow_short": True} if perp else {})}  # shorts need a perp
+        return run_backtest("rules", _decisions(m, tf), instrument, params=params, bar_minutes=tf,
                             exec_prices=ex if tf > 1 else None, exec_minutes=1, half_spread=0, **kw)
     except ValueError as e:  # an unknown rule is refused by the checker today
         raise AssertionError(f"not built: {e}") from e
@@ -225,8 +227,12 @@ BOTH = {(1, 5): (101.5, 100.0), (1, 12): (100.0, 98.5)}  # X at minute 5, then Y
     ("the minute that held the first reach is the one missing -> unknown", BOTH, {(1, 5)}, False, 1),
     ("the last minute holds both levels and is missing, nothing reached earlier -> unknown",
      {(1, 15): (101.5, 98.5)}, {(1, 15)}, False, 1),
-    ("only X in range: decided without the minutes even with gaps -> true", {(1, 9): (101.5, 100.0)},
-     {(1, 2), (1, 3), (1, 9)}, True, 0),
+    ("only X in range: decided without the minutes even with a gap -> true", {(1, 9): (101.5, 100.0)},
+     {(1, 9)}, True, 0),
+    # #155's degraded-bar gate: 3 of 15 minutes missing = 20% (> 10%) makes the decision bar degraded, so the entry
+    # that the candle's own high/low decides is held to the next close (candle 2), not lost and not unknown.
+    ("only X in range, 3 of 15 minutes missing: degraded-bar holds entry to next-close", {(1, 9): (101.5, 100.0)},
+     {(1, 2), (1, 3), (1, 9)}, 2, 0),
     ("only Y in range: false without the minutes, and not unknown", {(1, 9): (100.0, 98.5)}, {(1, 2), (1, 3)},
      False, 0),
     ("neither in range: false without the minutes, and not unknown", {}, {(1, 2), (1, 3)}, False, 0),
@@ -235,7 +241,8 @@ def test_a_missing_minute_matters_only_when_both_levels_are_in_the_range_and_it_
         name, spikes, drop, fires, unknown, instrument):
     res = _run(_defn(), _minutes(3, spikes=spikes), instrument, drop=drop)  # c2 follows so c1 closes even if its last minute is missing
     ft = _ft(res)
-    assert _fired(res) == ([1] if fires else []) and ft["unknown"] == unknown, name
+    want = [] if not fires else [2] if fires == 2 else [1]  # fires: False, True (candle 1) or 2 (held to candle 2)
+    assert _fired(res) == want and ft["unknown"] == unknown, name
 
 
 def test_a_missing_minute_in_an_earlier_candle_does_not_spoil_the_next_one(instrument):
@@ -277,8 +284,11 @@ def test_same_minute_and_unknown_are_false_in_every_entry_side_position(where, c
     assert 1 not in _fired(res) and _ft(res, f"long.entry.{where}")["judged"] >= 1
 
 
-def _exit_defn():
-    return {**BASE, "long": {"entry": {"left": "close", "op": "<", "right": 99.9},
+def _exit_defn(reenter=False):
+    """reenter=True is the original data: entry `close > 0` is true on every candle, so the side re-enters on the candle
+    the exit fires (#161 P1-5). The default entry is true on c0 only."""
+    return {**BASE, "long": {"entry": {"left": "close", "op": ">", "right": 0} if reenter else
+                             {"left": "close", "op": "<", "right": 99.9},
                              "exit": {"first_touch": {"reach": UP, "before": DOWN}}}}
 
 
@@ -297,6 +307,106 @@ def test_in_an_exit_condition_same_minute_and_unknown_resolve_true(name, spikes,
     """The entry (a plain rule) opens the position at c0's close; the exit is judged on c1."""
     res = _run(_exit_defn(), _minutes(2, spikes=spikes, closes={0: 99.8}), instrument, drop=drop)
     assert (1 in _exit_fills(res)) is exits and _ft(res, "long.exit")["judged"] >= 1, name
+
+
+
+
+@pytest.mark.parametrize("name, spikes, drop, exits", [
+    pytest.param("same minute resolves TRUE in an exit", SAME, (), True),
+    pytest.param("unknown resolves TRUE in an exit", BOTH, {(1, 2)}, True),
+    pytest.param("a clean X-first path exits", {(1, 3): (101.5, 100.0), (1, 9): (100.0, 98.5)}, (), True),
+    # a control, not a pin: nothing exits on a Y-first path, with or without the re-entry bug
+    pytest.param("a clean Y-first path does not exit", {(1, 3): (100.0, 98.5), (1, 9): (101.5, 100.0)}, (), False),
+])
+def test_the_same_exit_cases_on_the_original_data_where_the_entry_is_true_on_every_candle(
+        name, spikes, drop, exits, instrument):
+    """[Advisor 22:30, #161 same-candle re-entry = MAJOR] The original data, kept: entry `close > 0` holds on every
+    candle. An exit that fires at c1's close must show as an exit fill and the same side must NOT re-enter on c1."""
+    res = _run(_exit_defn(reenter=True), _minutes(2, spikes=spikes), instrument, drop=drop)
+    assert (1 in _exit_fills(res)) is exits and _ft(res, "long.exit")["judged"] >= 1, name
+    assert 1 not in _fired(res)[1:] or not exits, "re-entered on the candle the exit fired"
+
+
+# ------------------------------------------------------------ #161 same-candle re-entry (Advisor 22:30), plain rules
+# An exit fired at candle k's CLOSE: no same-direction re-entry on k, earliest k+1 close, in backtest and in paper.
+# Opposite direction on k only if the definition explicitly declares a reversal. After an INTRABAR exit (stop,
+# market-on-touch target during k) re-entry at k's close is allowed, and the report counts it.
+EXIT_UP = {"left": "close", "op": ">", "right": 100.5}  # true on c1 only (c1 closes at 101), so the exit fires at c1's close
+
+
+def _always_long(**extra):
+    return {**BASE, "long": {"entry": {"left": "close", "op": ">", "right": 0}, "exit": EXIT_UP}, **extra}
+
+
+def _at_close(res, k):
+    """(intent, side) of every fill whose time is candle k's close, in order."""
+    t = T0 + pd.Timedelta(minutes=15 * (k + 1))
+    rows = res.fills[res.fills["ts_last"] == t].sort_values("ts_init")
+    return [(res.decisions[o]["intent"], str(rows.loc[o, "side"])) for o in rows.index]
+
+
+@pytest.mark.parametrize("profile", [None, "balanced"], ids=["backtest", "paper"])
+def test_an_exit_fired_at_a_candles_close_is_one_round_trip_not_a_close_and_reopen(profile, instrument):
+    """(a) always-true entry + an exit that fires at c1's close. c0 opens; c1 closes it and does NOTHING else; the
+    earliest re-entry is c2's close (the exit rule is false there). Not close + reopen at the same price on c1."""
+    m = _minutes(4, closes={1: 101.0})
+    res = _run(_always_long(), m, instrument, risk_profile=profile)
+    assert [i for i, _ in _at_close(res, 0)] == ["entry"]
+    assert [i for i, _ in _at_close(res, 1)] == ["exit"], "the exit candle must hold only the exit"
+    assert [i for i, _ in _at_close(res, 2)] == ["entry"], "the earliest re-entry is the next candle's close"
+    assert getattr(res, "reentries_on_exit_candle", None) == 0, "not built: res.reentries_on_exit_candle"
+
+
+def test_an_explicitly_declared_reversal_may_open_the_opposite_way_on_the_exit_candle(instrument):
+    """(b) The long exit and a short entry are both true at c1's close, and the definition declares the reversal
+    (`{"short": {"entry": ..., "reverse": true}}`, named by PE1). Both fills are allowed on c1, exit first, and the
+    report counts one re-entry on the exit candle (an entry filled on a candle where a non-entry order also filled)."""
+    d = {**BASE, "long": {"entry": {"left": "close", "op": ">", "right": 0}, "exit": EXIT_UP},
+         "short": {"entry": EXIT_UP, "reverse": True}}
+    try:
+        res = _run(d, _minutes(3, closes={1: 101.0}), instrument, perp=True)
+    except AssertionError:
+        raise
+    assert [i for i, _ in _at_close(res, 1)] == ["exit", "entry"]
+    assert _at_close(res, 1)[1][1] == "SELL"
+    assert getattr(res, "reentries_on_exit_candle", None) == 1, "not built: res.reentries_on_exit_candle"
+
+
+def test_the_same_definition_without_a_declared_reversal_does_not_open_the_opposite_way_on_the_exit_candle(instrument):
+    """(1) Refused = no opposite fill on the exit candle and the count stays 0 (the ruling defines no refusal row)."""
+    d = {**BASE, "long": {"entry": {"left": "close", "op": ">", "right": 0}, "exit": EXIT_UP},
+         "short": {"entry": EXIT_UP}}
+    res = _run(d, _minutes(3, closes={1: 101.0}), instrument, perp=True)
+    assert [i for i, _ in _at_close(res, 1)] == ["exit"], "an undeclared reversal on the exit candle is refused"
+    assert getattr(res, "reentries_on_exit_candle", None) == 0, "not built: res.reentries_on_exit_candle"
+
+
+def test_an_undeclared_opposite_entry_still_fills_at_the_next_candle_if_its_condition_still_holds(instrument):
+    """[HoQA 22:42] The refusal is for the exit candle only; a fix that suppresses the signal for good must fail. The
+    long enters while close < 100.5 (c0 only), exits when close > 100.5, and the short enters on the same condition.
+    c1 and c2 both close at 101: c1 holds only the exit (the short is refused there), c2 holds the short entry."""
+    d = {**BASE, "long": {"entry": {"left": "close", "op": "<", "right": 100.5}, "exit": EXIT_UP},
+         "short": {"entry": EXIT_UP}}
+    res = _run(d, _minutes(4, closes={1: 101.0, 2: 101.0}), instrument, perp=True)
+    assert [i for i, _ in _at_close(res, 0)] == ["entry"]
+    assert [i for i, _ in _at_close(res, 1)] == ["exit"], "an undeclared reversal on the exit candle is refused"
+    assert _at_close(res, 2) == [("entry", "SELL")], "the short fills at the next candle, its condition still true"
+    assert getattr(res, "reentries_on_exit_candle", None) == 0, "not built: res.reentries_on_exit_candle"
+
+
+def test_after_an_intrabar_exit_re_entry_at_the_same_candles_close_is_allowed_and_counted(instrument):
+    """(c) A resting stop at the previous close minus 1 (99) is hit by minute 6 of c1 (low 98.5). The entry rule is
+    true at c1's close, so the side re-enters there, and the report counts one 're-entry on the exit candle'."""
+    d = {**BASE, "long": {"entry": {"left": "close", "op": ">", "right": 0}}, "exits": {"stop": {"level": DOWN}}}
+    res = _run(d, _minutes(3, spikes={(1, 6): (100.0, 98.5)}), instrument)
+    stopped = res.fills[(res.fills["ts_last"] > T0 + pd.Timedelta(minutes=15)) &
+                        (res.fills["ts_last"] < T0 + pd.Timedelta(minutes=30))]
+    assert len(stopped) >= 1 and all(res.decisions[o]["intent"] != "entry" for o in stopped.index), \
+        "the stop (a volume-capped stop may fill in two parts) must fire inside c1"
+    assert [i for i, _ in _at_close(res, 1)] == ["entry"], "re-entry at the exit candle's close is allowed"
+    count = getattr(res, "reentries_on_exit_candle", None)
+    assert count == 1, "not built: res.reentries_on_exit_candle (assumed name)"
+
 
 
 # ----------------------------------------------------------------------------------------- report (D, HoE 2) + reference
@@ -494,4 +604,21 @@ def test_the_paper_runtime_judges_the_same_candles_the_same_way(instrument):
     b = _run(_defn(), m, instrument, drop=drop, risk_profile="balanced")
     assert _fired(a) == _fired(b) == [5]
     assert _ft(a) == _ft(b)
-    assert a.fills["ts_last"].tolist() == b.fills["ts_last"].tolist()  # prices differ by sizing (risk profile), not by first_touch
+    assert a.fills["ts_last"].tolist() == b.fills["ts_last"].tolist()
+
+
+D13 = pytest.mark.xfail(strict=True, raises=AssertionError, reason="D13")
+
+
+@D13
+def test_fill_prices_match_between_research_and_the_paper_runtime_to_the_rounding_cent(instrument):
+    """[HoQA 22:30, one-taker-rule ruling 20:55] Same minutes, same decisions, same booked price. Tolerance is the #161
+    rounding cent: abs 0.02 divided by the smallest filled quantity. Today research books ~100.0049 and the paper runtime
+    100.00 (D13 gap, also pinned in d13-xfails). Never widen the tolerance to hide it."""
+    m, drop = _ref_path()
+    a = _run(_defn(), m, instrument, drop=drop)
+    b = _run(_defn(), m, instrument, drop=drop, risk_profile="balanced")
+    assert _fired(a) == _fired(b) == [5], "not built: first_touch"  # the entry must exist before its price can be compared
+    q = min(float(x) for x in [*a.fills["filled_qty"], *b.fills["filled_qty"]])
+    for pa, pb in zip(a.fills["avg_px"], b.fills["avg_px"]):
+        assert abs(float(pa) - float(pb)) <= 0.02 / q
