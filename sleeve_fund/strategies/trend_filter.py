@@ -41,7 +41,9 @@ SPEC = IdeaSpec(
 class TrendFilterConfig(LongFlatConfig):
     def __init__(self, *, fast: int = 50, slow: int = 200, ema: int = 0, vol_target: float = 0.0,
                  vol_lookback_days: int = 30, **kwargs) -> None:
-        if vol_target and kwargs.get("rebalance_band") is None:
+        # A converted perp (P2-1b, sizing="central") trades entries and exits, never rebalances.
+        converted = kwargs.get("sizing") == "central" and kwargs.get("market", "spot") != "spot"
+        if vol_target and kwargs.get("rebalance_band") is None and not converted:
             kwargs["rebalance_band"] = 0.25
         super().__init__(**kwargs)
         if not 1 < fast < slow:

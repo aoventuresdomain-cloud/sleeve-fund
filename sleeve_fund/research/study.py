@@ -20,7 +20,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.instruments import FeeSchedule, pair_of
-from sleeve_fund.markets import PERP
+from sleeve_fund.markets import PERP, SPOT
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
@@ -33,8 +33,10 @@ from sleeve_fund.research.metrics import (
     turnover_per_year,
     whole_days,
 )
+from sleeve_fund.research.conversion import CONVERSION_KEYS, cost_profile, gross_gap_flag
 from sleeve_fund.research.runner import BacktestResult, run_backtest
-from sleeve_fund.strategies import check_perp_sizing
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.venues import venue as venue_of
 from sleeve_fund.strategies.base import IdeaSpec
 
 
@@ -119,6 +121,10 @@ class StudyResult:
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
+    # P2-1b: a weight model converted to entry-sized trades, beside its legacy weight version on spot over the same
+    # research period: {"converted": {...}, "legacy": {...}, "investigate": bool}, each side with turnover, fee_drag
+    # and gross_return; None for any other study.
+    legacy_comparison: dict | None = None
 
     @property
     def not_judged(self) -> str:
@@ -322,6 +328,10 @@ def run_study(
     research = prices.iloc[:-holdout_bars] if holdout_bars else prices
     combos = grid(spec.param_grid)
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
+    # A converted weight model (P2-1b) or a centrally sized one (P2-1) runs every grid point that way: its sizing keys
+    # make each a variant of its own, never the legacy variant's key.
+    variant = {k: default_params[k] for k in CONVERSION_KEYS if default_params.get(k) is not None}
+    combos = [{**c, **variant} for c in combos] if variant else combos
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
     from sleeve_fund.venues import VENUES
@@ -358,12 +368,12 @@ def run_study(
     done = [0]
 
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
-           fees: FeeSchedule | None = None, slippage: float = 0.0) -> BacktestResult:
+           fees: FeeSchedule | None = None, slippage: float = 0.0, on=None) -> BacktestResult:
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
-        params = {**params, **market}
+        params = {**params, **market} if on is None else {**params, "market": SPOT}
         if not benchmark:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
@@ -371,7 +381,7 @@ def run_study(
         fine = None
         if exec_minutes is not None and not benchmark:  # nothing rests, nothing to guard
             fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
-        res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
+        res = run_backtest(name, df, on or instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
                            exec_minutes=exec_minutes or 1, half_spread=half_spread + slippage, fees=fees)
         if res.handler_errors:
@@ -434,6 +444,17 @@ def run_study(
             full_default = res
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
+    legacy_comparison = None
+    if default_params.get("sizing") == "central" and spec.name in REGISTRY \
+            and REGISTRY[spec.name][0].weight_sized(default_params):
+        # P2-1b rule 5: the legacy weight version, without the conversion's keys, on spot over the same period. On a
+        # venue that lists perpetuals only, the spot venue's instrument for the same asset trades the same prices.
+        legacy_params = {k: v for k, v in default_params.items() if k not in CONVERSION_KEYS}
+        spot = instrument if not perpetual else venue_of("KRAKEN").instrument(pair_of(instrument).split("/")[0], "USD")
+        legacy = bt(spec.name, research, legacy_params, on=spot)
+        sides = {"converted": cost_profile(full_default), "legacy": cost_profile(legacy)}
+        legacy_comparison = {**sides, "investigate": gross_gap_flag(sides["converted"]["gross_return"],
+                                                                    sides["legacy"]["gross_return"])}
     sensitivity = pd.DataFrame(rows)
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
     sharpes = [r["sharpe"] if math.isfinite(r["sharpe"]) else -math.inf for r in rows]
@@ -535,6 +556,7 @@ def run_study(
         ladder_slippage=slip,
         chosen_params=chosen,
         breakeven=breakeven,
+        legacy_comparison=legacy_comparison,
         fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
                   "that take liquidity"),

@@ -34,6 +34,7 @@ from sleeve_fund import markets, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.paper.runtime import WIPED_OUT, liquidation_reason
+from sleeve_fund.portfolio.conversion import band_order, band_target
 from sleeve_fund.portfolio.sizing import ATR_STOP_MULTIPLE, ROUND_UP_FLAG, Sizing, SizingInputs, rounds_up_too_often, size_entry
 from sleeve_fund.store import DUST, replay_book
 from sleeve_fund.strategies.indicators import Atr, AtrSma
@@ -42,6 +43,9 @@ from sleeve_fund.strategies.indicators import Atr, AtrSma
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
 MAKER_INTENTS = ("entry", "exit", "rebalance")
 OPENING_INTENTS = ("entry", "rebalance")  # every other order only ever reduces a position
+# P2-1b: a band add is refused when the position's risk to its stop would pass this share of equity (spec rule 4: "the
+# 5% open-risk check applies"), the portfolio limit the PM accepted on 6 Oct, held here per strategy.
+OPEN_RISK_MAX = 0.05
 EXIT_LEGS = ("stop_loss", "take_profit")  # the resting exits a backtest keeps through a reconcile halt
 # Exits after which the side they closed isn't entered again until the signal has moved off it (_exit_lock).
 LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
@@ -335,6 +339,7 @@ class LongFlatConfig(StrategyConfig):
         allow_short: bool = False,
         demo_mirror: bool = False,
         sizing: str = "legacy",
+        resize_band: float | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -408,6 +413,13 @@ class LongFlatConfig(StrategyConfig):
                 risk_per_trade = DEFAULT_RISK_PER_TRADE
         if market not in markets.MARKETS:
             raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
+        if resize_band is not None:
+            # P2-1b rule 4, the "entry-sized, 25% band" variant of a converted weight model: its size follows central
+            # sizing x weight, traded only past the band; without it the size is fixed for the trade.
+            if sizing != "central" or market == markets.SPOT or rebalance_band is not None:
+                raise ValueError("resize_band is for a weight model converted on a perpetual: it needs sizing=central")
+            if not 0 < resize_band < 1:
+                raise ValueError(f"resize_band {resize_band} outside (0, 1); use a fraction, e.g. 0.25 for 25%")
         if allow_short and market == markets.SPOT:
             raise ValueError("short positions need a perpetual: set market to perp (or perp-venue-fees)")
         if market != markets.SPOT:
@@ -445,6 +457,7 @@ class LongFlatConfig(StrategyConfig):
         self.stop_atr = stop_atr
         self.stop_fallback = stop_fallback  # the stop is the P2-1 fallback, not one the definition declared
         self.sizing = "central" if sizing == "central" and rebalance_band is None and not self.BENCHMARK else "legacy"
+        self.resize_band = resize_band
         self.stop_swing_bars = int(stop_swing_bars) if stop_swing_bars is not None else None
         self.atr_bars = int(atr_bars)
         # Or a take-profit that makes this many times what the stop loses, both after costs (r_target).
@@ -604,6 +617,8 @@ class LongFlatStrategy(Strategy):
         # so warm-up comes from the history store the hub feeds, never from the venue (set by the node).
         self.hub_fed = False
         self.hub_status = None  # the hub's own word on its venue connection (hub_client.HubStatus), when hub-fed
+        self._add_level: float | None = None  # P2-1b band add in flight: the position's stop level once it fills
+        self._band_reduce = False  # P2-1b band reduction in flight: the stop resizes to what is left once it fills
         self._resizing: dict[str, str] = {}  # backtest exits asked to resize, with why, until the venue confirms
         self._resize_due = False  # an entry slice filled while an exit was in flight (_resize_exits)
         self._resized_ns = None  # when the exits were last resized (_rest_exits)
@@ -1077,7 +1092,18 @@ class LongFlatStrategy(Strategy):
             if clamped != stop:
                 basis += f", held to {clamped:.1%}"
             stop = clamped
+        own = self.model_stop_level(side) if c.sizing == "central" else None
+        if own is not None and stop is not None and close > 0:
+            # P2-1b: a converted model's own exit level, where it can rest, when tighter than the fallback (rule 3).
+            frac = max(side * (close - own[0]) / close, MIN_STOP)
+            if frac < stop:
+                stop, basis = frac, own[1]
         return stop, self._target_for(stop, side), basis
+
+    def model_stop_level(self, side: int) -> tuple[float, str] | None:
+        """A converted weight model's own exit level as a price that can rest at the venue, built from closed bars,
+        and how it was set (P2-1b rule 3); None where it has none, and the fallback stop applies."""
+        return None
 
     def _target_for(self, stop: float | None, side: int | None = None) -> float | None:
         """The target as a share of the entry price: the fixed % one, or r_target around this stop."""
@@ -1482,6 +1508,8 @@ class LongFlatStrategy(Strategy):
             return  # the last decision is still being carried out
         current = self._pos_side()
         if side == current:
+            if side and self._cfg.resize_band is not None:
+                self._band(bar, side)
             return
         close = bar.close.as_double()
         reason, values = self.explain(bar, side)
@@ -1498,10 +1526,99 @@ class LongFlatStrategy(Strategy):
             return
         self._open(side, bar, reason, values)
 
+    def _converted_weight(self, bar: Bar) -> float | None:
+        """P2-1b: a weight model converted to entry-sized trades on a perpetual: its current weight (0 to 1, full weight
+        1), which sets its volatility-target size and the band variant's target; None for any other model."""
+        if self._cfg.sizing != "central" or not self._margin:
+            return None
+        if not type(self).weight_sized({"vol_target": getattr(self._cfg, "vol_target", None)}):
+            return None
+        w = self.target_weight(bar)
+        return None if w is None else abs(float(w))
+
+    def _band(self, bar: Bar, side: int) -> None:
+        """P2-1b rule 4, the band variant, on a bar the model stays on its side: the target is central sizing at this
+        close x the weight (ruling 5), traded only when more than resize_band of the size held away. A reduction is
+        an exit, always allowed; an add is an entry: every entry gate, its own stop, the room left under the margin
+        cap (Advisor 22:23) and the open-risk limit, and the position's stop moves to the tighter of its level and
+        the add's."""
+        w = self._converted_weight(bar)
+        if w is None or not w or self._entry_px is None:
+            return
+        close = bar.close.as_double()
+        plan = self._plan_exits(close, side)
+        if plan is None or not plan[0] or plan[0] != plan[0]:
+            return
+        equity, cash, _, _ = self._mark()
+        if equity <= 0:
+            return
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+        central = self._size(bar, side, equity, lev=lev, perp=True, share=share, stop=plan[0])
+        if not central.ok:
+            return
+        target = band_target(central.qty, w, 1.0).quantize(self._lot(), rounding=ROUND_DOWN)
+        held = self._position_qty()
+        order = band_order(target, held, Decimal(str(self._cfg.resize_band)))
+        values = {"close": close, "target_qty": float(target), "held_qty": float(held), "weight": round(w, 6),
+                  "band": self._cfg.resize_band}
+        exit_side, entry_side = (OrderSide.SELL, OrderSide.BUY) if side > 0 else (OrderSide.BUY, OrderSide.SELL)
+        if order < 0:
+            qty = (-order).quantize(self._lot(), rounding=ROUND_DOWN)
+            if qty < self._min_qty() or qty >= held:
+                return
+            self._band_reduce = True
+            self._submit(exit_side, qty, "exit", f"Band: reduce by {qty.normalize():f} to the {target.normalize():f} "
+                         f"target (central sizing x the model's {w:.0%}), more than {self._cfg.resize_band:.0%} below "
+                         f"the {held.normalize():f} held", {**values, "band": "reduce"})
+            return
+        if order == 0 or self._exit_lock == side or self._entry_blocked(bar):
+            return
+        if self.runtime is not None and not self.runtime.can_open():
+            return
+        if self._late_entry(bar, f"{_side_word(side)} add"):
+            return
+        # The room left under the margin cap: (cap x equity - posted margin) x leverage (Advisor 22:23).
+        posted = float(held) * close / lev if lev else float(held) * close
+        room = (self.runtime.position_budget(equity, posted) if self.runtime is not None
+                else max(0.0, (self._cap_pct() * equity - posted) * lev))
+        qty = min(order, central.qty, Decimal(str(room / close))).quantize(self._lot(), rounding=ROUND_DOWN)
+        if qty <= 0 or qty < self._min_qty() or qty <= Decimal(str(self._cfg.resize_band)) * held:
+            return  # nothing left under the cap, or what it leaves would land inside the band: no add
+        own = close * (1 - side * plan[0])
+        old = self._entry_px * (1 - side * self._stop_frac) if self._stop_frac else own
+        level = max(own, old) if side > 0 else min(own, old)  # the tighter of the position's stop and the add's own
+        total = float(held + qty)
+        risk = total * side * (close - level) + total * close * self._round_trip_cost()
+        if risk > OPEN_RISK_MAX * equity:
+            self._note("add_refused_open_risk", f"Add refused: the position's risk to its stop would be {risk:,.2f}, "
+                       f"more than {OPEN_RISK_MAX:.0%} of the {equity:,.2f} equity")
+            return
+        liq, distance = entry_liquidation(cash, total, close, side, self._cfg.assumed_taker_fee,
+                                          self._cfg.perp.maintenance_margin, lev)
+        frac = side * (close - level) / close
+        if liq is not None and frac > share * distance:
+            self._note("entry_refused_liquidation", f"Add refused: its stop at {level:,.6g} is more than {share:.0%} "
+                       f"of the way to the position's liquidation price {liq:,.6g}")
+            return
+        signal = {**self._sizing_words(central), **values, "side": _side_word(side), "sized_by": f"band add ({central.sized_by}; the room left under "
+                  "the margin cap)" if qty < min(order, central.qty) else f"band add ({central.sized_by})",
+                  "budget": round(float(qty) * close, 2), "stop_frac": round(plan[0], 6), "stop_basis": plan[2],
+                  "position_stop": round(level, 8), "risk_amount": round(float(qty) * close * loss_at_stop(plan[0], self._round_trip_cost(), side), 2),
+                  "stop_cfg": self._stop_cfg()}
+        if liq is not None:
+            signal["liquidation_px"] = round(liq, 8)
+            signal["leverage"] = round(total * close / equity, 4)
+        self._add_level = level
+        self._submit(entry_side, qty, "entry", f"Band: add {qty.normalize():f} toward the {target.normalize():f} target "
+                     f"(central sizing x the model's {w:.0%}), more than {self._cfg.resize_band:.0%} above the "
+                     f"{held.normalize():f} held; an add is an entry", signal)
+
     def _open(self, side: int, bar: Bar, reason: str, values: dict) -> None:
         """Open a position on a perpetual, all of it at market: long (side 1) or short (-1). Sized by the
         smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
         trade and the bar's volume; refused when its stop would sit too near the liquidation price."""
+        self._add_level = None  # an add that never filled leaves nothing for this entry
         if self._exit_lock == side:
             return
         if self._entry_blocked(bar):
@@ -1533,11 +1650,22 @@ class LongFlatStrategy(Strategy):
         if self._cfg.sizing == "central" and not self._central_stop_ok():
             return
         if self._stop_frac and self._cfg.sizing == "central":
-            sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share)
+            w = self._converted_weight(bar)
+            fixed = w is not None and self._cfg.resize_band is None
+            sizing = self._size(bar, side, equity, lev=lev, perp=True, share=share,
+                                vol_notional=w * equity if fixed else None)
             if not sizing.ok:
                 self._note("buy_skipped", sizing.skipped[0].upper() + sizing.skipped[1:])
                 return
             qty, size_by, budget = sizing.qty, sizing.sized_by, Decimal(str(min(sizing.limits.values())))
+            if w is not None and not fixed:
+                # P2-1b band variant: from flat it buys its band target, central sizing x the weight (ruling 5).
+                qty = band_target(qty, w, 1.0).quantize(self._lot(), rounding=ROUND_DOWN)
+                size_by, budget = f"{size_by}, x the model's {w:.0%} of full size", Decimal(str(float(qty) * close))
+                if qty <= 0 or qty < self._min_qty():
+                    self._note("buy_skipped", f"Entry skipped: central sizing x the model's {w:.0%} comes to {qty}, "
+                               f"below the smallest order the venue takes ({self._min_qty()})")
+                    return
         else:
             sizing = None
             fee = Decimal(str(self._cfg.assumed_taker_fee))
@@ -2303,7 +2431,8 @@ class LongFlatStrategy(Strategy):
             signal["stop_cfg"] = self._stop_cfg()
         self._submit(OrderSide.BUY, qty, "entry", reason, signal)
 
-    def _size(self, bar: Bar, side: int, equity: float, *, lev: float, perp: bool, share: float | None) -> Sizing:
+    def _size(self, bar: Bar, side: int, equity: float, *, lev: float, perp: bool, share: float | None,
+              stop: float | None = None, vol_notional: float | None = None) -> Sizing:
         """This entry's size from sizing.size_entry, the one rule backtest and paper share (P2-1): its risk to
         the planned stop, then the profile's cap (on the margin), leverage, the largest order, the bar's volume
         and, on a perpetual, the liquidation rule. Allocated equity is the strategy's own account equity."""
@@ -2311,11 +2440,11 @@ class LongFlatStrategy(Strategy):
         return size_entry(SizingInputs(
             allocated_equity=equity, price=bar.close.as_double(), side=side, leg_cost=self._round_trip_cost(),
             half_spread=self._half_spread(), risk_per_trade=self._cfg.risk_per_trade or DEFAULT_RISK_PER_TRADE,
-            position_cap_pct=self._cap_pct(), lot=self._lot(), min_qty=self._min_qty(), stop_frac=self._stop_frac,
+            position_cap_pct=self._cap_pct(), lot=self._lot(), min_qty=self._min_qty(), stop_frac=self._stop_frac if stop is None else stop,
             leverage=lev if perp else 1.0, perp=perp, max_notional=self._cfg.max_notional,
             volume_notional=float(cap) if cap is not None else None,
             maintenance_margin=float(self._cfg.perp.maintenance_margin) if perp else 0.0,
-            stop_to_liquidation=share if perp else None, stop_slippage=self._stop_slippage()))
+            stop_to_liquidation=share if perp else None, stop_slippage=self._stop_slippage(), vol_notional=vol_notional))
 
     def _central_stop_ok(self) -> bool:
         """A centrally sized entry needs a stop above 0: one computed at run time that comes to 0 or isn't a number
@@ -3646,11 +3775,28 @@ class LongFlatStrategy(Strategy):
             self._opened_seq = self.fee_model.bar_seq
         if opening:  # minutes before this fill are no one's to replay for this position
             self._replayed_to = max(self._replayed_to, int(event.ts_event))
+        band_add = opening and self._add_level is not None and bool(self._entry_px)
+        if band_add:
+            # P2-1b band add: an entry with its own stop, so the position works to the tighter of its stop and the
+            # add's, as a share of the new average entry (paper watches it; a backtest rests it again below).
+            self._stop_frac = (self._entry_side or 1) * (1 - self._add_level / self._entry_px)
+            self._add_level = None
         if self._backtest:
             if opening and self._pending_exit is None:
-                # On every entry fill, not only the last: a post-only entry can fill in slices through its
-                # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
-                self._rest_exits()
+                if band_add:
+                    # Placed again, whole, as a new order after the add.
+                    for order in self._resting_exits().values():
+                        self.cancel_order(order.client_order_id)
+                    self._rest_exits(fresh=True)
+                    self._rest_risk_stop()
+                else:
+                    # On every entry fill, not only the last: a post-only entry can fill in slices through its
+                    # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
+                    self._rest_exits()
+                    self._rest_risk_stop()
+            elif self._band_reduce and self._margin and self._pos_side() != 0 and done:
+                self._band_reduce = False
+                self._rest_exits()  # P2-1b band reduction: the resting stop shrinks to what is left
                 self._rest_risk_stop()
             elif self.decisions.get(str(event.client_order_id), {}).get("intent") in ("stop_loss", "take_profit"):
                 # As in paper: no re-entry until the signal has moved off the side that was closed.
@@ -3738,7 +3884,7 @@ class LongFlatStrategy(Strategy):
         self._entry_qty, self._entry_side = float(abs(post)), side
         return opening
 
-    def _rest_exits(self) -> None:
+    def _rest_exits(self, fresh: bool = False) -> None:
         """Backtests: after an entry fills, rest the stop at the venue as a real order would sit there (paper and
         live watch every trade instead): a sell stop at its level, filling there, or at the open when the price
         gaps through it. A flatten cancels it first (_sell_all). The target doesn't rest: within a bar the adverse
@@ -3751,7 +3897,7 @@ class LongFlatStrategy(Strategy):
             return
         if self.runtime is not None and self.runtime.status != "running":
             return  # halted, paused or flattening: nothing new rests (review round 11, B11-3)
-        resting = self._resting_exits()
+        resting = {} if fresh else self._resting_exits()
         if resting:
             # At most one resize per moment of the run. The simulated venue matches its resting orders against
             # the current bar again on every command, without using up what they took, so a resize there
@@ -3779,7 +3925,7 @@ class LongFlatStrategy(Strategy):
                 self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
                 exit_side, quantity, Price(level, self.instrument.price_precision), TriggerType.DEFAULT,
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
-                f"Stop-loss: resting {exit_word} at {level:,.6g}, {stop:.1%} {'below' if side > 0 else 'above'} the "
+                f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side)[:-len(' the entry')]} the "
                 f"{self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through",

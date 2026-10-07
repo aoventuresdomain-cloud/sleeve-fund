@@ -390,6 +390,23 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
                f"fee drag {fee_drag:.2%} of average equity a year")
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append("")
+    cmp = getattr(r, "legacy_comparison", None)  # a stand-in result (tests) may lack it
+    if cmp:
+        c, g = cmp["converted"], cmp["legacy"]
+        out.append("## Against the legacy weight version (spot, same period)")
+        out.append("")
+        out.append("| | Turnover | Fee drag | Gross return |")
+        out.append("| --- | --- | --- | --- |")
+        out.append(f"| Converted (entry-sized) | {c['turnover']:.1f}x a year | {c['fee_drag']:.2%} a year | "
+                   f"{c['gross_return']:+.2%} |")
+        out.append(f"| Legacy weight version | {g['turnover']:.1f}x a year | {g['fee_drag']:.2%} a year | "
+                   f"{g['gross_return']:+.2%} |")
+        out.append("")
+        out.append("Investigate the conversion before trusting either result: the gross returns differ by more than 30% "
+                   "(1.5 points when the legacy return is under 5%)." if cmp["investigate"] else
+                   "Gross returns are within 30% of each other (1.5 points when the legacy return is under 5%): a "
+                   "diagnostic, not a gate.")
+        out.append("")
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")

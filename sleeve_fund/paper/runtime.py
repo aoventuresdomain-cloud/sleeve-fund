@@ -197,8 +197,13 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
         return self.status == "running"
 
-    def position_budget(self, equity: float) -> float:
-        return equity * self.cap
+    def position_budget(self, equity: float, posted: float = 0.0) -> float:
+        """The largest notional an order may add: the cap on equity, less what the position already has up. posted:
+        the isolated margin a perpetual has posted (spot: the position held, at cost), so an add gets only the room
+        left under the margin cap, times the leverage (Advisor, 6 Oct 2026 22:23: (cap x equity - posted) x
+        leverage), and none once the cap is reached."""
+        lev = self.cap / self.profile.max_position_pct if self.profile.max_position_pct else 1.0
+        return max(0.0, (equity * self.profile.max_position_pct - posted) * lev) if posted else equity * self.cap
 
     # --- periodic tick ----------------------------------------------------------
 

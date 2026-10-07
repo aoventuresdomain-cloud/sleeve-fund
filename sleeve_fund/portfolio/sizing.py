@@ -79,6 +79,7 @@ class SizingInputs:
     stop_slippage: float | None = None  # past the stop price, as a share; None: max(half spread, 0.05%)
     maintenance_margin: float = 0.0  # a perpetual's maintenance margin rate, for the liquidation rule
     stop_to_liquidation: float | None = None  # the profile's share of the way to liquidation a stop may sit
+    vol_notional: float | None = None  # P2-1b: a converted weight model's own volatility-target notional (weight x equity)
 
 
 @dataclass
@@ -158,6 +159,9 @@ def size_entry(i: SizingInputs) -> Sizing:
             return Sizing(Decimal(0), "", stop, budget, 0.0, skipped="volatility targeting needs a target, the "
                           "instrument's volatility and its one-year floor")
         limits["volatility target"] = i.vol_target * equity / vol * i.regime_weight * i.fraction
+    if i.vol_notional is not None:
+        # P2-1b rule 2: a converted weight model takes the smaller of its stop size and its own volatility-target size.
+        limits["volatility target"] = max(i.vol_notional, 0.0)
     limits["margin cap" if i.perp else "position cap"] = i.position_cap_pct * equity * i.leverage
     if i.perp:
         limits[f"{i.leverage:g}x leverage cap"] = equity * i.leverage * (1 - i.leg_cost)

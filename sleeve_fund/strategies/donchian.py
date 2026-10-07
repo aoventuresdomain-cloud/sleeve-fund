@@ -150,3 +150,16 @@ class Donchian(LongFlatStrategy):
 
     def explain(self, bar: Bar, target) -> tuple[str, dict]:
         return self._why
+
+    def model_stop_level(self, side: int) -> tuple[float, str] | None:
+        """P2-1b, Advisor 6 Oct 17:09 ruling 1: where the whole position would be off, as a long's resting level: the
+        lowest of the active thirds' exit channels, each the lowest close of its n // 2 most recent closed bars, the
+        bar just closed included."""
+        closes = list(self._closes)
+        active = [n for n in self.c.lookbacks if self._on[n]]
+        if side <= 0 or not active or not closes:
+            return None
+        n = min(active, key=lambda k: min(closes[-max(k // 2, 1):]))
+        level = min(closes[-max(n // 2, 1):])
+        return level, (f"at the {n}-day third's exit, the lowest close of the last {max(n // 2, 1)} days "
+                       f"({level:,.6g}), the lowest of the active thirds'")

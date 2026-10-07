@@ -30,6 +30,8 @@ def check_perp_sizing(strategy: str, params: dict | None) -> None:
     from sleeve_fund import markets
 
     params = params or {}
+    if params.get("sizing") == "central":
+        return  # P2-1b: converted to entries and exits sized by central sizing, it trades a perpetual
     if strategy in REGISTRY and markets.is_perp(params) and REGISTRY[strategy][0].weight_sized(params):
         raise ValueError(f"{strategy.replace('_', ' ').capitalize()} is {PERP_WEIGHT_REFUSAL}")
 
