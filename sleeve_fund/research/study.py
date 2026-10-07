@@ -70,6 +70,8 @@ class Fold:
     # was made on, so the nearby-settings check can centre on what this fold chose (P1-G2).
     grid: pd.DataFrame = field(default_factory=pd.DataFrame)
     unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
+    # Every liquidation in the test window (_liquidations): a G1 finding whatever the P&L (GAP-LIQ-CAP).
+    liquidations: list = field(default_factory=list)
 
     @property
     def closed_in_window(self) -> int:
@@ -135,6 +137,15 @@ class StudyResult:
     @property
     def compare_returns(self) -> pd.Series:
         return self.oos_returns if self.oos_compare_returns is None else self.oos_compare_returns
+
+    # Every liquidation in out-of-sample (the folds' test windows) or the opened holdout, as _liquidations gives
+    # them: each a G1 finding whatever the P&L (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19 (5)).
+    holdout_liquidations: list = field(default_factory=list)
+
+    @property
+    def liquidations(self) -> list[dict]:
+        return [liq for f in self.folds for liq in getattr(f, "liquidations", [])] + list(
+            getattr(self, "holdout_liquidations", []))
 
     @property
     def not_judged(self) -> str:
@@ -567,6 +578,8 @@ def run_study(
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),
                 grid=pd.DataFrame(surface),
+                liquidations=_liquidations(run, test_idx[0], test_idx[-1],
+                                           f"out-of-sample test window {len(folds) + 1}"),
             )
         )
         oos_parts.append(test_ret)
@@ -626,10 +639,14 @@ def run_study(
         fee_basis=run_fees,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
+    # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
+    leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts)
+        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts,
+        leverage, market.get("market"))
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
-        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False)
+        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False, leverage,
+                                 market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -736,6 +753,7 @@ def run_study(
             else:
                 b_all = bt("buy_and_hold", prices, {}, benchmark=True)
                 result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
+            result.holdout_liquidations = _liquidations(run, h_start, prices.index[-1], "holdout")
         except Exception:
             if locks is not None:
                 # The lock was claimed before the look, so the holdout is spent: recorded as a crash, not a result.
@@ -747,6 +765,74 @@ def run_study(
         if locks is not None:
             locks.settle(idea_hash, underlying, trial)
     return result
+
+
+STOP_MISSING = "missing"
+STOP_BEYOND_HALF = "beyond half the distance to liquidation"
+STOP_GAPPED = "gapped past the stop"
+
+
+def _liquidations(run: BacktestResult, start, end, window: str) -> list[dict]:
+    """Every liquidation whose fill landed in [start, end] of this run, from its journal, as {window, ts, x,
+    stop_px, stop_ok, stop_why, needs_ack}. x: what the liquidation lost on the quantity it closed, at the average
+    entry price with that quantity's share of the entry fees, plus its own fee (exactly the margin plus the entry
+    and liquidation fees, GAP-LIQ-CAP); a part of the position closed earlier, at a profit or a loss, is not in it.
+    The stop: the position's protective stop, the last closing-side order with a trigger journaled while it was
+    held. A gap past a stop within half the distance to liquidation needs the PM's acknowledgement for G1; a missing
+    stop, or one beyond half way, is a G1 FAIL with no override (Independent Quant Advisor 7 Oct 00:19 (5))."""
+    j = getattr(run, "journal", None)
+    if j is None or j.sleeve_row is None:
+        return []
+    name = j.sleeve_row.name
+    orders = {o["order_id"]: o for o in j.orders(name, limit=1_000_000)}
+    fills = sorted(j.fills(name, limit=1_000_000), key=lambda f: (_utc(f["ts"]), f.get("id") or 0))
+    lo, hi = _utc(start), _utc(end)
+    found: dict[str, dict] = {}
+    held, avg, fee_unit, opened, entry, entry_px = 0.0, 0.0, 0.0, None, None, None
+    for f in fills:
+        side, qty, px, fee = (1 if f["side"] == "BUY" else -1), float(f["qty"]), float(f["price"]), float(f["fee"])
+        o = orders.get(f["order_id"], {})
+        if abs(held) < 1e-12:
+            held, avg, fee_unit, opened, entry, entry_px = 0.0, 0.0, 0.0, _utc(f["ts"]), o, px
+        if held == 0 or side * held > 0:  # opening or adding: the average entry and the entry fees per unit
+            avg = (abs(held) * avg + qty * px) / (abs(held) + qty)
+            fee_unit = (abs(held) * fee_unit + fee) / (abs(held) + qty)
+            held += side * qty
+            continue
+        closed = min(qty, abs(held))  # reducing, at most to flat (a fill past flat opens the rest the other way)
+        if o.get("intent") == "liquidation" and lo <= _utc(f["ts"]) <= hi:
+            liq = found.setdefault(f["order_id"], {"window": window, "ts": _utc(f["ts"]), "order_id": f["order_id"],
+                                                   "opened": opened, "entry": entry, "entry_px": entry_px,
+                                                   "closing_side": f["side"], "x": 0.0})
+            held_sign = 1 if held > 0 else -1
+            liq["x"] += held_sign * closed * (avg - px) + closed * fee_unit + fee * closed / qty
+        held += side * qty
+        if abs(held) < 1e-12 or side * held > 0:  # flat, or reversed: the rest is a new position from this fill
+            rest = abs(held) if side * held > 0 else 0.0
+            held, avg, fee_unit = side * rest, px, (fee / qty if rest else 0.0)
+            opened, entry, entry_px = (_utc(f["ts"]), o, px) if rest else (None, None, None)
+    for liq in found.values():
+        liq["x"] = round(liq["x"], 2)
+    return [_judged(liq, orders) for liq in found.values()]
+
+
+def _judged(liq: dict, orders: dict) -> dict:
+    entry = liq.pop("entry") or {}
+    sig = entry.get("signal") or {}
+    liq_px, entry_px = sig.get("liquidation_px"), liq.pop("entry_px")
+    opened, at, side = liq.pop("opened"), liq["ts"], liq.pop("closing_side")
+    stops = [o for o in orders.values() if o.get("side") == side and (o.get("signal") or {}).get("trigger") is not None
+             and opened is not None and opened <= _utc(o["ts"]) <= at and o.get("intent") in ("stop_loss", "liquidation")]
+    stop_px = float(stops[-1]["signal"]["trigger"]) if stops else None
+    if stop_px is None:
+        why = STOP_MISSING
+    elif liq_px and entry_px and abs(stop_px - entry_px) > 0.5 * abs(liq_px - entry_px) + 1e-9:
+        why = STOP_BEYOND_HALF
+    else:
+        why = STOP_GAPPED
+    liq.pop("order_id")
+    return {**liq, "x": liq.get("x"), "stop_px": stop_px, "stop_ok": why == STOP_GAPPED, "stop_why": why,
+            "needs_ack": why == STOP_GAPPED}
 
 
 def _holdout_trades(run: BacktestResult, start) -> int:
@@ -775,10 +861,14 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
     return int((inside.abs() > 1e-9).sum())
 
 
-def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool):
+def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool,
+                leverage: float | None = None, market: str | None = None):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
-    are priced on those bars' closes, so the benchmark compares timing, not fills."""
+    are priced on those bars' closes, so the benchmark compares timing, not fills. leverage: the risk profile's cap,
+    for a fold that traded the perpetual (its chosen market, else `market`): its trips and their draws are
+    liquidated as the engine books one, losing the margin and fees, never the move past it (Independent Quant
+    Advisor 7 Oct 00:19 (4))."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
 
     def bar(ts) -> int:
@@ -795,7 +885,8 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_pe
             out = min(max(bar(closed), entry + 1), end)
             if out <= entry:
                 continue
-            placed.append(Trade(entry, out, side))
+            perp = f.chosen.get("market", market) == PERP
+            placed.append(Trade(entry, out, side, leverage=leverage if perp else None))
             last = out
     closes = prices["close"].to_numpy(dtype=float)
     bars = sum(f.window_bars for f in folds)

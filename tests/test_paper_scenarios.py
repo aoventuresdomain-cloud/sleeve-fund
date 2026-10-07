@@ -31,7 +31,10 @@ def test_liquidate_in_paper_closes_past_bankruptcy_halts_and_reports_y_at_entry(
     objects, profiles = dict(risk.PROFILES), copy.deepcopy(risk.PROFILES)
     f = liquidate_in_paper(tmp_path, store)
     assert store.sleeve(NAME).status == "halted" and store.journal_book(NAME, 10_000)["qty"] == 0
-    assert f.close["avg_px"] > f.entry["avg_px"] * 1.5 and 0 < f.rem < 10_000
+    # Past bankruptcy where the market took it (the liquidation's market_px); booked at the bankruptcy price (GAP-LIQ-CAP,
+    # HoE 7 Oct 02:08)
+    assert f.close["intent"] == "liquidation" and f.close["signal"]["market_px"] > f.entry["avg_px"] * 1.5, f.close
+    assert f.close["avg_px"] == pytest.approx(f.entry["avg_px"] * 1.5, rel=1e-6) and 0 < f.rem < 10_000
     assert 9_000 < f.at_entry < 11_000 and f.x > 0 and f.y_at_entry == pytest.approx(100 * f.x / f.at_entry)
     assert risk.PROFILES == profiles  # nothing it touched is left changed
     assert all(risk.PROFILES[k] is v for k, v in objects.items())  # the same profile objects

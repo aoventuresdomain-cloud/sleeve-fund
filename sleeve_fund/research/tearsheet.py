@@ -34,6 +34,9 @@ NOT_APPLICABLE = "N/A"
 NEARBY_CHECK = "Holds at nearby settings"
 RANDOM_ENTRY_CHECK = "Beats random entry times"
 RANDOM_SIDE_CHECK = "Beats random long or short"
+LIQUIDATION_CHECK = "Liquidations"
+# A G1 check that a person's acknowledgement can clear: shown, and it stops a pass until acknowledged.
+NEEDS_ACK = "ACK"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
               RANDOM_ENTRY_CHECK, RANDOM_SIDE_CHECK)
 # More of the test windows' trades than this left out at the edges, and the trade count is flagged.
@@ -152,9 +155,12 @@ def _nearby(r: StudyResult) -> tuple[str, str]:
     return ("FAIL" if final[0] == "FAIL" or failed else "PASS"), words
 
 
-def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[str, str, str]]:
+def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
+              liquidation_ack: str | dict | None = None) -> list[tuple[str, str, str]]:
     """register: the trials register, when the study ran against the database. Its count of variants, which
-    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's."""
+    includes single backtests and paper strategies (QA P1-T1), then sets the bar instead of the idea counter's.
+    liquidation_ack: the PM's acknowledgement of the study's liquidations after gaps past correctly placed stops: a
+    note for all of them, or Store.g1_acks' rows by liquidation time. Never read for any other liquidation."""
     # On a perpetual the benchmark is the perp hold, priced only on the out-of-sample days its funding is known for,
     # and the strategy is compared on those same days (Advisor, 7 Oct 2026, RE-COST).
     insufficient = getattr(r, "hold_insufficient", False)
@@ -220,6 +226,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
             + _excluded_words(r) +
             f"{len(r.round_trips)} over the full research period, in-sample; turnover {r.turnover:.1f}x a year",
         ),
+        _liquidation_check(r, liquidation_ack),
     ]
     if why_not:
         # Under a NOT JUDGED headline these can't fail: they measure the out-of-sample the study didn't get,
@@ -228,6 +235,42 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None) -> list[tuple[s
                    f"not judged: {ev}" if verdict == "FAIL" and name in OOS_CHECKS else ev)
                   for name, verdict, ev in checks]
     return checks
+
+
+def _liquidation_check(r: StudyResult, ack: str | dict | None) -> tuple[str, str, str]:
+    """GAP-LIQ-CAP (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19 (5)): any liquidation in out-of-sample or
+    the holdout is a G1 finding, whatever the P&L. A gap past a stop placed within half the distance to liquidation
+    stops a pass until the PM acknowledges it; with no stop, or one beyond half way, it is a FAIL no acknowledgement
+    clears."""
+    liqs = getattr(r, "liquidations", None) or []
+    if not liqs:
+        return LIQUIDATION_CHECK, "PASS", "none in out-of-sample or the holdout"
+    words, waiting = [], False
+    for liq in liqs:
+        lost = f"{liq['x']:,.2f} lost" if liq.get("x") is not None else "its margin lost"
+        if not liq["stop_ok"]:
+            # An acknowledgement is never read here: it records that the PM has seen it, never a pass (DA, HoE).
+            why = ("no stop" if liq["stop_why"] == "missing" else f"its stop was {liq['stop_why']}") + \
+                ": a G1 FAIL the PM's acknowledgement can't clear"
+        elif (note := _ack_for(ack, liq)) is not None:
+            why = f"a gap past a correctly placed stop at {liq['stop_px']:,.6g}, acknowledged by the PM: {note}"
+        else:
+            waiting = True
+            why = f"a gap past a correctly placed stop at {liq['stop_px']:,.6g}: needs the PM's acknowledgement"
+        words.append(f"liquidated in the {liq['window']} on {pd.Timestamp(liq['ts']):%d %b %Y} ({lost}); {why}")
+    verdict = "FAIL" if any(not liq["stop_ok"] for liq in liqs) else NEEDS_ACK if waiting else "PASS"
+    return LIQUIDATION_CHECK, verdict, "; ".join(words)
+
+
+def _ack_for(ack, liq: dict) -> str | None:
+    """The PM's acknowledgement of one liquidation: a note covering every one, or the store's acknowledgements by
+    liquidation time (Store.g1_acks: {liquidation_ts: row}); None when it isn't acknowledged."""
+    if ack is None or isinstance(ack, str):
+        return ack or None
+    row = next((v for ts, v in ack.items() if pd.Timestamp(ts) == pd.Timestamp(liq["ts"])), None)
+    if row is None:
+        return None
+    return (row.get("note") if isinstance(row, dict) else None) or "acknowledged"
 
 
 def _random_entry_check(r: StudyResult) -> tuple[str, str, str]:
@@ -301,7 +344,7 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None) -> str:
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)
@@ -354,7 +397,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     out.append("")
     out.append("## G1 checks")
     out.append("")
-    checks = g1_checks(r, ledger, register)
+    checks = g1_checks(r, ledger, register, liquidation_ack)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
