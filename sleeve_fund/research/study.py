@@ -1216,7 +1216,6 @@ def missing_funding(params: dict, instrument, after: pd.Timestamp, until: pd.Tim
     for: None when the market is spot, 0 for a simulated perp, which charges its terms' fixed rate as its runs do.
     The perp buy and hold is priced only over a window with none missing; a missing rate is never filled in
     (Advisor, 7 Oct 2026)."""
-    from datetime import timedelta
 
     from sleeve_fund import funding
 
