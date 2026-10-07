@@ -2673,3 +2673,126 @@ def test_the_chart_passes_on_the_strategys_recorded_indicators_untouched_and_sur
     monkeypatch.setattr(store, "chart_indicators", broken, raising=False)
     d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
     assert d["indicators"] == [] and d["candles"]
+
+
+def test_the_page_names_what_clears_each_kind_of_halt(client):
+    """Advisor 6 Oct 18:17 (HC): a drawdown halt shows Resume, a day's-loss pause says it clears at 00:00 UTC with
+    no Resume, a liquidation says only a reset after liquidation, and a stopped holder reads exits only."""
+    from datetime import timedelta
+
+    from sleeve_fund.paper.runtime import EXITS_ONLY, utcnow
+    from sleeve_fund.store import LIQUIDATION_RESET
+
+    c, store = client
+    _new(c)
+    store.set_desired_state("btc-test", "running")
+
+    store.set_status("btc-test", "halted", "drawdown 21.0% hit the 20% limit")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "What clears it:" in page and "Only you can clear it, with Resume" in page
+    assert 'data-open="dlg-resume">Resume<' in page and 'id="dlg-ral"' not in page  # an ordinary halt: no reset after liquidation
+
+    store.set_status("btc-test", "paused", "daily loss 3.2% hit the 3% limit", utcnow() + timedelta(hours=3))
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "00:00 UTC roll" in page and "Clears at 00:00 UTC" in page
+    assert 'data-open="dlg-resume">Resume<' not in page
+
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", "Position margin lost (liquidated): 900.00, 110% of strategy equity at entry")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Only a reset after liquidation clears it" in page and 'data-open="dlg-ral"' in page
+    assert 'data-open="dlg-resume">Resume<' not in page
+
+    store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    store.set_status("btc-test", "paused", f"{EXITS_ONLY}: it was stopped while it still holds a position")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert "Exits only:" in page and "What clears it:" not in page
+
+
+LIQUIDATED_HALT_TEXT = "Position margin lost (liquidated): 3,328.70, 112.4% of strategy equity at entry (includes adds)"
+
+
+def _liquidated_with_incident(store):
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.set_status("btc-test", "halted", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    return next(e["id"] for e in store.events("btc-test", min_level="error") if e["kind"] == "incident")
+
+
+def test_a_liquidated_page_offers_reset_after_liquidation_with_its_figures_note_and_refusals(client):
+    """RAL (Advisor 17:57, 18:17): the dialog names X, Y% (with 'includes adds') and the equity left, holds the note
+    form and the reset form on the engine's incident, and a reset without the note is refused in words on the page;
+    an ordinary halt is offered neither."""
+    c, store = client
+    _new(c)
+    iid = _liquidated_with_incident(store)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    dialog = page.split('id="dlg-ral"')[1].split("</dialog>")[0]
+    assert "3,328.70" in dialog and "112.4% of its equity when the position was opened (includes adds)" in dialog
+    assert f'name="incident" value="{iid}"' in dialog
+    assert 'name="author"' in dialog and 'name="why_stop_did_not_protect"' in dialog
+    assert 'value="reset_after_liquidation"' in dialog and "stays open until the note is written" in dialog
+
+    form = {"command": "reset_after_liquidation", "reason": "Incident note written", "incident": str(iid)}
+    refused = c.post("/sleeves/btc-test/command", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" in refused.headers["location"] and "no+note+yet" in refused.headers["location"]
+    blank = c.post("/sleeves/btc-test/incident-note", data={"incident": str(iid), "author": "PM"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+    assert "command_error" in blank.headers["location"]
+    c.post("/sleeves/btc-test/incident-note", data={"incident": str(iid), "author": "PM",
+                                                    "why_stop_did_not_protect": "gap past the stop"},
+           auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "Written by PM" in c.get("/sleeves/btc-test", auth=AUTH).text
+    sent = c.post("/sleeves/btc-test/command", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" not in sent.headers["location"]
+    assert any(p["command"] == "reset_after_liquidation" for p in store.pending_commands("btc-test"))
+
+
+def test_a_reset_dropped_after_a_liquidation_is_named_until_the_next_reset(client):
+    """P1-D24 (HoE 7 Oct): the PM asked for a reset that did not happen, so the page says so until they reset again."""
+    c, store = client
+    _new(c)
+    sentence = "Your reset was cancelled because the strategy was liquidated first. The halt stays until you reset again."
+    assert sentence not in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.event("btc-test", "warning", "reset_dropped", "The reset asked for (x) was not carried out")
+    assert sentence in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.event("btc-test", "info", "liquidation_reset", "PM reset it after liquidation")
+    assert sentence not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_stopped_liquidated_strategy_still_offers_reset_after_liquidation_with_its_figures(client):
+    """CR on #194: Start is refused for a liquidated strategy the PM stopped, so the page must offer the reset it points
+    to, and the dialog keeps X and Y% though the stop replaced the halt's status reason."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", "stopped", "stopped by PM")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'data-open="dlg-ral"' in page and 'data-open="dlg-start"' in page
+    dialog = page.split('id="dlg-ral"')[1].split("</dialog>")[0]
+    assert "3,328.70" in dialog and "112.4% of its equity when the position was opened" in dialog
+
+
+def test_a_reset_after_liquidation_on_a_stopped_strategy_is_applied_and_ends_the_offer(client):
+    """CR on #194 with #193's stopped-strategy fix: from the page, a stopped liquidated strategy takes the reset at once;
+    the reset offer then goes and Start is open."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    iid = next(e["id"] for e in store.events("btc-test", min_level="error") if e["kind"] == "incident")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", "stopped", "stopped by PM")
+    c.post("/sleeves/btc-test/incident-note", data={"incident": str(iid), "author": "PM",
+                                                    "why_stop_did_not_protect": "gap past the stop"},
+           auth=AUTH, headers=SAME, follow_redirects=False)
+    r = c.post("/sleeves/btc-test/command", data={"command": "reset_after_liquidation", "incident": str(iid),
+                                                  "reason": "Incident note written"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"]
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'id="dlg-ral"' not in page and 'data-open="dlg-start"' in page

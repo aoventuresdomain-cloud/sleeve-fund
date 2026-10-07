@@ -53,7 +53,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import RESUMABLE, entry_blocked, liquidation_event
+from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -472,6 +472,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.
         liquidated = not bt_id and _liquidated(name)
         ral = _ral_view(st(), name) if liquidated else None
+        clearing = None if bt_id else _clearing(s)
+        reset_dropped = False if bt_id else _reset_dropped(name)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -488,7 +490,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total, liquidated=liquidated, ral=ral,
+                    order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
+                    reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
                     timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
@@ -758,6 +761,30 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note saved.'})}", status_code=303)
+
+    def _clearing(s) -> dict | None:
+        """What alone clears a strategy that isn't trading, for its page (Advisor 6 Oct 18:17): `kind` is liquidated
+        (only a reset after liquidation), drawdown (only a resume), daily (only the 00:00 UTC roll) or exits_only
+        (stopped while holding: only a flatten ends it). `why` is the engine's own words (clearing_action), so the
+        page and the refusals never disagree. None when nothing needs clearing."""
+        why = clearing_action(s, utcnow())
+        if why is not None:
+            kind = {"liquidated": "liquidated", "daily_pause": "daily"}.get(why.code, "drawdown")
+            return {"kind": kind, "why": str(why)}
+        if s.status == "paused" and (s.status_reason or "").startswith(EXITS_ONLY):
+            return {"kind": "exits_only", "why": s.status_reason}
+        return None
+
+    def _reset_dropped(name: str) -> bool:
+        """Whether a reset the PM asked for was cancelled because the strategy was liquidated first (P1-D24, HoE 7 Oct):
+        the page says so until the next reset, asked again or after liquidation, replaces it."""
+        dropped = st().last_event(name, ("reset_dropped",))
+        if dropped is None:
+            return False
+        after = st().last_event(name, (LIQUIDATION_RESET,))
+        if after and after["id"] > dropped["id"]:
+            return False
+        return not any(r["sleeve"] == name for r in st().pending_resets())
 
     def _liquidated(name: str) -> bool:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
@@ -1898,15 +1925,26 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
 
 
 def _ral_view(store, name: str) -> dict | None:
-    """What a liquidated strategy's page offers for its reset after liquidation: the liquidation's incident (the
-    newest since it), and the note on it, if written."""
+    """What a liquidated strategy's page offers for its reset after liquidation (Advisor 17:57, 18:17, 20:37): the
+    liquidation's incident (the newest since it) and its note; X and Y% read from the liquidation halt's own words
+    ("... lost (liquidated): X, Y% of strategy equity at entry", with "includes adds" when the position was added
+    to); and the equity left, the journal's cash. Whatever isn't there reads as None, and the dialog says so."""
     liq = liquidation_event(store, name)
     if liq is None:
         return None
     found = store.sleeve_events_since(name, ("incident",), since=liq["ts"])
     incident = found[-1] if found else None
+    s = store.sleeve(name)
+    # The halt's own words (its event), as a Stop replaces the status reason with "stopped by PM" (CR on #194).
+    halts = [e["message"] for e in store.sleeve_events_since(name, ("risk_halt",), since=liq["ts"])
+             if "(liquidated)" in e["message"]]
+    reason = halts[-1] if halts else s.status_reason or ""
+    m = re.search(r"\(liquidated\):\s*([\d,]+(?:\.\d+)?),\s*([\d,]+(?:\.\d+)?)%", reason)
     return {"liquidation": liq, "incident": incident,
-            "note": store.incident_note(incident["id"]) if incident is not None else None}
+            "note": store.incident_note(incident["id"]) if incident is not None else None,
+            "x": m.group(1) if m else None, "y": m.group(2) if m else None,
+            "adds": "includes adds" in reason.lower(),
+            "left": store.journal_book(name, s.starting_balance)["cash"]}
 
 
 def _demo_copy(store, s) -> dict | None:
