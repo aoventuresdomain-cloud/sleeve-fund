@@ -16,7 +16,7 @@ import os
 import re
 import secrets
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -649,7 +649,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
                     # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                st().decide(actor, command, reason, name)
+                # A Stop's acceptance is stamped to the microsecond: a raced fill is journaled with the ms after it
+                # (P1-SG15, Advisor 7 Oct 05:01).
+                st().decide(actor, command, reason, name,
+                            ts=datetime.now(timezone.utc) if command == "stop" else None)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and not set(why.codes) <= set(RESUMABLE)):
                 raise ValueError(f"a resume can't clear it. {why}")

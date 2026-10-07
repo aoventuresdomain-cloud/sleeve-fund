@@ -257,22 +257,34 @@ def test_a_stop_accepted_between_ticks_cancels_a_resting_entry_before_the_next_t
     assert entry["order_id"] not in {f["order_id"] for f in _fills(store)}, "the resting entry filled after the Stop"
 
 
-def test_a_stop_accepted_just_before_the_print_that_fills_a_resting_entry_keeps_it_with_its_stop_and_one_incident(
-        tmp_path, store, monkeypatch):  # noqa: F811
-    """The residual the HoE logged before G2 (one print): the Stop lands between two prints (t0+25:10.5) and the very
-    next print crosses a resting stop entry. The venue fills it before the strategy hears of either, as a real venue
-    can fill a resting order before a cancel lands; the raced-fill rule covers it: kept with its stop, one incident."""
+@pytest.mark.parametrize("case", ["crossing-first-print-within-1s", "crossing-first-print-at-1.5s",
+                                  "first-print-not-crossing"])
+def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_print_within_a_second(
+        tmp_path, store, monkeypatch, case):  # noqa: F811
+    """The one-print residual (HoE, logged before G2; Advisor 7 Oct 05:01 bounds). A Stop accepted between two prints:
+    its cancel goes out within GATE_WATCH_SECONDS whatever the feed does, so a resting stop entry fills only when the
+    first print after the Stop crosses it within that time, as a real venue can fill a resting order before a cancel
+    lands. Then the raced-fill rule holds: kept with its stop, one incident, one raced_fill row with the ms after the
+    Stop. A first print 1.5 s after the Stop finds the entry cancelled; a first print that doesn't cross cancels it
+    cleanly."""
     from test_exposure_gate_xfails import NAME, Egx, _events, _pm_stop
 
-    k = 25 * 60 + 11
-    real_start = Egx.on_start
+    from sleeve_fund import store as store_mod
+    from sleeve_fund.strategies import base
+
+    k = 25 * 60 + 11  # the price steps 2% here and crosses the entry (60 s later when the first print doesn't cross)
+    lead = 1.5 if case == "crossing-first-print-at-1.5s" else 0.25
+    accepted = pd.Timestamp(STD_T0) + pd.Timedelta(seconds=k - lead)
+    real_start, real_bar = Egx.on_start, Egx.on_bar
+
+    def stop(e):
+        with monkeypatch.context() as m:  # the decision is stamped as the dashboard stamps a Stop: its own instant
+            m.setattr(store_mod, "utcnow", lambda: accepted.to_pydatetime())
+            _pm_stop(store)
 
     def on_start(self):
         real_start(self)
-        at = pd.Timestamp(STD_T0) + pd.Timedelta(seconds=k - 0.5)
-        self.clock.set_time_alert("qa-stop", at.to_pydatetime(), callback=lambda e: _pm_stop(store))
-
-    real_bar = Egx.on_bar
+        self.clock.set_time_alert("qa-stop", accepted.to_pydatetime(), callback=stop)
 
     def on_bar(self, bar):
         resting = bool(self._rest)
@@ -284,19 +296,33 @@ def test_a_stop_accepted_just_before_the_print_that_fills_a_resting_entry_keeps_
 
     monkeypatch.setattr(Egx, "on_start", on_start)
     monkeypatch.setattr(Egx, "on_bar", on_bar)
+    if case == "crossing-first-print-within-1s":
+        # Here the gate reads land on whole seconds, as the prints do, and a read beats a print at the same instant;
+        # a live feed's prints fall anywhere between reads. Reads 0.75 s apart (still inside 1 s) put the next one
+        # after the crossing print, at t0+25:11.25.
+        monkeypatch.setattr(base, "GATE_WATCH_SECONDS", 0.75)
     plan = Plan(t0=STD_T0, tag="sr1")
     p0 = 60_000 + 5 * 60 * 0.01
-    plan.price = lambda s: (60_000 + s * 0.01) * (1.02 if s >= k else 1.0)
-    # the strategy wants the long from the candle after the fill on (no market entry of its own before the Stop)
+    cross = k + (60 if case == "first-print-not-crossing" else 0)
+    plan.price = lambda s: (60_000 + s * 0.01) * (1.02 if s >= cross else 1.0)
+    if case == "crossing-first-print-at-1.5s":
+        plan.holes.append((k - 1, k))  # no print between the Stop and the crossing one
+    # the strategy wants the long from the candle after the Stop on (no market entry of its own before it)
     plan.windows.append((M(plan.t0, 25) + pd.Timedelta(seconds=1), M(plan.t0, plan.minutes), 1))
     plan.rest.append((M(plan.t0, 5), 1, round(p0 * 1.01, 1), 0.05))
     run(tmp_path, store, plan, monkeypatch)
     assert store.sleeve(NAME).desired_state == "stopped", "set-up: the Stop never landed"
     (entry,) = [o for o in _orders(store) if o["intent"] == "entry"]
     fills = [f for f in _fills(store) if f["order_id"] == entry["order_id"]]
+    incidents = [e["message"][:120] for e in _events(store, ("incident",))]
+    raced = [e["message"] for e in _events(store, ("raced_fill",))]
+    if case != "crossing-first-print-within-1s":
+        assert not fills and entry["status"] == "canceled", f"the resting entry filled after the Stop: {entry}"
+        assert not incidents and not raced, (incidents, raced)
+        return
     assert fills, f"set-up: the crossing print did not fill the resting entry: {entry}"
     stops = [o for o in _orders(store) if o["intent"] == "stop_loss" and o["ts"] >= fills[0]["ts"]]
     assert stops, f"the raced entry has no stop: {[(o['intent'], o['order_type'], o['status']) for o in _orders(store)]}"
-    raced = [e for e in _events(store, ("incident",)) if "filled while nothing may open" in e["message"]]
-    assert len(raced) == 1, [e["message"][:120] for e in _events(store, ("incident",))]
+    assert len([m for m in incidents if "filled while nothing may open" in m]) == 1, incidents
     assert not [o for o in _orders(store) if o["intent"] == "exit"], "the raced entry was closed, not kept"
+    assert len(raced) == 1 and " 250 ms after nothing could open any more (stopped" in raced[0], raced

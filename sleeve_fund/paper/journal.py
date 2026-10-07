@@ -161,8 +161,8 @@ class MemoryJournal:
         self.events_.append({"id": next(self._ids), "sleeve": sleeve, "ts": ts or utcnow(), "level": level,
                              "kind": kind, "message": message})
 
-    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None) -> None:
-        self.decisions_.append({"ts": utcnow(), "actor": actor, "action": action, "sleeve": sleeve,
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None, ts=None) -> None:
+        self.decisions_.append({"ts": ts or utcnow(), "actor": actor, "action": action, "sleeve": sleeve,
                                 "reason": reason.strip()})
 
     # --- reads, newest first like Store -------------------------------------------------

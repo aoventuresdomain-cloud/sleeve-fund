@@ -33,7 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
-from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, WIPED_OUT, liquidation_reason
+from sleeve_fund.paper.runtime import EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma
 
@@ -121,6 +121,10 @@ MAX_PARTICIPATION = 0.25
 # feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
 STALE_PRICE_WARN_MINUTES = 5
 STALE_AT_START = "no trade or quote yet since this process started. It clears when data resumes"
+# P1-SG15 (Advisor 7 Oct 05:01): while an opening order rests at the venue, the gate is read this often whatever the feed
+# does, so a block's cancel goes out within it: a resting entry fills on at most a print inside it, never past 1 s.
+GATE_WATCH_SECONDS = 0.5
+GATE_WATCH = "entry-gate-watch"
 STALE_PRICE_RESTART_MINUTES = 15
 # Paper: how often at most the model's conditions on the forming candle are written for the Signals tab
 # (and straight after each bar). Display only: never in a backtest.
@@ -3804,6 +3808,22 @@ class LongFlatStrategy(Strategy):
         kept = [c for c, k in self._kept.items() if opens(k["info"].get("intent"), k["order"].side)]
         return (resting, kept) if resting or kept else ()
 
+    def _watch_gate(self) -> None:
+        """P1-SG15 (Advisor 7 Oct 05:01): read the gate every GATE_WATCH_SECONDS while an opening order rests at the
+        venue, so a block accepted between prints (a Stop) has its cancel sent within that time, not on the next print
+        or tick: a slow feed can't widen the window in which a resting entry may still fill."""
+        if GATE_WATCH not in self.clock.timer_names() and self._resting_openers():
+            self.clock.set_timer(GATE_WATCH, timedelta(seconds=GATE_WATCH_SECONDS), callback=self._on_gate_watch)
+
+    def _on_gate_watch(self, event) -> None:
+        try:
+            if self._resting_openers():
+                self._cancel_resting_entries()
+            elif GATE_WATCH in self.clock.timer_names():
+                self.clock.cancel_timer(GATE_WATCH)  # nothing opening rests: nothing to watch until one is accepted
+        except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
+            self._report("_on_gate_watch", exc)
+
     def _cancel_resting_entries(self) -> None:
         """While nothing may open (CHOKE: liquidated until a reset after liquidation, Advisor 17:57 rule (c), QA P1-D21;
         halted, paused or stopped), every entry or rebalance still resting at the venue, or the unfilled rest of one,
@@ -3857,6 +3877,10 @@ class LongFlatStrategy(Strategy):
                        + ("It is sold at once through the exit path, as that block flattens what it holds." if sells else
                           "It is kept with its stop, not closed; you decide what to do with it."),
                        ts=rt.now())
+        # Advisor 7 Oct 05:01: each raced fill is on record with how long after the block it filled, for fills-vs-model.
+        ms = max(0, round((rt.now() - rt.block_began(why)).total_seconds() * 1000))
+        rt.store.event(rt.name, "info", RACED_FILL, f"Raced fill: {qty:g} at {px:,.6g}, {ms} ms after nothing could "
+                       f"open any more ({', '.join(block_codes(why))}).", ts=rt.now())
 
     def _adds(self, side) -> bool:
         """Whether an order on `side` would make the position bigger: on a perp, a buy when flat or long and a sell
@@ -3884,6 +3908,8 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         if self.runtime is not None:
             self.runtime.on_timing(coid, accepted=int(event.ts_init))
+            if not self._backtest:
+                self._watch_gate()
         if coid in self._cancel_on_accept:  # a flatten was waiting for the venue to have this order
             self._cancel_on_accept.discard(coid)
             order = self.cache.order(event.client_order_id)
@@ -4327,7 +4353,8 @@ class LongFlatStrategy(Strategy):
             self._cancel_alert(coid)
         self.cancel_all_orders(self._cfg.instrument_id)
         if self.runtime is not None:
-            self.clock.cancel_timer("sleeve-tick") if "sleeve-tick" in self.clock.timer_names() else None
+            for timer in ("sleeve-tick", GATE_WATCH):
+                self.clock.cancel_timer(timer) if timer in self.clock.timer_names() else None
             self.runtime.on_stop()
         if self.recorder is not None:
             self.recorder.close()

@@ -1805,9 +1805,10 @@ class Store:
         with self.engine.begin() as c:
             c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
 
-    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None) -> None:
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
+               ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
-            c.execute(insert(decisions_t).values(ts=utcnow(), actor=actor, action=action, sleeve=sleeve,
+            c.execute(insert(decisions_t).values(ts=ts or utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
 
     def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,

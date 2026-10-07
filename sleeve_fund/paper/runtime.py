@@ -124,6 +124,7 @@ def clearing_action(sleeve, now: datetime | None = None, since: datetime | None 
 # A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
 BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
+RACED_FILL = "raced_fill"  # an opening order that filled after the gate closed, with the ms after (P1-SG15)
 # Inside an episode, which causes hold changed (one of several cleared, or another began): an info row, never an
 # alert, so the journal's gate reads the engine's holds as they are now (Advisor 00:20 (b): events follow the
 # transitions only).
@@ -428,6 +429,17 @@ class SleeveRuntime:
                                      holds=self.holds, since=_halted_since(self.store, self.name, state))
         self._episode(why if blocked else None)
         return blocked, why
+
+    def block_began(self, why) -> datetime:
+        """When the block a raced fill met began, for the ms it is journaled with (P1-SG15, Advisor 7 Oct 05:01): a PM
+        Stop's own acceptance (its decision), else the start of the block episode in the journal, else now."""
+        now = self.now()
+        if "stopped" in block_codes(why):
+            stop = self.store.decisions(self.name, limit=1, action="stop")
+            if stop and stop[0]["ts"] <= now:
+                return stop[0]["ts"]
+        began = self.store.last_event(self.name, (BLOCK_STARTED,), before=now)
+        return began["ts"] if began else now
 
     def _episode(self, why: str | None) -> None:
         """Journal a block episode's start and end (Advisor 22:29): one alert when nothing may open any more, and one
