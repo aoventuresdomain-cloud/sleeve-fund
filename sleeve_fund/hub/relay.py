@@ -1,8 +1,12 @@
 """The hub's venue side (v2 P1-1): one Nautilus node per venue, holding the venue's one public market-data
-connection, relaying every trade and quote and building each 1-minute bar once (Nautilus's own time-bar
-aggregator, stamped at the bar's close, as the paper strategies build theirs today). Everything goes to the
-fan-out (sleeve_fund.hub.server); closed bars also go to `sink`, the storage side's hook (the history store),
-which this module leaves to its owner.
+connection, relaying every trade and quote and building each 1-minute bar once, stamped at the bar's close.
+Everything goes to the fan-out (sleeve_fund.hub.server); closed bars also go to `sink`, the storage side's hook
+(the history store), which this module leaves to its owner.
+
+A trade counts in the minute of its venue time, as the venue's own candle counts it, not the minute it reached
+the hub in (P1-1-DELAY): a minute closes BAR_GRACE_SECONDS after its end, so a trade from its last moments that
+arrives just after the boundary still lands in it. Nautilus's own time-bar aggregator buckets by arrival time, and
+its build delay only shifts that window (and the bar's stamp), so the hub does not use it.
 
 A minute the hub missed (the venue connection dropped, or the hub was down) is announced as a gap and refilled
 from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits.
@@ -19,17 +23,61 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from nautilus_trader.common import DataActor, DataActorConfig
-from nautilus_trader.model import BarType, InstrumentId
+from nautilus_trader.model import InstrumentId, Quantity
 
 from sleeve_fund.hub import protocol
 
 MINUTE_NS = 60_000_000_000
 REFRESH_SECONDS = 60  # how often the relay picks up instruments asked for since it started
 VENUE_QUIET_SECONDS = 60  # no trade or quote for this long: the heartbeat says the venue is down
+BAR_GRACE_SECONDS = 2  # a minute's bar is built this long after the minute ends; a trade later than that is late
 
 
-def bar_type_for(instrument_id: str) -> BarType:
-    return BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-INTERNAL")
+class Minutes:
+    """Per instrument, the 1-minute bars under way, built from trades by their venue time. A minute is keyed by its
+    close: a trade at 12:00:59.9 is in the minute closing 12:01, one at exactly 12:01:00 in the next (the venue's
+    candle opens at its open time). Bars come out of close() once the minute is over; a trade for a minute already
+    closed is refused (add returns False), never put in a later one."""
+
+    def __init__(self) -> None:
+        self.bars: dict[str, dict[int, list]] = {}  # instrument id -> {close ns: [open, high, low, close, volume]}
+        self.closed: dict[str, int] = {}  # instrument id -> close of the last minute built
+        self.last_px: dict[str, object] = {}  # instrument id -> the last closed bar's close, for a minute without trades
+        self.no_qty: dict[str, Quantity] = {}  # instrument id -> zero at its size decimals
+
+    def add(self, instrument_id: str, ts_ns: int, px, qty) -> bool:
+        close = (ts_ns // MINUTE_NS + 1) * MINUTE_NS
+        if close <= self.closed.get(instrument_id, 0):
+            return False
+        self.no_qty.setdefault(instrument_id, Quantity(0, qty.precision))
+        b = self.bars.setdefault(instrument_id, {}).get(close)
+        if b is None:
+            self.bars[instrument_id][close] = [px, px, px, px, qty]
+        else:
+            b[1], b[2], b[3], b[4] = max(b[1], px), min(b[2], px), px, b[4] + qty
+        return True
+
+    def close(self, now_ns: int, grace_ns: int) -> list[tuple]:
+        """(instrument id, close ns, open, high, low, close, volume) for every minute over by now_ns - grace_ns, in
+        time order per instrument. A minute with no trades between two built ones comes out flat at the last close
+        with no volume, as Nautilus builds one (the relay stands the venue's candle in for it)."""
+        upto = (now_ns - grace_ns) // MINUTE_NS * MINUTE_NS
+        out = []
+        for iid in sorted(set(self.bars) | set(self.last_px)):
+            open_ = self.bars.get(iid, {})
+            due = sorted(c for c in open_ if c <= upto)
+            prev = self.closed.get(iid)
+            start = prev + MINUTE_NS if prev is not None else (due[0] if due else None)
+            if start is None:
+                continue
+            for close in range(start, upto + 1, MINUTE_NS):
+                b = open_.pop(close, None)
+                if b is None:
+                    px = self.last_px[iid]
+                    b = [px, px, px, px, self.no_qty[iid]]
+                out.append((iid, close, *b))
+                self.last_px[iid], self.closed[iid] = b[3], close
+        return out
 
 
 class Gaps:
@@ -105,6 +153,7 @@ class HubRelay(DataActor):
         self.relayed: set[str] = set()
         self.definitions: dict[str, dict] = {}  # instrument id -> the instrument, as Instrument.to_dict()
         self.gaps = Gaps()
+        self.minutes = Minutes()
         self._wanted: set[str] = set()
         self._lock = threading.Lock()
         self._last_tick = 0.0
@@ -154,6 +203,9 @@ class HubRelay(DataActor):
             self._relay(iid)
         self.clock.set_timer("hub-refresh", pd.Timedelta(seconds=REFRESH_SECONDS).to_pytimedelta(),
                              callback=self._refresh)
+        # Every minute, BAR_GRACE_SECONDS after it ends: the only wait the venue-time bars add (P1-1-DELAY).
+        first = (self.clock.timestamp_ns() // MINUTE_NS + 1) * MINUTE_NS + BAR_GRACE_SECONDS * 1_000_000_000
+        self.clock.set_timer_ns("hub-bars", MINUTE_NS, start_time_ns=first, callback=self._build)
 
     def _refresh(self, _event=None) -> None:
         self._write_late()
@@ -177,7 +229,6 @@ class HubRelay(DataActor):
         inst = InstrumentId.from_str(iid)
         self.subscribe_trades(inst)
         self.subscribe_quotes(inst)
-        self.subscribe_bars(bar_type_for(iid))
         self._since[iid] = time.time_ns()
         inst = self.cache.instrument(inst)
         with self._lock:
@@ -198,8 +249,12 @@ class HubRelay(DataActor):
 
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
-        n = self.late.setdefault(str(tick.instrument_id), [0, 0])
-        n[0] += tick.ts_event < self.gaps.last.get(str(tick.instrument_id), 0)  # its minute's bar already built
+        iid = str(tick.instrument_id)
+        n = self.late.setdefault(iid, [0, 0])
+        late = tick.ts_event < self.gaps.last.get(iid, 0)  # its minute's bar already built: never put in a later one
+        if not late:
+            late = not self.minutes.add(iid, tick.ts_event, tick.price, tick.size)
+        n[0] += late
         n[1] += 1
         self.fanout.publish(protocol.trade(tick, time.time_ns()))
 
@@ -207,12 +262,23 @@ class HubRelay(DataActor):
         self._last_tick = time.time()
         self.fanout.publish(protocol.quote(tick, time.time_ns()))
 
+    def _build(self, event=None, now_ns: int | None = None) -> None:
+        """The minutes over by BAR_GRACE_SECONDS before now: the timer's own time, so a timer firing a moment late
+        builds the same minutes."""
+        if now_ns is None:
+            now_ns = getattr(event, "ts_event", None) or self.clock.timestamp_ns()
+        for iid, close, o, h, l, c, v in self.minutes.close(now_ns, BAR_GRACE_SECONDS * 1_000_000_000):  # noqa: E741
+            self._closed(protocol.bar(iid, o, h, l, c, v, close, time.time_ns()))
+
     def on_bar(self, bar) -> None:
-        msg = protocol.bar_from_nautilus(bar, time.time_ns())
+        """A closed bar built elsewhere (a Nautilus bar), handled as the hub's own."""
+        self._closed(protocol.bar_from_nautilus(bar, time.time_ns()))
+
+    def _closed(self, msg: dict) -> None:
         iid, close = msg["id"], msg["ts"]
         missing = self.gaps.see(iid, close)
         # The first bar after subscribing opened before the hub saw any of its trades: a part bar. A bar with no
-        # volume was built while no trades arrived (Nautilus builds one at the last price), a dropped connection
+        # volume was built while no trades arrived (Minutes builds one at the last price), a dropped connection
         # as like as a quiet minute. Either way the venue's own candle stands in for it.
         stand_in = close - MINUTE_NS < self._since.get(iid, 0) or float(msg["v"]) == 0
         if missing is not None or stand_in:
