@@ -856,15 +856,16 @@ def test_gap_liq_cap_the_excess_is_not_in_the_random_entry_benchmark():
         short_in[-1]["ts"])]
     assert short_in and short_out, "set-up: the short opened and closed"
     q = sum(f["qty"] for f in short_in)
-    from sleeve_fund.venues import venue
 
     # One fee basis for both trades (QA amendment 01:05, PE1's finding): the benchmark's own cost per side, which the
     # study passes as instrument.taker_fee + the half spread (0 here). The short's X over its notional is then the
     # posted margin (1/3 at 3x) + the entry's cost + the liquidation fee on the trigger price (Advisor 00:19 (1)), about
     # 4/3 of the entry at 3x; the trigger's exact place moves the result by < 1e-3, inside the tolerance. If RE-COST
     # changes the benchmark's basis to the strategy's market fee, change `cost` here only.
-    inst = venue("KRAKEN").instrument("BTC", "USD")
-    cost = float(inst.taker_fee) + 0.0
+    # Re-pinned 7 Oct (HoQA, after #181 RE-COST merged in 6a9256a): the benchmark now charges the run's own market fee,
+    # here the study's perp at 0.05% taker (+ 0 half spread), not the venue's 0.80% spot taker. Set-up only: the
+    # formula and the 2e-3 tolerance are unchanged. (Was: venue("KRAKEN").instrument("BTC", "USD").taker_fee.)
+    cost = 0.0005 + 0.0
     r_long = 200.0 / 100.0 - 1 - 2 * cost
     r_short = -(1 / 3.0) - cost - cost * (4 / 3.0)
     want = (1 + r_long) * (1 + r_short) - 1
