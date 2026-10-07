@@ -29,34 +29,33 @@ def underlying(instrument: str) -> str:
 
 @dataclass(frozen=True)
 class Position:
-    """One strategy's open position. side: +1 long, -1 short; qty: unsigned. leverage: None for spot (its margin is
-    its full notional). stop_price: the stop resting for it now (a trail enforced as a stop at its current level), or
-    None when nothing rests."""
+    """One strategy's open position, in the seam's shape (day-0 note v4 section 2; QA's P2-1a cell G2). qty: signed
+    (long > 0). underlying: what its net counts in (underlying(instrument)). stop: the stop resting for it now (a trail
+    enforced as a stop at its current level), or None when nothing rests. leverage: None for spot (its margin is its
+    full notional)."""
 
     strategy: str
-    instrument: str
-    venue: str
-    side: int
+    underlying: str
     qty: Decimal
+    stop: Decimal | None = None
     leverage: float | None = None
-    stop_price: Decimal | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "qty", money(self.qty, "qty"))
-        if self.stop_price is not None:
-            object.__setattr__(self, "stop_price", money(self.stop_price, "stop_price"))
-        if self.side not in (1, -1):
-            raise ValueError(f"side is +1 or -1, not {self.side!r}")
+        if self.stop is not None:
+            object.__setattr__(self, "stop", money(self.stop, "stop"))
 
 
-def holding_for(position: Position, mark, atr_pct: float | None) -> Holding:
-    """The book's Holding for `position` at `mark`: signed notional, margin (notional / leverage on a perp, the full
-    notional on spot) and open risk from the mark (open_risk.position_risk: to the resting stop, or the stopless
-    measure when none rests or the price is through it). Costs and slippage stay in sizing, never in the open-risk
-    measure (HoE 20:12 UK, note v4 section 2). Spot counts too (Advisor GATE-SPOT, 20:20 UK). Raises ValueError when
-    a stopless position's daily ATR isn't known."""
-    mark = money(mark, "mark")
-    notional = position.side * position.qty * mark
-    margin = abs(notional) / Decimal(repr(float(position.leverage))) if position.leverage else abs(notional)
-    risk = position_risk(position.side * position.qty, mark, position.stop_price, atr_pct)
-    return Holding(underlying(position.instrument), notional, margin, risk)
+def holding_for(position, mark, atr_pct: float | None) -> Holding:
+    """The book's Holding for `position` (a Position, or anything with its strategy, underlying, signed qty and stop;
+    leverage defaults to None) at `mark`: signed notional, margin (notional / leverage on a perp, the full notional on
+    spot) and open risk from the mark (open_risk.position_risk: to the resting stop, or the stopless measure when none
+    rests or the price is through it). Costs and slippage stay in sizing, never in the open-risk measure (HoE 20:12
+    UK, note v4 section 2). Spot counts too (Advisor GATE-SPOT, 20:20 UK). Raises ValueError when a stopless
+    position's daily ATR isn't known."""
+    mark, qty = money(mark, "mark"), money(position.qty, "qty")
+    stop = None if position.stop is None else money(position.stop, "stop")
+    leverage = getattr(position, "leverage", None)
+    notional = qty * mark
+    margin = abs(notional) / Decimal(repr(float(leverage))) if leverage else abs(notional)
+    return Holding(position.underlying, notional, margin, position_risk(qty, mark, stop, atr_pct))

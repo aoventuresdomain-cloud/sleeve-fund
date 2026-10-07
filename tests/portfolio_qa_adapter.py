@@ -56,8 +56,8 @@ class Position:
     atr_frac: float = 0.0
 
     def holding(self):
-        p = _Position(self.strategy_id, self.instrument, self.venue, self.side, D(self.qty), self.leverage,
-                      None if self.stop_price is None else D(self.stop_price))
+        p = _Position(self.strategy_id, underlying(self.instrument), self.side * D(self.qty),
+                      None if self.stop_price is None else D(self.stop_price), self.leverage)
         return holding_for(p, D(self.mark), self.atr_frac)
 
 

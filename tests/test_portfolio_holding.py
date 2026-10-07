@@ -9,11 +9,11 @@ import pytest
 from sleeve_fund.open_risk import position_risk
 from sleeve_fund.portfolio import Position, holding_for
 from sleeve_fund.portfolio.book import backtest_book, book_equity
-from sleeve_fund.portfolio.holding import ALIASES
+from sleeve_fund.portfolio.holding import ALIASES, underlying
 
 
 def _long(qty="2", stop=None, lev=5.0, instrument="BTC/USDT"):
-    return Position("s1", instrument, "venue-a", 1, D(qty), lev, None if stop is None else D(stop))
+    return Position("s1", underlying(instrument), D(qty), None if stop is None else D(stop), lev)
 
 
 @pytest.mark.parametrize("side, stop, atr", [
@@ -24,7 +24,7 @@ def _long(qty="2", stop=None, lev=5.0, instrument="BTC/USDT"):
     (1, "101", 0.02),  # the price has gone through its stop: stopless, never 0
 ])
 def test_g5_the_books_holding_risk_is_the_interim_checks_formula(side, stop, atr):
-    pos = Position("s1", "BTC/USDT", "venue-a", side, D("2"), 5.0, None if stop is None else D(stop))
+    pos = Position("s1", "BTC", side * D("2"), None if stop is None else D(stop), 5.0)
     h = holding_for(pos, D("100"), atr)
     interim = position_risk(side * 2.0, 100.0, None if stop is None else float(stop), atr)
     assert float(h.risk) == pytest.approx(interim, rel=1e-12) and isinstance(h.risk, D)  # exact vs float
