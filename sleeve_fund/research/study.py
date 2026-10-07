@@ -450,7 +450,13 @@ def run_study(
         # P2-1b rule 5: the legacy weight version, without the conversion's keys, on spot over the same period. On a
         # venue that lists perpetuals only, the spot venue's instrument for the same asset trades the same prices.
         legacy_params = {k: v for k, v in default_params.items() if k not in CONVERSION_KEYS}
-        spot = instrument if not perpetual else venue_of("KRAKEN").instrument(pair_of(instrument).split("/")[0], "USD")
+        if perpetual:
+            from sleeve_fund.venues import VENUES
+
+            spot_venue = next(v for v in VENUES.values() if not v.perpetual)
+            spot = spot_venue.instrument(pair_of(instrument).split("/")[0], "USD")
+        else:
+            spot = instrument
         legacy = bt(spec.name, research, legacy_params, on=spot)
         sides = {"converted": cost_profile(full_default), "legacy": cost_profile(legacy)}
         legacy_comparison = {**sides, "investigate": gross_gap_flag(sides["converted"]["gross_return"],
