@@ -445,6 +445,8 @@ def test_a_change_to_a_longer_interval_fed_one_settlement_a_pass_is_one_possible
     profile = venue("BINANCE")
     monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
     monkeypatch.setattr(profile, "stats_loaders", {})
+    monkeypatch.setattr("sleeve_fund.funding.stale", lambda *a, **k: None)  # fixed stamps, real clock: holes only
+    monkeypatch.setattr("sleeve_fund.history._stale", set())
     sent = _inbox(monkeypatch)
     for t in every:
         kept.append(t)
