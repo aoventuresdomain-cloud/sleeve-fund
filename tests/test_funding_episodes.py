@@ -327,6 +327,36 @@ def test_paper_rebuilds_its_watched_settlements_after_a_restart():
     assert s._funding_missing == {t8, t16}
 
 
+def test_a_restart_never_watches_a_settlement_already_reversed():
+    """CR, #163: a baseline the venue's records showed was no settlement was reversed by its own row while another
+    settlement kept the episode open. A restart must not watch it again, or the first watch would refund it a
+    second time: a settlement with a reversal row, or whose rows net to zero, is skipped."""
+    from types import SimpleNamespace
+
+    from sleeve_fund import funding
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    t8, t12, t16 = (pd.Timestamp(f"2025-10-03 {h}:00", tz="UTC") for h in ("08", "12", "16"))
+    tag = funding.stale_tag("BINANCE", PAIR)
+    inbox = _Journal(events=[{"kind": "funding_stale", "message": f"{tag} No settled funding rate", "ts": t8}])
+    row = dict(qty=0.1, price=60_000.0, rate=0.0001)
+    rows = [{"ts": t8, "kind": "baseline", "amount": -0.6, **row},  # still missing: keeps the episode open
+            {"ts": t12, "kind": "baseline", "amount": -0.6, **row}, {"ts": t12, "kind": "reversal", "amount": 0.6, **row},
+            {"ts": t16, "kind": "baseline", "amount": -0.6, **row}, {"ts": t16, "kind": "settled", "amount": 0.6, **row}]
+    inbox.funding = lambda sleeve, limit=1000: rows
+    perp = SimpleNamespace(funding_venue="BINANCE", funding_hours=(0, 8, 16))
+    s = SimpleNamespace(_cfg=SimpleNamespace(perp=perp), instrument=None, _funding_missing=set(), _funding_paid={},
+                        runtime=SimpleNamespace(store=inbox, name="w"))
+    import sleeve_fund.strategies.base as base
+
+    orig, base.pair_of = base.pair_of, lambda instrument: PAIR
+    try:
+        LongFlatStrategy._rebuild_funding_missing(s)
+    finally:
+        base.pair_of = orig
+    assert s._funding_missing == {t8} and set(s._funding_paid) == {t8}, (s._funding_missing, s._funding_paid)
+
+
 def test_the_recovery_watch_runs_while_funding_is_deferred(monkeypatch):
     """With trades over 15 s apart, #146 defers the funding charge; the watch on missing settlements still runs, so
     the strategy clears or reopens its episode on time (QA P1-O17a-12)."""

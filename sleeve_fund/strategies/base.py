@@ -3230,10 +3230,19 @@ class LongFlatStrategy(Strategy):
         # one of the instrument's own intervals as its stored rates show it, else the profile's (CR minor 4)
         step = markets.latest_interval(funding.rates(terms.funding_venue, pair_of(self.instrument)))
         opened = min(starts) - pd.Timedelta(step or markets.funding_interval(terms.funding_hours))
+        rows: dict = {}
         for row in self.runtime.store.funding(self.runtime.name):
             ts = pd.Timestamp(row["ts"])
-            ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-            if row.get("kind") == "baseline" and ts > opened and ts not in state["never"]:
+            rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
+        for ts, booked in rows.items():
+            # A settlement already reversed (its own reversal row, or rows netting to zero) is never watched again,
+            # so a restart can't refund it twice (CR, #163)
+            amounts = [r.get("amount") for r in booked]
+            if any(r.get("kind") == "reversal" for r in booked) or (
+                    None not in amounts and len(amounts) > 1 and abs(sum(amounts)) < 1e-9):
+                continue
+            row = next((r for r in booked if r.get("kind") == "baseline"), None)
+            if row is not None and ts > opened and ts not in state["never"]:
                 self._funding_missing.add(ts)
                 if row.get("amount") is not None:
                     self._funding_paid[ts] = (row.get("qty"), row.get("price"), row.get("rate"), row["amount"])
