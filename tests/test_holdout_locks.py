@@ -17,6 +17,22 @@ def store(tmp_path):
     return Store(f"sqlite:///{tmp_path}/t.db")
 
 
+@pytest.fixture(autouse=True)
+def _recorded_the_day_the_counter_retired(monkeypatch):
+    """Trials here are recorded at midday on the day the counter retired, whatever day the tests run: an undated
+    trial's record time is where its unseen days begin, so the wall clock would move every expectation."""
+    import datetime as dt
+
+    from sleeve_fund.research import trials
+
+    class Frozen(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (COUNTER_RETIRED + pd.Timedelta(hours=12)).to_pydatetime().astimezone(tz)
+
+    monkeypatch.setattr(trials, "datetime", Frozen)
+
+
 def _trial(store, start, end, stage="in_sample"):
     TrialsRegister(store).record(definition_hash="d", idea_hash=IDEA, name="rsi_trend", family="trend",
                                  settings={}, dataset="ds", stage=stage, source="study", sharpe=0.5,
