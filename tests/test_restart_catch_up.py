@@ -39,6 +39,22 @@ def test_restart_a_missed_candle_with_an_exit_signal_exits_once_at_market_as_a_l
     assert [e for e in run.kinds("late_exit") if "missed candle 00:15" in e["message"]]
 
 
+@pytest.mark.parametrize("perp, side", [(False, 1), (True, -1)])
+def test_restart_killed_10_s_after_a_close_before_its_decision_exits_once_on_that_candle(perp, side):
+    """Pin 5 (R203-1, Advisor regrade): the last heartbeat, 00:15:10, came after the 00:15 close but before its bar
+    was decided, and that close said exit. Back at 00:15:40: one market exit, "Late exit, missed candle 00:15", before
+    the 00:16 close, and no entry caught up."""
+    from test_hub_146_qa import M, START, flat_prices, restart
+
+    run = restart(flat_prices(30), 10, 15 + 40 / 60, heartbeat=15 + 10 / 60, side=side, perp=perp, leave=15,
+                  warmup=30, stop=None)
+    exits = [o for o in run.orders if o["intent"] == "exit"]
+    assert len(exits) == 1 and exits[0]["reason"] == "Late exit, missed candle 00:15", exits
+    sent = exits[0]["ts"] if exits[0]["ts"].tzinfo else exits[0]["ts"].replace(tzinfo=timezone.utc)
+    assert sent.timestamp() * 1e9 < START + 16 * M
+    assert not [o for o in run.orders if o["intent"] == "entry" and o["order_id"] != "O-held"]
+
+
 @pytest.mark.parametrize("lag_s, opens", [(30, True), (120, False)])
 def test_running_a_late_bar_opens_under_90_s_and_is_skipped_past_it(lag_s, opens):
     """Pins 3 and 4: no restart, every bar `lag_s` late."""

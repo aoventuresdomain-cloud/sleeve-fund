@@ -25,14 +25,16 @@ Invariants on 1709cd9 (design items 1-5; 6-8 switch on with CASH-ONE-PATH, NIGHT
      time, with a price within SLIP and a qty to a cent of notional (B may skip an entry while it warms up again;
      after a restart the venue holds the position at the price it was put back at, not the journal's entry, so an
      entry can size a few lots apart); no fill is booked twice. When B skipped no entry, its final cash and position
-     (as notional) equal A's to the cent. Compared on money, quantity and status columns only (DA 20:35: no ids,
-     created_at/updated_at, order_timings, heartbeats, feed_seen or event timestamps). Two findings, open with HoQA:
-     R-I5-1 a restart after a stop loses the exit lock (strict xfail, ..._while_an_exit_lock_holds; the green
-     property leaves the entries after k unchecked when the lock holds at k); R-I5-2 a kill inside a candle loses
-     that candle's decision, so a close-based exit lands a candle later (not drawn).
+     (as notional) equal A's to the cent, cash before fees: each fee after k may be a cent apart until
+     CASH-ONE-PATH (R-I5-3, test_prop_inv_r_i5_3_fee_across_a_restart, strict xfail). Compared on money, quantity
+     and status columns only (DA 20:35: no ids, created_at/updated_at, order_timings, heartbeats, feed_seen or event
+     timestamps). Findings (HoQA 7 Oct): R-I5-1 MUST FIX, a restart after a stop loses the exit lock (strict xfail,
+     ..._while_an_exit_lock_holds; the green property leaves the entries after k unchecked when the lock holds at k);
+     R-I5-2 MUST FIX, a kill inside a candle loses that candle's exit (cells in test_r_i5_2_missed_candle.py; not
+     drawn here); R-I5-3 FOLLOW-UP, the fee above.
 
 Known failures (strict xfail, no shrinking in CI): the liquidation-gap runs (strict I1: cent drift, IR-1), the strict
-I1 on the nightly soak's two shrunk examples, and R-I5-1 (more models in test_r_i5_1_exit_lock.py).
+I1 on the nightly soak's two shrunk examples, R-I5-3, and R-I5-1 (more models in test_r_i5_1_exit_lock.py).
 
 Hypothesis (pinned dev dependency, HoE 7 Oct): profile "ci" is derandomized with a bounded max_examples, so a PR run is
 reproducible; "nightly" draws fresh seeds. Select with HYPOTHESIS_PROFILE. A failure prints the shrunk step list.
@@ -73,6 +75,18 @@ CENT = 0.01  # "to the cent": strictly less than one cent apart
 HALF_CENT_A_FILL = 0.005
 I1_STRICT = False
 DRIFT = {"cents": 0.0, "fills": 0, "where": ""}  # the largest I1 drift seen in this run, reported at the end
+# R-I5-3 (HoQA 7 Oct, FOLLOW-UP to CASH-ONE-PATH): the same fill after a restart can be charged a fee a cent apart
+# (one order's second fill: 0.16 straight through, 0.15 restarted). I5 compares cash before fees strictly and lets each
+# fill's fee after k differ by up to a cent until money.fill_cash quantises fees per fill the same way across a restart.
+FEE_STRICT = False
+FEE_DRIFT = {"cents": 0.0, "fills": 0}  # the largest fee difference I5 saw, reported at the end
+# R-I5-4 (QA Tester 2, 7 Oct; the sizing INFO HoQA noted): after a restart the simulated venue holds the position at the
+# price it was put back at, not the journal's entry, so an entry after k can size apart from A's: 17 lots (1.02 cents of
+# notional) after a 1.2% move. I5 matches entries within QTY_REL of A's qty and, when they sized apart, compares
+# equity (cash + position at the last price) before fees instead of cash and position, to the cent.
+SIZE_STRICT = True  # R-I5-4 fixed (base.py _restored_rounding): entries after a restart size as A's, to the cent
+QTY_REL = 0.001
+SIZE_DRIFT = {"rel": 0.0}  # the largest entry size difference I5 saw, reported at the end
 SLIP = 0.001  # an exit after a restart fills within 0.1% of where it filled straight through
 SPOT = {k: v for k, v in PARAMS.items() if k not in ("market", "allow_short")}
 HOUR0 = 7 + 50 / 60  # step i starts at HOUR0 + 8 i hours after test_replay.START: ten minutes before a settlement
@@ -207,12 +221,19 @@ def _check(store, where, expected_funding=None):
     last = store.last_equity(NAME)
     if last is None:
         return
-    # I1: at the last mark, from the fills, funding and insurance booked up to it
-    upto = [f for f in fills if f["ts"] <= last["ts"]]
-    book = replay_book(upto, START, store.funding_total(NAME, before=last["ts"] + _TICK),
-                       store.insurance_total(NAME, before=last["ts"] + _TICK))
-    marked = book["cash"] + book["qty"] * last["price"]
-    drift = max(abs(book["cash"] - last["cash"]), abs(marked - last["equity"]))
+    # I1: at the last mark, from the fills, funding and insurance booked up to it. A fill stamped at the mark's own
+    # instant may have come just before or just after it (the journal keeps no order between the two tables): the
+    # mark is checked against whichever of the two books it was taken on (nightly soak: a kill on the second of a
+    # stop's fill left the session's last mark taken just before it)
+    funding, insurance = (store.funding_total(NAME, before=last["ts"] + _TICK),
+                          store.insurance_total(NAME, before=last["ts"] + _TICK))
+    candidates = []
+    with_, without = [f for f in fills if f["ts"] <= last["ts"]], [f for f in fills if f["ts"] < last["ts"]]
+    for upto in [with_] if len(with_) == len(without) else [with_, without]:
+        book = replay_book(upto, START, funding, insurance)
+        marked = book["cash"] + book["qty"] * last["price"]
+        candidates.append((max(abs(book["cash"] - last["cash"]), abs(marked - last["equity"])), upto, book, marked))
+    drift, upto, book, marked = min(candidates, key=lambda c: c[0])
     if not I1_STRICT and drift * 100 > DRIFT["cents"]:
         DRIFT.update(cents=round(drift * 100, 4), fills=len(upto), where=where)
     _event(f"I1 drift: {'under 0.5' if drift < 0.005 else 'under 1' if drift < CENT else '1 or more'} cent")
@@ -286,24 +307,47 @@ def test_prop_inv_with_liquidation_gaps(r):
 def _largest_drift():
     """Reports the largest I1 drift the module's runs saw, as a warning (shown in every CI log)."""
     yield
-    if DRIFT["cents"]:
-        import warnings
+    import warnings
 
+    if SIZE_DRIFT["rel"]:
+        warnings.warn(f"PROP-INV I5 largest entry size difference after a restart {SIZE_DRIFT['rel']:.4%} (R-I5-4); "
+                      f"bound {QTY_REL:.1%} until it is fixed", stacklevel=1)
+    if FEE_DRIFT["cents"]:
+        warnings.warn(f"PROP-INV I5 largest fee difference after a restart {FEE_DRIFT['cents']} cents over "
+                      f"{FEE_DRIFT['fills']} fills (R-I5-3); bound 1 cent a fill until CASH-ONE-PATH", stacklevel=1)
+    if DRIFT["cents"]:
         warnings.warn(f"PROP-INV I1 largest drift {DRIFT['cents']} cents over {DRIFT['fills']} fills "
                       f"({DRIFT['where']}); bound {HALF_CENT_A_FILL * 100} cent a fill until CASH-ONE-PATH",
                       stacklevel=1)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="FOLLOW-UP until CASH-ONE-PATH money.fill_cash: I1 under "
-                   "1 cent on the nightly soak's shrunk examples (1.15 and 1.20 cents, the engine's per-fill cent "
-                   "rounding). XPASS once it lands: then I1 goes back to under 1 cent and HALF_CENT_A_FILL goes")
-@pytest.mark.parametrize("soak", ["every_step", "kill_A"])
+_I1_XFAIL = pytest.mark.xfail(strict=True, raises=AssertionError, reason="FOLLOW-UP until CASH-ONE-PATH "
+                              "money.fill_cash: I1 under 1 cent on the nightly soak's shrunk examples (1.15 and 1.20 "
+                              "cents, the engine's per-fill cent rounding). XPASS once it lands: then I1 goes back to "
+                              "under 1 cent and HALF_CENT_A_FILL goes")
+
+
+# every_step passes since R-I5-4 (the restored position's closes round as the venue's straight through)
+@pytest.mark.parametrize("soak", ["every_step", pytest.param("kill_A", marks=_I1_XFAIL)])
 def test_prop_inv_i1_strict_on_the_soak_examples(soak, monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "I1_STRICT", True)
     if soak == "every_step":
         _session({"perp": True, "steps": [{"legs": [(2, 0.0119)], "gap": None}, {"legs": [(4, 0.0234)], "gap": None}]})
     else:
         _kill_and_restart(True, [(5, 0.0), (2, 0.012), (2, -0.012), (2, -0.025)], 6, through_a_lock=False)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="R-I5-3 FOLLOW-UP until CASH-ONE-PATH money.fill_cash "
+                   "quantises each fill's fee the same way across a restart: the stop's second fill is charged 0.16 "
+                   "straight through and 0.15 after a restart (0.1553 owed), so final cash is a cent apart")
+def test_prop_inv_r_i5_3_fee_across_a_restart(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "FEE_STRICT", True)
+    _kill_and_restart(False, [(5, 0.0), (5, 0.025), (2, -0.025), (3, -0.025)], 8, through_a_lock=False)
+
+
+def test_prop_inv_r_i5_4_entry_size_across_a_restart(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "SIZE_STRICT", True)
+    _kill_and_restart(True, [(5, 0.0), (2, 0.025), (6, -0.025), (2, 0.012)], 7, through_a_lock=False)
 
 
 # --- I5: kill and restart at minute k ------------------------------------------------------------------------
@@ -329,8 +373,10 @@ def _orders_before(store, cut):
 
 
 def _same_fill(a, b, cent=False):
-    """Same side and intent, a price within SLIP, and the same qty: exactly, or (cent) to a cent of notional."""
-    qty = abs(a["qty"] - b["qty"]) * a["price"] < CENT if cent else abs(a["qty"] - b["qty"]) < 1e-12
+    """Same side and intent, a price within SLIP, and the same qty: exactly, or (cent) to a cent of notional, or
+    within QTY_REL of it until R-I5-4 is fixed."""
+    gap = abs(a["qty"] - b["qty"])
+    qty = (gap * a["price"] < CENT or (not SIZE_STRICT and gap <= QTY_REL * a["qty"])) if cent else gap < 1e-12
     return a["side"] == b["side"] and a["intent"] == b["intent"] and qty and \
         abs(b["price"] - a["price"]) <= SLIP * a["price"]
 
@@ -411,14 +457,18 @@ def _kill_and_restart(perp, legs, k, through_a_lock):
     if locked and not through_a_lock:
         return  # R-I5-1: B is flat at k, so nothing below is checked but the entries, which a lost lock changes
     # every entry B makes after k is one of A's
-    unmatched, left = [], [f for f in post_a if f["intent"] == "entry"]
+    unmatched, left, sized = [], [f for f in post_a if f["intent"] == "entry"], []
     for f in (f for f in post_b if f["intent"] == "entry"):
         hit = next((g for g in left if g["ts"] == f["ts"] and _same_fill(g, f, cent=True)), None)
         if hit is None:
             unmatched.append(_money(f))
         else:
             left.remove(hit)
+            sized.append(abs(hit["qty"] - f["qty"]) / hit["qty"])
     assert unmatched == [], ("I5 an entry after the restart that A never made", k, unmatched)
+    if sized and max(sized) > SIZE_DRIFT["rel"]:
+        SIZE_DRIFT.update(rel=max(sized))
+    apart_sized = any(r > 0 for r in sized) and not SIZE_STRICT
     skipped = bool(left)
     _event("I5 B skipped an entry" if skipped else "I5 B skipped no entry")
 
@@ -444,6 +494,18 @@ def _kill_and_restart(perp, legs, k, through_a_lock):
 
     if not skipped:
         ja, jb = a.journal_book(NAME, START), b.journal_book(NAME, START)
-        assert abs(ja["cash"] - jb["cash"]) < CENT and abs(ja["qty"] - jb["qty"]) * prices[-1] < CENT, \
+        fees = [(f, next((g for g in post_b if g["ts"] == f["ts"] and _same_fill(f, g, cent=True)), None))
+                for f in post_a]
+        apart = [round(abs(f["fee"] - g["fee"]) * 100, 6) for f, g in fees if g is not None]
+        fee_gap = sum(f["fee"] for f in fa) - sum(g["fee"] for g in fb)
+        if not FEE_STRICT and sum(apart) > FEE_DRIFT["cents"]:
+            FEE_DRIFT.update(cents=round(sum(apart), 4), fills=sum(1 for c in apart if c))
+        assert FEE_STRICT or all(c <= 1 + 1e-6 for c in apart), ("I5 a fee after k more than a cent apart", k, apart)
+        cash_gap = ja["cash"] - jb["cash"] + (0.0 if FEE_STRICT else fee_gap)  # before fees, unless strict
+        if apart_sized:  # R-I5-4: compared as equity at the last price, before fees
+            cash_gap += (ja["qty"] - jb["qty"]) * round(prices[-1], 1)
+        held = (abs(ja["qty"] - jb["qty"]) * prices[-1] < CENT or
+                (apart_sized and abs(ja["qty"] - jb["qty"]) <= QTY_REL * max(abs(ja["qty"]), abs(jb["qty"]))))
+        assert abs(cash_gap) < CENT and held, \
             ("I5 B skipped no entry but ends elsewhere", k, ja, jb, [_money(f) for f in post_a],
              [_money(f) for f in post_b])
