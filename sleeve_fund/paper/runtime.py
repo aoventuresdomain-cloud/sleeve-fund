@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sleeve_fund import risk
-from sleeve_fund.store import (LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
+from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
                                replay_book, utcnow)
 
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
@@ -375,7 +375,7 @@ class SleeveRuntime:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
         halt, which reset it, else the highest mark ever. Without the reset a settings edit after such a
         resume re-halted and flattened at once (review round 9, M9-2)."""
-        reset = self.store.last_event(self.name, ("drawdown_reset", RESET_AFTER_LIQUIDATION))
+        reset = self.store.last_event(self.name, ("drawdown_reset", RESET_AFTER_LIQUIDATION, BOOK_RESET))
         if reset is None:
             return self.store.peak_equity(self.name) or starting_balance
         # The reset's own mark was taken a moment before its event, on the tick that applied the resume.
@@ -387,7 +387,7 @@ class SleeveRuntime:
         """The daily-loss baseline after a (re)start: the equity at the PM's last resume today, which reset
         it (review round 9, M9-2), else the day's open (review round 8, B8-2), else this mark."""
         midnight = datetime.combine(risk.trading_day(now), datetime.min.time(), tzinfo=timezone.utc)
-        resumed = self.store.last_event(self.name, ("pm_resume", RESET_AFTER_LIQUIDATION))
+        resumed = self.store.last_event(self.name, ("pm_resume", RESET_AFTER_LIQUIDATION, BOOK_RESET))
         if resumed is not None and resumed["ts"] >= midnight:
             mark = self.store.equity_at_or_before(self.name, resumed["ts"])
             if mark is not None:
@@ -688,6 +688,14 @@ class SleeveRuntime:
                     self._set("paused", f"paused by PM: {cmd['reason']}")
             elif cmd["command"] == RAL:
                 self._reset_after_liquidation(cmd, equity)
+                continue
+            elif cmd["command"] == BOOK_RESET:
+                # Store.book_reset journaled the clear and set the status; this process re-bases its own references
+                # at its equity now. Never a liquidation, which only a reset after liquidation clears.
+                if not self.wiped_out and (self.status == "halted" or (self.status == "paused" and self.paused_until)):
+                    self.peak = self._day_open = equity
+                    self._set("running", "")
+                self.store.mark_applied(cmd["id"])
                 continue
             elif cmd["command"] == "resume" and self.status == "running":
                 # Already running: a resume would only reset the day's loss baseline (review round 10, m10-3).
