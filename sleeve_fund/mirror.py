@@ -46,6 +46,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from sleeve_fund import markets, risk
+from sleeve_fund.money import float_view
 
 FLAG_ENV = "DEMO_MIRROR"
 KEY_ENV = "DERIBIT_TESTNET_API_KEY"
@@ -365,6 +366,7 @@ def mirrored(store) -> list:
 def mirror_once(store, targets: dict) -> int:
     """Copy every mirrored strategy's new fills to its demo account; returns how many orders were sent.
     targets: {"BYBIT" | "DERIBIT": the demo account's client}, those set up."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     sent = 0
     for s in mirrored(store):
         name = target_for(s)
@@ -414,6 +416,7 @@ def mirror_once(store, targets: dict) -> int:
 def check_drift(store, targets: dict, last: dict[str, float]) -> dict[str, float]:
     """Warn once per change when a demo account's position differs from what the mirror put on (an order that
     failed, or something traded by hand on the demo account)."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     out = dict(last)
     for instrument, expected in store.mirror_positions().items():
         venue = next((t for t in targets.values() if t.owns(instrument)), None)
@@ -440,6 +443,7 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
     book in that direction (so an order that errored but went in is never sent again). Returns the gaps seen.
     Deribit is left to the drift warning: it is sized in dollars at each fill's price, so it has no exact
     target."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     venue, out = targets.get("BYBIT"), {}
     if venue is None:
         return out
@@ -495,6 +499,7 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
 def bybit_leverage(store) -> dict[str, tuple[float, list]]:
     """Per Bybit symbol, the leverage its mirrored strategies run at on paper (their risk profile's cap) and
     the strategies. They share one Bybit position, so when their caps differ the lowest is used."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     out: dict[str, tuple[float, list]] = {}
     for s in mirrored(store):
         symbol = s.instrument.replace("/", "").upper()
@@ -516,6 +521,7 @@ def prepare_margin(store, targets: dict, done: dict[str, float]) -> dict[str, fl
     once, the set-up tried again, and the catch-up reopens it at the new leverage. If it still fails, copies
     go on (same quantity, so the same profit and loss) and a warning says the leverage could not be set.
     Returns {symbol: leverage set}."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     venue, out = targets.get("BYBIT"), dict(done)
     if venue is None:
         return out
@@ -568,6 +574,7 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float], t
     labelled with tag ("resync", or "reset" after a PM reset). Its rows take the strategy's latest fill as their
     watermark: the paper position already counts every fill, so none is copied again afterwards. Returns paper
     against Bybit, before and after. Never touches the paper book."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     venue = targets.get("BYBIT")
     groups = bybit_leverage(store)
     if sleeve is not None:
@@ -624,6 +631,7 @@ def resync(store, targets: dict, sleeve: str | None, margin: dict[str, float], t
 
 def process_resyncs(store, targets: dict, margin: dict[str, float]) -> int:
     """Act on the PM's waiting resync requests, oldest first; returns how many were handled."""
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     done = 0
     for req in store.pending_resyncs():
         try:
@@ -659,6 +667,7 @@ def _put_on(store) -> dict[str, float]:
 
 
 def run(store, targets: dict, poll: float = POLL_SECONDS, stop=None) -> None:
+    store = float_view(store)  # the mirror's figures are floats (DA-9)
     drift, checked, gaps, caught, margin = {}, 0.0, {}, 0.0, {}
     while stop is None or not stop():
         try:

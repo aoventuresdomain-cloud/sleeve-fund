@@ -66,6 +66,7 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
     from sleeve_fund import markets
     from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
     from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.money import float_view
     from sleeve_fund.store import Store, utcnow
     from sleeve_fund.strategies import REGISTRY
 
@@ -99,9 +100,10 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
         strategy.fee_model = fee_model
         engine.add_strategy(strategy)
         engine.run()
-        orders = [o for o in reversed(store.orders(s["name"], limit=100_000))
+        journal = float_view(store)  # research compares in floats (DA-9: the journal itself is exact)
+        orders = [o for o in reversed(journal.orders(s["name"], limit=100_000))
                   if not (o.get("signal") or {}).get("watched")]  # a stop watched in the process is not sent
-        return (orders, list(reversed(store.fills(s["name"], limit=100_000)))) if with_fills else orders
+        return (orders, list(reversed(journal.fills(s["name"], limit=100_000)))) if with_fills else orders
     finally:
         runtime.now = utcnow  # break the runtime <-> strategy cycle on this thread
         engine.dispose()

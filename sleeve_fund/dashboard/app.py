@@ -37,6 +37,7 @@ from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
+from sleeve_fund.money import FloatView
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.spreads import series as spread_series
 from sleeve_fund.paper.config import (
@@ -148,7 +149,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     def st() -> Store:
-        return app.state.store
+        # Exact figures (DA-9) become floats here, at the display edge: the pages' arithmetic and charts are float.
+        return FloatView(app.state.store)
 
     def recent_reasons() -> list[dict]:
         """The PM's own reasons, newest first, for every reason picker's "You used recently" (UI v2, item 9)."""
