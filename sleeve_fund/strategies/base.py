@@ -33,7 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
-from sleeve_fund.paper.runtime import EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
+from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma
 
@@ -3836,6 +3836,13 @@ class LongFlatStrategy(Strategy):
         for order in resting:
             self._part_filled(str(order.client_order_id), order.filled_qty.as_double(), order.quantity.as_double(), why)
             self.cancel_order(order.client_order_id)
+        if resting and not self._backtest:
+            # Advisor 7 Oct 05:47: how long after the block (a Stop: its acceptance) the cancel went out, on record.
+            rt = self.runtime
+            ms = max(0, round((rt.now() - rt.block_began(why)).total_seconds() * 1000))
+            rt.store.event(rt.name, "info", ENTRY_CANCELLED, f"{len(resting)} resting opening order"
+                           f"{'s' if len(resting) != 1 else ''} cancelled {ms} ms after nothing could open any more "
+                           f"({', '.join(block_codes(why)) or why}).", ts=rt.now())
         for coid in kept:  # paper's kept post-only entry: no more slices of it go at market
             k = self._kept[coid]
             self._part_filled(coid, float(k["sent"]), k["order"].quantity.as_double(), why)

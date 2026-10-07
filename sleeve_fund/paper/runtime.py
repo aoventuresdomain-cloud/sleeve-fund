@@ -125,6 +125,7 @@ def clearing_action(sleeve, now: datetime | None = None, since: datetime | None 
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
 BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
 RACED_FILL = "raced_fill"  # an opening order that filled after the gate closed, with the ms after (P1-SG15)
+ENTRY_CANCELLED = "resting_entry_cancelled"  # resting opening orders cancelled at a block, with the ms after it (P1-SG15)
 # Inside an episode, which causes hold changed (one of several cleared, or another began): an info row, never an
 # alert, so the journal's gate reads the engine's holds as they are now (Advisor 00:20 (b): events follow the
 # transitions only).

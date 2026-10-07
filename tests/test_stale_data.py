@@ -258,7 +258,7 @@ def test_a_stop_accepted_between_ticks_cancels_a_resting_entry_before_the_next_t
 
 
 @pytest.mark.parametrize("case", ["crossing-first-print-within-1s", "crossing-first-print-at-1.5s",
-                                  "first-print-not-crossing"])
+                                  "first-print-not-crossing", "no-market-data-after-the-stop"])
 def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_print_within_a_second(
         tmp_path, store, monkeypatch, case):  # noqa: F811
     """The one-print residual (HoE, logged before G2; Advisor 7 Oct 05:01 bounds). A Stop accepted between two prints:
@@ -266,7 +266,8 @@ def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_prin
     first print after the Stop crosses it within that time, as a real venue can fill a resting order before a cancel
     lands. Then the raced-fill rule holds: kept with its stop, one incident, one raced_fill row with the ms after the
     Stop. A first print 1.5 s after the Stop finds the entry cancelled; a first print that doesn't cross cancels it
-    cleanly."""
+    cleanly; with no market data at all after the Stop, the gate read alone cancels it (Advisor 05:47). Every cancel is
+    on record with the ms from the Stop's acceptance (the instant its decision is stamped and committed)."""
     from test_exposure_gate_xfails import NAME, Egx, _events, _pm_stop
 
     from sleeve_fund import store as store_mod
@@ -303,10 +304,12 @@ def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_prin
         monkeypatch.setattr(base, "GATE_WATCH_SECONDS", 0.75)
     plan = Plan(t0=STD_T0, tag="sr1")
     p0 = 60_000 + 5 * 60 * 0.01
-    cross = k + (60 if case == "first-print-not-crossing" else 0)
+    cross = k + (60 if case in ("first-print-not-crossing", "no-market-data-after-the-stop") else 0)
     plan.price = lambda s: (60_000 + s * 0.01) * (1.02 if s >= cross else 1.0)
     if case == "crossing-first-print-at-1.5s":
         plan.holes.append((k - 1, k))  # no print between the Stop and the crossing one
+    if case == "no-market-data-after-the-stop":
+        plan.holes.append((k - 1, k + 120))  # nothing for two minutes; the price is past the trigger when it returns
     # the strategy wants the long from the candle after the Stop on (no market entry of its own before it)
     plan.windows.append((M(plan.t0, 25) + pd.Timedelta(seconds=1), M(plan.t0, plan.minutes), 1))
     plan.rest.append((M(plan.t0, 5), 1, round(p0 * 1.01, 1), 0.05))
@@ -319,6 +322,11 @@ def test_a_stop_between_prints_lets_a_resting_entry_fill_only_on_a_crossing_prin
     if case != "crossing-first-print-within-1s":
         assert not fills and entry["status"] == "canceled", f"the resting entry filled after the Stop: {entry}"
         assert not incidents and not raced, (incidents, raced)
+        (cancel,) = _events(store, ("resting_entry_cancelled",))
+        ms = int(cancel["message"].split(" cancelled ")[1].split(" ms ")[0])
+        assert ms <= 500 and "(stopped" in cancel["message"], cancel["message"]
+        if case == "no-market-data-after-the-stop":  # the read at t0+25:11, with no print since t0+25:09
+            assert ms == 250 and cancel["ts"] == pd.Timestamp(STD_T0) + pd.Timedelta(seconds=k), cancel
         return
     assert fills, f"set-up: the crossing print did not fill the resting entry: {entry}"
     stops = [o for o in _orders(store) if o["intent"] == "stop_loss" and o["ts"] >= fills[0]["ts"]]

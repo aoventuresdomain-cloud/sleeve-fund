@@ -642,6 +642,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     if blocked and not (s.status == "halted" and any(
                             c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
                         raise ValueError(f"not started. {why}")  # a halt is cleared only by its own action (HC)
+                # A Stop's acceptance, stamped to the microsecond just before it is committed: the time a raced fill
+                # and a resting entry's cancel are measured from (P1-SG15, Advisor 7 Oct 05:01 and 05:47).
+                accepted = datetime.now(timezone.utc) if command == "stop" else None
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
@@ -649,10 +652,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
                     # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                # A Stop's acceptance is stamped to the microsecond: a raced fill is journaled with the ms after it
-                # (P1-SG15, Advisor 7 Oct 05:01).
-                st().decide(actor, command, reason, name,
-                            ts=datetime.now(timezone.utc) if command == "stop" else None)
+                st().decide(actor, command, reason, name, ts=accepted)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and not set(why.codes) <= set(RESUMABLE)):
                 raise ValueError(f"a resume can't clear it. {why}")
