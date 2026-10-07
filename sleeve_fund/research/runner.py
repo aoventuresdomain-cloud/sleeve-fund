@@ -18,7 +18,7 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 
 from sleeve_fund import markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
-from sleeve_fund.instruments import BOOK_SHARE, BarOpens, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
+from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 
@@ -48,6 +48,9 @@ class BacktestResult:
     funding: list = field(default_factory=list)
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
+    # How far the fills can be trusted, when they relied on what traded first inside a bar (P1-D13): e.g.
+    # "bars-only: stop fills pessimistic". Empty when no resting level ever lay inside a bar.
+    labels: list = field(default_factory=list)
 
     @property
     def shorts(self) -> bool:
@@ -56,6 +59,18 @@ class BacktestResult:
 
 
 CHUNK_BARS = 100_000  # bars handed to the engine at a time
+BARS_ONLY_LABEL = "bars-only: stop fills pessimistic"
+LIQUIDATION_CHECK = " (liquidation check)"
+
+
+def fills_label(exec_minutes: int | None, relied: set) -> list[str]:
+    """The label a result carries when its fills relied on what traded first inside a bar (Advisor, P1-D13 18:36 and
+    19:00): on bars only, or on execution bars longer than a minute, and only when some resting level lay inside a
+    bar's range. When only the liquidation price did, it says so."""
+    if not relied:
+        return []
+    label = BARS_ONLY_LABEL if not exec_minutes else f"execution bars {exec_minutes} min: pessimistic fills"
+    return [label + ("" if "fill" in relied else LIQUIDATION_CHECK)]
 # The share of each bar's traded volume the simulated venue offers this strategy's orders. The engine
 # turns a bar into four prints (open, high, low, close) of a quarter of its volume each, and a resting
 # order fills only against the prints that trade through its price, at most a print's size each. With
@@ -148,6 +163,7 @@ def run_backtest(
         # comes and go at the next close. Same bars, same stop, same fill, with or without a runtime.
         runtime.backtest = True
 
+    fee_model = ScheduleFeeModel(fees, half_spread=half_spread)
     engine = BacktestEngine(
         BacktestEngineConfig(
             trader_id=TraderId.from_str("RESEARCH-001"),
@@ -166,7 +182,7 @@ def run_backtest(
             default_leverage=markets.VENUE_LEVERAGE if perp else None,
             base_currency=None,
             starting_balances=_opening_balances(starting_capital, quote, base, runtime, perp),
-            fee_model=(fee_model := ScheduleFeeModel(fees, half_spread=half_spread)),
+            fee_model=fee_model,
             modules=[BarOpens(fee_model)],  # a stop filled in a bar that opened through the target: the target
             fill_model=fill_model(),
             # Within a bar, the extreme nearer the open trades first for orders resting here (a post-only
@@ -178,9 +194,12 @@ def run_backtest(
         if exec_prices is not None and not exec_prices.empty:
             bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
             feed, feed_type = exec_prices, bar_type_for(instrument, exec_minutes)
+            coarse = exec_minutes > 1
         else:
             bar_type = bar_type_for(instrument, bar_minutes)
             feed, feed_type = prices, bar_type
+            # Bars alone: a minute bar is the finest there is, so only longer ones are booked pessimistically.
+            coarse, exec_minutes = bar_minutes > 1, None
         feed = _book_volume(feed, instrument)
         config = config_cls(
             instrument_id=instrument.id,
@@ -193,6 +212,13 @@ def run_backtest(
         strategy = strategy_cls(config).attach_runtime(runtime)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         engine.add_strategy(strategy)
+        # Every resting stop is booked by the fee model with its slippage, and on bars too coarse to say what traded
+        # first inside one, pessimistically against the bar (P1-D13).
+        strategy.pessimistic = coarse
+        fee_model.exit_info = strategy._exit_booking
+        fee_model.now = strategy.clock.timestamp_ns
+        if coarse:
+            fee_model.bars = ExecBars(feed)
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):
@@ -227,12 +253,14 @@ def run_backtest(
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
+            labels=fills_label(exec_minutes, fee_model.intrabar) if coarse else [],
         )
     finally:
         if runtime is not None:
             # The runtime's clock is a closure over the strategy, a reference cycle the garbage
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
+        fee_model.exit_info = fee_model.now = None  # closures over the strategy: the same cycle
         engine.dispose()
 
 

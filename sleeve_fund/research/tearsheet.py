@@ -263,8 +263,8 @@ def oos_gaps(r: StudyResult) -> str:
         words.append(
             f"{who[0].upper()}{who[1:]} halted the strategy in {len(halted)} of {n} folds: {' and '.join(split)}. "
             + "; ".join(f"The fold testing to {f.test_end:%b %Y} halted on {f.halted}" for f in halted)
-            + ". A halted run stays flat, as paper does until you resume it. Each fold's run trades through its "
-            "training stretch first, so the position carried into the test is realistic.")
+            + ". A halted run stays flat, as paper does until you resume it. Each test window starts flat "
+            "and trades from its own first bar, so no position or halt is carried in from training.")
     quiet = [f for f in idle if not f.halted]
     if quiet:
         words.append(f"In {len(quiet)} of the windows without a trade no halt was involved: the signal never "
@@ -352,6 +352,16 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
     for name, result, evidence in checks:
         out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
+    for label in getattr(r, "fill_labels", None) or []:
+        out.append(f"> Fills: {label}. Without 1-minute bars, what traded first inside a bar is unknown, so a stop the "
+                   "bar traded through was filled at its worst price, and a stop and a target both inside one bar as the "
+                   "stop.")
+        out.append("")
+    check = getattr(r, "spot_check", None)
+    if check and "gap" in check:
+        out.append(f"> 5-minute pass spot-checked on 1-minute bars: the window {check['window']} (seed {check['seed']}) "
+                   f"ended {check['gap']:+,.2f} on 1-minute bars against 5-minute ones.")
+        out.append("")
     gaps = oos_gaps(r)
     if gaps:
         out.append(f"> {gaps}")
