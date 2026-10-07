@@ -417,9 +417,10 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later
 
 
-def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, **params):
+def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, down=None, **params):
     """A model after a deploy restart: the journal holds `orders` (oldest first) and the warm-up is `closes`, one
-    `minutes` bar each; what on_start does with them before the first live bar."""
+    `minutes` bar each; what on_start does with them before the first live bar. down: the bar after whose close the
+    previous process last wrote its heartbeat, so the candles after it were missed (None: a first start)."""
     from datetime import datetime, timezone
 
     from sleeve_fund.strategies import REGISTRY
@@ -441,6 +442,8 @@ def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, **params):
     s = cls(cfg(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005,
                 **{"market": "perp", "allow_short": True, **params}))
     s.instrument, s.runtime = instrument, runtime
+    if down is not None:
+        s._last_alive = at(down, 5)
     bars = [Bar(bt, Price(c, 1), Price(c, 1), Price(c, 1), Price(c, 1), Quantity(1, 8), int(at(i).timestamp() * 1e9),
                 int(at(i).timestamp() * 1e9)) for i, c in enumerate(closes)]
     s._plan_resume()
@@ -556,3 +559,83 @@ def test_a_restart_after_a_stop_keeps_the_exit_lock_for_a_model_that_keeps_no_le
     monkeypatch.setattr(cls, "want_side", lambda self, bar: 1)
     assert _restarted(strategy, closes, [("entry", "BUY", 150, 1), ("exit", "SELL", 160, 30)],
                       **params)._exit_lock is False
+
+
+def _says(cls, monkeypatch, wants):
+    """Pin a model's signal by candle: wants[i] on 1-minute bar i, wants["else"] on every other."""
+    t0 = 1_790_000_000 // 86_400 * 86_400
+    monkeypatch.setattr(cls, "want_side", lambda self, bar: wants.get((bar.ts_event // 10**9 - t0) // 60,
+                                                                     wants["else"]))
+
+
+@pytest.mark.parametrize("held", [1, -1])
+def test_a_restart_catches_up_an_exit_a_missed_candle_said_once_at_market(held, monkeypatch):
+    """R-I5-2 (Advisor 7 Oct 21:15 UK): each candle that closed while the strategy was down is decided again, in
+    order, from the stored candles; the first that says exit closes the position once, now, at market, journalled
+    "Late exit, missed candle T". A candle the previous process saw (up to its last heartbeat) isn't one of them."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies import REGISTRY
+
+    cls = REGISTRY["trend_filter"][0]
+    entry = [("entry", "BUY" if held > 0 else "SELL", 150, 1)]
+    # flat on 165 (seen: the process died after 170), on 180 and 185 (missed), back on the held side after
+    _says(cls, monkeypatch, {165: 0, 180: 0, 185: 0, "else": held})
+    s = _restarted("trend_filter", [100_000.0] * 200, entry, book_qty=0.1 * held, down=170)
+    assert s._missed_exit == (1_790_000_000 // 86_400 * 86_400 + 180 * 60) * 10**9
+    events, sold = [], []
+    s.runtime.store = SimpleNamespace(event=lambda *a, **k: events.append(a))
+    s._entry_px, s._busy, s._pos_side, s._price = 100_000.0, (lambda: False), (lambda: held), (lambda: 100_000.0)
+    s._sell_all = lambda *a: sold.append(a)
+    s._exit_missed()
+    s._exit_missed()  # once
+    (intent, reason, values), = sold
+    assert (intent, reason) == ("exit", "Late exit, missed candle 03:00")
+    assert values["missed_candle"].endswith("T03:00:00+00:00")
+    assert [e[1:3] for e in events] == [("warning", "late_exit")] and "closed while the strategy was down" in events[0][3]
+    # on the side held at every missed candle: nothing to catch up
+    _says(cls, monkeypatch, {165: 0, "else": held})
+    assert _restarted("trend_filter", [100_000.0] * 200, entry, book_qty=0.1 * held, down=170)._missed_exit is None
+    # a first start missed nothing
+    _says(cls, monkeypatch, {180: 0, "else": held})
+    assert _restarted("trend_filter", [100_000.0] * 200, entry, book_qty=0.1 * held)._missed_exit is None
+
+
+def test_a_restart_never_catches_up_an_entry_a_missed_candle_said(monkeypatch):
+    """R-I5-2: entries are never caught up; the next one waits for the next live close. Flat after a signal exit,
+    with every missed candle saying long, nothing is armed for the first trade."""
+    from sleeve_fund.strategies import REGISTRY
+
+    cls = REGISTRY["trend_filter"][0]
+    _says(cls, monkeypatch, {"else": 1})
+    journal = [("entry", "BUY", 100, 1), ("exit", "SELL", 120, 1)]
+    assert _restarted("trend_filter", [100_000.0] * 200, journal, down=170)._missed_exit is None
+    _says(cls, monkeypatch, {"else": -1})  # nor a short entry
+    assert _restarted("trend_filter", [100_000.0] * 200, journal, down=170)._missed_exit is None
+
+
+def test_a_stop_the_outage_replay_sends_first_drops_the_missed_candle_exit():
+    """R-I5-2: stops are unaffected. On the first trade after the restart the outage replay goes first; when it sends
+    a stop or target, that closes the position and the missed candle's exit is dropped, not sent as well."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.venues import venue
+
+    cls, cfg = REGISTRY["trend_filter"]
+    s = cls(cfg(instrument_id=venue("kraken").instrument("BTC", "USD").id, assumed_taker_fee=0.0005,
+                bar_type=BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL"), market="perp", allow_short=True))
+    sent = []
+    for name in ("_snap_settlements", "_market_seen", "_note_trade", "_maybe_tick", "_publish_signals"):
+        setattr(s, name, lambda *a, **k: None)
+    s._resting_openers, s._still_awaiting = (lambda: False), (lambda: True)
+    s._exit_missed = lambda: sent.append("missed exit")
+    s._check_outage_exits = lambda: sent.append("stop") or True
+    tick = SimpleNamespace(ts_event=2, price=SimpleNamespace(as_double=lambda: 100.0))
+    s._outage_check, s._missed_exit = True, 1
+    s.on_trade(tick)
+    assert sent == ["stop"] and s._missed_exit is None
+    s._check_outage_exits = lambda: sent.append("nothing crossed") and False
+    s._outage_check, s._missed_exit, sent[:] = True, 1, []
+    s.on_trade(tick)
+    assert sent == ["nothing crossed", "missed exit"]

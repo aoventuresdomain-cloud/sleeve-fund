@@ -822,9 +822,10 @@ class Store:
             raise ValueError(f"bad status {status!r}")
         self._update_sleeve(name, status=status, status_reason=reason, paused_until=paused_until)
 
-    def heartbeat(self, name: str) -> None:
+    def heartbeat(self, name: str, at: datetime | None = None) -> None:
+        """at: the strategy's clock (the wall clock in paper, the engine's in a replay); now by default."""
         with self.engine.begin() as c:
-            c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(heartbeat_at=utcnow()))
+            c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(heartbeat_at=at or utcnow()))
 
     def feed_seen(self, name: str, at: datetime) -> None:
         """Paper only: the time of the latest trade or quote the strategy's venue sent."""

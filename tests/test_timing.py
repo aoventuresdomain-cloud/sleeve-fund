@@ -98,29 +98,6 @@ def test_the_strategy_page_shows_close_to_fill(client):  # noqa: F811
     assert timing_view([]) is None
 
 
-def test_a_bar_that_closed_while_the_strategy_was_down_is_decided_once_if_still_the_latest():
-    """m13-E3: a restart spanning a bar close decided nothing on that bar; the signal was lost."""
-    from types import SimpleNamespace
-
-    from sleeve_fund.strategies.base import late_bar
-
-    minute = 60_000_000_000
-    bars = [SimpleNamespace(ts_event=NS - minute), SimpleNamespace(ts_event=NS)]
-    at = lambda ns: datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)  # noqa: E731
-    down = at(NS - 40_000_000_000)  # the previous process's last heartbeat, 40 s before the close
-    assert late_bar(bars, NS + 20_000_000_000, minute, down, None) is bars[-1]  # down over the close: decide on it
-    assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS - 30 * minute)) is bars[-1]
-    assert late_bar(bars, NS + 20_000_000_000, minute, None, None) is None  # a first start: nothing was missed
-    assert late_bar(bars, NS + 20_000_000_000, minute, at(NS + 1_000_000_000), None) is None  # alive at the close
-    assert late_bar(bars, NS + minute, minute, down, None) is None  # a bar old: history, not a signal
-    hour = 60 * minute
-    hourly = [SimpleNamespace(ts_event=NS - hour), SimpleNamespace(ts_event=NS)]
-    assert late_bar(hourly, NS + 90_000_000_000, hour, down, None) is hourly[-1]
-    assert late_bar(hourly, NS + 50 * minute, hour, down, None) is hourly[-1]  # late: it may still exit (below)
-    assert late_bar(bars, NS + 20_000_000_000, minute, down, at(NS + 1_000_000)) is None  # acted on before
-    assert late_bar([], NS, minute, down, None) is None
-
-
 def test_journal_writes_leave_the_decision_path_and_every_read_sees_them():
     import time
 
@@ -346,18 +323,6 @@ def test_a_late_reversal_only_closes():
     s, bar, events, sold, opened = _late_strategy(lag_s=None, side_now=1, wants=-1)  # on time: close, then open
     s._on_bar_sided(bar)
     assert len(sold) == 1 and s._flip is not None and s._flip[0] == -1
-
-
-def test_a_missed_bar_is_decided_however_late_until_a_newer_bar_has_closed():
-    s, bar, *_ = _late_strategy()
-    decided, warmed = [], []
-    s.on_bar, s.on_historical_bars = decided.append, warmed.append
-    s._late, s._now_ns = bar, lambda: NS + 50 * 60_000_000_000
-    s._decide_late()
-    assert decided == [bar] and warmed == []  # 50 minutes late on an hourly bar: decided (exits only)
-    s._late, s._now_ns = bar, lambda: NS + 60 * 60_000_000_000
-    s._decide_late()
-    assert decided == [bar] and warmed == [[bar]]  # a newer bar has closed: it decides instead
 
 
 def _minutes(*hl, start=NS):
