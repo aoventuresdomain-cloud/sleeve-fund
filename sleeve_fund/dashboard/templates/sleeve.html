@@ -45,6 +45,7 @@
   {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
+{% if reset_dropped %}<div class="banner warn" role="status">Your reset was cancelled because the strategy was liquidated first. The halt stays until you reset again.</div>{% endif %}
 {% if clearing and clearing.kind == 'exits_only' %}<div class="banner warn" role="status"><strong>Exits only:</strong> it was stopped while it still holds a position, so nothing new opens and it stops once it is flat. Flatten ends it now.</div>{% endif %}
 {% if clearing and clearing.kind in ['liquidated', 'drawdown', 'daily'] %}<div class="banner" role="status"><strong>What clears it:</strong> {{ clearing.why }}.{% if clearing.kind == 'daily' %} Start and Resume don't lift it.{% endif %}</div>{% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}

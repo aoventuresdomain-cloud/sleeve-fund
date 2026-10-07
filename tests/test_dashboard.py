@@ -2679,3 +2679,15 @@ def test_the_incident_note_post_writes_the_note_and_says_which_field_is_blank(cl
     r = c.post(url, data={"incident": str(iid), "author": "PM", "why_stop_did_not_protect": "gap past the stop"},
                auth=AUTH, headers=SAME, follow_redirects=False)
     assert "command_error" not in r.headers["location"] and written == [(iid, "PM", "gap past the stop")]
+
+
+def test_a_reset_dropped_after_a_liquidation_is_named_until_the_next_reset(client):
+    """P1-D24 (HoE 7 Oct): the PM asked for a reset that did not happen, so the page says so until they reset again."""
+    c, store = client
+    _new(c)
+    sentence = "Your reset was cancelled because the strategy was liquidated first. The halt stays until you reset again."
+    assert sentence not in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.event("btc-test", "warning", "reset_dropped", "The reset asked for (x) was not carried out")
+    assert sentence in c.get("/sleeves/btc-test", auth=AUTH).text
+    store.event("btc-test", "info", "liquidation_reset", "PM reset it after liquidation")
+    assert sentence not in c.get("/sleeves/btc-test", auth=AUTH).text

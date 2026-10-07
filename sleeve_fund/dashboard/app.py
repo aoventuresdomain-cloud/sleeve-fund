@@ -58,7 +58,8 @@ from sleeve_fund.strategies.base import EXITS_ONLY, exit_warmup, maker_orders_en
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
-RAL = "reset_after_liquidation"  # the PM's command that ends a liquidation halt (RAL)
+RAL = "reset_after_liquidation"
+RAL_DONE = "liquidation_reset"  # the event a reset after liquidation journals  # the PM's command that ends a liquidation halt (RAL)
 # Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
 LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
                       "again only after you use Reset after liquidation, which asks for an incident note")
@@ -459,6 +460,17 @@ def create_app(store: Store | None = None) -> FastAPI:
             return {"kind": "exits_only", "why": s.status_reason, "action": "Flatten"}
         return None
 
+    def _reset_dropped(name: str) -> bool:
+        """Whether a reset the PM asked for was cancelled because the strategy was liquidated first (P1-D24, HoE 7 Oct):
+        the page says so until the next reset, asked again or after liquidation, replaces it."""
+        dropped = st().last_event(name, ("reset_dropped",))
+        if dropped is None:
+            return False
+        after = st().last_event(name, (RAL_DONE,))
+        if after and after["id"] > dropped["id"]:
+            return False
+        return not any(r["sleeve"] == name for r in st().pending_resets())
+
     def _ral_view(s) -> dict:
         """What the Reset after liquidation dialog shows (Advisor 17:57, 18:17, 20:37): the engine's open incident,
         X and Y% read from the liquidation halt's own words ("... lost (liquidated): X, Y% of strategy equity at
@@ -497,6 +509,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         liquidated = not bt_id and _liquidated(name)
         clearing = None if bt_id else _clearing(s, liquidated)
         ral = _ral_view(s) if liquidated else None
+        reset_dropped = False if bt_id else _reset_dropped(name)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -508,7 +521,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total, liquidated=liquidated, clearing=clearing, ral=ral,
+                    order_total=order_total, liquidated=liquidated, clearing=clearing, ral=ral, reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
                     account=st().account_of(name), accounts=st().accounts(), settings_pre=settings_pre,
