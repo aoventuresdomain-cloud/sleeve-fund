@@ -16,8 +16,10 @@ PAPER_DAYS = 42  # G2: at least six weeks of paper trading
 MIN_TRADES = 10  # fewer closed trades than this says nothing about the strategy
 
 
-def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], now: datetime) -> list[dict]:
-    """One row per G2 condition: label, ok (True, False, or None when only the PM can judge) and detail."""
+def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], now: datetime,
+                 held: str = "") -> list[dict]:
+    """One row per G2 condition: label, ok (True, False, or None when only the PM can judge) and detail. `held` is
+    why a G1 pass can't be promoted yet (pipeline.promotable), shown as its own unmet row."""
     s = x["sleeve"]
     days = max(0, (now - s.created_at).days)
     trades = x["trades"]["trades"]
@@ -36,6 +38,7 @@ def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], no
          else "not possible yet for a perpetual or long/short strategy: studies run spot, long only"
          if not studied_as(s.params)
          else "not for this instrument and interval yet; paper results alone are not evidence"},
+        *([{"label": "Holdout judged", "ok": False, "detail": held}] if g1 == "PASS" and held else []),
         {"label": "Six weeks of paper trading", "ok": days >= PAPER_DAYS,
          "detail": f"{days} of {PAPER_DAYS} days" if days < PAPER_DAYS else f"{days} days"},
         {"label": f"At least {MIN_TRADES} closed trades", "ok": trades >= MIN_TRADES,

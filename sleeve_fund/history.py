@@ -568,29 +568,234 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         from sleeve_fund import funding
 
         try:
-            flags = lambda: (funding.gaps(profile.name, pair, root),  # noqa: E731
-                             funding.interval_changes(profile.name, pair, root))
-            was_missed, was_maybe = flags()
-            kept = funding.refresh(profile.name, pair, root=root, since=since)
+            before = funding.rates(profile.name, pair, root).index
+            refused: list = []
+            kept = funding.refresh(profile.name, pair, root=root, since=since, refused=refused)
             funding_to = kept.index[-1] if len(kept) else None
-            missed, maybe = flags()
+            _alert_over_published_cap(profile, pair, kept[kept.index.difference(before)])
+            if refused:  # never kept as real rates: charged as missing, and said once a day for these settlements
+                at = ", ".join(f"{pd.Timestamp(t, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} ({r!r})" for t, r in refused)
+                _alert(f"{profile.name} {pair}: funding invalid {refused[0][0]}-{refused[-1][0]}", "warning",
+                       "funding_invalid", f"{pair}: {len(refused)} settled funding rate(s) refused "
+                       f"as not a number within the {funding.cap_of(profile.name, pair):.2%} cap, kept as missing: {at}")
+            missed, maybe = funding.settled_holes(profile.name, pair, root)  # QA P1-O18
             if missed or maybe:  # the hub's log (the status workflow) has the whole history every pass
                 span = lambda ab: f"{ab[0]:%Y-%m-%d %H:%M} to {ab[1]:%Y-%m-%d %H:%M}"  # noqa: E731
                 print(f"{profile.name} {pair}: funding: {len(missed)} missed settlement(s)"
                       + "".join(f"; missed between {span(g)}" for g in missed)
                       + "".join(f"; possible hole at interval change {span(g)}" for g in maybe))
-                # The alerts inbox only what this pass found new (QA P1-O11, Code Reviewer): old holes never clear,
-                # so alerting on the whole history would repeat it every day and on every restart.
-                new_missed = [g for g in missed if g not in was_missed]
-                new_maybe = [g for g in maybe if g not in was_maybe]
-                if new_missed or new_maybe:
-                    _alert(f"{profile.name} {pair}: funding", "warning", "funding_gap",
-                           f"{profile.name} {pair}: funding: new since the last pass"
-                           + "".join(f"; missed between {span(g)}" for g in new_missed)
-                           + "".join(f"; possible hole at interval change {span(g)}" for g in new_maybe))
+                _alert_funding_holes(profile.name, pair, root, [f"missed between {span(g)}" for g in missed]
+                                     + [f"possible hole at interval change {span(g)}" for g in maybe])
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
+        try:  # outside the refresh, so a feed failing on every pass is still raised
+            now = _now()
+            problem, key = funding.stale(profile.name, pair, root, now=now), f"{profile.name} {pair}: funding stale"
+            # One episode per outage, whoever notices first: a paper strategy on it may have opened (or closed) it
+            # already, under the same tag (Advisor, 6-7 Oct 2026; CR, #163).
+            tag, inbox = funding.stale_tag(profile.name, pair), _inbox()
+            rates = funding.rates(profile.name, pair, root)
+            if problem:
+                print(f"FUNDING STALE: {problem}")
+                if key not in _stale:  # once per episode (Advisor, 6 Oct 2026)
+                    _stale.add(key)
+                    if funding.stale_open(inbox, tag) is not True:
+                        from sleeve_fund import markets
+
+                        _warned.pop(key, None)
+                        after = markets.settlement_times(rates.index[-1].to_pydatetime(), now.to_pydatetime(),
+                                                         profile.funding_hours, rates)
+                        _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}; "
+                               f"{funding.from_words(pd.Timestamp(after[0]) if after else now)}", inbox)
+            _open_inner_gaps(profile, pair, rates, inbox, tag, now)
+            readable = _review_episodes(profile, pair, root, inbox, tag, now)
+            if not problem and key in _stale:
+                if not readable:  # the journal unreadable: this process's own episode ends with the rates keeping up
+                    _warned.pop(f"{key}: cleared", None)
+                    _alert(f"{key}: cleared", "info", "funding_stale_cleared",
+                           f"{tag} funding kept up again, newest rate {rates.index[-1]:%Y-%m-%d %H:%M} UTC", inbox)
+                    _stale.discard(key)
+                elif funding.stale_open(inbox, tag) is False:
+                    _stale.discard(key)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store is reported by the refresh itself
+            print(f"{profile.name} {pair}: funding staleness check failed: {exc!r}")
     _refresh_open_interest(profile, pair, root, funding_to)
+
+
+def _now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+# How long after a settlement the venue may take to publish its rate before the collector counts it as due (the
+# strategies' FUNDING_WAIT).
+PUBLISH_WAIT = pd.Timedelta(minutes=15)
+
+
+def _open_inner_gaps(profile, pair: str, rates: pd.Series, inbox, tag: str, now: pd.Timestamp) -> None:
+    """A settlement missing between two kept records (the gap inference: markets.settlement_times), due in the last
+    day, opens an episode as a late newest one does: one funding_stale per run of contiguous missing settlements,
+    from its first (Advisor, 7 Oct 2026; QA P1-O17a-10, -11). _review_episodes then marks each one and asks the
+    venue's history for it. Older holes are history, reported by funding.settled_holes; a day is when one still
+    unpublished is never published."""
+    from sleeve_fund import funding, markets
+
+    if len(rates) < 2:
+        return
+    try:
+        state = funding.journal_state(inbox, tag)
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return
+    since = max(rates.index[0], now - funding.NEVER_PUBLISHED_AFTER)
+    upto = min(now - PUBLISH_WAIT, rates.index[-1])
+    if upto <= since:
+        return
+    runs: list[list[pd.Timestamp]] = [[]]
+    for t in markets.settlement_times(since.to_pydatetime(), upto.to_pydatetime(), profile.funding_hours, rates):
+        t = pd.Timestamp(t)
+        if (abs(rates.index - t) <= funding.MATCH).any():
+            runs.append([])
+        else:
+            runs[-1].append(t)
+    opened = [o for o in state["open"] if o is not None]
+    for run in filter(None, runs):
+        if any(t in state["missing"] or t in state["never"] for t in run) or \
+                any(abs(o - t) <= funding.MATCH for o in opened for t in run):
+            continue  # already marked, or the episode it belongs to is open
+        n = len(run)
+        inbox.event(None, "warning", "funding_stale",
+                    f"{tag} No settled funding rate from the venue for {pair} at {run[0]:%d %b %Y %H:%M} UTC, "
+                    f"{n} settlement{'s' if n != 1 else ''} missing between the rates kept; "
+                    f"{funding.from_words(run[0])}")
+        opened.append(run[0])
+
+
+def _review_episodes(profile, pair: str, root, inbox, tag: str, now: pd.Timestamp) -> bool:
+    """The instrument's open staleness episodes against the store, settlement by settlement (Advisor, 7 Oct 2026;
+    QA P1-O17a-10, -11): every settlement due since the oldest one opened, a publication wait allowed, is kept,
+    missing (marked once, and first asked of the venue's history again: funding.backfill) or, still missing a day
+    after it was due once a later one is kept, never published (marked once, a warning: its baseline stays). An
+    episode closes once every settlement from the one it opened on to the latest due is kept or never published,
+    so one arriving late while a later one is missing leaves it open, and one never published can't hold it open
+    forever. The settlements are the venue's own times (markets.settlement_times). False when the journal can't be
+    read."""
+    from sleeve_fund import funding, markets
+
+    try:
+        state = funding.journal_state(inbox, tag)
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return False
+    opened = sorted(k for k in state["open"] if k is not None)
+    if not opened:
+        return True
+    rates = funding.rates(profile.name, pair, root)
+    if not len(rates):
+        return True
+    upto = (now - PUBLISH_WAIT).to_pydatetime()
+
+    def due():
+        before = markets.settlement_times(opened[0].to_pydatetime() - pd.Timedelta(days=1), opened[0].to_pydatetime(),
+                                          profile.funding_hours, rates)
+        start = before[-1] if before else opened[0].to_pydatetime()
+        return [pd.Timestamp(t) for t in markets.settlement_times(start - pd.Timedelta(seconds=1), upto,
+                                                                   profile.funding_hours, rates)]
+
+    def kept(t) -> bool:
+        return bool((abs(rates.index - t) <= funding.MATCH).any())
+
+    lost = [t for t in due() if not kept(t)]
+    if lost and funding.backfill(profile.name, pair, lost[0] - funding.MATCH, root):
+        rates = funding.rates(profile.name, pair, root)
+    settlements = due()
+    newest = rates.index[-1]
+    for t in settlements:
+        if kept(t) or t in state["never"]:
+            continue
+        if t not in state["missing"]:
+            funding.mark(inbox, tag, "funding_missing", t, inferred=t > rates.index[0])
+            state["missing"].add(t)
+        if now - t >= funding.NEVER_PUBLISHED_AFTER and newest > t + funding.MATCH:
+            funding.mark(inbox, tag, "funding_never_published", t)
+            state["never"].add(t)
+    # From the settlement each opened on (one written before episodes named it opened at its alert, inside the
+    # interval after it)
+    gap = pd.Timedelta(markets.funding_interval(profile.funding_hours)) - funding.MATCH
+    for o in opened:
+        if all(kept(t) or t in state["never"] for t in settlements if t > o - gap):
+            inbox.event(None, "info", "funding_stale_cleared", f"{tag} funding kept up again, {funding.from_words(o)}, "
+                        f"newest rate {newest:%Y-%m-%d %H:%M} UTC")
+    return True
+
+
+def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:
+    """Each funding hole goes to the alerts inbox once, ever (QA P1-O11, P1-O16): the holes already raised are
+    kept beside the rates, so a second new hole the same day still goes in, a restart repeats nothing, and holes
+    stored before this check existed are raised on its first pass. Old holes never clear, so the daily cap of
+    _alert would either repeat them or hold new ones back. The file's own lock is held from reading it to saving
+    it, so two refreshes of one instrument (a manual one while the hub runs) send a hole once (Code Reviewer); the
+    store's lock is taken only to save, so a slow database never holds up the store's writes (QA P1-O21)."""
+    from sleeve_fund import funding
+
+    path = funding._path(venue, pair, root).with_name("funding.alerted.json")
+    with _alerting(path):
+        raised, problem = _raised(path)
+        if problem:  # an incident in the alerts inbox, once a day (QA P1-O20)
+            _alert(f"{path}: unreadable", "error", "funding_alerted_unreadable", f"{pair}: {problem}")  # no venue
+        new = [h for h in holes if h not in raised]
+        if new:
+            try:
+                from sleeve_fund.store import Store
+
+                Store().event(None, "warning", "funding_gap", f"{pair}: funding: " + "; ".join(new))  # no venue
+            except Exception as exc:  # noqa: BLE001 - no database (locally): the log line says it; retried next pass
+                print(f"could not raise the funding_gap alert: {exc!r}")
+                return
+        elif not problem:
+            return
+        # Saved with the new holes, or rewritten clean when it couldn't be read, so its incident isn't raised daily.
+        with _writing(path.parent):
+            tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text(json.dumps(sorted(raised | set(new))))
+                _durable_replace(tmp, path)
+            except OSError as exc:  # sent, but not kept: not sent again by this process; a restart sends them again
+                _sent_holes.setdefault(str(path), set()).update(new)
+                tmp.unlink(missing_ok=True)
+                print(f"{venue} {pair}: could not keep the funding holes already raised in {path}: {exc!r}")
+
+
+@contextlib.contextmanager
+def _alerting(path: Path):
+    """One sender of an instrument's funding holes at a time, across threads and processes: a lock of its own beside
+    the alerted file, apart from the store's write lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name("funding.alerted.lock"), "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+_sent_holes: dict[str, set[str]] = {}  # alerted file -> holes this process sent but couldn't keep in it
+
+
+def _raised(path: Path) -> tuple[set[str], str | None]:
+    """The holes already raised for the instrument, and what is wrong with the file if it can't be used. A file that
+    can't be read, or isn't a list of hole words, is read as empty and said (QA P1-O20): its holes go in once more,
+    and the file is rewritten, rather than the instrument's alerts stopping for good."""
+    raised = set(_sent_holes.get(str(path), ()))
+    try:
+        kept = json.loads(path.read_text())
+    except FileNotFoundError:
+        return raised, None
+    except (OSError, ValueError) as exc:
+        problem = f"the funding holes already raised can't be read ({exc!r}); reading it as empty"
+    else:
+        if isinstance(kept, list) and all(isinstance(h, str) for h in kept):
+            return raised | set(kept), None
+        problem = "the funding holes already raised are not a list of holes; reading it as empty"
+    print(f"{path}: {problem}")
+    return raised, problem
 
 
 def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
@@ -616,6 +821,7 @@ def _refresh_open_interest(profile, pair: str, root, funding_to) -> None:
     print(f"{profile.name} {pair}: open interest to {oi} UTC (+{out['written']}{extra}), funding to {fr} UTC")
 
 
+_stale: set[str] = set()  # instruments whose funding was last seen stale, for the recovery line
 _warned: dict[str, float] = {}  # message prefix -> when it last went to the alerts inbox
 
 
@@ -625,6 +831,35 @@ def _warn_at_risk(problem: str | None, store=None) -> None:
         return
     print(f"OPEN INTEREST AT RISK: {problem}")
     _alert(problem.split(" last kept")[0], "error", "open_interest_at_risk", problem, store)  # instrument and series
+
+
+def _alert_over_published_cap(profile, pair: str, new: pd.Series) -> None:
+    """A rate kept this pass beyond the instrument's published cap (VenueProfile.published_funding_caps) is alerted,
+    and still kept and charged as it is: the cheap guard until each settlement's own cap is kept (Advisor, 6 Oct
+    2026; DA-11)."""
+    cap = (getattr(profile, "published_funding_caps", None) or {}).get(pair)
+    over = new[new.abs() > cap] if cap and len(new) else new.iloc[:0]
+    if not len(over):
+        return
+    at = ", ".join(f"{t:%Y-%m-%d %H:%M} ({r:.4%})" for t, r in over.items())
+    _alert(f"{profile.name} {pair}: funding over the published cap {over.index[-1]:%Y%m%d%H%M}", "warning",
+           "funding_over_cap", f"{pair}: {len(over)} settled funding rate(s) beyond the "
+           f"instrument's published {cap:.2%} cap, kept and charged as the venue settled them: {at}")
+
+
+_inbox_of: list = [None, None]  # (the Store class it was built from, the Store): one per process, not one per pass
+
+
+def _inbox():
+    """The journal the alerts go to, built once, or None without a database (locally)."""
+    from sleeve_fund import store as store_mod
+
+    if _inbox_of[0] is not store_mod.Store:  # built again only if the class changed (tests swap it)
+        try:
+            _inbox_of[:] = [store_mod.Store, store_mod.Store()]
+        except Exception:  # noqa: BLE001
+            return None
+    return _inbox_of[1]
 
 
 def _alert(key: str, level: str, kind: str, message: str, store=None) -> None:

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
+from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of
 from sleeve_fund import markets
 from sleeve_fund.markets import PERP
@@ -40,6 +41,43 @@ from sleeve_fund.strategies.base import IdeaSpec
 
 
 log_ = logging.getLogger(__name__)
+
+
+def _window_funding(marks: list, after: pd.Timestamp, end: pd.Timestamp) -> dict:
+    """A window's funding, its settlements in (after, end], `after` being the close of the bar before its first:
+    of its held settlements, those charged the baseline for a missing rate, and the longest stretch of held time
+    without the venue's rate (funding.baseline_summary)."""
+    inside = [m for m in marks if after < pd.Timestamp(m[0]) <= end]
+    n, m, longest = funding.baseline_summary(inside)
+    return {"funding_held": m, "funding_baseline": n, "funding_gap": longest, "funding_window_marks": inside}
+
+
+def _oos_funding(folds) -> tuple[int, int, pd.Timedelta]:
+    """(N, M, the longest stretch) over the out-of-sample windows joined: the test windows are contiguous, so a
+    stretch without the venue's rate runs on across a window's edge, broken only by a stored real rate (Advisor,
+    18:18; QA P1-O17a-2). Folds without their marks (older results) fall back to the per-window figures."""
+    n = sum(getattr(f, "funding_baseline", 0) for f in folds)
+    m = sum(getattr(f, "funding_held", 0) for f in folds)
+    joined = sorted((mk for f in folds for mk in getattr(f, "funding_window_marks", ())), key=lambda mk: mk[0])
+    if joined:
+        return n, m, funding.baseline_summary(joined)[2]
+    return n, m, max((getattr(f, "funding_gap", pd.Timedelta(0)) for f in folds), default=pd.Timedelta(0))
+
+
+def _funding_check(r) -> tuple[str, str]:
+    """PASS, WARN or NOT JUDGED on a study's out-of-sample funding (funding.baseline_check; Advisor, 6 Oct 2026). A
+    simulated perp has no venue's rates at all: every settlement is the baseline, and it is not judged until a
+    modelled rate series is in the trials register before the run (none can be registered yet). Nor is a run whose
+    venue's settlements don't fit the schedule charged (funding.schedule_mismatch)."""
+    n, m, longest = _oos_funding(r.folds)  # read with defaults: a fold that never held a perp carries no funding
+    verdict, words = funding.baseline_check(n, m, longest, "out-of-sample")
+    full = getattr(r, "full_period", None)
+    if getattr(full, "funding_schedule", ""):
+        return "NOT JUDGED", f"{full.funding_schedule}; {words}"
+    if getattr(full, "funding_simulated", False):
+        return "NOT JUDGED", (f"a simulated perpetual, with no venue's funding rates: {words}; no modelled rate "
+                              "series was in the trials register before the run")
+    return verdict, words
 
 
 @dataclass
@@ -69,6 +107,12 @@ class Fold:
     # Every grid point's Sharpe and round trips on this fold's training stretch: the surface the choice
     # was made on, so the nearby-settings check can centre on what this fold chose (P1-G2).
     grid: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # A perpetual's funding settlements a position was held through in the test window, how many of them were
+    # charged the baseline for a missing rate, and the longest stretch of held time without the rate (QA P1-O17).
+    funding_held: int = 0
+    funding_baseline: int = 0
+    funding_gap: pd.Timedelta = pd.Timedelta(0)
+    funding_window_marks: list = field(default_factory=list, repr=False)  # (ts, missing, held) in the window
     unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
     # Every liquidation in the test window (_liquidations): a G1 finding whatever the P&L (GAP-LIQ-CAP).
     liquidations: list = field(default_factory=list)
@@ -109,6 +153,8 @@ class StudyResult:
     errors: list = field(default_factory=list)
     error_count: int = 0
     holdout_withheld: str = ""  # why the holdout asked for was left closed
+    # The holdout run's funding (_window_funding), counted and judged as out-of-sample is (Advisor, 6 Oct 2026).
+    holdout_funding: dict = field(default_factory=dict)
     # The chosen settings over the research period at each fee of COST_LADDER: what costs the idea survives.
     cost_ladder: list[LadderRung] = field(default_factory=list)
     ladder_slippage: float = 0.0  # charged on every rung on top of the half spread, on orders that take liquidity
@@ -175,7 +221,32 @@ class StudyResult:
                     f"of {len(self.folds)} test windows flat or without a trade, and out-of-sample closed "
                     f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so at least half of it sat flat "
                     "rather than testing the idea")
+        verdict, words = _funding_check(self)
+        if verdict == "NOT JUDGED":
+            return f"its funding isn't the venue's: {words}"
         return ""
+
+    @property
+    def funding_baseline(self) -> tuple[int, int, pd.Timedelta]:
+        """Out-of-sample funding settlements charged the baseline for a missing rate, of those a position was held
+        through, and the longest stretch of held time without the venue's rate: what the G1 funding check reads."""
+        return _oos_funding(self.folds)
+
+    @property
+    def funding_check(self) -> tuple[str, str]:
+        return _funding_check(self)
+
+    @property
+    def holdout_funding_baseline(self) -> tuple[int, int, pd.Timedelta]:
+        h = self.holdout_funding
+        return h.get("funding_baseline", 0), h.get("funding_held", 0), h.get("funding_gap", pd.Timedelta(0))
+
+    @property
+    def holdout_not_judged(self) -> str:
+        """Why the opened holdout can't be read, or '': the same funding rule as out-of-sample, since the holdout is
+        the last check before G1 means anything (Advisor, 6 Oct 2026)."""
+        verdict, words = funding.baseline_check(*self.holdout_funding_baseline, "holdout")
+        return words if self.holdout and verdict == "NOT JUDGED" else ""
 
     @property
     def round_trips(self) -> list[float]:
@@ -578,6 +649,7 @@ def run_study(
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
                 halted_before_test=_halted_before(run.risk_events, test_idx[0]),
                 grid=pd.DataFrame(surface),
+                **_window_funding(run.funding_marks, train.index[-1], test_idx[-1]),
                 liquidations=_liquidations(run, test_idx[0], test_idx[-1],
                                            f"out-of-sample test window {len(folds) + 1}"),
             )
@@ -753,6 +825,8 @@ def run_study(
             else:
                 b_all = bt("buy_and_hold", prices, {}, benchmark=True)
                 result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
+            result.holdout_funding = _window_funding(run.funding_marks, prices.index[-holdout_bars - 1],
+                                                     prices.index[-1])
             result.holdout_liquidations = _liquidations(run, h_start, prices.index[-1], "holdout")
         except Exception:
             if locks is not None:

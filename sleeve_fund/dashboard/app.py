@@ -474,8 +474,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
+        from sleeve_fund.dashboard import pipeline
+
+        promotion = None if bt_id else pipeline.promotion_for(TEARSHEETS, s.strategy, s.instrument,
+                                                              spec_minutes(s.bar_spec), s.params)
         path = None if bt_id else gates.path_to_live(st(), x, _g1_of(s.strategy, s.instrument, spec_minutes(s.bar_spec),
-                                                                     s.params), st().accounts(), utcnow())
+                                                                     s.params), st().accounts(), utcnow(),
+                                                      held=promotion[1] if promotion else "")
         # The Overview's Position table is the Portfolio's, one row; Open orders lists working orders only.
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
@@ -1236,10 +1241,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         carry.update(bar_spec=bar_spec, tested_bar_spec=bar_spec, warmup_bars=_warmup_for(strategy, q, bar_spec))
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
         pair = q.get("instrument", "").strip().upper()
-        g1_here = (pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec),
-                                   {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
-                                    "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")})
-                   if pair else None)
+        studied = {"market": q.get("market") if q.get("market") in markets.MARKETS else None,
+                   "allow_short": str(q.get("allow_short", "")).lower() in ("1", "true", "on", "yes")}
+        g1_here = pipeline.g1_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec), studied) if pair else None
+        # A G1 pass whose holdout is not judged does not back paper evaluation (QA P1-O17a-7).
+        held = pipeline.promotion_for(TEARSHEETS, strategy, pair, spec_minutes(bar_spec), studied) if pair else None
+        held_back = held[1] if held and not held[0] and g1_here == "PASS" else ""
         chart = None
         if result:
             chart = {"t": result["t"], "equity": result["equity"], "benchmark": result["benchmark"],
@@ -1257,7 +1264,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "backtest.html", result=result, error=error, job=job, saved=saved, pre=dict(q),
                     market_words=market_words,
                     chosen=strategy, strategies=_strategy_choices(), instruments=_hints(venue), g1=g1, g1_here=g1_here,
-                    period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
+                    held_back=held_back, period=period, periods=BACKTEST_PERIODS, profiles=PROFILES, bar_spec=bar_spec,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes),
                     sleeve_qs=urlencode({**carry, "from": "backtest"}), chart=chart, stored=_stored(venue),
                     runs=st().backtests(limit=BACKTEST_KEEP), costs=exit_costs(backtest=True))
@@ -1783,8 +1790,8 @@ def _funding_health(venue: str, pair: str, root, log) -> dict:
     from sleeve_fund import funding
 
     try:
-        return {"funding_gaps": len(funding.gaps(venue, pair, root)),
-                "funding_maybe": len(funding.interval_changes(venue, pair, root))}
+        missed, maybe = funding.settled_holes(venue, pair, root)
+        return {"funding_gaps": len(missed), "funding_maybe": len(maybe)}
     except Exception as exc:  # noqa: BLE001 - the prices' badge stands without it
         log.warning(f"couldn't read the funding kept for {pair}: {exc!r}")
         return {}
