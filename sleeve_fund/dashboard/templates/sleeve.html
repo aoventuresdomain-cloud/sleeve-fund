@@ -237,7 +237,8 @@
     <div class="pos-card"><h3>Record</h3><dl>
       <div><dt>Worst drawdown</dt><dd>{{ x.max_drawdown|pct1 }}</dd></div>
       {% if not backtest_id %}<div><dt>Reconciled</dt><dd>{% if x.reconcile %}<span class="{{ 'loss' if x.reconcile.kind == 'reconcile_mismatch' else '' }}">{{ 'Mismatch' if x.reconcile.kind == 'reconcile_mismatch' else 'Matches' }}</span> <span class="faint">{{ x.reconcile.ts|ago }}</span>{% else %}<span class="muted">Not yet</span>{% endif %}</dd></div>
-      <div><dt>Heartbeat</dt><dd>{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</dd></div>{% endif %}
+      <div><dt>Heartbeat</dt><dd>{% if x.healthy %}<span class="dot ok"></span>{% else %}<span class="dot stale"></span>{% endif %}{{ s.heartbeat_at|ago }}</dd></div>
+      <div><dt>Candle close to fill</dt><dd title="From the close of the candle an order was decided on to its first fill, over the latest {{ timing.n if timing else 0 }} such orders; the part before the order left this server in brackets">{% if timing %}{{ '%.0f'|format(timing.median) }} ms median, {{ '%.0f'|format(timing.p95) }} ms p95 <span class="faint">({{ '%.0f'|format(timing.ours) if timing.ours is not none else '–' }} ms to send, {{ timing.n }} orders)</span>{% else %}<span class="muted">No fills yet</span>{% endif %}</dd></div>{% endif %}
     </dl></div>
   </div>
 </section>

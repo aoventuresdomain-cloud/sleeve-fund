@@ -98,8 +98,9 @@ def _minute(ts: datetime) -> datetime:
 # a lost 1 bp spread fails. Paper's exits sell at the bid on the trade through the level and the
 # backtest's at the level, so the backtest's stops come out better and its targets worse: measured
 # -1.7 to +5.1 bp on stops and -4.7 to -2.1 bp on targets. A stop 5% further away (0.05R, 5 bp here)
-# or a target 3% further fails.
-TOL_BP = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+# or a target 3% further fails. Since Advisor L12 FINAL the backtest books a target at its level less
+# max(half spread, 5 bp), the taker's slippage, so its targets sit up to that much lower again (-6.8 bp measured).
+TOL_BP = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-10.0, 1.0)}
 
 
 def _same_trades(ticks, bar, tol_bp=None):

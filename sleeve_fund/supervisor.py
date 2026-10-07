@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from sleeve_fund import accounts
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
-from sleeve_fund.paper.config import load_sleeve, to_store_kwargs
+from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
@@ -90,8 +90,20 @@ class Supervisor:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
         rather than started into a crash loop. A start that only sells a position it holds (a flatten waiting:
         the kill switch, a PM close) still goes ahead. So does one still holding a position (Independent Quant
-        Advisor, NA-4, QA P1-S7): it is never left unwatched, but started for its exits only (_exits_only)."""
+        Advisor, NA-4, QA P1-S7): it is never left unwatched, but started for its exits only (_exits_only). One saved
+        on the venue's own candles where the market data hub feeds the venue (check_hub_bar_spec, QA P1-C10) can't
+        start at all, so it is refused even then."""
         s = self.store.sleeve(name)
+        try:
+            check_hub_bar_spec(s.venue, s.bar_spec)
+        except ValueError as exc:
+            qty = self.store.journal_book(name, s.starting_balance)["qty"]
+            held = (f". It still holds a position ({qty:.12g}), which a flatten can't close while it can't start: "
+                    "an engineer needs to close it" if abs(qty) > 1e-12 else "")
+            self.store.set_desired_state(name, "stopped")
+            self.store.set_status(name, "stopped", f"not started: {exc}{held}")
+            self.store.event(name, "error", "start_refused", f"Not started: {exc}{held}")
+            return True
         try:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)

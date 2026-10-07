@@ -464,3 +464,21 @@ def audit_rows(sleeve, fills: list[dict], orders: dict[str, dict], venue: str) -
                      "order_id": f.get("order_id"), "trade_id": f.get("trade_id"),
                      **{k: v if not isinstance(v, (dict, list)) else str(v) for k, v in signal.items()}})
     return rows, keys
+
+
+def timing_view(timings: list[dict]) -> dict | None:
+    """Close to fill for the strategy's latest orders decided on a bar (Store.timings, v2 P1-2): median and 95th
+    percentile in milliseconds, and the median of how much of it was ours (bar close to order sent). None
+    before any such order has filled."""
+    done = [t for t in timings if t["bar_close"] and t["first_fill"]]
+    if not done:
+        return None
+
+    def ms(rows, a, b):
+        return sorted((r[b] - r[a]).total_seconds() * 1000 for r in rows if r[a] and r[b])
+
+    def pick(v, q):
+        return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+    fill, ours = ms(done, "bar_close", "first_fill"), ms(done, "bar_close", "sent")
+    return {"n": len(fill), "median": pick(fill, 0.5), "p95": pick(fill, 0.95), "ours": pick(ours, 0.5)}

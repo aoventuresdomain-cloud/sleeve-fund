@@ -9,7 +9,9 @@ A client opens with {"v": 1, "sub": ["<instrument id>", ...]} and the hub answer
   close (ts), built once by the hub from the trades it relays; refilled = fetched from the venue's REST candles
   after a gap rather than built live;
 - {"t": "gap", "id", "since", "until"}: minutes the hub could not build live (a dropped connection), being
-  refilled;
+  refilled; it comes before the live bar that shows the gap, and the refill after that bar;
+- {"t": "filled", "id", "since", "until"}: that refill is done, whatever it found (its bars came first), so a
+  client holding the live bar for it can stop waiting;
 and to every client, every HEARTBEAT_SECONDS, {"t": "hb", "ts", "venue_up"}: so a client tells a quiet market
 from a dead hub. Prices and sizes travel as the venue's own decimal strings, so nothing is rounded on the way.
 Timestamps are UNIX nanoseconds: ts the venue's (or the bar's close), recv when the hub received it."""

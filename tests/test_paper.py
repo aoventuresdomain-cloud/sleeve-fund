@@ -132,6 +132,12 @@ def _store_with_minutes(tmp_path, end, n):
     return store
 
 
+def _warmup_store(events):
+    """The journal a warm-up reads and writes: its events, and a strategy that has never run (m13-E3)."""
+    return type("S", (), {"event": lambda self, *a: events.append(a), "orders": lambda self, *a, **k: [],
+                          "sleeve": lambda self, name: type("Row", (), {"heartbeat_at": None})()})()
+
+
 def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     import pandas as pd
 
@@ -148,7 +154,7 @@ def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     assert all(b.bar_type == bt for b in bars)
 
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=3)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
@@ -171,7 +177,7 @@ def test_a_warm_up_that_loads_fewer_bars_than_the_model_needs_says_so_as_a_warni
     instrument = venue("kraken").instrument("BTC", "USD")
     bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=30)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
@@ -209,7 +215,7 @@ def test_warm_up_runs_up_to_now_and_says_any_hole_left(tmp_path):
     assert [b.close.as_double() for b in bars][-3:] == [500.0] * 3  # the venue's candles after the store's
 
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=6)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))  # no venue candles
@@ -396,8 +402,8 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     assert len(bars) == 140 and pd.Timestamp(bars[-1].ts_event, tz="UTC") == now  # the forming candle left out
 
     events = []
-    runtime = type("R", (), {"name": "rb", "book": {"qty": 0.076, "entry_px": 85_878.2},
-                             "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "rb", "book": {"qty": 0.076, "entry_px": 85_878.2}, "backtest": False,
+                             "store": _warmup_store(events)})()
     s = RsiBands(RsiBandsConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005, warmup_bars=140))
     s.attach_history(load)
     s.instrument, s.runtime = instrument, runtime

@@ -19,7 +19,7 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
-from sleeve_fund.instruments import BOOK_SHARE, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
+from sleeve_fund.instruments import BOOK_SHARE, BarOpens, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
 
@@ -192,9 +192,11 @@ def run_backtest(
             base_currency=None,
             starting_balances=_opening_balances(starting_capital, quote, base, runtime, perp),
             fee_model=(fee_model := ScheduleFeeModel(fees, half_spread=half_spread)),
+            modules=[BarOpens(fee_model)],  # a stop filled in a bar that opened through the target: the target
             fill_model=fill_model(),
-            # Within a bar, the extreme nearer the open trades first: a bar that opens near its low hits a
-            # stop before a target, rather than always high-then-low.
+            # Within a bar, the extreme nearer the open trades first for orders resting here (a post-only
+            # entry, the stops). The stop and target don't race on it: the target is judged after the bar,
+            # so the stop goes first (Advisor NA-2, LongFlatStrategy._bar_target).
             bar_adaptive_high_low_ordering=True,
         )
         engine.add_instrument(instrument)
@@ -214,6 +216,7 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
+        strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         engine.add_strategy(strategy)
         if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
             built = decision_bars(exec_prices, bar_minutes, exec_minutes)
@@ -385,12 +388,14 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
     leave the commissions as the venue's fee alone. Cash and equity are the same either way.
     With fee_paid (each order's unrounded venue fee), the commission shows that fee to the cent and the
     cent the charge's rounding left goes into the price with the spread: subtracting the exact spread
-    from a rounded charge showed a 0% fee as -0.01 (QA m-G7)."""
-    if fills is None or fills.empty or not spread_paid:
+    from a rounded charge showed a 0% fee as -0.01 (QA m-G7). A target booked at its level carries the
+    difference from its fill in the charge too (ScheduleFeeModel.booked), so it moves into the price the same way."""
+    if fills is None or fills.empty or not (spread_paid or fee_paid):
         return fills
     fills = fills.copy()
-    for coid, spread in spread_paid.items():
-        if coid not in fills.index or spread <= 0:
+    for coid in {**(fee_paid or {}), **spread_paid}:
+        spread = spread_paid.get(coid, 0.0)
+        if coid not in fills.index or (spread <= 0 and coid not in (fee_paid or {})):
             continue
         qty = float(fills.at[coid, "filled_qty"])
         px = float(fills.at[coid, "avg_px"])

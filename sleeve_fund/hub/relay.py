@@ -225,20 +225,21 @@ class HubRelay(DataActor):
 
     def _fill(self, iid: str, since_ns: int, until_ns: int) -> None:
         pair = self.pairs.get(iid)
-        if pair is None or self.recent is None:
-            return
+        bars = []
         try:
-            with self._lock:
-                d = self.definitions.get(iid)
-            precision = (d["price_precision"], d["size_precision"]) if d else None
-            bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns(), precision)
+            if pair is not None and self.recent is not None:  # else nothing to refill from: still say filled
+                with self._lock:
+                    d = self.definitions.get(iid)
+                precision = (d["price_precision"], d["size_precision"]) if d else None
+                bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns(), precision)
         except Exception as exc:  # noqa: BLE001 - the venue's REST down too: the gap stays announced
             print(f"hub: refill of {iid} failed: {exc!r}")
-            return
         for b in bars:
             self.fanout.publish(b)
         if bars:
             self._store.submit(self._keep, bars)
+        # Done, found or not: a client holding the live bar for this refill (QA P1-L2) stops waiting.
+        self.fanout.publish({"t": "filled", "id": iid, "since": since_ns, "until": until_ns})
 
     def _keep(self, msgs: list[dict]) -> None:
         try:

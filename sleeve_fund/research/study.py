@@ -570,8 +570,9 @@ def run_study(
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + _exit_words(exits)
-            + ". Both rest at the venue: the stop fills at its level (at market at once if the price is already "
-            "through it), the target at its level, and within a bar the extreme nearer the open trades first. "
+            + ". The stop rests at the venue and fills at its level (at market at once if the price is already "
+            "through it); the target fills at its level when the price trades through it. A bar that reaches "
+            "both takes the stop: the adverse side goes first. "
             "Paper watches both on every trade."
         )
 
