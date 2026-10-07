@@ -1584,7 +1584,12 @@ class LongFlatStrategy(Strategy):
                 else max(0.0, (self._cap_pct() * equity - posted) * lev))
         qty = min(order, central.qty, Decimal(str(room / close))).quantize(self._lot(), rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty() or qty <= Decimal(str(self._cfg.resize_band)) * held:
-            return  # nothing left under the cap, or what it leaves would land inside the band: no add
+            # Nothing left under the cap, or what it leaves would land inside the band: no add, said once until an
+            # add goes through, never retried as an order (Advisor 7 Oct 02:08, pin 2).
+            self._note("add_capped", f"Band add held back: the {target.normalize():f} target is more than "
+                       f"{self._cfg.resize_band:.0%} above the {held.normalize():f} held, but the room left under the "
+                       f"margin cap ({room:,.2f}) leaves too little to add", level="info")
+            return
         own = close * (1 - side * plan[0])
         old = self._entry_px * (1 - side * self._stop_frac) if self._stop_frac else own
         level = max(own, old) if side > 0 else min(own, old)  # the tighter of the position's stop and the add's own
@@ -1610,6 +1615,8 @@ class LongFlatStrategy(Strategy):
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(total * close / equity, 4)
         self._add_level = level
+        for kind in ("add_capped", "add_refused_open_risk", "entry_refused_liquidation"):
+            self._noted.discard(kind)
         self._submit(entry_side, qty, "entry", f"Band: add {qty.normalize():f} toward the {target.normalize():f} target "
                      f"(central sizing x the model's {w:.0%}), more than {self._cfg.resize_band:.0%} above the "
                      f"{held.normalize():f} held; an add is an entry", signal)
@@ -1619,6 +1626,8 @@ class LongFlatStrategy(Strategy):
         smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
         trade and the bar's volume; refused when its stop would sit too near the liquidation price."""
         self._add_level = None  # an add that never filled leaves nothing for this entry
+        for kind in ("add_capped", "add_refused_open_risk"):
+            self._noted.discard(kind)  # a new position says once again why its adds are held back
         if self._exit_lock == side:
             return
         if self._entry_blocked(bar):
@@ -3784,10 +3793,12 @@ class LongFlatStrategy(Strategy):
         if self._backtest:
             if opening and self._pending_exit is None:
                 if band_add:
-                    # Placed again, whole, as a new order after the add.
-                    for order in self._resting_exits().values():
-                        self.cancel_order(order.client_order_id)
+                    # Placed again, whole, as a new order after the add; the new reduce-only stop goes in before the
+                    # old one is cancelled, so the position is never without one (Advisor 7 Oct 02:08, pin 1b).
+                    old = list(self._resting_exits().values())
                     self._rest_exits(fresh=True)
+                    for order in old:
+                        self.cancel_order(order.client_order_id)
                     self._rest_risk_stop()
                 else:
                     # On every entry fill, not only the last: a post-only entry can fill in slices through its
@@ -3928,6 +3939,8 @@ class LongFlatStrategy(Strategy):
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side)[:-len(' the entry')]} the "
                 f"{self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
+                + ("; moved up with the band add, so the earlier units' stop tightens too" if fresh and side > 0 else
+                   "; moved down with the band add, so the earlier units' stop tightens too" if fresh else "")
                 + "; fills at that level, or the open if the price gaps through",
                 {"entry_px": round(self._entry_px, 8), "stop_loss": round(stop, 6), "trigger": round(level, 8)}))
         for order, intent, kind, reason, signal in orders:
