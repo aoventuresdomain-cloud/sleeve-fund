@@ -16,7 +16,7 @@ import os
 import re
 import secrets
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import markets
+from sleeve_fund import liquidation, markets
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -52,16 +52,12 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.paper.runtime import RESUMABLE, entry_blocked
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
-# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
-LIQUIDATED_HALT = "Position margin lost (liquidated)"
-# Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
-LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
-                      "again only after you use Reset after liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -629,12 +625,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = _reason(action, reason, reason_pick, reason_note)
             if not reason:
                 raise ValueError("every command needs a reason")
-            if command == "stop" and _flatten_waits(name):
-                raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
-                                 "drop it; stop it once it is flat")
             if command in ("start", "resume") and _liquidated(name):
                 # The page says so too; a stale page or a direct post must not restart it (QA P1-U25, U31).
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             if command == "flatten" and then == "stop":
                 then_stop = reason
             if command in ("start", "stop"):
@@ -646,12 +639,25 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if command == "start":
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
+                    check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    blocked, why = entry_blocked(st(), name, utcnow(), starting=True)  # CHOKE
+                    if blocked and not (s.status == "halted" and any(
+                            c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
+                        raise ValueError(f"not started. {why}")  # a halt is cleared only by its own action (HC)
+                # A Stop's acceptance, stamped to the microsecond just before it is committed: the time a raced fill
+                # and a resting entry's cancel are measured from (P1-SG15, Advisor 7 Oct 05:01 and 05:47).
+                accepted = datetime.now(timezone.utc) if command == "stop" else None
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
-                    # weeks later; it lapses instead, and the decision log says so.
+                    # weeks later; it lapses instead, and the decision log says so. Stop is always taken, a
+                    # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
+                    # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                st().decide(actor, command, reason, name)
+                st().decide(actor, command, reason, name, ts=accepted)
+            elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
+                  and not set(why.codes) <= set(RESUMABLE)):
+                raise ValueError(f"a resume can't clear it. {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
@@ -687,15 +693,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
         strategy's position margin was lost with no Reset after liquidation since. The routes and the page
         both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
-        return trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
-
-    def _flatten_waits(name: str) -> bool:
-        """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
-        drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
-        if not any(c["command"] == "flatten" for c in st().pending_commands(name)):
-            return False
-        hb = st().sleeve(name).heartbeat_at
-        return bool(hb and utcnow() - hb < STALE)
+        return trading.liquidated_since_reset(st(), name)
 
     @app.post("/sleeves/{name}/reset")
     def sleeve_reset(name: str, reason: str = Form(""), reason_pick: str | None = Form(None),
@@ -705,7 +703,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
             if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
@@ -2445,6 +2443,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     from nautilus_trader.model import BarType, InstrumentId
 
     check_perp_sizing(cfg.strategy, cfg.params)
+    check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)

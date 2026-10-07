@@ -99,7 +99,8 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
         strategy.fee_model = fee_model
         engine.add_strategy(strategy)
         engine.run()
-        orders = list(reversed(store.orders(s["name"], limit=100_000)))
+        orders = [o for o in reversed(store.orders(s["name"], limit=100_000))
+                  if not (o.get("signal") or {}).get("watched")]  # a stop watched in the process is not sent
         return (orders, list(reversed(store.fills(s["name"], limit=100_000)))) if with_fills else orders
     finally:
         runtime.now = utcnow  # break the runtime <-> strategy cycle on this thread

@@ -56,6 +56,33 @@ def stub_contract(monkeypatch):
         "price_precision": 1, "size_precision": 3, "min_quantity": 0.001, "min_notional": 5.0})
 
 
+GUARDS_OFF = "guards off: liquidation mechanics only"
+
+
+def _guards_off(reason=GUARDS_OFF):
+    """The mark that lifts stop safety's 5% open-risk limit for one test or one parametrised case (HoE 20:04, option
+    (a); the GAP-LIQ ruling), saying why. Every other guard stays on: no case here needs the stopless-above-1x
+    refusal (strategies.check_perp_stop) lifted, so it and check_perp_sizing run live."""
+    return pytest.mark.no_open_risk_limit(reason=reason)
+
+
+@pytest.fixture(autouse=True)
+def _guard_marks(monkeypatch, request):
+    """The guard-lift mark, applied here so this file behaves the same in the repo and run from QA's shared folder,
+    where tests/conftest.py isn't loaded; as the repo's conftest does, open risk reads a calm 2% daily ATR unless
+    real_daily_atr. A head without the open-risk limit (before stop safety) has nothing to lift."""
+    try:
+        from sleeve_fund import open_risk
+    except ImportError:
+        return
+    if request.node.get_closest_marker("real_daily_atr") is None:
+        monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
+    if request.node.get_closest_marker("no_open_risk_limit") is not None:
+        monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if request.node.get_closest_marker("no_restart_safety_stop") is not None:
+        monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
+
+
 @pytest.fixture(autouse=True)
 def _reg(monkeypatch, tmp_path):
     stub_contract(monkeypatch)  # harness, adopted from PE2's copy (26fd993): the lookup lib155 already stubs, per test
@@ -130,6 +157,7 @@ def _paper(inst, m1x, params, spec="15-MINUTE-LAST-INTERNAL", profile="aggressiv
     return st
 
 
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 def test_d2_paper_and_backtest_take_the_same_decision_on_a_holed_slower_candle(tmp_path):
     inst = binance_inst()
     m1 = synth_1m(days=1, seed=8, vol_day=0.01)
@@ -173,6 +201,7 @@ def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tm
 
 # P1-D4 BLOCKER on d70ee9f (paper charged a phantom 12:00 settlement at the baseline rate when the venue lengthened its
 # interval 4h -> 8h); fixed in aa7c2c6 (markets.settlement_wait). Kept as a regression test.
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 def test_d4_paper_charges_no_settlement_the_venue_never_made(tmp_path):
     inst = binance_inst()
     put_rates(pd.date_range("2025-10-03 00:00", "2025-10-03 08:00", freq="4h", tz="UTC"))  # then 8-hourly: next 16:00
@@ -357,6 +386,7 @@ def _paper_from(inst, m1x, params, hs, hub, spec_minutes=15, profile="aggressive
 # R1 own feed fixed at ba4f533 (paper.node attaches the stored minutes): strict marks removed, full re-run.
 
 
+@_guards_off("guards off: paper/backtest mechanics only (a stopless model above 1x)")
 @pytest.mark.parametrize("hub,stored_holes", [
     pytest.param(True, 0, id="hub-fed-all-stored"),
     pytest.param(True, 1, id="hub-fed-one-missing"),
@@ -542,6 +572,7 @@ def _says_y_at_entry(text, equity_at_entry):
 
 
 # P1-D15 full-margin case fixed at 26fd993 (X with both fees): mark removed. Shipped caps: see the pin further down.
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
 def test_p1_after_a_liquidation_the_strategy_stays_halted_through_a_resume_and_a_restart(tmp_path, _full_margin):
     """Advisor 6 Oct 17:57 (#155 post-liquidation), modelled on tests/test_long_short.py::test_a_strategy_wiped_out_by_
     a_gap_is_marked_at_zero_and_halted_through_a_restart at 73d3908 (the version with the resume/restart half). A paper
@@ -749,8 +780,8 @@ def test_r1_an_own_feed_node_attaches_the_stored_minutes_before_its_first_bar(tm
 def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0, after=("resume",)):
     """s21_liq.py as a helper: ping_pong on a perp, recorded and replayed as paper, liquidated by a 60% gap against
     it (pct: the profiles' margin cap, None keeps the shipped ones). Then each of `after` in turn ("resume": a PM
-    resume; "stopstart": the PM's Stop then Start through the dashboard's /sleeves/{name}/command and the supervisor's
-    step), each followed by a restarted process on a session that trades both ways (a dip, a rise, a dip), so a
+    resume; "stopstart": the PM's Stop through the dashboard's /sleeves/{name}/command and the supervisor's step, which
+    leaves it halted, then a Start the dashboard refuses, HC, HoE 20:03), each followed by a restarted process on a session that trades both ways (a dip, a rise, a dip), so a
     strategy free to trade does. Each later session starts two hours after the one before."""
     import dataclasses
     import test_replay
@@ -814,9 +845,13 @@ def _liquidate_then(tmp_path, *, side, profile, pct, balance=10_000.0, size=1.0,
                     assert c.post(f"/sleeves/{name}/command", data={"command": "stop", "reason": "QA stop"}, auth=auth,
                                   headers=same, follow_redirects=False).status_code == 303
                     sv.step()
-                    assert store.sleeve(name).status == "stopped"  # the supervisor writes "stopped" over the halt
-                    assert c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "QA start"}, auth=auth,
-                                  headers=same, follow_redirects=False).status_code == 303
+                    s = store.sleeve(name)  # HC (HoE 20:03): after Stop it isn't trading, the halt stays, Start is refused
+                    assert s.desired_state == "stopped" and sv.procs[name].popen is None, (s.desired_state, sv.procs[name])
+                    assert s.status == "halted", (s.status, s.status_reason)
+                    r = c.post(f"/sleeves/{name}/command", data={"command": "start", "reason": "QA start"}, auth=auth,
+                               headers=same, follow_redirects=False)
+                    assert r.status_code == 303 and "command_error" in r.headers["location"], r.headers.get("location")
+                    assert store.sleeve(name).desired_state == "stopped"
                     sv.procs[name].popen = None
                     sv.step()
                 finally:
@@ -847,6 +882,7 @@ def _says_margin_lost(text, margin, equity_at_entry):
     _says_y_at_entry(text, equity_at_entry)
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
 # P1-D15 shipped caps, P1-D17 and P1-D18 fixed on the next head after 26fd993 (PE2): marks removed.
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_p1_after_a_liquidation_on_the_shipped_margin_caps_the_strategy_stays_halted(tmp_path, side, profile):
@@ -880,7 +916,8 @@ def test_hc_a_small_liquidation_stays_halted_through_the_pms_stop_and_start(tmp_
     pytest.param("short", "balanced", 0.1, 10_000.0, 1.0, id="short-2x-10pct"),
     pytest.param("long", "aggressive", 0.1, 10_000.0, 1.0, id="long-3x-10pct"),
     pytest.param("short", "balanced", 0.1, 250_000.0, 25.0, id="short-2x-10pct-thousands"),
-    pytest.param("short", "balanced", 1.0, 10_000.0, 1.0, id="short-2x-full-margin-right-after"),
+    pytest.param("short", "balanced", 1.0, 10_000.0, 1.0, id="short-2x-full-margin-right-after",
+                 marks=_guards_off()),  # the only case over the 5% open-risk limit; the rest run guarded
     pytest.param("long", "aggressive", 0.004, 1_250_000.0, 50.0, id="long-3x-under-1pct-thousands"),
 ])
 def test_p1_the_liquidation_halt_gives_x_and_y_as_the_journal_has_them(tmp_path, side, profile, pct, balance, size):
@@ -1027,6 +1064,8 @@ def test_p1_x_keeps_the_liquidation_fee_when_its_fill_row_is_late(tmp_path):
     assert x >= full - 0.005, (x, full)  # never smaller than what the liquidation lost
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_x_after_a_partial_reduce_and_a_restart_is_the_remainder_with_its_share_of_the_entry_fee(tmp_path):
     """CR case 1 (6047b50), through the engine: a 2x short of 0.3325 on full margin, a third bought back (journaled),
     a restart that restores the rest from the journal, then a +60% gap liquidates it. X = the remainder's margin, plus
@@ -1074,6 +1113,8 @@ def test_p1_x_after_a_partial_reduce_and_a_restart_is_the_remainder_with_its_sha
     assert _x_of(s.status_reason) == pytest.approx(want, abs=0.01), (s.status_reason, want)
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_x_after_a_restart_holding_the_position_keeps_the_stored_entry_fee(tmp_path):
     """CR case 2 (6047b50), through the engine: the short is opened in one process, the process restarts (the
     position restored from the journal by an unjournaled, free order), then the gap liquidates it. X includes the
@@ -1138,6 +1179,8 @@ def test_p1_nothing_opens_after_a_liquidation_on_a_gap_bar_with_a_resting_entry(
     assert not [f for f in fills if f["ts"] > max(x["ts"] for x in liq)]
 
 
+@_guards_off()  # its stopless entry above 1x is over the 5% open-risk limit
+@pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF)  # it would close the carried short before the gap
 def test_p1_y_after_a_partial_reduce_is_x_over_the_equity_when_the_position_was_opened(tmp_path):
     """P1-D20 pin (Advisor 20:37): the partial-reduce run above (a third of the 2x short bought back, a restart, a
     60% gap). Y = X over the strategy's equity at the short's first entry fill, the same base after the reduction,

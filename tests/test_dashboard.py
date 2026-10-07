@@ -2141,7 +2141,8 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
 
     spot = _new(c, name="bn-spot", instrument="BTC/USDT", venue="binance")
     assert "perpetuals+only" in spot.headers["location"] and "venue=binance" in spot.headers["location"]
-    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp")
+    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp",
+              risk_profile="conservative")  # a stopless perp runs at 1x at most (check_perp_stop)
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
@@ -2479,6 +2480,16 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
     store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "until you use Reset after liquidation" not in page
+    if status == "halted":
+        # QA P1-U31 [halted] (HoE + Head of QA, 6 Oct): the liquidation is answered, the drawdown halt is not, and only
+        # a resume clears that (HC). The page shows only the drawdown halt; Start is refused until a resume is sent.
+        assert "Its position margin was lost (liquidated)" not in page and "Nothing trades until you resume" in page
+        r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "Only+you+can+clear+it%2C+with+Resume" in r.headers["location"] and store.sleeve("btc-test").desired_state == "stopped"
+        r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "command_error" not in r.headers["location"]
     r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
                headers=SAME, follow_redirects=False)
     assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
