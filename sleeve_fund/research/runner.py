@@ -237,6 +237,7 @@ def run_backtest(
         engine.end()
 
         fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
+        fills = _liquidations_booked(fills, strategy.liquidation_books)
         account = engine.generate_account_report(instrument.id.venue)
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
@@ -407,6 +408,23 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
         moved = float(first) - fee  # the spread, and whatever rounding left in the charge
         fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
         fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
+    return fills
+
+
+def _liquidations_booked(fills: pd.DataFrame, books: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """GAP-LIQ-CAP: each liquidation order as the strategy booked it (LongFlatStrategy._book_liquidation), at the
+    bankruptcy price with the fee on the liquidation (trigger) price, in place of the venue's fill at the market's
+    price: the same loss of exactly X as its journal, and none of the market's gap in any price, fee or trip."""
+    if fills is None or fills.empty or not books:
+        return fills
+    fills = fills.copy()
+    for coid, (px, fee) in books.items():
+        if coid not in fills.index:
+            continue
+        entry = fills.at[coid, "commissions"]
+        moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
+        fills.at[coid, "avg_px"] = str(px)
+        fills.at[coid, "commissions"] = [f"{fee:.2f} {moneys[0].split()[1]}", *moneys[1:]]
     return fills
 
 

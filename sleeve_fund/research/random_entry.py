@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from sleeve_fund.markets import LOW_FEE_PERP, liquidation_price
+
 DRAWS = 1000
 BAR = 95.0  # percentile of the random draws the strategy's net return must reach
 WEAK_EXPOSURE = 0.6  # in the market more than this share of the test bars: the benchmark is weak
@@ -32,6 +34,10 @@ class Trade:
     entry: int  # bar positions in the close series: bought (or sold short) at entry's close, out at exit's
     exit: int
     side: int  # 1 long, -1 short
+    # A perpetual's leverage on isolated margin: a draw through its liquidation price on any close it holds is
+    # liquidated as the engine books one, losing exactly its margin, 1 / leverage, plus fees (GAP-LIQ-CAP,
+    # Independent Quant Advisor 7 Oct 00:19 (4)). None: unlevered, the close-to-close move whatever it is.
+    leverage: float | None = None
 
 
 @dataclass
@@ -93,9 +99,33 @@ class RandomSideResult:
 
 
 def _trade_returns(closes: np.ndarray, entries: np.ndarray, holds: np.ndarray, sides: np.ndarray,
-                   cost: float) -> np.ndarray:
+                   cost: float, levs: np.ndarray | None = None) -> np.ndarray:
     gross = closes[entries + holds] / closes[entries] - 1
-    return sides * gross - 2 * cost
+    out = sides * gross - 2 * cost
+    if levs is None:
+        return out
+    for k in np.flatnonzero(~np.isnan(levs)):
+        trigger = _liquidated_at(closes, int(entries[k]), int(holds[k]), int(sides[k]), float(levs[k]))
+        if trigger is not None:
+            # Booked at the bankruptcy price: the margin and no more, the liquidation fee on the trigger price.
+            out[k] = -1 / levs[k] - cost - cost * trigger
+    return out
+
+
+def _liquidated_at(closes: np.ndarray, entry: int, hold: int, side: int, lev: float) -> float | None:
+    """The liquidation price, as a multiple of the entry, if a close the trade held reached it, else None."""
+    trigger = liquidation_price(1 / lev - side, side, LOW_FEE_PERP.maintenance_margin)
+    if trigger is None:
+        return None
+    path = closes[entry + 1:entry + hold + 1] / closes[entry]
+    hit = path <= trigger if side > 0 else path >= trigger
+    return trigger if hit.any() else None
+
+
+def _levs(trades, default: float | None) -> np.ndarray | None:
+    levs = np.array([t.leverage if t.leverage is not None else default if default is not None else np.nan
+                     for t in trades], dtype=float)
+    return None if np.isnan(levs).all() else levs
 
 
 def _sharpe(r: np.ndarray) -> float:
@@ -139,13 +169,15 @@ def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
         if (holds < 1).any():
             raise ValueError("a trade must hold for at least one bar")
         held += int(holds.sum())
-        per_window.append((start, end, np.array([t.entry for t in inside]), holds, np.array([t.side for t in inside])))
+        per_window.append((start, end, np.array([t.entry for t in inside]), holds, np.array([t.side for t in inside]),
+                           inside))
     return per_window, test_bars, held
 
 
 def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
-                draws: int = DRAWS, seed: int = 0) -> RandomSideResult:
-    """As random_entry, but the entries stay put and each trade's side is drawn at random, long or short."""
+                draws: int = DRAWS, seed: int = 0, leverage: float | None = None) -> RandomSideResult:
+    """As random_entry, but the entries stay put and each trade's side is drawn at random, long or short. A
+    perpetual's draws are liquidated as the engine books one, as random_entry's (Trade.leverage)."""
     c = np.asarray(closes, dtype=float)
     rng = np.random.default_rng(seed)
     per_window, _, _ = _by_window(trades, windows)
@@ -154,34 +186,42 @@ def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cos
     entries = np.concatenate([w[2] for w in per_window])
     holds = np.concatenate([w[3] for w in per_window])
     sides = np.concatenate([w[4] for w in per_window])
-    actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side))
-    gross = c[entries + holds] / c[entries] - 1
+    levs = _levs([t for w in per_window for t in w[5]], leverage)
+    actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side, levs))
+    long_ = _trade_returns(c, entries, holds, np.ones_like(sides), cost_per_side, levs)
+    short = _trade_returns(c, entries, holds, -np.ones_like(sides), cost_per_side, levs)
     drawn = rng.choice(np.array([-1, 1]), size=(draws, len(holds)))
-    rets = np.prod(1 + drawn * gross - 2 * cost_per_side, axis=1) - 1
+    rets = np.prod(1 + np.where(drawn > 0, long_, short), axis=1) - 1
     return RandomSideResult(return_percentile=float((rets < actual).mean() * 100), strategy_return=actual,
                             median_random_return=float(np.median(rets)), trades=len(holds), draws=draws)
 
 
 def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
-                 draws: int = DRAWS, seed: int = 0, in_market: float | None = None) -> RandomEntryResult:
+                 draws: int = DRAWS, seed: int = 0, in_market: float | None = None,
+                 leverage: float | None = None) -> RandomEntryResult:
     """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
     walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
     fraction, charged on entry and exit alike. in_market: the share of the windows' bars the strategy held any
     position, trades carried in and still open at the end included, though those stay out of the comparison
-    (Independent Quant Advisor, 6 Oct 2026); without it, the bars the given trades held."""
+    (Independent Quant Advisor, 6 Oct 2026); without it, the bars the given trades held. leverage: for trades that
+    don't carry their own, a perpetual's: the strategy's trades and every draw are liquidated as the engine books
+    one (Trade.leverage)."""
     c = np.asarray(closes, dtype=float)
     rng = np.random.default_rng(seed)
     per_window, test_bars, held = _by_window(trades, windows)
     n = sum(len(w[3]) for w in per_window)
     if n == 0:
         return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, 0, 0.0, draws, False, False)
-    actual = np.concatenate([_trade_returns(c, e, h, s, cost_per_side) for _, _, e, h, s in per_window])
+    levs = [_levs(w[5], leverage) for w in per_window]
+    actual = np.concatenate([_trade_returns(c, e, h, s, cost_per_side, lv)
+                             for (_, _, e, h, s, _), lv in zip(per_window, levs)])
     rets, sharpes = np.empty(draws), np.empty(draws)
     for d in range(draws):
         parts = []
-        for start, end, _, holds, sides in per_window:
+        for (start, end, _, holds, sides, _), lv in zip(per_window, levs):
             order, entries = _random_entries(rng, start, end, holds)
-            parts.append(_trade_returns(c, entries, holds[order], sides[order], cost_per_side))
+            parts.append(_trade_returns(c, entries, holds[order], sides[order], cost_per_side,
+                                        None if lv is None else lv[order]))
         r = np.concatenate(parts)
         rets[d], sharpes[d] = _compound(r), _sharpe(r)
     strategy_return, strategy_sharpe = _compound(actual), _sharpe(actual)

@@ -533,8 +533,12 @@ class LongFlatStrategy(Strategy):
         self._settled = None  # backtest: the venue's settled rates, loaded once
         self._funding_fallback_said = False  # the baseline fallback for a missing settled rate is said once
         self.funding_log: list[tuple] = []  # (time, amount) for every funding payment, for a backtest's equity
-        # (time, amount) for every shortfall the venue's insurance fund took past the bankruptcy price
+        # (time, amount) for every credit that only brought a flat book's equity back to zero (_cover_shortfall)
         self.insurance_log: list[tuple] = []
+        # GAP-LIQ-CAP: each liquidation order's booking, {order id: (bankruptcy price, its liquidation fees)}, which a
+        # backtest's fills report takes in place of the venue's (research.runner); and the one being closed now
+        self.liquidation_books: dict[str, tuple[float, float]] = {}
+        self._liq_closing: dict | None = None
         self._rebook: str | None = None  # a stop's order filled past liquidation, to re-book as one (GAP-LIQ)
         # Backtest on a perp: the equity at the minute's worst price, for the risk guard (_intrabar_guard),
         # and that price when it went through the liquidation price.
@@ -3367,7 +3371,8 @@ class LongFlatStrategy(Strategy):
         held = "long" if order.side == OrderSide.SELL else "short"
         liq = d.get("liq")
         if through_liquidation(1 if held == "long" else -1, price, liq):
-            d.update(journaled=True, intent="liquidation", signal={"price": price, "liquidation_px": round(liq, 8)},
+            d.update(journaled=True, intent="liquidation", signal={"price": price, "liquidation_px": round(liq, 8),
+                                                                   "market_px": round(price, 8)},
                      reason=f"Liquidated: the price {price:,.6g} gapped through the liquidation price {liq:,.6g}")
             self._liquidation_events(d["reason"], price, liq)
         else:
@@ -3424,7 +3429,7 @@ class LongFlatStrategy(Strategy):
             return False
         reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
                   "venue took the position first")
-        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price})
+        d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8)})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
         self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)
@@ -3441,21 +3446,55 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         rt.store.event(rt.name, "error", "liquidation", reason, ts=rt.now())
 
+    def _book_liquidation(self, coid: str, sign: int, qty: float, px: float, fee: float,
+                          entry: float) -> tuple[float, float]:
+        """GAP-LIQ-CAP (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19): a liquidation's fill of qty (sign: the
+        fill's side) is booked at the bankruptcy price, where the price move loses exactly the posted margin, gapped
+        past it or not, and its fee is qty x the liquidation (trigger) price x the taker rate, its own line. So every
+        liquidation loses exactly X, the margin plus the entry and liquidation fees. The simulated venue filled it at
+        the market's price px with the fee charged on that: the difference goes to cash beside it (_cash_adj), never
+        as P&L. How far the market went past bankruptcy (the venue's insurance fund's) or stopped short of it (margin
+        the venue kept) is journaled once the position is gone (_liquidation_diagnostic). Returns (price, fee)."""
+        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        held = -sign
+        bankrupt = markets.bankruptcy_price(held * qty, entry, lev)
+        trigger = (self.decisions[coid].get("signal") or {}).get("liquidation_px") or px
+        rate = self.runtime.taker_fee if self.runtime is not None else self._cfg.assumed_taker_fee
+        booked_fee = qty * float(trigger) * rate
+        self._cash_adj += sign * qty * (px - bankrupt) + (fee - booked_fee)
+        c = self._liq_closing or {"qty": 0.0, "market": 0.0, "past": 0.0, "bankrupt": bankrupt}
+        c.update(qty=c["qty"] + qty, market=c["market"] + qty * px, past=c["past"] + held * qty * (bankrupt - px))
+        self._liq_closing = c
+        _, fees = self.liquidation_books.get(coid, (bankrupt, 0.0))
+        self.liquidation_books[coid] = (bankrupt, fees + booked_fee)
+        return bankrupt, booked_fee
+
+    def _liquidation_diagnostic(self) -> None:
+        """Once a liquidation has closed the position: where the market took it beside the bankruptcy price it was
+        booked at, journaled as a diagnostic only (never P&L): past it, the venue's insurance fund covered the
+        difference; short of it, the venue kept the margin in between (Advisor 7 Oct 00:19 (1), (2))."""
+        c, self._liq_closing = self._liq_closing, None
+        if c is None or self.runtime is None or not c["qty"]:
+            return
+        market, past = c["market"] / c["qty"], c["past"]
+        rt = self.runtime
+        if past >= 0.005:
+            rt.store.event(rt.name, "warning", "insurance_fund",
+                           f"The market closed the position at {market:,.6g}, past the bankruptcy price "
+                           f"{c['bankrupt']:,.6g}: the {past:,.2f} beyond it is covered by the venue's insurance fund. "
+                           "Booked at the bankruptcy price: the strategy loses its margin and fees, no more",
+                           ts=rt.now())
+        elif past <= -0.005:
+            rt.store.event(rt.name, "info", "liquidation_forfeit",
+                           f"The market closed the position at {market:,.6g}, short of the bankruptcy price "
+                           f"{c['bankrupt']:,.6g}: the venue kept the {-past:,.2f} of margin in between. Booked at the "
+                           "bankruptcy price: the strategy loses its margin and fees", ts=rt.now())
+
     def _cover_shortfall(self, price: float, event=None) -> None:
-        """Isolated margin: a position closed past its bankruptcy price (a gap through the liquidation price)
-        loses its isolated margin and no more, plus its fees (markets.gap_loss_cap, the same figure as the Risk
-        page's stress rows; Independent Quant Advisor, QA P1-D3); the venue's insurance fund takes the rest. So
-        once flat, a price loss past the margin comes back to cash, journaled, and equity never ends below zero."""
-        credit = 0.0
-        pos = self.cache.position(event.position_id) if event is not None and event.position_id else None
-        if pos is not None and pos.is_closed and pos.peak_qty.as_double() > 0:
-            qty, entry = pos.peak_qty.as_double(), pos.avg_px_open
-            sign = 1 if pos.entry == OrderSide.BUY else -1
-            lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-            past = sign * (entry - pos.avg_px_close) * qty - markets.isolated_margin(qty, entry, lev)
-            credit = max(past, 0.0)
-        equity = self._mark()[0] + credit
-        credit += max(-equity, 0.0)
+        """Once flat, equity never ends below zero: a liquidation is booked at the bankruptcy price, so it loses
+        its isolated margin and fees and no more (_book_liquidation); should this book's own arithmetic still leave
+        it below zero, the difference comes back to cash, journaled as the venue's insurance fund's."""
+        credit = max(-self._mark()[0], 0.0)
         if credit <= 0:
             return
         credit = math.ceil(credit * 100) / 100  # to the cent, so no float residue leaves it a fraction below zero
@@ -3466,8 +3505,8 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.record_insurance(self.runtime.name, price=price, amount=round(credit, 8),
                                                 ts=self.runtime.now())
             self.runtime.store.event(self.runtime.name, "error", "insurance_fund",
-                                     f"Closed at {price:,.6g}, past the bankruptcy price: the venue's insurance fund "
-                                     f"takes the {credit:,.2f} shortfall, as isolated margin caps the loss at the "
+                                     f"Closed at {price:,.6g} with equity {credit:,.2f} below zero: the venue's "
+                                     "insurance fund takes the shortfall, as isolated margin caps the loss at the "
                                      "position's margin", ts=self.runtime.now())
 
     def _liquidation_figures(self, trade_id: str | None, notional: float = 0.0) -> tuple[float, float, float | None, bool]:
@@ -3576,7 +3615,8 @@ class LongFlatStrategy(Strategy):
             self.runtime.store.event(self.runtime.name, "warning", intent, reason, ts=self.runtime.now())
         self._exit_lock = side
         self._flip = None
-        self._sell_all(intent, reason, {"price": price, "liquidation_px": round(liq, 8), "distance": round(distance, 6)})
+        self._sell_all(intent, reason, {"price": price, "liquidation_px": round(liq, 8), "distance": round(distance, 6)}
+                       | ({"market_px": round(price, 8)} if crossed else {}))
         if crossed:
             self._on_liquidation(price, liq, reason)
 
@@ -3770,8 +3810,10 @@ class LongFlatStrategy(Strategy):
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
             wiped = None
             if underwater and self._liquidated is None:
-                # Its liquidation fee at the taker rate on this mark, until the fill gives the fee charged.
-                fees, taken, before, _ = self._liquidation_figures(None, abs(qty) * price)
+                # Its liquidation fee at the taker rate on the liquidation price, where the venue books it
+                # (_book_liquidation), until the fill gives the fee charged.
+                at = self._liq(cash, qty) if self._margin else None
+                fees, taken, before, _ = self._liquidation_figures(None, abs(qty) * (at or price))
                 self._liquidated = self._margin_lost(abs(qty) + taken, self._entry_px or price, fees, before)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
                 wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
@@ -4089,14 +4131,19 @@ class LongFlatStrategy(Strategy):
         elif book and kept_id is None:
             # A replayed exit (Advisor NA-1): journaled at the price the venue's resting order would have had. The
             # account's cash keeps the journal's, as for a restore; the fee is the venue's rate on that price.
-            fee = fee * book / px if px else fee
-            self._cash_adj += sign * qty * (px - book)
+            charged, fee = fee, (fee * book / px if px else fee)
+            self._cash_adj += sign * qty * (px - book) + (charged - fee)  # the fee too, as journaled (QA P1-D25)
             px = book
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
         if self._margin and self.runtime is not None and self._gap_liquidation(coid, journal_id, px):
             held = (held[0], self._entry_px)  # the entry a paper stop cleared as it fired, put back
+        if self.runtime is not None and coid == self._risk_stop_id and order is not None:
+            self._journal_risk_stop(order, px)  # first: a risk stop gapped through liquidation is booked as one below
+        if (self._margin and self.decisions.get(coid, {}).get("intent") == "liquidation" and held[1]
+                and self._entry_side == -sign):
+            px, fee = self._book_liquidation(coid, sign, qty, px, fee, held[1])
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
@@ -4146,8 +4193,6 @@ class LongFlatStrategy(Strategy):
                             else:
                                 self.cancel_order(order.client_order_id)
         if self.runtime is not None:
-            if coid == self._risk_stop_id and order is not None:
-                self._journal_risk_stop(order, px)
             # A fill on a gap took the bar's open price, so its record carries the open's time (QA P1-D12).
             at = (datetime.fromtimestamp(intrabar[0] / 1e9, tz=timezone.utc)
                   if intrabar is not None and intrabar[2] else None)
@@ -4174,6 +4219,7 @@ class LongFlatStrategy(Strategy):
                         self.runtime.liquidated = margin
                         self.runtime._set("halted", reason.replace(old, margin, 1))
                 self._liquidated = margin
+            self._liquidation_diagnostic()
             self._cover_shortfall(px, event)
             if self.decisions.get(coid, {}).get("intent") == "liquidation" and self.runtime is not None:
                 self._liquidation_incident()
