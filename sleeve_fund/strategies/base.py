@@ -804,7 +804,7 @@ class LongFlatStrategy(Strategy):
         refused order, one decision row each, naming why (Advisor 22:29 (3)); a backtest has no PM to read them."""
         if self.runtime is None or self.runtime.can_open():
             return False
-        if not self.runtime.backtest:
+        if not getattr(self.runtime, "backtest", False):
             why = self.runtime.entry_blocked()[1]
             self.runtime.refused(why or f"it is {self.runtime.status}", f"{what} would open the position")
         return True
@@ -2440,7 +2440,7 @@ class LongFlatStrategy(Strategy):
         """Send an exit at market. When it is the stop firing, the journal's watched stop ends "triggered", linked to
         the market stop-loss sent for it (Head of QA and HoE, 7 Oct); it ends "canceled" only when the position closes
         some other way (_sync_watched_stop)."""
-        watched = self._watched if intent == "stop_loss" and self.runtime is not None and not self._backtest else None
+        watched = self._watched if intent == "stop_loss" and self._watched is not None and not self._backtest else None
         if watched is not None:
             self._watched = None  # not the position closing some other way
         sent = len(self._sent)
@@ -3534,7 +3534,7 @@ class LongFlatStrategy(Strategy):
                 self._first_minute = self._last_market_ns // MINUTE_NS
         if self.runtime is not None and not self._backtest:
             self.runtime.market_seen()
-            self.runtime.holds.pop("stale_data", None)
+            getattr(self.runtime, "holds", {}).pop("stale_data", None)
         if self._noted & {"stale_price", "feed_dead", "hub_venue_down"}:
             self._noted -= {"stale_price", "feed_dead", "hub_venue_down"}
             if self.runtime is not None:
@@ -3551,11 +3551,11 @@ class LongFlatStrategy(Strategy):
         now = self.clock.timestamp_ns()
         minutes = (now - self._last_market_ns) / 60e9
         if minutes >= STALE_PRICE_WARN_MINUTES:
-            if self.runtime is not None:
+            if (holds := getattr(self.runtime, "holds", None)) is not None:
                 # Stale data holds every entry and add, and cancels resting entries, until a trade or quote arrives
                 # (Advisor 22:29 (1), 00:20 (b)); stops and exits still run on the last price.
-                self.runtime.holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
-                                                    "It clears when data resumes")
+                holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
+                                       "It clears when data resumes")
             self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
                        f"risk guard are using the last price, {self._price():,.6g}")
         if minutes >= STALE_PRICE_RESTART_MINUTES and self.hub_status is not None and self.hub_status.venue_down(now):
