@@ -52,8 +52,7 @@ class PingPong(LongFlatStrategy):
         self._ref: float | None = None
         self._why = ("", {})
 
-    def on_start(self) -> None:
-        super().on_start()
+    def resume_cycle(self) -> None:
         if self.runtime is None or self.runtime.backtest:
             return
         # After a restart, pick the cycle up from the journal: long from the average entry, or waiting to buy

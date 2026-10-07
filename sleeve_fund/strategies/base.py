@@ -952,6 +952,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
+        self.resume_cycle()  # before the warm-up, which decides the candles since on the model's own state
         self._plan_resume()
         if self.preload:
             preload, self.preload = self.preload, None
@@ -1576,6 +1577,11 @@ class LongFlatStrategy(Strategy):
         decided on again, without trading (_replay), so the leg ends, its time stop falls and an exit lock
         clears where they would have without the restart (review round 13, E13-3/E13-4). Models whose rules
         keep a leg override this; for any other model a restart rebuilds nothing beyond its indicators."""
+
+    def resume_cycle(self) -> None:
+        """After a restart, before the warm-up: put back the state a model keeps from the journal itself (ping_pong's
+        cycle), so the warm-up bars decided again (_replay), and any candle missed while it was down, are decided on
+        it rather than on a blank one (CR203-1). Most models keep none."""
 
     def _plan_resume(self) -> None:
         """After a restart: read the journal's last entry (its side and the bar it was decided on) and the first

@@ -434,8 +434,10 @@ def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, down=None, **p
     def at(i, seconds=0):  # bar i closes at t0 + i bars; an order goes out a few seconds after its bar
         return datetime.fromtimestamp(t0 + 60 * minutes * i + seconds, tz=timezone.utc)
 
-    rows = [{"intent": intent, "side": side, "ts": at(i, sec)} for intent, side, i, sec in orders][::-1]
-    store = type("S", (), {"orders": lambda self, name, limit=500: rows, "event": lambda self, *a, **k: None})()
+    rows = [{"intent": intent, "side": side, "ts": at(i, sec), "filled_qty": 0.1, "avg_px": 100.0}
+            for intent, side, i, sec in orders][::-1]
+    store = type("S", (), {"orders": lambda self, name, limit=500: rows, "event": lambda self, *a, **k: None,
+                           "fills": lambda self, name, limit=500: []})()
     runtime = type("R", (), {"name": "s1", "backtest": False, "store": store,
                              "book": {"qty": book_qty, "entry_px": 100.0 if book_qty else None}})()
     cls, cfg = REGISTRY[strategy]
@@ -444,6 +446,7 @@ def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, down=None, **p
     s.instrument, s.runtime = instrument, runtime
     if down is not None:
         s._last_alive = at(down, 5)
+    s.resume_cycle()
     bars = [Bar(bt, Price(c, 1), Price(c, 1), Price(c, 1), Price(c, 1), Quantity(1, 8), int(at(i).timestamp() * 1e9),
                 int(at(i).timestamp() * 1e9)) for i, c in enumerate(closes)]
     s._plan_resume()
@@ -639,3 +642,20 @@ def test_a_stop_the_outage_replay_sends_first_drops_the_missed_candle_exit():
     s._outage_check, s._missed_exit, sent[:] = True, 1, []
     s.on_trade(tick)
     assert sent == ["nothing crossed", "missed exit"]
+
+
+@pytest.mark.parametrize("held", [1, -1])
+def test_ping_pong_decides_the_missed_candles_on_its_own_cycle_not_a_blank_one(held):
+    """CR203-1: ping_pong put its cycle back only after the warm-up, so the candles missed while it was down were
+    decided on a blank cycle: a false close of a held short, and a long's exit measured from the wrong close. The
+    cycle now comes back first (resume_cycle). Entered at 100 on bar 150, down after bar 170."""
+    entry = [("entry", "BUY" if held > 0 else "SELL", 150, 1)]
+    t = (1_790_000_000 // 86_400 * 86_400 + 185 * 60) * 10**9
+    # closes at 100.5 since, inside both legs: the leg holds, nothing to catch up (a blank cycle starts long there)
+    s = _restarted("ping_pong", [100.5] * 200, entry, book_qty=0.1 * held, down=170)
+    assert (s._side, s._ref, s._missed_exit) == (held, 100.0, None)
+    # a missed candle ends the leg, measured from the entry's 100 (a blank cycle measures from 100.5): the long's
+    # 1% rise, the short's 0.5% dip (its take-profit)
+    ends = 101.0 if held > 0 else 99.5
+    s = _restarted("ping_pong", [100.5] * 185 + [ends] * 15, entry, book_qty=0.1 * held, down=170)
+    assert s._missed_exit == t
