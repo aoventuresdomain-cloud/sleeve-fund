@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn %}
+{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -40,7 +40,7 @@
   <div class="kpi" title="{{ book.margin_used|money }} isolated margin across open positions"><div class="k">Margin used</div><div class="v">{{ (book.margin_used / book.equity if book.equity > 0 else 0)|pct0 }}</div></div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected isolated-margin figures"><div class="k">Margin used</div><div class="v faint">–</div></div>{% endif %}
   {% if positions.open_risk is defined %}
-  <div class="kpi wrap" title="{{ open_risk_hint(positions) }}{% if book.equity > 0 and positions.open_risk is not none %} · {{ (positions.open_risk / book.equity)|pct1 }} of book{% endif %}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(positions) }}">{{ open_risk_text(positions) }}{% if positions.spot_left_out %} · spot {{ positions.spot_left_out|length }} not counted{% endif %}</div></div>
+  <div class="kpi wrap" title="{{ open_risk_hint(positions) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(positions) }}">{{ open_risk_text(positions) }}{% if positions.spot_left_out %} · spot {{ positions.spot_left_out|length }} not counted{% endif %}</div>{% if open_risk_room(positions, book.equity)|trim %}<div class="s">{{ open_risk_room(positions, book.equity) }}</div>{% endif %}</div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected open-risk figures"><div class="k">Open risk</div><div class="v faint">–</div></div>{% endif %}
   <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
   <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>

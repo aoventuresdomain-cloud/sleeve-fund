@@ -152,7 +152,10 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
         basis = "gapped" if gapped(qty, mark, stop) else ("stop" if stop is not None else "stopless")
         atr = None
         if basis != "stop":
-            atr = atr_pct(s)
+            try:
+                atr = atr_pct(s)
+            except Exception:  # noqa: BLE001 - the caller's lookup failing reads as not known, so the row is still shown
+                atr = None
             if atr is not None and not math.isfinite(atr):
                 atr = None
         try:

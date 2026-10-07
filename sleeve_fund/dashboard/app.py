@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import liquidation, markets
+from sleeve_fund import liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -114,6 +114,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["venue_choices"] = venue_choices
     templates.env.globals["venue_label"] = dev.venue_label  # "perpetual" or "spot": never the venue's name (QA U8)
     templates.env.globals["exit_ways"] = trading.exit_ways
+    templates.env.globals["open_risk_limit"] = open_risk.LIMIT  # the share of the book the gate allows
     templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"

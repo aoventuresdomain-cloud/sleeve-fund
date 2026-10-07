@@ -64,6 +64,12 @@ def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
     assert rows["nostop"]["risk"] is None and rows["nostop"]["atr_pct"] is None
     assert rows["stopped"]["risk"] == pytest.approx(220.0)
 
+    def broken(s):
+        raise OSError("history store unreadable")
+
+    (row,) = [r for r in open_risk.book_open_risk(store, broken) if r["sleeve"] == "nostop"]
+    assert row["risk"] is None and row["atr_pct"] is None  # never raises (PE2 review)
+
 
 def test_the_helper_leaves_out_archived_strategies_and_filters_by_account(store):
     _hold(store, "a", 0.1)
@@ -175,6 +181,7 @@ def test_a_perp_whose_daily_atr_isnt_known_is_left_out_and_named(client, monkeyp
     _hold(store, "nostop", 0.1)
     for url, got in _tiles(c).items():
         assert got[1] == "– · 1 not counted" and "warn" in got[0], (url, got)  # nothing measured: never 0
+    assert "headroom" not in c.get("/risk", auth=AUTH).text
     assert "nostop: no stop to measure and its daily ATR isn&#39;t known yet, so not counted" in c.get("/risk", auth=AUTH).text
 
 
@@ -202,6 +209,16 @@ def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
     _hold(store, "spot", 0.1, price=61_000, params={"stop_loss": 0.02}, stop_frac=0.02)
     for url, got in _tiles(c).items():
         assert got[1] == "220.00" and "warn" not in got[0], (url, got)
+    # The headroom against 5% of the book: the book here is the two strategies' 20,000.
+    for url in ("/", "/risk", "/trades"):
+        assert "780.00 headroom to the 5% limit · 1.1% of book" in c.get(url, auth=AUTH).text, url
     for url in ("/risk", "/trades"):
         assert re.search(r'<div class="s">spot, outside the limit: [\d,.]+ to stop</div>', c.get(url, auth=AUTH).text), url
     assert "Spot (spot) is outside the 5% limit" in c.get("/", auth=AUTH).text
+
+
+def test_a_book_over_the_limit_reads_red(client):
+    c, store = client
+    _hold(store, "big", 1.0)  # no stop: 6,000 counted against 5% of a 10,000 book
+    for url in ("/", "/risk", "/trades"):
+        assert '<span class="loss">over the 5% limit by 5,500.00</span> · 60.0% of book' in c.get(url, auth=AUTH).text, url
