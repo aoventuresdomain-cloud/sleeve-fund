@@ -211,7 +211,7 @@ class HistoryStore:
             cov = self.coverage(venue, pair)
             if cov is None:
                 return AppendResult(0, 0, 0)
-            top = cov.closed if cov.closed is not None else cov.last - pd.Timedelta(minutes=1)
+            top = _canon_top(cov)
             df = df[(df.index >= cov.first) & (df.index <= top)]
             if df.empty:
                 return AppendResult(0, 0, 0)
@@ -586,34 +586,64 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
     return {"pair": pair, "pages": pages, "last": cov.last if cov else None}
 
 
+def _canon_top(cov: Coverage) -> pd.Timestamp:
+    """The newest stored minute the venue's candle may replace: the newest known closed, else the one before the
+    loader's newest (which may still be forming). One rule for canonise() and canon() (CANON-F2)."""
+    return cov.closed if cov.closed is not None else cov.last - pd.Timedelta(minutes=1)
+
+
 def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_pages: int = 10_000, sleep=None,
-          dry_run: bool = False) -> dict:
+          dry_run: bool = False, until: pd.Timestamp | None = None) -> dict:
     """P1-1-CANON backfill: replace the hub's live bars stored since `since` with the venue's own 1-minute candles,
     up to the newest closed minute, each replacement recorded (HistoryStore.canonise). Reads the venue, writes only
     the history files; the loader's cursor is left alone. Not for a venue whose pages are built from trades (they
-    split minutes at their ends). dry_run: report the counts, write nothing (the HoE sees them before a real run)."""
+    split minutes at their ends). dry_run: report the counts, write nothing (the HoE sees them before a real run).
+    until: minutes opening at or after it are left alone, so a dry run and the real run cover the same closed window
+    however far apart they run (CANON-F3). The result says the window it covered: the first and last minute the venue
+    offered inside it, how many, and how many minutes the store holds in it."""
     import time
 
     if profile.minute_loader is None or profile.minute_cursor_at is None:
         raise ValueError(f"{profile.label} has no history loader that can start at a time")
     if profile.merge_minutes:
         raise ValueError(f"{profile.label} builds its minutes from trades; its stored bars are kept as they are")
+    since = pd.Timestamp(since)
+    if until is not None and pd.Timestamp(until) <= since:
+        raise ValueError(f"until ({until}) must be after since ({since})")
+    out = {"pair": pair, "pages": 0, "written": 0, "replaced": 0, "dry_run": dry_run,
+           "until": None if until is None else pd.Timestamp(until).isoformat(),
+           "first": None, "last": None, "offered": 0, "stored": 0}
     cov = store.coverage(profile.name, pair)
     if cov is None:
-        return {"pair": pair, "pages": 0, "written": 0, "replaced": 0}
-    top = cov.closed if cov.closed is not None else cov.last
-    cursor, pages, written, replaced = profile.minute_cursor_at(pd.Timestamp(since)), 0, 0, 0
+        return out
+    top = _canon_top(cov)
+    if until is not None:
+        top = min(top, pd.Timestamp(until) - pd.Timedelta(minutes=1))
+    cursor, pages, written, replaced = profile.minute_cursor_at(since), 0, 0, 0
+    first = last = None
+    offered = 0
     while pages < max_pages:
         bars, nxt, caught_up = profile.minute_loader(pair, cursor)
         pages += 1
-        if len(bars) > 1:  # the page's newest may still be forming: the next page starts on it
-            out = store.canonise(profile.name, pair, bars.iloc[:-1], dry_run=dry_run)
-            written, replaced = written + out.written, replaced + out.replaced
+        page = bars.iloc[:-1]  # the page's newest may still be forming: the next page starts on it
+        page = page[(page.index >= since) & (page.index <= top)]
+        if len(page):
+            res = store.canonise(profile.name, pair, page, dry_run=dry_run)
+            written, replaced = written + res.written, replaced + res.replaced
+            first = page.index[0] if first is None else first
+            last, offered = page.index[-1], offered + len(page)
         if caught_up or bars.empty or nxt == cursor or bars.index[-1] > top:
             break
         cursor = nxt
         (sleep or time.sleep)(profile.request_interval)
-    return {"pair": pair, "pages": pages, "written": written, "replaced": replaced, "dry_run": dry_run}
+    stored = 0
+    if top >= since:
+        held = store.read(profile.name, pair, 1, start=since, end=top + pd.Timedelta(minutes=1))  # close-stamped:
+        # since < close <= top's close is the minutes since..top
+        stored = int((held["missing"] == 0).sum())  # a minute the store holds, not a hole
+    out.update(pages=pages, written=written, replaced=replaced, offered=offered, stored=stored,
+               first=None if first is None else first.isoformat(), last=None if last is None else last.isoformat())
+    return out
 
 
 
@@ -1002,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
     can.add_argument("--venue", default=None)
     can.add_argument("--since", required=True, help="UTC time to start from, e.g. 2026-10-06")
+    can.add_argument("--until", default=None,
+                     help="UTC time to stop before (minutes opening at or after it are left alone), e.g. 2026-10-07T18:00")
     can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
@@ -1019,8 +1051,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "canon":
         since = pd.Timestamp(args.since, tz="UTC")
+        until = pd.Timestamp(args.until, tz="UTC") if args.until else None
         for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
-            print(canon(store, profile, pair, since, dry_run=args.dry_run))
+            print(canon(store, profile, pair, since, dry_run=args.dry_run, until=until))
         return 0
     if args.cmd == "refresh":
         for pair, since in [(p, None) for p in args.pairs] or _pairs_in_use(profile.name):

@@ -12,11 +12,12 @@ from __future__ import annotations
 import json
 import math
 import threading
+import uuid
 from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund.history import DEFAULT_ROOT
+from sleeve_fund.history import DEFAULT_ROOT, _durable_replace, _writing
 from sleeve_fund.markets import SNAP_WINDOW as _SNAP_WINDOW
 
 PAGE = 1000  # settlements a venue returns per request
@@ -31,6 +32,17 @@ _cache: dict[tuple[str, str, str], tuple[float, pd.Series]] = {}  # (root, venue
 
 def _path(venue: str, pair: str, root: str | Path | None = None) -> Path:
     return Path(root or DEFAULT_ROOT) / venue.upper() / pair.upper().replace("/", "-") / "funding.json"
+
+
+def _keep(path: Path, kept: list) -> None:
+    """Write the kept rates in place of the file: a temporary file of this writer's own, renamed over it once on
+    disk, so a reader sees the old rates or the new, never a part."""
+    tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps({"rates": kept}))
+        _durable_replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def rates(venue: str, pair: str, root: str | Path | None = None) -> pd.Series:
@@ -58,7 +70,7 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
     if loader is None:
         raise ValueError(f"{venue_profile(venue).label} publishes no funding rates")
     path = _path(venue, pair, root)
-    with _lock:
+    with _lock, _writing(path.parent):  # one writer per instrument, across processes too (CANON-F3)
         kept = json.loads(path.read_text())["rates"] if path.exists() else []
         start = kept[-1][0] + 1 if kept else (int(since.timestamp() * 1000) if since is not None else 0)
         for _ in range(max_pages):
@@ -67,10 +79,7 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
             if len(page) < PAGE:
                 break
             start = page[-1][0] + 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"rates": kept}))
-        tmp.replace(path)
+        _keep(path, kept)
     return rates(venue, pair, root)
 
 
@@ -86,7 +95,7 @@ def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None
     if loader is None:
         return 0
     path = _path(venue, pair, root)
-    with _lock:
+    with _lock, _writing(path.parent):  # one writer per instrument, across processes too (CANON-F3)
         if not path.exists():
             return 0
         kept = json.loads(path.read_text())["rates"]
@@ -102,9 +111,7 @@ def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None
             start = page[-1][0] + 1
         if added:
             kept = sorted(kept + added, key=lambda tr: tr[0])
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"rates": kept}))
-            tmp.replace(path)
+            _keep(path, kept)
             _cache.pop((str(path.parent.parent.parent), venue.upper(), pair.upper()), None)
     return len(added)
 
