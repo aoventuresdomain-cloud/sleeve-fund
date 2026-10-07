@@ -183,5 +183,15 @@ def test_a_stop_past_half_way_to_liquidation_reads_amber(client, monkeypatch):
     monkeypatch.setattr(trading, "position_margin", lambda x: (1_000.0, 54_000.0))
     _hold(store, "far", 0.1, stop_frac=0.08)  # stop 55,200: 80% of the way from 60,000 to 54,000
     page = c.get("/sleeves/far", auth=AUTH).text
-    assert re.search(r'<span class="warn" title="Past the half-way rule[^"]*">stop 80% of the way to liquidation', page)
+    assert re.search(r'<span class="warn" title="From the current price: past the half-way rule[^"]*">stop 80% of the way to liquidation', page)
     assert "stop 80% of the way to liquidation" in c.get("/risk", auth=AUTH).text
+
+
+def test_the_hover_says_what_the_figure_is_made_of(client):
+    """CR 7 Oct: with spot held too, the figure is the 5% limit's plus spot risk to stop, and the hover says so."""
+    c, store = client
+    _hold(store, "perp", 0.1, price=61_000, stop_frac=0.02)
+    assert "The 5% limit&#39;s figure" in c.get("/risk", auth=AUTH).text
+    _hold(store, "spot", 0.1, price=61_000, params={"stop_loss": 0.02}, stop_frac=0.02)
+    for url in ("/", "/risk", "/trades"):
+        assert "The 5% limit&#39;s figure plus spot risk to stop" in c.get(url, auth=AUTH).text, url

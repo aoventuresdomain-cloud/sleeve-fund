@@ -324,7 +324,7 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
     (risk_cell). A perpetual's part is what the 5% open-risk limit counts (open_risk.book_open_risk: one formula,
     so the perpetuals' total equals the gate's; Advisor 7 Oct 18:50 UK): a stop measured from the mark; no stop, a
     trail checked at the close or a stop the price has gone through at the stopless measure, named as estimated.
-    Spot, outside the limit, adds its risk to stop. Whatever can't be measured is left out and named, so the
+    Spot, outside the limit, adds its risk to stop, and the hover says so (CR, 7 Oct). Whatever can't be measured is left out and named, so the
     figure carries the "+" (P1-U24-1)."""
     from sleeve_fund import open_risk as limit
 
@@ -343,6 +343,9 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
         elif cell["kind"] == "through":
             through.append(p["sleeve"])
     trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
+    perps, spot = any(p.get("perp_limit") for p in positions), any(not p.get("perp_limit") for p in positions)
+    basis = ("The 5% limit's figure plus spot risk to stop" if perps and spot else
+             "The 5% limit's figure" if perps else "Spot risk to stop, outside the 5% limit" if spot else "")
     return {
         "margin": sum(p["margin"] for p in positions),
         "open_risk": total,
@@ -350,7 +353,7 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
         "through": through,
         "left_out": [n for names in left_out.values() for n in names],
         "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
-        "hint": open_risk_hint(estimated, through, left_out, trailing),
+        "hint": " · ".join(filter(None, (basis, open_risk_hint(estimated, through, left_out, trailing)))),
     }
 
 
@@ -368,7 +371,7 @@ def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str,
     for kind in ("unbounded", "trailing", "spot_through", "unknown", "none"):
         if left_out.get(kind):
             parts.append(f"{', '.join(left_out[kind])}: {LEFT_OUT[kind]}")
-    return " · ".join(parts) or "Money lost if every stop is hit"
+    return " · ".join(parts)
 
 
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
