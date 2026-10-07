@@ -159,3 +159,76 @@ def test_a_liquidation_incident_is_answered_by_one_command_only(engine):
     if engine.dialect.name == "postgresql":  # SQLite here doesn't enforce foreign keys
         with pytest.raises(IntegrityError), engine.begin() as c:  # the incident must be a real event
             c.execute(insert(commands_t).values(**{**row, "incident": 10**9}))
+
+
+def _gate_row(sleeve_id, **over):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from sleeve_fund.store import utcnow
+
+    return {"seq": 1, "sleeve_id": sleeve_id, "bar_ts": datetime(2026, 10, 7, tzinfo=timezone.utc), "intent_id": "i1",
+            "intent": "open_long", "underlying": "BTC", "profile_version": 1, "outcome": "approved", "limit_hit": None,
+            "requested_qty": Decimal("1"), "approved_qty": Decimal("1"), "price": Decimal("100"),
+            "regime_weight": Decimal("0.5"), "stage": "submit", "decided_at": utcnow(), **over}
+
+
+def test_0010_seeds_the_pms_accepted_limits_and_profiles_are_append_only(engine):
+    """P2-2: the migration and create_all both hold version 1, the limits the PM accepted (risk.PORTFOLIO); a change
+    is a new version and an old one is never rewritten (Store has no update for it)."""
+    from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    assert store.portfolio_profile() == PORTFOLIO == store.portfolio_profile(1)
+    assert Store.in_memory().portfolio_profile() == PORTFOLIO
+    v2 = store.add_portfolio_profile(PortfolioProfile(version=9, gross=1.2), created_by="pm", note="tighter gross")
+    assert v2 == 2 and store.portfolio_profile() == PortfolioProfile(version=2, gross=1.2)
+    assert store.portfolio_profile(1) == PORTFOLIO
+    with pytest.raises(LookupError):
+        store.portfolio_profile(3)
+    assert [m for m in dir(Store) if "portfolio_profile" in m] == ["add_portfolio_profile", "portfolio_profile"]
+
+
+def test_0010_refuses_names_and_limits_outside_the_spec(engine):
+    """The CHECKs of v2/p2-2-tables.md: a gate decision's outcome, limit and stage, a reservation's release reason,
+    the supervisor's single row and status, and a profile whose halt is not above its pause."""
+    from datetime import date
+    from decimal import Decimal
+
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import (PORTFOLIO_PROFILE_V1, gate_decisions_t, gate_reservations_t, portfolio_profile_t,
+                                   portfolio_state_t, utcnow)
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    sid = store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD",
+                              bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
+
+    def refused(table, row):
+        with pytest.raises(IntegrityError), engine.begin() as c:
+            c.execute(insert(table), [row])
+
+    for bad in ({"outcome": "ok"}, {"limit_hit": "portfolio_halt"}, {"stage": "exit"}):
+        refused(gate_decisions_t, _gate_row(sid, **bad))
+    with engine.begin() as c:
+        did = c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id),
+                        [_gate_row(sid, outcome="trimmed", limit_hit="below_min")]).scalar_one()
+    refused(gate_decisions_t, _gate_row(sid, seq=2))  # one decision per strategy, bar, intent and stage
+    now = utcnow()
+    res = {"decision_id": did, "sleeve_id": sid, "underlying": "BTC", "remaining_qty": Decimal("1"),
+           "notional": Decimal("100"), "margin": Decimal("50"), "open_risk": Decimal("2"), "created_at": now,
+           "expires_at": now, "released_at": now}
+    refused(gate_reservations_t, {**res, "release_reason": "expired"})
+    with engine.begin() as c:
+        c.execute(insert(gate_reservations_t), [{**res, "release_reason": "ttl"}])
+    state = {"id": 1, "status": "ok", "reference_equity": Decimal("1000"), "hwm": Decimal("1000"),
+             "day_start_equity": Decimal("1000"), "day_start": date(2026, 10, 7), "book_equity": Decimal("1000"),
+             "marked_at": now, "profile_version": 1, "updated_at": now}
+    refused(portfolio_state_t, {**state, "id": 2})
+    refused(portfolio_state_t, {**state, "status": "stopped"})
+    refused(portfolio_profile_t, {**PORTFOLIO_PROFILE_V1, "version": 2, "drawdown_halt": Decimal("0.03")})
+    with engine.begin() as c:
+        c.execute(insert(portfolio_state_t), [state])

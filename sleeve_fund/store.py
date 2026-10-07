@@ -18,14 +18,18 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
     MetaData,
+    Numeric,
+    Sequence,
     String,
     Table,
     Text,
@@ -485,6 +489,144 @@ holdout_locks_t = Table(
     UniqueConstraint("idea_hash", "underlying", name="holdout_locks_idea_underlying"),
 )
 HOLDOUT_SOURCES = ("study", "ledger_import")
+
+# The portfolio limits gate's tables (v2 P2-2; Data Architect's shapes, v2/p2-2-tables.md). Money and quantities are
+# EXACT; limits and ratios keep their own scales. Paper only: a backtest keeps its decisions in its result.
+LIMIT = Numeric(10, 4)
+# A BIGINT key that still autoincrements on SQLite (which only does so for INTEGER PRIMARY KEY).
+BIG_ID = BigInteger().with_variant(Integer, "sqlite")
+# The PM's limits, one row per version, never updated: a change is a new version, the current one the highest.
+portfolio_profile_t = Table(
+    "portfolio_profile",
+    metadata,
+    Column("version", Integer, primary_key=True, autoincrement=False),
+    Column("created_at", TS, nullable=False),
+    Column("created_by", Text, nullable=False),  # "pm", or the migration's seed
+    Column("gross_max", LIMIT, nullable=False),  # x book
+    Column("net_underlying_max", LIMIT, nullable=False),  # x book, per underlying across venues and contract types
+    Column("margin_max", LIMIT, nullable=False),  # share of book
+    Column("open_risk_max", LIMIT, nullable=False),  # share of book
+    Column("drawdown_halt", LIMIT, nullable=False),
+    Column("daily_pause", LIMIT, nullable=False),
+    Column("note", Text),
+    CheckConstraint("gross_max > 0 AND net_underlying_max > 0 AND margin_max > 0 AND open_risk_max > 0 "
+                    "AND daily_pause > 0 AND drawdown_halt > daily_pause", name="portfolio_profile_limits"),
+)
+# Version 1, the PM's accepted limits (6 Oct 2026, risk.PORTFOLIO), as migration 0010 seeds it: a store made by
+# create_all holds it too, so no database ever has a gate without accepted limits.
+PORTFOLIO_PROFILE_V1 = {
+    "version": 1, "created_at": datetime(2026, 10, 6, 14, 17, tzinfo=timezone.utc), "created_by": "migration 0010",
+    "gross_max": Decimal("1.5"), "net_underlying_max": Decimal("0.5"), "margin_max": Decimal("0.5"),
+    "open_risk_max": Decimal("0.05"), "drawdown_halt": Decimal("0.15"), "daily_pause": Decimal("0.03"),
+    "note": "the PM's accepted portfolio limits (6 Oct 2026)",
+}
+event.listen(portfolio_profile_t, "after_create",
+             lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
+# The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
+portfolio_state_t = Table(
+    "portfolio_state",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=False),
+    Column("status", String(16), nullable=False),
+    Column("paused_until", TS),  # with 'paused': the next 00:00 UTC
+    Column("halt_reason", Text),  # with 'halted'
+    Column("reference_equity", EXACT, nullable=False),  # the halt reference: re-based at the PM's Resume
+    Column("hwm", EXACT, nullable=False),  # the true high-water mark; reset only by a book reset
+    Column("day_start_equity", EXACT, nullable=False),
+    Column("day_start", Date, nullable=False),  # the UTC day it belongs to
+    Column("book_equity", EXACT, nullable=False),  # the last mark: the whole fund, unallocated cash included
+    Column("marked_at", TS, nullable=False),  # older than 60 s: entries blocked as portfolio_state_stale
+    Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    Column("updated_at", TS, nullable=False),
+    CheckConstraint("id = 1", name="portfolio_state_one_row"),
+    CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
+)
+# The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
+# source of truth. The 5 s mark lives in portfolio_state only.
+book_marks_t = Table(
+    "book_marks",
+    metadata,
+    Column("ts", TS, primary_key=True),
+    Column("equity", EXACT, nullable=False),
+    Column("gross", EXACT, nullable=False),  # sum of abs notional
+    Column("net_max", EXACT, nullable=False),  # the largest abs net notional of any underlying
+    Column("net_underlying", String(16)),  # which underlying that was
+    Column("margin_used", EXACT, nullable=False),  # posted isolated margin; spot counts its full notional
+    Column("open_risk", EXACT, nullable=False),
+    Column("hwm", EXACT, nullable=False),
+    Column("reference_equity", EXACT, nullable=False),
+    Column("day_start_equity", EXACT, nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+)
+# One row per check of an order that raises a position, at submit or as the backstop at fill. seq is the first-come
+# order, taken inside the gate's lock (Postgres: the gate_decision_seq sequence; SQLite: max + 1 under the lock).
+GATE_DECISION_SEQ = Sequence("gate_decision_seq", metadata=metadata)
+GATE_OUTCOMES = ("approved", "trimmed", "rejected", "late", "portfolio_state_stale", "error")
+GATE_LIMITS = ("gross", "net_instrument", "margin", "open_risk", "halt", "pause", "portfolio_state_stale",
+               "lock_error", "below_min")
+GATE_STAGES = ("submit", "fill")
+GATE_RELEASES = ("fill", "reject", "cancel", "ttl")
+
+
+def _in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(v) for v in values)})"
+
+
+gate_decisions_t = Table(
+    "gate_decisions",
+    metadata,
+    Column("id", BIG_ID, primary_key=True),
+    Column("seq", BigInteger, nullable=False, unique=True),
+    Column("sleeve_id", Integer, ForeignKey("sleeves.id"), nullable=False),
+    Column("bar_ts", TS, nullable=False),  # the decision's bar
+    Column("intent_id", Text, nullable=False),  # the strategy's id for the intent
+    Column("intent", String(16), nullable=False),  # entry, add, band add, rebalance increase, reversal open leg
+    Column("underlying", String(16), nullable=False),  # what net is counted by, e.g. BTC
+    Column("order_id", String(64), ForeignKey("orders.order_id")),  # set with the order row when sent
+    Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    Column("outcome", String(24), nullable=False),
+    Column("limit_hit", String(24)),
+    Column("requested_qty", EXACT, nullable=False),
+    Column("approved_qty", EXACT, nullable=False),  # 0 when rejected; rounded down to the step
+    Column("price", EXACT, nullable=False),  # the expected fill price used
+    # the book before this entry, reservations included
+    Column("book_equity", EXACT),
+    Column("gross", EXACT),
+    Column("net_underlying", EXACT),
+    Column("margin_used", EXACT),
+    Column("open_risk", EXACT),
+    Column("regime_weight", Numeric(10, 6)),
+    Column("regime_state", Text),
+    Column("stage", String(8), nullable=False),
+    Column("decided_at", TS, nullable=False),
+    CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
+    CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
+    CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
+    UniqueConstraint("sleeve_id", "bar_ts", "intent_id", "stage", name="gate_decisions_sleeve_bar_intent_stage"),
+    Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
+)
+# Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the
+# fill, reject or cancel row. Never released blind while its order may still fill (Advisor 20:25 UK).
+gate_reservations_t = Table(
+    "gate_reservations",
+    metadata,
+    Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id"), primary_key=True, autoincrement=False),
+    Column("sleeve_id", Integer, ForeignKey("sleeves.id"), nullable=False),
+    Column("underlying", String(16), nullable=False),
+    Column("remaining_qty", EXACT, nullable=False),  # signed; reduced by partial fills
+    Column("notional", EXACT, nullable=False),  # what it counts against each limit
+    Column("margin", EXACT, nullable=False),
+    Column("open_risk", EXACT, nullable=False),
+    Column("created_at", TS, nullable=False),
+    Column("cancel_sent_at", TS),  # the sweep's cancel of an order that outlived it; re-sent with an alert at 60 s
+    Column("expires_at", TS, nullable=False),
+    Column("released_at", TS),  # null while active
+    Column("release_reason", String(8)),
+    CheckConstraint(_in("release_reason", GATE_RELEASES), name="gate_reservations_release_reason"),
+    Index("gate_reservations_active", "underlying", sqlite_where=text("released_at IS NULL"),
+          postgresql_where=text("released_at IS NULL")),
+)
 HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
@@ -1967,6 +2109,35 @@ class Store:
             c.execute(update(holdout_locks_t).where(holdout_locks_t.c.id == lock_id,
                                                     holdout_locks_t.c.status == "claimed")
                       .values(status=status, trial_id=trial_id))
+
+    def portfolio_profile(self, version: int | None = None):
+        """The PM's portfolio limits as a risk.PortfolioProfile: the latest version, or the one named. Raises
+        LookupError when there is none, so a caller never falls back to limits nobody accepted."""
+        from sleeve_fund.risk import PortfolioProfile
+        t = portfolio_profile_t
+        q = select(t).where(t.c.version == version) if version is not None else \
+            select(t).order_by(t.c.version.desc()).limit(1)
+        with self.engine.connect() as c:
+            r = c.execute(q).first()
+        if r is None:
+            raise LookupError(f"no portfolio profile {version if version is not None else '(none recorded)'}")
+        return PortfolioProfile(version=r.version, gross=float(r.gross_max),
+                                net_instrument=float(r.net_underlying_max), margin=float(r.margin_max),
+                                open_risk=float(r.open_risk_max), drawdown=float(r.drawdown_halt),
+                                daily_loss=float(r.daily_pause))
+
+    def add_portfolio_profile(self, limits, created_by: str, note: str | None = None) -> int:
+        """Record new portfolio limits as the next version and return it. Append-only: there is no update, because
+        every gate decision names the version it was taken under. limits.version is ignored."""
+        t = portfolio_profile_t
+        with self.engine.begin() as c:
+            version = (c.execute(select(func.max(t.c.version))).scalar() or 0) + 1
+            c.execute(insert(t), [{
+                "version": version, "created_at": utcnow(), "created_by": created_by, "note": note,
+                "gross_max": to_decimal(limits.gross), "net_underlying_max": to_decimal(limits.net_instrument),
+                "margin_max": to_decimal(limits.margin), "open_risk_max": to_decimal(limits.open_risk),
+                "drawdown_halt": to_decimal(limits.drawdown), "daily_pause": to_decimal(limits.daily_loss)}])
+        return version
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""
