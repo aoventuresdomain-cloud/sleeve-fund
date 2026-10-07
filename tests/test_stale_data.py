@@ -8,6 +8,7 @@ Also here: a fired stop's watched row stays linked to the market stop-loss sent 
 list on the way (Code Reviewer on #182)."""
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 import test_hub_146_qa as qa
 from test_exposure_gate_xfails import (M, STD_T0, Plan, _fills, _live_openers, _offline, _orders,  # noqa: F401
@@ -194,3 +195,63 @@ def test_a_fired_stops_watched_row_links_its_market_stop_loss_when_the_sent_list
     assert len(markets) == 1 and markets[0]["status"] == "filled", f"set-up: the market stop-loss: {markets}"
     assert watched["status"] == "triggered", watched
     assert (watched.get("signal") or {}).get("triggered_order") == markets[0]["order_id"], (watched, markets[0])
+
+
+# P1-SG21: the staleness clock across a restart ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("enter", [3, 8], ids=["wanted-3min-in", "wanted-8min-in"])
+def test_a_process_started_on_a_dead_feed_holds_entries_until_its_first_trade_or_quote(monkeypatch, enter):
+    """A process starts with no trade or quote reaching it for 30 minutes (a restart on a dead feed; the hub's candles
+    still arrive). The model wants long from `enter` minutes in: nothing opens until trades resume, the hold says it
+    counts from the process start, and the entry goes once data is back."""
+    holds = []
+
+    def record(st, what, before):
+        if what == "watchdog":
+            holds.append(st.runtime.holds.get("stale_data"))
+
+    _recording(monkeypatch, record)
+    resume = 30 * 60
+    got = paper(flat_prices(40), enter=enter, leave=38, side=1, profile="conservative",
+                gone=frozenset(range(0, resume)))
+    entries = [o for o in got.orders if o["intent"] == "entry"]
+    assert entries, "set-up: no entry once data resumed"
+    first = int(pd.Timestamp(entries[0]["ts"]).value)
+    assert first >= START + resume * S, f"an entry went {(first - START) / S:.0f} s in, before any trade or quote"
+    assert holds and all(h and "since this process started" in h for h in holds[:3]), holds[:3]
+
+
+# P1-SG15: nothing opens from the instant the Stop is accepted -----------------------------------------------------
+
+
+def _stop_at(monkeypatch, store, at):  # noqa: F811
+    """The PM's Stop written to the journal on the first trade at or after `at`: between two 30 s runtime ticks."""
+    from test_exposure_gate_xfails import Egx, _pm_stop
+
+    real, accepted = Egx.on_trade, []
+
+    def on_trade(self, tick):
+        if not accepted and tick.ts_event >= at.value:
+            accepted.append(pd.Timestamp(tick.ts_event, tz="UTC").to_pydatetime())
+            _pm_stop(store)
+        return real(self, tick)
+
+    monkeypatch.setattr(Egx, "on_trade", on_trade)
+    return accepted
+
+
+def test_a_stop_accepted_between_ticks_cancels_a_resting_entry_before_the_next_trade(tmp_path, store, monkeypatch):  # noqa: F811
+    """A stop entry rests from t0+5, 1 % above; the Stop is accepted at t0+25:10 (ticks fall on :00 and :30) and the
+    price steps 2 % up at t0+25:11. The resting entry is cancelled on the Stop's own trade and never fills."""
+    plan = Plan(t0=STD_T0, tag="sb")
+    k = 25 * 60 + 10
+    p0 = 60_000 + 5 * 60 * 0.01
+    plan.price = lambda s: (60_000 + s * 0.01) * (1.02 if s >= k + 1 else 1.0)
+    plan.rest.append((M(plan.t0, 5), 1, round(p0 * 1.01, 1), 0.05))
+    accepted = _stop_at(monkeypatch, store, plan.t0 + pd.Timedelta(seconds=k))
+    run(tmp_path, store, plan, monkeypatch)
+    assert accepted, "set-up: the Stop never landed"
+    (entry,) = [o for o in _orders(store) if o["intent"] == "entry"]
+    assert entry["status"] in ("canceled", "cancelled"), entry
+    assert entry["order_id"] not in {f["order_id"] for f in _fills(store)}, "the resting entry filled after the Stop"

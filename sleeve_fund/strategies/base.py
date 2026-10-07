@@ -120,6 +120,7 @@ MAX_PARTICIPATION = 0.25
 # Paper's price watchdog: minutes without a trade or a quote before it warns, and before it treats the
 # feed as dead and stops reporting, so the supervisor restarts the process and it reconnects.
 STALE_PRICE_WARN_MINUTES = 5
+STALE_AT_START = "no trade or quote yet since this process started. It clears when data resumes"
 STALE_PRICE_RESTART_MINUTES = 15
 # Paper: how often at most the model's conditions on the forming candle are written for the Signals tab
 # (and straight after each bar). Display only: never in a backtest.
@@ -569,6 +570,7 @@ class LongFlatStrategy(Strategy):
         self._watched: tuple[str, tuple] | None = None
         self._watched_n = 0  # watched-stop rows written by this process, for their order ids
         self._last_market_ns: int | None = None  # the latest trade or quote, for the price watchdog
+        self._market_since_start = False  # whether this process has had a trade or quote yet (P1-SG21)
         self._held_w = None  # the target weight last traded to (None: not known yet, e.g. after a restart)
         self._maker: dict[str, dict] = {}  # working post-only orders: intent, reason and signal by client order id
         self._fallback: set[str] = set()  # post-only orders this strategy cancelled for running out of time
@@ -867,6 +869,10 @@ class LongFlatStrategy(Strategy):
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
+        if self.runtime is not None and not self._backtest:
+            # P1-SG21 (Advisor STALE-5MIN): a process has no fresh price until its first trade or quote, so a restart on
+            # a dead feed holds entries from its first moment instead of opening for 5 minutes on a stale one.
+            self.runtime.holds["stale_data"] = STALE_AT_START
         if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
@@ -928,6 +934,10 @@ class LongFlatStrategy(Strategy):
         self._last_close = tick.price.as_double()  # freshest price for marking between bars
         self._market_seen()
         self._note_trade(int(tick.ts_event))
+        if not self._backtest and self._resting_openers():
+            # P1-SG15: a Stop (or any block) accepted between ticks cancels a resting entry before the next trade can
+            # fill it; asked only while an opening order rests, so a strategy without one reads nothing more per trade.
+            self._cancel_resting_entries()
         if self._restore is not None:
             self._send_restore()
             return
@@ -2729,6 +2739,11 @@ class LongFlatStrategy(Strategy):
         qty = qty.quantize(step, rounding=ROUND_DOWN)
         if qty <= 0 or qty < self._min_qty():
             return
+        why = self._gated(order.side, kept["info"].get("intent"))
+        if why:  # P1-SG15: nothing opens from the moment the gate closes, not from the next tick
+            self._part_filled(coid, float(kept["sent"]), order.quantity.as_double(), why)
+            self._close_kept(coid, f"cancelled: nothing may open now. {why}")
+            return
         piece = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=order.side,
                                           quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
                                           time_in_force=TimeInForce.GTC)
@@ -3639,6 +3654,7 @@ class LongFlatStrategy(Strategy):
 
     def _market_seen(self) -> None:
         self._last_market_ns = self.clock.timestamp_ns()
+        self._market_since_start = True
         if not self._backtest and not self.hub_fed:
             self._minutes_seen.add(self._last_market_ns // MINUTE_NS)
             if self._first_minute is None:
@@ -3665,8 +3681,10 @@ class LongFlatStrategy(Strategy):
             if self.runtime is not None:
                 # Stale data holds every entry and add, and cancels resting entries, until a trade or quote arrives
                 # (Advisor 22:29 (1), 00:20 (b)); stops and exits still run on the last price.
-                self.runtime.holds["stale_data"] = (f"last price {(now - self._last_market_ns) / 1e9:.0f} s old. "
-                                                    "It clears when data resumes")
+                age = (now - self._last_market_ns) / 1e9
+                self.runtime.holds["stale_data"] = (
+                    f"last price {age:.0f} s old. It clears when data resumes" if self._market_since_start else
+                    f"no trade or quote since this process started {age:.0f} s ago. It clears when data resumes")
             self._note("stale_price", f"No trade or quote from the venue for {minutes:.0f} minutes; marks and the "
                        f"risk guard are using the last price, {self._price():,.6g}")
         if minutes >= STALE_PRICE_RESTART_MINUTES and self.hub_status is not None and self.hub_status.venue_down(now):
@@ -3765,11 +3783,9 @@ class LongFlatStrategy(Strategy):
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_tick", exc)
 
-    def _cancel_resting_entries(self) -> None:
-        """While nothing may open (CHOKE: liquidated until a reset after liquidation, Advisor 17:57 rule (c), QA P1-D21;
-        halted, paused or stopped), every entry or rebalance still resting at the venue, or the unfilled rest of one,
-        is cancelled. Without it a resting entry filled later and opened a position on a halted strategy. Closing
-        orders (stops, exits, the liquidation itself) are left alone."""
+    def _resting_openers(self) -> tuple:
+        """The opening orders that rest, as (orders at the venue, kept post-only client order ids), or () when none
+        does. An opening order is an entry, or a rebalance that adds (as _gated reads it at submit)."""
         open_ = [o for o in self.cache.orders_open(strategy_id=self.strategy_id) if o.status != OrderStatus.PENDING_CANCEL]
         if self._journal_intents is None and any(str(o.client_order_id) not in self.decisions for o in open_):
             # An order this process has no decision for was sent before a restart: the journal has its intent. Read
@@ -3784,6 +3800,14 @@ class LongFlatStrategy(Strategy):
             return what == "entry" or (what == "rebalance" and self._adds(side))
         resting = [o for o in open_ if opens(intent(str(o.client_order_id)), o.side)]
         kept = [c for c, k in self._kept.items() if opens(k["info"].get("intent"), k["order"].side)]
+        return (resting, kept) if resting or kept else ()
+
+    def _cancel_resting_entries(self) -> None:
+        """While nothing may open (CHOKE: liquidated until a reset after liquidation, Advisor 17:57 rule (c), QA P1-D21;
+        halted, paused or stopped), every entry or rebalance still resting at the venue, or the unfilled rest of one,
+        is cancelled. Without it a resting entry filled later and opened a position on a halted strategy. Closing
+        orders (stops, exits, the liquidation itself) are left alone."""
+        resting, kept = self._resting_openers() or ([], [])
         blocked, why = self.runtime.entry_blocked()  # asked every tick, so the block episode is journaled
         if not blocked:
             return
