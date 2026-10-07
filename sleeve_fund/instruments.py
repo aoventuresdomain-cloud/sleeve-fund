@@ -335,7 +335,10 @@ class ScheduleFeeModel(FeeModel):
         side = info["side"]
         if self._liquidation_close(info, filled):
             # Advisor 7 Oct 03:23 (D13-F2): a liquidation close, gapped or not, pays no half spread and no 0.05 %
-            # floor: booked at the venue's fill, as before D13.
+            # floor: booked at the venue's fill, as before D13. Inside a bar's range it still relied on the
+            # liquidation check, so the run keeps its label.
+            if self.bars is not None and self.now is not None and self.bars.at(self.now()) is not None:
+                self.intrabar.add("liq")
             fee = qty * fill_px.as_decimal() * self.rate_for(order)
             self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(fee)
             self.booked_fills.setdefault(coid, []).append((filled, 0.0))
