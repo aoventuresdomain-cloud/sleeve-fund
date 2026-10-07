@@ -177,6 +177,8 @@ def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ..
         later = (idx[i + 1].to_pydatetime() - b) if i + 1 < len(idx) else None
         if gap <= step or (gap <= fixed and (later is None or later >= gap)):
             continue  # no gap, or the venue moved back towards the schedule
+        # TODO(DA-11): `published` is the venue's interval now, so it exempts only the newest gap; once a later record
+        # lands, a lengthened gap reads as missing again. Settle with each instrument's interval history (CR minor 2).
         if later is None and published is not None and gap <= published:
             continue  # the venue's published interval is this wide: lengthened, not lost
         t = a + step

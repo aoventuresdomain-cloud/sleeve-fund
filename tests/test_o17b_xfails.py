@@ -344,7 +344,6 @@ def test_a_lengthened_interval_is_not_blocked(tmp_path, monkeypatch, binance):
     assert not kinds(out["events"], "funding_entry_blocked")
 
 
-@xfail
 def test_a_lengthened_interval_is_not_read_as_a_missed_settlement_or_charged_a_false_baseline(tmp_path, monkeypatch,
                                                                                                binance):
     """Advisor 19:11 / ~19:20: the instrument is charged every 4 hours; after 08:00 the venue lengthens to 8 hours (it

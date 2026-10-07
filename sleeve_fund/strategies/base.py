@@ -518,6 +518,7 @@ class LongFlatStrategy(Strategy):
         # Paper: the settlement whose rate the venue hadn't published by its check, watched until it arrives, and
         # when it was last asked for (funding_stale / funding_stale_cleared, per instrument, once per episode).
         self._funding_missing: set = set()  # every settlement charged the baseline whose rate hasn't come yet
+        self._funding_last_settled = None  # paper: the newest settlement charged at the venue's own rate
         self._funding_recheck = None
         # (time, amount, kind) for every funding payment, for a backtest's equity: kind "settled" (the venue's rate) or
         # "baseline" (missing, charged adversely).
@@ -2765,6 +2766,7 @@ class LongFlatStrategy(Strategy):
         for ts, qty, px in held:
             inside = self._intrabar is not None and self._intrabar[0] < int(ts.timestamp()) * 1_000_000_000 <= self._intrabar[1]
             if qty == 0 or (inside and self._intrabar[2]):  # a gap fill at the bar's open held nothing after it
+                self._mark_flat(terms, [ts], now)  # marked flat, so a batch mixing flat and held leaves no hole (CR)
                 self._funding_since = ts
                 continue
             rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
@@ -2899,10 +2901,12 @@ class LongFlatStrategy(Strategy):
                 return None
             if rate is None:
                 self._funding_missing.add(when)
-                self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
-                                      f"{when:%d %b %Y %H:%M} UTC, {int((wait or self.FUNDING_WAIT).total_seconds() // 60)} "
-                                      "minutes after it settled; charging the baseline, whichever side is held, until it "
-                                      "arrives")
+                self._funding_missed(terms, pair, when, f"No settled funding rate from the venue for {pair} at "
+                                     f"{when:%d %b %Y %H:%M} UTC, {int((wait or self.FUNDING_WAIT).total_seconds() // 60)} "
+                                     "minutes after it settled; charging the baseline, whichever side is held, until it "
+                                     "arrives")
+            elif rate is not None and (self._funding_last_settled is None or when > self._funding_last_settled):
+                self._funding_last_settled = when  # a settlement the venue published: earlier missing ones may be lost
         if rate is None:
             if self._backtest and held and not self._funding_fallback_said and self.runtime is not None:
                 self._funding_fallback_said = True
@@ -2928,30 +2932,113 @@ class LongFlatStrategy(Strategy):
             return None
 
     def _watch_funding_recovery(self, terms, now) -> None:
-        """Paper, while settlements charged the baseline are still missing: once every one's rate has arrived, the
-        instrument's staleness episode ends (O17b trues the charges up). One arriving while another is still missing
-        keeps the episode open (CR, #163)."""
+        """Paper, while settlements charged the baseline are still missing (Advisor, 7 Oct 2026; QA P1-O17a-8, -10,
+        -11): one whose rate arrives leaves the watch (O17b trues it up); one still missing a day after it was due,
+        once a later one is published, is never published (marked once; its baseline stays) and leaves it too. Every
+        one still missing is in an open episode (one closed meanwhile, or never opened, is opened again on it), and an
+        episode closes once every settlement in it, from the one it opened on, is kept or never published: so one
+        arriving while another is missing keeps it open (CR, #163), and one never published can't hold it open."""
         if self._funding_recheck is not None and now - self._funding_recheck < self.FUNDING_RECHECK:
             return
         self._funding_recheck = now
-        pair = pair_of(self.instrument)
-        arrived = {when for when in sorted(self._funding_missing) if self._venue_rate(terms, pair, when) is not None}
-        if self._funding_missing - arrived:
-            # Still charging the baseline: an episode closed meanwhile (the collector, its store caught up to the
-            # settlement the episode opened on) is opened again, so the inbox never reads clear while one is missing.
-            first = min(self._funding_missing - arrived)
-            self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
-                                  f"{first:%d %b %Y %H:%M} UTC yet; charging the baseline, whichever side is held, "
-                                  "until it arrives", ts=first)  # opened on that settlement, so only its rate closes it
-        if not arrived:
+        import pandas as pd
+
+        from sleeve_fund import funding
+
+        pair, rt = pair_of(self.instrument), self.runtime
+        venue = getattr(terms, "funding_venue", None) or ""
+        asked: dict = {}
+
+        def arrived(when) -> bool:
+            if when not in asked:
+                asked[when] = self._venue_rate(terms, pair, when) is not None
+            return asked[when]
+
+        came = {when for when in sorted(self._funding_missing) if arrived(when)}
+        self._funding_missing -= came
+        try:
+            state = funding.journal_state(rt.store, funding.stale_tag(venue, pair))
+        except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
+            state = None
+        tag = funding.stale_tag(venue, pair)
+        if state is None:
+            self._funding_watch_unread(pair, came)
             return
-        self._funding_missing -= arrived
-        if self._funding_missing:
+        stamp = pd.Timestamp(now)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp
+        later = max([t for t in (getattr(self, "_funding_last_settled", None), self._newest_kept(terms, pair))
+                     if t is not None],
+                    default=None)
+        for when in sorted(self._funding_missing):
+            if when in state["never"] or (stamp - when >= funding.NEVER_PUBLISHED_AFTER and later is not None
+                                          and later > when + funding.MATCH):
+                if when not in state["never"]:
+                    funding.mark(rt.store, tag, "funding_never_published", when, ts=rt.now())
+                    state["never"].add(when)
+                self._funding_missing.discard(when)
+        for when in sorted(self._funding_missing):
+            # Still charging the baseline: an episode closed meanwhile is opened again on it, so the inbox never reads
+            # clear while one is missing.
+            self._funding_missed(terms, pair, when, f"No settled funding rate from the venue for {pair} at "
+                                 f"{when:%d %b %Y %H:%M} UTC yet; charging the baseline, whichever side is held, "
+                                 "until it arrives", state=state)
+        # From the settlement each opened on (one written before episodes named it opened at its alert, inside the
+        # interval after it)
+        hours = getattr(terms, "funding_hours", None) or (0, 8, 16)
+        gap = pd.Timedelta(markets.funding_interval(hours)) - funding.MATCH
+        for o in sorted(k for k in state["open"] if k is not None):
+            waiting = [t for t in state["missing"] if t > o - gap and t not in state["never"]
+                       and (t in self._funding_missing or not arrived(t))]
+            if not waiting:
+                rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
+                               f"arrived from the venue for every settlement missing {funding.from_words(o)}"
+                               + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _newest_kept(self, terms, pair):
+        from sleeve_fund import funding
+
+        if getattr(terms, "funding_venue", None) is None:
+            return None
+        try:
+            kept = funding.rates(terms.funding_venue, pair).index
+        except Exception:  # noqa: BLE001 - no store here: the venue's answers alone say what was published
+            return None
+        return kept[-1] if len(kept) else None
+
+    def _funding_missed(self, terms, pair: str, when, message: str, state: dict | None = None) -> None:
+        """Paper: settlement `when` is charged the baseline, its rate missing. Marked once (funding_missing), and
+        alerted unless an open episode already holds it: one opened on or before it with every settlement since then
+        missing too (funding.episode_of), so one outage alerts once and a later one after a published rate alerts
+        again (Advisor, 7 Oct 2026, QA P1-O17a-11)."""
+        from sleeve_fund import funding
+
+        rt = self.runtime
+        if rt is None:
             return
-        last = max(arrived)
-        self._funding_episode(pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
-                                                  "has arrived from the venue"
-                                                  + (f", with {len(arrived) - 1} earlier" if len(arrived) > 1 else ""))
+        tag = funding.stale_tag(getattr(terms, "funding_venue", None) or "", pair)
+        try:
+            state = state if state is not None else funding.journal_state(rt.store, tag)
+        except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
+            self._funding_episode(pair, True, message)
+            return
+        if when not in state["missing"]:
+            kept = self._newest_kept(terms, pair)
+            funding.mark(rt.store, tag, "funding_missing", when, ts=rt.now(), inferred=kept is not None)
+            state["missing"].add(when)
+        starts = [k for k in state["open"] if k is not None and k <= when]
+        due = self._settlements(terms, min(starts) - timedelta(seconds=1), when)[0] if starts and terms is not None else []
+        if funding.episode_of(state, when, due) is None:
+            event = {"kind": "funding_stale", "ts": rt.now()}
+            rt.store.event(None, "warning", "funding_stale", f"{tag} {message}; {funding.from_words(when)}",
+                           ts=event["ts"])
+            state["open"][when] = event
+
+    def _funding_watch_unread(self, pair: str, came: set) -> None:
+        """The journal unreadable: the instrument's one episode closes once nothing is missing."""
+        if came and not self._funding_missing:
+            last = max(came)
+            self._funding_episode(pair, False, f"The settled funding rate for {pair} at {last:%d %b %Y %H:%M} UTC "
+                                  "has arrived from the venue" + (f", with {len(came) - 1} earlier" if len(came) > 1 else ""))
 
     def _rebuild_funding_missing(self) -> None:
         """Paper, on start: the settlements of the instrument's open staleness episode still charged the baseline,
@@ -2964,14 +3051,21 @@ class LongFlatStrategy(Strategy):
         terms = self._cfg.perp
         if terms is None or terms.funding_venue is None:
             return
-        since = funding.stale_since(self.runtime.store, funding.stale_tag(terms.funding_venue, pair_of(self.instrument)))
-        if since is None:
+        try:
+            state = funding.journal_state(self.runtime.store, funding.stale_tag(terms.funding_venue, pair_of(self.instrument)))
+        except Exception:  # noqa: BLE001 - no database (locally): nothing to carry on watching
             return
-        opened = since - pd.Timedelta(markets.funding_interval(terms.funding_hours))  # back to the settlement it opened on
+        starts = [k for k in state["open"] if k is not None]
+        if not starts:
+            return
+        # Back to the settlement the oldest opened on (an episode written before they named it opened at its alert),
+        # one of the instrument's own intervals as its stored rates show it, else the profile's (CR minor 4)
+        step = markets.latest_interval(funding.rates(terms.funding_venue, pair_of(self.instrument)))
+        opened = min(starts) - pd.Timedelta(step or markets.funding_interval(terms.funding_hours))
         for row in self.runtime.store.funding(self.runtime.name):
             ts = pd.Timestamp(row["ts"])
             ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-            if row.get("kind") == "baseline" and ts > opened:
+            if row.get("kind") == "baseline" and ts > opened and ts not in state["never"]:
                 self._funding_missing.add(ts)
 
     def _funding_episode(self, pair: str, stale: bool, message: str, ts=None) -> None:

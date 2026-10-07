@@ -73,6 +73,41 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
     return rates(venue, pair, root)
 
 
+def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None = None, loader=None,
+             max_pages: int = 10) -> int:
+    """Ask the venue's history again for the settlements from `after` up to the newest kept, and keep any it now has
+    that the store lacks (a missing settlement, before it is called never published; Advisor, 7 Oct 2026, QA
+    P1-O17a-11). refresh() only tops up past the newest kept, so a hole is never refetched otherwise. How many were
+    added."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    loader = loader or venue_profile(venue).funding_loader
+    if loader is None:
+        return 0
+    path = _path(venue, pair, root)
+    with _lock:
+        if not path.exists():
+            return 0
+        kept = json.loads(path.read_text())["rates"]
+        if not kept:
+            return 0
+        have, last = {t for t, _ in kept}, kept[-1][0]
+        start, added = int(after.timestamp() * 1000), []
+        for _ in range(max_pages):
+            page = loader(pair, start)
+            added += [[t, r] for t, r in _usable(page, venue, pair) if t < last and t not in have]
+            if len(page) < PAGE or not page or page[-1][0] >= last:
+                break
+            start = page[-1][0] + 1
+        if added:
+            kept = sorted(kept + added, key=lambda tr: tr[0])
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"rates": kept}))
+            tmp.replace(path)
+            _cache.pop((str(path.parent.parent.parent), venue.upper(), pair.upper()), None)
+    return len(added)
+
+
 def _usable(page, venue: str, pair: str, refused: list | None = None) -> list:
     """The page's settlements whose rate can be believed. A null from the venue (the loader passes it as None), a NaN,
     an infinity or a rate beyond the venue's cap is left out and said, so it is a hole gaps() reports rather than a
@@ -235,34 +270,101 @@ def stale_tag(venue: str, pair: str) -> str:
     return f"[{pair.upper()}]"
 
 
-def stale_open(store, tag: str) -> bool | None:
-    """Whether the instrument's staleness episode is open in the journal: its latest funding_stale /
-    funding_stale_cleared is a funding_stale, however long ago, so an outage of days alerts once and a rate arriving
-    days late still logs its recovery (QA P1-O17a-1). None when the journal can't be read: the caller then alerts,
-    since alerting twice beats never."""
-    try:
-        last = _last_episode_event(store, tag)
-    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
-        return None
-    return last is not None and last["kind"] == "funding_stale"
+# The journal's events for an instrument's funding (Advisor, 7 Oct 2026, QA P1-O17a-11): an episode is a run of
+# missing settlements, opened by one funding_stale and closed by one funding_stale_cleared, both naming the
+# settlement it opened on ("episode from ... UTC"); each missing settlement is marked once (funding_missing), and one still
+# missing a day after it was due, once a later one is published, once more (funding_never_published).
+EPISODE_KINDS = ("funding_stale", "funding_stale_cleared", "funding_missing", "funding_never_published")
+NEVER_PUBLISHED_AFTER = pd.Timedelta(hours=24)
+_STAMP = "%Y-%m-%d %H:%M"
 
 
-def stale_since(store, tag: str) -> pd.Timestamp | None:
-    """When the instrument's open staleness episode was opened (its funding_stale's time, UTC), or None when none is
-    open or the journal can't be read."""
+def _stamp_in(message: str, before: str) -> pd.Timestamp | None:
+    """The 'YYYY-MM-DD HH:MM UTC' time just after `before` in an episode message, or None."""
+    at = message.find(before)
+    if at < 0:
+        return None
     try:
-        last = _last_episode_event(store, tag)
-    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return pd.Timestamp(message[at + len(before):at + len(before) + 16], tz="UTC")
+    except ValueError:
         return None
-    if last is None or last["kind"] != "funding_stale" or last.get("ts") is None:
-        return None
-    ts = pd.Timestamp(last["ts"])
+
+
+def _utc(ts) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
-def _last_episode_event(store, tag: str) -> dict | None:
-    return next((e for e in store.events_of(("funding_stale", "funding_stale_cleared"), limit=500)
-                 if e["message"].startswith(tag)), None)
+def journal_state(store, tag: str) -> dict:
+    """The instrument's funding episodes as the journal has them: {"open": {opening settlement: its funding_stale},
+    "missing": settlements marked missing, "never": settlements marked never published}. A funding_stale written
+    before episodes named their settlement opens one at its own time, and a funding_stale_cleared naming none
+    closes every one then open (one episode per instrument, as they were). Raises when the journal can't be read."""
+    events = [e for e in store.events_of(EPISODE_KINDS, limit=2000) if e["message"].startswith(tag)]
+    opened: dict = {}
+    missing, never = set(), set()
+    for e in reversed(events):  # oldest first
+        kind, msg = e["kind"], e["message"]
+        if kind == "funding_missing" or kind == "funding_never_published":
+            t = _stamp_in(msg, f"{tag} ")
+            if t is not None:
+                (missing if kind == "funding_missing" else never).add(t)
+            continue
+        key = _stamp_in(msg, "episode from ")
+        if kind == "funding_stale":
+            key = key if key is not None else (_utc(e["ts"]) if e.get("ts") is not None else None)
+            opened.setdefault(key, e)
+        elif key is None:
+            opened.clear()
+        else:
+            opened.pop(key, None)
+    return {"open": opened, "missing": missing, "never": never}
+
+
+def stale_open(store, tag: str) -> bool | None:
+    """Whether any of the instrument's staleness episodes is open in the journal, however long ago it opened, so an
+    outage of days alerts once and a rate arriving days late still logs its recovery (QA P1-O17a-1). None when the
+    journal can't be read: the caller then alerts, since alerting twice beats never."""
+    try:
+        return bool(journal_state(store, tag)["open"])
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return None
+
+
+def stale_since(store, tag: str) -> pd.Timestamp | None:
+    """The settlement the instrument's oldest open staleness episode opened on (UTC), or None when none is open or
+    the journal can't be read."""
+    try:
+        keys = [k for k in journal_state(store, tag)["open"] if k is not None]
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return None
+    return min(keys) if keys else None
+
+
+def episode_of(state: dict, t: pd.Timestamp, due: list) -> pd.Timestamp | None:
+    """The open episode missing settlement `t` belongs to: one opened at or before it with every settlement from its
+    opening to `t` (`due`, the instrument's settlements in that span) marked missing or never published, so one
+    outage is one episode, and a missing settlement after a published one opens another (Advisor, 7 Oct 2026)."""
+    gone = state["missing"] | state["never"]
+    for o in sorted((k for k in state["open"] if k is not None and k <= t), reverse=True):
+        if all(_utc(u) in gone for u in due if o <= _utc(u) < t):
+            return o
+    return None
+
+
+def mark(store, tag: str, kind: str, t: pd.Timestamp, ts=None, inferred: bool = False) -> None:
+    """Journal one settlement's state: funding_missing (info) or funding_never_published (a warning)."""
+    if kind == "funding_missing":
+        store.event(None, "info", kind, f"{tag} {t:{_STAMP}} UTC settlement missing"
+                    + (" (inferred time)" if inferred else ""), ts=ts)
+    else:
+        store.event(None, "warning", kind, f"{tag} {t:{_STAMP}} UTC rate never published; baseline kept, true-up "
+                    "impossible", ts=ts)
+
+
+def from_words(o: pd.Timestamp) -> str:
+    """The episode's name in its funding_stale and funding_stale_cleared messages."""
+    return f"episode from {o:{_STAMP}} UTC"
 
 
 # Funding charged at the baseline for a missing rate (Advisor, 6 Oct 2026, QA P1-O17): from BASELINE_WARN of the held
