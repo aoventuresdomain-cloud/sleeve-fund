@@ -2502,14 +2502,15 @@ class LongFlatStrategy(Strategy):
         terms = self._cfg.perp
         if terms is None or price <= 0:
             return
+        now = self.clock.utc_now()
         if not self._backtest and self._entry_px is not None and (
                 self._awaiting is not None
-                or (self._trade_ns is not None and self._now_ns() - self._trade_ns > UNSEEN_GAP_NS)):
+                or (self._trade_ns is not None and self._now_ns() - self._trade_ns > UNSEEN_GAP_NS)) and not (
+                self._funding_overdue(terms, now)):
             # No trade is reaching the strategy, or the minutes it missed are still to come: they may show the
             # venue's stop closed the position before a settlement in them. Settled once they are replayed (QA
             # P1-L19); a settlement after the replayed exit is not the position's (_funding_skip).
             return
-        now = self.clock.utc_now()
         since, self._funding_since = self._funding_since, now
         if since is None:
             return
@@ -2537,6 +2538,17 @@ class LongFlatStrategy(Strategy):
 
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
+    # ...and holds a settlement back for missed minutes at most this long (DA 7 Oct): on a market that trades less often
+    # than UNSEEN_GAP_NS the hold would otherwise never end.
+    FUNDING_DEFER_MAX = timedelta(minutes=15)
+
+    def _funding_overdue(self, terms, now: datetime) -> bool:
+        """A settlement held back for missed minutes is charged anyway once FUNDING_DEFER_MAX has passed and a trade
+        from after it has reached the strategy (the feed is back, and its replay has had that long to run)."""
+        since = self._funding_since
+        due = markets.funding_times(since, now, terms.funding_hours)[:1] if since is not None else []
+        return bool(due) and now - due[0] >= self.FUNDING_DEFER_MAX and (
+            self._trade_ns is not None and self._trade_ns > int(due[0].timestamp()) * 1_000_000_000)
 
     def _funding_rate(self, terms, ts, now) -> float | None:
         """The rate settled at `ts`: the venue's own where its terms name one (sleeve_fund.funding), else the
