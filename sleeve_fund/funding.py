@@ -17,9 +17,10 @@ from pathlib import Path
 import pandas as pd
 
 from sleeve_fund.history import DEFAULT_ROOT
+from sleeve_fund.markets import SNAP_WINDOW as _SNAP_WINDOW
 
 PAGE = 1000  # settlements a venue returns per request
-MATCH = pd.Timedelta(minutes=1)  # a settlement is stamped within this of its scheduled time
+MATCH = pd.Timedelta(_SNAP_WINDOW)  # a settlement is stamped within this of its time (markets.SNAP_WINDOW)
 # A settled rate beyond the venue's cap (VenueProfile.funding_cap), either way, is not believed: kept as missing and
 # said. This is the default cap, a sanity bound well past any a venue sets per settlement, until each instrument's
 # published cap is kept beside its rates (DA-11).
@@ -130,6 +131,21 @@ def cap_of(venue: str, pair: str) -> float:
     return venue_profile(venue).funding_cap(pair)
 
 
+def snap_note(series: pd.Series, ts) -> str:
+    """The audit note " (snapped +N min)" when the record charged at settlement `ts` is stamped off it (inside MATCH, so it is that
+    settlement's rate, published late or early: Advisor, 7 Oct 2026), else "": kept for the audit."""
+    if series is None or series.empty:
+        return ""
+    ts = pd.Timestamp(ts)
+    i = series.index.searchsorted(ts - MATCH)
+    if i + 1 < len(series) and abs(series.index[i + 1] - ts) < abs(series.index[i] - ts):
+        i += 1
+    if i >= len(series) or abs(series.index[i] - ts) > MATCH:
+        return ""
+    off = round((series.index[i] - ts) / pd.Timedelta(minutes=1))
+    return f" (snapped {off:+d} min)" if off else ""
+
+
 def believable(rate, cap: float = CAP) -> bool:
     """A settled rate that can be charged: a finite number within the cap. Anything else is a missing rate (QA P1-O17)."""
     try:
@@ -155,6 +171,8 @@ def rate_at(series: pd.Series, ts: pd.Timestamp, cap: float = CAP) -> float | No
     if series.empty:
         return None
     i = series.index.searchsorted(ts - MATCH)
+    if i + 1 < len(series) and abs(series.index[i + 1] - ts) < abs(series.index[i] - ts):
+        i += 1  # the nearer of two inside the minute either side: one record to one settlement (QA P1-O17a-14)
     if i < len(series) and abs(series.index[i] - ts) <= MATCH:
         rate = float(series.iloc[i])
         # A NaN, infinite or unbelievable rate in a file the collector didn't write is missing, never charged

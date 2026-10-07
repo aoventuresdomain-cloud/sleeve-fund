@@ -20,7 +20,7 @@ depends_on = None
 def upgrade() -> None:
     with op.batch_alter_table('funding', schema=None) as batch_op:
         batch_op.add_column(sa.Column('kind', sa.String(length=16), server_default='settled', nullable=False))
-        batch_op.create_check_constraint('funding_kind', "kind IN ('settled', 'baseline', 'true_up')")
+        batch_op.create_check_constraint('funding_kind', "kind IN ('settled', 'baseline', 'true_up', 'reversal')")
 
 
 def downgrade() -> None:

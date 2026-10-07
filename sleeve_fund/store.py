@@ -119,7 +119,7 @@ funding_t = Table(
     # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
     # correction to the venue's rate), QA P1-O17.
     Column("kind", String(16), nullable=False, server_default="settled"),
-    CheckConstraint("kind IN ('settled', 'baseline', 'true_up')", name="funding_kind"),
+    CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
 )
 

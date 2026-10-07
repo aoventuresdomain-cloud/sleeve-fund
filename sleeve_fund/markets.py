@@ -139,7 +139,7 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
     before the first record, and with no records, the venue profile's fixed `hours`."""
     if settled is None or len(settled) == 0:
         return funding_times(after, until, hours)
-    idx = settled.index.round("min")
+    idx = snapped(settled)
     first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
     out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
     out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
@@ -155,6 +155,33 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
                     out.append(t)
                 t += step
     return sorted(set(out))
+
+
+# A record within this either side of a settlement is that settlement's rate, published late or early: one window
+# for the gap reader (snapped) and the engine's match (funding.MATCH is this), so one rate is never charged twice
+# (Advisor, 7 Oct 2026, QA P1-O17a-14).
+SNAP_WINDOW = timedelta(minutes=1)
+_ONE_MINUTE = SNAP_WINDOW
+
+
+def snapped(settled):
+    """The venue's records' settlement times: each to the minute, and one within a minute either side of the hour
+    is that hour's settlement, published late or early (Advisor, 7 Oct 2026, QA P1-O17a-14), so a record at 08:01
+    is the 08:00 settlement, read as no gap and charged once. One to one: of two records snapping to one hour the
+    nearer takes it, the other keeps its own minute. The records keep their own stamps (funding.snap_note)."""
+    import pandas as pd
+
+    idx = settled.index.round("min")
+    hour = idx.round("h")
+    near = abs(idx - hour) <= pd.Timedelta(_ONE_MINUTE)
+    out, taken = list(idx), {}
+    for i in (j for j in range(len(idx)) if near[j]):
+        best = taken.get(hour[i])
+        if best is None or abs(idx[i] - hour[i]) < abs(idx[best] - hour[i]):
+            taken[hour[i]] = i
+    for h, i in taken.items():
+        out[i] = h
+    return pd.DatetimeIndex(out).sort_values()
 
 
 def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ...],
@@ -182,30 +209,27 @@ def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ..
         if later is None and published is not None and gap <= published:
             continue  # the venue's published interval is this wide: lengthened, not lost
         t = a + step
-        while t < b:
+        while t < b - _ONE_MINUTE:  # a record within a minute is that settlement's own, charged once (QA P1-O17a-14)
             if after < t <= until:
                 out.append(t)
             t += step
     return out
 
 
-def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
-    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
-    `wait`; for a settlement foreseen past its newest record, one of the venue's latest intervals more, plus `wait`
-    again for the store's refresh to bring in the next record. If the venue has lengthened its interval, the newer
-    record that skips the foreseen time lands within that, and the time is then no settlement at all
-    (settlement_times), so it is never charged (no phantom baseline charge)."""
-    step = latest_interval(settled)
-    if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
-        return wait
-    return 2 * wait + step
+def settlement_wait(ts: datetime, settled, wait: timedelta, hours: tuple[int, ...] | None = None) -> timedelta:
+    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate: `wait`,
+    whether the time is recorded or foreseen past the newest record, so a missing rate is alerted, charged and blocks
+    entries 15 minutes after it was due (Advisor, 7 Oct 2026, QA P1-O17a-13). A foreseen time the venue's next record
+    shows was no settlement (its interval lengthened) has its baseline reversed by its own journaled correction
+    (LongFlatStrategy._reverse_unsettled), never by waiting a whole interval first."""
+    return wait
 
 
 def latest_interval(settled) -> timedelta | None:
     """The venue's settlement interval as its two newest records show it, or None with fewer than two."""
     if settled is None or len(settled) < 2:
         return None
-    idx = settled.index.round("min")
+    idx = snapped(settled)
     step = (idx[-1] - idx[-2]).to_pytimedelta()
     return step if step > timedelta(0) else None
 

@@ -469,6 +469,19 @@ def handler_error_words(handler: str, exc: BaseException | str) -> str:
     return f"handling {where}: {what or 'no message'}" + (f" ({kind})" if kind else "")
 
 
+def pd_ts(t):
+    import pandas as pd
+
+    t = pd.Timestamp(t)
+    return t.tz_localize("UTC") if t.tzinfo is None else t
+
+
+def funding_snap_note(settled, ts) -> str:
+    from sleeve_fund import funding
+
+    return funding.snap_note(settled, ts)
+
+
 class LongFlatStrategy(Strategy):
     """Holds a share of the sleeve between 0% and 100%, never short. Subclasses implement
     want_long() for all-or-nothing, or target_weight() for anything in between."""
@@ -519,6 +532,7 @@ class LongFlatStrategy(Strategy):
         # when it was last asked for (funding_stale / funding_stale_cleared, per instrument, once per episode).
         self._funding_missing: set = set()  # every settlement charged the baseline whose rate hasn't come yet
         self._funding_last_settled = None  # paper: the newest settlement charged at the venue's own rate
+        self._funding_paid: dict = {}  # paper: settlement -> (qty, price, rate, amount) charged the baseline
         self._funding_recheck = None
         # (time, amount, kind) for every funding payment, for a backtest's equity: kind "settled" (the venue's rate) or
         # "baseline" (missing, charged adversely).
@@ -2769,7 +2783,8 @@ class LongFlatStrategy(Strategy):
                 self._mark_flat(terms, [ts], now)  # marked flat, so a batch mixing flat and held leaves no hole (CR)
                 self._funding_since = ts
                 continue
-            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
+            wait = markets.settlement_wait(ts, settled, self.FUNDING_WAIT, terms.funding_hours)
+            rate = self._funding_rate(terms, ts, now, wait)
             if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
                 return
             rate, baseline = rate
@@ -2783,7 +2798,8 @@ class LongFlatStrategy(Strategy):
                                                                                   not self._funding_skip[1]):
                 continue  # closed before it (an outage's replayed exit), or a credit the target may have missed
             self.funding_marks.append((ts, baseline, True))
-            self._book_funding(ts, qty, px, rate, amount, "baseline" if baseline else "settled")
+            note = "" if baseline or settled is None else funding_snap_note(settled, ts)
+            self._book_funding(ts, qty, px, rate, amount, "baseline" if baseline else "settled", note)
         self._funding_since = max(self._funding_since, self._rescan_from(now))
 
     def _mark_flat(self, terms, times, now) -> None:
@@ -2805,16 +2821,18 @@ class LongFlatStrategy(Strategy):
         self.funding_marks.append((ts, baseline, True))
 
     def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float,
-                      kind: str = "settled") -> None:
+                      kind: str = "settled", note: str = "") -> None:
         self._cash_adj += amount
         self.funding_log.append((ts, amount, kind))
+        if kind == "baseline" and not self._backtest:
+            self._funding_paid[ts] = (qty, px, rate, amount)  # reversed if the venue shows it was no settlement
         if self.runtime is not None:
             self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
                                               amount=round(amount, 8), ts=ts, kind=kind)
             self.runtime.store.event(self.runtime.name, "info", "funding",
                                      f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                      f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
-                                     f"{px:,.6g} ({rate:.4%})", ts=ts)
+                                     f"{px:,.6g} ({rate:.4%}){note}", ts=ts)
 
     def _fund_opened_in_bar(self, window: tuple[int, int, bool], qty: float, low: float, high: float) -> None:
         """Rule (c) for a resting entry or add a bars-only backtest filled inside a bar (Independent Quant Advisor, 6 Oct
@@ -2832,7 +2850,8 @@ class LongFlatStrategy(Strategy):
         for ts in times:
             if not lo < int(ts.timestamp()) * 1_000_000_000 <= hi:
                 continue
-            rate = self._funding_rate(terms, ts, now, markets.settlement_wait(ts, settled, self.FUNDING_WAIT))
+            wait = markets.settlement_wait(ts, settled, self.FUNDING_WAIT, terms.funding_hours)
+            rate = self._funding_rate(terms, ts, now, wait)
             if rate is None:
                 continue
             rate, baseline = rate
@@ -2954,6 +2973,8 @@ class LongFlatStrategy(Strategy):
                 asked[when] = self._venue_rate(terms, pair, when) is not None
             return asked[when]
 
+        if terms is not None:
+            self._reverse_unsettled(terms)
         came = {when for when in sorted(self._funding_missing) if arrived(when)}
         self._funding_missing -= came
         try:
@@ -2988,11 +3009,42 @@ class LongFlatStrategy(Strategy):
         gap = pd.Timedelta(markets.funding_interval(hours)) - funding.MATCH
         for o in sorted(k for k in state["open"] if k is not None):
             waiting = [t for t in state["missing"] if t > o - gap and t not in state["never"]
-                       and (t in self._funding_missing or not arrived(t))]
+                       and (t in self._funding_missing or not arrived(t))
+                       and (terms is None or self._is_settlement(terms, t))]
             if not waiting:
                 rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
                                f"arrived from the venue for every settlement missing {funding.from_words(o)}"
                                + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _is_settlement(self, terms, when) -> bool:
+        """Whether `when` is still one of the venue's settlements as its records now read (markets.settlement_times)."""
+        from sleeve_fund import funding
+
+        times = self._settlements(terms, when - timedelta(minutes=2), when + timedelta(minutes=2))[0]
+        return any(abs(pd_ts(t) - pd_ts(when)) <= funding.MATCH for t in times)
+
+    def _reverse_unsettled(self, terms) -> None:
+        """Paper: a settlement charged the baseline that the venue's newer records show was none (its interval
+        lengthened, so the time foreseen from the shorter step never settled) has the charge reversed by its own
+        journaled correction, kind "reversal", never by editing the original row, and leaves the watch (Advisor,
+        7 Oct 2026, QA P1-O17a-13). O17b never trues up a reversed baseline."""
+        for when in sorted(self._funding_missing):
+            if self._is_settlement(terms, when):
+                continue
+            self._funding_missing.discard(when)
+            paid = self._funding_paid.pop(when, None)
+            if paid is None:
+                continue
+            qty, px, rate, amount = paid
+            self._cash_adj -= amount
+            self.funding_log.append((when, -amount, "reversal"))
+            if self.runtime is not None:
+                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
+                                                  amount=round(-amount, 8), ts=when, kind="reversal")
+                self.runtime.store.event(self.runtime.name, "info", "funding",
+                                         f"Funding reversed: {abs(amount):,.2f} back; the venue's records show no "
+                                         f"settlement at {when:%d %b %Y %H:%M} UTC (its interval lengthened), so the "
+                                         "baseline charged for it is refunded", ts=self.runtime.now())
 
     def _newest_kept(self, terms, pair):
         from sleeve_fund import funding
@@ -3067,6 +3119,8 @@ class LongFlatStrategy(Strategy):
             ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
             if row.get("kind") == "baseline" and ts > opened and ts not in state["never"]:
                 self._funding_missing.add(ts)
+                if row.get("amount") is not None:
+                    self._funding_paid[ts] = (row.get("qty"), row.get("price"), row.get("rate"), row["amount"])
 
     def _funding_episode(self, pair: str, stale: bool, message: str, ts=None) -> None:
         """Open (funding_stale, a warning) or close (funding_stale_cleared) the instrument's staleness episode, once

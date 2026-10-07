@@ -231,14 +231,15 @@ def test_a_foreseen_settlement_the_venue_skips_is_not_a_settlement_once_a_newer_
 
 
 def test_paper_waits_a_foreseen_settlement_until_a_newer_record_could_drop_it():
-    """CR minor 1: a time foreseen from the 4 h step waits one more interval than a published one, so the venue's
-    08:00 record (back to 8-hourly) lands and drops 04:00 before any baseline is charged for it."""
+    """CR minor 1, then the Advisor (7 Oct 2026, QA P1-O17a-13; HoE): a time foreseen from the 4 h step waits the
+    usual 15 minutes like a recorded one; if the venue's 08:00 record (back to 8-hourly) then drops 04:00, its
+    baseline is reversed by a correction of its own."""
     from datetime import timedelta
 
     t = lambda s: utc(s).to_pydatetime()  # noqa: E731
     four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
     wait = timedelta(minutes=15)
-    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == timedelta(hours=4, minutes=30)  # and the store's refresh after the 08:00 record
+    assert markets.settlement_wait(t("2025-10-05 04:00"), four, wait) == wait  # foreseen: the usual wait
     assert markets.settlement_wait(t("2025-10-05 00:00"), four, wait) == wait  # a recorded time: the usual wait
     assert markets.settlement_wait(t("2025-10-05 04:00"), None, wait) == wait  # no records: the fixed hours'
 

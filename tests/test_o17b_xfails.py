@@ -389,3 +389,74 @@ def test_a_perp_add_is_refused_today_in_paper(tmp_path, monkeypatch, binance):
     buys = [f for f in out["fills"] if f[1] == "BUY"]
     assert len(out["fills"]) == 1 and len(buys) == 1, f"the position was increased or changed: {out['fills']}"
     assert buys[0][0] == utc(f"{DAY} 11:52")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# #163 x O17b (Head of QA, 7 Oct, accepting the DA's per-settlement interface; Advisor ~02:12 O17a-11): entries are
+# blocked while ANY staleness episode on the instrument is open; a settlement the venue never published (still missing
+# 24 h after due with a later one stored, marked funding_never_published) does not block, so no episode blocks
+# entries forever.
+# ---------------------------------------------------------------------------------------------------------------
+
+def _np_hub_pass(m, b, store, at, rates: dict) -> None:
+    """One pass of the hub's funding refresh (history._refresh_funding) at `at` on the journal `store`; the store
+    file and the venue's history hold `rates` (settlement -> rate), the events it writes are stamped `at`."""
+    import sleeve_fund.store as store_mod
+    from o17_harness import _REAL_RATES, ms, write_rates
+    from sleeve_fund import funding, history
+
+    at = utc(at)
+    m.setattr(funding, "rates", _REAL_RATES)
+    write_rates({utc(k): v for k, v in rates.items()})
+    rows = [(ms(t), r) for t, r in sorted((utc(k), v) for k, v in rates.items())]
+    real_stale = funding.stale
+
+    class Stamped:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+        def event(self, sleeve, level, kind, message, ts=None):
+            return store.event(sleeve, level, kind, message, ts=ts or at.to_pydatetime())
+
+    with m.context() as c:
+        c.setattr(funding, "stale", lambda v, p, root=None, now=None: real_stale(v, p, root, now=at))
+        c.setattr(history, "_now", lambda: at, raising=False)
+        c.setattr(b, "funding_loader", lambda pair, start: [x for x in rows if x[0] >= start])
+        c.setattr(b, "stats_loaders", {})
+        inbox = Stamped()
+        c.setattr(store_mod, "Store", lambda *a, **k: inbox)
+        history._warned.clear()
+        history._refresh_funding(b, PAIR, funding.DEFAULT_ROOT, None)
+        history._warned.clear()
+    funding._cache.clear()
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
+def test_a_never_published_settlement_does_not_block_entries_but_an_open_episode_does(tmp_path, monkeypatch, binance):
+    """Paper "w" marks 08:00 missing at 08:15 (never published; every later settlement is). Control: a flat strategy
+    started at 16:35, whose entry is due at 16:40, is held back (08:00's episode is open, under 24 h). After the hub's
+    passes at 4 Oct 00:30 and 08:30, 08:00 is never published and its episode closed: a flat strategy started at
+    08:35 enters at 08:40, with no funding_entry_blocked."""
+    from sleeve_fund import funding, history
+
+    assert callable(getattr(funding, "stale_open", None)), "not built: the per-instrument staleness episode"
+    monkeypatch.setattr(history, "_stale", set(), raising=False)
+    store = journal()
+    made, create = set(), store.create_sleeve
+    store.create_sleeve = lambda **kw: None if kw["name"] in made else (made.add(kw["name"]), create(**kw))[1]
+    later = {"2025-10-02 16:00": 0.0001, "2025-10-03 00:00": 0.0001, "2025-10-03 16:00": 0.0002,
+             "2025-10-04 00:00": 0.0001, "2025-10-04 08:00": 0.0001}
+    run = dict(rates=later, store=store, published={"2025-10-03 08:00": NEVER})
+    paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-05 00:00", 1)), "2025-10-03 07:50", 30,
+          name="w", **run)
+    ctl = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 16:40", "2025-10-05 00:00", 1)), "2025-10-03 16:35",
+                25, name="f1", **run)
+    assert not _entries_after(ctl, "2025-10-03 16:39"), f"control: entered while 08:00's episode is open {ctl['fills']}"
+    for at in ("2025-10-04 00:30", "2025-10-04 08:30"):
+        _np_hub_pass(monkeypatch, binance, store, at, {k: v for k, v in later.items() if utc(k) < utc(at)})
+    never = [e for e in store.events(None, limit=5000) if e["kind"] == "funding_never_published"]
+    assert never, "setup: 08:00 not marked never published by the 4 Oct 08:30 pass"
+    out = paper(tmp_path, monkeypatch, binance, win(("2025-10-04 08:40", "2025-10-05 00:00", 1)), "2025-10-04 08:35",
+                25, name="f2", **run)
+    assert _entries_after(out, "2025-10-04 08:39"), "a never-published settlement blocked the entry"
+    assert not [e for e in out["events"] if e["kind"] == "funding_entry_blocked" and utc(e["ts"]) > utc("2025-10-04 08:00")]
