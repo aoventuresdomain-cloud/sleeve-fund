@@ -20,6 +20,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund.instruments import FeeSchedule, pair_of
+from sleeve_fund import markets
 from sleeve_fund.markets import PERP
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
@@ -94,6 +95,7 @@ class StudyResult:
     holdout: dict | None = None
     holdout_benchmark: dict | None = None
     fee_note: str = ""
+    fee_basis: FeeSchedule | None = None  # the schedule the strategy's runs paid: its market's, or the instrument's
     notes: list[str] = field(default_factory=list)
     instrument: str = ""  # BASE/QUOTE, and the bar length tested: a G1 pass counts for exactly these
     bar_minutes: int = 1440
@@ -198,6 +200,10 @@ class LadderRung:
     sharpe: float
     round_trips: int
     fees_paid: float
+    # The random-entry benchmark at this rung's own cost (RE-COST): the strategy's out-of-sample trips priced on the
+    # bars' closes, and the median of the random draws, both paying this fee plus the rung's spread and slippage.
+    oos_timing_return: float | None = None
+    random_return: float | None = None
 
 
 def _log_growth(total_return: float) -> float:
@@ -346,6 +352,13 @@ def run_study(
         half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
     spread_used = half_spread
 
+    def paid(params: dict) -> FeeSchedule:
+        """The schedule a run with these settings pays (runner.run_backtest's own default: its market's, or the
+        instrument's). The benchmarks, the fee note and the variant's key take it too, so a perp study's strategy and
+        its random entries pay the same fee on the same trades (RE-COST)."""
+        return markets.fees_for({**params, **market}, FeeSchedule(instrument.maker_fee, instrument.taker_fee),
+                                str(instrument.id.venue))
+
     exec_minutes = bar_minutes_of(exec_prices) if exec_prices is not None and len(exec_prices) else None
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
         raise ValueError(f"{exec_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
@@ -390,7 +403,7 @@ def run_study(
         # counter line's, so folding the counter in later doesn't count it twice.
         from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash, line_id, run_setup
 
-        setup = run_setup(risk_profile=risk_profile, fee=float(instrument.taker_fee) + spread_used,
+        setup = run_setup(risk_profile=risk_profile, fee=float(paid(params).taker) + spread_used,
                           windows=(train_days, test_days, holdout_days))
         return register.record(
             definition_hash=legacy_definition_hash(spec.name, full, setup), idea_hash=legacy_idea_hash(spec.name),
@@ -508,6 +521,7 @@ def run_study(
         bench_parts.append(b_ret)
         start += test_bars
 
+    run_fees = paid(chosen)
     result = StudyResult(
         spec=spec,
         dataset=dataset,
@@ -535,13 +549,18 @@ def run_study(
         ladder_slippage=slip,
         chosen_params=chosen,
         breakeven=breakeven,
-        fee_note=(f"{float(instrument.maker_fee):.2%} maker on post-only orders, {float(instrument.taker_fee):.2%} taker "
+        fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
                   f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
-                  "that take liquidity"),
+                  f"that take liquidity; break-even: {breakeven}"),
+        fee_basis=run_fees,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(instrument.taker_fee) + spread_used, full_default.shorts)
+        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts)
+    for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
+        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False)
+        if at_rung.trades:
+            rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "

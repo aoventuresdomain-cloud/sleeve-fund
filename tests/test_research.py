@@ -665,3 +665,36 @@ def test_a_fold_where_no_setting_scores_fails_with_a_reason_not_a_crash(tmp_path
     assert verdict == "FAIL" and "no setting scored a Sharpe on this fold's training stretch" in words
     assert r.holdout is None and "no setting scored" in r.holdout_withheld
     assert render(r, ledger)  # the sheet renders
+
+
+def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instrument, monkeypatch):
+    """RE-COST: the random-entry benchmark and the fee note charged the instrument's spot taker fee while a perp
+    run paid its market's, so the strategy looked worse than it was next to the benchmark."""
+    import sleeve_fund.research.study as study
+    from dataclasses import replace
+
+    # A perpetual on a venue that lists spot: every setting trades the simulated low-fee perp market.
+    perp = replace(SPEC, param_grid={k: v[:2] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
+                   default_params={**SPEC.default_params, "market": "perp"})
+
+    costs, runs = [], []
+    real_bench, real_bt = study._benchmarks, study.run_backtest
+    monkeypatch.setattr(study, "_benchmarks", lambda *a: costs.append(a[3]) or real_bench(*a))
+    monkeypatch.setattr(study, "run_backtest", lambda *a, **k: runs.append((a[3], k, r := real_bt(*a, **k))) and r or r)
+    r = run_study(perp, synthetic_ohlcv(days=1100, seed=3), instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"),
+                  synthetic=True, holdout_days=0, train_days=365, test_days=365, half_spread=0)
+    perp_taker = 0.0005  # the simulated low-fee perp market's
+    assert float(instrument.taker_fee) != perp_taker
+    assert costs[0] == pytest.approx(perp_taker)  # the headline benchmark; the cost ladder's follow
+    # The strategy's own runs (not the cost ladder's, nor buy and hold's), on the same basis: every fill paid that fee
+    # on its notional, no more, no less.
+    paid = [res for params, k, res in runs if params.get("market") == "perp" and k.get("fees") is None
+            and not res.fills.empty]
+    assert paid
+    for res in paid:
+        notional = sum(float(q) * float(p) for q, p in zip(res.fills["filled_qty"], res.fills["avg_px"]))
+        assert res.fees_paid == pytest.approx(notional * perp_taker, abs=0.02)
+    assert f"{perp_taker:.2%} taker" in r.fee_note and f"break-even: {r.breakeven}" in r.fee_note
+    # The Quant Researcher's line: the benchmark at each rung's own fee, costlier rungs never better for random entry.
+    rand = [rung.random_return for rung in r.cost_ladder]
+    assert None not in rand and rand == sorted(rand, reverse=True) and rand[0] > rand[-1]

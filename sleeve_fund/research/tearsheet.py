@@ -396,11 +396,14 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
         out.append("")
         out.append(f"**Break-even fee:** {_breakeven_words(r)}.")
         out.append("")
-        out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid |")
-        out.append("| --- | --- | --- | --- | --- |")
+        out.append("| Fee per side | Total return | Sharpe | Round trips | Fees paid | Out-of-sample timing "
+                   "| Random entry (median) |")
+        out.append("| --- | --- | --- | --- | --- | --- | --- |")
         for rung in r.cost_ladder:
+            timing, rand = getattr(rung, "oos_timing_return", None), getattr(rung, "random_return", None)
             out.append(f"| {rung.fee:.2%} | {_pct(rung.total_return)} | {_num(rung.sharpe)} | {rung.round_trips} "
-                       f"| {rung.fees_paid:,.0f} |")
+                       f"| {rung.fees_paid:,.0f} | {'—' if timing is None else _pct(timing)} "
+                       f"| {'—' if rand is None else _pct(rand)} |")
         out.append("")
         out.append("The settings tuning on the whole research period picks (best in-sample Sharpe on the grid), at "
                    "each fee, charged per side on maker and taker fills alike, so for a post-only strategy it mixes "
@@ -408,7 +411,9 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None) -> str:
                    f"bid-ask spread as above plus {r.ladder_slippage:.2%} slippage on orders that take liquidity. 0.02% and "
                    "0.05% are a low-fee perpetual venue's maker and taker rates, 0.10-0.40% typical spot taker rates, "
                    "0.80% a high-fee spot venue's taker rate. The break-even interpolates log(1 + return) between "
-                   "rungs, then re-runs at that fee to verify it.")
+                   "rungs, then re-runs at that fee to verify it. The last two columns are the random-entry benchmark "
+                   "at the rung's cost: the strategy's out-of-sample trips priced on the bars' closes, and the median "
+                   "of the same number of random trips held as long.")
         out.append("")
     out.append("## Walk-forward folds")
     out.append("")
