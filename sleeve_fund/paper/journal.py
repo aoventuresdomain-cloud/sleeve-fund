@@ -9,10 +9,12 @@ positions and reasons show in the same screens as paper's.
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 from datetime import datetime
 
 from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
-                                _check_rebook, _rebook_words, exact_sum, utcnow)
+                                _check_rebook, _conflict_words, _rebook_words, _same_fill, exact_sum,
+                                utcnow)
 
 _FINISHED = FINISHED_ORDER_STATUSES
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
@@ -25,6 +27,7 @@ class MemoryJournal:
         self.sleeve_row: Sleeve | None = None
         self.equity: list[dict] = []
         self.fills_: list[dict] = []
+        self._fill_keys: dict[tuple, dict] = {}  # (sleeve, order, trade) -> its fill: each booked once (DA-2)
         self.funding_: list[dict] = []
         self.insurance_: list[dict] = []
         self.orders_: dict[str, dict] = {}
@@ -101,9 +104,28 @@ class MemoryJournal:
             self._worst = (self._peak_mark, mark)
 
     def record_fill(self, sleeve: str, *, side: str, qty: float, price: float, fee: float, order_id: str,
-                    trade_id: str, ts: datetime | None = None) -> None:
-        self.fills_.append({"id": next(self._ids), "sleeve": sleeve, "ts": ts or utcnow(), "side": side, "qty": qty,
-                            "price": price, "fee": fee, "order_id": order_id, "trade_id": trade_id})
+                    trade_id: str, ts: datetime | None = None) -> str:
+        """As Store.record_fill (DA-2): "new", "same" or "differs"; a fill is booked once per (strategy, order, trade)."""
+        if (f := self._fill_keys.get((sleeve, order_id, trade_id))) is not None:
+            if _same_fill(SimpleNamespace(**f), side, qty, price, fee):
+                return "same"
+            self.event(sleeve, "error", "fill_conflict", _conflict_words(order_id, trade_id, side, qty, price, fee), ts=ts)
+            return "differs"
+        f = {"id": next(self._ids), "sleeve": sleeve, "ts": ts or utcnow(), "side": side, "qty": qty,
+             "price": price, "fee": fee, "order_id": order_id, "trade_id": trade_id}
+        self.fills_.append(f)
+        self._fill_keys[(sleeve, order_id, trade_id)] = f
+        return "new"
+
+    def book_fill(self, sleeve: str, *, side: str, qty: float, price: float, fee: float, order_id: str,
+                  trade_id: str, ts: datetime | None = None) -> str:
+        """As Store.book_fill (DA-2): the fill, its order and the fill event, once per (strategy, order, trade)."""
+        booked = self.record_fill(sleeve, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
+                                  trade_id=trade_id, ts=ts)
+        if booked == "new":
+            self.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
+            self.event(sleeve, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
+        return booked  # a conflict's error event is record_fill's
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
                      signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
