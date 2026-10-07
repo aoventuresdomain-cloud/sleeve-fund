@@ -4,8 +4,16 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  pytest:
+  # The suite runs as 4 shards in parallel, each with its own Postgres. Every shard collects the same sorted list of
+  # test ids and runs every 4th one, so each test runs exactly once across the shards. The browser tests all go to
+  # shard 0, the only one that installs the browser.
+  shard:
+    name: pytest shard ${{ matrix.shard }}/4
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     services:
       postgres:
         image: postgres:16
@@ -23,5 +31,22 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
-      - run: python -m playwright install --with-deps chromium  # tests/test_browser.py
-      - run: pytest -q
+      - if: matrix.shard == 0
+        run: python -m playwright install --with-deps chromium  # tests/test_browser.py
+      - name: Pick this shard's tests
+        shell: bash
+        run: |
+          pytest --collect-only -q | grep '::' | LC_ALL=C sort > all-tests.txt
+          {
+            if [ "${{ matrix.shard }}" = 0 ]; then grep '^tests/test_browser\.py::' all-tests.txt || true; fi
+            grep -v '^tests/test_browser\.py::' all-tests.txt | awk -v k=${{ matrix.shard }} 'NR % 4 == k'
+          } > shard-tests.txt
+          echo "shard ${{ matrix.shard }}/4 runs $(wc -l < shard-tests.txt) of $(wc -l < all-tests.txt) tests"
+      - run: pytest -q @shard-tests.txt  # one test id per line (pytest >= 8.2)
+  # The check the merge flow reads: green only when every shard is.
+  pytest:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.shard.result }}" = success
