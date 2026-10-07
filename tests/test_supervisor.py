@@ -464,3 +464,77 @@ def test_a_reset_keeps_a_pause_or_halt_and_restarts_a_running_strategy(store):
     assert halted.status == "halted" and "20% limit" in halted.status_reason
     assert running.status == "stopped" and running.desired_state == "running"  # starts afresh and runs
     # The fresh paper process reads that status and keeps it until a resume (review round 10, B10-3).
+
+
+@pytest.fixture
+def pg_store():
+    import os
+
+    from sleeve_fund.store import make_engine, metadata
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("row locks need Postgres: CI runs these against it (TEST_DATABASE_URL)")
+    engine = make_engine(url)
+    metadata.drop_all(engine)
+    return Store(engine=engine)
+
+
+def _reset_requested(store, name="bn-race"):
+    store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp"}, venue="binance")
+    store.request_reset(name, "Test finished")
+    return store.pending_reset(name)
+
+
+def _waits(fn, *args, **kw):
+    """fn run on its own connection; True while it is still blocked half a second later."""
+    import threading
+
+    t = threading.Thread(target=fn, args=args, kwargs=kw, daemon=True)
+    t.start()
+    t.join(0.5)
+    return t
+
+
+def test_a_kill_switch_pressed_while_the_reset_completes_waits_for_it_and_stays_pending(pg_store):
+    """Code Reviewer on #188: a press landing while split_run's transaction is in flight wrote its hold to a reset
+    already done, and the fresh run started unpaused. It now waits for the reset's row and, finding it done, stays a
+    pending command of the fresh run, which the paper process applies."""
+    from sqlalchemy import select, update
+
+    from sleeve_fund.store import reset_holds_t, resets_t
+
+    store = pg_store
+    req = _reset_requested(store)
+    with store.engine.connect() as c, c.begin():  # split_run, part way through: the reset row locked, not yet done
+        c.execute(select(resets_t.c.id).where(resets_t.c.id == req["id"]).with_for_update())
+        press = _waits(store.command, "bn-race", "flatten", "Book kill switch: drawdown")
+        assert press.is_alive()  # it waits for the reset to finish
+        c.execute(update(resets_t).where(resets_t.c.id == req["id"]).values(done_at=utcnow(), run="bn-race--old"))
+    press.join(10)
+    assert not press.is_alive()
+    with store.engine.connect() as c:
+        assert c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == req["id"])).all() == []
+    assert [cmd["command"] for cmd in store.pending_commands("bn-race")] == ["flatten"]
+
+
+def test_a_reset_completing_while_a_kill_switch_is_pressed_waits_and_keeps_its_hold(pg_store):
+    """The other order: split_run waits for a press already under way, then reads the hold it wrote, so the fresh run
+    starts paused."""
+    from sqlalchemy import insert, select
+
+    from sleeve_fund.store import reset_holds_t, resets_t
+
+    store = pg_store
+    req = _reset_requested(store)
+    with store.engine.connect() as c, c.begin():  # Store.command, part way through: the reset row locked
+        c.execute(select(resets_t.c.id).where(resets_t.c.id == req["id"]).with_for_update())
+        c.execute(insert(reset_holds_t).values(reset_id=req["id"], status="paused", paused_until=None,
+                                               status_reason="flattened by PM: Book kill switch: drawdown"))
+        reset = _waits(store.split_run, req)
+        assert reset.is_alive()  # it waits for the press to commit
+    reset.join(10)
+    assert not reset.is_alive()
+    s = store.sleeve("bn-race")
+    assert s.status == "paused" and "kill switch" in s.status_reason and "kept through a reset" in s.status_reason

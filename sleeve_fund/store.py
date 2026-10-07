@@ -1363,6 +1363,9 @@ class Store:
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
                  insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
+            # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
+            # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
+            c.execute(select(resets_t.c.id).where(resets_t.c.id == request["id"]).with_for_update())
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
@@ -1752,7 +1755,10 @@ class Store:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
             if holds_through_reset and command in ("pause", "flatten"):
-                req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))).first()
+                # Locked as split_run locks it, so a press while the reset completes waits for it: it then finds the
+                # reset done and stays a pending command of the fresh run, never a hold on a run already put away.
+                req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))
+                                .with_for_update()).first()
                 held = req and c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
                 if req is not None and held != "halted":  # never downgrade a halt, as the paper process doesn't
                     # The reset drops pending commands and starts the run afresh, so record the pause the paper
