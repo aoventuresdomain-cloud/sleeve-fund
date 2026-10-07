@@ -4269,8 +4269,8 @@ class LongFlatStrategy(Strategy):
         elif book and kept_id is None:
             # A replayed exit (Advisor NA-1): journaled at the price the venue's resting order would have had. The
             # account's cash keeps the journal's, as for a restore; the fee is the venue's rate on that price.
-            fee = fee * book / px if px else fee
-            self._cash_adj += sign * qty * (px - book)
+            charged, fee = fee, (fee * book / px if px else fee)
+            self._cash_adj += sign * qty * (px - book) + (charged - fee)  # the fee too, as journaled (QA P1-D25)
             px = book
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:
