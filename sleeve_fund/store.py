@@ -1378,7 +1378,9 @@ class Store:
         with self.engine.begin() as c:
             # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
             # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
-            c.execute(select(resets_t.c.id).where(resets_t.c.id == request["id"]).with_for_update())
+            locked = c.execute(select(resets_t.c.restart).where(resets_t.c.id == request["id"]).with_for_update()).first()
+            if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
+                request["restart"] = locked.restart
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
@@ -1768,19 +1770,35 @@ class Store:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
             if holds_through_reset and command in ("pause", "flatten"):
-                # Locked as split_run locks it, so a press while the reset completes waits for it: it then finds the
-                # reset done and stays a pending command of the fresh run, never a hold on a run already put away.
-                req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))
-                                .with_for_update()).first()
-                held = req and c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
-                if req is not None and held != "halted":  # never downgrade a halt, as the paper process doesn't
-                    # The reset drops pending commands and starts the run afresh, so record the pause the paper
-                    # process would have set (paper.runtime) as the hold split_run carries over.
-                    words = "flattened by PM" if command == "flatten" else "paused by PM"
-                    c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
-                    c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
-                                                           status_reason=f"{words}: {reason.strip()}", paused_until=None))
+                self._hold_on_reset(c, sleeve, command, reason)
         self.decide(actor, command, reason, sleeve)
+
+    def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
+        """A PM control on a strategy whose reset is under way, kept on the fresh run without a command for its
+        process (Advisor, 7 Oct, P1-KR-1/3): a Pause or Flatten (the kill switch) whose sale the reset's own flatten
+        already makes becomes the reset's hold; a Stop keeps the fresh run stopped. False when no reset is open."""
+        with self.engine.begin() as c:
+            return self._hold_on_reset(c, sleeve, command, reason)
+
+    def _hold_on_reset(self, c, sleeve: str, command: str, reason: str) -> bool:
+        # Locked as split_run locks it, so a press while the reset completes waits for it: it then finds the reset
+        # done and acts on the fresh run as on any other, never on a run already put away.
+        req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))
+                        .with_for_update()).first()
+        if req is None:
+            return False
+        if command == "stop":
+            c.execute(update(resets_t).where(resets_t.c.id == req.id).values(restart=0))
+            return True
+        held = c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
+        if held != "halted":  # never downgrade a halt, as the paper process doesn't
+            # The reset drops pending commands and starts the run afresh, so record the pause the paper process
+            # would have set (paper.runtime) as the hold split_run carries over.
+            words = "flattened by PM" if command == "flatten" else "paused by PM"
+            c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
+            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
+                                                   status_reason=f"{words}: {reason.strip()}", paused_until=None))
+        return True
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:
         """Set one parameter a strategy has never had, without a restart (True if set). A key it already has,
