@@ -310,3 +310,41 @@ def test_sg5_a_holder_still_guarded_by_its_limits_never_opens_an_entry(tmp_path,
     assert abs(store.journal_book(name, 10_000)["qty"]) <= carried + 1e-12
     kinds = {e["kind"] for e in store.events(name, limit=1000)}
     assert "entry_blocked" in kinds, kinds  # it did try to trade, and the gate refused it
+
+
+def test_the_pm_controls_act_on_a_strategy_whose_reset_is_under_way(client):
+    """P1-KR-1, P1-KR-3 (Head of QA; Advisor 7 Oct: one mechanism, every PM control kept as the reset's hold). With a
+    reset's flatten waiting, Flatten was refused and the kill switch skipped the strategy, and a Stop was overridden
+    by the reset's restart: each fresh run traded. Now Flatten and the kill switch are kept as the fresh run's pause
+    without a second sale, and a Stop leaves it stopped."""
+    from sleeve_fund.supervisor import Supervisor
+
+    c, store = client
+    pm = {"auth": ("pm", "test-pw"), "headers": {"origin": "http://testserver"}, "follow_redirects": False}
+    for name in ("s2", "s3"):
+        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                            starting_balance=10_000, risk_profile="balanced")
+    for name in ("s1", "s2", "s3"):
+        store.set_desired_state(name, "running")
+        store.set_status(name, "running")
+        store.record_fill(name, side="BUY", qty=0.01, price=60_000.0, fee=0.3, order_id="o1", trade_id="t1")
+        assert c.post(f"/sleeves/{name}/reset", data={"reason": "Test finished"}, **pm).status_code == 303
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()  # each reset's flatten waits for its process
+    flat = c.post("/sleeves/s1/command", data={"command": "flatten", "reason": "Hold it"}, **pm).headers["location"]
+    assert "command_error" not in flat
+    assert c.post("/book/flatten", data={"reason": "Drawdown"}, **pm).headers["location"] == "/risk?killed=3"
+    assert "command_error" not in c.post("/sleeves/s3/command", data={"command": "stop", "reason": "Done"},
+                                         **pm).headers["location"]
+    sup.reset_pending()  # s3's flatten went with its Stop: queued again, started only to sell
+    for name in ("s1", "s2", "s3"):
+        flattens = [cmd for cmd in store.pending_commands(name) if cmd["command"] == "flatten"]
+        assert len(flattens) == 1, (name, flattens)  # one sale each, never a second
+        store.mark_applied(flattens[0]["id"])
+        store.record_fill(name, side="SELL", qty=0.01, price=60_000.0, fee=0.3, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_resets() == []
+    s1, s2, s3 = (store.sleeve(n) for n in ("s1", "s2", "s3"))
+    assert s1.status == "paused" and s1.status_reason.startswith("flattened by PM: Book kill switch: Drawdown")
+    assert s2.status == "paused" and s2.status_reason.startswith("flattened by PM: Book kill switch: Drawdown")
+    assert s3.desired_state == "stopped"
