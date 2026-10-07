@@ -130,6 +130,7 @@ def run_backtest(
     fees: FeeSchedule | None = None,
     warmup_prices: pd.DataFrame | None = None,
     first_touch_flip: bool = False,
+    first_touch_count_from: pd.Timestamp | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -157,7 +158,8 @@ def run_backtest(
     strategy's warm-up from the history store is, so the window opens on settled indicators.
 
     first_touch_flip: resolve a rule-builder first_touch the other way when a candle is ambiguous (true in an entry,
-    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07)."""
+    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07). first_touch_count_from: its
+    report counts only the candles closing from then on, so a study reads a window's test candles alone."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -249,6 +251,7 @@ def run_backtest(
             strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
         for node in getattr(getattr(strategy, "rules", None), "touches", ()):
             node.flip = first_touch_flip
+            node.count_from = None if first_touch_count_from is None else int(pd.Timestamp(first_touch_count_from).value)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
         spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
