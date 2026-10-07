@@ -177,7 +177,7 @@ def test_a_warm_up_that_loads_fewer_bars_than_the_model_needs_says_so_as_a_warni
     instrument = venue("kraken").instrument("BTC", "USD")
     bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=30)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))

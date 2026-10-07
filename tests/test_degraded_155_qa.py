@@ -244,7 +244,10 @@ def test_d8_a_hole_inside_the_warm_up_window_is_named(tmp_path):
     hs = HistoryStore(tmp_path / "h")
     hs.append_bars("KRAKEN", "BTC/USD", [(int(t.value), 100.0, 100.0, 100.0, 100.0, 1.0) for t in opens], "live")
     events = []
-    rt = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a, **k: events.append(a)})()})()
+    rt = type("R", (), {"name": "s1", "backtest": False,  # harness: #146's warm-up reads these (main fac1a93)
+                        "store": type("S", (), {"event": lambda self, *a, **k: events.append(a),
+                                                "orders": lambda self, *a, **k: [],
+                                                "sleeve": lambda self, name: type("Row", (), {"heartbeat_at": None})()})()})()
     inst = kraken_inst()
     cfg = TrendFilterConfig(instrument_id=inst.id, bar_type=BarType.from_str("BTC/USD.KRAKEN-15-MINUTE-LAST-INTERNAL"),
                             fast=5, slow=20, assumed_taker_fee=0.004, warmup_bars=100)
