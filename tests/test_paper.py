@@ -438,7 +438,7 @@ def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, down=None, **p
             for intent, side, i, sec in orders][::-1]
     store = type("S", (), {"orders": lambda self, name, limit=500: rows, "event": lambda self, *a, **k: None,
                            "fills": lambda self, name, limit=500: []})()
-    runtime = type("R", (), {"name": "s1", "backtest": False, "store": store,
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": store, "last_fill_this_run": lambda self: None,
                              "book": {"qty": book_qty, "entry_px": 100.0 if book_qty else None}})()
     cls, cfg = REGISTRY[strategy]
     s = cls(cfg(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005,
@@ -595,7 +595,8 @@ def test_a_restart_catches_up_an_exit_a_missed_candle_said_once_at_market(held, 
     (intent, reason, values), = sold
     assert (intent, reason) == ("exit", "Late exit, missed candle 03:00")
     assert values["missed_candle"].endswith("T03:00:00+00:00")
-    assert [e[1:3] for e in events] == [("warning", "late_exit")] and "closed while the strategy was down" in events[0][3]
+    assert [e[1:3] for e in events] == [("warning", "late_exit")]
+    assert "closed while the strategy was down" in events[0][3]
     # on the side held at every missed candle: nothing to catch up
     _says(cls, monkeypatch, {165: 0, "else": held})
     assert _restarted("trend_filter", [100_000.0] * 200, entry, book_qty=0.1 * held, down=170)._missed_exit is None
