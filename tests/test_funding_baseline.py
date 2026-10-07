@@ -168,8 +168,6 @@ def test_paper_refuses_to_start_a_perp_whose_latest_settlement_step_is_shorter(t
     _switching_rates(tmp_path)
     s = SimpleNamespace(strategy="buy_and_hold", instrument="BTC/USDT", venue="BINANCE",
                         params={"market": "perp", "venue": "BINANCE"})
-    monkeypatch.setattr("sleeve_fund.paper.config.from_store", lambda s: SimpleNamespace(venue="BINANCE"))
     with pytest.raises(ValueError, match="funding schedule mismatch"):
         check_funding_schedule(s)
-    monkeypatch.setattr("sleeve_fund.paper.config.from_store", lambda s: SimpleNamespace(venue="KRAKEN"))
-    check_funding_schedule(SimpleNamespace(**{**vars(s), "params": {"market": "perp"}}))  # simulated: no venue rates
+    check_funding_schedule(SimpleNamespace(**{**vars(s), "venue": "KRAKEN", "params": {"market": "perp"}}))  # simulated
