@@ -298,7 +298,7 @@ def risk_cell(p: dict, row: dict | None) -> dict:
         if row is None:
             return {"kind": "none", "amount": None}
         if row["risk"] is None:
-            return {"kind": "unknown", "amount": None}
+            return {"kind": "unknown", "amount": None, "through": row["basis"] == "gapped"}
         kind = {"stop": "stop", "stopless": "estimated", "gapped": "through"}[row["basis"]]
         return {"kind": kind, "amount": row["risk"], "trailing": bool(p.get("trailing_model"))}
     if p.get("trailing"):
@@ -311,7 +311,7 @@ def risk_cell(p: dict, row: dict | None) -> dict:
 
 
 # Why a part is left out of Open risk, by risk_cell kind, as the hover says it.
-LEFT_OUT = {"unknown": "not counted, its daily ATR isn't known yet",
+LEFT_OUT = {"unknown": "no stop to measure and its daily ATR isn't known yet, so not counted",
             "none": "not counted by the open-risk limit (archived)",
             "trailing": "trailing stop, level not shown, not counted",
             "unbounded": "no stop, so unbounded",
@@ -319,41 +319,55 @@ LEFT_OUT = {"unknown": "not counted, its daily ATR isn't known yet",
 STOPLESS_WORDS = "counted at the larger of 10% and 3 daily ATRs"
 
 
+def _tally(cells: list[tuple[str, dict]]) -> tuple[float, int, list[str], list[str], dict[str, list[str]]]:
+    """(total, parts counted, estimated, through, left out by kind) over (strategy, risk cell) pairs."""
+    total, counted, estimated, through, left_out = 0.0, 0, [], [], {}
+    for name, cell in cells:
+        if cell["amount"] is None:
+            left_out.setdefault(cell["kind"], []).append(name)
+            continue
+        total, counted = total + cell["amount"], counted + 1
+        if cell["kind"] == "estimated":
+            estimated.append(name)
+        elif cell["kind"] == "through":
+            through.append(name)
+    return total, counted, estimated, through, left_out
+
+
 def open_risk(positions: list[dict], store: Store | None = None) -> dict:
     """Margin and Open risk across positions (open_position's dicts), each position given its "risk" cell
-    (risk_cell). A perpetual's part is what the 5% open-risk limit counts (open_risk.book_open_risk: one formula,
-    so the perpetuals' total equals the gate's; Advisor 7 Oct 18:50 UK): a stop measured from the mark; no stop, a
-    trail checked at the close or a stop the price has gone through at the stopless measure, named as estimated.
-    Spot, outside the limit, adds its risk to stop, and the hover says so (CR, 7 Oct). Whatever can't be measured is left out and named, so the
-    figure carries the "+" (P1-U24-1)."""
+    (risk_cell). Open risk is the 5% open-risk limit's figure and nothing else, so the tile equals the gate
+    (open_risk.book_open_risk, one formula; Advisor 7 Oct 18:50 UK; QA R200-1): perpetuals only, a stop measured
+    from the mark; no stop, a trail checked at the close or a stop the price has gone through at the stopless
+    measure, named as estimated. Spot is outside the limit and has its own line, its risk to stop (spot_risk).
+    Whatever can't be measured is left out and named, so the figure carries the "+" (P1-U24-1); with nothing
+    measured at all it has no figure (None) rather than a 0."""
     from sleeve_fund import open_risk as limit
 
     rows = {}
     if store is not None and any(p.get("perp_limit") for p in positions):
         rows = {r["sleeve"]: r for r in limit.book_open_risk(store, _atr_pct(utcnow()))}
-    total, estimated, through, left_out = 0.0, [], [], {}
     for p in positions:
-        cell = p["risk"] = risk_cell(p, rows.get(p["sleeve"]))
-        if cell["amount"] is None:
-            left_out.setdefault(cell["kind"], []).append(p["sleeve"])
-            continue
-        total += cell["amount"]
-        if cell["kind"] == "estimated":
-            estimated.append(p["sleeve"])
-        elif cell["kind"] == "through":
-            through.append(p["sleeve"])
+        p["risk"] = risk_cell(p, rows.get(p["sleeve"]))
+    perps = [(p["sleeve"], p["risk"]) for p in positions if p.get("perp_limit")]
+    spots = [(p["sleeve"], p["risk"]) for p in positions if not p.get("perp_limit")]
+    total, counted, estimated, through, left_out = _tally(perps)
+    spot_total, spot_counted, _, _, spot_left = _tally(spots)
     trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
-    perps, spot = any(p.get("perp_limit") for p in positions), any(not p.get("perp_limit") for p in positions)
-    basis = ("The 5% limit's figure plus spot risk to stop" if perps and spot else
-             "The 5% limit's figure" if perps else "Spot risk to stop, outside the 5% limit" if spot else "")
     return {
         "margin": sum(p["margin"] for p in positions),
-        "open_risk": total,
+        "open_risk": total if counted or not left_out else None,
         "estimated": estimated,
         "through": through,
         "left_out": [n for names in left_out.values() for n in names],
         "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
-        "hint": " · ".join(filter(None, (basis, open_risk_hint(estimated, through, left_out, trailing)))),
+        "hint": open_risk_hint(estimated, through, left_out, trailing) or (
+            "Money lost if every stop is hit, as the 5% open-risk limit counts it" if perps else
+            "No perpetual positions: the 5% open-risk limit counts perpetuals only"),
+        "spot": [n for n, _ in spots],
+        "spot_risk": (spot_total if spot_counted or not spot_left else None) if spots else None,
+        "spot_left_out": [n for names in spot_left.values() for n in names],
+        "spot_hint": open_risk_hint([], [], spot_left, trailing) or "Money lost if every spot stop is hit",
     }
 
 

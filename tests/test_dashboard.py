@@ -2404,10 +2404,14 @@ def test_open_risk_tile_with_only_a_trailing_position_shows_plus_warn_and_count(
             out[url] = (m.group(1), m.group(2)) if m else None
         return out
 
+    # The tile is the 5% limit's figure, perpetuals only (QA R200-1): spot's count is on its own line, or after
+    # the figure on the Portfolio's KPI.
     for url, got in tiles().items():
         assert got is not None, url
         assert "warn" in got[0], url
-        assert got[1].strip().endswith("0.00+ · 1 not counted"), (url, got)
+        assert got[1].strip() == ("0.00 · spot 1 not counted" if url == "/" else "0.00"), (url, got)
+    for url in ("/risk", "/trades"):
+        assert "spot, outside the limit: – to stop · 1 not counted" in c.get(url, auth=AUTH).text, url
     # A stopless position joins it: both are left out, so the count is 2.
     store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=5_000, params={})
@@ -2415,7 +2419,9 @@ def test_open_risk_tile_with_only_a_trailing_position_shows_plus_warn_and_count(
     store.record_fill("nostop", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-2", trade_id="t2")
     store.record_equity("nostop", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
     for url, got in tiles().items():
-        assert "warn" in got[0] and got[1].strip().endswith("+ · 2 not counted"), (url, got)
+        assert "warn" in got[0] and got[1].strip() == ("0.00 · spot 2 not counted" if url == "/" else "0.00"), (url, got)
+    for url in ("/risk", "/trades"):
+        assert "spot, outside the limit: – to stop · 2 not counted" in c.get(url, auth=AUTH).text, url
 
 
 def test_resuming_after_a_liquidation_says_it_stays_halted(client):

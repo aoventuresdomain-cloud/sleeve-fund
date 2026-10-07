@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_warn, risk_cell, stop_liq %}
+{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, spot_risk_text, open_risk_warn, risk_cell, stop_liq %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
@@ -97,7 +97,7 @@
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
   {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
   <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ risk.margin|money }}</div></div>
-  <div title="{{ open_risk_hint(risk) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(risk) }}">{{ open_risk_text(risk) }}</div></div>
+  <div title="{{ open_risk_hint(risk) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(risk) }}">{{ open_risk_text(risk) }}</div>{% if risk.spot %}<div class="s{{ ' warn' if risk.spot_left_out }}">{{ spot_risk_text(risk) }}</div>{% endif %}</div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
 
@@ -116,7 +116,7 @@
       <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="warn">None</span>{% endif %}</td>
       {% set pos = r.position %}
       <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
-      <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% if pos.stop_liq is not none and pos.stop_liq > 0.5 %}<div class="sub">{{ stop_liq(pos.stop_liq) }}</div>{% endif %}{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>
+      <td class="num" data-m="hide">{% if pos and pos.liq_px %}<span class="{{ 'loss' if pos.to_liq is not none and pos.to_liq < 0.1 else ('warn' if pos.to_liq is not none and pos.to_liq < 0.25) }}"{% if pos.to_liq is not none %} title="{{ pos.to_liq|pct1 }} from the mark"{% endif %}>{{ pos.liq_px|px }}</span>{% if pos.stop_liq is not none %}<div class="sub">{{ stop_liq(pos.stop_liq) }}</div>{% endif %}{% elif pos and pos.perp %}<span class="faint" title="At this size the isolated margin is never used up">none</span>{% else %}<span class="faint">–</span>{% endif %}</td>
       <td class="num" data-m="hide">{% if not pos %}<span class="faint">–</span>{% else %}{{ risk_cell(pos) }}{% endif %}</td>
     </tr>{% endfor %}</tbody>
   </table>

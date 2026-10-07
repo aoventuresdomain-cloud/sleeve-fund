@@ -1,7 +1,7 @@
 {# Open positions, one table for the Portfolio and the strategy page (UI v2 item 5): the same columns in the same
    order, Strategy first on the Portfolio only. Rows are trading.book_positions rows. No percentages in cells; a
    distance or share goes in the cell's title. Margin, liquidation and risk to stop read the view's figures. #}
-{% from "_macros.html" import money_signed, open_risk_warn, open_risk_hint, open_risk_text, risk_cell, stop_liq %}
+{% from "_macros.html" import money_signed, open_risk_warn, open_risk_hint, open_risk_text, spot_risk_text, risk_cell, stop_liq %}
 
 {% macro _lev(p) -%}
 {%- set lev = p.leverage if p.leverage is defined and p.leverage is not none else (p.perp.leverage if p.perp else none) -%}
@@ -12,7 +12,7 @@
 {% macro _liq(p) -%}
 {%- set liq = p.liq_px if p.liq_px is defined else (p.perp.liq_px if p.perp else none) -%}
 {%- set to_liq = p.to_liq if p.to_liq is defined else (p.perp.to_liq if p.perp else none) -%}
-{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>{% if p.stop_liq is defined and p.stop_liq is not none and p.stop_liq > 0.5 %}<div class="sub">{{ stop_liq(p.stop_liq) }}</div>{% endif %}
+{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>{% if p.stop_liq is defined and p.stop_liq is not none %}<div class="sub">{{ stop_liq(p.stop_liq) }}</div>{% endif %}
 {%- elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>
 {%- else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif -%}
 {%- endmacro %}
@@ -49,7 +49,7 @@
   {% if rows|length > 1 %}<tfoot><tr><th scope="row" colspan="{{ 5 if show_strategy else 4 }}">Total, {{ rows|length }} positions</th>
     <td class="num">{{ positions.notional|money }}</td><td colspan="5"></td>
     <td class="num">{{ money_signed(positions.unrealised) }}</td>
-    <td class="num">{% if positions.open_risk is defined %}<span class="{{ open_risk_warn(positions) }}" title="{{ open_risk_hint(positions) }}">{{ open_risk_text(positions) }}</span>{% else %}<span class="faint" title="Waiting on the corrected figure">–</span>{% endif %}</td>
+    <td class="num">{% if positions.open_risk is defined %}<span class="{{ open_risk_warn(positions) }}" title="{{ open_risk_hint(positions) }}">{{ open_risk_text(positions) }}</span>{% if positions.spot %}<div class="sub{{ ' warn' if positions.spot_left_out }}">{{ spot_risk_text(positions) }}</div>{% endif %}{% else %}<span class="faint" title="Waiting on the corrected figure">–</span>{% endif %}</td>
     <td class="num">{{ positions.fees|money }}</td><td></td></tr></tfoot>{% endif %}
 </table>
 {# Phones: a card per position. #}

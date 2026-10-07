@@ -1,7 +1,8 @@
 """Phase 2 risk readouts (FE v2; Advisor 7 Oct 18:50, 18:55 and 19:00 UK). Open risk on the dashboard is what the 5%
 open-risk limit counts, read through open_risk.book_open_risk, so the tile equals the gate: a perpetual with no stop,
 a close-checked trail or a stop the price has gone through counts at notional x max(10%, 3 daily ATR), named as
-estimated, never 0. A stop's distance towards liquidation reads amber past half way. A stop booked as a liquidation
+estimated, never 0; spot has its own line, outside the limit (QA R200-1). A stop's distance towards liquidation
+reads in words, faint within half way, amber past it. A stop booked as a liquidation
 reads in the Advisor's words, from the engine's stop_relabelled flag. conftest gives every pair a 2% daily ATR, so a
 stopless perpetual counts at 10% of its notional."""
 
@@ -55,9 +56,8 @@ def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
     _hold(store, "nostop", 0.1)
     asked = []
 
-    def atr(s):
+    def atr(s):  # no daily ATR known
         asked.append(s.name)
-        return None
 
     rows = {r["sleeve"]: r for r in open_risk.book_open_risk(store, atr)}
     assert asked == ["nostop"]
@@ -174,24 +174,34 @@ def test_a_perp_whose_daily_atr_isnt_known_is_left_out_and_named(client, monkeyp
     monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: None)
     _hold(store, "nostop", 0.1)
     for url, got in _tiles(c).items():
-        assert got[1] == "0.00+ · 1 not counted" and "warn" in got[0], (url, got)
-    assert "nostop: not counted, its daily ATR isn&#39;t known yet" in c.get("/risk", auth=AUTH).text
+        assert got[1] == "– · 1 not counted" and "warn" in got[0], (url, got)  # nothing measured: never 0
+    assert "nostop: no stop to measure and its daily ATR isn&#39;t known yet, so not counted" in c.get("/risk", auth=AUTH).text
 
 
-def test_a_stop_past_half_way_to_liquidation_reads_amber(client, monkeypatch):
+@pytest.mark.parametrize("stop_frac, cls, words", [
+    (0.08, "warn", "stop past half way to liquidation"),  # stop 55,200: 80% of the way from 60,000 to 54,000
+    (0.02, "faint", "stop within half way to liquidation"),  # 58,800: 20%, shown faint rather than hidden
+    (0.11, "loss", "stop at or past liquidation"),  # 53,400: the venue liquidates first
+])
+def test_a_stops_way_to_liquidation_reads_in_words_with_the_share_in_the_title(client, monkeypatch, stop_frac, cls,
+                                                                              words):
     c, store = client
     monkeypatch.setattr(trading, "position_margin", lambda x: (1_000.0, 54_000.0))
-    _hold(store, "far", 0.1, stop_frac=0.08)  # stop 55,200: 80% of the way from 60,000 to 54,000
-    page = c.get("/sleeves/far", auth=AUTH).text
-    assert re.search(r'<span class="warn" title="From the current price: past the half-way rule[^"]*">stop 80% of the way to liquidation', page)
-    assert "stop 80% of the way to liquidation" in c.get("/risk", auth=AUTH).text
+    _hold(store, "far", 0.1, stop_frac=stop_frac)
+    share = round((60_000 * stop_frac) / 6_000 * 100)
+    pattern = rf'<span class="{cls}" title="From the current price, the stop is {share}% of the way to liquidation[^"]*">{words}</span>'
+    for url in ("/sleeves/far", "/risk", "/trades", "/"):
+        assert re.search(pattern, c.get(url, auth=AUTH).text), url
 
 
-def test_the_hover_says_what_the_figure_is_made_of(client):
-    """CR 7 Oct: with spot held too, the figure is the 5% limit's plus spot risk to stop, and the hover says so."""
+def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
+    """QA R200-1: the tile is the 5% limit's figure, perpetuals only, so it equals the gate; spot risk to stop is
+    its own line, outside the limit."""
     c, store = client
-    _hold(store, "perp", 0.1, price=61_000, stop_frac=0.02)
-    assert "The 5% limit&#39;s figure" in c.get("/risk", auth=AUTH).text
+    _hold(store, "perp", 0.1, price=61_000, stop_frac=0.02)  # 220.00, the gate's figure
     _hold(store, "spot", 0.1, price=61_000, params={"stop_loss": 0.02}, stop_frac=0.02)
-    for url in ("/", "/risk", "/trades"):
-        assert "The 5% limit&#39;s figure plus spot risk to stop" in c.get(url, auth=AUTH).text, url
+    for url, got in _tiles(c).items():
+        assert got[1] == "220.00" and "warn" not in got[0], (url, got)
+    for url in ("/risk", "/trades"):
+        assert re.search(r'<div class="s">spot, outside the limit: [\d,.]+ to stop</div>', c.get(url, auth=AUTH).text), url
+    assert "Spot (spot) is outside the 5% limit" in c.get("/", auth=AUTH).text

@@ -755,6 +755,7 @@ td.health { line-height: 1.35; }
 .kpi .k { display: flex; align-items: center; color: var(--muted); font-size: 11.5px; font-weight: 500; white-space: nowrap; }
 .kpi .k .help { flex: none; margin-left: 3px; }
 .kpi .v { font-size: 17px; font-weight: 550; letter-spacing: -0.02em; white-space: nowrap; margin-top: 3px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; }
+.kpi.wrap .v { white-space: normal; overflow-wrap: anywhere; }  /* a figure with a count after it wraps, never truncates */
 .kpi .s { color: var(--muted); font-size: 11.5px; margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
 .kpi.lead { background: linear-gradient(160deg, var(--accent-soft), var(--panel) 70%); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
 .kpi.lead .v { font-size: 21px; letter-spacing: -0.03em; }
