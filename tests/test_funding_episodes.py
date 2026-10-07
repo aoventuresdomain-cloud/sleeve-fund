@@ -28,6 +28,8 @@ from o17_harness import (  # noqa: F401  (fixtures are used by name)
 def test_a_second_missing_settlement_keeps_the_episode_open_when_the_first_arrives(tmp_path, monkeypatch, binance):
     """08:00 never arrives, 16:00 arrives at 16:30: one funding_stale for the whole stretch and no
     funding_stale_cleared, so the inbox never says the instrument is fine while a charge is still on the baseline."""
+    # A trade every 5 s: with #146, a trade gap past UNSEEN_GAP_NS (15 s) defers funding while the minutes it missed
+    # are still to come, so 30-second ticks would never settle in this harness.
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 16:40", 1)),
                 "2025-10-03 07:50", 530, step=5, rates={"2025-10-03 16:00": 0.0002},
                 published={"2025-10-03 08:00": NEVER, "2025-10-03 16:00": "2025-10-03 16:30"})
@@ -209,3 +211,54 @@ def test_a_strategy_still_missing_a_settlement_reopens_an_episode_closed_meanwhi
         LongFlatStrategy._watch_funding_recovery(s, None, t16 + pd.Timedelta(minutes=minute))
     assert [k for _, k, _ in inbox.sent] == ["funding_stale"]
     assert "16:00" in inbox.sent[0][2] and inbox.sent[0][2].startswith(tag)
+    assert inbox.kept[0]["ts"] == t16  # opened on the missing settlement, so only its own rate closes it
+
+
+def _hub_pass(monkeypatch, binance, store, at, kept: dict):
+    """One collector pass over the instrument at simulated time `at`, its store holding `kept`, alerting into the
+    paper journal `store` at that time."""
+    from types import SimpleNamespace
+
+    import sleeve_fund.store as store_mod
+    from o17_harness import _REAL_RATES, write_rates
+    from sleeve_fund import funding, history
+
+    write_rates(kept)
+    real_stale = funding.stale
+    with monkeypatch.context() as m:
+        m.setattr(funding, "rates", _REAL_RATES)
+        m.setattr(funding, "stale", lambda v, p, root=None, now=None: real_stale(v, p, root, now=utc(at)))
+        m.setattr(binance, "funding_loader", lambda pair, start: [])
+        m.setattr(binance, "stats_loaders", {})
+        m.setattr(store_mod, "Store", lambda *a, **k: SimpleNamespace(
+            events_of=store.events_of,
+            event=lambda sleeve, level, kind, message, ts=None: store.event(sleeve, level, kind, message,
+                                                                            ts=ts or utc(at).to_pydatetime())))
+        history._warned.clear()
+        history._refresh_funding(binance, PAIR, funding.DEFAULT_ROOT, None)
+    funding._cache.clear()
+
+
+def test_the_collector_does_not_close_an_episode_on_a_later_settlement_while_its_own_never_arrives(
+        tmp_path, monkeypatch, binance):
+    """08:00 never arrives, 16:00 arrives at 16:30. Paper opens the episode at 08:15; the hub's passes after 16:30 see
+    16:00 kept but never 08:00, so they leave it open: one funding_stale and no clear, rather than an open/clear pair
+    on every pass (CR on #163)."""
+    from o17_harness import journal
+    from sleeve_fund import history
+
+    monkeypatch.setattr(history, "_stale", set())
+    store = journal()
+    paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 17:40", 1)), "2025-10-03 07:50", 530,
+          step=5, rates={"2025-10-03 16:00": 0.0002}, store=store, name="w",
+          published={"2025-10-03 08:00": NEVER, "2025-10-03 16:00": "2025-10-03 16:30"})
+    kept = {"2025-10-02 16:00": 0.0001, "2025-10-03 00:00": 0.0001, "2025-10-03 16:00": 0.0002}
+    for at in ("2025-10-03 16:45", "2025-10-03 17:45", "2025-10-03 18:45"):
+        _hub_pass(monkeypatch, binance, store, at, kept)
+    got = [e["kind"] for e in store.events(None, limit=500) if e["kind"].startswith("funding_stale")]
+    assert got == ["funding_stale"], got
+    kept["2025-10-03 08:00"] = 0.0001  # backfilled at last: the episode closes, once
+    _hub_pass(monkeypatch, binance, store, "2025-10-03 19:45", kept)
+    _hub_pass(monkeypatch, binance, store, "2025-10-03 20:45", kept)
+    got = [e["kind"] for e in reversed(store.events(None, limit=500)) if e["kind"].startswith("funding_stale")]
+    assert got == ["funding_stale", "funding_stale_cleared"], got

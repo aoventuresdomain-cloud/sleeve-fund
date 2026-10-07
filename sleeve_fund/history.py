@@ -608,7 +608,7 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
                 # it was opened on, and stays open while that settlement is missing (QA P1-O17a-8).
                 open_ = funding.stale_open(inbox, tag)
                 kept = funding.rates(profile.name, pair, root).index
-                if open_ is not True or _caught_up(kept, funding.stale_since(inbox, tag)):
+                if open_ is not True or _caught_up(kept, funding.stale_since(inbox, tag), profile.funding_hours):
                     was = key in _stale
                     _stale.discard(key)
                     if open_ is True or (open_ is None and was):
@@ -620,16 +620,17 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
     _refresh_open_interest(profile, pair, root, funding_to)
 
 
-def _caught_up(kept, since) -> bool:
-    """Whether the kept rates reach the settlement due when a staleness episode opened (`since`): the opener raises
-    it after that settlement was due, so its interval boundary at or before `since` is the settlement it waited on.
-    An unknown opening time is taken as caught up, as before (the rates keep up)."""
-    from sleeve_fund import funding
+def _caught_up(kept, since, hours: tuple[int, ...]) -> bool:
+    """Whether the store holds the settlement a staleness episode was opened on: the venue's last settlement at or
+    before the episode's opening time (`since`). Only that settlement's own rate closes it, so a later one arriving
+    while it is still missing leaves the episode open (CR on #163) and the hole is named by funding_gap. An unknown
+    opening time is taken as caught up, as before (the rates keep up)."""
+    from sleeve_fund import funding, markets
 
-    if since is None or not len(kept):
-        return since is None
-    step = kept[-1] - kept[-2] if len(kept) > 1 else pd.Timedelta(hours=8)
-    return kept[-1] >= since.floor(step) - funding.MATCH
+    if since is None:
+        return True
+    due = markets.funding_times(since - pd.Timedelta(days=1), since, hours)[-1]
+    return bool(len(kept)) and bool((abs(kept - pd.Timestamp(due)) <= funding.MATCH).any())
 
 
 def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:

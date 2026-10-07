@@ -2623,7 +2623,7 @@ class LongFlatStrategy(Strategy):
             first = min(self._funding_missing - arrived)
             self._funding_episode(pair, True, f"No settled funding rate from the venue for {pair} at "
                                   f"{first:%d %b %Y %H:%M} UTC yet; charging the baseline, whichever side is held, "
-                                  "until it arrives")
+                                  "until it arrives", ts=first)  # opened on that settlement, so only its rate closes it
         if not arrived:
             return
         self._funding_missing -= arrived
@@ -2634,7 +2634,7 @@ class LongFlatStrategy(Strategy):
                                                   "has arrived from the venue"
                                                   + (f", with {len(arrived) - 1} earlier" if len(arrived) > 1 else ""))
 
-    def _funding_episode(self, pair: str, stale: bool, message: str) -> None:
+    def _funding_episode(self, pair: str, stale: bool, message: str, ts=None) -> None:
         """Open (funding_stale, a warning) or close (funding_stale_cleared) the instrument's staleness episode, once
         whichever strategy on it, or the collector, notices first: the journal's latest such event for the instrument
         says whether one is open (Advisor, 6 Oct 2026: per instrument, once per episode; CR, #163)."""
@@ -2647,7 +2647,7 @@ class LongFlatStrategy(Strategy):
         tag = funding.stale_tag(getattr(perp, "funding_venue", None) or "", pair)
         open_ = funding.stale_open(rt.store, tag)
         if stale and open_ is not True:
-            rt.store.event(None, "warning", "funding_stale", f"{tag} {message}", ts=rt.now())
+            rt.store.event(None, "warning", "funding_stale", f"{tag} {message}", ts=ts or rt.now())
         elif not stale and open_ is not False:
             rt.store.event(None, "info", "funding_stale_cleared", f"{tag} {message}", ts=rt.now())
 
