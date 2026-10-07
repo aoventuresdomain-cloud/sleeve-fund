@@ -93,9 +93,17 @@ class RandomSideResult:
 
 
 def _trade_returns(closes: np.ndarray, entries: np.ndarray, holds: np.ndarray, sides: np.ndarray,
-                   cost: float) -> np.ndarray:
+                   cost) -> np.ndarray:
     gross = closes[entries + holds] / closes[entries] - 1
-    return sides * gross - 2 * cost
+    return sides * gross - _round_trip(cost, entries, holds)
+
+
+def _round_trip(cost, entries: np.ndarray, holds: np.ndarray):
+    """Both sides' cost: one figure per side, or one per bar (the spread in force at each bar, SPREAD-PIT), charged
+    at the entry's bar and the exit's."""
+    if np.ndim(cost) == 0:
+        return 2 * cost
+    return cost[entries] + cost[entries + holds]
 
 
 def _sharpe(r: np.ndarray) -> float:
@@ -143,7 +151,7 @@ def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
     return per_window, test_bars, held
 
 
-def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side,
                 draws: int = DRAWS, seed: int = 0) -> RandomSideResult:
     """As random_entry, but the entries stay put and each trade's side is drawn at random, long or short."""
     c = np.asarray(closes, dtype=float)
@@ -157,16 +165,16 @@ def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cos
     actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side))
     gross = c[entries + holds] / c[entries] - 1
     drawn = rng.choice(np.array([-1, 1]), size=(draws, len(holds)))
-    rets = np.prod(1 + drawn * gross - 2 * cost_per_side, axis=1) - 1
+    rets = np.prod(1 + drawn * gross - _round_trip(cost_per_side, entries, holds), axis=1) - 1
     return RandomSideResult(return_percentile=float((rets < actual).mean() * 100), strategy_return=actual,
                             median_random_return=float(np.median(rets)), trades=len(holds), draws=draws)
 
 
-def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side,
                  draws: int = DRAWS, seed: int = 0, in_market: float | None = None) -> RandomEntryResult:
     """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
     walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
-    fraction, charged on entry and exit alike. in_market: the share of the windows' bars the strategy held any
+    fraction, charged on entry and exit alike: one figure, or one per bar of closes (the spread in force then). in_market: the share of the windows' bars the strategy held any
     position, trades carried in and still open at the end included, though those stay out of the comparison
     (Independent Quant Advisor, 6 Oct 2026); without it, the bars the given trades held."""
     c = np.asarray(closes, dtype=float)

@@ -207,3 +207,33 @@ def test_a_take_profit_books_with_the_spread_in_force_when_it_fills_not_when_it_
     assert exit_px == pytest.approx(float(target_fill_px(level, True, 0.003)), rel=1e-6)  # what it booked
     assert res.decisions[coid]["signal"]["book_px"] == pytest.approx(exit_px, rel=1e-6)  # and journaled
     assert f"booked at {res.decisions[coid]['signal']['book_px']:,.6g}" in res.decisions[coid]["reason"]
+
+
+def test_the_random_entry_baseline_pays_the_spread_in_force_at_each_bar_as_the_strategy_does():
+    """QD 7 Oct: the strategy pays each fill's own spread, so the baseline it must beat is charged from the same
+    series, at the bars each trip (the strategy's or a draw's) opens and closes on."""
+    import numpy as np
+
+    from sleeve_fund.research.random_entry import Trade, random_entry, random_side
+
+    closes = np.linspace(100.0, 120.0, 40)
+    trades, windows = [Trade(5, 15, 1), Trade(20, 30, -1)], [(0, 39)]
+    flat = random_entry(closes, trades, windows, 0.001)
+    assert random_entry(closes, trades, windows, np.full(40, 0.001)).strategy_return == pytest.approx(
+        flat.strategy_return)
+    cost = np.where(np.arange(40) < 18, 0.001, 0.004)  # the spread widened from bar 18
+    pit = random_entry(closes, trades, windows, cost)
+    long_leg = closes[15] / closes[5] - 1 - 0.002
+    short_leg = -(closes[30] / closes[20] - 1) - 0.008
+    assert pit.strategy_return == pytest.approx((1 + long_leg) * (1 + short_leg) - 1)
+    side = random_side(closes, trades, windows, cost)
+    assert side.strategy_return == pytest.approx(pit.strategy_return)
+
+
+def test_series_at_many_matches_at():
+    import numpy as np
+
+    s = SpreadSeries(((_ns(T0), _measured(0.0002, T0)), (_ns(T0 + timedelta(hours=1)), _measured(0.0003, T0))),
+                     SpreadQuote(0.0005, "assumed", 0, None))
+    times = [_ns(T0) - 1, _ns(T0), _ns(T0 + timedelta(minutes=59)), _ns(T0 + timedelta(hours=1)), _ns(T0) + 10**15]
+    assert list(s.at_many(np.array(times))) == [s.at(t) for t in times]

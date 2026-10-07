@@ -79,6 +79,14 @@ class SpreadSeries:
         i = bisect_right(self._froms, ts_ns)
         return self.points[i - 1][1] if i else self.assumed
 
+    def at_many(self, ts_ns):
+        """The half spread in force at each of an array of UNIX ns times, as a numpy array."""
+        import numpy as np
+
+        values = np.array([self.assumed.half_spread] + [q.half_spread for _, q in self.points])
+        return values[np.searchsorted(np.array(self._froms, dtype=np.int64), np.asarray(ts_ns, dtype=np.int64),
+                                      side="right")]
+
     def at(self, ts_ns) -> float:
         return self.quote_at(ts_ns).half_spread
 

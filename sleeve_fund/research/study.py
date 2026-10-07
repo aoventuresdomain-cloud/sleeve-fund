@@ -611,7 +611,8 @@ def run_study(
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(instrument.taker_fee) + spread_used, full_default.shorts)
+        research, folds, test_bars, float(instrument.taker_fee), series if series is not None else spread_used,
+        full_default.shorts)
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "
@@ -790,11 +791,14 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
     return int((inside.abs() > 1e-9).sum())
 
 
-def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool):
+def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
-    are priced on those bars' closes, so the benchmark compares timing, not fills."""
+    are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
+    SpreadSeries whose value in force at each bar's close is charged there, for the strategy's trips and the draws
+    alike (SPREAD-PIT)."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
+    cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
 
     def bar(ts) -> int:
         return max(int(index.searchsorted(ts, side="right")) - 1, 0)
