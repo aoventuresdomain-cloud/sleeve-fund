@@ -73,7 +73,10 @@ def check_funding_schedule(s: Sleeve) -> None:
     from sleeve_fund import funding, markets
     from sleeve_fund.paper.config import from_store
 
-    terms = markets.terms(s.params, from_store(s).venue)
+    try:
+        terms = markets.terms(s.params, from_store(s).venue)
+    except ValueError:  # a market the venue doesn't list: the node's own start refuses it, with its reason
+        return
     if terms is None or terms.funding_venue is None:
         return
     why = funding.schedule_mismatch(terms.funding_venue, s.instrument, terms.funding_hours, latest=True)

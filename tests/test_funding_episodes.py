@@ -29,7 +29,7 @@ def test_a_second_missing_settlement_keeps_the_episode_open_when_the_first_arriv
     """08:00 never arrives, 16:00 arrives at 16:30: one funding_stale for the whole stretch and no
     funding_stale_cleared, so the inbox never says the instrument is fine while a charge is still on the baseline."""
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 16:40", 1)),
-                "2025-10-03 07:50", 530, step=30, rates={"2025-10-03 16:00": 0.0002},
+                "2025-10-03 07:50", 530, step=5, rates={"2025-10-03 16:00": 0.0002},
                 published={"2025-10-03 08:00": NEVER, "2025-10-03 16:00": "2025-10-03 16:30"})
     assert len(kinds(out["events"], "funding_stale")) == 1
     assert not kinds(out["events"], "funding_stale_cleared")

@@ -341,12 +341,21 @@ def _funding_bars(side, wick_in_bar: bool):
     return df
 
 
+def _funding_rate_stub(strategy_cls, rate):
+    """A fixed funding rate for `_funding_rate`, on either signature (harness only, 7 Oct 00:35): before #163 it takes
+    (terms, ts, now) and returns the rate; from #163 it also takes held= and returns (rate, is_baseline)."""
+    import inspect
+
+    if "held" in inspect.signature(strategy_cls._funding_rate).parameters:
+        return lambda self, terms, ts, now, held=True, *_, **__: (rate, False)
+    return lambda self, terms, ts, now, *_, **__: rate
+
 def _funding_run(side, wick_in_bar, monkeypatch, rate=0.0001):
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.strategies.base import LongFlatStrategy
     from sleeve_fund.venues import venue
 
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now: rate)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, rate))
     inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
     params = {"enter": 180, "leave": 10**6, "side": side, "take_profit": 0.02, "market": "perp",
               "allow_short": True}
@@ -875,7 +884,7 @@ def _funding_paper(monkeypatch, *, side, stop_in_outage: bool, rate=0.0001):
 
     start = int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value)
     monkeypatch.setattr(qa, "START", start)
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now: rate)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, rate))
     p = flat_prices(40)
     if stop_in_outage:
         p = shape(p, 7.5, 7 + 50 / 60, adverse(side, 0.02))  # 07:57:30-07:57:50 through the 1 % stop
