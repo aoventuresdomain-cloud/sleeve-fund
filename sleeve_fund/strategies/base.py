@@ -1815,14 +1815,6 @@ class LongFlatStrategy(Strategy):
         """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
         (v2 P1-4), the latest closed slower candle is degraded (over 10% of its minutes missing: Advisor 6 Oct
         16:40, 4.1), or the decision is late (_late_entry). Exits and reductions are never held."""
-        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
-        if thin is not None:
-            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
-                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
-                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
-                       level="info")
-            return True
-        self._noted.discard("slower_degraded")
         if self._short_history is not None:
             if any(s.count < s.need for s in self._slower):
                 self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "
@@ -1833,6 +1825,14 @@ class LongFlatStrategy(Strategy):
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "info", "warmup_met",
                                          "Entries open again: its slower candles now have the closed ones they need")
+        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
+        if thin is not None:
+            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
+                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
+                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
+                       level="info")
+            return True
+        self._noted.discard("slower_degraded")
         return self._late_entry(bar, what)
 
     def _late_entry(self, bar: Bar, what: str) -> bool:
