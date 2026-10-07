@@ -738,9 +738,9 @@ for _r in REASONS:
 # (reason, path) -> mark, from the runs on main 9ae1f8a and #155 eb737bd (README). Funding: O17b's block isn't built.
 # Stopped and retired: the process still running after the PM's Stop opens and fills (the stopped-process window).
 XFAIL_REPLAY: dict = {
-    **{(r, p): xf(GATE) for r in ("funding_missing",) for p in PATHS},  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass: stopped, retired
+    **{(r, p): xf(GATE) for r in ("funding_missing",) for p in PATHS},  # PE2 (stop-safety, master 43bf3747): marks removed where these pass: stopped, retired
     **{("stale_data", p): xf(GATE, condition=ON_MAIN) for p in ("new_entry", "reversal_open_leg")},  # #155 D-items
-    # PE2 (stop-safety, master 3e66ce8f): stale_data resting_entry_fill and resting_add_fill pass (marks removed)
+    # PE2 (stop-safety, master 43bf3747): stale_data resting_entry_fill and resting_add_fill pass (marks removed)
 }
 
 
@@ -748,7 +748,7 @@ def _marked(cells, table):
     out = []
     for r, p in cells:
         marks = []
-        if r == "liquidation_gap" and not p:  # PE2 (stop-safety, master 3e66ce8f): the path cells pass; the reason-only stay
+        if r == "liquidation_gap" and not p:  # PE2 (stop-safety, master 43bf3747): the path cells pass; the reason-only stay
             marks.append(xf(GAP_LIQ))
         elif (r, p) in table:
             marks.append(table[(r, p)])
@@ -776,7 +776,7 @@ def test_replay_no_exposure_is_added_while_blocked(tmp_path, store, monkeypatch,
         assert not live, f"resting entry not cancelled at the block: {live}"
 
 
-@pytest.mark.parametrize("reason_name", [pytest.param("stopped"), pytest.param("retired")])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+@pytest.mark.parametrize("reason_name", [pytest.param("stopped"), pytest.param("retired")])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_a_stop_market_entry_resting_before_stop_or_retire_is_cancelled_and_never_fills(tmp_path, store, monkeypatch,
                                                                                        reason_name):
     """[R113; PE2 via the coordinator] A breakout-style resting entry (a STOP_MARKET order with intent entry, BUY 0.05
@@ -918,7 +918,7 @@ for _r in PAPER_REASONS:
         PAPER_CELLS.append((_r, _p))
 
 XFAIL_PAPER: dict = {
-    # PE2 (stop-safety, master 3e66ce8f): daily_pause-dashboard_resume and retired-dashboard_start pass (marks removed)
+    # PE2 (stop-safety, master 43bf3747): daily_pause-dashboard_resume and retired-dashboard_start pass (marks removed)
     **{("funding_missing", p): xf(GATE) for p in PAPER_PATHS},  # O17b not built
 }
 
@@ -1058,7 +1058,7 @@ def _maker_run(tmp_path, store, monkeypatch, reason_name, after=None):
 # The missing funding rate is a perp-only block, and maker-first is refused on a perp: no partial-fill cell for it
 # until maker reaches perps (README).
 PARTIAL_REASONS = ("drawdown_halt", "daily_pause", "stopped", "winding_down")
-XFAIL_PARTIAL: dict = {}  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped)  # README: the process trades on after the PM's Stop
+XFAIL_PARTIAL: dict = {}  # PE2 (stop-safety, master 43bf3747): marks removed where these pass (stopped)  # README: the process trades on after the PM's Stop
 
 
 @pytest.mark.parametrize("reason_name", _marked1(PARTIAL_REASONS, XFAIL_PARTIAL))
@@ -1079,7 +1079,7 @@ def test_a_partly_filled_entry_has_its_remainder_cancelled_at_the_block(tmp_path
 # held: a flattening block sells it with the rest; a block that doesn't flatten keeps it with its stop.
 KEPT_REASONS = tuple(r for r in ("drawdown_halt", "daily_pause", "stopped", "winding_down") if not _flattens(r))
 FLAT_PARTIAL_REASONS = tuple(r for r in ("drawdown_halt", "daily_pause") if _flattens(r))
-XFAIL_KEPT: dict = {}  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped)  # Stop trades on
+XFAIL_KEPT: dict = {}  # PE2 (stop-safety, master 43bf3747): marks removed where these pass (stopped)  # Stop trades on
 
 
 @pytest.mark.parametrize("reason_name", FLAT_PARTIAL_REASONS)
@@ -1156,7 +1156,7 @@ FALL = 10  # minutes into the next session when the price falls 3% through the r
 
 
 @pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}")
-                                                for st, r in U35_FLAT])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                                for st, r in U35_FLAT])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_a_raced_fill_under_a_flattening_block_is_sold_at_once(tmp_path, store, client, monkeypatch, status,
                                                                reason_name):
     """P1-U35 under the Advisor's 23:05 ruling: under a drawdown halt, a liquidation, or the daily pause of a profile
@@ -1186,7 +1186,7 @@ def test_a_raced_fill_under_a_flattening_block_is_sold_at_once(tmp_path, store, 
 
 @pytest.mark.parametrize("status,reason_name", [pytest.param(st, r, id=f"u35-{st}",
                                                              marks=[] if st in ("stopped", "retired") else xf(CHOKE))
-                                                for st, r in U35_KEEP])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass (stopped, retired)
+                                                for st, r in U35_KEEP])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass (stopped, retired)
 def test_a_raced_fill_under_a_block_that_does_not_flatten_is_kept_with_its_stop_and_one_incident(
         tmp_path, store, client, monkeypatch, status, reason_name):
     """P1-U35 [R113 Advisor 20:56 "fills racing cancel accepted and stopped, never unwatched"; Advisor 20:52 via the
@@ -1333,7 +1333,7 @@ def test_after_its_own_clearing_action_opening_works_again(tmp_path, store, clie
                                f"{[(o['ts'], o['intent']) for o in _orders(store)]}")
 
 
-# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
+# PE2 (stop-safety, master 43bf3747): passes (mark removed)
 def test_a_daily_pause_ends_at_the_next_0000_utc_roll_and_not_before(tmp_path, store, monkeypatch):
     """Assertion 5 for the daily pause [R79 "daily pause: next 00:00 UTC roll"]: paused at 10:15, it is still
     blocked 30 s before 00:00 UTC (a restart then keeps it), and opens 30 s after it, on a frozen clock."""
@@ -1366,7 +1366,7 @@ JOURNAL_HELD = ("drawdown_halt", "daily_pause", "liquidation", "winding_down", "
 
 
 @pytest.mark.parametrize("reason_name", [pytest.param(r, marks=xf(GATE) if r in ("funding_missing", "winding_down")
-                                                          else []) for r in GATE_REASONS])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                                          else []) for r in GATE_REASONS])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_the_gate_returns_blocked_and_names_its_reason(tmp_path, store, monkeypatch, reason_name):
     """Assertion 4, at its source: in each blocked state the ONE gate's state function returns (True, reason), the
     reason naming the state in words the PM reads (drawdown, daily loss, liquidated, funding, degraded data, wind-down,
@@ -1398,7 +1398,7 @@ def test_the_gate_returns_blocked_and_names_its_reason(tmp_path, store, monkeypa
 
 
 REFUSAL = "entry_blocked"  # the decision log's action for a refused opening order (assumed; README)
-XFAIL_NAMED: dict = {r: xf(GATE) for r in ("funding_missing",)}  # PE2 (stop-safety, master 3e66ce8f): the rest pass (marks removed)
+XFAIL_NAMED: dict = {r: xf(GATE) for r in ("funding_missing",)}  # PE2 (stop-safety, master 43bf3747): the rest pass (marks removed)
 
 
 @pytest.mark.parametrize("reason_name", _marked1(GATE_REASONS, XFAIL_NAMED))
@@ -1420,7 +1420,7 @@ ROUTE_CELLS = ([("dashboard_resume", r) for r in ("daily_pause", "liquidation", 
                + [("dashboard_reset", r) for r in ("liquidation",)])
 XFAIL_ROUTE: dict = {
     **{c: xf(GATE) for c in ROUTE_CELLS if c[1] == "winding_down"},  # accepted (wind-down: not built)
-    # PE2 (stop-safety, master 3e66ce8f): the daily_pause, retired and drawdown_halt routes pass (marks removed)
+    # PE2 (stop-safety, master 43bf3747): the daily_pause, retired and drawdown_halt routes pass (marks removed)
     **{c: xf(GATE, condition=not HAS_164) for c in ROUTE_CELLS if c[1] == "liquidation"},  # #164 refuses them
 }
 
@@ -1457,7 +1457,7 @@ def test_each_route_refusal_names_its_reason(tmp_path, store, client, monkeypatc
 # ---------------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("what", [pytest.param("resting_fill_1s_after", id="zero-window-resting-fill"),
-                                  pytest.param("new_submit_next_bar", id="zero-window-new-submit")])  # PE2 (stop-safety, master 3e66ce8f): pass
+                                  pytest.param("new_submit_next_bar", id="zero-window-new-submit")])  # PE2 (stop-safety, master 43bf3747): pass
 def test_nothing_opens_from_the_moment_the_stop_is_accepted(tmp_path, store, monkeypatch, what):
     """[CHOKE invariants 22:29 (2)] Zero window after Stop: nothing that opens or adds is accepted from the timestamp
     the Stop was ACCEPTED (the journal's desired_state write, noted at the runtime tick that makes it), not from when the
@@ -1497,7 +1497,7 @@ GATE_ALERT = "entry_blocked"  # the event kind of the ONE alert when a block epi
 GATE_CLEARED = "entry_block_cleared"  # the event kind when it ends, carrying the refusal count (assumed; README)
 
 
-# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
+# PE2 (stop-safety, master 43bf3747): passes (mark removed)
 def test_a_block_episode_journals_one_alert_a_decision_per_refusal_and_one_cleared_event(tmp_path, store, monkeypatch):
     """[CHOKE invariants 22:29 (3)] A drawdown halt at t0+25 while the signal wants long on every one-minute bar from
     t0+30 to the end (so the gate refuses an entry on each of about 20 bars), then the PM's Resume and a restart whose
@@ -1745,7 +1745,7 @@ JOURNAL_COMBOS = {
 
 
 @pytest.mark.parametrize("combo", [pytest.param(c, marks=[] if c in ('drawdown_halt+stopped', 'drawdown_halt+retired+stopped', 'daily_pause+stopped', 'liquidated+retired+stopped') else xf(CAUSE))
-                                   for c in list(JOURNAL_COMBOS)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in list(JOURNAL_COMBOS)])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_the_gate_lists_every_active_cause_in_the_fixed_order(store, combo):
     """[00:20 (b) "When several causes apply, list all of them"] Several causes at once, read from the journal (the
     gate the supervisor and the dashboard read): a drawdown halt or a daily-loss pause by the guard, or a liquidation,
@@ -1794,7 +1794,7 @@ ENGINE_COMBOS = {
 
 
 @pytest.mark.parametrize("combo", [pytest.param(c, marks=[] if c in ('drawdown_halt+degraded_candle', 'stopped+degraded_candle') else xf(CAUSE))
-                                   for c in list(ENGINE_COMBOS)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in list(ENGINE_COMBOS)])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_the_engine_lists_every_active_cause_in_the_fixed_order(tmp_path, store, monkeypatch, combo):
     """[00:20 (b)] The engine's own reading in a replayed session with two causes at once, one the journal holds (a
     drawdown halt, or the PM's Stop) and one only the engine knows (the degraded candle [R46]): both are listed, in
@@ -1810,7 +1810,7 @@ def test_cause_the_engine_lists_every_active_cause_in_the_fixed_order(tmp_path, 
 
 
 @pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('drawdown_halt', 'daily_pause') else xf(CAUSE))
-                                   for c in ["drawdown_halt", "daily_pause"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in ["drawdown_halt", "daily_pause"]])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_a_guard_refusal_gives_the_figure_its_limit_and_what_clears_it(store, cause):
     """[00:20 (b): "Drawdown halt: down 15.3% against a 15% limit since 22:10 UTC. Only you can clear it."] The guard's
     halt (drawdown 25.0% against the 20% limit) or daily-loss pause (6.0% against 5%), read by the engine that halted
@@ -1828,7 +1828,7 @@ def test_cause_a_guard_refusal_gives_the_figure_its_limit_and_what_clears_it(sto
 
 
 @pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('liquidated', 'retired', 'stopped') else xf(CAUSE))
-                                   for c in ["liquidated", "retired", "stopped"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in ["liquidated", "retired", "stopped"]])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_a_state_refusal_names_the_state_in_its_own_word_and_what_clears_it(store, cause):
     """[00:20 (b): "Retired: cannot be started."; "Retired, Winding down and Stopped are distinct words"] From the
     journal: a liquidated strategy (code liquidated; cleared only by the reset after liquidation), a retired one (Stop +
@@ -1867,7 +1867,7 @@ def _ages(text: str) -> list[float]:
 
 
 @pytest.mark.parametrize("cause", [pytest.param(c, marks=[] if c in ('degraded_candle', 'stale_data') else xf(CAUSE))
-                                   for c in ["degraded_candle", "stale_data", "funding_missing"]])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in ["degraded_candle", "stale_data", "funding_missing"]])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_a_data_refusal_gives_the_figure_and_what_clears_it(tmp_path, store, monkeypatch, cause):
     """[00:20 (b): "Data stale: last price 94 s old. Clears when data resumes."; "Funding rate missing."] The engine's
     own causes, read in a replayed session: the degraded 5-minute candle closing at t0+30 (2 of its 5 minutes
@@ -1900,7 +1900,7 @@ def test_cause_a_data_refusal_gives_the_figure_and_what_clears_it(tmp_path, stor
         assert re.search(CAUSE_CLEARS[cause], text.lower()), f"the PM text does not say what clears it: {text!r}"
 
 
-# PE2 (stop-safety, master 3e66ce8f): passes (mark removed)
+# PE2 (stop-safety, master 43bf3747): passes (mark removed)
 def test_cause_each_refused_entry_decision_row_lists_every_cause_with_its_figure(tmp_path, store, monkeypatch):
     """[00:20 (b); 22:29 (3)] A drawdown halt at t0+25, the degraded 5-minute candle closing at t0+30, and a signal
     that wants long from that candle on: one decision row (action "entry_blocked") per refused entry, each naming the
@@ -1936,7 +1936,7 @@ EPISODES = {
 
 
 @pytest.mark.parametrize("case", [pytest.param(c, marks=[] if c in ('one_of_two_clears', 'degraded_candle_alone', 'stale_data_alone') else xf(CAUSE))
-                                   for c in list(EPISODES)])  # PE2 (stop-safety, master 3e66ce8f): marks removed where these pass
+                                   for c in list(EPISODES)])  # PE2 (stop-safety, master 43bf3747): marks removed where these pass
 def test_cause_block_events_follow_the_transitions_not_the_causes_or_the_ticks(tmp_path, store, monkeypatch, case):
     """[00:20 (b); 22:29 (3)] One "entry_blocked" event when a block starts and one "entry_block_cleared" when the last
     cause clears: not when one of several clears (the degraded candle ends at t0+35 while the PM's Stop from t0+32
@@ -2279,7 +2279,7 @@ def _backtest_cell(monkeypatch, reason_name, path_name):
 CHOKE2_BACKTEST = [(r, p) for r in ("drawdown_halt", "daily_pause", "liquidation_gap")
                    for p in ("new_entry", "resting_entry_fill")]
 XFAIL_CHOKE2: dict = {
-    # PE2 (stop-safety, master 3e66ce8f): ("rebalance", "stopped") passes (mark removed)
+    # PE2 (stop-safety, master 43bf3747): ("rebalance", "stopped") passes (mark removed)
     ("mirror", "drawdown_halt"): xf(CHOKE2),  # the catch-up buys a failed copy whatever the state now
     ("mirror", "stopped"): xf(CHOKE2),
 }
