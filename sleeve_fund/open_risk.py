@@ -138,6 +138,42 @@ def gapped(qty: float, mark: float, stop: float | None) -> bool:
     return bool(qty) and stop is not None and (mark - stop) * qty <= 0
 
 
+def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
+    """Read-only, for the dashboard's Open risk (FE v2, signature agreed with PE2 7 Oct): what the limit counts for
+    each open perp position, by the same rules as account_book, so the tile equals the gate. One row per strategy
+    that isn't archived, is a perpetual and holds a position, in store.sleeves() order, on `account` (None: every
+    account): {sleeve, risk, basis, atr_pct}. basis is "stop" (measured to its journaled stop), "stopless" (no
+    placed stop, a close-checked trail included) or "gapped" (the price has gone through its stop, still open).
+    `atr_pct(sleeve)` is asked only for stopless and gapped rows; risk is None when it gives nothing. Never raises."""
+    from sleeve_fund import markets
+
+    archived = store.archived()
+    rows = []
+    for s in store.sleeves():
+        if s.name in archived or (account is not None and store.account_of(s.name) != account):
+            continue
+        last = store.last_equity(s.name)
+        if last is None or not last["qty"] or not markets.is_perp(s.params):
+            continue
+        qty, mark = last["qty"], last["price"]
+        stop = _journal_stop(store, s, qty)
+        basis = "gapped" if gapped(qty, mark, stop) else ("stop" if stop is not None else "stopless")
+        atr = None
+        if basis != "stop":
+            try:
+                atr = atr_pct(s)
+            except Exception:  # noqa: BLE001 - the caller's lookup failing reads as not known, so the row is still shown
+                atr = None
+            if atr is not None and not math.isfinite(atr):
+                atr = None
+        try:
+            risk = position_risk(qty, mark, stop if basis == "stop" else None, atr)
+        except ValueError:  # stopless or gapped with no daily ATR: can't be measured
+            risk = None
+        rows.append({"sleeve": s.name, "risk": risk, "basis": basis, "atr_pct": atr})
+    return rows
+
+
 def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[float, float, list[str]]:
     """Paper: (the book, the open risk of the other perp strategies on the account, those of them whose stop the
     price has gone through while still open). `atr_pct(sleeve)` gives a strategy's daily ATR share. Raises

@@ -26,7 +26,9 @@ def _book(store):
     store.record_fill("pp-short", side="SELL", qty=0.05, price=60_000, fee=1.5, order_id="P-1", trade_id="T-1")
     # Equity 10,048.50: starting 10,000 + 50 unrealised (short 0.05 from 60,000, marked at 59,000) - 1.50 fee.
     store.record_equity("pp-short", equity=10_048.5, cash=12_998.5, qty=-0.05, price=59_000, benchmark=10_000)
-    store.record_order("rsi-long", order_id="R-1", side="BUY", qty=1.0, intent="entry", reason="RSI 28 below 30")
+    # Its 2% stop journaled with the entry, as paper journals a fixed stop (base.py), which the open-risk limit reads.
+    store.record_order("rsi-long", order_id="R-1", side="BUY", qty=1.0, intent="entry", reason="RSI 28 below 30",
+                       signal={"stop_frac": 0.02})
     store.update_order("R-1", fill_qty=1.0, fill_px=3_000, fee=1.2)
     store.record_fill("rsi-long", side="BUY", qty=1.0, price=3_000, fee=1.2, order_id="R-1", trade_id="T-2")
     # Equity 9,968.80: 10,000 - 30 unrealised (long 1 from 3,000 at 2,970) - 1.20 fee.
@@ -69,7 +71,7 @@ def test_positions_table_has_the_v2_columns_and_no_percentages(client):  # noqa:
     assert "−30.00" in long_ and ">1.20</td>" in long_ and "Realised" not in table
     # The short has neither stop nor target: an amber "none" stop, "none" target, and an unbounded risk.
     assert '<span class="warn" title="No stop-loss on this position">none</span>' in short
-    assert '<span class="faint" title="No take-profit on this position">none</span>' in short and "unbounded" in short
+    assert '<span class="faint" title="No take-profit on this position">none</span>' in short and " est.</span>" in short
     assert "2,940.00" in long_  # the long's 2% stop under its 3,000 entry
     # No cell contains a % (a distance or share goes in a title).
     cells = re.sub(r'title="[^"]*"', "", table)
@@ -166,7 +168,9 @@ def test_kpi_ledger_has_the_eight_tiles_with_the_detail_on_hover(client):  # noq
 
     if hasattr(trading, "open_risk"):
         assert 'title="3,000.00 isolated margin across open positions"><div class="k">Margin used</div><div class="v">12%' in kpis
-        assert "1 position without a stop, so unbounded" in kpis and '<div class="v warn">30.00+' in kpis
+        # FE v2: the stopless perp short is counted at the limit's estimate and named (Advisor 7 Oct 18:50 UK).
+        assert "pp-short: no stop, counted at the larger of 10% and 3 daily ATRs" in kpis
+        assert re.search(r'<div class="v warn">[\d,.]+ · 1 estimated</div>', kpis)
     else:
         assert kpis.count('class="kpi pending"') == 2
     assert "gross exposure" not in page.lower() and "Sharpe" not in kpis
