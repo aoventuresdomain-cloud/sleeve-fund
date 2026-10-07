@@ -206,6 +206,11 @@ def _utc(ns: int) -> datetime:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
 
 
+def _aware(ts: datetime) -> datetime:
+    """A journal time with its zone (a stored time without one is UTC)."""
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
 # A decision this long after its bar's close (a bar missed over a restart, m13-E3) opens or adds to nothing: the
 # price has moved on from the signal. Exits and reductions always run, however late (Independent Quant Advisor,
 # 5 Oct 2026). The same limit the hub client puts on a refilled bar.
@@ -393,7 +398,7 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        if market not in markets.MARKETS:
+        if market not in markets.MARKETS and market != markets.PERP_FUNDING_STRESS:  # research only
             raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
         if allow_short and market == markets.SPOT:
             raise ValueError("short positions need a perpetual: set market to perp (or perp-venue-fees)")
@@ -674,6 +679,7 @@ class LongFlatStrategy(Strategy):
         # An outage's replayed exit: when the venue's order closed the position (_held_at).
         self._replayed_close: datetime | None = None
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
+        self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -904,10 +910,7 @@ class LongFlatStrategy(Strategy):
             if self._margin:
                 # Funding owed for times the process was down while a position was held is settled on the
                 # first tick, at that tick's price.
-                last = self.runtime.store.funding(self.runtime.name, limit=1)
-                fills = self.runtime.store.fills(self.runtime.name, limit=1) if book["qty"] else []
-                marks = [r["ts"] for r in (*last, *fills)]
-                self._funding_since = max(marks) if marks else self.runtime.now()
+                self._funding_since = self._funding_resumes_from(book["qty"])
                 if not self.runtime.backtest:
                     self._replayed_close = self._journaled_replayed_close()
             if self.runtime.backtest:
@@ -2059,8 +2062,11 @@ class LongFlatStrategy(Strategy):
         if self._trade_ns is not None and end - self._trade_ns > UNSEEN_GAP_NS:
             spans.append((self._trade_ns, end))
         self._unseen = [(a, b) for a, b in self._unseen if b > end]
-        if self._awaiting is not None and end >= self._awaiting[0]:
-            self._awaiting = None  # its minutes are all here now
+        if self._awaiting is not None and end >= self._awaiting[0] - UNSEEN_GAP_NS:
+            # Its minutes are all here now, bar a stretch after the bar shorter than UNSEEN_GAP_NS: ordinary trade
+            # spacing, not time unseen. A sparse trade landing just before each minute's bar would otherwise re-arm
+            # the wait for ever (QA FD-F8).
+            self._awaiting = None
         if not any(b > start and a < end for a, b in spans) or self._busy() or not self._replay_watches():
             return False
         return self._replay_missed(self._unseen_minutes(bar, start, end) or [bar],
@@ -2135,12 +2141,13 @@ class LongFlatStrategy(Strategy):
         self._outage_book = {"book_px": round(px, 8), "price_source": "replay_model", "market_on_return": now,
                              "outage_level": round(level, 8), "outage_while": while_, "breached_at": _hhmm(at),
                              "half_spread_booked": spread, "half_spread_live": self._half_spread()}
+        closed = datetime.fromtimestamp(at / 1e9, tz=timezone.utc)  # the close of the minute the venue's order filled in
         if intent in EXIT_LEGS or intent == "liquidation":  # read back after a restart (_position_at, CR #179)
-            self._outage_book["replayed_close"] = datetime.fromtimestamp(at / 1e9, tz=timezone.utc).isoformat()
+            self._outage_book["replayed_close"] = closed.isoformat()
         if intent in EXIT_LEGS or intent == "liquidation":
             # The venue's order closed the position in that minute: no settlement after it is the position's,
             # though the order goes now (QA P1-L19).
-            self._funding_skip = (datetime.fromtimestamp(at / 1e9, tz=timezone.utc), False)
+            self._funding_skip = (closed, False)
             self._reverse_funding_after(self._funding_skip[0])
             self._replayed_close = self._funding_skip[0]
         try:
@@ -3066,7 +3073,7 @@ class LongFlatStrategy(Strategy):
             # Paper: a settlement this process saw pass keeps the position it noted then (_snap_settlements); one it
             # didn't (a restart since) is read from the journal; and one the outage replay found the venue's order
             # had closed the position before is held flat (QA FD-F1, P1-L19).
-            current = self._net_position()[0]
+            current = self._net_position()[0] - self._filling  # the journal has none of a fill being booked (FD-F9)
             held = [(ts, self._position_at(ts, current, q if int(ts.timestamp()) * 1_000_000_000 in self._held_at
                                            else None), px) for ts, q, px in held]
         if not any(q for _, q, _ in held):
@@ -3089,6 +3096,11 @@ class LongFlatStrategy(Strategy):
             if self._funding_skip is not None and ts > self._funding_skip[0] and (amount > 0 or
                                                                                   not self._funding_skip[1]):
                 continue  # closed before it (an outage's replayed exit), or a credit the target may have missed
+            if amount > 0 and ts == self._replayed_close:
+                # The replay's exit filled at an unknown time inside the minute ending at the settlement: the worse
+                # outcome, as the backtest of the same minutes books it (rule (c)): a cost is paid, a credit is not
+                # (QA FD-F10).
+                continue
             self._book_funding(ts, qty, px, rate, amount)
             if deadline and self.runtime is not None:
                 self.runtime.store.event(
@@ -3122,6 +3134,30 @@ class LongFlatStrategy(Strategy):
         if noted is not None:
             return noted
         return 0.0 if abs(held) < self._lot() / 2 else float(held)  # under half a lot is flat
+
+    def _funding_resumes_from(self, qty: float) -> datetime:
+        """After a restart: where funding is settled from. The last settlement booked, or the fill that opened the
+        position held since (from flat) if later: a settlement between it and the restart that wasn't booked yet is
+        charged on the position the journal shows held at it (_position_at), though a fill came after it, or the
+        book is flat now (QA FD-F7). Before, the last fill was used, past such a settlement."""
+        store, name = self.runtime.store, self.runtime.name
+        last = store.funding(name, limit=1)
+        booked = _aware(last[0]["ts"]) if last else None
+        fills = store.fills(name, limit=10_000)  # newest first
+        running, half, opened = Decimal(repr(float(qty))), self._lot() / 2, None
+        for f in fills:
+            at = _aware(f["ts"])
+            if booked is not None and at <= booked:
+                break
+            before = running - Decimal(repr(float(f["qty"]))) * (1 if f["side"] == "BUY" else -1)
+            if abs(before) < half <= abs(running):
+                opened = at
+                break
+            running = before
+        if opened is None and booked is None and qty and fills:
+            opened = _aware(fills[0]["ts"])  # the journal doesn't reach the opening: its last fill, as before
+        marks = [t for t in (booked, opened) if t is not None]
+        return max(marks) if marks else self.runtime.now()
 
     def _journaled_replayed_close(self) -> datetime | None:
         """After a restart: when the last outage replay found the venue's order closed the position, from the replayed
@@ -4042,11 +4078,11 @@ class LongFlatStrategy(Strategy):
                 # Settle funding owed up to the fill before booking it, on the position held until then: a stop or a
                 # liquidation filled on a gap pays the settlements it was held through, and the insurance fund's
                 # share is then reckoned on that cash.
-                self._intrabar = intrabar
+                self._intrabar, self._filling = intrabar, fill
                 try:
                     self._apply_funding(self._last_close or float(event.last_px))
                 finally:
-                    self._intrabar = None
+                    self._intrabar, self._filling = None, 0.0
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed

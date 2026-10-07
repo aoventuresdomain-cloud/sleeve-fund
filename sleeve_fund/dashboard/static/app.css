@@ -441,6 +441,9 @@ pre.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-siz
 .pc-note { margin-top: 12px; padding: 10px 12px; background: var(--raised); border-radius: 6px; }
 .pc-source { font-size: 12px; color: var(--faint); margin: 8px 0 0; }
 .pc-source { color: var(--warn); }
+.pc-strat-note { font-size: 12px; color: var(--faint); margin: 8px 0 0; }
+.pc-strat-more { font-size: 12px; color: var(--faint); margin: 6px 0 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pc-strat-more button { font-size: 12px; padding: 1px 8px; }
 @media (max-width: 900px) { .pc-canvas { height: 320px; } }
 /* Price chart controls: the instrument dropdown is the title; indicators and intervals on the right. */
 .price-chart .panel-head { flex-wrap: wrap; row-gap: 8px; }
