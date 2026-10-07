@@ -99,7 +99,7 @@ class EngineJournal(FloatView):
         """The instrument's size decimals, from the strategy's instrument as it starts."""
         self._grid = {"lot": Decimal(1).scaleb(-lot_decimals)} if lot_decimals is not None else {}
 
-    def exact(self, kind: str, x, what: str, sleeve=None) -> Decimal:
+    def exact(self, kind: str, x, what: str, sleeve=None, order_id=None) -> Decimal:
         """x as the journal books it. A quantity must already lie on the lot (Advisor 21:17 UK). A float within a few
         float steps of a lot multiple is that multiple: the venue's quantity, read as a float (303.82504499 can
         read 303.82504499000004), so the engine's quantity is unchanged. Anything further off is never rounded: it is
@@ -111,7 +111,8 @@ class EngineJournal(FloatView):
         q = d.quantize(step, rounding=ROUND_HALF_EVEN)
         if q == d or (isinstance(x, float) and abs(q - d) <= LOT_NOISE_ULPS * Decimal(math.ulp(x))):
             return q
-        why = (f"The engine's {what} {x!r} is not a whole number of lots ({step}). The journal never rounds a "
+        on = f" on order {order_id}" if order_id else ""
+        why = (f"The engine's {what} {x!r}{on} is not a whole number of lots ({step}). The journal never rounds a "
                "quantity, so this write was refused; check the order against the venue")
         try:
             self._exact.event(sleeve, "error", "qty_off_lot", why)
@@ -129,9 +130,10 @@ class EngineJournal(FloatView):
 
         def call(*args, **kwargs):
             sleeve = args[0] if args and name != "update_order" else None
+            order_id = args[0] if args and name == "update_order" else kwargs.get("order_id")
             for k, kind in fields.items():
                 if kwargs.get(k) is not None:
-                    d = self.exact(kind, kwargs[k], k, sleeve)
+                    d = self.exact(kind, kwargs[k], k, sleeve, order_id)
                     kwargs[k] = float(d) if floats else d  # a float prints as d, so a saved copy is d again
             return write(*args, **kwargs)
 

@@ -70,3 +70,29 @@ def test_the_float_view_passes_a_write_through_untouched():
     exact = Decimal("10000.123456789012345678")
     FloatView(Spy()).record_equity("s1", equity=exact)
     assert seen == [(("s1",), {"equity": exact})] and type(seen[0][1]["equity"]) is Decimal
+
+
+def test_an_off_lot_fill_on_an_order_names_the_order(store):
+    j = EngineJournal(store)
+    j.set_grid(lot_decimals=3)
+    _order(j, 0.1)
+    with pytest.raises(ValueError, match="on order O-1"):
+        j.update_order("O-1", fill_qty=0.0505, fill_px=60_000.0, fee=0.1)
+    assert store.orders("s1")[0]["filled_qty"] == 0
+
+
+def test_the_cores_get_a_plain_decimal_from_a_journal_figure():
+    """money() strips the journal's float-tolerant Money, so a core mixing in a float still fails loudly (CR207-1)."""
+    from sleeve_fund.money import Money, money
+
+    d = money(Money("1.5"))
+    assert type(d) is Decimal and d == Decimal("1.5")
+    with pytest.raises(TypeError):
+        d + 0.1
+
+
+def test_a_journal_figure_compares_with_none_like_any_value():
+    from sleeve_fund.money import Money
+
+    assert (Money("1") == None) is False and (Money("1") != None) is True  # noqa: E711 - the comparison under test
+    assert Money("1") not in [None] and Money("1") in [None, Money("1")]

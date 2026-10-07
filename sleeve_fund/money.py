@@ -28,7 +28,8 @@ def money(value: Decimal | int | str, name: str = "amount") -> Decimal:
     ValueError."""
     if isinstance(value, bool) or not isinstance(value, (Decimal, int, str)):
         raise TypeError(f"{name} is money: pass a Decimal, int or str, not {type(value).__name__}")
-    d = value if isinstance(value, Decimal) else Decimal(value)
+    # A journal Money (float-tolerant) comes in as a plain Decimal, so the core's float TypeError still trips (CR207-1).
+    d = Decimal(value) if type(value) is not Decimal else value
     if not d.is_finite():
         raise ValueError(f"{name} must be a finite amount, not {d}")
     return d
@@ -47,6 +48,9 @@ PRECISION, SCALE = 38, 18
 QUANTUM = Decimal(1).scaleb(-SCALE)
 
 
+_NONE = object()  # no operand: None is a real operand (Money == None is False, not a TypeError)
+
+
 class Money(Decimal):
     """An exact Decimal that also takes a float operand, as the decimal the float prints as (rule 1), so code and
     checks written in floats keep working on the journal's exact figures. Arithmetic with a Money stays a Money;
@@ -61,9 +65,11 @@ class Money(Decimal):
         return other
 
     def _wrap(op):
-        def method(self, other=None, *rest):
-            other = Money._of(other)
-            r = op(self, other, *rest) if other is not None or rest else op(self)
+        def method(self, other=_NONE, *rest):
+            if other is _NONE:
+                r = op(self)
+            else:
+                r = op(self, Money._of(other), *rest)
             return Money(r) if isinstance(r, Decimal) and not isinstance(r, Money) else r
         return method
 
