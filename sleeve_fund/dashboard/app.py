@@ -504,6 +504,31 @@ def create_app(store: Store | None = None) -> FastAPI:
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
+    def _strategy_indicators(name: str) -> list[dict]:
+        """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):
+        as the platform recorded them, passed on untouched and never recomputed here. The store gives them once
+        the Quant Developer's recording lands; until then, or if it fails, the chart has none and still draws."""
+        source = getattr(st(), "chart_indicators", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart indicators for %s", name)
+            return []
+
+    def _strategy_decisions(name: str) -> list[dict]:
+        """Fills and missed entries the strategy recorded (P1-3m): [{kind: fill|missed, side, t, signal_t, price,
+        reason, code}], passed on untouched. Empty until the platform's journal read lands, or if it fails."""
+        source = getattr(st(), "chart_decisions", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart decisions for %s", name)
+            return []
+
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
         from sleeve_fund.dashboard import charts
@@ -543,6 +568,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
                               limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        data["indicators"] = _strategy_indicators(name)
+        data["decisions"] = _strategy_decisions(name)
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."

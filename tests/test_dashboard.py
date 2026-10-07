@@ -1340,8 +1340,20 @@ def test_an_age_never_reads_minus_zero():
     assert _held(timedelta(seconds=-2)) == "0 min" and _held(timedelta(minutes=5)) == "5 min"
 
 
-def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
+def _wait_for_job(c, job_id: str, seconds: float = 300.0) -> dict:
+    """Poll a background study job until it leaves queued/running, up to a deadline: a fixed count of polls ran out
+    under a busy parallel CI run while the job was still working (FLAKY-STUDY)."""
     import time
+
+    deadline = time.monotonic() + seconds
+    while True:
+        j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
+        if j["status"] not in ("queued", "running") or time.monotonic() >= deadline:
+            return j
+        time.sleep(0.05)
+
+
+def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     from urllib.parse import parse_qs, urlparse
 
     from sleeve_fund import history
@@ -1362,22 +1374,14 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
     running = c.get(r.headers["location"], auth=AUTH).text
     assert 'id="study-job"' in running and 'value="240" checked' in running  # the form shows what is running
-    for _ in range(600):
-        j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
-        if j["status"] not in ("queued", "running"):
-            break
-        time.sleep(0.05)
+    j = _wait_for_job(c, job_id)
     assert j["status"] == "done", j
     assert re.fullmatch(r"buy_and_hold_kraken-ethusd-store-240m_\d{8}-\d{6}", j["run_id"])
     first = j["run_id"]
     assert "conservative risk profile" in c.get(f"/research/{first}", auth=AUTH).text
     # A re-run with other exits is new evidence beside the old, not a replacement (review round 8, R8-M3).
     r = c.post("/research/run", data={**form, "stop_loss_pct": "5"}, auth=AUTH, headers=SAME, follow_redirects=False)
-    for _ in range(200):
-        j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
-        if j["status"] not in ("queued", "running"):
-            break
-        time.sleep(0.05)
+    j = _wait_for_job(c, parse_qs(urlparse(r.headers["location"]).query)["job"][0])
     assert j["status"] == "done" and j["run_id"] != first
     listing = c.get("/research", auth=AUTH).text
     assert f'/research/{first}"' in listing and f'/research/{j["run_id"]}"' in listing
@@ -2511,6 +2515,19 @@ def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
     assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
 
 
+def test_a_funding_alert_tag_names_the_pair_and_no_venue(client):
+    """The funding alerts tag their messages with the venue upper-cased and the pair (#163); the Alerts page
+    and the outside alert read "[BTC/USDT] …" (QA P1-U30, CR)."""
+    from sleeve_fund import alerts
+
+    c, store = client
+    store.event(None, "warning", "funding_stale", "[BINANCE BTC/USDT] funding is 9 hours behind")
+    page = c.get("/alerts", auth=AUTH).text
+    assert "[BTC/USDT] funding is 9 hours behind" in page and "BINANCE" not in page
+    ev = store.alerts(limit=5)
+    assert "[BTC/USDT] funding is 9 hours behind" in alerts.message(ev) and "BINANCE" not in alerts.message(ev)
+
+
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
                                    " Position margin lost (liquidated)", "Position  margin lost (liquidated)",
                                    "Position\u00a0margin lost (liquidated)"])
@@ -2562,3 +2579,27 @@ def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
         store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
     store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_the_chart_passes_on_the_strategys_recorded_indicators_untouched_and_survives_a_failure(client, monkeypatch):
+    """P1-3s: the platform's own values go to the chart as recorded (v2/chart-indicators-shape.md); a recording that
+    isn't there yet or fails leaves an empty list and a chart that still draws."""
+    from sleeve_fund.dashboard import charts
+
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD", bar_spec="1-HOUR-LAST-INTERNAL")
+    store.record_equity("sol-x", equity=10_000, cash=10_000, qty=0, price=100, benchmark=10_000)
+    charts._cache.clear()
+    monkeypatch.setattr(charts, "candles", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == []
+    sample = [{"key": "ema", "label": "EMA(20)", "pane": "price", "kind": "line", "group": None,
+               "settled_from": 3600, "points": [[3600, 101.5], [7200, 101.7]]}]
+    monkeypatch.setattr(store, "chart_indicators", lambda name: sample, raising=False)
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == sample
+
+    def broken(name):
+        raise RuntimeError("recording failed")
+
+    monkeypatch.setattr(store, "chart_indicators", broken, raising=False)
+    d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
+    assert d["indicators"] == [] and d["candles"]

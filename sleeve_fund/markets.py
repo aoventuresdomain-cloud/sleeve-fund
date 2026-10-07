@@ -19,6 +19,10 @@ SPOT = "spot"
 PERP = "perp"
 PERP_VENUE_FEES = "perp-venue-fees"
 MARKETS = (SPOT, PERP, PERP_VENUE_FEES)
+# Research only, never offered as a choice: the simulated perp with funding at FUNDING_STRESS_RATE, the study's
+# funding-stress line (Advisor, 7 Oct 2026: the 0.01% baseline is light in strong uptrends).
+PERP_FUNDING_STRESS = "perp-funding-stress"
+FUNDING_STRESS_RATE = 0.0003
 # The simulated venue's leverage for a perp account: above every risk profile's cap (sleeve_fund.risk), so
 # our own leverage and liquidation guards, not the simulated venue's margin check, decide.
 VENUE_LEVERAGE = 10
@@ -49,7 +53,7 @@ VENUE_FEE_PERP = PerpTerms("Perpetual at the venue's spot fees (stress)", None, 
 
 def market_of(params: dict | None) -> str:
     m = (params or {}).get("market") or SPOT
-    if m not in MARKETS:
+    if m not in MARKETS and m != PERP_FUNDING_STRESS:
         raise ValueError(f"unknown market {m!r}; choose one of {', '.join(MARKETS)}")
     return m
 
@@ -73,6 +77,11 @@ def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
             if m != PERP:
                 raise ValueError("this venue trades its own perpetuals: choose the perp market")
             return native_terms(profile)
+    if m == PERP_FUNDING_STRESS:
+        from dataclasses import replace
+
+        return replace(LOW_FEE_PERP, label=f"{LOW_FEE_PERP.label}, funding at {FUNDING_STRESS_RATE:.2%}",
+                       funding_rate=FUNDING_STRESS_RATE)
     return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
 
