@@ -116,6 +116,52 @@ def funding_times(after: datetime, until: datetime, hours: tuple[int, ...]) -> l
     return out
 
 
+def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], settled=None) -> list[datetime]:
+    """The funding settlements in (after, until], oldest first, to the minute. With the venue's settled rates
+    (`settled`, indexed by settlement time), its own times: a symbol moved from 8-hourly to 4- or 1-hourly
+    settlements pays every one (QA P1-O1). Past the newest record, the venue's latest interval carries on from
+    it (paper, before the venue publishes the next rate); before the first record, and with no records, the
+    venue profile's fixed `hours`."""
+    if settled is None or len(settled) == 0:
+        return funding_times(after, until, hours)
+    idx = settled.index.round("min")
+    first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
+    out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
+    out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
+    if until > last:
+        step = latest_interval(settled)
+        if step is None:  # a single record (a new listing): the fixed hours after it
+            out += funding_times(max(after, last), until, hours)
+        else:
+            t = last + step
+            while t <= until:
+                if t > after:
+                    out.append(t)
+                t += step
+    return sorted(set(out))
+
+
+def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
+    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
+    `wait`; for a settlement foreseen past its newest record, one of the venue's latest intervals more, plus `wait`
+    again for the store's refresh to bring in the next record. If the venue has lengthened its interval, the newer
+    record that skips the foreseen time lands within that, and the time is then no settlement at all
+    (settlement_times), so it is never charged (no phantom baseline charge)."""
+    step = latest_interval(settled)
+    if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
+        return wait
+    return 2 * wait + step
+
+
+def latest_interval(settled) -> timedelta | None:
+    """The venue's settlement interval as its two newest records show it, or None with fewer than two."""
+    if settled is None or len(settled) < 2:
+        return None
+    idx = settled.index.round("min")
+    step = (idx[-1] - idx[-2]).to_pytimedelta()
+    return step if step > timedelta(0) else None
+
+
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
     """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
     opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the
@@ -123,6 +169,13 @@ def isolated_margin(qty: float, entry: float, leverage: float, balance: float | 
     backtest, the dashboard and the demo copy (set to isolated at the same leverage)."""
     margin = abs(qty) * entry / max(leverage, 1e-9)
     return min(margin, max(balance, 0.0)) if balance is not None else margin
+
+
+def gap_loss_cap(qty: float, entry: float, leverage: float, balance: float, taker: float, liq: float | None) -> float:
+    """The most an isolated perpetual position can lose however far the price gaps (Independent Quant Advisor, QA
+    P1-D3): its whole isolated margin, plus the taker fee on the close at its liquidation price. The engine books a
+    gap past the bankruptcy price at this (the insurance fund takes the rest), and the Risk page's stress rows use it."""
+    return isolated_margin(qty, entry, leverage, balance) + taker * abs(qty) * (liq or 0.0)
 
 
 def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:
