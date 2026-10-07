@@ -1315,7 +1315,7 @@ CLEARING = {"drawdown_halt": _clear_drawdown_halt, "liquidation": _clear_liquida
             "liquidation_gap": lambda *a: _clear_liquidation(*a, reason="liquidation_gap"),
             "funding_missing": _clear_funding, "stale_data": _clear_stale, "stopped": _clear_stopped}
 XFAIL_CLEAR: dict = {
-    "liquidation": xf(GATE),  # halted through the liquidation_reset row: nothing reads it until RAL
+    "liquidation": None,  # PE2 (P1-RAL): passes (mark removed)
     "funding_missing": xf(GATE),  # never blocked in the first place (O17b)
     "stale_data": xf(GATE, condition=ON_MAIN),
     "liquidation_gap": None,  # PE2 (P1-RAL): passes (mark removed)
@@ -2027,7 +2027,7 @@ def _book_snapshot(store, names) -> dict:
     return out
 
 
-@xf(RAL)
+# PE2 (P1-RAL): passes (mark removed)
 def test_ral_a_book_reset_clears_each_strategys_drawdown_halt_and_daily_pause_once_journalled_book_reset(store,
                                                                                                         monkeypatch):
     """[00:20 (a)] One strategy halted on its drawdown (10,000 to 7,500), another paused on its daily loss (10,000 to
@@ -2057,7 +2057,7 @@ def test_ral_a_book_reset_clears_each_strategys_drawdown_halt_and_daily_pause_on
     assert [len(_clears(store, n)) for n in (NAME, OTHER)] == [1, 1], "a second book reset cleared again"
 
 
-@xf(RAL)
+# PE2 (P1-RAL): passes (mark removed)
 @pytest.mark.parametrize("kept", ["liquidated", "retired", "stopped"])
 def test_ral_a_book_reset_keeps_a_liquidation_a_retirement_and_a_stop_and_starts_nothing(store, monkeypatch, kept):
     """[00:20 (a) "It does NOT clear: a liquidation incident, Retired or Winding down status, or Stopped"] Beside a
@@ -2098,7 +2098,7 @@ def test_ral_a_book_reset_keeps_a_liquidation_a_retirement_and_a_stop_and_starts
     assert NAME not in sup.procs or not sup.procs[NAME].alive, "the supervisor started it after the book reset"
 
 
-@xf(RAL)
+# PE2 (P1-RAL): passes (mark removed)
 @pytest.mark.parametrize("what", ["holding", "resting_order"])
 def test_ral_a_book_reset_is_refused_unless_every_strategy_is_flat_with_no_resting_orders(store, monkeypatch, what):
     """[00:20 (a) "refused unless every strategy is flat and has no resting orders"; (b) a code and PM text] One
@@ -2164,7 +2164,7 @@ def _fail_second_book_reset(store):
                           "BEGIN SELECT RAISE(ABORT, 'QA injected failure on the second book_reset row'); END"))
 
 
-@xf(RAL)
+# PE2 (P1-RAL): passes (mark removed)
 def test_ral_a_book_reset_is_one_transaction(store, monkeypatch):
     """[00:20 (a) "the clears are written in the same transaction as the new equity"] Two strategies to clear (a
     drawdown halt, a daily pause); the database refuses the second "book_reset" row: the reset fails and leaves

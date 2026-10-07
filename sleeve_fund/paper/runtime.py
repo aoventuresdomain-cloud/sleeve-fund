@@ -541,8 +541,8 @@ class SleeveRuntime:
                          + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}", ts=self.now())
         for request in self.store.pending_resets():
             if request["sleeve"] == self.name and request["created_at"] <= cmd["created_at"]:
-                self.store.drop_reset(request, "lapsed: asked before the liquidation, which the reset after "
-                                      "liquidation answered")
+                self.store.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
+                                        "liquidation answered")
 
     def incident_once(self, head: str, message: str) -> None:
         """An incident about the position held now, written once: a restart or a deploy doesn't repeat it while no
