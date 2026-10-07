@@ -135,8 +135,10 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
     settlements pays every one (QA P1-O1). A gap between two records wider than the interval before it is missing
     settlements at that interval (charged the baseline, QA P1-O17), unless the venue lengthened its interval: the
     step after the gap is as wide (or, at the newest record, the venue's `published` interval is). Past the newest
-    record, the venue's latest interval carries on from it (paper, before the venue publishes the next rate);
-    before the first record, and with no records, the venue profile's fixed `hours`."""
+    record, the venue's published interval (or its latest step, counting provisionally missing settlements, no wider
+    than the profile's) carries on from it
+    (paper, before the venue publishes the next rate); before the first record, and with no records, the venue
+    profile's fixed `hours`."""
     if settled is None or len(settled) == 0:
         return funding_times(after, until, hours)
     idx = snapped(settled)
@@ -145,7 +147,11 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
     out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
     out += _missing_between(idx.as_unit("ns"), after, until, hours, published)
     if until > last:
-        step = latest_interval(settled)
+        # The venue's published interval where it gives one; else its latest step, no wider than the profile's: a
+        # wider one is lost records (filled above), and a lengthening is honoured only where published (DA-11).
+        step = published or _latest_step(idx, hours)
+        if step is not None and not published:
+            step = min(step, funding_interval(hours))
         if step is None:  # a single record (a new listing): the fixed hours after it
             out += funding_times(max(after, last), until, hours)
         else:
@@ -189,7 +195,8 @@ def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ..
     """The settlements in (after, until] missing from a gap between the venue's records (settlement_times): a gap
     wider than the profile's interval, or one wider than the interval before it that the venue then kept (a lost
     record after a move to shorter settlements), is filled at the shorter of the two. A gap no wider than the
-    profile's interval that ends the records is the venue back on (or moved towards) the schedule, not a loss; a
+    profile's interval is the venue back on (or moved towards) the schedule, not a loss, only once the step after
+    it is as wide; ending the records, it is provisionally missing (Advisor, 7 Oct 04:31); a
     lengthening is only read as one where the venue publishes it (`published`, the newest gap; DA-11), so until
     then a longer interval reads as missing settlements, charged the baseline (the adverse side)."""
     out: list[datetime] = []
@@ -198,12 +205,14 @@ def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ..
     hi = min(int(idx.searchsorted(until, side="left")) + 1, len(idx))  # up to the first record at or past `until`
     for i in range(lo, hi):
         a, b = idx[i - 1].to_pydatetime(), idx[i].to_pydatetime()
-        before = (a - idx[i - 2].to_pydatetime()) if i >= 2 else fixed
+        before = _whole_hours(a - idx[i - 2].to_pydatetime()) if i >= 2 else fixed
         step = min(fixed, before) if before > timedelta(0) else fixed
         gap = b - a
         later = (idx[i + 1].to_pydatetime() - b) if i + 1 < len(idx) else None
-        if gap <= step or (gap <= fixed and (later is None or later >= gap)):
-            continue  # no gap, or the venue moved back towards the schedule
+        if gap <= step or (gap <= fixed and later is not None and later >= gap):
+            continue  # no gap, or the venue moved back towards the schedule, as the step after it shows
+        # With no later record yet, a gap wider than the step before it is provisionally missing (the adverse
+        # default): reversed by its own correction if the next step shows the move back (Advisor, 7 Oct 04:31).
         # TODO(DA-11): `published` is the venue's interval now, so it exempts only the newest gap; once a later record
         # lands, a lengthened gap reads as missing again. Settle with each instrument's interval history (CR minor 2).
         if later is None and published is not None and gap <= published:
@@ -223,6 +232,24 @@ def settlement_wait(ts: datetime, settled, wait: timedelta, hours: tuple[int, ..
     shows was no settlement (its interval lengthened) has its baseline reversed by its own journaled correction
     (LongFlatStrategy._reverse_unsettled), never by waiting a whole interval first."""
     return wait
+
+
+def _latest_step(idx, hours: tuple[int, ...]) -> timedelta | None:
+    """The step to the newest record, counting the settlements missing before it (Advisor, 7 Oct 04:31): after
+    12:00 on 4 h and a lost 16:00, the newest gap 12:00 -> 20:00 is a 4 h step, not 8 h."""
+    if len(idx) < 2:
+        return None
+    last = idx[-1].to_pydatetime()
+    filled = _missing_between(idx.as_unit("ns"), idx[-2].to_pydatetime(), last, hours, None)
+    step = last - (filled[-1] if filled else idx[-2].to_pydatetime())
+    return _whole_hours(step) if step > timedelta(0) else None
+
+
+def _whole_hours(step: timedelta) -> timedelta:
+    """A step between records as the venue's interval, in whole hours (at least one): a record stamped off its hour
+    outside the snap window (08:02) leaves steps of 7 h 58 min and 8 h 2 min, still the 8-hourly schedule, never
+    a 2-minute one (QA P1-O17a-14, outside-the-window pin)."""
+    return max(timedelta(hours=1), timedelta(hours=round(step / timedelta(hours=1))))
 
 
 def latest_interval(settled) -> timedelta | None:

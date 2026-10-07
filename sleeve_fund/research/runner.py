@@ -242,7 +242,7 @@ def run_backtest(
             spread_paid=sum(fee_model.spread_paid.values()),
             half_spread=half_spread,
             journal=runtime.store if risk_profile is not None else None,
-            funding=[{"ts": ts, "amount": a, "kind": k} for ts, a, k in strategy.funding_log],
+            funding=[_funding_row(strategy, ts, a, k) for ts, a, k in strategy.funding_log],
             funding_marks=list(strategy.funding_marks),
             funding_simulated=strategy._cfg.perp is not None and strategy._cfg.perp.funding_venue is None,
             funding_schedule=_funding_schedule(strategy, instrument, prices),
@@ -285,6 +285,14 @@ def _opening_balances(starting_capital: float, quote: Currency, base: Currency, 
     if perp:
         return [Money(_opening_cash(starting_capital, runtime), quote)]
     return [Money(book["cash"], quote)] + ([Money(book["qty"], base)] if book["qty"] > 0 else [])
+
+
+def _funding_row(strategy, ts, amount: float, kind: str) -> dict:
+    """A BacktestResult.funding row; a settled charge paid by a snapped record keeps its audit note (QA P1-O17a-14)."""
+    row = {"ts": ts, "amount": amount, "kind": kind}
+    if kind == "settled" and ts in strategy.funding_notes:
+        row["note"] = strategy.funding_notes[ts]
+    return row
 
 
 def _funding_schedule(strategy, instrument, prices: pd.DataFrame) -> str:

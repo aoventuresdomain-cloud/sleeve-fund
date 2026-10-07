@@ -607,6 +607,7 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
                                                          profile.funding_hours, rates)
                         _alert(key, "warning", "funding_stale", f"{tag} {problem.split(': ', 1)[-1]}; "
                                f"{funding.from_words(pd.Timestamp(after[0]) if after else now)}", inbox)
+            _open_inner_gaps(profile, pair, rates, inbox, tag, now)
             readable = _review_episodes(profile, pair, root, inbox, tag, now)
             if not problem and key in _stale:
                 if not readable:  # the journal unreadable: this process's own episode ends with the rates keeping up
@@ -628,6 +629,44 @@ def _now() -> pd.Timestamp:
 # How long after a settlement the venue may take to publish its rate before the collector counts it as due (the
 # strategies' FUNDING_WAIT).
 PUBLISH_WAIT = pd.Timedelta(minutes=15)
+
+
+def _open_inner_gaps(profile, pair: str, rates: pd.Series, inbox, tag: str, now: pd.Timestamp) -> None:
+    """A settlement missing between two kept records (the gap inference: markets.settlement_times), due in the last
+    day, opens an episode as a late newest one does: one funding_stale per run of contiguous missing settlements,
+    from its first (Advisor, 7 Oct 2026; QA P1-O17a-10, -11). _review_episodes then marks each one and asks the
+    venue's history for it. Older holes are history, reported by funding.settled_holes; a day is when one still
+    unpublished is never published."""
+    from sleeve_fund import funding, markets
+
+    if len(rates) < 2:
+        return
+    try:
+        state = funding.journal_state(inbox, tag)
+    except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox
+        return
+    since = max(rates.index[0], now - funding.NEVER_PUBLISHED_AFTER)
+    upto = min(now - PUBLISH_WAIT, rates.index[-1])
+    if upto <= since:
+        return
+    runs: list[list[pd.Timestamp]] = [[]]
+    for t in markets.settlement_times(since.to_pydatetime(), upto.to_pydatetime(), profile.funding_hours, rates):
+        t = pd.Timestamp(t)
+        if (abs(rates.index - t) <= funding.MATCH).any():
+            runs.append([])
+        else:
+            runs[-1].append(t)
+    opened = [o for o in state["open"] if o is not None]
+    for run in filter(None, runs):
+        if any(t in state["missing"] or t in state["never"] for t in run) or \
+                any(abs(o - t) <= funding.MATCH for o in opened for t in run):
+            continue  # already marked, or the episode it belongs to is open
+        n = len(run)
+        inbox.event(None, "warning", "funding_stale",
+                    f"{tag} No settled funding rate from the venue for {pair} at {run[0]:%d %b %Y %H:%M} UTC, "
+                    f"{n} settlement{'s' if n != 1 else ''} missing between the rates kept; "
+                    f"{funding.from_words(run[0])}")
+        opened.append(run[0])
 
 
 def _review_episodes(profile, pair: str, root, inbox, tag: str, now: pd.Timestamp) -> bool:

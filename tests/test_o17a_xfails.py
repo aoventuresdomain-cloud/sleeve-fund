@@ -89,7 +89,7 @@ REASON = "QA O17a: not built yet (Advisor 17:52)"
 xfail = pytest.mark.xfail(strict=True, reason=REASON)
 
 LONG = pytest.param(1, id="long")
-SHORT_X = pytest.param(-1, id="short", marks=xfail)
+SHORT_X = pytest.param(-1, id="short")
 
 
 def _paid_baseline(rows):
@@ -185,7 +185,6 @@ def test_a_simulated_perp_charges_the_baseline_to_both_sides(side):
     _paid_baseline(r.journal.funding_)
 
 
-@xfail
 def test_a_simulated_perps_charges_are_labelled_baseline(monkeypatch):
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.venues import venue
@@ -197,7 +196,6 @@ def test_a_simulated_perps_charges_are_labelled_baseline(monkeypatch):
     assert (r.funding_at_baseline, r.funding_held) == (len(r.funding), len(r.funding))
 
 
-@xfail
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_the_baseline_is_scaled_to_the_instruments_interval(binance, monkeypatch, side):
     """O17a review (~18:25): baseline = 0.01% x interval / 8 h. An instrument settling every 4 hours pays 0.005% for a
@@ -235,7 +233,6 @@ def _mixed(binance, risk_profile):
     return backtest(binance, hourly_bars("2025-10-03 00:00", "2025-10-07 23:00"), win(*SPANS), risk_profile)
 
 
-@xfail
 @pytest.mark.parametrize("risk_profile", [None, "balanced"], ids=["research", "risk-profile"])
 def test_n_of_m_counts_baseline_settlements_over_held_settlements_only(binance, risk_profile):
     """12 held settlements (7 with a kept rate, one of them exactly 0), 5 of them missing; 3 more missing while flat.
@@ -245,7 +242,6 @@ def test_n_of_m_counts_baseline_settlements_over_held_settlements_only(binance, 
     assert (r.funding_at_baseline, r.funding_held) == (5, 12)
 
 
-@xfail
 def test_each_charge_says_whether_it_was_the_venue_rate_or_the_baseline(binance):
     r = _mixed(binance, "balanced")
     want = {utc(t): ("baseline" if t in MISSING_HELD else "settled") for t in HELD}
@@ -260,7 +256,6 @@ INVALID = [("nan", float("nan")), ("inf", float("inf")), ("minus-inf", float("-i
            ("over-the-cap", 0.05), ("under-minus-the-cap", -0.05)]
 
 
-@xfail
 @pytest.mark.strategy_errors
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("bad", [b for _, b in INVALID], ids=[n for n, _ in INVALID])
@@ -279,7 +274,6 @@ def test_an_invalid_kept_rate_is_missing_charged_the_baseline_to_both_sides_and_
     assert (r.funding_at_baseline, r.funding_held) == (1, 3)
 
 
-@xfail
 def test_the_collector_never_stores_an_invalid_rate_and_alerts_it(tmp_path, binance, monkeypatch):
     """funding.refresh through the hub's pass (history._refresh_funding): NaN, +-inf and rates over the cap are not
     kept as real rates, and one funding_invalid warning reaches the alerts inbox. (NaN and inf are dropped today, but
@@ -314,7 +308,6 @@ def test_the_collector_never_stores_an_invalid_rate_and_alerts_it(tmp_path, bina
     assert invalid and all(lv == "warning" for lv, k, _ in sent if k == "funding_invalid")
 
 
-@xfail
 def test_a_rate_of_exactly_zero_is_a_real_rate_not_missing(binance):
     """Zero is a settled rate: charged 0 (no baseline) and not counted at baseline."""
     write_rates({t: 0.0 for t in settlements("2025-10-03 00:00", "2025-10-05 00:00")})
@@ -341,7 +334,6 @@ def _run(binance, spans, missing_from, missing_to, keep_inside=()):
     return backtest(binance, hourly_bars(S0, S1), win(*spans), None), gap
 
 
-@xfail
 @pytest.mark.parametrize("run_days, lo, hi", [(10, 9, 11), (3, 2, 4)], ids=["held-10-days", "held-3-days"])
 def test_the_longest_run_held_throughout_is_its_length(binance, run_days, lo, hi):
     start = utc("2025-09-05 00:00")
@@ -350,7 +342,6 @@ def test_the_longest_run_held_throughout_is_its_length(binance, run_days, lo, hi
     assert lo * D <= r.funding_baseline_longest <= hi * D
 
 
-@xfail
 def test_flat_time_inside_a_stretch_neither_breaks_it_nor_counts(binance):
     """Missing 5 Sep -> 16 Sep (11 days of clock). Held 5-9 Sep and 12-16 Sep, flat 9-12 Sep: one run of about 8 days
     held, so over 7 (clock time would read 11; two runs broken by the flat spell would read 4 each)."""
@@ -359,7 +350,6 @@ def test_flat_time_inside_a_stretch_neither_breaks_it_nor_counts(binance):
     assert pd.Timedelta(days=7, hours=8) <= r.funding_baseline_longest <= 9 * D
 
 
-@xfail
 def test_a_long_flat_spell_does_not_make_a_short_held_run_long(binance):
     """Missing 5 Sep -> 17 Sep (12 days of clock). Held 5-8 Sep and 14-17 Sep, flat between: about 6 days held, so at
     most 7 and judged (clock time would read 12)."""
@@ -368,7 +358,6 @@ def test_a_long_flat_spell_does_not_make_a_short_held_run_long(binance):
     assert 5 * D <= r.funding_baseline_longest <= pd.Timedelta(days=6, hours=16)
 
 
-@xfail
 def test_a_real_rate_stored_while_flat_breaks_the_run(binance):
     """Missing 5 Sep -> 17 Sep except one real rate stored on 11 Sep 00:00, while flat (9-13 Sep). Held 5-9 and 13-17:
     two runs of about 4 days, not one of 8."""
@@ -400,7 +389,6 @@ BANDS = [
 ]
 
 
-@xfail
 @pytest.mark.parametrize("n, m, run, verdict", [b[1:] for b in BANDS], ids=[b[0] for b in BANDS])
 def test_the_baseline_bands(n, m, run, verdict):
     from sleeve_fund.research.tearsheet import NOT_JUDGED
@@ -415,7 +403,6 @@ def test_the_baseline_bands(n, m, run, verdict):
         assert "backfill" in words.lower()
 
 
-@xfail
 def test_a_funding_warn_does_not_fail_g1():
     """WARN is shown, not a fail: today g1_verdict counts any verdict other than PASS, INFO or N/A as a fail."""
     from sleeve_fund.research.tearsheet import g1_verdict
@@ -454,7 +441,6 @@ def _counts(lines):
     return [(int(a), int(b)) for ln in lines for a, b in re.findall(r"(\d+) of (\d+)", ln)]
 
 
-@xfail
 @pytest.mark.parametrize("case", list(STUDY_GAPS))
 def test_the_tear_sheet_judges_funding_on_the_oos_windows_and_the_holdout_apart(tmp_path, binance, case):
     """N and M are worked out here from the full-period run's own charges, which buy and hold shares with every fold
@@ -495,7 +481,6 @@ def test_the_tear_sheet_judges_funding_on_the_oos_windows_and_the_holdout_apart(
     assert bool(_lines(sheet, "holdout not judged")) == holdout_unjudged
 
 
-@xfail
 def test_a_simulated_perp_study_is_not_judged_without_a_registered_rate_model(tmp_path):
     """Kraken BTC/USD as a perp: no venue rates, so every settlement is the labelled baseline, and with no modelled
     rate series in the trials register before the run, G1 is not judged (18:18)."""
@@ -520,7 +505,6 @@ def test_a_simulated_perp_study_is_not_judged_without_a_registered_rate_model(tm
 # 6. Paper: the staleness alert, per instrument, once per episode, replacing funding_fallback; recovery logged
 # ---------------------------------------------------------------------------------------------------------------
 
-@xfail
 def test_paper_raises_one_staleness_alert_per_episode_instead_of_funding_fallback(tmp_path, monkeypatch, binance):
     """Long from 07:52 to 16:25; neither 08:00 nor 16:00 is ever published. One funding_stale warning, raised when the
     15-minute check on 08:00 fails (not before), naming the instrument; the second missing settlement in the same
@@ -536,7 +520,6 @@ def test_paper_raises_one_staleness_alert_per_episode_instead_of_funding_fallbac
     assert not kinds(out["events"], "funding_fallback")
 
 
-@xfail
 def test_two_strategies_on_the_instrument_raise_one_staleness_alert(tmp_path, monkeypatch, binance):
     """Per instrument: two paper strategies on BTC/USDT, both holding over the same missing 08:00, share one journal.
     One funding_stale alert in all, not one each."""
@@ -551,7 +534,6 @@ def test_two_strategies_on_the_instrument_raise_one_staleness_alert(tmp_path, mo
     assert not kinds(out["events"], "funding_fallback")
 
 
-@xfail
 def test_the_staleness_alert_logs_its_recovery(tmp_path, monkeypatch, binance):
     """08:00 published at 08:30: stale from 08:15, then one funding_stale_cleared at or after 08:30."""
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 08:45", 1)),
@@ -562,7 +544,6 @@ def test_the_staleness_alert_logs_its_recovery(tmp_path, monkeypatch, binance):
     assert cleared["ts"] >= utc("2025-10-03 08:30") and PAIR in cleared["message"]
 
 
-@xfail
 def test_paper_marks_the_baseline_row_in_the_journal(tmp_path, monkeypatch, binance):
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 08:25", -1)),
                 "2025-10-03 07:50", 35, published={"2025-10-03 08:00": NEVER})
@@ -571,7 +552,6 @@ def test_paper_marks_the_baseline_row_in_the_journal(tmp_path, monkeypatch, bina
 
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_holdout_not_judged_for_funding_blocks_promotion_but_not_g1(tmp_path, binance):
     """Advisor 19:11 / ~19:20, point 2: G1 can still pass on the OOS windows, but a strategy whose holdout is "not
     judged" for missing rates cannot go past the holdout step: no promotion to paper evaluation until the rates are
@@ -1000,7 +980,6 @@ def _built_missing(store, t) -> None:
     assert len(_missing_of(store, t)) == 1, f"{_at(t)} not marked missing exactly once: {_show(_events(store))}"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_each_missing_settlement_is_marked_once_after_the_15_minute_wait_and_one_outage_alerts_once(
         tmp_path, monkeypatch, binance):
     """Held 07:52 -> 16:25; neither 08:00 nor 16:00 is ever published (the store keeps 2 Oct 16:00 and 3 Oct 00:00).
@@ -1022,7 +1001,6 @@ def test_each_missing_settlement_is_marked_once_after_the_15_minute_wait_and_one
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_rate_published_inside_the_15_minute_wait_is_never_missing(tmp_path, monkeypatch, binance):
     """The 15-minute boundary: 08:00 is published at 08:14 (inside the wait: settled, never missing); 16:00 at 16:16
     (one minute past it: missing at 16:15, an episode from 16:00, closed once the rate is in, from 16:16)."""
@@ -1043,7 +1021,6 @@ def test_a_rate_published_inside_the_15_minute_wait_is_never_missing(tmp_path, m
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_missing_settlement_not_contiguous_with_an_open_episode_opens_its_own(tmp_path, monkeypatch, binance):
     """08:00 is published only on 4 Oct at 02:00, 16:00 on time, 4 Oct 00:00 never. At 00:15 the open episode (from
     08:00) does not take 00:00: 16:00 between them is stored. 00:00 opens its own: two funding_stale, from 08:00
@@ -1062,7 +1039,6 @@ def test_a_missing_settlement_not_contiguous_with_an_open_episode_opens_its_own(
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_two_missing_the_first_published_late_never_reads_clear_and_alerts_once(tmp_path, monkeypatch, binance):
     """P1-O17a-10. 08:00 is published at 17:00 and 16:00 never; held throughout; the hub passes at 08:30, 12:00,
     16:30, 17:30 and 18:30. 16:00 is still charged the baseline, so the hub must not write "kept up again" at 17:30
@@ -1086,7 +1062,6 @@ def test_two_missing_the_first_published_late_never_reads_clear_and_alerts_once(
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_paper_restart_mid_episode_keeps_it_open_and_alerts_once(tmp_path, monkeypatch, binance):
     """P1-O17a-10, with the paper node restarted at 16:45 (a deploy) after 08:00 and 16:00 were both charged the
     baseline. 08:00 arrives at 17:00, 16:00 never. The restarted strategy rebuilds its watched settlements from the
@@ -1112,7 +1087,6 @@ def test_a_paper_restart_mid_episode_keeps_it_open_and_alerts_once(tmp_path, mon
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_restarted_paper_strategy_rebuilds_its_watched_settlements_and_closes_the_episode_itself(
         tmp_path, monkeypatch, binance):
     """The rebuild itself (P1-O17a-10's fix): 08:00 and 16:00 both missing and charged the baseline; paper restarted
@@ -1155,7 +1129,6 @@ def _sparse_after(monkeypatch, after, every: int = 30) -> None:
         monkeypatch.setattr(Recorder, name, keep)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_the_strategy_closes_an_episode_itself_with_trades_more_than_15_s_apart(tmp_path, monkeypatch, binance):
     """P1-O17a-12. Trades every 5 s until 09:00 (paper opens the episode for 08:00 at 08:15), then every 30 s. 08:00
     is published at 12:00; the hub passes at 08:30, 10:00 and 12:30. The strategy's recovery watch runs before #146's
@@ -1183,7 +1156,6 @@ def _open_08(tmp_path, monkeypatch, binance, store) -> None:
           rates=HISTORY, store=store, name="w")
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_the_collector_backfills_a_missing_settlement_from_the_venue_history_first(tmp_path, monkeypatch, binance):
     """O17a-11 ruling: once a later settlement is stored, the hub's refresh first refetches from the earliest missing
     one. Paper opened the episode for 08:00; the store then kept 16:00 (the venue published 08:00 late, after the
@@ -1219,7 +1191,6 @@ def _pass_days(monkeypatch, binance, store, rates: dict, at_times) -> None:
 LATER = {k: v for k, v in RATES8.items() if k != "2025-10-03 08:00"}  # 08:00 never published; the rest on time
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_settlement_still_missing_24_h_after_due_is_never_published_once_with_its_own_alert(tmp_path, monkeypatch,
                                                                                               binance):
     """O17a-11 ruling. 08:00 is never published; every later settlement is. Hub passes at 16:30, 00:30 and 4 Oct
@@ -1250,7 +1221,6 @@ def test_a_settlement_still_missing_24_h_after_due_is_never_published_once_with_
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_never_published_settlement_does_not_silence_a_later_outage(tmp_path, monkeypatch, binance):
     """P1-O17a-11. 08:00 is never published; the feed keeps up from 16:00 to 4 Oct 08:00 and then stops. 08:00 is
     never published by the 4 Oct 08:30 pass and its episode closes; the new outage (4 Oct 16:00 on) raises its own
@@ -1270,7 +1240,6 @@ def test_a_never_published_settlement_does_not_silence_a_later_outage(tmp_path, 
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_missing_settlement_is_not_never_published_while_nothing_later_is_stored(tmp_path, monkeypatch, binance):
     """Never published needs a later settlement stored: the feed stops after 3 Oct 00:00, so at 4 Oct 08:30 and 09:00
     (past 24 h) 08:00 is still missing, not never published, and its episode stays open (an outage, not a hole)."""
@@ -1286,7 +1255,6 @@ def test_a_missing_settlement_is_not_never_published_while_nothing_later_is_stor
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_a_legacy_staleness_event_without_from_is_read_as_opened_at_its_time(tmp_path, monkeypatch, binance):
     """A funding_stale written before this interface (no "from"), at 3 Oct 08:15, is an episode opened at 08:15. The
     store keeps every settlement to 16:00: the 16:30 pass closes it once, "from 2025-10-03 08:15 UTC"."""
@@ -1310,8 +1278,13 @@ def test_a_legacy_staleness_event_without_from_is_read_as_opened_at_its_time(tmp
 #    g = the gap between two stored records, s_prev / s_next = the steps before / after it; missing settlements are
 #    placed every f = min(P, s_prev) from the gap's start, strictly before its end.
 #    (a) g > P: missing, filled at f.  (b) g <= P, g > s_prev and s_next == s_prev: a lost record after a move to
-#    shorter settlements, filled at f.  (c) g <= P and s_next >= g, or no later record yet: the venue moving back
-#    towards its schedule, NOT missing.  (d) a lengthening beyond P is honoured only where the venue publishes its
+#    shorter settlements, filled at f.  (c), as amended (Advisor 04:31, 04:33): g <= P is NOT missing only once
+#    s_next >= g (the venue moving back towards its schedule); while s_next is unknown and g > s_prev it is
+#    PROVISIONALLY missing (baseline and alert), reversed by its own journaled "reversal" row and its alert closed when
+#    the next record shows s_next >= g, or missing for good under (b) when s_next == s_prev (no new row). At most one
+#    charge and one reversal per settlement. s_prev and s_next come from STORED records only; provisional settlements
+#    feed foresight only: past the newest record, the published interval, else min(latest step counting provisional
+#    settlements, P).  (d) a lengthening beyond P is honoured only where the venue publishes its
 #    interval (VenueProfile.funding_interval), and only on the newest gap; a sustained wider step is not a lengthening.
 #    Default: a gap matching none of (a)-(c) is missing (adverse), with an alert. 02:13 pins: every inferred missing
 #    settlement enters the per-settlement model flagged "inferred time"; the venue-history backfill replaces it; the
@@ -1348,9 +1321,13 @@ GAPS = {
                                                "10-04 08:00"), "2025-10-04 04:00",
                                             {"10-03 00:00": S_, "10-03 04:00": S_, "10-03 08:00": S_,
                                              "10-03 16:00": S_, "10-04 00:00": S_}),
-    # (c) the same gap ending the records (no later record yet): no 12:00
-    "c-gap-ending-the-records": (_t("10-03 04:00", "10-03 08:00", "10-03 16:00"), "2025-10-03 23:00",
-                                 {"10-03 00:00": S_, "10-03 04:00": S_, "10-03 08:00": S_, "10-03 16:00": S_}),
+    # amended (c) (Advisor 04:31, 04:33): the same gap ending the records (s_next unknown, g > s_prev) is PROVISIONALLY
+    # missing: 12:00 at the baseline; foresight past 16:00 is min(4 h counting the provisional 12:00, P), so 20:00 is
+    # due and at the baseline too. s_prev / s_next come from stored records only.
+    "c-gap-ending-the-records-is-provisionally-missing": (_t("10-03 04:00", "10-03 08:00", "10-03 16:00"),
+                                                          "2025-10-03 23:00",
+                                                          {"10-03 00:00": S_, "10-03 04:00": S_, "10-03 08:00": S_,
+                                                           "10-03 12:00": B_, "10-03 16:00": S_, "10-03 20:00": B_}),
     # default: 2 h step (00:00 -> 02:00), then g = 6 h (02:00 -> 08:00) <= P, > s_prev, s_prev < s_next (4 h) < g:
     # missing, filled at f = 2 h (04:00, 06:00)
     "default-none-of-a-to-c": (_t("10-03 02:00", "10-03 08:00", "10-03 12:00", "10-03 16:00", "10-03 20:00"),
@@ -1369,7 +1346,6 @@ GAPS = {
 }
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("case", list(GAPS))
 def test_a_gap_between_stored_records_is_read_by_the_rules(binance, monkeypatch, case, side):
@@ -1387,13 +1363,40 @@ def test_a_gap_between_stored_records_is_read_by_the_rules(binance, monkeypatch,
             assert x["amount"] < 0, x  # the baseline is paid whichever side is held
 
 
+R_ = "reversal"  # the journaled row that reverses a provisional baseline (amended (c), Advisor 04:31)
+
+
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_c_step_after_as_wide_reverses_both_in_the_backtest(binance, side):
+    """Sibling of c-gap-ending-the-records-is-provisionally-missing, with 4 Oct 00:00 stored (run to 02:00). Gap
+    08:00 -> 16:00: s_next = 8 h >= g, so 12:00 is not missing. Gap 16:00 -> 00:00: from STORED records s_prev = 8 h
+    (08:00 -> 16:00), so g <= s_prev is no gap and 20:00 is not missing either (counting the provisional 12:00 would
+    make s_prev 4 h and wrongly keep 20:00 missing). The backtest may book this net (no rows) or as a baseline and its
+    own reversal row each: 12:00 and 20:00 each net to zero, with at most one charge and one reversal, no orphan
+    reversal, and every record charged once as settled."""
+    write_rates({t: 0.0001 for t in B8 + _t("10-03 04:00", "10-03 08:00", "10-03 16:00", "10-04 00:00")})
+    r = backtest(binance, hourly_bars("2025-10-02 00:00", "2025-10-04 02:00"),
+                 win(("2025-10-02 01:00", "2026-01-01", side)))
+    rows = [(utc(x["ts"]), x.get("kind"), x["amount"]) for x in r.journal.funding_
+            if utc(x["ts"]) >= utc("2025-10-03 00:00")]
+    shown = [(f"{t:%d %H:%M}", k, round(a, 6)) for t, k, a in sorted(rows, key=lambda x: (x[0], str(x[1])))]
+    for t in _t("10-03 12:00", "10-03 20:00"):
+        at = [(k, a) for ts, k, a in rows if ts == t]
+        kinds_at = [k for k, _ in at]
+        assert kinds_at.count(B_) <= 1 and kinds_at.count(R_) <= 1 and set(kinds_at) <= {B_, R_}, shown
+        assert (R_ in kinds_at) == (B_ in kinds_at), f"{t:%H:%M}: a charge without its reversal, or an orphan: {shown}"
+        assert sum(a for _, a in at) == pytest.approx(0, abs=1e-9), f"{t:%H:%M} does not net to zero: {shown}"
+    others = sorted((ts, k) for ts, k, _ in rows if ts not in _t("10-03 12:00", "10-03 20:00"))
+    assert others == [(t, S_) for t in _t("10-03 00:00", "10-03 04:00", "10-03 08:00", "10-03 16:00", "10-04 00:00")], \
+        shown
+
+
 def _gap_paper(tmp_path, monkeypatch, binance, store, rates, start, minutes, side=1, opens=None, published=None):
     opens = opens or utc(start) + pd.Timedelta(minutes=2)
     return paper(tmp_path, monkeypatch, binance, win((opens, "2025-10-05 00:00", side)), start, minutes,
                  rates=rates, store=store, published=published)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_paper_the_8h_single_missing_settlement_is_inferred_marked_and_charged_once(tmp_path, monkeypatch, binance,
                                                                                     side):
@@ -1412,11 +1415,11 @@ def test_paper_the_8h_single_missing_settlement_is_inferred_marked_and_charged_o
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_paper_a_record_lost_right_after_a_shortening_is_missing_at_the_15_minute_wait(tmp_path, monkeypatch, binance):
     """(b) in paper: the venue moved to 4 h at 12:00 (08:00, 12:00 stored); 16:00 is never published, 20:00 is. 16:00
     (12:00 + 4 h, foreseen) is marked missing "(inferred time)" between 16:15 and 16:16 (the 15-minute wait, not a
-    longer one), opens an episode from 16:00 and is charged the baseline once; 12:00 and 20:00 are settled."""
+    longer one), opens an episode from 16:00 and is charged the baseline once; 12:00 and 20:00 are settled. At 20:30
+    s_next is unknown, so 16:00 is still (provisionally) missing: no reversal row (amended (c), Advisor 04:31)."""
     store = journal()
     rates = {**{f"{t:%Y-%m-%d %H:%M}": 0.0001 for t in B8}, "2025-10-03 08:00": 0.0001, "2025-10-03 12:00": 0.0001,
              "2025-10-03 20:00": 0.0001}
@@ -1430,23 +1433,101 @@ def test_paper_a_record_lost_right_after_a_shortening_is_missing_at_the_15_minut
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
-def test_paper_the_venue_moving_back_to_its_schedule_leaves_no_settlement_missing(tmp_path, monkeypatch, binance):
-    """(c) in paper: 4 h records (00:00, 04:00, 08:00), then the venue is back on 8 h: 16:00 is the next record, no
-    12:00. However paper handles the foreseen 12:00 meanwhile, once 16:00 is stored 12:00 is not a missing settlement:
-    any mark of it says "(inferred time)", no episode is left open at 16:40, and 08:00 and 16:00 are settled."""
+def _rows(out) -> list:
+    return sorted((r["ts"], r.get("kind"), r["amount"]) for r in out["funding"])
+
+
+def _rshow(rows) -> list:
+    return [(f"{t:%d %H:%M}", k, round(a, 6)) for t, k, a in rows]
+
+
+def _net_zero(rows, *times) -> None:
+    for t in times:
+        assert sum(a for ts, _, a in rows if ts == utc(t)) == pytest.approx(0, abs=1e-6), \
+            f"{t} does not net to zero: {_rshow(rows)}"
+
+
+def _closed_from(store, t, not_before) -> None:
+    """The episode from settlement t was opened and then closed (its alert), not before `not_before`."""
+    opened = [e for e in _stales(store) if _from(t) in e["message"]]
+    closed = [e for e in _cleared(store) if _from(t) in e["message"]]
+    assert len(opened) == 1 and len(closed) == 1, f"episode from {t}: {_show(_events(store, *EPISODE))}"
+    assert closed[0]["ts"] >= utc(not_before), f"closed before {not_before}: {_show(_events(store, *EPISODE))}"
+
+
+def test_paper_c_step_after_as_wide_reverses_both(tmp_path, monkeypatch, binance):
+    """Amended (c) in paper (Advisor 04:31 / 04:33; replaces the 02:40 reading "back on schedule, not missing"). 4 h
+    records (00:00, 04:00, 08:00), then 16:00 and 4 Oct 00:00. 12:00 (foreseen at 4 h) is charged the baseline at
+    12:15 and alerted; once 16:00 lands, s_next is unknown and g (8 h) > s_prev (4 h): still provisionally missing.
+    Foresight past 16:00 is min(4 h counting the provisional 12:00, P), so 20:00 is charged at 20:15 and alerted (a
+    new episode: 16:00 between is stored). When 00:00 lands, 08:00 -> 16:00 has s_next = 8 h >= g (12:00 reversed)
+    and 16:00 -> 00:00 is g <= s_prev = 8 h from stored records (20:00 reversed): each by its own "reversal" row,
+    net zero, both alerts closed then, not before."""
     store = journal()
-    rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002}
-    out = _gap_paper(tmp_path, monkeypatch, binance, store, rates, "2025-10-03 07:50", 530)
-    kinds_ = {r["ts"]: r.get("kind") for r in out["funding"]}
-    assert kinds_.get(utc("2025-10-03 08:00")) == S_ and kinds_.get(utc("2025-10-03 16:00")) == S_, kinds_
-    assert all("(inferred time)" in e["message"] for e in _missing_of(store, "2025-10-03 12:00")), _show(_events(store))
-    got = _events(store, *EPISODE)
-    assert not got or got[-1]["kind"] == "funding_stale_cleared", f"left open: {_show(got)}"
+    rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002,
+             "2025-10-04 00:00": 0.0001}
+    out = _gap_paper(tmp_path, monkeypatch, binance, store, rates, "2025-10-03 07:50", 1010)
+    for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
+        _built_missing(store, t)
+        (m,) = _missing_of(store, t)
+        assert "(inferred time)" in m["message"], _show([m])
+        assert utc(t) + pd.Timedelta(minutes=15) <= m["ts"] < utc(t) + pd.Timedelta(minutes=16), _show([m])
+    rows = _rows(out)
+    want = [("2025-10-03 08:00", S_), ("2025-10-03 12:00", B_), ("2025-10-03 12:00", R_), ("2025-10-03 16:00", S_),
+            ("2025-10-03 20:00", B_), ("2025-10-03 20:00", R_), ("2025-10-04 00:00", S_)]
+    assert [(t, k) for t, k, _ in rows] == [(utc(t), k) for t, k in want], _rshow(rows)
+    _net_zero(rows, "2025-10-03 12:00", "2025-10-03 20:00")
+    for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
+        _closed_from(store, t, "2025-10-04 00:00")
     _texts_ok(store)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
+B8_RATES = {f"{t:%Y-%m-%d %H:%M}": 0.0001 for t in B8}
+SHORTENED = {**B8_RATES, "2025-10-03 08:00": 0.0001, "2025-10-03 12:00": 0.0001, "2025-10-03 20:00": 0.0001}
+
+
+def test_paper_a_record_lost_after_a_shortening_stays_missing_when_the_step_after_matches(tmp_path, monkeypatch,
+                                                                                         binance):
+    """(b) settled by the next record: as the 20:30 cell, but 4 Oct 00:00 lands (4 h after 20:00), run to 00:40.
+    s_next (4 h) == s_prev (4 h): 16:00 is missing for good (backfill, then never published at 24 h). It stays charged
+    once, with no reversal and no new row; its episode stays open; 00:00 is settled."""
+    store = journal()
+    out = _gap_paper(tmp_path, monkeypatch, binance, store, {**SHORTENED, "2025-10-04 00:00": 0.0001},
+                     "2025-10-03 11:50", 770)
+    _built_missing(store, "2025-10-03 16:00")
+    rows = _rows(out)
+    want = [("2025-10-03 12:00", S_), ("2025-10-03 16:00", B_), ("2025-10-03 20:00", S_), ("2025-10-04 00:00", S_)]
+    assert [(t, k) for t, k, _ in rows] == [(utc(t), k) for t, k in want], _rshow(rows)
+    assert not [e for e in _cleared(store) if _from("2025-10-03 16:00") in e["message"]], _show(_events(store))
+    assert [e for e in _stales(store) if _from("2025-10-03 16:00") in e["message"]], _show(_events(store))
+    _texts_ok(store)
+
+
+def test_paper_the_04_00_branch_reverses_16_00_and_00_00_when_04_00_lands(tmp_path, monkeypatch, binance):
+    """The Advisor's 04:00 branch (04:31). Records 08:00, 12:00, (16:00 lost), 20:00, no 4 Oct 00:00, then 04:00
+    lands; run to 04:40. 16:00 is charged at 16:15 and stays provisional at 20:00 (s_next unknown). Foresight past
+    20:00 is 4 h (counting the provisional 16:00), so 00:00 is charged at 00:15 (its own episode: 20:00 between is
+    stored). When 04:00 lands: 12:00 -> 20:00 has s_next = 8 h >= g = 8 h, so 16:00 is reversed; 20:00 -> 04:00 is
+    8 h <= s_prev = 8 h from stored records (12:00 -> 20:00), no gap, so 00:00 is reversed. Each by its own "reversal"
+    row, net zero, both alerts closed then, not before."""
+    store = journal()
+    out = _gap_paper(tmp_path, monkeypatch, binance, store, {**SHORTENED, "2025-10-04 04:00": 0.0001},
+                     "2025-10-03 11:50", 1010)
+    for t in ("2025-10-03 16:00", "2025-10-04 00:00"):
+        _built_missing(store, t)
+        (m,) = _missing_of(store, t)
+        assert "(inferred time)" in m["message"], _show([m])
+        assert utc(t) + pd.Timedelta(minutes=15) <= m["ts"] < utc(t) + pd.Timedelta(minutes=16), _show([m])
+    rows = _rows(out)
+    want = [("2025-10-03 12:00", S_), ("2025-10-03 16:00", B_), ("2025-10-03 16:00", R_), ("2025-10-03 20:00", S_),
+            ("2025-10-04 00:00", B_), ("2025-10-04 00:00", R_), ("2025-10-04 04:00", S_)]
+    assert [(t, k) for t, k, _ in rows] == [(utc(t), k) for t, k in want], _rshow(rows)
+    _net_zero(rows, "2025-10-03 16:00", "2025-10-04 00:00")
+    for t in ("2025-10-03 16:00", "2025-10-04 00:00"):
+        _closed_from(store, t, "2025-10-04 04:00")
+    _texts_ok(store)
+
+
 @pytest.mark.parametrize("case", ["a-8h-one-missing", "default-none-of-a-to-c"])
 def test_the_collector_marks_an_inferred_settlement_and_the_backfill_replaces_it(tmp_path, monkeypatch, binance, case):
     """02:13 pins through the hub. The store holds records with a gap, as the collector kept them (a: 08:00 lost on
@@ -1522,7 +1603,6 @@ SNAPS = {
 }
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("case", list(SNAPS))
 def test_a_record_within_a_minute_of_its_settlement_is_that_settlements_rate(binance, case, side):
@@ -1547,7 +1627,6 @@ DRIFT = [("2025-10-03 07:59:00", 0.00011, "2025-10-03 08:00"),  # -60 s
          ("2025-10-04 07:59:30", 0.00014, "2025-10-04 08:00")]  # -30 s
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_records_and_settlements_match_one_to_one_with_drifting_stamps(binance, side):
     """A day of stamps drifting by -60 s, +30 s, +60 s and -30 s: each settlement (3 Oct 08:00 to 4 Oct 08:00) is
@@ -1563,7 +1642,6 @@ def test_records_and_settlements_match_one_to_one_with_drifting_stamps(binance, 
     assert all(rate == pytest.approx(w) for (_, _, rate), (_, _, w) in zip(rows, expect)), _shown(rows)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("stamp, signed", [("2025-10-03 08:01", "+1 min"), ("2025-10-03 07:59", "-1 min")],
                          ids=["late", "early"])
@@ -1579,7 +1657,6 @@ def test_a_snapped_record_keeps_its_own_stamp_flagged_for_audit(binance, stamp, 
     assert f"{utc(stamp):%H:%M}" in text, f"the record's own stamp {utc(stamp):%H:%M} is not kept: {text}"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_paper_a_record_stamped_a_minute_late_is_charged_once_at_the_settlement(tmp_path, monkeypatch, binance, side):
     """Paper reads the venue's records too: 08:00's record is stamped 08:01 (published 08:05, inside the wait).
@@ -1593,7 +1670,6 @@ def test_paper_a_record_stamped_a_minute_late_is_charged_once_at_the_settlement(
     assert not _events(store, "funding_missing", "funding_stale"), _show(_events(store))
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
 def test_the_collector_reads_a_snapped_record_as_no_gap_but_still_marks_a_real_one(tmp_path, monkeypatch, binance):
     """The store keeps 08:01 (08:00's record, late) and 4 Oct 00:00, and lost 16:00. The 4 Oct 00:30 pass marks 16:00
     missing "(inferred time)" (the control), and nothing for 08:00 or 08:01: no funding_missing, no episode from them."""

@@ -537,6 +537,7 @@ class LongFlatStrategy(Strategy):
         # (time, amount, kind) for every funding payment, for a backtest's equity: kind "settled" (the venue's rate) or
         # "baseline" (missing, charged adversely).
         self.funding_log: list[tuple] = []
+        self.funding_notes: dict = {}  # settlement -> its audit note (a snapped record), for BacktestResult.funding
         # (time, the venue's rate missing, a position held) for every settlement: how much of a backtest's funding is
         # the venue's own (Advisor, 6 Oct 2026, QA P1-O17). Flat settlements are marked in backtests only.
         self.funding_marks: list[tuple] = []
@@ -2889,6 +2890,8 @@ class LongFlatStrategy(Strategy):
                       kind: str = "settled", note: str = "") -> None:
         self._cash_adj += amount
         self.funding_log.append((ts, amount, kind))
+        if note:
+            self.funding_notes[ts] = note.strip(" ()")  # the snapped record's own stamp, kept for the audit
         if kind == "baseline" and not self._backtest:
             self._funding_paid[ts] = (qty, px, rate, amount)  # reversed if the venue shows it was no settlement
         if self.runtime is not None:

@@ -215,16 +215,20 @@ def test_settlement_times_follow_the_venues_records_and_carry_its_latest_interva
 
 
 def test_a_foreseen_settlement_the_venue_skips_is_not_a_settlement_once_a_newer_record_lands():
-    """4-hourly records, then the venue goes back to 8-hourly: 04:00 was foreseen from the 4 h step, but once the
-    08:00 record is kept it is no settlement (CR minor 1: no phantom charge). A single record (a new listing)
-    falls back to the fixed hours after it."""
+    """4-hourly records, then the venue goes back to 8-hourly: 04:00 was foreseen from the 4 h step. The 08:00 record
+    alone leaves it provisionally missing (the step after the gap is unknown: the adverse side); once 16:00 is kept,
+    8 h on, it is no settlement (CR minor 1: no phantom charge; Advisor, 7 Oct 04:31, amended (c)). A single
+    record (a new listing) falls back to the fixed hours after it."""
     t = lambda s: utc(s).to_pydatetime()  # noqa: E731
     four = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-04 20:00"), utc("2025-10-05 00:00")]))
     assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 05:00"), (0, 8, 16), four) == [
         t("2025-10-05 04:00")]  # foreseen: paper waits for its record
     eight = pd.concat([four, pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))])
     assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 09:00"), (0, 8, 16), eight) == [
-        t("2025-10-05 08:00")]
+        t("2025-10-05 04:00"), t("2025-10-05 08:00")]  # provisionally missing
+    back = pd.concat([eight, pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 16:00")]))])
+    assert markets.settlement_times(t("2025-10-05 00:00"), t("2025-10-05 17:00"), (0, 8, 16), back) == [
+        t("2025-10-05 08:00"), t("2025-10-05 16:00")]
     one = pd.Series(0.0001, index=pd.DatetimeIndex([utc("2025-10-05 08:00")]))
     assert markets.settlement_times(t("2025-10-05 07:00"), t("2025-10-06 01:00"), (0, 8, 16), one) == [
         t("2025-10-05 08:00"), t("2025-10-05 16:00"), t("2025-10-06 00:00")]

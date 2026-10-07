@@ -471,21 +471,30 @@ def test_paper_marks_a_settlement_never_published_after_a_day_once_and_closes_it
 
 def test_paper_reverses_the_baseline_for_a_foreseen_settlement_the_venue_never_made(tmp_path, monkeypatch, binance):
     """4-hourly records to 08:00, then the venue goes back to 8-hourly. 12:00, foreseen from the 4 h step, is alerted
-    and charged the baseline 15 minutes after it was due (QA P1-O17a-13); once the 16:00 record is kept it shows 12:00
-    never settled, so the charge is reversed by its own journaled row (kind "reversal"), the original row untouched,
-    and the episode closes (Advisor, 7 Oct 2026)."""
+    and charged the baseline 15 minutes after it was due (QA P1-O17a-13). The 16:00 record alone leaves it provisionally
+    missing (the step after the gap is still unknown); once 4 Oct 00:00 is kept, 8 h after 16:00, it shows 12:00 never
+    settled, so the charge is reversed by its own journaled row (kind "reversal"), the original row untouched, and the
+    episode closes (Advisor, 7 Oct 2026, (c) as amended 04:31)."""
     from o17_harness import journal
 
-    rates = {f"2025-10-03 {h}": 0.0001 for h in ("00:00", "04:00", "08:00", "16:00")}
+    from sleeve_fund import funding
+
+    rates = {**{f"2025-10-03 {h}": 0.0001 for h in ("00:00", "04:00", "08:00", "16:00")}, "2025-10-04 00:00": 0.0001}
     store = journal()
-    out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-03 16:40", 1)), "2025-10-03 07:50",
-                530, step=5, rates=rates, store=store, name="w", published={"2025-10-03 12:00": NEVER},
+    out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-04 00:40", 1)), "2025-10-03 07:50",
+                1010, step=5, rates=rates, store=store, name="w", published={"2025-10-03 12:00": NEVER},
                 stored={"2025-10-03 00:00": "2025-10-03 00:00", "2025-10-03 04:00": "2025-10-03 04:00",
-                        "2025-10-03 08:00": "2025-10-03 08:00", "2025-10-03 16:00": "2025-10-03 16:01"})
+                        "2025-10-03 08:00": "2025-10-03 08:00", "2025-10-03 16:00": "2025-10-03 16:01",
+                        "2025-10-04 00:00": "2025-10-04 00:01"})
     at12 = [r for r in out["funding"] if utc(r["ts"]) == utc("2025-10-03 12:00")]
     assert [r.get("kind") for r in at12] == ["baseline", "reversal"], at12
     assert at12[0]["amount"] < 0 and at12[1]["amount"] == pytest.approx(-at12[0]["amount"])
     stale = [e for e in store.events(None, limit=500) if e["kind"] == "funding_stale"]
     assert stale and utc("2025-10-03 12:15") <= pd.Timestamp(stale[-1]["ts"]) < utc("2025-10-03 12:17")
+    # 16:00 foresees 20:00 at the 4 h step (the shorter, adverse one, counting 12:00): missed too, its own episode
+    # (16:00 kept between them), and reversed with 12:00 once 00:00 shows the 8 h step
+    at20 = [r.get("kind") for r in out["funding"] if utc(r["ts"]) == utc("2025-10-03 20:00")]
+    assert at20 == ["baseline", "reversal"], out["funding"]
     got = [e["kind"] for e in reversed(store.events(None, limit=500)) if e["kind"].startswith("funding_stale")]
-    assert got == ["funding_stale", "funding_stale_cleared"], got
+    assert sorted(got) == ["funding_stale"] * 2 + ["funding_stale_cleared"] * 2, got
+    assert funding.journal_state(store, "[BTC/USDT]")["open"] == {}, got

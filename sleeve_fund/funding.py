@@ -132,7 +132,8 @@ def cap_of(venue: str, pair: str) -> float:
 
 
 def snap_note(series: pd.Series, ts) -> str:
-    """The audit note " (snapped +N min)" when the record charged at settlement `ts` is stamped off it (inside MATCH, so it is that
+    """The audit note " (record stamped HH:MM UTC, snapped +N min)" when the record charged at settlement `ts` is stamped off it
+    (inside MATCH, so it is that
     settlement's rate, published late or early: Advisor, 7 Oct 2026), else "": kept for the audit."""
     if series is None or series.empty:
         return ""
@@ -143,7 +144,7 @@ def snap_note(series: pd.Series, ts) -> str:
     if i >= len(series) or abs(series.index[i] - ts) > MATCH:
         return ""
     off = round((series.index[i] - ts) / pd.Timedelta(minutes=1))
-    return f" (snapped {off:+d} min)" if off else ""
+    return f" (record stamped {series.index[i]:%H:%M} UTC, snapped {off:+d} min)" if off else ""
 
 
 def believable(rate, cap: float = CAP) -> bool:
