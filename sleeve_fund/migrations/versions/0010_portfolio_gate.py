@@ -30,14 +30,45 @@ LIMITS = ('gross', 'net_instrument', 'margin', 'open_risk', 'halt', 'pause', 'po
           'below_min')
 
 
+# The PM's accepted limits (6 Oct 14:17), as sleeve_fund.risk.PortfolioProfile v1 holds them. Frozen here, as a
+# migration must be; a test keeps it equal to store.PORTFOLIO_PROFILE_V1.
+SEED = {
+    'version': 1, 'created_at': datetime(2026, 10, 6, 14, 17, tzinfo=timezone.utc), 'created_by': 'migration 0010',
+    'gross_max': Decimal('1.5'), 'net_underlying_max': Decimal('0.5'), 'margin_max': Decimal('0.5'),
+    'open_risk_max': Decimal('0.05'), 'drawdown_halt': Decimal('0.15'), 'daily_pause': Decimal('0.03'),
+    'note': "the PM's accepted portfolio limits (6 Oct 2026)",
+}
+
+
 def _in(column, values):
     return f"{column} IN ({', '.join(repr(v) for v in values)})"
 
 
 def upgrade() -> None:
-    if op.get_bind().dialect.name == 'postgresql':
-        op.execute(sa.schema.CreateSequence(sa.Sequence('gate_decision_seq')))
-    profile = op.create_table(
+    bind = op.get_bind()
+    # A Store opened on the database before this ran (create_all, the same code) may already have built these
+    # tables, and seeded version 1: those are left as they are, and the deploy's drift check compares them.
+    have = set(sa.inspect(bind).get_table_names())
+    if bind.dialect.name == 'postgresql':
+        op.execute(sa.schema.CreateSequence(sa.Sequence('gate_decision_seq'), if_not_exists=True))
+    if 'portfolio_profile' not in have:
+        _profile()
+    if 'portfolio_state' not in have:
+        _state()
+    if 'book_marks' not in have:
+        _book_marks()
+    if 'gate_decisions' not in have:
+        _decisions()
+    if 'gate_reservations' not in have:
+        _reservations()
+    types = {'version': sa.Integer(), 'created_at': TS, 'created_by': sa.Text(), 'note': sa.Text()}
+    profile = sa.table('portfolio_profile', *(sa.column(k, types.get(k, LIMIT)) for k in SEED))
+    if bind.execute(sa.select(sa.func.count()).select_from(profile).where(profile.c.version == 1)).scalar() == 0:
+        op.bulk_insert(profile, [SEED])
+
+
+def _profile() -> None:
+    op.create_table(
         'portfolio_profile',
         sa.Column('version', sa.Integer(), autoincrement=False, nullable=False),
         sa.Column('created_at', TS, nullable=False),
@@ -53,6 +84,9 @@ def upgrade() -> None:
                            'AND daily_pause > 0 AND drawdown_halt > daily_pause', name='portfolio_profile_limits'),
         sa.PrimaryKeyConstraint('version'),
     )
+
+
+def _state() -> None:
     op.create_table(
         'portfolio_state',
         sa.Column('id', sa.Integer(), autoincrement=False, nullable=False),
@@ -69,9 +103,14 @@ def upgrade() -> None:
         sa.Column('updated_at', TS, nullable=False),
         sa.CheckConstraint('id = 1', name='portfolio_state_one_row'),
         sa.CheckConstraint("status IN ('ok', 'paused', 'halted')", name='portfolio_state_status'),
+        sa.CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name='portfolio_state_paused_until'),
+        sa.CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name='portfolio_state_halt_reason'),
         sa.ForeignKeyConstraint(['profile_version'], ['portfolio_profile.version']),
         sa.PrimaryKeyConstraint('id'),
     )
+
+
+def _book_marks() -> None:
     op.create_table(
         'book_marks',
         sa.Column('ts', TS, nullable=False),
@@ -89,6 +128,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(['profile_version'], ['portfolio_profile.version']),
         sa.PrimaryKeyConstraint('ts'),
     )
+
+
+def _decisions() -> None:
     op.create_table(
         'gate_decisions',
         sa.Column('id', BIG_ID, nullable=False),
@@ -117,6 +159,8 @@ def upgrade() -> None:
         sa.CheckConstraint(_in('outcome', OUTCOMES), name='gate_decisions_outcome'),
         sa.CheckConstraint(_in('limit_hit', LIMITS), name='gate_decisions_limit_hit'),
         sa.CheckConstraint(_in('stage', ('submit', 'fill')), name='gate_decisions_stage'),
+        sa.CheckConstraint('approved_qty >= 0 AND approved_qty <= requested_qty', name='gate_decisions_approved_qty'),
+        sa.CheckConstraint("outcome <> 'rejected' OR approved_qty = 0", name='gate_decisions_rejected_none'),
         sa.ForeignKeyConstraint(['order_id'], ['orders.order_id']),
         sa.ForeignKeyConstraint(['profile_version'], ['portfolio_profile.version']),
         sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id'], ondelete='RESTRICT'),
@@ -125,6 +169,9 @@ def upgrade() -> None:
         sa.UniqueConstraint('sleeve_id', 'bar_ts', 'intent_id', 'stage', name='gate_decisions_sleeve_bar_intent_stage'),
     )
     op.create_index('gate_decisions_sleeve_decided_at', 'gate_decisions', ['sleeve_id', 'decided_at'], unique=False)
+
+
+def _reservations() -> None:
     op.create_table(
         'gate_reservations',
         sa.Column('decision_id', BIG_ID, autoincrement=False, nullable=False),
@@ -141,6 +188,8 @@ def upgrade() -> None:
         sa.Column('release_reason', sa.String(length=8), nullable=True),
         sa.CheckConstraint(_in('release_reason', ('fill', 'reject', 'cancel', 'ttl')),
                            name='gate_reservations_release_reason'),
+        sa.CheckConstraint('(released_at IS NULL) = (release_reason IS NULL)', name='gate_reservations_released'),
+        sa.CheckConstraint('remaining_qty >= 0', name='gate_reservations_remaining_qty'),
         sa.ForeignKeyConstraint(['decision_id'], ['gate_decisions.id']),
         sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id'], ondelete='RESTRICT'),
         sa.PrimaryKeyConstraint('decision_id'),
@@ -149,13 +198,6 @@ def upgrade() -> None:
                     sqlite_where=sa.text('released_at IS NULL'), postgresql_where=sa.text('released_at IS NULL'))
     op.create_index('gate_reservations_active_sleeve', 'gate_reservations', ['sleeve_id'], unique=False,
                     sqlite_where=sa.text('released_at IS NULL'), postgresql_where=sa.text('released_at IS NULL'))
-    # The PM's accepted limits (6 Oct 14:17), as sleeve_fund.risk.PortfolioProfile v1 holds them.
-    op.bulk_insert(profile, [{
-        'version': 1, 'created_at': datetime(2026, 10, 6, 14, 17, tzinfo=timezone.utc), 'created_by': 'migration 0010',
-        'gross_max': Decimal('1.5'), 'net_underlying_max': Decimal('0.5'), 'margin_max': Decimal('0.5'),
-        'open_risk_max': Decimal('0.05'), 'drawdown_halt': Decimal('0.15'), 'daily_pause': Decimal('0.03'),
-        'note': "the PM's accepted portfolio limits (6 Oct 2026)",
-    }])
 
 
 def downgrade() -> None:

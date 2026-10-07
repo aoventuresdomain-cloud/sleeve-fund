@@ -540,6 +540,8 @@ portfolio_state_t = Table(
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
+    CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name="portfolio_state_paused_until"),
+    CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name="portfolio_state_halt_reason"),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.
@@ -603,6 +605,8 @@ gate_decisions_t = Table(
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
+    CheckConstraint("approved_qty >= 0 AND approved_qty <= requested_qty", name="gate_decisions_approved_qty"),
+    CheckConstraint("outcome <> 'rejected' OR approved_qty = 0", name="gate_decisions_rejected_none"),
     UniqueConstraint("sleeve_id", "bar_ts", "intent_id", "stage", name="gate_decisions_sleeve_bar_intent_stage"),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
 )
@@ -624,6 +628,8 @@ gate_reservations_t = Table(
     Column("released_at", TS),  # null while active
     Column("release_reason", String(8)),
     CheckConstraint(_in("release_reason", GATE_RELEASES), name="gate_reservations_release_reason"),
+    CheckConstraint("(released_at IS NULL) = (release_reason IS NULL)", name="gate_reservations_released"),
+    CheckConstraint("remaining_qty >= 0", name="gate_reservations_remaining_qty"),
     Index("gate_reservations_active", "underlying", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),
     Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),

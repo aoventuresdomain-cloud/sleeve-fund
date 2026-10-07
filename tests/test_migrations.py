@@ -232,6 +232,82 @@ def test_0010_refuses_names_and_limits_outside_the_spec(engine):
              "marked_at": now, "profile_version": 1, "updated_at": now}
     refused(portfolio_state_t, {**state, "id": 2})
     refused(portfolio_state_t, {**state, "status": "stopped"})
+    refused(portfolio_state_t, {**state, "status": "paused"})  # paused needs its paused_until
+    refused(portfolio_state_t, {**state, "status": "halted"})  # halted needs its reason
     refused(portfolio_profile_t, {**PORTFOLIO_PROFILE_V1, "version": 2, "drawdown_halt": Decimal("0.03")})
     with engine.begin() as c:
         c.execute(insert(portfolio_state_t), [state])
+
+
+def test_0010_refuses_impossible_quantities_and_half_released_reservations(engine):
+    """DA's review: approved is 0..requested and 0 when rejected; a reservation's release time and reason come
+    together; remaining_qty is never below 0."""
+    from decimal import Decimal
+
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import gate_decisions_t, gate_reservations_t, utcnow
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    sid = store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD",
+                              bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
+
+    def refused(table, row):
+        with pytest.raises(IntegrityError), engine.begin() as c:
+            c.execute(insert(table), [row])
+
+    refused(gate_decisions_t, _gate_row(sid, approved_qty=Decimal("2")))  # more than asked
+    refused(gate_decisions_t, _gate_row(sid, approved_qty=Decimal("-1")))
+    refused(gate_decisions_t, _gate_row(sid, outcome="rejected", limit_hit="gross"))  # rejected with a quantity
+    with engine.begin() as c:
+        did = c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id),
+                        [_gate_row(sid, outcome="trimmed", approved_qty=Decimal("0.5"), limit_hit="gross")]
+                        ).scalar_one()
+    now = utcnow()
+    res = {"decision_id": did, "sleeve_id": sid, "underlying": "BTC", "remaining_qty": Decimal("0.5"),
+           "notional": Decimal("50"), "margin": Decimal("25"), "open_risk": Decimal("1"), "created_at": now,
+           "expires_at": now}
+    refused(gate_reservations_t, {**res, "released_at": now})  # released with no reason
+    refused(gate_reservations_t, {**res, "release_reason": "fill"})  # a reason but still active
+    refused(gate_reservations_t, {**res, "remaining_qty": Decimal("-0.1")})
+    with engine.begin() as c:
+        c.execute(insert(gate_reservations_t), [res])
+
+
+def test_0010_seed_equals_the_stores_copy_field_by_field(engine):
+    """The migration's frozen seed and store.PORTFOLIO_PROFILE_V1 (create_all's) are deliberate copies that must
+    never drift (DA)."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from sleeve_fund.store import PORTFOLIO_PROFILE_V1, portfolio_profile_t
+
+    schema.migrate(engine)
+    with engine.connect() as c:
+        row = dict(c.execute(select(portfolio_profile_t).where(portfolio_profile_t.c.version == 1)).one()._mapping)
+    at = row["created_at"]
+    row["created_at"] = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    assert set(row) == set(PORTFOLIO_PROFILE_V1)
+    for k, want in PORTFOLIO_PROFILE_V1.items():
+        assert row[k] == want, (k, row[k], want)
+    assert isinstance(row["created_at"], datetime)
+
+
+def test_0010_on_a_database_a_newer_store_already_opened_keeps_its_tables_and_one_seed(engine):
+    """A Store opened on a database at 0009 builds the new tables itself (create_all, seeding v1); 0010 then leaves
+    them as they are, adds no second seed, and the result matches the code (DA-9's c1 cell opens one that way)."""
+    from alembic import command
+    from sqlalchemy import func, select
+
+    from sleeve_fund.store import portfolio_profile_t
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0009")
+    Store(engine=engine)
+    assert schema.migrate(engine, log=lambda _: None) == f"at migration {schema.head()}"
+    with engine.connect() as c:
+        assert c.execute(select(func.count()).select_from(portfolio_profile_t)).scalar() == 1
+    assert schema.report(engine)[1] == []
