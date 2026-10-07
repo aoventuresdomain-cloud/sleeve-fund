@@ -50,7 +50,7 @@ def route(strategy: str, venue: str, profiles: Mapping[str, object], *, tag: str
 
 
 def venue_of(instrument_id: str) -> str:
-    """The venue an instrument id names: BTC/USD.KRAKEN -> KRAKEN."""
+    """The venue an instrument id names: the part after its last dot, upper case."""
     symbol, dot, venue = str(instrument_id).rpartition(".")
     if not dot or not symbol or not venue:
         raise ValueError(f"{instrument_id!r} is not an instrument id with a venue")
