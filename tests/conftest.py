@@ -53,3 +53,23 @@ def full_margin(monkeypatch):
 
     for name, p in list(risk.PROFILES.items()):
         monkeypatch.setitem(risk.PROFILES, name, dataclasses.replace(p, max_position_pct=1.0))
+
+
+@pytest.fixture(autouse=True)
+def _open_risk_setup(monkeypatch, request):
+    """Paper measures a stopless perp position's open risk from its pair's daily ATR in the history store
+    (sleeve_fund.open_risk), which tests don't fill: a calm 2% day unless a test sets its own. A test of the paper
+    engine's mechanics with a stopless model above 1x (paper-backtest parity, funding, liquidation) lifts the
+    open-risk limit, which would refuse its entries in paper only."""
+    if "real_daily_atr" not in request.keywords:
+        from sleeve_fund import open_risk
+
+        monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
+    if "no_open_risk_limit" in request.keywords:
+        from sleeve_fund import open_risk
+
+        monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if "no_restart_safety_stop" in request.keywords:  # QA SG11: the marker, never a bare monkeypatch
+        from sleeve_fund.strategies.base import LongFlatStrategy
+
+        monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)

@@ -303,7 +303,8 @@ def _late_strategy(lag_s=None, side_now=0, wants=1):
                             market="perp")
     s = TrendFilter(cfg)
     events, sold, opened = [], [], []
-    s.runtime = SimpleNamespace(name="s1", store=SimpleNamespace(event=lambda *a, **k: events.append(a)))
+    s.runtime = SimpleNamespace(name="s1", backtest=False, holds={},
+                                store=SimpleNamespace(event=lambda *a, **k: events.append(a)))
     s.want_side = lambda bar: wants
     s._busy = lambda: False
     s._pos_side = lambda: side_now

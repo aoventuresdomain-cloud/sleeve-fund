@@ -166,6 +166,7 @@ def test_a_position_held_across_a_restart_with_a_short_slower_warm_up_still_exit
     s._slower[0].need = 5
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac, s._restore = 100.0, 1, 0.02, 0.05, None
     s.runtime.backtest, s.runtime.now = False, lambda: None
+    s._mark = lambda: (0.0, 0.0, 0.0, 97.5)  # no engine behind this fake: a stop reads the account (#182)
     assert s._check_exits(97.5)  # past the 2% stop: it sells
     assert sold[-1][0] == "stop_loss"
     s, bar, events, sold, opened = _late_strategy(side_now=0, wants=1)
