@@ -81,7 +81,8 @@ def clearing_action(sleeve, now: datetime | None = None) -> Why | None:
 
 # A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
-BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_unblocked", "Nothing opens: "
+BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens: "
+REFUSED = "entry_blocked"  # the decision log's action for an order the gate refused (QA's exposure-gate master)
 RETIRED = Why("it is retired (archived), and only Restore clears that", "retired")
 
 
@@ -393,7 +394,7 @@ class SleeveRuntime:
     def refused(self, why: str, what: str) -> None:
         """One decision row for an order the gate refused (Advisor 22:29); the episode's cleared event counts them."""
         self._refused += 1
-        self.store.decide("system", "entry_refused", f"Order not sent: {what}, and {why}", self.name)
+        self.store.decide("system", REFUSED, f"Order not sent: {what}, and {why}", self.name)
 
     def can_open(self) -> bool:
         if self.wiped_out:

@@ -673,6 +673,16 @@ class LongFlatStrategy(Strategy):
             self._degraded.setdefault(bar.ts_event, missing)
         return False
 
+    def _cannot_open(self, what: str) -> bool:
+        """Whether the strategy's status holds every entry. In paper, the entry the signal wanted is journaled as a
+        refused order, one decision row each, naming why (Advisor 22:29 (3)); a backtest has no PM to read them."""
+        if self.runtime is None or self.runtime.can_open():
+            return False
+        if not self.runtime.backtest:
+            why = self.runtime.entry_blocked()[1]
+            self.runtime.refused(why or f"it is {self.runtime.status}", f"{what} would open the position")
+        return True
+
     def _entry_blocked(self, bar: Bar) -> bool:
         """Whether no new entry may be decided on this bar because it is degraded; says why, once per bar."""
         if bar.ts_event != self._no_entry_ts:
@@ -684,6 +694,9 @@ class LongFlatStrategy(Strategy):
         self.log.info(f"entry held back on a degraded bar: {missing} of {minutes} minutes missing")
         self._note("degraded_bar", f"Entry held back: this {minutes}-minute bar is missing {missing} of its minutes "
                    "(over 10%), so no new position is opened on it; exits still run", level="info")
+        if self.runtime is not None and not self.runtime.backtest:  # its decision row (Advisor 22:29 (3))
+            self.runtime.refused(f"the {minutes}-minute candle is degraded ({missing} of its minutes missing)",
+                                 "an entry would open the position")
         return True
 
     def attach_minutes(self, loader) -> "LongFlatStrategy":
@@ -1511,7 +1524,7 @@ class LongFlatStrategy(Strategy):
             return
         if self._entry_blocked(bar):
             return
-        if self.runtime is not None and not self.runtime.can_open():
+        if self._cannot_open("a long entry" if side > 0 else "a short entry"):
             return
         if self._safety_stop:
             if self._entry_px is not None or self._exits_only:
@@ -1667,7 +1680,7 @@ class LongFlatStrategy(Strategy):
         if w > 0 and not is_long:
             if self._exit_lock or self._entry_blocked(bar):
                 return
-            if self.runtime is not None and not self.runtime.can_open():
+            if self._cannot_open("a long entry"):
                 return
             if self._has_exits:
                 plan = self._plan_exits(close)

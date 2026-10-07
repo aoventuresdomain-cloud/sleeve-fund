@@ -76,7 +76,7 @@ def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(pric
     before = [o for o in res.journal.orders_.values() if o["ts"] < cut]
     if before[-1]["intent"] == "entry":  # it held a position when the gate closed: its exit still went
         assert after and after[0]["intent"] != "entry"
-    refused = [d for d in res.journal.decisions_ if d["action"] == "entry_refused"]
+    refused = [d for d in res.journal.decisions_ if d["action"] == "entry_blocked"]
     assert refused and all(d["reason"].endswith("would open or add to the position, and held for the test")
                            for d in refused), refused[:2]
 
