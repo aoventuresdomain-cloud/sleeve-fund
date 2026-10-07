@@ -726,7 +726,10 @@ def test_a_simulated_perps_buy_and_hold_is_a_perp_with_spot_beside_it_and_a_fund
     assert stress["rate"] == 0.0003 and stress["hold"][1] < stress["hold"][0]  # a long pays more funding
     text = render(r, IdeaLedger(tmp_path / "l"))
     assert "Holding spot instead" in text and "Funding stress" in text
-    assert dict((n, v) for n, v, _ in g1_checks(r, IdeaLedger(tmp_path / "l")))[SHARPE_CHECK] != "N/A"
+    # The hold is priced, so the Sharpe check has a figure: not "no verdict" (the hold-insufficient path). A simulated
+    # perp's funding is NOT JUDGED (#163, Advisor 6 Oct), so the verdict itself shows N/A under that headline.
+    _, ev = {n: (v, e) for n, v, e in g1_checks(r, IdeaLedger(tmp_path / "l"))}[SHARPE_CHECK]
+    assert not ev.startswith("no verdict") and "Sharpe" in ev, ev
 
 
 def _native(tmp_path, monkeypatch, kept_from):

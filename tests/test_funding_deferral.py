@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import test_hub_146_qa as qa
+from test_hub_146_full_round import _funding_rate_stub  # either _funding_rate signature (#163 adds held=)
 from test_hub_146_qa import _probe, flat_prices, paper  # noqa: F401 - _probe registers the probe strategy
 
 SETTLED = pd.Timestamp("2025-10-03 08:00", tz="UTC")
@@ -17,7 +18,7 @@ def _quiet(monkeypatch, every: int, side: int, offset: int = 0):
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, 0.0001))
     p = flat_prices(40)
     quiet = frozenset(s for s in range(len(p)) if (s - offset) % every)  # one trade every `every` seconds, nothing else
     return paper(p, side=side, perp=True, profile="aggressive", leave=35, gone=quiet)
@@ -48,7 +49,7 @@ def test_without_a_trade_after_the_settlement_it_stays_held_however_long(monkeyp
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, 0.0001))
     p = flat_prices(40)
     run = paper(p, side=1, perp=True, profile="aggressive", leave=35, gone=frozenset(range(8 * 60, len(p))))
     assert [r for r in run.sequence() if r[0] == "entry"], run.sequence()
@@ -68,7 +69,7 @@ def _late_refill(monkeypatch, *, side, stop_in_outage: bool):
 
     start = int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value)
     monkeypatch.setattr(qa, "START", start)
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, 0.0001))
     p = flat_prices(40)
     if stop_in_outage:
         p = shape(p, 7.5, 7 + 50 / 60, adverse(side, 0.02))  # 07:57:30-07:57:50 through the 1 % stop
@@ -101,6 +102,17 @@ def test_a_refill_after_the_deadline_showing_a_stop_before_it_reverses_the_charg
     # The replayed close is journaled on the exit's order, for a restart before the next booking (CR #179)
     closes = [o["signal"].get("replayed_close") for o in run.orders if (o.get("signal") or {}).get("replayed_close")]
     assert closes and closes[0] < SETTLED.isoformat(), [o["signal"] for o in run.orders]
+
+
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_a_reversed_deadline_charge_is_its_own_reversal_row_and_is_never_trued_up(side, monkeypatch):
+    """The correcting row is kind "reversal", so a true-up never reads it as a settlement to correct, and reversing
+    a charge raises no funding outage (CR-3, M-1 on #163)."""
+    run = _late_refill(monkeypatch, side=side, stop_in_outage=True)
+    charged, correction = sorted(_at_settlement(run), key=lambda r: r["id"])
+    assert (charged["kind"], correction["kind"]) == ("settled", "reversal"), (charged, correction)
+    assert [r for r in run.store.funding("q146") if r["kind"] == "true_up"] == []
+    assert run.store.events_of(("funding_missing", "funding_stale"), limit=1000) == []  # global alerts
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
@@ -146,7 +158,7 @@ def test_a_settlement_younger_than_the_deadline_is_not_booked_with_an_older_one(
 
     monkeypatch.setattr(markets, "LOW_FEE_PERP", dataclasses.replace(markets.LOW_FEE_PERP, funding_hours=tuple(range(24))))
     monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, 0.0001))
     booked = _booked_at(monkeypatch)
     n = 90
     p = flat_prices(n)
@@ -175,7 +187,7 @@ def test_after_a_restart_a_settlement_after_the_replayed_close_is_not_charged(re
 
     start = int(pd.Timestamp("2025-10-03 08:06", tz="UTC").value)  # the new process
     monkeypatch.setattr(qa, "START", start)
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, 0.0001))
     p = flat_prices(20)
     at = lambda hhmm: datetime.fromisoformat(f"2025-10-03T{hhmm}:00+00:00")  # noqa: E731
     create = Store.create_sleeve

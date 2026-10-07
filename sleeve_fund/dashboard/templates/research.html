@@ -61,7 +61,7 @@
       <p class="answers"><b>Answers:</b> {{ c.answers }} <span class="kill">Kill</span> {{ c.kill_rule }}</p>
       <div class="study-stage">
         {{ stepper(c.row.stage, stages, c.row.observation) }}
-        <span class="muted">{{ stages[c.row.stage] }}{% if c.row.g1 == 'PASS' %}: passed on {{ c.row.passed_where|join(', ') }}{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} in paper{% if c.row.observation %} <span class="warn" title="No G1 pass for: {{ c.row.observing|map(attribute='name')|join(', ') }}">· {{ c.row.observing|length }} of {{ c.row.sleeves|length }} on observation</span>{% endif %}{% endif %}</span>
+        <span class="muted">{{ stages[c.row.stage] }}{% if c.row.g1 == 'PASS' %}: {% if c.row.passed_where %}passed on {{ c.row.passed_where|join(', ') }}{% else %}G1 passed, holdout not judged (backfill the funding rates){% endif %}{% endif %}{% if c.row.sleeves %} · {{ c.row.sleeves|length }} in paper{% if c.row.observation %} <span class="warn" title="No G1 pass for: {{ c.row.observing|map(attribute='name')|join(', ') }}">· {{ c.row.observing|length }} of {{ c.row.sleeves|length }} on observation</span>{% endif %}{% endif %}</span>
         <span class="stage-links"><a href="/backtest?strategy={{ c.name }}">Backtest</a> · <a href="/sleeves/new?strategy={{ c.name }}">New strategy</a></span>
       </div>
     </div>

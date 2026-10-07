@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Results · {{ s.label if s.strategy else title }} · Multi-Strategy Fund{% endblock %}
+{% block content %}
+<div class="page-head result-head">
+  <div>
+    <p class="crumb"><a href="/research#results">Results</a> <span class="faint">›</span></p>
+    <h1>{% if s.strategy %}{{ [s.label, s.instrument, candle_words(s.minutes)|lower ~ ' candles' if s.minutes else none]|select|join(' · ') }}{% else %}{{ title|replace('_', ' ') }}{% endif %}</h1>
+    <p class="lede">{{ [s.venue_label|capitalize if s.venue_label, when.strftime('%d %b %Y %H:%M') ~ ' UK']|select|join(' · ') }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data: proves the pipeline, not the idea</span>{% endif %}</p>
+  </div>
+  <div class="actions"><a class="button secondary" href="/research/{{ title }}">Full tear sheet</a></div>
+</div>
+
+<section class="verdict {{ s.tone }}" aria-label="Verdict">
+  <span class="big">{{ s.word }}</span>
+  <p>{{ banner }}</p>
+  <span class="chip {{ s.tone }}">{{ {'PASS': 'G1 passed', 'FAIL': 'G1 failed'}.get(s.g1, 'G1 not judged') }}</span>
+</section>
+
+<div class="grid" style="margin-top:16px">
+  <section class="panel span-6" id="trials" aria-labelledby="trials-h">
+    <div class="panel-head"><h2 id="trials-h">Variants tried and deflated Sharpe</h2></div>
+    {% if variants is not none %}
+    <p style="font-size:28px;font-weight:550;letter-spacing:-0.03em;margin:0 0 8px">{{ '{:,}'.format(variants) }} <span class="muted">variant{{ '' if variants == 1 else 's' }} of this idea</span></p>
+    <p>Every setting tried counts, because the best of many tries looks good by luck alone.{% if project_variants is not none %} Across the project: {{ project_ideas }} idea{{ '' if project_ideas == 1 else 's' }}, {{ project_variants }} variant{{ '' if project_variants == 1 else 's' }}.{% endif %}</p>
+    {% if dsr %}<p class="{{ 'gain' if dsr.rstrip('%')|float >= 95 else 'warn' }}"><b>Deflated Sharpe {{ dsr }}</b>: the chance the out-of-sample Sharpe is real, not the best of many tries. 95% is a strong bar.</p>
+    {% elif dsr_why %}<p class="warn"><b>Deflated Sharpe not available.</b> {{ dsr_why|replace("can't be computed here: ", "") }}</p>{% endif %}
+    {% if uncertain %}<p class="warn">{{ uncertain }}.</p>{% endif %}
+    {% else %}<p class="muted">This tear sheet was written before the variant count was kept, so it has no count or deflated Sharpe.</p>{% endif %}
+  </section>
+
+  <section class="panel span-6" id="breakeven" aria-labelledby="be-h">
+    <div class="panel-head"><h2 id="be-h">Break-even fee</h2></div>
+    <p style="font-size:28px;font-weight:550;letter-spacing:-0.03em;margin:0 0 8px" class="{% if s.breakeven is not none and s.fee is not none %}{{ 'loss' if s.breakeven < s.fee else 'gain' }}{% endif %}">{{ breakeven }} <span class="muted">per side</span></p>
+    <p>The most the idea can pay in fees and still make money over the research period.{% if s.fee is not none %} This venue charges {{ '%.2f'|format(s.fee * 100) }}%{% if s.breakeven is not none and s.breakeven_kind == 'at' %}, so {{ 'fees eat the edge' if s.breakeven < s.fee else 'the edge survives its fee' }}{% endif %}.{% endif %}</p>
+    {% if s.breakeven_words %}<p class="muted">{{ s.breakeven_words }}</p>{% endif %}
+  </section>
+
+  <section class="panel span-6" id="nearby" aria-labelledby="nb-h">
+    <div class="panel-head"><h2 id="nb-h">Nearby settings</h2>
+      {% if nearby %}<span class="right"><span class="chip {{ {'PASS': 'running', 'FAIL': 'halted'}.get(nearby[0], 'paused') }}">{{ {'PASS': 'Holds', 'FAIL': 'Does not hold'}.get(nearby[0], 'Not judged') }}</span></span>{% endif %}</div>
+    {% if nearby %}<p>Nudging each setting a step either way should not break it. A result that only works at one exact setting is a peak, not an edge.</p>
+    <p class="muted">{{ nearby[1] }}</p>
+    {% else %}<p class="muted">This tear sheet has no nearby-settings check.</p>{% endif %}
+  </section>
+
+  <section class="panel span-6" id="trades" aria-labelledby="tr-h">
+    <div class="panel-head"><h2 id="tr-h">Out-of-sample trades</h2></div>
+    {% if trades is not none %}
+    <p style="font-size:28px;font-weight:550;letter-spacing:-0.03em;margin:0 0 8px" class="{{ 'gain' if trades_met else 'warn' }}">{{ '{:,}'.format(trades) }} <span class="muted">of {{ min_trades }} needed</span></p>
+    {% if trades_met %}<p>Enough trades for the out-of-sample Sharpe to mean something.</p>
+    {% else %}<p class="warn"><b>Not judged.</b> {{ trades }} trade{{ '' if trades == 1 else 's' }} is fewer than the {{ min_trades }} needed, so the Sharpe is mostly luck and says nothing yet about the idea.</p>{% endif %}
+    {% if not_judged %}<p class="muted">{{ not_judged }}</p>{% endif %}
+    {% else %}<p class="muted">This tear sheet does not give the out-of-sample trade count.</p>{% endif %}
+  </section>
+
+  <section class="panel span-12" id="ablation" aria-labelledby="ab-h">
+    <div class="panel-head"><h2 id="ab-h">Ablation</h2><span class="right"><span class="chip paused">Not run yet</span></span></div>
+    <p>Each block of the idea switched off in turn, to show which pieces earn their place. This study has no ablation yet.</p>
+  </section>
+</div>
+{% endblock %}
