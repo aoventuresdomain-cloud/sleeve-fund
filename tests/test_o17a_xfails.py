@@ -24,6 +24,10 @@ Rulings pinned (advisor-rulings.md; the latest wins where they differ):
 - v5, 7 Oct (sections 8-10): Advisor ~02:12 O17a-11 FUNDING EPISODES (per-settlement states, episodes, backfill,
   never published at 24 h; P1-O17a-10/-11/-12), the DA's event interface as accepted by the Head of QA, Advisor ~02:40
   FUNDING GAP READING full text (rules (a)-(d) and the default), and the G1-NP follow-up (before strategy testing).
+- 7 Oct 06:30 EPISODE AFTER RECLASSIFICATION and 06:33 EPISODE MEMBERSHIP + ALERT TEXT (Advisor; section 9c, and the
+  section 8 membership re-pin): the episode is the outage; a miss while it is open joins it whatever lies between; it
+  closes once every settlement is terminal (stored, reclassified, never published), with one closing notice giving
+  each outcome. Not in #163: follow-up O17a-EPISODE (DA, MINOR, before strategy testing; HoE 06:30), REASON_EPISODE.
 
 Today (c7a73f1, strategies/base.py _apply_funding / _funding_rate ~1859-1923): a missing rate is charged the terms'
 fixed 0.01% as amount = -qty x price x rate, so a long pays and a SHORT IS CREDITED; one "funding_fallback" warning
@@ -86,6 +90,7 @@ from o17_harness import (  # noqa: F401  (fixtures are used by name)
 from sleeve_fund import funding
 
 REASON = "QA O17a: not built yet (Advisor 17:52)"
+REASON_EPISODE = "O17a-EPISODE follow-up (Advisor 06:28/06:30 episode rulings; HoE 06:30): not in #163"
 xfail = pytest.mark.xfail(strict=True, reason=REASON)
 
 LONG = pytest.param(1, id="long")
@@ -815,6 +820,9 @@ def test_a_simulated_perp_keeps_the_flat_fallback():
 #    paper, never both). Episode o closes when every settlement from o to the latest due is stored or never published.
 #    On start, paper rebuilds its watched settlements from the baseline rows of open episodes (never-published ones out).
 #    Legacy funding_stale events without "from" read as an episode opened at the event's time.
+#    MEMBERSHIP SUPERSEDED (Advisor 06:30 / 06:33): a settlement missed while an episode is open (any of its settlements
+#    still provisionally missing or missing) joins it whatever lies between; the contiguity rule above is re-pinned by
+#    the two cells that replace test_a_missing_settlement_not_contiguous_with_an_open_episode_opens_its_own (O17a-EPISODE).
 #
 #    Events (global, sleeve None; every text starts with the instrument tag "[BTC/USDT]" and names no venue, O17a-9):
 #    funding_missing (info, once per settlement): "{tag} {t:%Y-%m-%d %H:%M} UTC settlement missing", plus
@@ -1021,21 +1029,52 @@ def test_a_rate_published_inside_the_15_minute_wait_is_never_missing(tmp_path, m
     _texts_ok(store)
 
 
-def test_a_missing_settlement_not_contiguous_with_an_open_episode_opens_its_own(tmp_path, monkeypatch, binance):
-    """08:00 is published only on 4 Oct at 02:00, 16:00 on time, 4 Oct 00:00 never. At 00:15 the open episode (from
-    08:00) does not take 00:00: 16:00 between them is stored. 00:00 opens its own: two funding_stale, from 08:00
-    and from 4 Oct 00:00, both open at 00:30."""
+def _repin_run(tmp_path, monkeypatch, binance, store, published=None):
+    """4 h records (00:00, 04:00, 08:00), then 16:00 kept; 12:00 and 20:00 missing at their 15-minute wait (12:00 unless
+    `published` brings it in first). Held throughout; paper 07:50 -> 20:30."""
+    rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002}
+    rates.update({"2025-10-03 12:00": 0.0002} if published else {})
+    return paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-06 00:00", 1)), "2025-10-03 07:50",
+                 12 * 60 + 40, rates=rates, store=store, published=published)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+def test_a_miss_while_the_open_episode_is_unresolved_joins_it_whatever_lies_between(tmp_path, monkeypatch, binance):
+    """Re-pinned per Advisor 06:30 (episode membership; confirmed 06:33, which supersedes the contiguity reading this
+    section's header gives). Replaces test_a_missing_settlement_not_contiguous_with_an_open_episode_opens_its_own.
+    A kept 16:00 lies between a missing 12:00 and a missing 20:00. At 20:15 12:00 is still unresolved (provisionally
+    missing: s_next unknown), so the episode opened at 12:15 is open and 20:00 joins it: one funding_stale, from
+    12:00, raised at 12:15, nothing cleared, and 20:00 marked missing once (its state, not a new alert)."""
     store = journal()
-    rates = {k: v for k, v in RATES8.items() if k != "2025-10-04 00:00"}
-    paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-05 00:00", 1)), "2025-10-03 07:50",
-          16 * 60 + 40, rates=rates, store=store, published={"2025-10-03 08:00": "2025-10-04 02:00"})
-    _built_missing(store, "2025-10-04 00:00")
+    _repin_run(tmp_path, monkeypatch, binance, store)
+    for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
+        _built_missing(store, t)
     stale = _stales(store)
-    froms = [_from(t) in e["message"] for e in stale for t in ("2025-10-03 08:00", "2025-10-04 00:00")]
-    assert len(stale) == 2 and sum(froms) == 2, _show(_events(store))
-    assert _from("2025-10-03 08:00") in stale[0]["message"] and _from("2025-10-04 00:00") in stale[1]["message"]
-    assert stale[1]["ts"] >= utc("2025-10-04 00:15"), _show(stale)
-    assert not _cleared(store) and not _missing_of(store, "2025-10-03 16:00"), _show(_events(store))
+    assert len(stale) == 1, \
+        f"20:00 missed while the episode from 12:00 is unresolved must join it, not raise its own: {_show(stale)}"
+    assert _from("2025-10-03 12:00") in stale[0]["message"], _show(stale)
+    assert utc("2025-10-03 12:15") <= stale[0]["ts"] < utc("2025-10-03 12:16"), _show(stale)
+    assert not _cleared(store), f"the episode was closed while 12:00 is unresolved: {_show(_events(store, *EPISODE))}"
+    _texts_ok(store)
+
+
+def test_a_miss_after_the_episode_resolved_opens_a_new_one(tmp_path, monkeypatch, binance):
+    """Re-pinned per Advisor 06:30 (episode membership; confirmed 06:33). The other half: 12:00 is published at 13:00,
+    so its episode (opened 12:15) closes between 13:00 and 13:16, before 20:15. 20:00, missed after that, opens a new
+    episode: two funding_stale (from 12:00, then from 20:00 at 20:15), the first closed, the second open at 20:30."""
+    store = journal()
+    _repin_run(tmp_path, monkeypatch, binance, store, published={"2025-10-03 12:00": "2025-10-03 13:00"})
+    for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
+        _built_missing(store, t)
+    stale = _stales(store)
+    assert len(stale) == 2, f"two outages, two episodes: {_show(_events(store, *EPISODE))}"
+    assert _from("2025-10-03 12:00") in stale[0]["message"] and _from("2025-10-03 20:00") in stale[1]["message"], \
+        _show(stale)
+    assert utc("2025-10-03 20:15") <= stale[1]["ts"] < utc("2025-10-03 20:16"), _show(stale)
+    closed = _cleared(store)
+    assert len(closed) == 1 and _from("2025-10-03 12:00") in closed[0]["message"], \
+        f"only the episode from 12:00 closes: {_show(_events(store, *EPISODE))}"
+    assert utc("2025-10-03 13:00") <= closed[0]["ts"] < utc("2025-10-03 13:16"), _show(closed)
     _texts_ok(store)
 
 
@@ -1731,6 +1770,232 @@ def test_the_collector_reads_a_snapped_record_as_no_gap_but_still_marks_a_real_o
     assert not early, f"a snapped record read as a gap: {_show(early)}"
     (stale,) = _stales(store)
     assert _from("2025-10-03 16:00") in stale["message"], _show(_events(store))
+    _texts_ok(store)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 9c. The episode after reclassification (Advisor 7 Oct 06:30 EPISODE AFTER RECLASSIFICATION, and 06:33 EPISODE
+#     MEMBERSHIP + ALERT TEXT). The episode is the outage, not its first settlement: it is open while any of its
+#     settlements is provisionally missing or missing, and closes once every one is terminal (stored or backfilled,
+#     reclassified, never published); a settlement missed while it is open joins it, whatever lies between. Its alert
+#     text is written once, at open; the current missing set is read live from the episode's state (missing and never
+#     published marks, the store) and its funding_reclassified events, with no new alert when the set changes. ONE
+#     closing notice (funding_stale_cleared, "episode from ...") gives each settlement's outcome: backfilled /
+#     reclassified / never published. G1 counts stay per settlement: a reclassified settlement is never counted as
+#     never published. If every settlement of an episode is reclassified, it closes as "reclassified, no missing
+#     settlement" and is kept (its events and rows stay).
+#     Scenario (P1-O17a-15's, without the restart): 4 h records 3 Oct 00:00, 04:00, 08:00, then 16:00, then 4 Oct 04:00
+#     and every 4 h after it; 4 Oct 00:00 is never published unless a cell publishes it late. 12:00 is charged at
+#     12:15 (the episode opens); 20:00 at 20:15 and 00:00 at 00:15 join it; when 04:00 lands, 12:00 and 20:00 are
+#     reversed (reclassified) and 00:00 stays missing.
+#     Assumed (DA, 7 Oct): funding_reclassified (info, once per settlement, global; starts with the instrument tag,
+#     names no venue): names the settlement, "reclassified, not missing", the reversal row's journal id (funding.id)
+#     and the episode ("episode from {o} UTC"). Settlements are named "YYYY-MM-DD HH:MM" (or "DD Mon YYYY HH:MM").
+#     O17b's entry block while 4 Oct 00:00 is missing belongs to test_o17b_xfails.py (not pinned here).
+# ---------------------------------------------------------------------------------------------------------------
+
+RECLASS = "funding_reclassified"
+EP_OPEN = "2025-10-03 12:00"
+EP_RATES = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002,
+            **{f"{t:%Y-%m-%d %H:%M}": 0.0001 for t in _grid("2025-10-04 04:00", "2025-10-05 04:00", 4)}}
+EP_REVERSED = ("2025-10-03 12:00", "2025-10-03 20:00")
+EP_MISSING = "2025-10-04 00:00"
+_FROM_ANY = re.compile(r"from \d{4}-\d\d-\d\d \d\d:\d\d UTC")
+
+
+def _episode_run(tmp_path, monkeypatch, binance, until, published=None):
+    """The 9c scenario as paper, held from 07:52, run from 3 Oct 07:50 to `until`; `published` gives 4 Oct 00:00 a
+    late publication time (its rate is then the venue's). Checks the money rows the episode rulings stand on (built on
+    #163: 12:00 and 20:00 each one baseline and one reversal, 00:00 its baseline, not reversed)."""
+    store = journal()
+    minutes = int((utc(until) - utc("2025-10-03 07:50")).total_seconds() // 60)
+    rates = {**EP_RATES, **({EP_MISSING: 0.0001} if published else {})}
+    out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-06 00:00", 1)), "2025-10-03 07:50",
+                minutes, rates=rates, store=store, published=published)
+    rows = _rows(out)
+    for t in EP_REVERSED:
+        assert sorted(k for ts, k, _ in rows if ts == utc(t)) == [B_, R_], \
+            f"setup: {t} one baseline and one reversal {_rshow(rows)}"
+    at00 = [k for ts, k, _ in rows if ts == utc(EP_MISSING)]
+    assert B_ in at00 and R_ not in at00, f"setup: 00:00 charged the baseline, not reversed {_rshow(rows)}"
+    _built_missing(store, EP_MISSING)
+    return out, store
+
+
+def _stamp_at(text: str, t) -> int:
+    """Where settlement t is named in `text` (episode names removed), or -1."""
+    t = utc(t)
+    found = [text.find(s) for s in (f"{t:%Y-%m-%d %H:%M}", f"{t:%d %b %Y %H:%M}") if s in text]
+    return min(found) if found else -1
+
+
+def _says(message: str, t) -> bool:
+    return _stamp_at(_FROM_ANY.sub("", message), t) >= 0
+
+
+def _reclassified(store) -> list:
+    return _events(store, RECLASS)
+
+
+def _live_missing(store) -> list:
+    """The episode's current missing set, as the ruling reads it: settlements marked missing, less those reclassified
+    (funding_reclassified), never published, or stored since."""
+    state = funding.journal_state(store, TAG)
+    gone = {t for t in state["missing"] for e in _reclassified(store) if _says(e["message"], t)}
+    stored = set(funding.rates("BINANCE", PAIR).index)
+    return sorted(t for t in state["missing"] - gone - state["never"] if t not in stored)
+
+
+def _late_alerts(store, after) -> list:
+    return [e for e in _stales(store) if e["ts"] >= utc(after)]
+
+
+def _closing(store) -> list:
+    return [e for e in _cleared(store) if _from(EP_OPEN) in e["message"]]
+
+
+def _outcomes_listed(notice: str, outcomes: dict) -> None:
+    """The closing notice names every settlement of the episode, each followed by its outcome word."""
+    text = _FROM_ANY.sub("", notice)
+    where = {t: _stamp_at(text, t) for t in outcomes}
+    assert all(p >= 0 for p in where.values()), \
+        f"the closing notice does not name {[t for t, p in where.items() if p < 0]}: {notice}"
+    order = sorted(where, key=where.get)
+    for i, t in enumerate(order):
+        seg = text[where[t]:where[order[i + 1]] if i + 1 < len(order) else len(text)].lower()
+        assert re.search(outcomes[t], seg), f"{t}: outcome {outcomes[t]!r} not given after it in: {notice}"
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+def test_after_the_reversals_one_episode_stays_open_naming_only_the_missing_settlement(tmp_path, monkeypatch, binance):
+    """Advisor 06:30 pin for 4 Oct 05:00: exactly ONE funding_stale is open, the episode opened 3 Oct 12:15 (from
+    12:00), its opened_at unchanged; it was never closed and reopened and no second alert was raised (20:00 and 00:00
+    joined it; the 04:00 reversals changed its set, not its alert). Its live missing set is 4 Oct 00:00 only."""
+    _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 05:00")
+    stale = _stales(store)
+    assert len(stale) == 1, f"one outage, one funding_stale: {_show(_events(store, *EPISODE))}"
+    assert _from(EP_OPEN) in stale[0]["message"], f"not the episode from 12:00: {_show(stale)}"
+    assert utc("2025-10-03 12:15") <= stale[0]["ts"] < utc("2025-10-03 12:16"), f"opened_at moved: {_show(stale)}"
+    assert not _cleared(store), f"closed (and reopened?) while 00:00 is missing: {_show(_events(store, *EPISODE))}"
+    opened = funding.journal_state(store, TAG)["open"]
+    assert list(opened) == [utc(EP_OPEN)], f"open episodes {sorted(opened)}, want only the one from 12:00"
+    assert _live_missing(store) == [utc(EP_MISSING)], \
+        (f"the episode's missing set is {[f'{t:%d %H:%M}' for t in _live_missing(store)]}, want 4 Oct 00:00 only "
+         f"(12:00 and 20:00 reclassified): {_show(_events(store, *FUNDING_EVENTS, RECLASS))}")
+    _texts_ok(store)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+def test_the_reversed_settlements_are_shown_on_the_episode_as_reclassified_with_their_reversal_ids(
+        tmp_path, monkeypatch, binance):
+    """Advisor 06:30: on the episode, 12:00 and 20:00 are shown as "reclassified, not missing", each with its reversal
+    journal id. One funding_reclassified each (info), once 04:00 has landed, naming the settlement, the episode (from
+    12:00) and the id of that settlement's own reversal row; none for 00:00, which is still missing."""
+    out, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 05:00")
+    rec = _reclassified(store)
+    assert rec, f"not built: no {RECLASS} events (the episode's reclassified settlements): {_show(_events(store))}"
+    ids = {}
+    for t in EP_REVERSED:
+        (rid,) = [r["id"] for r in out["funding"] if r["ts"] == utc(t) and r.get("kind") == R_]
+        ids[t] = rid
+        mine = [e for e in rec if _says(e["message"], t)]
+        assert len(mine) == 1, f"{t} not shown as reclassified exactly once: {_show(rec)}"
+        (e,) = mine
+        text = e["message"]
+        assert e["level"] == "info" and e["ts"] >= utc("2025-10-04 04:00"), _show([e])
+        assert re.search(r"reclassified,?\s+not missing", text, re.I), f"{t}: no 'reclassified, not missing': {text}"
+        assert _from(EP_OPEN) in text, f"{t}: does not name the episode from 12:00: {text}"
+        bare = re.sub(r"\d{4}-\d\d-\d\d \d\d:\d\d|\d\d \w{3} \d{4} \d\d:\d\d", "", text)
+        assert re.search(rf"(?<![\w.:-]){rid}(?![\w.:])", bare), f"{t}: its reversal journal id {rid} not shown: {text}"
+        assert text.startswith(TAG) and not re.search(r"binance", text, re.I), text
+    assert ids[EP_REVERSED[0]] != ids[EP_REVERSED[1]], ids
+    assert not [e for e in rec if _says(e["message"], EP_MISSING)], f"00:00 is missing, not reclassified: {_show(rec)}"
+
+
+def test_the_episode_closes_when_the_missing_settlement_is_backfilled(tmp_path, monkeypatch, binance):
+    """Advisor 06:30: when 4 Oct 00:00 is backfilled (published at 06:00), the episode closes as normal: the one from
+    12:00 closes once, between 06:00 and 06:16, nothing is left open, nothing is never published, and no alert was
+    raised after 00:15 (no close and reopen)."""
+    _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 06:40",
+                            published={EP_MISSING: "2025-10-04 06:00"})
+    closed = _closing(store)
+    assert len(closed) == 1, f"the episode from 12:00 did not close once: {_show(_events(store, *EPISODE))}"
+    assert utc("2025-10-04 06:00") <= closed[0]["ts"] < utc("2025-10-04 06:16"), _show(closed)
+    assert not funding.journal_state(store, TAG)["open"], f"left open: {_show(_events(store, *EPISODE))}"
+    assert not _never(store), _show(_events(store))
+    assert not _late_alerts(store, "2025-10-04 00:16"), _show(_events(store, *EPISODE))
+    _texts_ok(store)
+
+
+def test_the_episode_closes_once_the_missing_settlement_is_never_published_and_it_counts_for_g1(
+        tmp_path, monkeypatch, binance):
+    """Advisor 06:30: 4 Oct 00:00 still absent at 5 Oct 00:00 (due + 24 h; later settlements stored): it is never
+    published, marked once (a warning, "never published", "baseline", "true-up"), and the episode closes then, not
+    before. It counts towards the G1 1% rule (in the journal's never-published set); the reclassified 12:00 and 20:00
+    do not. Its baseline row stays, with no reversal."""
+    out, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-05 00:40")
+    never = _never(store, EP_MISSING)
+    assert len(never) == 1, f"00:00 not marked never published exactly once: {_show(_events(store))}"
+    text = never[0]["message"].lower()
+    assert never[0]["level"] == "warning" and never[0]["ts"] >= utc("2025-10-05 00:00"), _show(never)
+    assert "never published" in text and "baseline" in text and "true-up" in text, never[0]["message"]
+    state = funding.journal_state(store, TAG)
+    assert utc(EP_MISSING) in state["never"], f"00:00 not in the never-published set G1 counts: {state['never']}"
+    assert not {utc(t) for t in EP_REVERSED} & state["never"], f"a reclassified settlement counted for G1: {state}"
+    closed = _closing(store)
+    assert len(closed) == 1 and closed[0]["ts"] >= utc("2025-10-05 00:00"), \
+        f"the episode from 12:00 must close once 00:00 is never published, not before: {_show(_events(store, *EPISODE))}"
+    assert not state["open"], f"left open: {_show(_events(store, *EPISODE))}"
+    assert not _late_alerts(store, "2025-10-04 00:16"), _show(_events(store, *EPISODE))
+    assert [k for t, k, _ in _rows(out) if t == utc(EP_MISSING)] == [B_], _rshow(_rows(out))
+    _texts_ok(store)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+@pytest.mark.parametrize("case", ["backfilled", "never-published"])
+def test_one_closing_notice_gives_each_settlements_outcome(tmp_path, monkeypatch, binance, case):
+    """Advisor 06:33 (2): ONE closing notice for the episode from 12:00, stating each settlement's outcome: 12:00 and
+    20:00 reclassified; 4 Oct 00:00 backfilled (published at 06:00) or never published (still absent at 5 Oct 00:00)."""
+    if case == "backfilled":
+        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 06:40",
+                                published={EP_MISSING: "2025-10-04 06:00"})
+        last = "backfill"
+    else:
+        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-05 00:40")
+        last = "never published"
+    closed = _closing(store)
+    assert len(_cleared(store)) == 1 and len(closed) == 1, \
+        f"one episode, one closing notice: {_show(_events(store, *EPISODE))}"
+    _outcomes_listed(closed[0]["message"], {EP_REVERSED[0]: "reclassif", EP_REVERSED[1]: "reclassif",
+                                            EP_MISSING: last})
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+def test_an_episode_whose_settlements_are_all_reclassified_closes_as_such_and_is_kept(tmp_path, monkeypatch, binance):
+    """Advisor 06:30 variant: every settlement of the episode is reclassified. As the 9c scenario but 4 Oct 00:00 is
+    published on time (the amended (c) sibling, run to 00:40): 12:00 opens the episode at 12:15, 20:00 joins it at
+    20:15; when 00:00 lands both are reversed. The episode closes once, at or after 00:00, as "reclassified, no missing
+    settlement", its notice giving 12:00 and 20:00 as reclassified, and it is kept: its funding_stale and missing
+    marks stay in the journal, each settlement keeps its baseline and reversal rows, nothing is never published."""
+    store = journal()
+    out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-06 00:00", 1)), "2025-10-03 07:50",
+                1010, rates={**EP_RATES, EP_MISSING: 0.0001}, store=store)
+    rows = _rows(out)
+    for t in EP_REVERSED:
+        assert sorted(k for ts, k, _ in rows if ts == utc(t)) == [B_, R_], f"setup: {t} {_rshow(rows)}"
+        _built_missing(store, t)
+    stale = _stales(store)
+    assert len(stale) == 1 and _from(EP_OPEN) in stale[0]["message"], \
+        f"one episode, from 12:00 (20:00 joins it): {_show(_events(store, *EPISODE))}"
+    closed = _cleared(store)
+    assert len(closed) == 1 and _from(EP_OPEN) in closed[0]["message"], _show(_events(store, *EPISODE))
+    assert closed[0]["ts"] >= utc(EP_MISSING), _show(closed)
+    assert re.search(r"reclassified,?\s+no missing settlement", closed[0]["message"], re.I), \
+        f"not closed as 'reclassified, no missing settlement': {closed[0]['message']}"
+    _outcomes_listed(closed[0]["message"], {t: "reclassif" for t in EP_REVERSED})
+    assert _stales(store) == stale and all(_missing_of(store, t) for t in EP_REVERSED), \
+        f"the episode was not kept: {_show(_events(store))}"
+    assert not _never(store), _show(_events(store))
     _texts_ok(store)
 
 
