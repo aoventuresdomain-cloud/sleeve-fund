@@ -81,9 +81,21 @@ class HubStatus:
         # announced without them: a hub restarted without its gap state, QA P1-L16) and not refilled yet. The
         # strategy opens nothing while any are (the L16 condition); minutes no trade happened in aren't here.
         self.lost: dict[str, set[int]] = {}
+        # instrument -> {a sent bar's close: its minutes as (close ns, open, high, low, close), oldest first}: what a
+        # first_touch rule judges (R2), the same minutes the bar was built from. Kept SKIPPED_KEEP_NS.
+        self.minutes: dict[str, dict[int, list[tuple]]] = {}
 
     def unfilled(self, iid: str) -> list[int]:
         return sorted(self.lost.get(iid, ()))
+
+    def minutes_of(self, iid: str, after: int, until: int) -> list[tuple]:
+        """The minutes closing in (after, until] of the sent bars closing in that span, oldest first. A minute not
+        here is unknown to first_touch, lost or quiet alike: on bars longer than a minute `lost` isn't kept, so the
+        two can't be told apart, and judging a path with a real hole would be the unsafe side. A quiet minute is
+        refilled from the venue's REST candles (the hub stands one in for a bar without volume), which on the paper
+        venue come flat at the last price, as the history store keeps them, so backtest and paper see the same."""
+        bars = self.minutes.get(iid, {})
+        return [m for end in sorted(bars) if after < end <= until for m in bars[end] if after < m[0] <= until]
 
     def venue_down(self, now_ns: int) -> bool:
         """The hub is alive (a recent heartbeat) and says its venue connection is down."""
@@ -173,6 +185,7 @@ class Decoder:
         # lands later is sent late, once, so its stop is still checked (the strategy replays it).
         self.skipped: dict[str, set[int]] = {}
         self.lost = status.lost if status is not None else {}  # shared with the strategy (HubStatus.lost)
+        self.bar_minutes = status.minutes if status is not None else {}  # shared too (HubStatus.minutes)
         self._late_run: dict[str, list[int]] = {}  # instrument -> the closes of a run of late bars
         self._late_sent: dict[str, set[int]] = {}  # instrument -> minutes sent late (one report per run of them)
         # instrument -> its price and size decimals, from the hub's definitions. A refilled minute's numbers
@@ -375,6 +388,10 @@ class Decoder:
                 if bar_rule.degraded(missing, self.period // MINUTE_NS):
                     self.status.degraded[b.end] = missing
         bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
+        kept = self.bar_minutes.setdefault(iid, {})
+        kept[b.end] = [(ts, *(float(b.minutes[ts][k]) for k in ("o", "h", "l", "c"))) for ts in sorted(b.minutes)]
+        for end in [e for e in kept if e < b.end - SKIPPED_KEEP_NS]:
+            del kept[end]
         px, qty = self._digits(iid, b.minutes.values())
         *prices, v = b.ohlcv()
         return Bar(bt, *(Price.from_str(f"{n:.{px}f}") for n in prices), Quantity.from_str(f"{v:.{qty}f}"),

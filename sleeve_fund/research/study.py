@@ -38,6 +38,7 @@ from sleeve_fund.research.metrics import (
 from sleeve_fund.research.runner import BacktestResult, run_backtest
 from sleeve_fund.strategies import check_perp_sizing
 from sleeve_fund.strategies.base import STOP_INTENTS, IdeaSpec
+from sleeve_fund.strategies.rules import FIRST_TOUCH_RERUN
 
 # P1-D13 (Advisor 6 Oct 18:16 to 19:16): G1 stands on fills that don't depend on what traded first inside a bar. With a
 # resting exit (a stop, a target, the risk guard's stops, a perpetual's liquidation price) the out-of-sample windows
@@ -213,6 +214,11 @@ class StudyResult:
         return [liq for f in self.folds for liq in getattr(f, "liquidations", [])] + list(
             getattr(self, "holdout_liquidations", []))
 
+    # R2-G1: for a model with a first_touch rule, the out-of-sample share of ambiguous candles and, when it is over
+    # FIRST_TOUCH_FLIP_SHARE, both resolutions' out-of-sample summaries and which one G1 judged ("as ruled" or
+    # "opposite"). Empty for a model without one.
+    first_touch: dict = field(default_factory=dict)
+
     @property
     def not_judged(self) -> str:
         """Why G1 can't judge this study, in words, or '' when it can (review round 8, M8-3 and M8-4):
@@ -314,6 +320,67 @@ class StudyResult:
 # and taker rates, a mid venue, and a high-fee spot venue's taker rate (the stress case). The Independent
 # Quant Advisor (6 Oct 2026, P1-G1) added 0.15-0.40%, where most spot taker fees sit: return bends with the
 # fee, so a wide gap there misplaced the break-even.
+# R2-G1 (Advisor 6 Oct ~22:07 and ~22:11): a first_touch rule's ambiguous candles (both levels first reached in one
+# minute, or a minute missing or inconsistent before the first reach) resolve by a fixed rule, not by what traded.
+# Over this share of the candles that reached either level, G1 re-runs with the opposite resolution and judges on the
+# worse of the two. The rule's own threshold, so the report's rerun_opposite_resolution and the study agree.
+FIRST_TOUCH_FLIP_SHARE = FIRST_TOUCH_RERUN
+
+
+# R2-G1-F1 (Advisor 7 Oct): too few out-of-sample level-reaching candles to trust the share also forces the re-run.
+FIRST_TOUCH_MIN_REACHED = 20
+
+
+def first_touch_counts(runs) -> tuple[int, int] | None:
+    """(ambiguous, reached) candles across every first_touch rule of these runs: ambiguous is same_minute + unknown,
+    reached is the candles that reached either level. None when none of them has a first_touch rule."""
+    ambiguous = reached = 0
+    seen = False
+    for run in runs:
+        for st in (run.first_touch or {}).values():
+            seen = True
+            ambiguous += st["same_minute"] + st["unknown"]
+            reached += st["reached"]
+    return (ambiguous, reached) if seen else None
+
+
+def first_touch_share(runs) -> float | None:
+    """Ambiguous candles over the candles that reached either level, across every first_touch rule of these runs;
+    None when none of them has a first_touch rule."""
+    counts = first_touch_counts(runs)
+    if counts is None:
+        return None
+    ambiguous, reached = counts
+    return ambiguous / reached if reached else 0.0
+
+
+def _resolved(runs) -> str:
+    """How the runs' first_touch rules resolved an ambiguous candle, by rule path: "long.entry false when ambiguous"."""
+    out = {}
+    for run in runs:
+        for path, st in (run.first_touch or {}).items():
+            out.setdefault(path, st.get("resolved", ""))
+    return "; ".join(f"{p} {r}" for p, r in sorted(out.items()))
+
+
+def needs_flip(share: float | None, fold_shares=(), reached: int | None = None) -> bool:
+    """Whether G1 must also judge the opposite resolution (Advisor 7 Oct): the pooled out-of-sample share or any
+    fold's strictly over FIRST_TOUCH_FLIP_SHARE, or fewer than FIRST_TOUCH_MIN_REACHED level-reaching candles."""
+    if share is None:
+        return False
+    return (share > FIRST_TOUCH_FLIP_SHARE or any(f > FIRST_TOUCH_FLIP_SHARE for f in fold_shares)
+            or (reached is not None and reached < FIRST_TOUCH_MIN_REACHED))
+
+
+def _worse(a: pd.Series, b: pd.Series) -> bool:
+    """Whether daily returns a are worse than b on G1's measure, the Sharpe (no Sharpe, as with no trades, is worst),
+    then the total return; a tie is not worse."""
+    def key(r: pd.Series) -> tuple[float, float]:
+        sharpe = summary(r)["sharpe"]
+        return (-math.inf if math.isnan(sharpe) else sharpe, float((1 + r).prod() - 1) if len(r) else 0.0)
+    return key(a) < key(b)
+
+
 COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.008)
 # Slippage beyond the spread each rung also pays on orders that take liquidity (strategy sprint, PM approved
 # 5 Oct 2026): 2 basis points on the deepest books (BTC, ETH), 5 on the rest.
@@ -519,9 +586,12 @@ def run_study(
 
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
            fees: FeeSchedule | None = None, slippage: float = 0.0, oos: bool = False, trade_from=None,
-           feed: pd.DataFrame | None = None) -> BacktestResult:
+           feed: pd.DataFrame | None = None, flip: bool = False,
+           count_from: pd.Timestamp | None = None) -> BacktestResult:
         """One run. oos: an out-of-sample window or the holdout, on oos_exec_prices, flat until trade_from (a bar's
-        close time). feed: these execution bars instead."""
+        close time). feed: these execution bars instead. flip: a first_touch rule's ambiguous candles resolve the
+        other way (R2-G1); count_from: its report counts only the candles closing from then on (a window's test
+        candles)."""
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
@@ -540,7 +610,8 @@ def run_study(
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
                            exec_minutes=bar_minutes_of(source) if fine is not None else 1,
-                           half_spread=half_spread + slippage, fees=fees)
+                           half_spread=half_spread + slippage, fees=fees,
+                           first_touch_flip=flip, first_touch_count_from=count_from)
         if not benchmark:
             labels.extend(x for x in res.labels if x not in labels)
             resting[0] = resting[0] or any(d.get("intent") in RESTING_INTENTS for d in res.decisions.values())
@@ -593,21 +664,17 @@ def run_study(
         bench_ret = daily_returns(bench.equity)
     spot_ret = daily_returns(bt("buy_and_hold", research, {}, benchmark=True).equity) \
         if perp_hold and not (profile is not None and profile.perpetual) else None
-    compare_parts, spot_parts, oos_days = [], [], [0]
-
-    def fold_benchmark(test_ret: pd.Series, first, last) -> pd.Series:
-        oos_days[0] += len(test_ret)
-        if spot_ret is not None:
-            spot_parts.append(spot_ret.reindex(test_ret.index).dropna())
+    def fold_benchmark(test_ret: pd.Series, first, last) -> tuple[pd.Series, tuple]:
+        """A test window's benchmark, and what the window adds to the comparison (its days, the strategy's days the
+        hold covers, the spot hold's), kept per window so a first_touch re-run can replace them (R2-G1)."""
+        spot = spot_ret.reindex(test_ret.index).dropna() if spot_ret is not None else None
         if not perp_hold:
-            compare_parts.append(test_ret)
-            return bench_ret.reindex(test_ret.index).dropna()
+            return bench_ret.reindex(test_ret.index).dropna(), (len(test_ret), test_ret, spot)
         held = hold_returns(first, last)
         if held is None:
-            return pd.Series(dtype=float)
+            return pd.Series(dtype=float), (len(test_ret), None, spot)
         held = held.reindex(test_ret.index).dropna()
-        compare_parts.append(test_ret.reindex(held.index))
-        return held
+        return held, (len(test_ret), test_ret.reindex(held.index), spot)
 
     # 1. Sensitivity over the full research period.
     # The cost ladder: a variant over the research period at each fee. Not logged as variants, since the
@@ -660,9 +727,36 @@ def run_study(
         sensitivity.loc[at, ["breakeven_fee", "breakeven"]] = [float("nan") if fee is None else fee, breakeven]
 
     # 2. Walk-forward.
+    def scored(k, train, through_test, test_idx, best, best_sharpe, surface, run):
+        """Test window k's fold from its run: its days, not the train's, scored alone."""
+        # The test window's days, not the train's, its first measured from the flat capital it started with (P1-D13).
+        test_ret = whole_days(daily_returns(_flat_until(run, test_idx[0] - bar)), test_idx[0], bar)
+        b_ret, parts = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
+        return (
+            Fold(
+                train_start=train.index[0],
+                train_end=train.index[-1],
+                test_end=test_idx[-1],
+                chosen=best,
+                train_sharpe=best_sharpe,
+                test=summary(test_ret),
+                benchmark_test=_summary_or_none(b_ret),
+                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0] - bar),
+                window_bars=len(test_idx),
+                in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
+                halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
+                halted_before_test=_halted_before(run.risk_events, test_idx[0]),
+                grid=pd.DataFrame(surface),
+                **_window_funding(run.funding_marks, train.index[-1], test_idx[-1]),
+                liquidations=_liquidations(run, test_idx[0], test_idx[-1], f"out-of-sample test window {k + 1}"),
+            ),
+            test_ret, b_ret, parts, run,
+        )
+
     folds: list[Fold] = []
     fold_runs: list = []
-    oos_parts, bench_parts = [], []
+    windows = []  # (index in folds, inputs, run) of each window that chose a setting
+    oos_parts, bench_parts, compare_by = [], [], []  # compare_by: fold_benchmark's parts, per window
     start = 0
     while start + train_bars + test_bars <= len(research):
         train = research.iloc[start : start + train_bars]
@@ -682,46 +776,57 @@ def run_study(
             # fold sits flat through its test window and fails the nearby-settings check, saying why (CR, #156).
             days = whole_days(bench_ret, test_idx[0], bar)
             test_ret = pd.Series(0.0, index=days.index[days.index <= test_idx[-1]])
+            b_ret, parts = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
             folds.append(Fold(train_start=train.index[0], train_end=train.index[-1], test_end=test_idx[-1], chosen={},
-                              train_sharpe=float("nan"), test=summary(test_ret),
-                              benchmark_test=_summary_or_none(b_ret := fold_benchmark(test_ret, test_idx[0],
-                                                                                      test_idx[-1])),
+                              train_sharpe=float("nan"), test=summary(test_ret), benchmark_test=_summary_or_none(b_ret),
                               window_bars=len(test_idx), unscored=True, grid=pd.DataFrame(surface)))
             oos_parts.append(test_ret)
             bench_parts.append(b_ret)
+            compare_by.append(parts)
             start += test_bars
             continue
         # The chosen params over training and the test window, trading only from the window's first bar: it starts
         # flat (P1-D13 19:00), and the training bars before it warm the model up. Scored on the test days alone.
-        run = bt(spec.name, through_test, best, oos=True, trade_from=test_idx[0] - bar)
+        window = (train, through_test, test_idx, best, best_sharpe, surface)
+        # The run's first_touch report counts the test candles only: the share G1 reads is out of sample (CR #171).
+        run = bt(spec.name, through_test, best, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
         fold_runs.append((through_test, test_idx, best, run))
-        # The test window's days, not the train's, its first measured from the flat capital it started with.
-        test_ret = whole_days(daily_returns(_flat_until(run, test_idx[0] - bar)), test_idx[0], bar)
-        b_ret = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
-        folds.append(
-            Fold(
-                train_start=train.index[0],
-                train_end=train.index[-1],
-                test_end=test_idx[-1],
-                chosen=best,
-                train_sharpe=best_sharpe,
-                test=summary(test_ret),
-                benchmark_test=_summary_or_none(b_ret),
-                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0] - bar),
-                window_bars=len(test_idx),
-                in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
-                halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
-                halted_before_test=_halted_before(run.risk_events, test_idx[0]),
-                grid=pd.DataFrame(surface),
-                **_window_funding(run.funding_marks, train.index[-1], test_idx[-1]),
-                liquidations=_liquidations(run, test_idx[0], test_idx[-1],
-                                           f"out-of-sample test window {len(folds) + 1}"),
-            )
-        )
+        fold, test_ret, b_ret, parts, run = scored(len(folds), *window, run)
+        windows.append((len(folds), window, run))
+        folds.append(fold)
+        compare_by.append(parts)
         oos_parts.append(test_ret)
         bench_parts.append(b_ret)
         start += test_bars
 
+    # R2-G1-F1: each window run counts its test candles only, so these are out-of-sample counts, pooled and per fold.
+    first_touch = {}
+    counts = first_touch_counts(run for _, _, run in windows)
+    share = flip = None
+    if counts is not None:
+        ambiguous, reached = counts
+        share = ambiguous / reached if reached else 0.0
+        fold_shares = [first_touch_share([run]) or 0.0 for _, _, run in windows]
+        flip = needs_flip(share, fold_shares, reached)
+        first_touch = {"share": share, "ambiguous": ambiguous, "reached": reached, "fold_shares": fold_shares,
+                       "threshold": FIRST_TOUCH_FLIP_SHARE, "min_reached": FIRST_TOUCH_MIN_REACHED, "flipped": flip,
+                       "judged_on": "as ruled", "resolved": _resolved(run for _, _, run in windows)}
+    if flip:
+        # Every window again with its ambiguous candles resolved the other way; G1 then judges the worse.
+        alt_folds, alt_oos, alt_bench, alt_compare = list(folds), list(oos_parts), list(bench_parts), list(compare_by)
+        for k, window, _ in windows:
+            alt_folds[k], alt_oos[k], alt_bench[k], alt_compare[k], flipped = scored(
+                k, *window, bt(spec.name, window[1], window[3], oos=True,
+                                trade_from=window[2][0] - bar, flip=True, count_from=window[2][0]))
+            first_touch["opposite_resolved"] = _resolved([flipped])
+        ruled, opposite = pd.concat(oos_parts), pd.concat(alt_oos)
+        first_touch["as_ruled"], first_touch["opposite"] = summary(ruled), summary(opposite)
+        if _worse(opposite, ruled):
+            folds, oos_parts, bench_parts, compare_by = alt_folds, alt_oos, alt_bench, alt_compare
+            first_touch["judged_on"] = "opposite"
+    oos_days = [sum(days for days, _, _ in compare_by)]
+    compare_parts = [part for _, part, _ in compare_by if part is not None]
+    spot_parts = [spot for _, _, spot in compare_by if spot is not None]
     run_fees = paid(chosen)
     covered = len(pd.concat(compare_parts)) if compare_parts else 0
     hold_insufficient = perp_hold and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
@@ -766,6 +871,7 @@ def run_study(
         errors=errors,
         error_count=error_count[0],
         cost_ladder=ladder,
+        first_touch=first_touch,
         ladder_slippage=slip,
         chosen_params=chosen,
         breakeven=breakeven,
@@ -895,6 +1001,14 @@ def run_study(
         try:
             run = bt(spec.name, prices, chosen, oos=True, trade_from=h_start - bar)  # starts flat, as each window does
             h_ret = whole_days(daily_returns(_flat_until(run, h_start - bar)), h_start, bar)
+            if first_touch.get("flipped"):
+                # The one look covers both resolutions, and the holdout too is judged on the worse (R2-G1).
+                flipped = bt(spec.name, prices, chosen, oos=True, trade_from=h_start - bar, flip=True)
+                other = whole_days(daily_returns(_flat_until(flipped, h_start - bar)), h_start, bar)
+                worse = _worse(other, h_ret)
+                result.first_touch["holdout_judged_on"] = "opposite" if worse else "as ruled"
+                if worse:
+                    h_ret, run = other, flipped  # its liquidations too are the judged run's
             result.holdout = summary(h_ret)
             if perp_hold:
                 hb_ret = hold_returns(h_start, prices.index[-1])
