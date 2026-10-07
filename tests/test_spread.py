@@ -15,10 +15,12 @@ def test_a_market_buy_pays_half_the_spread_in_its_price(prices, instrument):
     wide = run_backtest("buy_and_hold", df, instrument, half_spread=0.001)
     assert float(flat.fills["avg_px"].iloc[0]) == pytest.approx(100.0)
     assert float(wide.fills["avg_px"].iloc[0]) == pytest.approx(100.1)
-    assert wide.fees_paid == pytest.approx(flat.fees_paid, abs=0.01)  # the venue's fee alone
+    # The venue's fee alone, on the price the order filled at: the ask, 0.1% above mid (P1-D13, HoE OK 7 Oct).
+    assert wide.fees_paid == pytest.approx(flat.fees_paid * 1.001, abs=0.01)
     qty = float(wide.fills["filled_qty"].iloc[0])
     assert wide.spread_paid == pytest.approx(qty * 100 * 0.001, abs=0.01)
-    assert wide.equity.iloc[-1] == pytest.approx(flat.equity.iloc[-1] - wide.spread_paid, abs=0.02)
+    extra_fee = wide.fees_paid - flat.fees_paid
+    assert wide.equity.iloc[-1] == pytest.approx(flat.equity.iloc[-1] - wide.spread_paid - extra_fee, abs=0.02)
 
 
 def test_a_sell_takes_the_bid(prices, instrument):

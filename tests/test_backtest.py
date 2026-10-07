@@ -95,7 +95,7 @@ def test_a_stopped_trade_loses_its_risk_budget_with_costs_and_reads_minus_one_r(
     assert len(res.fills) == 2
     # Bars only, the stop is booked at the bar's low less its slippage (P1-D13), here 0.9% under its 9,400 level:
     # 1% of risk plus that gap, so about 1.1R. On minute bars it fills at the level (test_d13 covers both).
-    assert res.equity.iloc[-1] == pytest.approx(9_889.72, abs=0.01)
+    assert res.equity.iloc[-1] == pytest.approx(9_889.71, abs=0.01)  # a cent moved by main's #156 fee rounding
     j = res.journal
     (trip,) = trading.trips(j.fills(limit=10), j.events(limit=100), {o["order_id"]: o for o in j.orders()})
     assert trip["r"] == pytest.approx(-1.10, abs=0.01)
