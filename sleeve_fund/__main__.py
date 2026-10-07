@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from sleeve_fund.data import load_kraken_ohlcvt, synthetic_ohlcv
+from sleeve_fund.data import load_ohlcvt_csv, synthetic_ohlcv
 from sleeve_fund.instruments import history_price_decimals
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.run import LEDGER, STUDY_MINUTES, TEARSHEETS, StudyRequest, run_store_study, spec_of
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("strategy")
     src = st.add_mutually_exclusive_group(required=True)
     src.add_argument("--store", action="store_true", help="bars from the venue history store (the server's)")
-    src.add_argument("--data", help="Kraken OHLCVT daily CSV")
+    src.add_argument("--data", help="daily OHLCVT CSV (time, open, high, low, close, volume, trades)")
     src.add_argument("--synthetic", action="store_true", help="random-walk data, pipeline check only")
     st.add_argument("--base", default="BTC")
     st.add_argument("--quote", default="USD")
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.synthetic:
         prices, dataset = synthetic_ohlcv(), "synthetic"
     else:
-        prices = load_kraken_ohlcvt(args.data)
+        prices = load_ohlcvt_csv(args.data)
         dataset = Path(args.data).stem
     from sleeve_fund.fees import resolve
 

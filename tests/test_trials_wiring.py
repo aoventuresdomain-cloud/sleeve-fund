@@ -237,7 +237,7 @@ def test_cli_study_on_a_data_file_is_counted(tmp_path, monkeypatch):
     store = Store(db)
     before = len(store.trials())
     import sleeve_fund.__main__ as cli
-    monkeypatch.setattr(cli, "load_kraken_ohlcvt", lambda path: synthetic_ohlcv(days=1900, seed=3))
+    monkeypatch.setattr(cli, "load_ohlcvt_csv", lambda path: synthetic_ohlcv(days=1900, seed=3))
     csv = tmp_path / "XBTUSD_1440.csv"
     csv.write_text("stand-in: the loader is replaced with 1,900 synthetic days\n")
     assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "trend_filter", "--data", str(csv),
