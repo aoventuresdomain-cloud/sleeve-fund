@@ -1738,7 +1738,9 @@ class Store:
 
     # --- PM commands and decisions ----------------------------------------------
 
-    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM") -> None:
+    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True) -> None:
+        """holds_through_reset: a pause or flatten asked for while a reset is under way is kept on the fresh run, as
+        one in force before the reset is (m13-U5); the reset's own flatten passes False."""
         if command not in COMMANDS:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
@@ -1749,6 +1751,16 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
                                                 created_at=utcnow()))
+            if holds_through_reset and command in ("pause", "flatten"):
+                req = c.execute(select(resets_t.c.id).where(resets_t.c.sleeve == sleeve, resets_t.c.done_at.is_(None))).first()
+                held = req and c.execute(select(reset_holds_t.c.status).where(reset_holds_t.c.reset_id == req.id)).scalar()
+                if req is not None and held != "halted":  # never downgrade a halt, as the paper process doesn't
+                    # The reset drops pending commands and starts the run afresh, so record the pause the paper
+                    # process would have set (paper.runtime) as the hold split_run carries over.
+                    words = "flattened by PM" if command == "flatten" else "paused by PM"
+                    c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
+                    c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
+                                                           status_reason=f"{words}: {reason.strip()}", paused_until=None))
         self.decide(actor, command, reason, sleeve)
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:
