@@ -481,7 +481,10 @@ ERROR_KINDS = ("handler_failed", "tick_failed")
 LIQUIDATION_RESET = "liquidation_reset"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
-ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
+# "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
+ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
+                  "triggered")
+FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
@@ -866,7 +869,7 @@ class Store:
                 values["filled_qty"] = filled
                 values["fee"] = row.fee + fee
                 values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
-            if status is not None and row.status not in ("filled", "canceled", "rejected", "denied", "expired"):
+            if status is not None and row.status not in FINISHED_ORDER_STATUSES:
                 values["status"] = status  # a late "accepted" never reopens a finished order
             if message:
                 values["message"] = message

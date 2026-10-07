@@ -149,7 +149,7 @@
   <table class="responsive" data-hide-md="3 6">
     <thead><tr><th>Sent</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Fee</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody id="ord-list">{% for o in orders %}
-    <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
+    <tr data-kind="{{ 'rejected' if o.status in ['rejected', 'denied'] else 'filled' if o.status == 'triggered' else o.status }}"><td data-m="hide">{{ o.ts|ts }}</td><td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td><td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="hide">{{ o.qty|qty }}</td><td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td><td class="num" data-m="hide">{{ o.fee|money }}</td>
       <td data-m="right"><span class="chip {{ o.tone }}">{{ o.status_label }}</span></td><td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td></tr>
     {% endfor %}<tr data-none hidden><td colspan="8" class="muted">No orders match.</td></tr></tbody>

@@ -2114,8 +2114,8 @@ class LongFlatStrategy(Strategy):
             if intent in EXIT_LEGS:
                 self._exit_lock = side if self._margin else True
                 self._entry_px = None  # don't fire again while the order is in flight
-                self._sell_all(intent, reason, {"entry_px": entry, intent: self._stop_frac if intent == "stop_loss"
-                                                else self._tp_frac})
+                self._exit_at_market(intent, reason, {"entry_px": entry, intent: self._stop_frac
+                                                      if intent == "stop_loss" else self._tp_frac}, px)
             elif intent == "liquidation":
                 self._liquidation_guard(cash, qty, px)
             else:  # the risk guard: the tick judges the equity at the minute's worst price, as it would have
@@ -2431,14 +2431,26 @@ class LongFlatStrategy(Strategy):
             values["target_px"] = round(self._entry_px * (1 + side * tp), 8)
         self._exit_lock = side if self._margin else True
         self._entry_px = None  # don't fire again while the sell is in flight
-        if hit == "stop_loss" and self._watched is not None and self.runtime is not None:
-            # The journal's watched stop is done: the market stop-loss sent now stands in its place (P1-U35, QA).
-            self.runtime.store.update_order(self._watched[0], status="canceled",
-                                            message=f"stop fired at {price:,.6g}: the market stop-loss sent for it "
-                                                    "closes the position")
-            self._watched = None
-        self._sell_all(hit, reason, values)
+        self._exit_at_market(hit, reason, values, price)
         return True
+
+    def _exit_at_market(self, intent: str, reason: str, values: dict, price: float) -> None:
+        """Send an exit at market. When it is the stop firing, the journal's watched stop ends "triggered", linked to
+        the market stop-loss sent for it (Head of QA and HoE, 7 Oct); it ends "canceled" only when the position closes
+        some other way (_sync_watched_stop)."""
+        watched = self._watched if intent == "stop_loss" and self.runtime is not None and not self._backtest else None
+        if watched is not None:
+            self._watched = None  # not the position closing some other way
+        sent = len(self._sent)
+        self._sell_all(intent, reason, values)
+        if watched is not None:
+            oid = str(self._sent[-1]) if len(self._sent) > sent else None
+            self.runtime.store.update_order(
+                watched[0], status="triggered",
+                message=f"triggered at {price:,.6g}: " + (f"the market stop-loss {oid} closes the position" if oid else
+                                                          "its market stop-loss goes once the order in flight is done"))
+            if oid is not None:
+                self.runtime.store.merge_order_signal(watched[0], {"triggered_order": oid})
 
     def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None,
                  weight: float = 1.0) -> None:

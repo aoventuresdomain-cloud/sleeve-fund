@@ -11,10 +11,10 @@ from __future__ import annotations
 import itertools
 from datetime import datetime
 
-from sleeve_fund.store import (INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, _check_rebook, _rebook_words,
-                                exact_sum, utcnow)
+from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
+                                _check_rebook, _rebook_words, exact_sum, utcnow)
 
-_FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
+_FINISHED = FINISHED_ORDER_STATUSES
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
 
 

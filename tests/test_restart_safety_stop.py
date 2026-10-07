@@ -261,7 +261,8 @@ def test_the_watched_stop_row_shows_the_safety_stop_once_with_its_incident_and_i
     assert strat._check_exits(stop * 0.99)  # through the stop: paper sends its market stop-loss
     assert sent == ["stop_loss"] and _watched_rows(store) == []
     (done,) = [r for r in _watched_rows(store, open_only=False) if r["order_id"] == row["order_id"]]
-    assert done["status"] == "canceled" and done["message"].startswith("stop fired at ")
+    # It fired, so it ends "triggered", not cancelled (Head of QA and HoE, 7 Oct); no venue here, so nothing was sent.
+    assert done["status"] == "triggered" and done["message"].startswith("triggered at ")
 
 
 def test_a_second_restart_further_against_the_position_never_loosens_the_safety_stop(store, instrument):
