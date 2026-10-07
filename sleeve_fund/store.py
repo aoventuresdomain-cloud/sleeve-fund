@@ -136,7 +136,7 @@ insurance_t = Table(
     Index("insurance_sleeve_ts", "sleeve", "ts"),
 )
 
-# The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
+# The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
 # failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
 mirror_t = Table(
     "demo_mirror",
@@ -500,6 +500,16 @@ def exact_sum(a: float, b: float) -> float:
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
 
 
+# A position worth less than this (in the quote currency) is below every venue's smallest order, so no flatten can
+# close it: a reset treats it as flat (QA P1-D6). Venues' minimums are a few units (5 on the perpetuals).
+DUST_NOTIONAL = 1.0
+
+
+def is_dust(book: dict) -> bool:
+    """A journal book (replay_book) holding a position too small for any venue to take an order for."""
+    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0.0) < DUST_NOTIONAL
+
+
 def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
@@ -510,8 +520,9 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     fill that crosses through flat opens the remainder at its own price. The position is summed in
     Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
-    goes negative; if it does, the negative stays visible so reconciliation catches it."""
-    cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    goes negative; if it does, the negative stays visible so reconciliation catches it. entry_fees: the fees paid
+    to open the position still held, pro-rated to what is left of it after a reduction."""
+    cash, qty, entry, n, fees = float(starting_balance), Decimal(0), None, 0, 0.0
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
@@ -528,14 +539,18 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
             new = Decimal(0)
         if new == 0:
             legs = 0
-            entry = None
+            entry, fees = None, 0.0
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
+            fees += float(f["fee"])
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
+            fees = float(f["fee"]) * float(abs(new)) / float(q)
+        else:  # reducing
+            fees *= float(abs(new)) / float(abs(qty))
         qty = new
     return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding), "insurance": float(insurance)}
+            "funding": float(funding), "insurance": float(insurance), "entry_fees": fees}
 
 
 def is_backtest(name: str | None) -> bool:
@@ -859,11 +874,14 @@ class Store:
                 c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
                           .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         if statuses:
             q = q.where(orders_t.c.status.in_(statuses))
+        if intents:
+            q = q.where(orders_t.c.intent.in_(intents))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
 
@@ -1209,10 +1227,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def funding_total(self, sleeve: str) -> float:
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
+        q = select(func.coalesce(func.sum(funding_t.c.amount), 0.0)).where(funding_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(funding_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
-                                   .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
@@ -1223,10 +1244,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def insurance_total(self, sleeve: str) -> float:
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
+        q = select(func.coalesce(func.sum(insurance_t.c.amount), 0.0)).where(insurance_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(insurance_t.c.amount), 0.0))
-                                   .where(insurance_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -1291,14 +1315,16 @@ class Store:
         with self.engine.connect() as c:
             return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
 
-    def split_run(self, request: dict, now: datetime | None = None) -> str:
+    def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
         journal (fills, marks, orders, events, decisions, mirror record) moves to the run, archived, and the
         strategy keeps its name and settings with an empty journal, so it replays to its starting capital.
-        Nothing is deleted. Returns the run's name."""
+        Nothing is deleted. Returns the run's name. dust_ok: a position too small for any order (is_dust) goes with
+        the run."""
         name, now = request["sleeve"], now or utcnow()
         s = self.sleeve(name)
-        if abs(self.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+        book = self.journal_book(name, s.starting_balance)
+        if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
@@ -1315,6 +1341,8 @@ class Store:
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper

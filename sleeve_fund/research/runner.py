@@ -16,6 +16,7 @@ from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
+from sleeve_fund import bars as bar_rule
 from sleeve_fund import funding, markets
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
@@ -203,6 +204,14 @@ def run_backtest(
         strategy = strategy_cls(config).attach_runtime(runtime)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         engine.add_strategy(strategy)
+        if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
+            built = decision_bars(exec_prices, bar_minutes, exec_minutes)
+            strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
+            thin = built[built["degraded"]]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+        if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
+            thin = prices[prices["degraded"].astype(bool)]
+            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):
@@ -216,7 +225,7 @@ def run_backtest(
         if perp:
             equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
                                                     _opening_cash(starting_capital, runtime),
-                                                    [ts for ts, _ in strategy.insurance_log])
+                                                    list(strategy.insurance_log))
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
@@ -249,6 +258,22 @@ def run_backtest(
             # collector would otherwise free on whatever thread it runs on, which the engine forbids.
             runtime.now = _utcnow
         engine.dispose()
+
+
+def decision_bars(exec_prices: pd.DataFrame, bar_minutes: int, exec_minutes: int) -> pd.DataFrame:
+    """The decision bars the engine builds from execution bars stamped at their close, by close time: how many of
+    each one's minutes are missing and whether that makes it degraded (sleeve_fund.bars). A decision bar none of
+    whose execution bars exist isn't listed: the engine would make it up flat from nothing (QA P1-D1)."""
+    idx = exec_prices.index
+    period = pd.Timedelta(minutes=bar_minutes)
+    close = (idx - pd.Timedelta(1, "ns")).floor(period) + period
+    # Each execution bar counts its own minutes: all of them, less any the store says it was built without (QA P1-D10).
+    have = exec_minutes - (exec_prices["missing"].fillna(0).astype("int64").to_numpy()
+                           if "missing" in exec_prices.columns else 0)
+    present = pd.Series(have, index=close).groupby(level=0).sum().clip(lower=0, upper=bar_minutes)
+    out = pd.DataFrame({"missing": (bar_minutes - present).astype("int64")})
+    out["degraded"] = [bar_rule.degraded(int(m), bar_minutes) for m in out["missing"]]
+    return out
 
 
 def _opening_balances(starting_capital: float, quote: Currency, base: Currency, runtime, perp: bool = False) -> list[Money]:
@@ -290,10 +315,10 @@ def _perp_mark_to_market(
     takes its payments, and equity is cash plus the signed position at the close. Exposure is the
     position's gross value over equity, signed: negative while short.
 
-    insurance: the times the strategy closed past its bankruptcy price (LongFlatStrategy._cover_shortfall).
-    Isolated margin loses no more than the strategy's equity, so at each the insurance fund brings this
-    book's cash back to zero, by this book's own arithmetic (its fill prices carry the spread, and its fees
-    round apart from the venue's by fractions of a cent)."""
+    insurance: (time, amount) for each close past the bankruptcy price (LongFlatStrategy._cover_shortfall): the
+    insurance fund takes a loss past the position's isolated margin, so the amount comes back to cash; and should
+    this book's own arithmetic still leave flat cash below zero (its fill prices carry the spread, and its fees
+    round apart from the venue's by fractions of a cent), it is brought back to zero."""
     idx = prices.index
     flows = []  # (ts, cash change, qty change)
     if fills is not None and not fills.empty:
@@ -307,11 +332,15 @@ def _perp_mark_to_market(
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
     for ts, amount, *_ in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
-    for ts in sorted(pd.Timestamp(t) for t in insurance):
+    for ts, amount in sorted((pd.Timestamp(t), float(a)) for t, a in insurance):
         before = [(c, q) for t, c, q in flows if t <= ts]
         cash_now, qty_now = opening_cash + sum(c for c, _ in before), sum(q for _, q in before)
-        if cash_now < 0 and abs(qty_now) < 1e-9:  # flat: equity is cash
-            flows.append((ts, math.ceil(-cash_now * 100) / 100, 0.0))  # to the cent, as the strategy books it
+        if abs(qty_now) < 1e-9:  # flat: equity is cash
+            # The margin-cap part as the strategy booked it; any part that only brought equity to zero, by this
+            # book's own arithmetic.
+            amount = max(amount if cash_now + amount >= 0 else 0.0, 0.0) or math.ceil(max(-cash_now, 0.0) * 100) / 100
+            if amount:
+                flows.append((ts, amount, 0.0))
     if not flows:
         return (pd.Series(opening_cash, index=idx).rename("equity"),
                 pd.Series(0.0, index=idx).rename("exposure"))

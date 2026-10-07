@@ -920,10 +920,7 @@ def test_l19_outage_stop_booked_before_the_settlement_pays_and_receives_no_08_00
 # ================================================== NA-3: a liquidation found by the replay opens an incident, halts
 
 
-@pytest.mark.xfail(strict=True, reason="P1-L18 MAJOR (#146 replay + the liquidation incident/halt of Advisor 17:57 "
-                   "and 18:17, built nowhere yet: not in main, not in #155 26fd993): a liquidation found by the outage "
-                   "replay journals a 'liquidation' error and closes, but opens no incident and leaves the strategy "
-                   "running, not halted until a PM reset after liquidation")
+# P1-L18: passes with #155's incident and halt on the liquidation fill (PE2): its xfail mark removed
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 @pytest.mark.parametrize("label, perp, profile, side", qa.LIQ_SETUPS, ids=qa.LIQ_IDS)
 def test_l18_a_liquidation_found_by_the_replay_opens_an_incident_and_halts(path, label, perp, profile, side):

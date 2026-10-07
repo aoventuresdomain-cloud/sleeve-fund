@@ -25,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from sleeve_fund import bars as bar_rule
+
 OHLCV = ["open", "high", "low", "close", "volume"]
 DEFAULT_ROOT = Path(os.environ.get("HISTORY_DIR", Path(__file__).resolve().parent.parent / "data" / "history"))
 _lock = threading.Lock()
@@ -198,7 +200,8 @@ class HistoryStore:
         return _load(d / f"{ts.strftime('%Y-%m')}.npz")
 
     def read(self, venue: str, pair: str, minutes: int = 1440, start=None, end=None) -> pd.DataFrame:
-        """Bars of `minutes` length, stamped at their CLOSE (UTC), complete bars only."""
+        """Bars of `minutes` length, stamped at their CLOSE (UTC), built by the one bar-build rule
+        (sleeve_fund.bars): columns OHLCV, missing and degraded; part bars at either end of the coverage left out."""
         cov = self.coverage(venue, pair)
         if cov is None:
             raise KeyError(f"no stored history for {venue} {pair}")
@@ -208,6 +211,8 @@ class HistoryStore:
         # Bars that divide a day never span two months, so each month is resampled on its own and
         # years of minutes are never held in memory at once.
         by_month = minutes > 1 and 1440 % minutes == 0
+        # Just past the last minute that is surely closed: a longer bar ending after it is a part bar.
+        stop = cov.last + pd.Timedelta(minutes=0 if _forming(pd.DatetimeIndex([cov.last]), cov)[0] else 1)
         parts = []
         for path in _month_files(d):
             month = pd.Timestamp(path.stem + "-01", tz="UTC")
@@ -217,12 +222,12 @@ class HistoryStore:
                 continue
             part = _load(path)
             part = part[(part.index >= cov.first) & (part.index <= cov.last) & ~_forming(part.index, cov)]
-            parts.append(_resample(part, minutes) if by_month else part)
+            parts.append(_resample(part, minutes, cov.first, stop) if by_month else part)
         if not parts:
-            return pd.DataFrame(columns=OHLCV)
+            return pd.DataFrame(columns=bar_rule.COLUMNS)
         bars = pd.concat(parts).sort_index()
-        if minutes > 1 and not by_month:
-            bars = _resample(bars, minutes)
+        if not by_month:  # longer bars that don't divide a day, and 1-minute bars (given missing 0)
+            bars = _resample(bars, minutes, cov.first, stop)
         bars = bars.set_axis(bars.index + pd.Timedelta(minutes=minutes))
         bars.index.name = "timestamp"
         if lo is not None:
@@ -482,13 +487,11 @@ def _save(path: Path, df: pd.DataFrame) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """1-minute bars by open time -> complete `minutes` bars by open time."""
-    if minutes <= 1:
-        return df
-    g = df.resample(f"{minutes}min", origin="epoch", label="left", closed="left")
-    bars = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-    return bars[g["close"].count() == minutes]  # complete bars only: a part-day isn't a daily bar
+def _resample(df: pd.DataFrame, minutes: int, first: pd.Timestamp | None = None,
+              end: pd.Timestamp | None = None) -> pd.DataFrame:
+    """1-minute bars by open time -> `minutes` bars by open time, by the one bar-build rule (sleeve_fund.bars,
+    m13-E6): built from the minutes present, with how many are missing; part bars at either end left out."""
+    return bar_rule.build_bars(df, minutes, first, end)
 
 
 def _load(path: Path) -> pd.DataFrame:
@@ -526,9 +529,6 @@ def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000,
     return {"pair": pair, "pages": pages, "last": cov.last if cov else None}
 
 
-# Always kept, so research has them before any sleeve trades them; sleeves' own instruments are added. A venue
-# whose instruments are named differently (USDT-quoted perpetuals) lists its own (VenueProfile.core_pairs).
-CORE_PAIRS = ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "SUI/USD")
 
 
 # Where the backfill starts for an instrument the PM asks Research for: enough for the default study
@@ -537,12 +537,13 @@ REQUEST_YEARS = 5
 
 
 def _pairs_in_use(venue: str, store=None) -> list[tuple[str, pd.Timestamp | None]]:
-    """(instrument, where a first backfill starts) for the core list, every strategy's instrument and
-    every instrument the PM asked Research for."""
+    """(instrument, where a first backfill starts) for the venue's core list (VenueProfile.core_pairs, always
+    kept so research has them before any strategy trades them), every strategy's instrument and every
+    instrument the PM asked Research for."""
     from sleeve_fund.venues import VENUES
 
     profile = VENUES.get(venue.upper())
-    pairs: dict[str, pd.Timestamp | None] = {p: None for p in (profile and profile.core_pairs) or CORE_PAIRS}
+    pairs: dict[str, pd.Timestamp | None] = {p: None for p in (profile.core_pairs if profile else ())}
     try:
         from sleeve_fund.paper.config import from_store
         from sleeve_fund.store import Store
@@ -588,7 +589,8 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
         except Exception as exc:  # noqa: BLE001 - the prices are stored; funding catches up on the next pass
             print(f"{profile.name} {pair}: funding refresh failed: {exc!r}")
         try:  # outside the refresh, so a feed failing on every pass is still raised
-            problem, key = funding.stale(profile.name, pair, root), f"{profile.name} {pair}: funding stale"
+            now = _now()
+            problem, key = funding.stale(profile.name, pair, root, now=now), f"{profile.name} {pair}: funding stale"
             # One episode per instrument, whoever notices first: a paper strategy on it may have opened (or closed)
             # it already, under the same tag (Advisor, 6 Oct 2026; CR, #163).
             tag, inbox = funding.stale_tag(profile.name, pair), _inbox()
@@ -607,8 +609,9 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
                 # reads as clean: an episode is closed only once the store holds a rate at or after the settlement
                 # it was opened on, and stays open while that settlement is missing (QA P1-O17a-8).
                 open_ = funding.stale_open(inbox, tag)
-                kept = funding.rates(profile.name, pair, root).index
-                if open_ is not True or _caught_up(kept, funding.stale_since(inbox, tag), profile.funding_hours):
+                rates = funding.rates(profile.name, pair, root)
+                kept = rates.index
+                if open_ is not True or _caught_up(rates, funding.stale_since(inbox, tag), profile.funding_hours, now):
                     was = key in _stale
                     _stale.discard(key)
                     if open_ is True or (open_ is None and was):
@@ -620,17 +623,34 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
     _refresh_open_interest(profile, pair, root, funding_to)
 
 
-def _caught_up(kept, since, hours: tuple[int, ...]) -> bool:
-    """Whether the store holds the settlement a staleness episode was opened on: the venue's last settlement at or
-    before the episode's opening time (`since`). Only that settlement's own rate closes it, so a later one arriving
-    while it is still missing leaves the episode open (CR on #163) and the hole is named by funding_gap. An unknown
+def _now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+# How long after a settlement the venue may take to publish its rate before the collector counts it as due (the
+# strategies' FUNDING_WAIT).
+PUBLISH_WAIT = pd.Timedelta(minutes=15)
+
+
+def _caught_up(rates, since, hours: tuple[int, ...], now: pd.Timestamp | None = None) -> bool:
+    """Whether the store holds every settlement from the one a staleness episode was opened on (the venue's last at
+    or before the episode's opening time, `since`) to the latest due by `now`, a publication wait allowed: one
+    arriving late while a later one is still missing leaves the episode open (CR on #163; QA P1-O17a-10), and the
+    hole is named by funding_gap. The settlements are the venue's own times (markets.settlement_times). An unknown
     opening time is taken as caught up, as before (the rates keep up)."""
     from sleeve_fund import funding, markets
 
     if since is None:
         return True
-    due = markets.funding_times(since - pd.Timedelta(days=1), since, hours)[-1]
-    return bool(len(kept)) and bool((abs(kept - pd.Timestamp(due)) <= funding.MATCH).any())
+    if not len(rates):
+        return False
+    now = now or pd.Timestamp.now(tz="UTC")
+    since = since.to_pydatetime()
+    before = markets.settlement_times(since - pd.Timedelta(days=1), since, hours, rates)
+    opened = before[-1] if before else since
+    due = markets.settlement_times(opened - pd.Timedelta(seconds=1), (now - PUBLISH_WAIT).to_pydatetime(), hours, rates)
+    kept = rates.index
+    return all((abs(kept - pd.Timestamp(t)) <= funding.MATCH).any() for t in (due or [opened]))
 
 
 def _alert_funding_holes(venue: str, pair: str, root, holes: list[str]) -> None:

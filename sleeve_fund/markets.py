@@ -128,6 +128,86 @@ def baseline_rate(terms: PerpTerms) -> float:
     return abs(terms.funding_rate) * (funding_interval(terms.funding_hours) / timedelta(hours=8))
 
 
+def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], settled=None,
+                     published: timedelta | None = None) -> list[datetime]:
+    """The funding settlements in (after, until], oldest first, to the minute. With the venue's settled rates
+    (`settled`, indexed by settlement time), its own times: a symbol moved from 8-hourly to 4- or 1-hourly
+    settlements pays every one (QA P1-O1). A gap between two records wider than the interval before it is missing
+    settlements at that interval (charged the baseline, QA P1-O17), unless the venue lengthened its interval: the
+    step after the gap is as wide (or, at the newest record, the venue's `published` interval is). Past the newest
+    record, the venue's latest interval carries on from it (paper, before the venue publishes the next rate);
+    before the first record, and with no records, the venue profile's fixed `hours`."""
+    if settled is None or len(settled) == 0:
+        return funding_times(after, until, hours)
+    idx = settled.index.round("min")
+    first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
+    out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
+    out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]
+    out += _missing_between(idx.as_unit("ns"), after, until, hours, published)
+    if until > last:
+        step = latest_interval(settled)
+        if step is None:  # a single record (a new listing): the fixed hours after it
+            out += funding_times(max(after, last), until, hours)
+        else:
+            t = last + step
+            while t <= until:
+                if t > after:
+                    out.append(t)
+                t += step
+    return sorted(set(out))
+
+
+def _missing_between(idx, after: datetime, until: datetime, hours: tuple[int, ...],
+                     published: timedelta | None) -> list[datetime]:
+    """The settlements in (after, until] missing from a gap between the venue's records (settlement_times): a gap
+    wider than the profile's interval, or one wider than the interval before it that the venue then kept (a lost
+    record after a move to shorter settlements), is filled at the shorter of the two. A gap no wider than the
+    profile's interval that ends the records is the venue back on (or moved towards) the schedule, not a loss; a
+    lengthening is only read as one where the venue publishes it (`published`, the newest gap; DA-11), so until
+    then a longer interval reads as missing settlements, charged the baseline (the adverse side)."""
+    out: list[datetime] = []
+    fixed = funding_interval(hours)
+    lo = max(int(idx.searchsorted(after, side="right")), 1)  # the first record past `after`, the gap before it
+    hi = min(int(idx.searchsorted(until, side="left")) + 1, len(idx))  # up to the first record at or past `until`
+    for i in range(lo, hi):
+        a, b = idx[i - 1].to_pydatetime(), idx[i].to_pydatetime()
+        before = (a - idx[i - 2].to_pydatetime()) if i >= 2 else fixed
+        step = min(fixed, before) if before > timedelta(0) else fixed
+        gap = b - a
+        later = (idx[i + 1].to_pydatetime() - b) if i + 1 < len(idx) else None
+        if gap <= step or (gap <= fixed and (later is None or later >= gap)):
+            continue  # no gap, or the venue moved back towards the schedule
+        if later is None and published is not None and gap <= published:
+            continue  # the venue's published interval is this wide: lengthened, not lost
+        t = a + step
+        while t < b:
+            if after < t <= until:
+                out.append(t)
+            t += step
+    return out
+
+
+def settlement_wait(ts: datetime, settled, wait: timedelta) -> timedelta:
+    """How long paper waits after settlement `ts` for the venue's record before charging the baseline rate:
+    `wait`; for a settlement foreseen past its newest record, one of the venue's latest intervals more, plus `wait`
+    again for the store's refresh to bring in the next record. If the venue has lengthened its interval, the newer
+    record that skips the foreseen time lands within that, and the time is then no settlement at all
+    (settlement_times), so it is never charged (no phantom baseline charge)."""
+    step = latest_interval(settled)
+    if step is None or ts <= settled.index[-1].round("min").to_pydatetime():
+        return wait
+    return 2 * wait + step
+
+
+def latest_interval(settled) -> timedelta | None:
+    """The venue's settlement interval as its two newest records show it, or None with fewer than two."""
+    if settled is None or len(settled) < 2:
+        return None
+    idx = settled.index.round("min")
+    step = (idx[-1] - idx[-2]).to_pytimedelta()
+    return step if step > timedelta(0) else None
+
+
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
     """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
     opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the
@@ -135,6 +215,13 @@ def isolated_margin(qty: float, entry: float, leverage: float, balance: float | 
     backtest, the dashboard and the demo copy (set to isolated at the same leverage)."""
     margin = abs(qty) * entry / max(leverage, 1e-9)
     return min(margin, max(balance, 0.0)) if balance is not None else margin
+
+
+def gap_loss_cap(qty: float, entry: float, leverage: float, balance: float, taker: float, liq: float | None) -> float:
+    """The most an isolated perpetual position can lose however far the price gaps (Independent Quant Advisor, QA
+    P1-D3): its whole isolated margin, plus the taker fee on the close at its liquidation price. The engine books a
+    gap past the bankruptcy price at this (the insurance fund takes the rest), and the Risk page's stress rows use it."""
+    return isolated_margin(qty, entry, leverage, balance) + taker * abs(qty) * (liq or 0.0)
 
 
 def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:

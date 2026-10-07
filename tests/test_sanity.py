@@ -1065,17 +1065,19 @@ def test_a_gap_through_the_liquidation_price_is_liquidated_in_full_and_trades_no
     liq = opened["signal"]["liquidation_px"]
     assert (gap > liq) if opened["side"] == "SELL" else (gap < liq)  # the gap went past it
     assert abs(_held(j.fills_)) < float(TICK_INST.size_increment) / 2
-    # Isolated margin: what the gap lost past the strategy's equity is the venue's insurance fund's, booked
-    # once, to the cent, in the journal as in the result, and the strategy ends at zero, not below.
+    # Isolated margin: what the gap lost past the position's margin is the venue's insurance fund's (Independent
+    # Quant Advisor, QA P1-D3), booked once, to the cent, in the journal as in the result; the rest is kept.
     cash = 10_000.0 + sum(f["amount"] for f in j.funding_)
     for f in j.fills_:
         cash -= (1 if f["side"] == "BUY" else -1) * f["qty"] * f["price"] + f["fee"]
-    shortfall = max(0.0, -cash)
-    if shortfall:
+    sign = 1 if opened["side"] == "BUY" else -1
+    margin = opened["filled_qty"] * opened["avg_px"] / risk.profile(profile).max_leverage
+    past = sign * (opened["avg_px"] - closed["avg_px"]) * opened["filled_qty"] - margin
+    if past > 0:
         assert len(res.insurance) == len(j.insurance_) == 1, (res.insurance, j.insurance_)
-        assert res.insurance[0]["amount"] == pytest.approx(shortfall, abs=0.011)
+        assert res.insurance[0]["amount"] == pytest.approx(past, abs=0.011)
         assert j.insurance_[0]["amount"] == pytest.approx(res.insurance[0]["amount"], abs=1e-8)
-        assert 0 <= res.equity.iloc[-1] < 0.02, res.equity.iloc[-1]
+        assert res.equity.iloc[-1] == pytest.approx(cash + past, abs=0.02), res.equity.iloc[-1]
     else:
         assert not res.insurance and not j.insurance_
 

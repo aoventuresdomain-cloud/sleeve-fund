@@ -14,6 +14,8 @@ from pathlib import Path
 
 import markdown
 
+from sleeve_fund.venues import RESEARCH_VENUE
+
 # Research's recommended settings per model, with why, the question it answers and the pre-registered kill
 # rule. rsi_cross: strategy sprint, run 1 (research/strategy-sprint/run-1-rsi-15m.md, PM 5 Oct 2026).
 PLANS: dict[str, dict] = {
@@ -23,7 +25,7 @@ PLANS: dict[str, dict] = {
         "kill_rule": "if break-even is under 0.05% per side, or it loses on 2 or more of the 4 instruments.",
         "why": ("15 minutes trades often enough to judge in a year; the sealed year is opened once, after "
                 "settings are frozen. Start with BTC/USDT: the deepest book, so a fail there kills the idea."),
-        "defaults": {"venue": "binance", "instrument": "BTC/USDT", "minutes": 15, "train_days": 730,
+        "defaults": {"venue": RESEARCH_VENUE.lower(), "instrument": "BTC/USDT", "minutes": 15, "train_days": 730,
                      "test_days": 365, "holdout_days": 365, "use_holdout": False, "risk_profile": "balanced",
                      "stop_atr": 2, "atr_bars": 14},
     },

@@ -27,7 +27,7 @@ from sleeve_fund import accounts
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import Sleeve, Store, utcnow
+from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing
 
 POLL_SECONDS = 5
@@ -38,6 +38,10 @@ CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten:
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 MAX_BACKOFF = 300
+# Flattens a reset or a clean slate queues for one strategy before it stops asking and says the PM must close
+# it: a position below the venue's smallest order can't be closed by an order, and asking again every step
+# only piled up commands (review round 13, m13-E1).
+SYSTEM_FLATTENS = 3
 
 
 @dataclass
@@ -150,21 +154,31 @@ class Supervisor:
         """Carry each PM reset forward (5 Oct 2026): a strategy still holding is flattened first (a PM flatten,
         which pauses it; started if stopped so the flatten can trade); once flat its process is stopped, the run
         so far is put away under its own name (Store.split_run), and the strategy starts again at its starting
-        capital if it was running. A strategy copied to Bybit Demo then has its demo copy resynced (flat, on
+        capital if it was running. A strategy copied to a demo account by quantity then has its demo copy resynced (flat, on
         the paper margin terms) before it trades again."""
         for req in self.store.pending_resets():
             name = req["sleeve"]
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
-            if abs(self.store.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
-                if not any(c["command"] == "flatten" for c in pending):
-                    self.store.command(name, "flatten", f"Reset strategy: {req['reason']}", actor=req["actor"])
+            book = self.store.journal_book(name, s.starting_balance)
+            qty = book["qty"]
+            dust = is_dust(book)
+            if abs(qty) > 1e-12 and not dust:
+                why = f"Reset strategy: {req['reason']}"
+                if not any(c["command"] == "flatten" for c in pending) and _flatten_again(self.store, name, why,
+                                                                                         req["created_at"], qty):
+                    self.store.command(name, "flatten", why, actor=req["actor"])
                     if s.desired_state != "running":
                         self.store.set_desired_state(name, "running")
                 continue
+            if dust:
+                self.store.event(name, "warning", "reset_dust",
+                                 f"The {qty:.12g} still held is worth under {DUST_NOTIONAL:g}, below any venue's smallest "
+                                 "order, so no flatten can close it: the reset treats it as flat and it stays with the "
+                                 "run put away")
             self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
             self.store.drop_pending(name, "lapsed: the strategy was reset")
-            run = self.store.split_run(req)
+            run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)
@@ -272,8 +286,8 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     """Insert sleeves from TOML files that aren't in the database yet. Never overwrites. A file with
     `start = false` under [sleeve] adds its strategy stopped, for the PM to start from the dashboard.
     One exception for a strategy already there: a file asking for the demo mirror turns it on when the strategy
-    has never had that setting (the Binance strategies were added before the mirror could copy them, 5 Oct
-    2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
+    has never had that setting (the first perpetual strategies were added before the mirror could copy them,
+    5 Oct 2026). It only tells the mirror to copy; the strategy itself is not restarted or changed."""
     existing = {s.name for s in store.sleeves()}
     added = []
     for path in paths:
@@ -290,6 +304,22 @@ def seed(store: Store, paths: list[str]) -> list[str]:
                      cfg.name)
         added.append(cfg.name)
     return added
+
+
+def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool:
+    """Whether a reset or a clean slate may queue another flatten (`why`) for a strategy still holding qty: at
+    most SYSTEM_FLATTENS since `since` (the reset's request, or the last clean slate finished, so an earlier slate
+    with the same reason doesn't count). The last refusal says once what is left and that the PM must close it."""
+    asked = sum(1 for d in store.decisions(name, limit=1_000, action="flatten", since=since)
+                if d["reason"] == why.strip())
+    if asked < SYSTEM_FLATTENS:
+        return True
+    if not any(e["kind"] == "flatten_gave_up" and e["message"].endswith(why)
+               for e in store.events(name, limit=200)):
+        store.event(name, "error", "flatten_gave_up",
+                    f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the venue's smallest "
+                    f"order; the PM must close it before this can finish: {why}")
+    return False
 
 
 def clear(store: Store, path: str) -> list[str]:
@@ -324,8 +354,10 @@ def clear(store: Store, path: str) -> list[str]:
             # flattened like any other holder: until it is flat it stays in the book's figures.
             if abs(qty) > 1e-12:
                 holding.append(s.name)
-                if not any(c["command"] == "flatten" for c in store.pending_commands(s.name)):
-                    store.command(s.name, "flatten", f"{reason}: flattened so it can be archived", actor="system")
+                why = f"{reason}: flattened so it can be archived"
+                if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
+                        and _flatten_again(store, s.name, why, store.book_start(), qty)):
+                    store.command(s.name, "flatten", why, actor="system")
                 if s.desired_state != "running":
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)
