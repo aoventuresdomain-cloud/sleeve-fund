@@ -47,6 +47,7 @@
         {% if saved %}<span class="bt-links">Saved run: <a href="/orders?sleeve={{ saved.sleeve|urlencode }}">{{ result.orders }} orders</a> · <a href="/trades?sleeve={{ saved.sleeve|urlencode }}">trades</a> · <a href="/sleeves/{{ saved.sleeve|urlencode }}">strategy screen</a></span>{% endif %}
         {% if result.errors %}<span class="right muted">Fix the strategy's error before starting it on paper.</span>{% else %}<a class="button right" href="/sleeves/new?{{ sleeve_qs }}">Start a paper strategy with these settings</a>{% endif %}</div>
       {% if g1_here != 'PASS' %}<p class="banner warn" style="margin:0 0 10px">In-sample. Not G1 evidence for {{ result.pair }} at this interval.</p>
+      {% elif held_back %}<p class="banner warn" style="margin:0 0 10px">In-sample. G1 passed for {{ result.pair }} at this interval, but {{ held_back }}. Paper on it is observation only until then.</p>
       {% else %}<p class="muted" style="margin:0 0 10px;font-size:12.5px">In-sample. G1 comes from the research tests.</p>{% endif %}
       {% if result.errors %}<p class="banner loss" role="alert" style="margin:0 0 10px">{{ result.errors }}</p>{% endif %}
       {% if result.risk.note %}<p class="banner {{ 'warn' if result.risk.halted else '' }}" style="margin:0 0 10px">{{ result.risk.note }}</p>{% endif %}

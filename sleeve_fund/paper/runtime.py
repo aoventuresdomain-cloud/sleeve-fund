@@ -18,7 +18,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sleeve_fund import risk
-from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, replay_book, utcnow
+from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
+                               replay_book, utcnow)
 
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
@@ -224,6 +225,58 @@ def liquidation_head(store, name: str) -> str | None:
     return WIPED_OUT
 
 
+def liquidation_event(store, name: str) -> dict | None:
+    """The liquidation a strategy is halted for while it is liquidated (liquidation_head), else None: its newest
+    "liquidation" event since the last reset after liquidation, else its liquidation halt, else its liquidation order
+    (as {"id": None, "ts": ...}). A reset after liquidation answers this one and no earlier one (P1-RAL)."""
+    if liquidation_head(store, name) is None:
+        return None
+    reset = store.last_event(name, (RESET_AFTER_LIQUIDATION,))
+    since = store.sleeve_events_since(name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
+    for found in ([e for e in since if e["kind"] == "liquidation"],
+                  [e for e in since if fold(e["message"]).startswith(fold(WIPED_OUT))
+                   or fold(e["message"]).startswith(LIQUIDATED_WORDS)]):
+        if found:
+            return found[-1]
+    order = store.last_order(name, ("liquidation",))
+    return {"id": None, "ts": order["ts"]} if order is not None else None
+
+
+def ral_refusal(store, name: str, incident: int | None, actor: str) -> str | None:
+    """Why the PM's reset after liquidation (RAL) can't be taken, in words, else None (Advisor 17:57 and 18:17): only
+    the PM sends it; only a liquidated strategy takes it; it names this liquidation's incident, which has its note on
+    why the half-liquidation stop did not protect the position."""
+    if actor != "PM":
+        return "only the PM can reset a strategy after a liquidation"
+    liq = liquidation_event(store, name)
+    if liq is None:
+        return ("it isn't halted after a liquidation, so there is nothing for a reset after liquidation to clear: "
+                "its own action clears its halt or pause")
+    if incident is None:
+        return ("name the liquidation's incident: a reset after liquidation answers one incident, once its note says "
+                f"{WHY_STOP_FIELD}")
+    ev = store.event_by_id(incident)
+    if ev is None or ev["kind"] != "incident" or ev["sleeve"] != name or ev["ts"] < liq["ts"]:
+        return (f"#{incident} is not the incident of this strategy's liquidation of {liq['ts']:%d %b %H:%M} UTC: name "
+                "that incident")
+    if store.incident_note(incident) is None:
+        return f"incident #{incident} has no note yet: write {WHY_STOP_FIELD}, and its author, first"
+    return None
+
+
+def ral_words(store, name: str, cmd: dict, liq: dict, old: float, equity: float) -> str:
+    """What a reset after liquidation journals (Advisor 17:57, 18:17): the PM, the incident, the note's author, the old
+    and new high-water marks and the equity before and after the liquidation. The engine's and the store's (a stopped
+    strategy, which no process applies it for) say the same."""
+    note = store.incident_note(cmd["incident"]) if cmd.get("incident") is not None else None
+    before = store.equity_at_or_before(name, liq["ts"] - timedelta(seconds=1))
+    return (f"Reset after liquidation by the PM, answering incident #{cmd['incident']} (note by "
+            f"{note['author'] if note else 'nobody'}): high-water mark {old:,.2f} becomes {equity:,.2f}, "
+            "the remaining equity, which is also the day's loss baseline. Equity "
+            + (f"{before['equity']:,.2f}" if before else "unknown")
+            + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}")
+
+
 def said_since_last_fill(store, name: str, head: str) -> bool:
     """Whether an incident starting with `head` was written since the position last changed (its last fill): one
     incident per position, read only back to that fill (CR 13)."""
@@ -338,7 +391,7 @@ class SleeveRuntime:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
         halt, which reset it, else the highest mark ever. Without the reset a settings edit after such a
         resume re-halted and flattened at once (review round 9, M9-2)."""
-        reset = self.store.last_event(self.name, ("drawdown_reset",))
+        reset = self.store.last_event(self.name, ("drawdown_reset", RESET_AFTER_LIQUIDATION, BOOK_RESET))
         if reset is None:
             return self.store.peak_equity(self.name) or starting_balance
         # The reset's own mark was taken a moment before its event, on the tick that applied the resume.
@@ -350,7 +403,7 @@ class SleeveRuntime:
         """The daily-loss baseline after a (re)start: the equity at the PM's last resume today, which reset
         it (review round 9, M9-2), else the day's open (review round 8, B8-2), else this mark."""
         midnight = datetime.combine(risk.trading_day(now), datetime.min.time(), tzinfo=timezone.utc)
-        resumed = self.store.last_event(self.name, ("pm_resume",))
+        resumed = self.store.last_event(self.name, ("pm_resume", RESET_AFTER_LIQUIDATION, BOOK_RESET))
         if resumed is not None and resumed["ts"] >= midnight:
             mark = self.store.equity_at_or_before(self.name, resumed["ts"])
             if mark is not None:
@@ -477,6 +530,29 @@ class SleeveRuntime:
             self.incident_once(LIQ_STUCK_HEAD, f"{LIQ_STUCK_HEAD} after {mins:.0f} minutes, and the PM's "
                                f"{', '.join(waiting)} waits behind it: check the order at the venue. Stop is still "
                                "taken: it runs for its exits only")
+
+    def _reset_after_liquidation(self, cmd: dict, equity: float) -> None:
+        """The PM's reset after liquidation (P1-RAL; Advisor 17:57, 18:17): a new high-water mark and day baseline at
+        the remaining equity, the halt lifted, one liquidation_reset event naming the PM, the incident, the note's
+        author, the old and new marks and the equity before and after the liquidation. The old mark stays in the
+        journal; the book's own limits and figures are untouched. A reset asked for before the liquidation lapses,
+        so it can't run without a fresh confirmation (#167 round). One already answered (a retry, a restart) is a no-op."""
+        self.store.mark_applied(cmd["id"])
+        liq = liquidation_event(self.store, self.name)
+        if liq is None:
+            self.store.event(self.name, "info", "ral_ignored",  # events.kind is String(32) (QA RAL-F1)
+                             f"reset after liquidation ignored, nothing to reset: {cmd['reason']}", ts=self.now())
+            return
+        old = self.peak
+        self.peak, self._day_open = equity, equity
+        self.wiped_out, self.liquidated = False, None
+        self._set("running", "")
+        self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
+                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
+        for request in self.store.pending_resets():
+            if request["sleeve"] == self.name and request["created_at"] <= cmd["created_at"]:
+                self.store.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
+                                        "liquidation answered")
 
     def incident_once(self, head: str, message: str) -> None:
         """An incident about the position held now, written once: a restart or a deploy doesn't repeat it while no
@@ -620,6 +696,17 @@ class SleeveRuntime:
             elif cmd["command"] == "pause":
                 if self.status != "halted":
                     self._set("paused", f"paused by PM: {cmd['reason']}")
+            elif cmd["command"] == RAL:
+                self._reset_after_liquidation(cmd, equity)
+                continue
+            elif cmd["command"] == BOOK_RESET:
+                # Store.book_reset journaled the clear and set the status; this process re-bases its own references
+                # at its equity now. Never a liquidation, which only a reset after liquidation clears.
+                if not self.wiped_out and (self.status == "halted" or (self.status == "paused" and self.paused_until)):
+                    self.peak = self._day_open = equity
+                    self._set("running", "")
+                self.store.mark_applied(cmd["id"])
+                continue
             elif cmd["command"] == "resume" and self.status == "running":
                 # Already running: a resume would only reset the day's loss baseline (review round 10, m10-3).
                 self.store.event(self.name, "info", "pm_resume_ignored",

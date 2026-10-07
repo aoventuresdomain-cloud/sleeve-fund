@@ -13,8 +13,15 @@
 </nav>
 
 <div class="tab-panel" id="tab-overview" role="tabpanel" data-panel="overview">
-  {% if pre.not_reset %}<div class="banner loss" role="alert">Not reset: {{ pre.not_reset }}. Its position margin was lost (liquidated), so it waits for Reset after liquidation, which asks for an incident note.</div>{% endif %}
-  {% if pre.reset %}<div class="banner" role="status">Reset asked for every {{ 'other ' if pre.not_reset }}strategy on the book. Each one closes its position, is put away under Previous book and restarts at its starting capital; its page shows "Resetting…" until it has.</div>{% endif %}
+  {% if pre.confirm_liquidated %}<div class="banner loss" role="alert">
+    <p>Nothing was reset yet. These strategies lost their position margin (liquidated): {{ pre.confirm_liquidated }}. A book reset also ends each liquidation, but each liquidation's incident stays open until its note is written and you acknowledge it.</p>
+    <form method="post" action="/book/reset/confirm">
+      <input type="hidden" name="reason" value="{{ pre.confirm_reason }}">
+      {% for n in pre.confirm_liquidated.split(', ') %}<input type="hidden" name="liquidated" value="{{ n }}">{% endfor %}
+      <button type="submit">Reset the book, these included</button>
+    </form>
+  </div>{% endif %}
+  {% if pre.reset %}<div class="banner" role="status">Reset asked for every strategy on the book. Each one closes its position, is put away under Previous book and restarts at its starting capital; its page shows "Resetting…" until it has.</div>{% endif %}
   {% if pre.reset_error %}<div class="banner loss" role="alert">Nothing was reset: {{ pre.reset_error }}.</div>{% endif %}
   {# Path to live: read-only, from the real state (G2 not approved is Paper; the demo mirror on is Demo check). #}
   <section class="panel journey-panel" aria-labelledby="ptl-h">

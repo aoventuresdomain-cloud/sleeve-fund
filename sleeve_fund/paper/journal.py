@@ -229,9 +229,9 @@ class MemoryJournal:
         return replay_book(self.fills_, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None) -> None:
+                       ts: datetime | None = None, kind: str = "settled") -> None:
         self.funding_.append({"sleeve": sleeve, "ts": ts or utcnow(), "qty": qty, "price": price, "rate": rate,
-                              "amount": amount})
+                              "amount": amount, "kind": kind})
 
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.funding_))[:limit]

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import markdown
 
+from sleeve_fund.research.guardrails import MIN_OOS_TRADES
 from sleeve_fund.venues import RESEARCH_VENUE
 
 # Research's recommended settings per model, with why, the question it answers and the pre-registered kill
@@ -178,7 +179,15 @@ def history_chip(h: dict) -> dict:
                                              f"{fm} possible funding hole{'s' if fm != 1 else ''} at an interval change"
                                              if fm else "") if p)
         title = f"{title}; {funding_note}" if title else funding_note
-    return {"text": b["text"], "tone": BADGE_TONE[b["state"]], "state": b["state"], "days": days, "title": title}
+    text, tone = b["text"], BADGE_TONE[b["state"]]
+    if (fg or fm) and b["state"] == "stored":
+        # Funding holes don't hold backtests back (state stays "stored"), but the chip says so, not only its hover
+        # (QA P1-O15): funding charged at the baseline where the venue's rate is missing.
+        words = [f"{fg} funding hole{'s' if fg != 1 else ''}" if fg else "",
+                 f"{fm} possible funding hole{'s' if fm != 1 else ''}" if fm else ""]  # QA P1-O19
+        text = text.replace("no gaps", "no price gaps · " + " · ".join(w for w in words if w))
+        tone = BADGE_TONE["filling"]
+    return {"text": text, "tone": tone, "state": b["state"], "days": days, "title": title}
 
 
 BADGE_TONE = {"stored": "running", "filling": "paused", "gaps": "halted", "none": ""}
@@ -378,8 +387,16 @@ def banner(s: dict) -> str:
     else:
         lead = "This tear sheet has no cost ladder, so it names no break-even fee."
     if s["g1"] == "FAIL" and s.get("failed"):
-        lead += " G1 failed on: " + "; ".join(x[0].lower() + x[1:] if x[1:2].islower() else x
-                                              for x in s["failed"]) + "."
+        # Too few out-of-sample trades is "not judged", as the Results page says it, not a failed idea.
+        few = [x for x in s["failed"] if x.lower().startswith("enough out-of-sample trades")]
+        failed = [x for x in s["failed"] if x not in few]
+        if failed:
+            lead += " G1 failed on: " + "; ".join(x[0].lower() + x[1:] if x[1:2].islower() else x
+                                                  for x in failed) + "."
+        if few:
+            n = s.get("oos_trades")
+            lead += (f" Not judged: {n:,} out-of-sample trades is fewer than the {MIN_OOS_TRADES} needed."
+                     if n is not None else f" Not judged: fewer than {MIN_OOS_TRADES} out-of-sample trades.")
     elif s["g1"] == "NOT JUDGED":
         why = re.sub(r"^not judged: ", "", s.get("evidence") or "", flags=re.I).rstrip(".")
         lead += f" Not judged: {why}." if why else " The study's runs can't be judged."

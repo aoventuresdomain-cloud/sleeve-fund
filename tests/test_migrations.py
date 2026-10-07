@@ -132,3 +132,30 @@ def test_cli_migrate_fails_the_deploy_when_a_migration_fails(engine, monkeypatch
     monkeypatch.setattr(schema, "make_engine", lambda: engine)
     with pytest.raises(RuntimeError):
         schema.main(["migrate"])  # uncaught: the process exits non-zero and the services don't start
+
+
+def test_a_liquidation_incident_is_answered_by_one_command_only(engine):
+    """0007 (P1-RAL): commands.command holds 'reset_after_liquidation' (23 characters), and commands.incident, the
+    liquidation event a reset answers, is unique where set: a retry or a double click can't reset twice."""
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import commands_t, utcnow
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=1_000)
+    store.event("s", "error", "liquidation", "liquidated")
+    (inc,) = [e["id"] for e in store.events("s", limit=5) if e["kind"] == "liquidation"]
+    row = dict(sleeve="s", command="reset_after_liquidation", reason="r", created_at=utcnow(), incident=inc)
+    with engine.begin() as c:
+        c.execute(insert(commands_t).values(**row))
+    with pytest.raises(IntegrityError), engine.begin() as c:
+        c.execute(insert(commands_t).values(**row))
+    with engine.begin() as c:  # commands without an incident are unaffected
+        c.execute(insert(commands_t).values(**{**row, "command": "pause", "incident": None}))
+        c.execute(insert(commands_t).values(**{**row, "command": "resume", "incident": None}))
+    if engine.dialect.name == "postgresql":  # SQLite here doesn't enforce foreign keys
+        with pytest.raises(IntegrityError), engine.begin() as c:  # the incident must be a real event
+            c.execute(insert(commands_t).values(**{**row, "incident": 10**9}))

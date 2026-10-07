@@ -4,8 +4,17 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  pytest:
+  # The suite runs as parallel shards, each with its own Postgres. The browser tests run on their own shard, the only
+  # one that installs the browser; pytest-split shares the rest into 5 groups of about equal run time, using the
+  # durations stored in .test_durations (a test missing from it counts as the average). Every test runs exactly once.
+  # To refresh the durations after the suite has changed a lot: pytest --store-durations --ignore=tests/test_browser.py
+  shard:
+    name: pytest shard ${{ matrix.group }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ["1", "2", "3", "4", "5", browser]
     services:
       postgres:
         image: postgres:16
@@ -17,11 +26,27 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 20
     env:
       TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/sleeve_test
+      # A test still running after 10 minutes fails the shard at once, naming the test and dumping every thread's stack,
+      # instead of hanging the job (the slowest test today takes about 5 minutes).
+      PYTEST_ARGS: --timeout=600 --timeout-method=thread --durations=10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
-      - run: python -m playwright install --with-deps chromium  # tests/test_browser.py
-      - run: pytest -q
+      - if: matrix.group == 'browser'
+        run: python -m playwright install --with-deps chromium
+      - if: matrix.group == 'browser'
+        run: pytest -q $PYTEST_ARGS tests/test_browser.py
+      - if: matrix.group != 'browser'
+        run: >-
+          pytest -q $PYTEST_ARGS --ignore=tests/test_browser.py
+          --splits 5 --group ${{ matrix.group }} --splitting-algorithm least_duration
+  # The check the merge flow reads: green only when every shard is.
+  pytest:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.shard.result }}" = success

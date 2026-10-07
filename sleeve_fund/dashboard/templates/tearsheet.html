@@ -7,7 +7,7 @@
     <h1>{% if s.strategy %}{{ [s.label, s.instrument, candle_words(s.minutes)|lower ~ ' candles' if s.minutes else none]|select|join(' · ') }}{% else %}{{ title|replace('_', ' ') }}{% endif %}</h1>
     <p class="lede">{{ [s.venue_label|capitalize if s.venue_label, s.when.strftime('%d %b %Y %H:%M') ~ ' UTC']|select|join(' · ') }}{% if 'synthetic' in s.dataset %} · <span class="warn">synthetic data: proves the pipeline, not the idea</span>{% endif %}</p>
   </div>
-  <div class="actions"><a class="button secondary" href="/research/{{ title }}/download" download>Download tear sheet</a></div>
+  <div class="actions"><a class="button secondary" href="/results/{{ title }}">Guardrail results</a> <a class="button secondary" href="/research/{{ title }}/download" download>Download tear sheet</a></div>
 </div>
 
 <section class="verdict {{ s.tone }}" aria-label="Verdict">

@@ -19,12 +19,13 @@ from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets, open_risk
+from sleeve_fund import funding, markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.strategies.definitions import uses_first_touch
 
 
 @dataclass
@@ -56,6 +57,16 @@ class BacktestResult:
     reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
+    # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
+    # settlements charged the baseline and the longest stretch of held time without the rate (QA P1-O17).
+    funding_marks: list = field(default_factory=list)
+    funding_at_baseline: int = 0
+    funding_held: int = 0
+    funding_baseline_longest: pd.Timedelta = pd.Timedelta(0)
+    # A simulated perp: no venue's rates at all, every settlement charged the baseline (Advisor, 6 Oct 2026)
+    funding_simulated: bool = False
+    # Why the venue's stored settlements don't fit the schedule charged, or "" (funding.schedule_mismatch)
+    funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
     # How far the fills can be trusted, when they relied on what traded first inside a bar (P1-D13): e.g.
@@ -64,6 +75,9 @@ class BacktestResult:
     # Filled orders decided before the model's indicators had settled (its warmup_needed), each flagged
     # "unsettled" in its decision; kept as the model trades them (Independent Quant Advisor, 6 Oct, 5.1).
     unsettled_fills: int = 0
+    # Rule-builder first_touch rules (R2), by rule path ("long.entry", "long.entry[1]", "long.exit"): judged, true,
+    # reached, same_minute, unknown, ambiguous_share and the rest (Rules.first_touch_stats).
+    first_touch: dict = field(default_factory=dict)
     # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
     # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
     open_risk_binds: int = 0
@@ -144,6 +158,8 @@ def run_backtest(
     progress=None,
     fees: FeeSchedule | None = None,
     warmup_prices: pd.DataFrame | None = None,
+    first_touch_flip: bool = False,
+    first_touch_count_from: pd.Timestamp | None = None,
 ) -> BacktestResult:
     """prices: bars of `bar_minutes` length indexed by close time, as the history store returns them.
 
@@ -170,7 +186,11 @@ def run_backtest(
     fees: charge this schedule instead of the market's or the instrument's (the cost ladder).
 
     warmup_prices: bars of `bar_minutes` before `prices`, fed to the strategy first without trading, as a paper
-    strategy's warm-up from the history store is, so the window opens on settled indicators."""
+    strategy's warm-up from the history store is, so the window opens on settled indicators.
+
+    first_touch_flip: resolve a rule-builder first_touch the other way when a candle is ambiguous (true in an entry,
+    false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07). first_touch_count_from: its
+    report counts only the candles closing from then on, so a study reads a window's test candles alone."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -178,6 +198,15 @@ def run_backtest(
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
+    minutes_in = touches and bar_minutes > 1 and exec_prices is not None and not exec_prices.empty \
+        and exec_minutes == 1
+    first_minute = prices.index[0] - pd.Timedelta(minutes=bar_minutes - 1)  # the first decision candle's first
+    if minutes_in and (exec_prices.index[0] > first_minute or exec_prices.index[-1] < prices.index[-1]):
+        # the engine decides on candles built from these minutes: one they don't reach is never judged at all
+        raise ValueError(f"the first_touch rule needs the 1-minute bars of every decision candle: they run "
+                         f"{exec_prices.index[0]} to {exec_prices.index[-1]}, the decision candles {prices.index[0]} "
+                         f"to {prices.index[-1]}")
     perp = markets.is_perp(params)
     if fees is None:
         fees = markets.fees_for(params, FeeSchedule(instrument.maker_fee, instrument.taker_fee), str(instrument.id.venue))
@@ -260,6 +289,11 @@ def run_backtest(
             **params,
         )
         strategy = strategy_cls(config).attach_runtime(runtime)
+        if minutes_in:
+            strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
+        for node in getattr(getattr(strategy, "rules", None), "touches", ()):
+            node.flip = first_touch_flip
+            node.count_from = None if first_touch_count_from is None else int(pd.Timestamp(first_touch_count_from).value)
         strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
         if series.points:  # each bar's fills charge the measurement in force when it opened (BarOpens)
             fee_model.spread_series = strategy.spread_series = series
@@ -313,6 +347,12 @@ def run_backtest(
         else:
             equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
         fees_paid = _fees_paid(fills)
+        touched = strategy.first_touch_stats() if touches else {}
+        if touches and bar_minutes > 1 and not minutes_in and any(st["missing"] for st in touched.values()):
+            raise ValueError(
+                f"the first_touch rule needed the 1-minute bars of {sum(st['missing'] for st in touched.values())}"
+                " candles that reached both its levels, and the run had none: run it with those minutes (exec_prices, "
+                "exec_minutes = 1)")
         return BacktestResult(
             strategy=strategy_name,
             params=params,
@@ -328,13 +368,19 @@ def run_backtest(
             spreads_used=series.report(start_ns, end_ns),
             spread_text=series.text(start_ns, end_ns),
             journal=runtime.store if risk_profile is not None else None,
-            funding=[{"ts": ts, "amount": a} for ts, a in strategy.funding_log],
+            funding=[_funding_row(strategy, ts, a, k) for ts, a, k in strategy.funding_log],
+            funding_marks=list(strategy.funding_marks),
+            funding_simulated=strategy._cfg.perp is not None and strategy._cfg.perp.funding_venue is None,
+            funding_schedule=_funding_schedule(strategy, instrument, prices),
+            **dict(zip(("funding_at_baseline", "funding_held", "funding_baseline_longest"),
+                       funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
             insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
             handler_errors=list(strategy.handler_errors),
             unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
                                 if strategy.decisions.get(o, {}).get("unsettled")),
             handler_error_count=strategy.handler_error_count,
             labels=fills_label(exec_minutes, fee_model.intrabar) if coarse else [],
+            first_touch=touched,
             reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, bar_minutes),
             open_risk_binds=strategy.open_risk_binds,
             open_risk_max=strategy.open_risk_max,
@@ -347,6 +393,32 @@ def run_backtest(
             runtime.now = _utcnow
         fee_model.exit_info = fee_model.now = None  # closures over the strategy: the same cycle
         engine.dispose()
+
+
+def ranges_from(df: pd.DataFrame):
+    """A first_touch range source over the decision candles indexed by close time: close ns -> (high, low), or None
+    for a candle not among them. Their range is the venue's, so a minute missing from exec_prices is still in it."""
+    ts = df.index.as_unit("ns").asi8
+    hl = df[["high", "low"]].to_numpy(dtype=float)
+
+    def source(until: int):
+        i = np.searchsorted(ts, until)
+        return (float(hl[i, 0]), float(hl[i, 1])) if i < len(ts) and ts[i] == until else None
+
+    return source
+
+
+def minutes_from(df: pd.DataFrame):
+    """A first_touch minute source over 1-minute bars indexed by close time: (after ns, until ns) -> the bars closing in
+    (after, until] as (close ns, open, high, low, close)."""
+    ts = df.index.as_unit("ns").asi8  # UTC nanoseconds, as data.to_bars stamps the bars
+    ohlc = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+
+    def source(after: int, until: int) -> list:
+        i, j = np.searchsorted(ts, after, side="right"), np.searchsorted(ts, until, side="right")
+        return [(int(ts[k]), *map(float, ohlc[k])) for k in range(i, j)]
+
+    return source
 
 
 def reentries_on_exit_candle(fills: pd.DataFrame | None, decisions: dict, bar_minutes: int) -> int:
@@ -389,6 +461,29 @@ def _opening_balances(starting_capital: float, quote: Currency, base: Currency, 
     return [Money(book["cash"], quote)] + ([Money(book["qty"], base)] if book["qty"] > 0 else [])
 
 
+def _funding_row(strategy, ts, amount: float, kind: str) -> dict:
+    """A BacktestResult.funding row; a settled charge paid by a snapped record keeps its audit note (QA P1-O17a-14)."""
+    row = {"ts": ts, "amount": amount, "kind": kind}
+    if kind == "settled" and ts in strategy.funding_notes:
+        row["note"] = strategy.funding_notes[ts]
+    return row
+
+
+def _funding_schedule(strategy, instrument, prices: pd.DataFrame) -> str:
+    """funding.schedule_mismatch over the run, for a perp charged the venue's own rates."""
+    terms = strategy._cfg.perp
+    if terms is None or terms.funding_venue is None or not len(prices):
+        return ""
+    return funding.schedule_mismatch(terms.funding_venue, pair_of(instrument), terms.funding_hours,
+                                     start=prices.index[0], end=prices.index[-1]) or ""
+
+
+def _funding_interval(strategy) -> pd.Timedelta:
+    """The time between the perpetual's settlements, for the held time a stretch without the venue's rate spans."""
+    terms = strategy._cfg.perp
+    return pd.Timedelta(markets.funding_interval(terms.funding_hours)) if terms is not None else pd.Timedelta(0)
+
+
 def _opening_cash(starting_capital: float, runtime) -> float:
     return starting_capital if runtime is None else float(runtime.book["cash"])
 
@@ -417,7 +512,7 @@ def _perp_mark_to_market(
             fee = sum(float(str(m).split()[0]) for m in
                       (f["commissions"] if isinstance(f["commissions"], (list, tuple)) else [f["commissions"]]))
             flows.append((pd.Timestamp(f["ts_last"]), -side * qty * float(f["avg_px"]) - fee, side * qty))
-    for ts, amount in funding:
+    for ts, amount, *_ in funding:
         flows.append((pd.Timestamp(ts), float(amount), 0.0))
     for ts, amount in sorted((pd.Timestamp(t), float(a)) for t, a in insurance):
         before = [(c, q) for t, c, q in flows if t <= ts]

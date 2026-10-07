@@ -37,6 +37,7 @@ from sqlalchemy import (
     insert,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -44,7 +45,13 @@ from sqlalchemy.exc import IntegrityError
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
-COMMANDS = {"pause", "resume", "flatten"}
+# The PM's reset after a liquidation (P1-RAL): ends a liquidation halt, from a new high-water mark at the remaining
+# equity, once the liquidation's incident has its note (Independent Quant Advisor, 6 Oct 17:57 and 18:17).
+RAL = "reset_after_liquidation"
+# The book reset (Advisor 7 Oct 00:20 (a)): each strategy's own drawdown halt and daily-loss pause cleared, its
+# references re-based at its equity now, journaled as an event of this kind; the command tells a running process.
+BOOK_RESET = "book_reset"
+COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
@@ -116,6 +123,10 @@ funding_t = Table(
     Column("price", Float, nullable=False),
     Column("rate", Float, nullable=False),
     Column("amount", Float, nullable=False),
+    # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
+    # correction to the venue's rate), QA P1-O17.
+    Column("kind", String(16), nullable=False, server_default="settled"),
+    CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
 )
 
@@ -167,10 +178,14 @@ commands_t = Table(
     metadata,
     Column("id", Integer, primary_key=True),
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
-    Column("command", String(16), nullable=False),
+    Column("command", String(32), nullable=False),
     Column("reason", Text, nullable=False),
     Column("created_at", TS, nullable=False),
     Column("applied_at", TS),
+    # The liquidation incident (events.id) a reset after liquidation answers; one command per incident (P1-RAL).
+    Column("incident", Integer, ForeignKey("events.id", ondelete="RESTRICT")),
+    Index("commands_incident", "incident", unique=True, postgresql_where=text("incident IS NOT NULL"),
+          sqlite_where=text("incident IS NOT NULL")),
 )
 
 decisions_t = Table(
@@ -479,6 +494,10 @@ ERROR_KINDS = ("handler_failed", "tick_failed")
 # The event a PM's "Reset after liquidation" journals (item RAL): the one thing that ends a liquidation halt.
 # The engine (#155) and the dashboard both read it from here.
 LIQUIDATION_RESET = "liquidation_reset"
+# The note on a liquidation's incident that a reset after liquidation needs (Advisor 18:17): an events row of its own,
+# "Incident #<id> note by <author>: ...", so the incident it answers is in its words.
+INCIDENT_NOTE = "incident_note"
+WHY_STOP_FIELD = "why the half-liquidation stop did not protect the position"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
@@ -688,6 +707,30 @@ def _put_trial_in(c, row: dict) -> None:
     except IntegrityError:
         if not c.execute(select(trials_t.c.id).where(trials_t.c.id == row["id"])).first():
             raise
+
+LABEL_CLEARED = {"drawdown_halt": "drawdown halt", "daily_pause": "daily-loss pause"}
+
+
+def _cleared_words(store: "Store", s: "Sleeve") -> str:
+    """What a book reset clears for one strategy, with the old reference and level (Advisor 7 Oct 00:20)."""
+    from sleeve_fund import risk
+
+    profile = risk.profile(s.risk_profile)
+    if s.status == "halted":
+        peak = store.peak_equity(s.name) or s.starting_balance
+        return (f"the drawdown halt ({s.status_reason}) is cleared: its reference, the high-water mark of {peak:,.2f} "
+                f"against a {profile.max_drawdown:.0%} limit, is re-based with the book")
+    return (f"the daily-loss pause ({s.status_reason}) is cleared: its reference, the day's opening equity, against a "
+            f"{profile.daily_loss:.0%} limit, is re-based with the book")
+
+
+class BookResetRefused(ValueError):
+    """A book reset refused before it changed anything: `code` is stable, the text is the PM's."""
+
+    def __init__(self, code: str, text: str) -> None:
+        super().__init__(text)
+        self.code = code
+
 
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
@@ -1250,10 +1293,10 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None) -> None:
+                       ts: datetime | None = None, kind: str = "settled") -> None:
         with self.engine.begin() as c:
             c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
-                                                amount=amount))
+                                                amount=amount, kind=kind))
 
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         q = select(funding_t).where(funding_t.c.sleeve == sleeve).order_by(funding_t.c.ts.desc()).limit(limit)
@@ -1314,9 +1357,12 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(select(orders_t.c.reason).where(orders_t.c.order_id == order_id)).scalar() or ""
 
-    def request_reset(self, sleeve: str, reason: str, actor: str = "PM") -> None:
+    def request_reset(self, sleeve: str, reason: str, actor: str = "PM", *, book: bool = False) -> None:
         """Ask the supervisor to reset a strategy: it flattens it, puts the run so far away and restarts it at
-        its starting capital (supervisor.Supervisor.reset_pending)."""
+        its starting capital (supervisor.Supervisor.reset_pending). A per-strategy reset keeps any halt or pause. A
+        book reset (`book`) re-bases the high-water mark and the day's start with the book, so it clears the
+        strategy's own drawdown halt and daily-loss pause, journaled once each with the old reference and level; never
+        the PM's pause, a stop or a liquidation's incident (Independent Quant Advisor, 7 Oct 00:20)."""
         s = self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest can't be reset; run a new backtest instead")
@@ -1326,13 +1372,20 @@ class Store:
             raise ValueError("a reason is required")
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
+        from sleeve_fund.paper.runtime import liquidation_head  # the engine's liquidation rule
+
+        if liquidation_head(self, sleeve) is not None:
+            # Advisor 20:41 (U27): an ordinary reset can't clear a liquidation.
+            raise ValueError("its position margin was lost (liquidated), so a reset can't clear it: use Reset after "
+                             "liquidation, which asks for an incident note")
         with self.engine.begin() as c:
             rid = c.execute(insert(resets_t).values(sleeve=sleeve, reason=reason.strip(), actor=actor, created_at=utcnow(),
                                                     restart=int(s.desired_state == "running"), run="")).inserted_primary_key[0]
+            cleared = book and (s.status == "halted" or (s.status == "paused" and s.paused_until is not None))
             # A pause leaves desired_state running, so restart alone would lift it: keep it (U13-4).
             hold = ({"status": s.status, "status_reason": s.status_reason or "", "paused_until": s.paused_until}
-                    if s.status in ("paused", "halted") else None)
-            if s.status != "halted":  # never downgrade a halt, as the paper process doesn't
+                    if s.status in ("paused", "halted") and not cleared else None)
+            if not (hold and hold["status"] == "halted"):  # never downgrade a halt, as the paper process doesn't
                 # P1-KR-2: a PM pause or flatten (the kill switch) pressed just before the reset, which the paper
                 # process has not applied yet, is kept as the pause it would have set (paper.runtime): the reset
                 # puts its pending commands away with the old run. The system's own flattens (a clean slate's) aren't.
@@ -1346,7 +1399,70 @@ class Store:
                     hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
             if hold:
                 c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
-        self.decide(actor, "reset", f"Reset strategy: {reason.strip()}", sleeve)
+        if cleared:
+            self.event(sleeve, "info", BOOK_RESET, f"Book reset: {_cleared_words(self, s)}")
+        self.decide(actor, "reset", f"{'Book reset' if book else 'Reset strategy'}: {reason.strip()}", sleeve)
+
+    def book_reset(self, reason: str, actor: str = "PM", now: datetime | None = None) -> list[str]:
+        """The book reset (Independent Quant Advisor, 7 Oct 00:20 (a)): every strategy in the book is re-based at its
+        equity now, so each one's own drawdown halt and daily-loss pause is cleared, once, journaled as a "book_reset"
+        event with the old reference and the level. It never clears a liquidation (only a reset after liquidation
+        does), a retirement, a stop or the PM's pause, and starts nothing: a stopped strategy stays stopped. Refused,
+        changing nothing, unless every strategy is flat with no resting orders (BookResetRefused, with a code). One
+        transaction: the clears, the new marks, the commands that tell running processes and the decision row land
+        together or not at all. Returns the strategies cleared."""
+        from sleeve_fund.paper.runtime import clearing_action, liquidation_head  # the engine's own rules
+
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        now = now or utcnow()
+        archived = self.archived()
+        book = [s for s in self.sleeves() if not is_backtest(s.name) and s.name not in archived]
+        for s in book:
+            held = self.journal_book(s.name, s.starting_balance)["qty"]
+            if abs(held) > 1e-12:
+                raise BookResetRefused("not_flat", f"{s.name} still holds a position ({held:g}), so the book can't be "
+                                       "reset: close it (Flatten) first, then reset the book.")
+            if (open_ := self.orders(s.name, statuses=OPEN_ORDER_STATUSES, limit=1)):
+                raise BookResetRefused("resting_orders", f"{s.name} has a resting order ({open_[0]['intent']}), so the "
+                                       "book can't be reset: cancel it (Flatten cancels it) first, then reset the book.")
+        cleared = []
+        for s in book:
+            halt = clearing_action(s, now)
+            if halt is None or halt.code not in ("drawdown_halt", "daily_pause"):
+                continue
+            if liquidation_head(self, s.name) is not None:
+                continue  # a liquidation stays until its reset after liquidation (Advisor 17:57)
+            mark = self.equity_at_or_before(s.name, now)
+            level = float(mark["equity"]) if mark else float(self.journal_book(s.name, s.starting_balance)["cash"])
+            if halt.code == "drawdown_halt":
+                old = f"the high-water mark of {self.peak_equity(s.name) or s.starting_balance:,.2f}"
+            else:
+                midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+                day_open = self.day_open_equity(s.name, midnight)
+                old = f"the day's opening equity of {day_open if day_open is not None else s.starting_balance:,.2f}"
+            words = LABEL_CLEARED[halt.code]
+            cleared.append((s, mark, level,
+                            f"Book reset: the {words} ({s.status_reason}) is cleared. Its reference, {old}, is "
+                            f"re-based at the equity now, {level:,.2f}. {reason.strip()}"))
+        with self.engine.begin() as c:
+            for s, mark, level, message in cleared:
+                c.execute(insert(equity_t).values(sleeve=s.name, ts=now, equity=level, cash=level, qty=0.0,
+                                                  price=float(mark["price"]) if mark else 0.0,
+                                                  benchmark=float(mark["benchmark"]) if mark else level))
+                c.execute(insert(events_t).values(sleeve=s.name, ts=now, level="info", kind=BOOK_RESET,
+                                                  message=message))
+                stopped = s.desired_state == "stopped"
+                c.execute(update(sleeves_t).where(sleeves_t.c.name == s.name).values(
+                    status="stopped" if stopped else "running", paused_until=None, updated_at=now,
+                    status_reason="book reset: stays stopped until you press Start" if stopped else ""))
+                if not stopped:  # its process re-bases its own references too
+                    c.execute(insert(commands_t).values(sleeve=s.name, command=BOOK_RESET, reason=reason.strip(),
+                                                        created_at=now))
+            c.execute(insert(decisions_t).values(
+                ts=now, actor=actor, action=BOOK_RESET, sleeve=None,
+                reason=f"Book reset: {reason.strip()} (cleared: {', '.join(s.name for s, *_ in cleared) or 'none'})"))
+        return [s.name for s, *_ in cleared]
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
         rows = self.pending_resets()
@@ -1546,6 +1662,46 @@ class Store:
                     _not_backtest(events_t.c.sleeve)))
         with self.engine.connect() as c:
             return c.execute(q).scalar() or 0
+
+    def event_by_id(self, event_id: int) -> dict | None:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(events_t).where(events_t.c.id == event_id)))
+        return rows[0] if rows else None
+
+    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str) -> None:
+        """The note on a liquidation's incident (Advisor 18:17): why the half-liquidation stop did not protect the
+        position, and who wrote it. Both are required. A later note on the same incident replaces it."""
+        why, author = (why_stop_did_not_protect or "").strip(), (author or "").strip()
+        if not why:
+            raise ValueError(f"the note needs {WHY_STOP_FIELD}")
+        if not author:
+            raise ValueError("the note needs its author")
+        ev = self.event_by_id(incident_id)
+        if ev is None or ev["kind"] != "incident" or ev["sleeve"] is None:
+            raise ValueError(f"#{incident_id} is not a strategy's incident")
+        self.event(ev["sleeve"], "info", INCIDENT_NOTE,
+                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}")
+
+    def incident_note(self, incident_id: int) -> dict | None:
+        """The latest note on an incident (write_incident_note), with its author, else None."""
+        ev = self.event_by_id(incident_id)
+        if ev is None or ev["sleeve"] is None:
+            return None
+        head = f"Incident #{incident_id} note by "
+        notes = [e for e in self.sleeve_events_since(ev["sleeve"], (INCIDENT_NOTE,), after_id=incident_id)
+                 if e["message"].startswith(head)]
+        if not notes:
+            return None
+        note = notes[-1]
+        note["author"] = note["message"][len(head):].split(f": {WHY_STOP_FIELD}: ", 1)[0]
+        return note
+
+    def incident_is_open(self, incident_id: int) -> bool:
+        """An incident closes only once its note is written AND the PM has acknowledged it (Advisor 21:05, RAL 7/8):
+        neither a reset after liquidation nor a book reset closes it."""
+        with self.engine.connect() as c:
+            acked = c.execute(select(acks_t.c.event_id).where(acks_t.c.event_id == incident_id)).first() is not None
+        return not (acked and self.incident_note(incident_id) is not None)
 
     def ack(self, event_id: int, actor: str, note: str = "") -> None:
         with self.engine.begin() as c:
@@ -1767,9 +1923,12 @@ class Store:
 
     # --- PM commands and decisions ----------------------------------------------
 
-    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True) -> None:
+    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True,
+                incident: int | None = None) -> None:
         """holds_through_reset: a pause or flatten asked for while a reset is under way is kept on the fresh run, as
-        one in force before the reset is (m13-U5); the reset's own flatten passes False."""
+        one in force before the reset is (m13-U5); the reset's own flatten passes False. `incident`: the liquidation
+        event a reset after liquidation answers; a second command for the same incident raises IntegrityError
+        (commands_incident), so a retry or a double click never resets twice."""
         if command not in COMMANDS:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
@@ -1777,12 +1936,90 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
         self.sleeve(sleeve)  # raises if unknown
-        with self.engine.begin() as c:
-            c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
-                                                created_at=utcnow()))
-            if holds_through_reset and command in ("pause", "flatten"):
-                self._hold_on_reset(c, sleeve, command, reason)
+        here = None  # a reset after liquidation applied here, as no process will apply it
+        if command == RAL:
+            from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
+
+            if (why := ral_refusal(self, sleeve, incident, actor)) is not None:
+                raise ValueError(why)
+            reason = f"{reason.strip()} (incident #{incident})"
+            here = self._ral_here(sleeve, reason, incident)
+        elif incident is not None:
+            raise ValueError("only a reset after liquidation names an incident")
+        now = utcnow()
+        try:
+            with self.engine.begin() as c:
+                cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
+                                                          created_at=now, incident=incident)).inserted_primary_key[0]
+                if holds_through_reset and command in ("pause", "flatten"):
+                    self._hold_on_reset(c, sleeve, command, reason)
+                if here:
+                    self._apply_ral(c, sleeve, cid, here, now)
+        except IntegrityError:
+            if incident is None:
+                raise
+            raise ValueError(f"already reset for this liquidation: incident #{incident} has its reset after "
+                             "liquidation") from None
+        if here:
+            self._lapse_resets_before(sleeve, now)
         self.decide(actor, command, reason, sleeve)
+
+    def apply_waiting_ral(self, sleeve: str) -> bool:
+        """A reset after liquidation still waiting when its strategy was stopped (QA RAL-F2: Stop after the RAL): no
+        process will apply it once the strategy is stopped and flat, so it is applied here as Store.command applies
+        one sent to a stopped strategy. True if one was applied; a process that got there first wins."""
+        waiting = [c for c in self.pending_commands(sleeve) if c["command"] == RAL]
+        if not waiting or (here := self._ral_here(sleeve, waiting[-1]["reason"], waiting[-1]["incident"])) is None:
+            return False
+        now = utcnow()
+        with self.engine.begin() as c:
+            if not self._apply_ral(c, sleeve, waiting[-1]["id"], here, now):
+                return False
+        self._lapse_resets_before(sleeve, now)
+        return True
+
+    def _apply_ral(self, c, sleeve: str, command_id: int, here: dict, now: datetime) -> bool:
+        """Apply a reset after liquidation in the caller's transaction, as the engine's _reset_after_liquidation does:
+        the command applied, the liquidation_reset event, a mark at the remaining equity (which a Start's restored
+        high-water mark and day baseline read) and the strategy stopped, no longer halted. False (nothing written)
+        when the command was applied already."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIQUIDATION_RESET,
+                                          message=here["words"]))
+        if here["mark"] is not None:
+            c.execute(insert(equity_t).values(sleeve=sleeve, ts=now, **here["mark"]))
+        c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
+            status="stopped", status_reason="stopped: reset after liquidation", paused_until=None))
+        return True
+
+    def _lapse_resets_before(self, sleeve: str, now: datetime) -> None:
+        for request in self.pending_resets():  # as the engine does: a reset asked before the RAL lapses
+            if request["sleeve"] == sleeve and request["created_at"] <= now:
+                self.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
+                                  "liquidation answered")
+
+    def _ral_here(self, sleeve: str, reason: str, incident: int) -> dict | None:
+        """A reset after liquidation for a strategy no process will apply it for (CR on #193): stopped and flat, so
+        the supervisor runs nothing, and Start is refused while it is liquidated. Returns what Store.command journals
+        for it in the command's own transaction (the engine's words, and a mark at the remaining equity, so a later
+        Start restores the new high-water mark and day baseline from it), else None for the process to apply."""
+        from sleeve_fund.paper.runtime import SleeveRuntime, liquidation_event, ral_words
+
+        s = self.sleeve(sleeve)
+        book = self.journal_book(sleeve, s.starting_balance)
+        liq = liquidation_event(self, sleeve)
+        if s.desired_state == "running" or abs(book["qty"]) > 1e-12 or liq is None:
+            return None  # liq None: nothing left to reset (a book reset ended it), so it isn't applied (QA D-1)
+        equity = book["cash"]
+        last = self.equity_at_or_before(sleeve, utcnow())
+        cmd = {"incident": incident, "reason": reason}
+        words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
+        mark = (None if last is None else
+                {"equity": equity, "cash": equity, "qty": 0.0, "price": last["price"], "benchmark": last["benchmark"]})
+        return {"words": words, "mark": mark}
 
     def hold_on_reset(self, sleeve: str, command: str, reason: str) -> bool:
         """A PM control on a strategy whose reset is under way, kept on the fresh run without a command for its
@@ -1854,7 +2091,9 @@ class Store:
 
     def drop_pending(self, sleeve: str, why: str) -> int:
         """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
-        pending = self.pending_commands(sleeve)
+        # A reset after liquidation doesn't lapse: its incident can't be answered twice, so it is applied instead
+        # (apply_waiting_ral, or the process still running for its exits) (QA RAL-F2).
+        pending = [c for c in self.pending_commands(sleeve) if c["command"] != RAL]
         for cmd in pending:
             self.mark_applied(cmd["id"])
             if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them
