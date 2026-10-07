@@ -181,6 +181,9 @@ def test_0010_seeds_the_pms_accepted_limits_and_profiles_are_append_only(engine)
     schema.migrate(engine)
     store = Store(engine=engine)
     assert store.portfolio_profile() == PORTFOLIO == store.portfolio_profile(1)
+    got = store.portfolio_profile()  # Numeric(10,4) back as the floats the core's ratios are written in
+    assert (got.gross, got.net_instrument, got.margin, got.open_risk, got.drawdown, got.daily_loss) == \
+        (1.5, 0.5, 0.5, 0.05, 0.15, 0.03)
     assert Store.in_memory().portfolio_profile() == PORTFOLIO
     v2 = store.add_portfolio_profile(PortfolioProfile(version=9, gross=1.2), created_by="pm", note="tighter gross")
     assert v2 == 2 and store.portfolio_profile() == PortfolioProfile(version=2, gross=1.2)

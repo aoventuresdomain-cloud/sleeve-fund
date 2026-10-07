@@ -119,7 +119,7 @@ def upgrade() -> None:
         sa.CheckConstraint(_in('stage', ('submit', 'fill')), name='gate_decisions_stage'),
         sa.ForeignKeyConstraint(['order_id'], ['orders.order_id']),
         sa.ForeignKeyConstraint(['profile_version'], ['portfolio_profile.version']),
-        sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id']),
+        sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id'], ondelete='RESTRICT'),
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('seq'),
         sa.UniqueConstraint('sleeve_id', 'bar_ts', 'intent_id', 'stage', name='gate_decisions_sleeve_bar_intent_stage'),
@@ -142,10 +142,12 @@ def upgrade() -> None:
         sa.CheckConstraint(_in('release_reason', ('fill', 'reject', 'cancel', 'ttl')),
                            name='gate_reservations_release_reason'),
         sa.ForeignKeyConstraint(['decision_id'], ['gate_decisions.id']),
-        sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id']),
+        sa.ForeignKeyConstraint(['sleeve_id'], ['sleeves.id'], ondelete='RESTRICT'),
         sa.PrimaryKeyConstraint('decision_id'),
     )
     op.create_index('gate_reservations_active', 'gate_reservations', ['underlying'], unique=False,
+                    sqlite_where=sa.text('released_at IS NULL'), postgresql_where=sa.text('released_at IS NULL'))
+    op.create_index('gate_reservations_active_sleeve', 'gate_reservations', ['sleeve_id'], unique=False,
                     sqlite_where=sa.text('released_at IS NULL'), postgresql_where=sa.text('released_at IS NULL'))
     # The PM's accepted limits (6 Oct 14:17), as sleeve_fund.risk.PortfolioProfile v1 holds them.
     op.bulk_insert(profile, [{

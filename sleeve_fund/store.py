@@ -578,7 +578,7 @@ gate_decisions_t = Table(
     metadata,
     Column("id", BIG_ID, primary_key=True),
     Column("seq", BigInteger, nullable=False, unique=True),
-    Column("sleeve_id", Integer, ForeignKey("sleeves.id"), nullable=False),
+    Column("sleeve_id", Integer, ForeignKey("sleeves.id", ondelete="RESTRICT"), nullable=False),  # outlives a strategy
     Column("bar_ts", TS, nullable=False),  # the decision's bar
     Column("intent_id", Text, nullable=False),  # the strategy's id for the intent
     Column("intent", String(16), nullable=False),  # entry, add, band add, rebalance increase, reversal open leg
@@ -612,7 +612,7 @@ gate_reservations_t = Table(
     "gate_reservations",
     metadata,
     Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id"), primary_key=True, autoincrement=False),
-    Column("sleeve_id", Integer, ForeignKey("sleeves.id"), nullable=False),
+    Column("sleeve_id", Integer, ForeignKey("sleeves.id", ondelete="RESTRICT"), nullable=False),  # outlives a strategy
     Column("underlying", String(16), nullable=False),
     Column("remaining_qty", EXACT, nullable=False),  # signed; reduced by partial fills
     Column("notional", EXACT, nullable=False),  # what it counts against each limit
@@ -626,6 +626,8 @@ gate_reservations_t = Table(
     CheckConstraint(_in("release_reason", GATE_RELEASES), name="gate_reservations_release_reason"),
     Index("gate_reservations_active", "underlying", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),
+    Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),
+          postgresql_where=text("released_at IS NULL")),  # the sweep, and DA-6's reset guard
 )
 HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
@@ -2121,10 +2123,10 @@ class Store:
             r = c.execute(q).first()
         if r is None:
             raise LookupError(f"no portfolio profile {version if version is not None else '(none recorded)'}")
-        return PortfolioProfile(version=r.version, gross=float(r.gross_max),
-                                net_instrument=float(r.net_underlying_max), margin=float(r.margin_max),
-                                open_risk=float(r.open_risk_max), drawdown=float(r.drawdown_halt),
-                                daily_loss=float(r.daily_pause))
+        return PortfolioProfile(version=r.version, gross=float(str(r.gross_max)),
+                                net_instrument=float(str(r.net_underlying_max)), margin=float(str(r.margin_max)),
+                                open_risk=float(str(r.open_risk_max)), drawdown=float(str(r.drawdown_halt)),
+                                daily_loss=float(str(r.daily_pause)))
 
     def add_portfolio_profile(self, limits, created_by: str, note: str | None = None) -> int:
         """Record new portfolio limits as the next version and return it. Append-only: there is no update, because
