@@ -344,16 +344,43 @@ def test_first_come_reservations_and_release():
     assert (d3.outcome, d3.approved_qty) == ("approved", D("20"))  # 3,000 - d2's 1,000 = 2,000
 
 
-def test_a_stale_reservation_is_swept_with_an_alert():
+def _ttl_gate():
     g = _gate_mod()
     clock = {"now": NOW}
-    gt = g.Gate(PP(), lambda: _raw(_replace(state(_crowded()), mark_ts=clock["now"])), lambda: clock["now"])  # fresh mark
-    assert gt.decide(intent("s4", "CCC/USDT", 1, 3_000)).approved_qty == D("30")  # takes ALL the headroom, never fills
-    assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "rejected"  # nothing left
+    book = {"held": list(_crowded())}
+    gt = g.Gate(PP(), lambda: _raw(_replace(state(book["held"]), mark_ts=clock["now"])), lambda: clock["now"])
+    return g, gt, clock, book
+
+
+@xf("a reservation past its TTL is NOT released blind: the sweep alerts and the headroom stays held until the cancel "
+    "is confirmed; a confirmed cancel frees it [R-FAIL, Advisor 7 Oct 20:25]")
+def test_a_stale_reservation_alerts_and_is_kept_until_the_cancel_is_confirmed():
+    g, gt, clock, _ = _ttl_gate()
+    d1 = gt.decide(intent("s4", "CCC/USDT", 1, 3_000))
+    assert d1.approved_qty == D("30")  # takes ALL the headroom, never fills
     clock["now"] = NOW + timedelta(seconds=g.RESERVATION_TTL_SECONDS + 1)
-    alerts = gt.sweep()
-    assert [a["kind"] for a in alerts] == ["reservation_expired"]
+    assert [a["kind"] for a in gt.sweep()] == ["reservation_expired"]
+    assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "rejected"  # still held: no confirm yet
+    clock["now"] += timedelta(seconds=g.RESERVATION_TTL_SECONDS + 1)
+    assert "reservation_expired" in [a["kind"] for a in gt.sweep()]  # still unconfirmed: alerts again, still kept
+    assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "rejected"
+    gt.release(d1, "cancelled")  # the venue confirms the cancel
     assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "approved"
+
+
+def test_a_swept_reservation_that_had_filled_converts_to_the_holding_once():
+    g, gt, clock, book = _ttl_gate()
+    d1 = gt.decide(intent("s4", "CCC/USDT", 1, 2_000))  # 1,000 of headroom left
+    clock["now"] = NOW + timedelta(seconds=g.RESERVATION_TTL_SECONDS + 1)
+    gt.sweep()
+    d2 = gt.decide(intent("s5", "EEE/USDT", 1, 2_000))
+    assert d2.approved_qty == D("10")  # the swept reservation still holds its 2,000: 1,000 left
+    gt.release(d2, "cancelled")
+    book["held"].append(pos("s4", "CCC/USDT", 1, 2_000))  # the fill reaches the book
+    gt.release(d1, "filled")  # the cancel answer: already filled
+    d3 = gt.decide(intent("s6", "FFF/USDT", 1, 2_000))
+    # counted once (holding) -> 1,000 left -> 10; counted twice -> rejected; dropped (gap) -> 20
+    assert (d3.outcome, d3.approved_qty, d3.limit_hit) == ("trimmed", D("10"), "gross")
 
 
 # ---- fail closed; exits never gated [R-FAIL] [SPEC] --------------------------------------------------------------

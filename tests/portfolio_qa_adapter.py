@@ -4,8 +4,10 @@ sleeve_fund.portfolio.gate.check_order on a ledger fed from QA's state snapshot,
 portfolio.holding_for, every halt and pause from mark_book / book_breach. QA's figures are floats; they become exact
 Decimals here, at the edge (Decimal(str(x)), DA's rule 1).
 
-What lives only here: QA's Gate object (paper's call sites hold the ledger and call check_order themselves), and its
-reduce-only path, which approves without asking because exits never go to the gate at all."""
+What lives only here: QA's Gate object (paper's call sites hold the ledger and call check_order themselves), its
+reduce-only path, which approves without asking because exits never go to the gate at all, and QA's resting order: an
+approved entry is an order sent and live until its release (cancel confirmed, rejected or filled), so the sweep cancels
+it and holds the reservation (Advisor 20:25 UK)."""
 
 from __future__ import annotations
 
@@ -150,6 +152,8 @@ class Gate:
         alerts = len(self.ledger.alerts)
         core = intent.core()
         c = _gate.check_order(self.ledger, intent.strategy_id, core, self.profile, self.clock())
+        if c.reservation is not None:  # QA's approved entry is an order sent and resting until it is released
+            self.ledger.attach_order(c.reservation, f"Q-{c.reservation}")
         d = c.decision
         new = self.ledger.alerts[alerts:]
         k = d.limit_hit if d.limit_hit in LIMITS else "gross"
@@ -171,7 +175,8 @@ class Gate:
 
     def sweep(self) -> list[dict]:
         alerts = len(self.ledger.alerts)
-        _gate.sweep(self.ledger, self.clock(), lambda order_id: False, lambda order_id: None)
+        resting = {r.order_id for r in self.ledger.reservations()}
+        _gate.sweep(self.ledger, self.clock(), resting.__contains__, lambda order_id: None)
         return [{"kind": k, "message": m} for k, m, _ in self.ledger.alerts[alerts:]]
 
 
