@@ -292,3 +292,208 @@ def test_risk_limits_table_fits_its_panel_on_a_desktop(site, browser):
                          " return [s.scrollWidth, s.clientWidth, s.querySelectorAll('thead th').length]; }")
     assert size[2] == 9 and size[0] <= size[1], size
     ctx.close()
+
+
+def _fixture_candles(n=40, day=86400, start=1_760_000_000 - 1_760_000_000 % 86400 - 40 * 86400):
+    """Daily candles and the strategy's own recorded indicators in the agreed shape (v2/chart-indicators-shape.md):
+    t is the bar's close, settled_from marks where warm-up ends."""
+    times = [start + i * day for i in range(n)]
+    candles = [{"time": t, "open": 100 + i, "high": 102 + i, "low": 99 + i, "close": 101 + i} for i, t in enumerate(times)]
+    ema = [[t + day, 100.5 + i] for i, t in enumerate(times)]
+    rsi = [[t + day, 40 + (i % 20)] for i, t in enumerate(times)]
+    return {"interval": 1440, "source": "venue", "candles": candles, "volume": [{"time": t, "value": 1.0} for t in times],
+            "markers": [], "notes": {}, "lines": [], "intervals": ["1d"], "chosen": "1d", "pair": "ETH/USD",
+            "home": "ETH/USD", "pairs": [],
+            "indicators": [
+                {"key": "ema", "label": "EMA(10)", "pane": "price", "kind": "line", "group": None,
+                 "settled_from": times[10] + day, "points": ema},
+                {"key": "rsi", "label": "RSI(14)", "pane": "lower", "kind": "line", "levels": [30, 70],
+                 "settled_from": times[14] + day, "points": rsi},
+                {"key": "div", "label": "RSI divergence", "pane": "price", "kind": "marker",
+                 "points": [[times[20] + day, "bull"]]}]}
+
+
+def test_the_strategys_recorded_indicators_are_drawn_with_warm_up_marked_and_nothing_recomputed(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    legend = page.inner_text(".pc-legend")
+    assert "EMA(10)" in legend
+    assert page.locator(".pc-sub").count() == 1 and "RSI(14)" in page.inner_text(".pc-sub-legend")
+    note = page.inner_text(".pc-strat-note")
+    assert "Shaded: the model's indicators were still warming up; any trade here is marked unsettled" in note
+    assert errors == []
+    ctx.close()
+
+
+def test_the_overlay_names_the_candle_size_it_was_recorded_on_and_groups_share_a_colour(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    for i in fixture["indicators"]:  # recorded on 4-hour candles, on a daily chart
+        if i["kind"] == "line":
+            i["points"] = [[p[0] - 86400 + 14400 * (k % 6), p[1]] for k, p in enumerate(i["points"])]
+    fixture["indicators"].append({"key": "bb.upper", "label": "Bollinger upper", "pane": "price", "kind": "line",
+                                  "group": "bb", "settled_from": None, "points": [[p[0], 130.0] for p in fixture["indicators"][0]["points"]]})
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert "minute candles, so it shows only on that interval" in page.inner_text(".pc-strat-note")
+    assert errors == []
+    ctx.close()
+
+
+def test_a_settings_change_rebuilds_the_overlay_labels_and_levels_and_warm_up_joins_the_line(site, browser):
+    """CR on #173: the same keys with a new label and guide levels (an RSI period or entry level changed) redraw
+    the legend and the strip; the dashed warm-up reaches the first settled point."""
+    import json
+
+    first = _fixture_candles()
+    second = json.loads(json.dumps(first))
+    for i in second["indicators"]:
+        if i["key"] == "rsi":
+            i["label"], i["levels"] = "RSI(7)", [25, 75]
+    served = [first]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(served[0])))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-sub-legend", timeout=5000)
+    assert "RSI(14)" in page.inner_text(".pc-sub-legend")
+    served[0] = second
+    page.click(".pc-intervals button")  # a live re-render with the new settings, no page reload
+    page.wait_for_function("document.querySelector('.pc-sub-legend').innerText.includes('RSI(7)')", timeout=5000)
+    assert "RSI(7)" in page.inner_text(".pc-sub-legend") and errors == []
+    ctx.close()
+
+
+def test_the_platforms_own_sentence_shows_when_it_has_no_indicators_to_draw(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    fixture["indicators"], fixture["indicators_note"] = [], "The strategy's indicators are drawn on its own 1h candles."
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend", timeout=5000)
+    assert "drawn on its own 1h candles" in page.inner_text(".pc-strat-note")
+    ctx.close()
+
+
+def test_recorded_lines_are_steps_with_a_toggle_and_unshown_ones_wait_until_asked_for(site, browser):
+    """Advisor rules via QD: values hold from close to close (never joined by straight segments), only the lines the
+    strategy's rules read are drawn at first, the others are offered, and each drawn line can be hidden again."""
+    import json
+
+    fixture = _fixture_candles()
+    fixture["indicators"].append({"key": "atr", "label": "ATR(14)", "pane": "lower", "kind": "line", "shown": False,
+                                  "settled_from": None, "points": [[p[0], 2.0] for p in fixture["indicators"][0]["points"]]})
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-strat-more button", timeout=5000)
+    assert page.locator(".pc-sub").count() == 1 and "ATR(14)" not in page.inner_text(".pc-sub-legend")
+    assert "Also recorded, not drawn" in page.inner_text(".pc-strat-more")
+    page.click(".pc-strat-more button")
+    page.wait_for_function("document.querySelectorAll('.pc-sub').length === 2", timeout=5000)
+    legend = page.locator(".pc-legend span", has_text="EMA(10)")
+    legend.click()
+    assert page.locator(".pc-legend span", has_text="EMA(10)").evaluate("e => e.style.opacity") == "0.4"
+    assert errors == []
+    ctx.close()
+
+
+def test_recorded_decisions_are_drawn_once_each_on_closed_candles_and_never_ahead(site, browser):
+    import json
+    import time
+
+    fixture = _fixture_candles()
+    day = 86400
+    t = [c["time"] for c in fixture["candles"]]
+    future = (int(time.time()) // day + 5) * day
+    fixture["decisions"] = [
+        {"kind": "fill", "side": "buy", "t": t[12] + 3600, "signal_t": t[11] + day, "price": 112.0, "reason": "ema cross", "code": ""},
+        {"kind": "missed", "side": "buy", "t": t[20] + day, "signal_t": t[20] + day, "price": None, "reason": "Halted: daily loss pause", "code": "blocked"},
+        {"kind": "missed", "side": "sell", "t": t[25] + day, "signal_t": t[25] + day, "price": None, "reason": "Stale data: no candle for 3 minutes", "code": "stale_data"},
+        {"kind": "missed", "side": "buy", "t": future, "signal_t": future, "price": None, "reason": "ahead of its candle", "code": "blocked"},
+        {"kind": "missed", "side": "buy", "t": 5, "signal_t": 5, "price": None, "reason": "no such candle", "code": "blocked"},
+    ]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    drawn = json.loads(page.get_attribute(".pc-canvas", "data-decisions"))
+    assert drawn == {"fills": 1, "missed": 2}
+    assert errors == []
+    ctx.close()
+
+
+def test_the_warm_up_shading_follows_the_models_own_lines_not_ones_the_pm_adds(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    t = [c["time"] for c in fixture["candles"]]
+    fixture["indicators"][0]["shown"] = True
+    fixture["indicators"][1]["shown"] = False
+    fixture["indicators"][1]["settled_from"] = t[30] + 86400  # a slow line the PM has not turned on
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert page.get_attribute(".pc-canvas", "data-warm") == "10"
+    ctx.close()
+
+
+def test_decisions_that_do_not_line_up_with_this_candle_size_say_so(site, browser):
+    import json
+
+    fixture = _fixture_candles()
+    fixture["decisions"] = [{"kind": "missed", "side": "buy", "t": 0, "signal_t": fixture["candles"][5]["time"] + 14400,
+                             "price": None, "reason": "Halted", "code": "blocked"}]
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD})
+    ctx.route("**/api/sleeves/eth-trend/candles*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(fixture)))
+    page = ctx.new_page()
+    page.goto(site + "/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(".pc-legend span", timeout=5000)
+    assert "show only on that interval" in page.inner_text(".pc-strat-note")
+    assert page.get_attribute(".pc-canvas", "data-decisions") == '{"fills":0,"missed":0}'
+    ctx.close()
