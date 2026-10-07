@@ -698,7 +698,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                 st().decide(actor, command, reason, name)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
-                  and why.code != "halted"):
+                  and why.code not in ("halted", "drawdown_halt")):
                 raise ValueError(f"a resume can't clear it: {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
