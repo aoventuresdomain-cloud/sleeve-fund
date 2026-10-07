@@ -555,6 +555,7 @@ class LongFlatStrategy(Strategy):
         self._liquidated: str | None = None
         self._snap_ns: int | None = None
         self._settled = None  # backtest: the venue's settled rates, loaded once
+        self._settled_idx = None  # backtest: their snapped settlement times (markets.snapped), once
         self._funding_fallback_said = False  # backtest: the baseline for a missing settled rate is said once
         # Paper: the settlement whose rate the venue hadn't published by its check, watched until it arrives, and
         # when it was last asked for (funding_stale / funding_stale_cleared, per instrument, once per episode).
@@ -3244,6 +3245,8 @@ class LongFlatStrategy(Strategy):
             if self._backtest:
                 if self._settled is None:
                     self._settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
+                    # fixed for the run, so snapped once, not every hour (QA P1-O17a-17)
+                    self._settled_idx = markets.snapped(self._settled) if self._settled is not None and len(self._settled) else None
                 settled = self._settled
             else:
                 settled = funding.rates(terms.funding_venue, pair_of(self.instrument))
@@ -3253,7 +3256,8 @@ class LongFlatStrategy(Strategy):
 
             interval = getattr(venue(terms.funding_venue), "funding_interval", None)
             published = interval(pair_of(self.instrument)) if callable(interval) else None
-        return markets.settlement_times(since, now, terms.funding_hours, settled, published), settled
+        idx = getattr(self, "_settled_idx", None) if self._backtest else None
+        return markets.settlement_times(since, now, terms.funding_hours, settled, published, idx), settled
 
     # Paper rescans this far back, so a settlement the venue publishes late, at a time the schedule didn't
     # foresee (a change of interval), is still charged when its record arrives.

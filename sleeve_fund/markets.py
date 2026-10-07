@@ -138,7 +138,7 @@ def baseline_rate(terms: PerpTerms) -> float:
 
 
 def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], settled=None,
-                     published: timedelta | None = None) -> list[datetime]:
+                     published: timedelta | None = None, snapped_idx=None) -> list[datetime]:
     """The funding settlements in (after, until], oldest first, to the minute. With the venue's settled rates
     (`settled`, indexed by settlement time), its own times: a symbol moved from 8-hourly to 4- or 1-hourly
     settlements pays every one (QA P1-O1). A gap between two records wider than the interval before it is missing
@@ -147,10 +147,12 @@ def settlement_times(after: datetime, until: datetime, hours: tuple[int, ...], s
     record, the venue's published interval (or its latest step, counting provisionally missing settlements, no wider
     than the profile's) carries on from it
     (paper, before the venue publishes the next rate); before the first record, and with no records, the venue
-    profile's fixed `hours`."""
+    profile's fixed `hours`. `snapped_idx` is `snapped(settled)` computed once by a caller whose records are fixed
+    (a backtest calls this every hour: re-snapping thousands of records each time made it many times slower, QA
+    P1-O17a-17)."""
     if settled is None or len(settled) == 0:
         return funding_times(after, until, hours)
-    idx = snapped(settled)
+    idx = snapped(settled) if snapped_idx is None else snapped_idx
     first, last = idx[0].to_pydatetime(), idx[-1].to_pydatetime()
     out = funding_times(after, min(until, first - timedelta(seconds=1)), hours) if after < first else []
     out += [t.to_pydatetime() for t in idx[(idx > after) & (idx <= until)]]

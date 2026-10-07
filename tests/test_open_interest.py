@@ -459,6 +459,8 @@ def _one_hole(tmp_path, monkeypatch):
     profile = venue("BINANCE")
     monkeypatch.setattr(profile, "funding_loader", lambda pair, start: [(t, 0.0001) for t in kept if t >= start])
     monkeypatch.setattr(profile, "stats_loaders", {})
+    monkeypatch.setattr("sleeve_fund.funding.stale", lambda *a, **k: None)  # fixed stamps, real clock: holes only
+    monkeypatch.setattr("sleeve_fund.history._stale", set())
     return profile, funding._path("BINANCE", "BTC/USDT", tmp_path).with_name("funding.alerted.json")
 
 
