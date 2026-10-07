@@ -3751,7 +3751,11 @@ class LongFlatStrategy(Strategy):
         now = self.clock.timestamp_ns()
         if mine.order_type == OrderType.STOP_MARKET and intent in STOP_INTENTS:
             return {"kind": "stop", "side": side, "trigger": mine.trigger_price.as_double(), "rested": mine.ts_init < now,
-                    "liq": intent in ("liquidation_cut", "liquidation")}
+                    "liq": intent in ("liquidation_cut", "liquidation"),
+                    "liq_px": self.decisions[coid].get("liq") if intent != "liquidation" else None,
+                    "liquidation": intent == "liquidation"}
+        if intent == "liquidation":  # the market close at the liquidation price (_check_liquidation)
+            return {"kind": "liquidation", "side": side}
         return None
 
     def _levels_in_bar(self, bar: Bar) -> None:

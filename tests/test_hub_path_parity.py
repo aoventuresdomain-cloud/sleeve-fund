@@ -205,7 +205,9 @@ def _final_qty(fills):
     return sum(f["qty"] * (1 if f["side"] == "BUY" else -1) for f in fills)
 
 
-TOL = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+# Stops: Advisor D13-STOP-PARITY (7 Oct 00:20), one-sided: the backtest is never better than paper and is worse by
+# at most the 0.05 % floor plus 7 bp.
+TOL = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-12.0, 0.3), "take_profit": (-6.0, 1.0)}
 
 
 def _assert_same(hub, ref, minute_slack=0):
