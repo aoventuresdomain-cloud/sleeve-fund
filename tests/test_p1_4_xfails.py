@@ -355,10 +355,24 @@ def test_a_venue_with_an_08_00_anchor_closes_its_daily_candles_at_08_00(monkeypa
 
 # ---- warm-up short at start (Advisor 19:48) ----------------------------------------------------------------------
 
+# Set-up only (HoQA, 7 Oct, CR on the trial merge with main a83de76): since #182 a perp restored without a stop runs
+# "for its exits only" (an incident, and entries held as entry_held_safety_stop), which would hold the entries these
+# cells test for a reason other than the warm-up. So the restart's model carries a stop that never triggers on these
+# prices. The longest price path used below (cell "...lifts once the slower candles have closed live") moves at most
+# 4.09% down from any earlier point (1.0148 at 00:24 to 0.9733 at 00:53) and at most 5.00% up from any earlier point
+# (0.9733 at 00:53 to 1.0220 at 01:13); the other cells' paths are prefixes of it or move less (cell 11's own 2% stop
+# is kept: it is the stop under test). The half spread is 0.5 on ~60,000 (under 0.001%). A stop 6% away therefore can't
+# be reached by a long or a short entered at any minute of any of these paths. It must also stay inside gate 5's open
+# risk cap (5% of the book): the entry here is ~6,600 notional, so 6% is ~396 of open risk against a cap of ~500
+# (8% was refused at 00:55 as entry_refused_open_risk, 528 > 500).
+FAR_STOP = 0.06
+
+
 def _restart_holding_a_long(tmp_path, monkeypatch, legs, params):
     """A paper restart (recorded session, replayed through the paper runtime) of rsi_cross on 1-minute candles
     with a 15-minute trend filter, holding a long of 0.05 entered at 60,000, whose slower-candle warm-up the
-    history store can't meet (it loads nothing). Returns the orders sent and the journal's events."""
+    history store can't meet (it loads nothing). Returns the orders sent and the journal's events. The model has a
+    stop (FAR_STOP unless the cell sets its own) so the restore is not stopless (see FAR_STOP)."""
     from sleeve_fund.research.replay import replay
     from sleeve_fund.store import replay_book
     from sleeve_fund.strategies.base import LongFlatStrategy
@@ -387,7 +401,8 @@ def _restart_holding_a_long(tmp_path, monkeypatch, legs, params):
     meta = {"balances": [f"{book['cash'] + book['qty'] * book['entry_px']:.2f} USD"],
             "sleeve": {"name": "mtf-restart", "strategy": "rsi_cross", "instrument": "BTC/USD",
                        "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": "balanced",
-                       "params": {**PERP, "trend_sma": 3, "trend_minutes": 15, **params}, "maker_fee": "0.0002",
+                       "params": {**PERP, "trend_sma": 3, "trend_minutes": 15, "stop_loss": FAR_STOP, **params},
+                       "maker_fee": "0.0002",
                        "taker_fee": "0.0005", "tick_seconds": 30}}
     path = tmp_path / "restart.jsonl.gz"
     _record(path, meta, legs)
