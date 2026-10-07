@@ -95,3 +95,4 @@ def test_a_journal_figure_compares_with_none_like_any_value():
     from sleeve_fund.money import Money
 
     assert (Money("1") == None) is False and (Money("1") != None) is True  # noqa: E711 - the comparison under test
+    assert Money("1") not in [None] and Money("1") in [None, Money("1")]
