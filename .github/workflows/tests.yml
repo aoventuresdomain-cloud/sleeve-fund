@@ -4,16 +4,16 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  # The suite runs as 4 shards in parallel, each with its own Postgres. Every shard collects the same sorted list of
-  # test ids and runs every 4th one, so each test runs exactly once across the shards. The browser tests all go to
-  # shard 0, the only one that installs the browser.
+  # The suite runs as parallel shards, each with its own Postgres. The browser tests run on their own shard, the only
+  # one that installs the browser; pytest-split shares the rest into 4 groups of about equal run time, using the
+  # durations stored in .test_durations (a test missing from it counts as the average). Every test runs exactly once.
   shard:
-    name: pytest shard ${{ matrix.shard }}/4
+    name: pytest shard ${{ matrix.group }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        group: ["1", "2", "3", "4", browser]
     services:
       postgres:
         image: postgres:16
@@ -25,24 +25,23 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 20
     env:
       TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/sleeve_test
+      # A test still running after 5 minutes fails the shard at once, naming the test and dumping every thread's stack,
+      # instead of hanging the job. The durations list feeds .test_durations.
+      PYTEST_ARGS: --timeout=300 --timeout-method=thread --durations=0 --durations-min=1.0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
-      - if: matrix.shard == 0
-        run: python -m playwright install --with-deps chromium  # tests/test_browser.py
-      - name: Pick this shard's tests
-        shell: bash
-        run: |
-          pytest --collect-only -q | grep '::' | LC_ALL=C sort > all-tests.txt
-          {
-            if [ "${{ matrix.shard }}" = 0 ]; then grep '^tests/test_browser\.py::' all-tests.txt || true; fi
-            grep -v '^tests/test_browser\.py::' all-tests.txt | awk -v k=${{ matrix.shard }} 'NR % 4 == k'
-          } > shard-tests.txt
-          echo "shard ${{ matrix.shard }}/4 runs $(wc -l < shard-tests.txt) of $(wc -l < all-tests.txt) tests"
-      - run: pytest -q @shard-tests.txt  # one test id per line (pytest >= 8.2)
+      - if: matrix.group == 'browser'
+        run: python -m playwright install --with-deps chromium
+      - if: matrix.group == 'browser'
+        run: pytest -q $PYTEST_ARGS tests/test_browser.py
+      - if: matrix.group != 'browser'
+        run: >-
+          pytest -q $PYTEST_ARGS --ignore=tests/test_browser.py
+          --splits 4 --group ${{ matrix.group }} --splitting-algorithm least_duration
   # The check the merge flow reads: green only when every shard is.
   pytest:
     needs: shard
