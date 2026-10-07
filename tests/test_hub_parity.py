@@ -53,7 +53,7 @@ def test_missing_minutes_price_and_volume_differences_and_refills_are_reported(t
     store = HistoryStore(tmp_path)
     store.append_bars(V, P, _rows(ours.iloc[:3]), "live")
     store.append_bars(V, P, _rows(ours.iloc[3:]), "live")
-    store.append_bars(V, P, _rows(venue.iloc[[0]] * 1.01), "refill")  # disagrees with a stored bar
+    store.append_bars(V, P, _rows(venue.iloc[[0]] * 1.01), "live")  # disagrees with a stored bar: kept (P1-1-CANON)
     (p,) = run(store, _profile(venue), [P], START, START + pd.Timedelta("10min"), late={P: (3, 1000)})
     assert not p.ok
     assert p.venue_only == list(venue.index[[3, 4]]) and p.store_only == []
