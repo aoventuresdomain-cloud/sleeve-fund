@@ -352,17 +352,15 @@ def _ttl_gate():
     return g, gt, clock, book
 
 
-@xf("a reservation past its TTL is NOT released blind: the sweep alerts and the headroom stays held until the cancel "
-    "is confirmed; a confirmed cancel frees it [R-FAIL, Advisor 7 Oct 20:25]")
 def test_a_stale_reservation_alerts_and_is_kept_until_the_cancel_is_confirmed():
     g, gt, clock, _ = _ttl_gate()
     d1 = gt.decide(intent("s4", "CCC/USDT", 1, 3_000))
     assert d1.approved_qty == D("30")  # takes ALL the headroom, never fills
     clock["now"] = NOW + timedelta(seconds=g.RESERVATION_TTL_SECONDS + 1)
-    assert [a["kind"] for a in gt.sweep()] == ["reservation_expired"]
+    assert [a["kind"] for a in gt.sweep()] == ["reservation_order_cancelled"]  # cancel sent, reservation kept
     assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "rejected"  # still held: no confirm yet
     clock["now"] += timedelta(seconds=g.RESERVATION_TTL_SECONDS + 1)
-    assert "reservation_expired" in [a["kind"] for a in gt.sweep()]  # still unconfirmed: alerts again, still kept
+    assert "reservation_cancel_unconfirmed" in [a["kind"] for a in gt.sweep()]  # re-sent, alerts again, still kept
     assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "rejected"
     gt.release(d1, "cancelled")  # the venue confirms the cancel
     assert gt.decide(intent("s5", "EEE/USDT", 1, 1_000)).outcome == "approved"
