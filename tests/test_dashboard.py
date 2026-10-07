@@ -2774,3 +2774,25 @@ def test_a_stopped_liquidated_strategy_still_offers_reset_after_liquidation_with
     assert 'data-open="dlg-ral"' in page and 'data-open="dlg-start"' in page
     dialog = page.split('id="dlg-ral"')[1].split("</dialog>")[0]
     assert "3,328.70" in dialog and "112.4% of its equity when the position was opened" in dialog
+
+
+def test_a_reset_after_liquidation_on_a_stopped_strategy_is_applied_and_ends_the_offer(client):
+    """CR on #194 with #193's stopped-strategy fix: from the page, a stopped liquidated strategy takes the reset at once;
+    the reset offer then goes and Start is open."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    iid = next(e["id"] for e in store.events("btc-test", min_level="error") if e["kind"] == "incident")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", "stopped", "stopped by PM")
+    c.post("/sleeves/btc-test/incident-note", data={"incident": str(iid), "author": "PM",
+                                                    "why_stop_did_not_protect": "gap past the stop"},
+           auth=AUTH, headers=SAME, follow_redirects=False)
+    r = c.post("/sleeves/btc-test/command", data={"command": "reset_after_liquidation", "incident": str(iid),
+                                                  "reason": "Incident note written"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert "command_error" not in r.headers["location"]
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'id="dlg-ral"' not in page and 'data-open="dlg-start"' in page
