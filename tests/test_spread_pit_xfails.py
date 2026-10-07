@@ -369,7 +369,9 @@ def _replayed_stop(run, h, side: int, stop: float = 0.01):
     """(booked price, the stop level from the journaled entry) of the replayed stop."""
     entry = h.fill_px(run, "entry")
     ex = h.first_exit(run.sequence())
-    (o,) = [o for o in run.orders if o["intent"] == ex[0]]
+    # the filled order only: since #182 a watched stop is also journaled as its own order ("STOP (watched)",
+    # status "triggered") beside the replayed MARKET fill (PE1, set-up)
+    (o,) = [o for o in run.orders if o["intent"] == ex[0] and o.get("status") == "filled"]
     return ex, o, entry * (1 - side * stop)
 
 
