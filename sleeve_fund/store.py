@@ -14,7 +14,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     JSON,
@@ -132,7 +132,7 @@ insurance_t = Table(
     Index("insurance_sleeve_ts", "sleeve", "ts"),
 )
 
-# The Deribit testnet demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
+# The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
 # failed to copy, and a "start" row marking the fill it started after. The paper journal stays the record.
 mirror_t = Table(
     "demo_mirror",
@@ -215,6 +215,24 @@ orders_t = Table(
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
     Index("orders_sleeve_ts", "sleeve", "ts"),
+)
+# When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
+# and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
+# the venue's own stamp on the last fill, which the clock check compares against. Backtests keep none.
+order_timings_t = Table(
+    "order_timings",
+    metadata,
+    Column("order_id", String(64), ForeignKey("orders.order_id"), primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("bar_close", TS),  # the decision bar's close; none when a tick or the risk guard decided
+    Column("bar_recv", TS),  # when the node had that bar
+    Column("decided", TS),
+    Column("sent", TS),  # none for an order held by the strategy until it can fill (a paper post-only)
+    Column("accepted", TS),
+    Column("first_fill", TS),
+    Column("last_fill", TS),
+    Column("venue_ts", TS),
+    Index("order_timings_sleeve_decided", "sleeve", "decided"),
 )
 # The stop and target an open position works to after the PM edited them, or after a restart set them
 # again from the market, as shares of its entry price (the entry order's signal holds the plan it was
@@ -463,10 +481,26 @@ ERROR_KINDS = ("handler_failed", "tick_failed")
 LIQUIDATION_RESET = "liquidation_reset"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
-ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired")
+# "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
+ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
+                  "triggered")
+FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
+
+
+def _check_rebook(order_id: str, row) -> None:
+    """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
+    if row is None:
+        raise ValueError(f"no order {order_id!r} to re-book")
+    if row["intent"] != "stop_loss" or not row["filled_qty"]:
+        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled stop-loss can "
+                         f"(it is {row['intent']}, {row['filled_qty']:g} filled)")
+
+
+def _rebook_words(order_id: str, reason: str) -> str:
+    return f"Order {order_id} re-booked from stop_loss to liquidation: {reason}"
 
 
 def exact_sum(a: float, b: float) -> float:
@@ -476,6 +510,16 @@ def exact_sum(a: float, b: float) -> float:
 
 
 DUST = Decimal("1e-10")  # a position closer to flat than this is flat: the smallest lot is 1e-8
+
+
+# A position worth less than this (in the quote currency) is below every venue's smallest order, so no flatten can
+# close it: a reset treats it as flat (QA P1-D6). Venues' minimums are a few units (5 on the perpetuals).
+DUST_NOTIONAL = 1.0
+
+
+def is_dust(book: dict) -> bool:
+    """A journal book (replay_book) holding a position too small for any venue to take an order for."""
+    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0.0) < DUST_NOTIONAL
 
 
 def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
@@ -488,8 +532,9 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     fill that crosses through flat opens the remainder at its own price. The position is summed in
     Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
-    goes negative; if it does, the negative stays visible so reconciliation catches it."""
-    cash, qty, entry, n = float(starting_balance), Decimal(0), None, 0
+    goes negative; if it does, the negative stays visible so reconciliation catches it. entry_fees: the fees paid
+    to open the position still held, pro-rated to what is left of it after a reduction."""
+    cash, qty, entry, n, fees = float(starting_balance), Decimal(0), None, 0, 0.0
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
@@ -506,14 +551,18 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
             new = Decimal(0)
         if new == 0:
             legs = 0
-            entry = None
+            entry, fees = None, 0.0
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
             entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
+            fees += float(f["fee"])
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
+            fees = float(f["fee"]) * float(abs(new)) / float(q)
+        else:  # reducing
+            fees *= float(abs(new)) / float(abs(qty))
         qty = new
     return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding), "insurance": float(insurance)}
+            "funding": float(funding), "insurance": float(insurance), "entry_fees": fees}
 
 
 def is_backtest(name: str | None) -> bool:
@@ -527,6 +576,14 @@ def _not_backtest(col):
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _from_ns(ns: int) -> datetime:
+    """UNIX nanoseconds -> an aware UTC datetime to the microsecond (utcnow() drops them)."""
+    return _EPOCH + timedelta(microseconds=ns // 1000)
 
 
 def _aware(ts: datetime | None) -> datetime | None:
@@ -748,7 +805,10 @@ class Store:
                                              fee=fee, order_id=order_id, trade_id=trade_id))
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:
+        """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
+        order_timings row in the same transaction, so that row never exists without its order (DA-8)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -757,14 +817,45 @@ class Store:
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
                                               message=""))
+            if timing:
+                c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
+                    k: _from_ns(v) for k, v in timing.items() if v is not None}))
+
+    def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
+        """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
+        acceptance, each fill) on the row record_order wrote with the decision; ignored for an order with no row
+        (a risk stop, a restore: nothing decided them on a bar). A call with `decided` for an order with no row
+        adds it. fill: our clock at a fill; the first is kept as first_fill, every one moves last_fill."""
+        values = {k: _from_ns(v) for k, v in stamps.items() if v is not None}
+        if fill is not None:
+            values["last_fill"] = _from_ns(fill)
+        with self.engine.begin() as c:
+            row = c.execute(select(order_timings_t.c.first_fill).where(order_timings_t.c.order_id == order_id)).first()
+            if row is None:
+                if "decided" in values:
+                    c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **values))
+            elif values:
+                if fill is not None and row.first_fill is None:
+                    values["first_fill"] = values["last_fill"]
+                c.execute(update(order_timings_t).where(order_timings_t.c.order_id == order_id).values(**values))
+
+    def timings(self, sleeve: str, limit: int = 500) -> list[dict]:
+        """The strategy's latest order timings, newest decision first."""
+        q = (select(order_timings_t).where(order_timings_t.c.sleeve == sleeve)
+             .order_by(order_timings_t.c.decided.desc()).limit(limit))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         """Move an order on (accepted, cancelled, rejected...) or add a fill to it. Unknown ids are ignored:
-        orders sent before this journal existed have no row."""
+        orders sent before this journal existed have no row. intent: what the order turned out to carry out (a
+        backtest's resting stop booked as the target, when its bar opened through the target)."""
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         with self.engine.begin() as c:
             row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
             if row is None:
@@ -778,17 +869,41 @@ class Store:
                 values["filled_qty"] = filled
                 values["fee"] = row.fee + fee
                 values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
-            if status is not None and row.status not in ("filled", "canceled", "rejected", "denied", "expired"):
+            if status is not None and row.status not in FINISHED_ORDER_STATUSES:
                 values["status"] = status  # a late "accepted" never reopens a finished order
             if message:
                 values["message"] = message
+            if intent is not None:
+                values["intent"] = intent
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
+        liquidation it was. The only intent change the journal allows (Data Architect): stop_loss to liquidation, on
+        an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
+            _check_rebook(order_id, row and row._mapping)
+            c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                      .values(intent="liquidation", reason=reason, signal=signal, updated_at=utcnow()))
+        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+    def merge_order_signal(self, order_id: str, values: dict) -> None:
+        """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
+        are ignored, as in update_order."""
+        with self.engine.begin() as c:
+            row = c.execute(select(orders_t.c.signal).where(orders_t.c.order_id == order_id).with_for_update()).first()
+            if row is not None:
+                c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
+                          .values(signal={**(row.signal or {}), **values}, updated_at=utcnow()))
+
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         q = select(orders_t)
         q = q.where(orders_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(orders_t.c.sleeve))
         if statuses:
             q = q.where(orders_t.c.status.in_(statuses))
+        if intents:
+            q = q.where(orders_t.c.intent.in_(intents))
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(orders_t.c.ts.desc(), orders_t.c.id.desc()).limit(limit)))
 
@@ -1134,10 +1249,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def funding_total(self, sleeve: str) -> float:
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
+        q = select(func.coalesce(func.sum(funding_t.c.amount), 0.0)).where(funding_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(funding_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(funding_t.c.amount), 0.0))
-                                   .where(funding_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
@@ -1148,10 +1266,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def insurance_total(self, sleeve: str) -> float:
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
+        q = select(func.coalesce(func.sum(insurance_t.c.amount), 0.0)).where(insurance_t.c.sleeve == sleeve)
+        if before is not None:
+            q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(select(func.coalesce(func.sum(insurance_t.c.amount), 0.0))
-                                   .where(insurance_t.c.sleeve == sleeve)).scalar() or 0.0)
+            return float(c.execute(q).scalar() or 0.0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -1212,22 +1333,35 @@ class Store:
             return _rows(c.execute(select(resets_t).where(resets_t.c.done_at.is_(None)).order_by(resets_t.c.id)))
 
     def reset_runs(self) -> dict[str, datetime]:
-        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's."""
+        """Runs put away by a reset: {run name: when}. They are an earlier book's, like previous_book's. A refused
+        reset (refuse_reset) put nothing away."""
         with self.engine.connect() as c:
-            return {r.run: _aware(r.done_at) for r in c.execute(select(resets_t).where(resets_t.c.done_at.is_not(None)))}
+            return {r.run: _aware(r.done_at) for r in c.execute(
+                select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
 
-    def split_run(self, request: dict, now: datetime | None = None) -> str:
+    def refuse_reset(self, request: dict, why: str) -> None:
+        """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
+        with self.engine.begin() as c:
+            closed = c.execute(update(resets_t).where(resets_t.c.id == request["id"], resets_t.c.done_at.is_(None))
+                               .values(done_at=utcnow(), run="")).rowcount
+        if closed:  # journaled once, whoever asks twice
+            self.decide("system", "reset_refused", f"Not reset: {why}", request["sleeve"])
+            self.event(request["sleeve"], "warning", "reset_refused", f"Reset not carried out: {why}")
+
+    def split_run(self, request: dict, now: datetime | None = None, dust_ok: bool = False) -> str:
         """Put a stopped, flat strategy's run so far away under a name of its own and start it afresh: its
         journal (fills, marks, orders, events, decisions, mirror record) moves to the run, archived, and the
         strategy keeps its name and settings with an empty journal, so it replays to its starting capital.
-        Nothing is deleted. Returns the run's name."""
+        Nothing is deleted. Returns the run's name. dust_ok: a position too small for any order (is_dust) goes with
+        the run."""
         name, now = request["sleeve"], now or utcnow()
         s = self.sleeve(name)
-        if abs(self.journal_book(name, s.starting_balance)["qty"]) > 1e-12:
+        book = self.journal_book(name, s.starting_balance)
+        if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
         moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
-                 insurance_t, orders_t, mirror_requests_t)
+                 insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
@@ -1240,6 +1374,8 @@ class Store:
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
@@ -1317,10 +1453,13 @@ class Store:
         with self.engine.connect() as c:
             return int(c.execute(select(func.max(events_t.c.id))).scalar() or 0)
 
-    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
-        """One sleeve's events of these kinds newer than an id, oldest first."""
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0,
+                            since: datetime | None = None) -> list[dict]:
+        """One sleeve's events of these kinds newer than an id (and at or after `since`), oldest first."""
         q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds), events_t.c.id > after_id)
              .order_by(events_t.c.id))
+        if since is not None:
+            q = q.where(events_t.c.ts >= since)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
@@ -1348,9 +1487,12 @@ class Store:
         with self.engine.connect() as c:
             return {r["entry_order"]: r for r in _rows(c.execute(q))}
 
-    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
-        q = (select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
-             .order_by(events_t.c.id.desc()).limit(1))
+    def last_event(self, sleeve: str, kinds: tuple[str, ...], before: datetime | None = None) -> dict | None:
+        """The newest event of these kinds, or the newest at or before `before`."""
+        q = select(events_t).where(events_t.c.sleeve == sleeve, events_t.c.kind.in_(kinds))
+        if before is not None:
+            q = q.where(events_t.c.ts <= before)
+        q = q.order_by(events_t.c.id.desc()).limit(1)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
@@ -1663,9 +1805,10 @@ class Store:
         with self.engine.begin() as c:
             c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
 
-    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None) -> None:
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
+               ts: datetime | None = None) -> None:
         with self.engine.begin() as c:
-            c.execute(insert(decisions_t).values(ts=utcnow(), actor=actor, action=action, sleeve=sleeve,
+            c.execute(insert(decisions_t).values(ts=ts or utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
 
     def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,

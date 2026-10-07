@@ -11,9 +11,10 @@ from __future__ import annotations
 import itertools
 from datetime import datetime
 
-from sleeve_fund.store import INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve, exact_sum, utcnow
+from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
+                                _check_rebook, _rebook_words, exact_sum, utcnow)
 
-_FINISHED = ("filled", "canceled", "rejected", "denied", "expired")
+_FINISHED = FINISHED_ORDER_STATUSES
 KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
 
 
@@ -28,6 +29,7 @@ class MemoryJournal:
         self.insurance_: list[dict] = []
         self.orders_: dict[str, dict] = {}
         self.events_: list[dict] = []
+        self.decisions_: list[dict] = []
         self.exit_plans_: dict[str, list[dict]] = {}
         self._ids = itertools.count(1)
         self._peak: float | None = None
@@ -104,7 +106,8 @@ class MemoryJournal:
                             "price": price, "fee": fee, "order_id": order_id, "trade_id": trade_id})
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
-                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None) -> None:
+                     signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
+                     timing: dict | None = None) -> None:  # timing: a backtest keeps none (record_timing)
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -113,14 +116,30 @@ class MemoryJournal:
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
 
+    def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
+        row = self.orders_.get(order_id)
+        _check_rebook(order_id, row)
+        row.update(intent="liquidation", reason=reason, signal=signal)
+        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+
+    def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
+        rows = [o for o in self.orders_.values() if o["intent"] in intents]
+        return max(rows, key=lambda o: (o["ts"], o["id"])) if rows else None
+    def record_timing(self, sleeve: str, order_id: str, **stamps) -> None:
+        """A backtest keeps no order timings: its stamps are its replay clock."""
+
     def update_order(self, order_id: str, *, status: str | None = None, message: str | None = None,
                      fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                     qty: float | None = None) -> None:
+                     qty: float | None = None, intent: str | None = None) -> None:
         if status is not None and status not in ORDER_STATUSES:
             raise ValueError(f"bad order status {status!r}")
+        if intent is not None and intent not in INTENTS:
+            raise ValueError(f"bad intent {intent!r}")
         row = self.orders_.get(order_id)
         if row is None:
             return
+        if intent is not None:
+            row["intent"] = intent
         if qty is not None:
             row["qty"] = qty
         if fill_qty:
@@ -142,17 +161,24 @@ class MemoryJournal:
         self.events_.append({"id": next(self._ids), "sleeve": sleeve, "ts": ts or utcnow(), "level": level,
                              "kind": kind, "message": message})
 
+    def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None, ts=None) -> None:
+        self.decisions_.append({"ts": ts or utcnow(), "actor": actor, "action": action, "sleeve": sleeve,
+                                "reason": reason.strip()})
+
     # --- reads, newest first like Store -------------------------------------------------
 
     def events(self, sleeve: str | None = None, limit: int = 100, min_level: str = "info") -> list[dict]:
         levels = LEVELS[LEVELS.index(min_level):]
         return [e for e in reversed(self.events_) if e["level"] in levels][:limit]
 
-    def last_event(self, sleeve: str, kinds: tuple[str, ...]) -> dict | None:
-        return next((e for e in reversed(self.events_) if e["kind"] in kinds), None)
+    def last_event(self, sleeve: str, kinds: tuple[str, ...], before: datetime | None = None) -> dict | None:
+        return next((e for e in reversed(self.events_)
+                     if e["kind"] in kinds and (before is None or e["ts"] <= before)), None)
 
-    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0) -> list[dict]:
-        return [e for e in self.events_ if e["kind"] in kinds and e["id"] > after_id]
+    def sleeve_events_since(self, sleeve: str, kinds: tuple[str, ...], after_id: int = 0,
+                            since: datetime | None = None) -> list[dict]:
+        return [e for e in self.events_
+                if e["kind"] in kinds and e["id"] > after_id and (since is None or e["ts"] >= since)]
 
     # Exit plans set after entry (see Store.set_exit_plan). A backtest starts flat and its settings don't
     # change mid-run, so it rarely has any; they are kept for the same calls.
@@ -165,9 +191,11 @@ class MemoryJournal:
     def exit_plans(self, sleeve: str) -> dict[str, dict]:
         return {k: v[-1] for k, v in self.exit_plans_.items() if v}
 
-    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500) -> list[dict]:
+    def orders(self, sleeve: str | None = None, statuses: tuple[str, ...] | None = None, limit: int = 500,
+               intents: tuple[str, ...] | None = None) -> list[dict]:
         rows = sorted(self.orders_.values(), key=lambda o: (o["ts"], o["id"]), reverse=True)
-        return [o for o in rows if not statuses or o["status"] in statuses][:limit]
+        return [o for o in rows if (not statuses or o["status"] in statuses)
+                and (not intents or o["intent"] in intents)][:limit]
 
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         return list(reversed(self.fills_))[:limit]
@@ -202,22 +230,23 @@ class MemoryJournal:
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
                        ts: datetime | None = None) -> None:
-        self.funding_.append({"sleeve": sleeve, "ts": ts, "qty": qty, "price": price, "rate": rate, "amount": amount})
+        self.funding_.append({"sleeve": sleeve, "ts": ts or utcnow(), "qty": qty, "price": price, "rate": rate,
+                              "amount": amount})
 
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.funding_))[:limit]
 
-    def funding_total(self, sleeve: str) -> float:
-        return float(sum(f["amount"] for f in self.funding_))
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+        return float(sum(f["amount"] for f in self.funding_ if before is None or f["ts"] < before))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
-        self.insurance_.append({"sleeve": sleeve, "ts": ts, "price": price, "amount": amount})
+        self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount})
 
     def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.insurance_))[:limit]
 
-    def insurance_total(self, sleeve: str) -> float:
-        return float(sum(f["amount"] for f in self.insurance_))
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+        return float(sum(f["amount"] for f in self.insurance_ if before is None or f["ts"] < before))
 
     # --- into the real journal ---------------------------------------------------------
 

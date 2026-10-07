@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
-from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow
+from sleeve_fund.paper.runtime import liquidation_head
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
@@ -16,15 +17,17 @@ EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", 
 
 STATUS_TABS = {
     "open": ("Open", OPEN_ORDER_STATUSES),
-    "filled": ("Filled", ("filled",)),
+    "filled": ("Filled", ("filled", "triggered")),
     "canceled": ("Cancelled", ("canceled", "expired")),
     "rejected": ("Rejected", ("rejected", "denied")),
     "all": ("All", None),
 }
 STATUS_LABELS = {"submitted": "Sent", "accepted": "Working", "partially_filled": "Part filled", "filled": "Filled",
-                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired"}
+                 "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired",
+                 "triggered": "Triggered"}
 STATUS_TONES = {"submitted": "paused", "accepted": "paused", "partially_filled": "paused", "filled": "running",
-                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted"}
+                "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted",
+                "triggered": "running"}
 
 _PX = ("close", "price", "entry_px", "peak", "trail_stop")
 _PCT = ("gap", "move", "stop_loss", "take_profit")
@@ -177,33 +180,11 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
     return opened
 
 
-def liquidated_since_reset(store: Store, sleeve: str, halt_words: str) -> bool:
-    """Whether the strategy's position margin was lost (a liquidation event or order, or a halt whose message
-    starts with halt_words) with no reset after liquidation since. Read from the journal, not the latest halt:
-    a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). The halt words
-    match in any case and spacing (P1-U28a)."""
-    reset = store.last_event(sleeve, (LIQUIDATION_RESET,))
-    since_id, since_ts = (reset["id"], reset["ts"]) if reset else (0, None)
-    words = _fold(halt_words)
-    if any(e["kind"] == "liquidation" or _fold(e["message"]).startswith(words)
-           for e in store.sleeve_events_since(sleeve, ("liquidation", "risk_halt"), after_id=since_id)):
-        return True
-    order = store.last_order(sleeve, ("liquidation",))
-    if order is None:
-        return False
-    if since_ts is None or order["ts"] > since_ts:
-        return True
-    if order["ts"] < since_ts:
-        return False
-    # A liquidation order in the same instant as the reset: orders and events share no id, so the liquidation
-    # wins the tie (P1-U28b) unless the reset answered a liquidation event of that same instant.
-    answered = store.last_event(sleeve, ("liquidation",))
-    return not (answered is not None and answered["id"] < since_id and answered["ts"] == order["ts"])
-
-
-def _fold(text: str) -> str:
-    """Text for a loose match: one plain space between words, in any case (a no-break space counts as one)."""
-    return " ".join((text or "").split()).casefold()
+def liquidated_since_reset(store: Store, sleeve: str) -> bool:
+    """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
+    (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
+    return liquidation_head(store, sleeve) is not None
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
@@ -259,13 +240,20 @@ def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | Non
     return abs(qty) * max(side * (price - stop_px), 0.0)
 
 
+# Strategies whose stop trails the market inside the strategy and isn't journaled (A2-T will journal it).
+TRAILING_STOP = {"rsi_pullback"}
+
+
 def open_risk(positions: list[dict]) -> dict:
     """Margin and open risk across positions (open_position's dicts): margin put up, the sum of their Risk to
-    stop, and the strategies whose position has no stop, which leave open risk unbounded."""
+    stop, the strategies whose position has no stop of any kind, which leave open risk unbounded, and those
+    with a trailing stop, whose level isn't shown yet: they are bounded, but not counted until the engine
+    gives their risk (UI v2 P1-U24)."""
     return {
         "margin": sum(p["margin"] for p in positions),
         "open_risk": sum(p["risk_to_stop"] for p in positions if p["risk_to_stop"] is not None),
-        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None],
+        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None and not p.get("trailing")],
+        "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
     }
 
 
@@ -306,6 +294,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "liq_px": liq,
         "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
         "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
+        "trailing": stop_px is None and x["sleeve"].strategy in TRAILING_STOP,
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
@@ -485,3 +474,21 @@ def audit_rows(sleeve, fills: list[dict], orders: dict[str, dict], venue: str) -
                      "order_id": f.get("order_id"), "trade_id": f.get("trade_id"),
                      **{k: v if not isinstance(v, (dict, list)) else str(v) for k, v in signal.items()}})
     return rows, keys
+
+
+def timing_view(timings: list[dict]) -> dict | None:
+    """Close to fill for the strategy's latest orders decided on a bar (Store.timings, v2 P1-2): median and 95th
+    percentile in milliseconds, and the median of how much of it was ours (bar close to order sent). None
+    before any such order has filled."""
+    done = [t for t in timings if t["bar_close"] and t["first_fill"]]
+    if not done:
+        return None
+
+    def ms(rows, a, b):
+        return sorted((r[b] - r[a]).total_seconds() * 1000 for r in rows if r[a] and r[b])
+
+    def pick(v, q):
+        return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+    fill, ours = ms(done, "bar_close", "first_fill"), ms(done, "bar_close", "sent")
+    return {"n": len(fill), "median": pick(fill, 0.5), "p95": pick(fill, 0.95), "ours": pick(ours, 0.5)}

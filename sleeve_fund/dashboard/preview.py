@@ -201,14 +201,18 @@ def _halt_reason(message: str) -> str:
     return f"DD {m.group(1)}" if m else reason
 
 
-def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1440) -> dict:
+def _risk(events: list[dict], risk_profile: str | None, checked_minutes: int = 1440, refused: str | None = None,
+          binds: int = 0) -> dict:
     """What the runtime's risk guard did, in words the page shows. checked_minutes: how often it
-    valued the book (paper does every 30 s)."""
+    valued the book (paper does every 30 s). refused: why paper wouldn't start these settings; binds: entries the
+    open-risk limit would have refused on paper (a backtest trades them all)."""
     halts = [e for e in events if e["kind"] in ("risk_halt", "reconcile_mismatch")]
     pauses = [e for e in events if e["kind"] == "risk_pause"]
     out = {"profile": risk_profile, "halted": None, "pauses": len(pauses), "checked_minutes": checked_minutes,
            "events": [{"t": e["ts"].strftime("%d %b %Y"), "kind": e["kind"], "message": e["message"]} for e in events]}
-    notes = []
+    notes = [refused[0].upper() + refused[1:] + "."] if refused else []
+    if binds:
+        notes.append(f"Paper would refuse {binds} entr{'ies' if binds != 1 else 'y'} (open risk over 5% of the book).")
     if halts:
         h = halts[0]
         out["halted"] = h["ts"].strftime("%d %b %Y")
@@ -368,7 +372,8 @@ def run(strategy: str, pair: str, params: dict, starting: float = 10_000.0, fetc
         "bench_cap": bench_cap,
         "data": _data_note(prices, minutes),
         "execution": _execution(res, wait, matched_on),
-        "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes),
+        "risk": _risk(res.risk_events, risk_profile, exec_step if exec_prices is not None else minutes,
+                      refused=res.paper_refusal, binds=res.open_risk_binds),
         "errors": _errors(res.handler_errors, res.handler_error_count),
         "spread": {"half": spread.half_spread, "paid": round(res.spread_paid, 2), "text": spread.text,
                    "short": spread.short, "source": spread.source},

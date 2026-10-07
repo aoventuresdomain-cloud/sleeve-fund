@@ -98,17 +98,35 @@ def test_a_minute_missed_and_not_in_the_store_either_leaves_the_bar_short_and_to
     assert len(out) == 2 and [k for _, k, _ in said] == ["bar_incomplete"] and "missing 1 of its 15" in said[0][2]
 
 
-def test_on_one_minute_bars_a_missed_minute_is_told_and_kept_as_history_not_decided_on(tmp_path):
+def test_on_one_minute_bars_missed_minutes_are_sent_from_the_store_under_the_late_rule_and_told(tmp_path):
+    """Exits always run (QA P1-C1): minutes the client missed are bars a stop could have been breached in, so
+    they are sent, stamped when they arrived, for the strategy's late rule (exits only once over 90 s)."""
     df = _minutes(6)
     hs = _store(tmp_path, df)
     said, report = _recorder()
     d = Decoder("1-MINUTE-LAST-EXTERNAL", report, stored_minutes("BINANCE", "BTC/USDT", hs))
-    out = _feed(d, df, [0, 1, 4, 5])  # 18:03 and 18:04 missed
-    assert [b.ts_event for b in out] == [T0 + M, T0 + 2 * M, T0 + 5 * M, T0 + 6 * M]
-    assert said == [("warning", "hub_gap", f"{IID}: the feed missed 2 minutes closing 05 Oct 18:03 UTC to 05 Oct "
-                     "18:04 UTC, so they weren't decided on; 2 recovered from the history store for the record")]
-    # A refill of one landing afterwards changes nothing: it was told already.
-    assert d(_msg(df, 2), T0 + 6 * M + 5 * S) is None and len(said) == 1
+    out = [d(_msg(df, i), int(df.index[i].value) + M + 2 * S) for i in (0, 1, 4, 5)]  # 18:03 and 18:04 missed
+    assert out[2] and [b.ts_event for b in out[2]] == [T0 + 3 * M, T0 + 4 * M, T0 + 5 * M]  # with 18:05, in order
+    assert [_tup(b) for b in (out[0], out[1], *out[2], out[3])] == _store_bars(hs, 1)
+    assert {b.ts_init for b in out[2]} == {T0 + 5 * M + 2 * S}  # stamped when they came: the late rule sees the lag
+    assert said[0] == ("warning", "hub_gap", f"{IID}: the feed missed 2 minutes closing 05 Oct 18:03 UTC to 05 Oct "
+                       "18:04 UTC; 2 recovered from the history store and sent late (exits only on any over 90 s)")
+    assert [k for _, k, _ in said[1:]] == ["bar_late"] and "18:03 UTC was complete only 122 s" in said[1][2]  # 18:04: 62 s
+    # A refill of one landing afterwards changes nothing: it was sent already.
+    assert d(_msg(df, 2), T0 + 6 * M + 5 * S) is None and len(said) == 2
+
+
+def test_minutes_recovered_across_several_bars_send_every_bar_they_complete(tmp_path):
+    """A gap over more than one longer bar: each bar the store completes is sent, oldest first, not only the
+    last one."""
+    df = _minutes(30)
+    hs = _store(tmp_path, df)
+    d = Decoder("5-MINUTE-LAST-EXTERNAL", recover=stored_minutes("BINANCE", "BTC/USDT", hs))
+    out = []
+    for i in [0, 1, 2, 3, 4, 5, 17, 18, 19]:  # 18:07 to 18:17 missed: the bars to 18:10 and 18:15 inside it
+        got = d(_msg(df, i), int(df.index[i].value) + M + 2 * S)
+        out += got if isinstance(got, list) else [got] if got is not None else []
+    assert [_tup(b) for b in out] == _store_bars(hs, 5, end=pd.Timestamp(T0 + 20 * M, tz="UTC"))[:4]
 
 
 def _as_refilled(m):
@@ -358,7 +376,7 @@ def test_the_price_watchdog_waits_while_the_hub_is_up_but_has_lost_its_venue():
                                 bar_type=BarType.from_str(f"{inst.id}-15-MINUTE-LAST-EXTERNAL")))
     events = []
     s._last_market_ns, s._price = T0, lambda: 60_000.0
-    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False,
+    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False, holds={},
                                 store=SimpleNamespace(event=lambda *a, **k: events.append(a[2])))
     s.hub_status = HubStatus()
     s.hub_status.heartbeat_ns, s.hub_status.venue_up = now - 3 * S, False
@@ -391,7 +409,7 @@ def test_the_dashboard_refuses_a_hub_venue_strategy_on_the_venues_own_candles(cl
 
     c, store = client
     form = {"name": "daily-b", "strategy": "trend_filter", "instrument": "BTC/USDT", "venue": "binance",
-            "bar_spec": "1-DAY-LAST-EXTERNAL", "starting_balance": "5000", "risk_profile": "balanced",
+            "bar_spec": "1-DAY-LAST-EXTERNAL", "starting_balance": "5000", "risk_profile": "conservative",
             "warmup_bars": "0", "reason": "test", "market": "perp"}
     r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     error = parse_qs(urlparse(r.headers["location"]).query)["error"][0]
@@ -429,3 +447,32 @@ def _drop_here(*objs):
         if isinstance(o, list):
             o.clear()
     gc.collect()
+
+
+def test_a_strategy_saved_on_the_venues_own_candles_is_refused_at_start_not_crash_looped(tmp_path, monkeypatch):
+    """QA P1-C10: one saved before the create-time refusal (P1-C7) is stopped by the supervisor and says why,
+    even with a flatten waiting, since its node can't start at all; the hub's own minutes still start."""
+    from sleeve_fund import supervisor
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    for name, spec in (("daily", "1-DAY-LAST-EXTERNAL"), ("hourly", "1-HOUR-LAST-INTERNAL")):
+        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USDT", bar_spec=spec,
+                            starting_balance=1_000, venue="binance")
+    store.command("daily", "flatten", "Book kill switch: test", actor="PM")
+    started = []
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: started.append(a[0][-1]) or
+                        SimpleNamespace(pid=1, poll=lambda: None))
+    supervisor.Supervisor(store).step()
+    s = store.sleeve("daily")
+    assert started == ["hourly"] and s.desired_state == "stopped"
+    assert s.status_reason.startswith("not started: bar_spec: strategies on this market decide on bars built")
+    (said,) = [e["message"] for e in store.events("daily", limit=10) if e["kind"] == "start_refused"]
+    assert "venue's own 1-day candles aren't available there" in said and "still holds" not in said
+    # Holding a position it can't close itself: said plainly (code review on #146).
+    store.record_fill("daily", side="BUY", qty=0.01, price=100.0, fee=0.008, order_id="o1", trade_id="t1")
+    store.set_desired_state("daily", "running")
+    supervisor.Supervisor(store).step()
+    said = [e["message"] for e in store.events("daily", limit=10) if e["kind"] == "start_refused"][0]
+    assert said.endswith("It still holds a position (0.01), which a flatten can't close while it can't start: an "
+                         "engineer needs to close it")

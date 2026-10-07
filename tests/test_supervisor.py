@@ -271,6 +271,61 @@ def test_a_strategy_added_before_its_file_asked_for_the_demo_mirror_gets_it_with
     assert store.sleeve("ping-pong-ls-binance").params["demo_mirror"] is False
 
 
+def test_a_reset_asked_for_before_a_liquidation_is_not_carried_out(store):
+    """QA P1-U33: a reset already waiting when the liquidation lands would put it away unanswered. The supervisor
+    closes it unrun, says why, and leaves the strategy for Reset after liquidation; one asked after that runs."""
+    from sleeve_fund import liquidation
+    from sleeve_fund.store import LIQUIDATION_RESET
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup = Supervisor(store, python="true")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert not store.pending_commands("bn-ls")  # not flattened for the reset, nor started to
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    assert store.decisions("bn-ls")[0]["reason"] == f"Not reset: {liquidation.REFUSAL}"
+    assert store.last_event("bn-ls", ("reset_refused",))["message"].endswith("asks for an incident note")
+    # After Reset after liquidation, a new reset is carried out as usual.
+    store.event("bn-ls", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
+    store.record_fill("bn-ls", side="SELL", qty=0.076, price=80_000.0, fee=3.0, order_id="o2", trade_id="t2")
+    store.request_reset("bn-ls", "Again")
+    sup.reset_pending()
+    assert store.pending_reset("bn-ls") is None and len(store.reset_runs()) == 1
+
+
+def test_a_reset_refused_mid_flatten_leaves_a_stopped_strategy_stopped(store):
+    """Code review on #167: the first pass queues the reset's flatten and starts a stopped, holding strategy so
+    it can trade; if a liquidation lands before the second pass, the refusal takes both back."""
+    from sleeve_fund.supervisor import Supervisor
+
+    store.create_sleeve(name="bn-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
+    store.set_desired_state("bn-ls", "stopped")
+    store.request_reset("bn-ls", "Test finished")
+    sup = Supervisor(store, python="true")
+    req = store.pending_reset("bn-ls")
+    sup.reset_pending()  # pass 1: flatten queued, started so it can trade
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["flatten"]
+    assert store.sleeve("bn-ls").desired_state == "running"
+    store.command("bn-ls", "pause", "PM paused it", actor="PM")  # not the reset's: stays
+    store.event("bn-ls", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    sup.reset_pending()  # pass 2: refused
+    assert store.pending_reset("bn-ls") is None and not store.reset_runs()
+    assert [c["command"] for c in store.pending_commands("bn-ls")] == ["pause"]
+    assert store.sleeve("bn-ls").desired_state == "stopped"
+    refusals = [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"]
+    assert len(refusals) == 1
+    store.refuse_reset(req, "again")  # a second close of the same request journals nothing
+    assert [d for d in store.decisions("bn-ls") if d["action"] == "reset_refused"] == refusals
+
+
 @pytest.mark.sanity
 def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_capital(store):
     """PM, 5 Oct 2026. Nothing is deleted: the run so far moves to its own archived name under Previous book."""
@@ -304,6 +359,48 @@ def test_a_reset_flattens_puts_the_run_away_and_starts_again_at_the_starting_cap
     assert store.journal_book(run, 10_000)["qty"] == 0.0 and len(store.fills(run)) == 2  # kept, not deleted
     assert store.pending_resyncs()[-1]["sleeve"] == "bn-ls"  # the demo copy is set flat on the paper terms
     assert store.decisions("bn-ls")[0]["reason"].startswith("Started afresh at 10,000")
+
+
+def test_a_reset_that_cant_flatten_stops_asking_and_says_the_pm_must_close_it(store):
+    """Review round 13, m13-E1: a position the strategy can't close got a fresh flatten every supervisor step, for
+    ever. Now three, then one error event; the reset stays pending. (Dust below any venue's smallest order is
+    treated as flat instead: test_degraded_155_qa.test_d6.)"""
+    from sleeve_fund.supervisor import SYSTEM_FLATTENS, Supervisor
+
+    store.create_sleeve(name="dust", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    store.record_fill("dust", side="BUY", qty=1e-4, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
+    store.set_signal_state("dust", {"rows": []})
+    store.request_reset("dust", "Test finished")
+    sup = Supervisor(store, python="true")
+    for _ in range(20):
+        sup.reset_pending()
+        for c in store.pending_commands("dust"):  # the process takes it, and the dust stays
+            store.mark_applied(c["id"])
+    assert len(store.decisions("dust", action="flatten")) == SYSTEM_FLATTENS
+    gave_up = [e for e in store.events("dust", limit=50) if e["kind"] == "flatten_gave_up"]
+    assert len(gave_up) == 1 and "0.0001" in gave_up[0]["message"] and gave_up[0]["level"] == "error"
+    assert store.pending_reset("dust") is not None
+    # Closed by the PM: the reset finishes, and the fresh run has no Signals left from the old one (m13-E2).
+    store.record_fill("dust", side="SELL", qty=1e-4, price=86_000.0, fee=0.0, order_id="o2", trade_id="t2")
+    sup.reset_pending()
+    assert store.pending_reset("dust") is None and store.signal_state("dust") is None
+
+
+def test_a_clean_slate_that_cant_flatten_stops_asking_too(store, sleeve, tmp_path):
+    """m13-E1, the clean slate's side: the same three flattens, then one error event; the entry stays open."""
+    from sleeve_fund.supervisor import SYSTEM_FLATTENS
+
+    store.record_fill("s", side="BUY", qty=3e-8, price=86_000.0, fee=0.0, order_id="o1", trade_id="t1")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-05"\nreason = "clean slate"\n')
+    for _ in range(10):
+        assert clear(store, str(path)) == []
+        for c in store.pending_commands("s"):
+            store.mark_applied(c["id"])
+    assert len(store.decisions("s", action="flatten")) == SYSTEM_FLATTENS
+    assert [e["level"] for e in store.events("s", limit=100) if e["kind"] == "flatten_gave_up"] == ["error"]
+    assert "s" not in store.archived()
 
 
 def test_a_flat_stopped_strategy_resets_at_once_and_stays_stopped(store):

@@ -53,8 +53,9 @@ def test_the_backtest_page_refuses_it(client):  # noqa: F811
 
 
 def _existing(store, name="dc-perp", desired_state="stopped"):
-    # Written before the guard: the store holds it as it was.
-    return store.create_sleeve(name=name, strategy="donchian", instrument="BTC/USDT", bar_spec="1-DAY-LAST-EXTERNAL",
+    # Written before the guard: the store holds it as it was. On hourly bars built from the hub's minutes, so the
+    # supervisor's hub candle check (QA P1-C10) passes and the weight guard is what refuses it.
+    return store.create_sleeve(name=name, strategy="donchian", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
                                starting_balance=10_000, params=PERP, venue="BINANCE", desired_state=desired_state)
 
 

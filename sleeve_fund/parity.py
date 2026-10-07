@@ -1,7 +1,7 @@
 """Hub bar parity: the history store's 1-minute bars (as the market data hub wrote them) against the venue's own
 1-minute candles over the same window, per instrument. Replaces the shadow run for P1-1 (v2 spec).
 
-    python scripts/hub_parity.py --venue binance --hours 24 [--pair BTC/USDT ...] [--out report.md]
+    python scripts/hub_parity.py --venue <venue> --hours 24 [--pair <BASE/QUOTE> ...] [--out report.md]
 
 Reports, per instrument: minutes on both sides, minutes only on one side, minutes whose OHLC differ by more than
 the tolerance or whose volume differs by more than 0.1%, the largest differences, the minutes the hub refilled

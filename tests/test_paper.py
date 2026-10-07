@@ -132,6 +132,12 @@ def _store_with_minutes(tmp_path, end, n):
     return store
 
 
+def _warmup_store(events):
+    """The journal a warm-up reads and writes: its events, and a strategy that has never run (m13-E3)."""
+    return type("S", (), {"event": lambda self, *a: events.append(a), "orders": lambda self, *a, **k: [],
+                          "sleeve": lambda self, name: type("Row", (), {"heartbeat_at": None})()})()
+
+
 def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     import pandas as pd
 
@@ -148,7 +154,7 @@ def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     assert all(b.bar_type == bt for b in bars)
 
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=3)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
@@ -156,6 +162,31 @@ def test_sleeve_on_trade_built_bars_warms_up_from_the_history_store(tmp_path):
     s._warm_from_history()
     assert s.slow.initialized and s.slow.value == pytest.approx(sum(b.close.as_double() for b in bars) / 3)
     assert events == [("s1", "info", "warmup", "Loaded 3 of 3 warm-up bars from the history store")]
+
+
+def test_a_warm_up_that_loads_fewer_bars_than_the_model_needs_says_so_as_a_warning(tmp_path):
+    """Review round 13, m13-E4: "Loaded 1500 of 19296 warm-up bars" went out at info level, with no word that the
+    model's averages are unsettled until the rest close."""
+    import pandas as pd
+
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.venues import venue
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    store = _store_with_minutes(tmp_path, now + pd.Timedelta(minutes=20), 10 * 60)  # 10 hours: 9 or 10 bars
+    instrument = venue("kraken").instrument("BTC", "USD")
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    events = []
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
+    cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
+                            warmup_bars=30)
+    s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))
+    s.instrument, s.runtime = instrument, runtime
+    s._warm_from_history()
+    ((_, level, kind, msg),) = events
+    loaded = int(msg.split()[1])
+    assert level == "warning" and kind == "warmup" and loaded < 30
+    assert f"{30 - loaded} short of what the model looks back over, so its indicators are unsettled" in msg
 
 
 def test_warm_up_runs_up_to_now_and_says_any_hole_left(tmp_path):
@@ -184,7 +215,7 @@ def test_warm_up_runs_up_to_now_and_says_any_hole_left(tmp_path):
     assert [b.close.as_double() for b in bars][-3:] == [500.0] * 3  # the venue's candles after the store's
 
     events = []
-    runtime = type("R", (), {"name": "s1", "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "s1", "backtest": False, "store": _warmup_store(events)})()
     cfg = TrendFilterConfig(instrument_id=instrument.id, bar_type=bt, fast=2, slow=3, assumed_taker_fee=0.008,
                             warmup_bars=6)
     s = TrendFilter(cfg).attach_history(history_loader("KRAKEN", "BTC/USD", store))  # no venue candles
@@ -288,6 +319,17 @@ def test_candles_built_while_no_trades_arrived_are_rebuilt_from_the_venue_before
     assert "No trades reached this process for 2 candles" in msg and "2 rebuilt from the venue's own candles" in msg
 
 
+def test_a_part_bar_replaced_by_the_venues_whole_candle_is_no_longer_degraded():
+    """CR minor on #155: the bar after held ones, seen here only in part (degraded), is decided on as the venue's
+    whole candle when the venue saw more of it, so its degraded mark goes with the part bar."""
+    s, bar, step, _ = _gap_strategy(lambda *a: [bar(2, 110.0, 5), bar(3, 131.0, 9)])
+    step(bar(1, 100.0, 1))
+    assert step(bar(2, 100.0, 0)) is None
+    s.mark_degraded({bar(3, 0, 0).ts_event: 40})
+    assert step(bar(3, 130.0, 1)).close.as_double() == 131.0
+    assert bar(3, 0, 0).ts_event not in s._degraded
+
+
 def test_a_quiet_market_is_used_flat_without_a_warning_and_an_unreachable_venue_says_so():
     s, bar, step, events = _gap_strategy(lambda *a: [bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 2)])
     for b in (bar(1, 100.0, 3), bar(2, 100.0, 0), bar(3, 101.0, 1)):
@@ -360,8 +402,8 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     assert len(bars) == 140 and pd.Timestamp(bars[-1].ts_event, tz="UTC") == now  # the forming candle left out
 
     events = []
-    runtime = type("R", (), {"name": "rb", "book": {"qty": 0.076, "entry_px": 85_878.2},
-                             "store": type("S", (), {"event": lambda self, *a: events.append(a)})()})()
+    runtime = type("R", (), {"name": "rb", "book": {"qty": 0.076, "entry_px": 85_878.2}, "backtest": False,
+                             "store": _warmup_store(events)})()
     s = RsiBands(RsiBandsConfig(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005, warmup_bars=140))
     s.attach_history(load)
     s.instrument, s.runtime = instrument, runtime

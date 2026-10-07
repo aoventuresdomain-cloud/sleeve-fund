@@ -1,6 +1,7 @@
 """The sleeve runtime (journal, PM controls, risk guard) driven through a real backtest."""
 
 import os
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -366,9 +367,10 @@ def test_a_reload_mid_day_keeps_the_days_opening_equity(store, reload):
 
 
 @pytest.mark.parametrize("reload", [False, True])
-def test_a_pm_resume_after_a_daily_pause_survives_a_reload(store, reload):
-    """The PM's resume resets the day's baseline. A reload the same day (a settings edit) must keep it,
-    not restore the midnight open and re-pause and flatten at once (review round 9, M9-2 case f)."""
+def test_a_pm_resume_never_lifts_a_daily_pause_which_holds_through_a_reload_until_the_next_roll(store, reload):
+    """Independent Quant Advisor, 6 Oct 18:17 (HC), superseding review round 9's M9-2: a daily-loss pause is cleared
+    only by the next 00:00 UTC roll. The PM's resume is ignored, a reload the same day (a settings edit) keeps the
+    pause, and the roll lifts it."""
     from datetime import datetime, timedelta, timezone
 
     _sleeve(store)
@@ -379,19 +381,22 @@ def test_a_pm_resume_after_a_daily_pause_survives_a_reload(store, reload):
     assert rt.tick(equity=10_000, price=10_000, **mark) is None
     t[0] += timedelta(hours=10)
     assert rt.tick(equity=9_450, price=9_450, **mark) == "flatten"  # down 5.5%: paused
+    until = store.sleeve("s1").paused_until
+    assert until == datetime(2024, 3, 3, 0, 0, tzinfo=timezone.utc)  # the next 00:00 UTC
     store.command("s1", "resume", "checked, carry on")
     t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=9_450, price=9_450, **mark) is None
-    assert store.sleeve("s1").status == "running"
+    rt.tick(equity=9_450, price=9_450, **mark)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()  # the resume is ignored
     if reload:
         rt = SleeveRuntime(store, "s1", now=lambda: t[0])
         rt.on_start(0.008)
     t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=9_440, price=9_440, **mark) is None  # 5.6% off midnight, 0.1% off the resume
-    assert store.sleeve("s1").status == "running"
-    t[0] += timedelta(minutes=1)
-    assert rt.tick(equity=8_950, price=8_950, **mark) == "flatten"  # 5.3% off the resume: paused again
-    assert store.sleeve("s1").status == "paused"
+    rt.tick(equity=9_440, price=9_440, **mark)
+    s = store.sleeve("s1")
+    assert (s.status, s.paused_until) == ("paused", until) and not rt.can_open()
+    t[0] = until + timedelta(seconds=30)
+    rt.tick(equity=9_440, price=9_440, cash=9_440, qty=0.0)  # flat, as the pause left it
+    assert rt.can_open() and store.sleeve("s1").status == "running"  # the roll lifts it
 
 
 @pytest.mark.parametrize("reload", [False, True])
@@ -636,3 +641,134 @@ def test_reconcile_allows_the_float_step_at_a_large_position(store):
     assert drift - held > 2e-8  # more than two 8-decimal lots
     assert rt.reconcile(cash=cash, qty=drift, qty_tolerance=2e-8)
     assert not rt.reconcile(cash=cash, qty=held + 0.001, qty_tolerance=2e-8)
+
+
+def _liquidated(store, t):
+    """A strategy liquidated and halted in the ruled words, as the engine journals it: the liquidation, a drawdown
+    halt on the same tick, then the liquidation's own halt."""
+    _sleeve(store)
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.0005)
+    rt.tick(equity=10_000, cash=10_000, qty=0.0, price=60_000)
+    store.event("s1", "error", "liquidation", "Liquidated: the price 97,440 reached the liquidation price 90,490.4")
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440,
+            ruined="Position margin lost (liquidated): 4,100.00, 41% of strategy equity")
+    assert store.sleeve("s1").status == "halted"
+    return rt
+
+
+def _after(store, t, minutes=1):
+    t[0] += timedelta(minutes=minutes)
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.0005)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    return rt
+
+
+def test_a_pm_resume_never_runs_a_liquidated_strategy_even_for_a_tick(store):
+    """QA on #164, HoE 6 Oct 19:11: after a liquidation the PM's resume leaves it halted in the liquidation's words,
+    with no drawdown reset, and nothing may open on the tick that takes the resume or after."""
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    rt = _liquidated(store, t)
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    s = store.sleeve("s1")
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): 4,100.00")
+    assert not rt.can_open() and not _after(store, t).can_open()
+    assert store.last_event("s1", ("drawdown_reset",)) is None
+    assert not [c for c in store.pending_commands("s1") if c["command"] == "resume"]  # taken up, not left waiting
+
+
+def test_a_liquidation_survives_a_stop_start_a_restart_while_halted_and_a_resume(store):
+    """QA on #164, HoE 6 Oct 19:11: the journal decides, not the latest reason. Liquidated, then Stop/Start (which
+    wrote "stopped" over the halt before HC), then a restart while halted that halts again on drawdown, then a
+    resume: still liquidated, halted in its words, in this process and in a fresh one."""
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    _liquidated(store, t)
+    store.set_status("s1", "stopped", "stopped by PM")
+    store.event("s1", "error", "risk_halt", "drawdown 41.0% hit the 20% limit; flattened, PM must resume")
+    store.set_status("s1", "halted", "drawdown 41.0% hit the 20% limit")
+    rt = _after(store, t)
+    assert rt.liquidated is not None and not rt.can_open()
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=5_900, cash=5_900, qty=0.0, price=97_440)
+    s = store.sleeve("s1")
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): 4,100.00"), s
+    fresh = _after(store, t)
+    assert not fresh.can_open() and store.sleeve("s1").status == "halted"
+    assert store.last_event("s1", ("drawdown_reset",)) is None
+
+
+def test_a_reset_after_liquidation_in_the_journal_ends_the_liquidated_state(store):
+    """The journal rule's other half: a liquidation before the last reset after liquidation no longer counts."""
+    from sleeve_fund.paper.runtime import RESET_AFTER_LIQUIDATION
+
+    t = [datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)]
+    _liquidated(store, t)
+    store.event("s1", "info", RESET_AFTER_LIQUIDATION, "reset after the liquidation")
+    assert SleeveRuntime(store, "s1", now=lambda: t[0]).liquidated is None
+
+
+def test_the_pms_commands_wait_while_a_liquidation_order_is_working(store):
+    """QA P1-U34: a resume queued while paused is never applied on the tick that liquidates (the guard has sent the
+    liquidation, which hasn't filled): it waits, so the strategy is never running with the position still held; the
+    next tick has the liquidation's halt, which a resume doesn't clear."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2024, 3, 2, 12, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    mark = {"cash": 0.0, "qty": 1.0}
+    rt.tick(equity=10_000, price=10_000, **mark)
+    store.command("s1", "pause", "holding")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=10_000, price=10_000, **mark)
+    assert store.sleeve("s1").status == "paused"
+    store.command("s1", "resume", "carry on")
+    t[0] += timedelta(minutes=1)
+    rt.tick(equity=9_900, price=9_900, liquidating=True, **mark)
+    assert store.sleeve("s1").status == "paused" and not rt.can_open()
+    assert [c["command"] for c in store.pending_commands("s1")] == ["resume"]  # still waiting
+
+
+@pytest.mark.parametrize("kind", ["store", "memory"])
+def test_orders_by_intent_and_funding_and_insurance_before_a_time_are_read_in_the_query(store, kind):
+    """Code Reviewer on 81e6d6f (minor 2): the liquidation figures read only the liquidation orders, and only the
+    funding and insurance booked before the position opened, not every row the strategy ever had."""
+    from datetime import datetime, timedelta, timezone
+
+    from sleeve_fund.paper.journal import MemoryJournal
+
+    j = store if kind == "store" else MemoryJournal()
+    _sleeve(j)
+    t0 = datetime(2024, 3, 2, tzinfo=timezone.utc)
+    for i, intent in enumerate(("entry", "liquidation", "exit", "liquidation")):
+        j.record_order("s1", order_id=f"o{i}", side="BUY", qty=1.0, intent=intent, reason="", ts=t0 + timedelta(hours=i))
+    assert {o["order_id"] for o in j.orders("s1", intents=("liquidation",))} == {"o1", "o3"}
+    for h, amount in ((0, 1.5), (8, -0.5), (16, 2.0)):
+        j.record_funding("s1", qty=1.0, price=100.0, rate=0.0001, amount=amount, ts=t0 + timedelta(hours=h))
+        j.record_insurance("s1", price=100.0, amount=amount * 10, ts=t0 + timedelta(hours=h))
+    cut = t0 + timedelta(hours=16)
+    assert j.funding_total("s1", before=cut) == pytest.approx(1.0) and j.funding_total("s1") == pytest.approx(3.0)
+    assert j.insurance_total("s1", before=cut) == pytest.approx(10.0) and j.insurance_total("s1") == pytest.approx(30.0)
+
+
+def test_the_daily_pause_is_lifted_by_the_first_tick_after_the_0000_utc_roll(store):
+    """QA SG14: the strategy page reads the store's status, so the roll lifts the pause on the tick, not at the next
+    entry check."""
+    from datetime import datetime, timedelta, timezone
+
+    _sleeve(store)
+    t = [datetime(2025, 10, 3, 23, 59, 30, tzinfo=timezone.utc)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.008)
+    rt._set("paused", "daily loss 6.0% hit the 5% limit", datetime(2025, 10, 4, tzinfo=timezone.utc))
+    flat = {"equity": 9_400, "cash": 9_400, "qty": 0.0, "price": 60_000}
+    rt.tick(**flat)
+    assert store.sleeve("s1").status == "paused"
+    t[0] += timedelta(minutes=1)
+    rt.tick(**flat)
+    assert store.sleeve("s1").status == "running"

@@ -1340,8 +1340,20 @@ def test_an_age_never_reads_minus_zero():
     assert _held(timedelta(seconds=-2)) == "0 min" and _held(timedelta(minutes=5)) == "5 min"
 
 
-def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
+def _wait_for_job(c, job_id: str, seconds: float = 300.0) -> dict:
+    """Poll a background study job until it leaves queued/running, up to a deadline: a fixed count of polls ran out
+    under a busy parallel CI run while the job was still working (FLAKY-STUDY)."""
     import time
+
+    deadline = time.monotonic() + seconds
+    while True:
+        j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
+        if j["status"] not in ("queued", "running") or time.monotonic() >= deadline:
+            return j
+        time.sleep(0.05)
+
+
+def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     from urllib.parse import parse_qs, urlparse
 
     from sleeve_fund import history
@@ -1362,22 +1374,14 @@ def test_a_g1_study_runs_from_the_research_page(client, tmp_path, monkeypatch):
     job_id = parse_qs(urlparse(r.headers["location"]).query)["job"][0]
     running = c.get(r.headers["location"], auth=AUTH).text
     assert 'id="study-job"' in running and 'value="240" checked' in running  # the form shows what is running
-    for _ in range(600):
-        j = c.get(f"/api/backtest/jobs/{job_id}", auth=AUTH).json()
-        if j["status"] not in ("queued", "running"):
-            break
-        time.sleep(0.05)
+    j = _wait_for_job(c, job_id)
     assert j["status"] == "done", j
     assert re.fullmatch(r"buy_and_hold_kraken-ethusd-store-240m_\d{8}-\d{6}", j["run_id"])
     first = j["run_id"]
     assert "conservative risk profile" in c.get(f"/research/{first}", auth=AUTH).text
     # A re-run with other exits is new evidence beside the old, not a replacement (review round 8, R8-M3).
     r = c.post("/research/run", data={**form, "stop_loss_pct": "5"}, auth=AUTH, headers=SAME, follow_redirects=False)
-    for _ in range(200):
-        j = c.get(f"/api/backtest/jobs/{parse_qs(urlparse(r.headers['location']).query)['job'][0]}", auth=AUTH).json()
-        if j["status"] not in ("queued", "running"):
-            break
-        time.sleep(0.05)
+    j = _wait_for_job(c, parse_qs(urlparse(r.headers["location"]).query)["job"][0])
     assert j["status"] == "done" and j["run_id"] != first
     listing = c.get("/research", auth=AUTH).text
     assert f'/research/{first}"' in listing and f'/research/{j["run_id"]}"' in listing
@@ -2141,7 +2145,8 @@ def test_research_backtest_and_new_strategy_pages_offer_the_venue(client, tmp_pa
 
     spot = _new(c, name="bn-spot", instrument="BTC/USDT", venue="binance")
     assert "perpetuals+only" in spot.headers["location"] and "venue=binance" in spot.headers["location"]
-    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp")
+    ok = _new(c, name="bn-perp", instrument="BTC/USDT", venue="binance", market="perp",
+              risk_profile="conservative")  # a stopless perp runs at 1x at most (check_perp_stop)
     assert ok.headers["location"] == "/sleeves/bn-perp" and store.sleeve("bn-perp").venue == "BINANCE"
     assert _new(c, name="kr").status_code == 303 and store.sleeve("kr").venue is None
     shown = c.get("/sleeves/bn-perp", auth=AUTH).text
@@ -2354,6 +2359,65 @@ def test_a_trailing_stop_says_its_level_is_not_shown_rather_than_guess_it(client
     assert [ln["kind"] for ln in lines] == ["entry"]
 
 
+def test_a_trailing_stop_is_not_unbounded_and_open_risk_says_what_it_leaves_out(client):
+    """P1-U24: a trailing stop bounds the loss, so its risk to stop reads "trailing · level not shown", never
+    "unbounded"; "unbounded" is for a position with no stop of any kind. Open risk says which it leaves out."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    trailing = "trailing · level not shown"
+    for url in ("/risk", "/trades", "/"):
+        page = c.get(url, auth=AUTH).text
+        assert "unbounded" not in page.replace("so unbounded", ""), url
+    assert trailing in c.get("/risk", auth=AUTH).text and trailing in c.get("/trades", auth=AUTH).text
+    assert "rp: trailing stop, level not shown, not counted" in c.get("/risk", auth=AUTH).text
+    assert "1 with a trailing stop, level not shown, not counted" in c.get("/", auth=AUTH).text
+    # A position with no stop of any kind is still unbounded, and the hover lists both.
+    store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={})
+    store.record_order("nostop", order_id="E-2", side="BUY", qty=0.05, intent="entry", reason="start")
+    store.record_fill("nostop", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-2", trade_id="t2")
+    store.record_equity("nostop", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    risk = c.get("/risk", auth=AUTH).text
+    assert "nostop: no stop, so unbounded · rp: trailing stop, level not shown, not counted" in risk
+
+
+def test_open_risk_tile_with_only_a_trailing_position_shows_plus_warn_and_count(client):
+    """P1-U24-1 (QA probe, Advisor S9): whenever a position is left out of the Open risk sum (no stop, or a
+    trailing stop whose level isn't shown) the tile carries the "+", the warn colour and a visible count; a
+    hover-only note isn't enough. Home, Risk and Trades agree."""
+    c, store = client
+    store.create_sleeve(name="rp", strategy="rsi_pullback", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={"atr_mult": 2.5})
+    store.record_order("rp", order_id="E-1", side="BUY", qty=0.05, intent="entry", reason="RSI 28 in an up-trend")
+    store.record_fill("rp", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-1", trade_id="t1")
+    store.record_equity("rp", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+
+    def tiles():
+        out = {}
+        for url in ("/", "/risk", "/trades"):
+            html = c.get(url, auth=AUTH).text
+            m = re.search(r'<div class="k">Open risk</div><div class="v([^"]*)">([^<]*)', html)
+            out[url] = (m.group(1), m.group(2)) if m else None
+        return out
+
+    for url, got in tiles().items():
+        assert got is not None, url
+        assert "warn" in got[0], url
+        assert got[1].strip().endswith("0.00+ · 1 not counted"), (url, got)
+    # A stopless position joins it: both are left out, so the count is 2.
+    store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5_000, params={})
+    store.record_order("nostop", order_id="E-2", side="BUY", qty=0.05, intent="entry", reason="start")
+    store.record_fill("nostop", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="E-2", trade_id="t2")
+    store.record_equity("nostop", equity=5_000, cash=2_000, qty=0.05, price=60_500, benchmark=5_000)
+    for url, got in tiles().items():
+        assert "warn" in got[0] and got[1].strip().endswith("+ · 2 not counted"), (url, got)
+
+
 def test_resuming_after_a_liquidation_says_it_stays_halted(client):
     """Advisor 6 Oct 17:57: a strategy halted because its position margin was lost stays halted through a
     resume until the PM resets it after liquidation; other halts keep their wording. Read from the journal,
@@ -2479,6 +2543,16 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
     store.event("btc-test", "info", LIQUIDATION_RESET, "PM reset it after liquidation")
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert "until you use Reset after liquidation" not in page
+    if status == "halted":
+        # QA P1-U31 [halted] (HoE + Head of QA, 6 Oct): the liquidation is answered, the drawdown halt is not, and only
+        # a resume clears that (HC). The page shows only the drawdown halt; Start is refused until a resume is sent.
+        assert "Its position margin was lost (liquidated)" not in page and "Nothing trades until you resume" in page
+        r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "Only+you+can+clear+it%2C+with+Resume" in r.headers["location"] and store.sleeve("btc-test").desired_state == "stopped"
+        r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
+                   headers=SAME, follow_redirects=False)
+        assert "command_error" not in r.headers["location"]
     r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
                headers=SAME, follow_redirects=False)
     assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
@@ -2498,6 +2572,19 @@ def test_a_book_reset_skips_a_liquidated_strategy_and_names_it(client):
     setup = c.get(r.headers["location"], auth=AUTH).text
     assert "Not reset: btc-test. Its position margin was lost (liquidated)" in setup
     assert "Reset after liquidation" in setup and "Reset asked for every other strategy" in setup
+
+
+def test_a_funding_alert_tag_names_the_pair_and_no_venue(client):
+    """The funding alerts tag their messages with the venue upper-cased and the pair (#163); the Alerts page
+    and the outside alert read "[BTC/USDT] …" (QA P1-U30, CR)."""
+    from sleeve_fund import alerts
+
+    c, store = client
+    store.event(None, "warning", "funding_stale", "[BINANCE BTC/USDT] funding is 9 hours behind")
+    page = c.get("/alerts", auth=AUTH).text
+    assert "[BTC/USDT] funding is 9 hours behind" in page and "BINANCE" not in page
+    ev = store.alerts(limit=5)
+    assert "[BTC/USDT] funding is 9 hours behind" in alerts.message(ev) and "BINANCE" not in alerts.message(ev)
 
 
 @pytest.mark.parametrize("words", ["position margin lost (liquidated): 1.00", "POSITION MARGIN LOST (LIQUIDATED)",
@@ -2551,3 +2638,27 @@ def test_a_liquidated_halt_far_back_in_the_journal_still_counts(client):
         store.event("btc-test", "error", "tick_failed", f"tick {i} failed")
     store.set_status("btc-test", "halted", "drawdown 96.2% hit the 20% limit")
     assert "it stays halted" in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_the_chart_passes_on_the_strategys_recorded_indicators_untouched_and_survives_a_failure(client, monkeypatch):
+    """P1-3s: the platform's own values go to the chart as recorded (v2/chart-indicators-shape.md); a recording that
+    isn't there yet or fails leaves an empty list and a chart that still draws."""
+    from sleeve_fund.dashboard import charts
+
+    c, store = client
+    _new(c, name="sol-x", instrument="SOL/USD", bar_spec="1-HOUR-LAST-INTERNAL")
+    store.record_equity("sol-x", equity=10_000, cash=10_000, qty=0, price=100, benchmark=10_000)
+    charts._cache.clear()
+    monkeypatch.setattr(charts, "candles", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == []
+    sample = [{"key": "ema", "label": "EMA(20)", "pane": "price", "kind": "line", "group": None,
+               "settled_from": 3600, "points": [[3600, 101.5], [7200, 101.7]]}]
+    monkeypatch.setattr(store, "chart_indicators", lambda name: sample, raising=False)
+    assert c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()["indicators"] == sample
+
+    def broken(name):
+        raise RuntimeError("recording failed")
+
+    monkeypatch.setattr(store, "chart_indicators", broken, raising=False)
+    d = c.get("/api/sleeves/sol-x/candles", auth=AUTH).json()
+    assert d["indicators"] == [] and d["candles"]
