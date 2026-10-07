@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund.instruments import FeeSchedule
+from sleeve_fund.margin import isolated_liquidation, isolated_margin, liquidation_price  # noqa: F401 (re-exported)
 
 SPOT = "spot"
 PERP = "perp"
@@ -272,30 +273,11 @@ def latest_interval(settled) -> timedelta | None:
     return step if step > timedelta(0) else None
 
 
-def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
-    """The margin an isolated perpetual position puts up: its notional at entry over the leverage it is
-    opened at (the risk profile's cap), never more than the balance there is to put up. The rest of the
-    strategy's equity is not at risk to the venue's liquidation. The one margin figure for paper,
-    backtest, the dashboard and the demo copy (set to isolated at the same leverage)."""
-    margin = abs(qty) * entry / max(leverage, 1e-9)
-    return min(margin, max(balance, 0.0)) if balance is not None else margin
-
-
 def gap_loss_cap(qty: float, entry: float, leverage: float, balance: float, taker: float, liq: float | None) -> float:
     """The most an isolated perpetual position can lose however far the price gaps (Independent Quant Advisor, QA
     P1-D3): its whole isolated margin, plus the taker fee on the close at its liquidation price. The engine books a
     gap past the bankruptcy price at this (the insurance fund takes the rest), and the Risk page's stress rows use it."""
     return isolated_margin(qty, entry, leverage, balance) + taker * abs(qty) * (liq or 0.0)
-
-
-def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: float) -> float | None:
-    """The liquidation price of a position of qty opened at entry on isolated margin at this leverage.
-    cash is the strategy's spot-style cash (its balance less qty x entry). None when flat, or when no
-    positive price liquidates it (a long at 1x or less is fully paid for)."""
-    if qty == 0 or entry <= 0:
-        return None
-    margin = isolated_margin(qty, entry, leverage, cash + qty * entry)
-    return liquidation_price(margin - qty * entry, qty, maintenance)
 
 
 @dataclass(frozen=True)
@@ -335,17 +317,3 @@ def liquidation_booking(qty: float, entry: float, exit_px: float, leverage: floa
     past = -qty * (exit_px - bankrupt)  # > 0: the market went past bankruptcy; < 0: it closed short of it
     return LiquidationBooking(fill_px=bankrupt, loss=margin + entry_fee + liquidation_fee, market_px=exit_px,
                               insurance=max(past, 0.0), forfeited=max(-past, 0.0))
-
-
-def liquidation_price(cash: float, qty: float, maintenance: float) -> float | None:
-    """The price at which a position's equity (cash + qty x price) falls to the maintenance margin on
-    its value, cash being the margin backing it less qty x entry (isolated_liquidation). None when flat,
-    or when no positive price liquidates it (a long fully paid for in cash)."""
-    if qty == 0:
-        return None
-    # cash + qty * p = maintenance * |qty| * p  =>  p = cash / (maintenance * |qty| - qty)
-    denom = maintenance * abs(qty) - qty
-    if denom == 0:
-        return None
-    p = cash / denom
-    return p if p > 0 else None

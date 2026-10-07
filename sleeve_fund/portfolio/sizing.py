@@ -13,7 +13,10 @@ product. Then the caps, smallest first wins:
 - leverage cap: notional at most allocated equity x leverage, less room for the fee;
 - largest order cap, and a share of the bar's volume;
 - on a perpetual, the PM's liquidation rule: the stop sits no further than half the way to the liquidation price
-  (or the profile's tighter share). The size shrinks until it does; the leverage is never widened to make it fit.
+  (or the profile's tighter share). The engine posts ISOLATED margin, notional / the leverage (markets.isolated_margin),
+  so that distance is set by the leverage and the maintenance margin, not the size: shrinking the notional can't bring
+  the stop inside it. An entry whose stop doesn't fit is refused, naming liquidation; the stop is never moved and the
+  leverage never raised (Head of QA, Q199-1).
 
 The Advisor's guarantees (MUST FIX, 7 Oct 17:03), each pinned in tests/test_sizing.py:
 1. Nothing is sized without a stop. A definition that declares none gets the fallback, ATR_STOP_MULTIPLE x Wilder's
@@ -21,7 +24,8 @@ The Advisor's guarantees (MUST FIX, 7 Oct 17:03), each pinned in tests/test_sizi
    carries more than the stopless 1x: it carries none.
 2. Open risk of a position with no placed stop is notional x max(10%, 3 daily ATR), from open_risk.stopless_move, the
    one formula; risk_per_unit() uses it.
-3. On a perpetual the stop is never further than half the distance to liquidation.
+3. On a perpetual the stop is never further than half the distance to the engine's liquidation price (exactly half is
+   allowed), with the venue's maintenance margin (Advisor 20:08 UK).
 
 A stop fills as a market order, past its price: the loss per unit carries a named stop slippage, by default the larger
 of half the spread and 0.05% (D13). Below the venue's smallest order, the entry rounds up to it only when the risk then
@@ -35,6 +39,7 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from types import MappingProxyType
 from collections.abc import Mapping
 
+from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.money import money, scale
 
 ATR_STOP_MULTIPLE = 2.5  # the fallback stop, in Wilder ATR(14)s, when a definition declares none
@@ -174,6 +179,18 @@ def _validate(i: SizingInputs) -> None:
                          f"{i.stop_to_liquidation}")
 
 
+def liquidation_distance(i: SizingInputs) -> float:
+    """How far the price can move against this entry before the venue liquidates it, as a share of the entry: the
+    engine's own margin.entry_liquidation (isolated margin at the leverage, the venue's maintenance margin, measured
+    from the entry with the fee paid), not a copy of it. On isolated margin the distance doesn't depend on the size
+    while the margin and fee fit the balance, so it is measured on half the equity's notional, which always fits.
+    inf when nothing liquidates it (a long at 1x or less is fully paid for)."""
+    equity, price = float(i.allocated_equity), float(i.price)
+    _, distance = entry_liquidation(equity, equity / 2 / price, price, i.side, float(i.leg_cost),
+                                    i.maintenance_margin, i.leverage)
+    return distance
+
+
 def stop_slippage(i: SizingInputs) -> float:
     """The named stop slippage the loss per unit carries: the venue's own, or max(half spread, 0.05%) (D13)."""
     return max(i.half_spread, DEFAULT_STOP_SLIPPAGE) if i.stop_slippage is None else i.stop_slippage
@@ -204,11 +221,12 @@ def size_entry(i: SizingInputs) -> Sizing:
     limits["margin cap" if i.perp else "position cap"] = scale(equity, i.position_cap_pct * i.leverage)
     if i.perp:
         limits[f"{i.leverage:g}x leverage cap"] = scale(equity, i.leverage * (1 - i.leg_cost))
-        # The whole account margins the position: the price can move about equity / notional - maintenance margin
-        # before liquidation, so the stop fits within its share of that while notional stays under this.
         share = STOP_TO_LIQUIDATION if i.stop_to_liquidation is None else i.stop_to_liquidation
-        limits[f"liquidation rule (stop within {share:.0%} of the way)"] = (
-            equity / Decimal(repr(stop / share + i.maintenance_margin)))
+        distance = liquidation_distance(i)
+        if stop > share * distance:
+            return Sizing(zero, "", stop, budget, zero, limits, skipped=(
+                f"entry refused: its {stop:.2%} stop is more than {share:.0%} of the way to the liquidation price "
+                f"({distance:.2%} away at {i.leverage:g}x isolated margin); the stop is never moved"))
     if i.max_notional is not None:
         limits["largest order cap"] = i.max_notional
     if i.volume_notional is not None:

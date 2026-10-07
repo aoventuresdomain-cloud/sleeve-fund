@@ -33,6 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
+from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
@@ -198,14 +199,6 @@ def through_liquidation(side: int, price: float, liq: float | None) -> bool:
     return liq is not None and price > 0 and (price <= liq if side > 0 else price >= liq)
 
 
-def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: float,
-                      leverage: float) -> tuple[float | None, float]:
-    """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
-    leverage as its isolated margin: markets.isolated_margin), and how far that is from close as a share of
-    it (inf when none)."""
-    notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
-    liq = markets.isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
-    return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
 
 
 def _utc(ns: int) -> datetime:

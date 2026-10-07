@@ -13,6 +13,12 @@ Sources: as the P2-1 master ([S30], [S39], [A8], [B1], [B2], [R-...] Advisor 6 O
 - [V4] day-0 interface note v4: money and quantity are Decimal; ratios float; a float passed for a money field is
   refused with TypeError, int/str/Decimal accepted; NaN/Inf refused at every dataclass boundary; quantities round DOWN
   to the lot; money never rounded inside a core; intent_for uses open_risk.position_risk so sizing and gate agree.
+- [ISO] the engine's liquidation is on ISOLATED margin: margin = notional / the profile leverage
+  (markets.isolated_margin), liquidation via strategies.base.entry_liquidation; main refuses an entry whose stop is past
+  the share of that distance (base.py ~2010). HoQA correction 7 Oct 20:40 UK (HoE OK + Advisor confirmed 20:15 UK): the 6 Oct R-LIQ cell
+  and the first G3 sweep measured it on the whole allocated equity (cross margin), which is not how the engine liquidates.
+- [ADV-2008a] Advisor 20:08 UK: the venue's maintenance margin is used; a stopless entry is not refused by this check
+  (the 1x cap governs); exactly 50% allowed, above refused.
 - [G1-G3] Advisor MUST FIX, 17:03 UK 7 Oct (advisor-rulings.md:275): deleting _cap_pct keeps (G1) a stopless Model is
   capped at 1x; (G2) open risk counts stopless positions at notional x max(10%, 3 daily ATR); (G3) the stop sits no
   further than half the distance to liquidation. [G4] note v4: the fallback stop is a REAL stop with D13's slippage.
@@ -183,17 +189,12 @@ def test_on_spot_the_cap_is_on_the_notional():
     assert s.qty == D("20.00")
 
 
-def test_a_stop_too_wide_for_the_leverage_lowers_the_size_never_moves_the_stop():
-    # 20% stop, 3x allowed, every other cap wide. Half way to liquidation must cover 20%: notional / equity <=
-    # 1 / (0.2 / 0.5 + 0.005) = 2.469x, so notional <= 24,691.36 (3x would be 30,000).
+def test_a_stop_too_wide_for_the_leverage_is_refused_never_moved():
+    # 20% stop at 3x isolated: liquidation ~33% away (1/3 - 0.5% maintenance, plus the fee), half of it ~16.4% < 20%.
     s = _size(stop_frac=0.2, perp=True, leverage=3.0, position_cap_pct=1.0, risk_per_trade=0.9,
               maintenance_margin=0.005, stop_to_liquidation=0.5)
+    assert s.qty == 0 and s.skipped and "liquidation" in s.skipped, (s.qty, s.sized_by, s.skipped)
     assert s.stop_frac == 0.2  # never moved
-    if s.qty == 0:
-        assert s.skipped  # refused, saying why
-        return
-    assert float(s.qty) * 100 <= 24_691.36 + 1e-6, s.qty
-    assert "liquidation" in s.sized_by, s.sized_by
 
 
 @pytest.mark.parametrize("kw", [dict(), dict(perp=True, leverage=2.0, position_cap_pct=0.2, risk_per_trade=0.5)])
@@ -370,17 +371,21 @@ def test_g2_holding_for_counts_a_stopless_position_at_the_stopless_move(qty, atr
     assert abs(h.risk - risk) <= D("0.01"), (h.risk, risk)
 
 
-def test_g3_every_perp_stop_fits_within_half_the_distance_to_liquidation():
+def test_g3_every_perp_stop_fits_within_half_the_engines_distance_to_liquidation():
+    from sleeve_fund.strategies.base import entry_liquidation
+
     for lev in (1.0, 2.0, 3.0, 5.0):
-        for stop in (0.02, 0.1, 0.2, 0.3, 0.45):
-            s = _size(stop_frac=stop, perp=True, leverage=lev, position_cap_pct=1.0, risk_per_trade=0.9,
-                      maintenance_margin=0.005, stop_to_liquidation=0.5)
-            if s.qty == 0:
-                assert s.skipped, (lev, stop)
-                continue
-            assert s.stop_frac == stop, (lev, stop, s.stop_frac)  # never moved
-            notional = s.qty * D(100)
-            assert D(repr(stop)) <= D("0.5") * (D(10_000) / notional - D("0.005")) + D("1e-12"), (lev, stop, s.qty)
+        for stop in (0.02, 0.05, 0.1, 0.2, 0.3, 0.45):
+            for side in (1, -1):
+                for mm in (0.005, 0.05):
+                    s = _size(stop_frac=stop, side=side, perp=True, leverage=lev, position_cap_pct=1.0,
+                              risk_per_trade=0.9, maintenance_margin=mm, stop_to_liquidation=0.5)
+                    if s.qty == 0:
+                        assert s.skipped, (lev, stop, side, mm)
+                        continue
+                    assert s.stop_frac == stop, (lev, stop, s.stop_frac)  # never moved
+                    _, dist = entry_liquidation(10_000.0, float(s.qty), 100.0, side, 0.0, mm, lev)
+                    assert stop <= 0.5 * dist + 1e-12, (lev, stop, side, mm, s.qty, dist)
 
 
 @xf("G4: no declared stop -> the 2.5 x ATR fallback is a REAL stop: Intent's risk per unit is the stop distance, not "

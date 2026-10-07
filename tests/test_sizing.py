@@ -170,12 +170,12 @@ def test_a_quiet_stretch_cannot_size_up_past_the_volatility_floor():
     assert s.sized_by == "volatility target" and s.qty == D("25.00")
 
 
-def test_the_liquidation_rule_shrinks_the_size_and_names_itself():
-    """The PM's rule: the stop sits no further than half the way to liquidation; leverage is never widened."""
+def test_a_stop_too_wide_for_the_leverage_is_refused_never_moved_or_shrunk_to_fit():
+    """The PM's rule on isolated margin (Q199-1): at 3x the price is ~33% from liquidation whatever the size, so a 20%
+    stop is past half of it. Shrinking the notional can't help: the entry is refused, naming liquidation."""
     s = size_entry(_in(perp=True, leverage=3.0, position_cap_pct=1.0, stop_frac=0.2, risk_per_trade=0.9,
                        stop_to_liquidation=0.5, maintenance_margin=0.005))
-    assert s.sized_by.startswith("liquidation rule") and s.qty == D("246.91")  # 10,000 / (0.2 / 0.5 + 0.005)
-
+    assert s.qty == 0 and not s.ok and "liquidation" in s.skipped and s.stop_frac == 0.2
 
 # --- Decimal money (day-0 interface note v4; DA rules) -------------------------------------------------------------
 
@@ -235,6 +235,18 @@ def test_the_core_reads_no_store_database_runner_or_strategy():
     assert not [m for m in names if any(b in m.split(".") or m.startswith(b) for b in banned)], names
 
 
+def test_importing_the_core_loads_no_engine_or_store():
+    """margin.py carries the engine's liquidation arithmetic with no imports, so the core stays pure (Q199-1)."""
+    import subprocess
+    import sys
+
+    code = ("import sys, sleeve_fund.portfolio.sizing; "
+            "print([m for m in sys.modules if m.startswith(('nautilus', 'sqlalchemy', 'sleeve_fund.store', "
+            "'sleeve_fund.strategies', 'sleeve_fund.paper'))])")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]"
+
+
 # --- the Advisor's three guarantees (MUST FIX, 7 Oct 17:03) --------------------------------------------------------
 
 GRID = [dict(perp=p, leverage=lev, stop_frac=st, atr=atr, overlay=ov, vol_target=0.02, instrument_vol=0.01,
@@ -292,24 +304,56 @@ def test_guarantee_2_a_stopped_entry_counts_as_open_risk_counts_the_position(sid
 @pytest.mark.parametrize("lev", [1.0, 2.0, 3.0, 5.0, 10.0, 20.0])
 @pytest.mark.parametrize("stop", [0.005, 0.02, 0.05, 0.1, 0.25, 0.45])
 @pytest.mark.parametrize("cap", [None, 0.5, 0.3])
-def test_guarantee_3_on_a_perp_the_stop_is_never_further_than_half_the_distance_to_liquidation(lev, stop, cap):
-    """Whatever binds, the account's distance to liquidation at the sized notional (equity / notional - maintenance
-    margin) is at least twice the stop (or the profile's tighter share); with no share given, half applies."""
-    mm = 0.005
-    s = size_entry(_in(perp=True, leverage=lev, stop_frac=stop, position_cap_pct=1.0, risk_per_trade=0.5,
-                       maintenance_margin=mm, stop_to_liquidation=cap))
-    assert s.ok
-    distance = D(10_000) / (s.qty * 100) - Decimal(repr(mm))
-    assert Decimal(repr(stop)) <= Decimal(repr(cap or 0.5)) * distance
-    assert any(k.startswith("liquidation rule") for k in s.limits)
+@pytest.mark.parametrize("side", [1, -1])
+@pytest.mark.parametrize("mm", [0.005, 0.05])
+def test_guarantee_3_every_perp_stop_is_within_half_the_engines_distance_to_liquidation(lev, stop, cap, side, mm):
+    """Measured as the engine liquidates (margin.entry_liquidation, which strategies.base uses: isolated margin at the leverage, the
+    venue's maintenance margin, the fee) at the size taken: within the share, or refused naming liquidation."""
+    from sleeve_fund.strategies.base import entry_liquidation
+
+    s = size_entry(_in(side=side, perp=True, leverage=lev, stop_frac=stop, position_cap_pct=1.0, risk_per_trade=0.5,
+                       maintenance_margin=mm, stop_to_liquidation=cap, leg_cost=0.001))
+    if not s.ok:
+        assert "liquidation" in s.skipped and s.stop_frac == stop
+        _, dist = entry_liquidation(10_000.0, 50.0, 100.0, side, 0.001, mm, lev)
+        assert stop > (cap or 0.5) * dist
+        return
+    _, dist = entry_liquidation(10_000.0, float(s.qty), 100.0, side, 0.001, mm, lev)
+    assert stop <= (cap or 0.5) * dist + 1e-12
+
+
+@pytest.mark.parametrize("lev", [1.0, 1.5, 2.0, 3.0, 5.0, 20.0])
+@pytest.mark.parametrize("side", [1, -1])
+@pytest.mark.parametrize("mm", [0.0, 0.005, 0.05])
+def test_the_liquidation_distance_is_the_engines_whatever_the_size(lev, side, mm):
+    """HoE 20:15 UK: the core calls the engine's own function, not a copy; on isolated margin the size doesn't move it."""
+    from sleeve_fund.portfolio import sizing
+    from sleeve_fund.strategies import base
+
+    assert sizing.entry_liquidation is base.entry_liquidation
+    got = sizing.liquidation_distance(_in(side=side, perp=True, leverage=lev, maintenance_margin=mm, leg_cost=0.001))
+    for qty in (0.5, 20.0, 10_000.0 * lev / 100 * 0.95):  # margin + fee within the balance (SZ-LEV-FEE)
+        _, dist = base.entry_liquidation(10_000.0, qty, 100.0, side, 0.001, mm, lev)
+        assert got == pytest.approx(dist, rel=1e-9, abs=1e-12)
+
+
+@pytest.mark.parametrize("lev, stop", [(3.0, 0.20), (2.0, 0.30), (5.0, 0.10)])
+@pytest.mark.parametrize("side", [1, -1])
+def test_guarantee_3_pinned_refusals(lev, stop, side):
+    """HoE 20:15 UK pins: each stop is past half the way to liquidation at its leverage, so the entry is refused naming
+    liquidation, with the stop as declared and nothing sized."""
+    s = size_entry(_in(side=side, perp=True, leverage=lev, stop_frac=stop, position_cap_pct=1.0, risk_per_trade=0.9))
+    assert not s.ok and s.qty == 0 and s.stop_frac == stop
+    assert s.skipped.startswith("entry refused") and "liquidation price" in s.skipped
 
 
 def test_guarantee_3_the_venues_maintenance_margin_counts():
-    """Advisor 20:08 UK (a): liquidation is measured with the venue's maintenance margin, never a zero approximation:
-    10,000 / (0.2 / 0.5 + mm) at mm 0 and 0.05."""
-    kw = dict(perp=True, leverage=3.0, position_cap_pct=1.0, stop_frac=0.2, risk_per_trade=0.9)
-    assert size_entry(_in(**kw, maintenance_margin=0.0)).qty == D("250.00")
-    assert size_entry(_in(**kw, maintenance_margin=0.05)).qty == D("222.22")
+    """Advisor 20:08 UK (a): the venue's maintenance margin, never a zero approximation. At 3x long the distance is
+    (1/3 - mm) / (1 - mm): 33.33% at mm 0, 29.82% at 5%, so a 16% stop fits half of the first and not the second."""
+    kw = dict(perp=True, leverage=3.0, position_cap_pct=1.0, stop_frac=0.16, risk_per_trade=0.9)
+    assert size_entry(_in(**kw, maintenance_margin=0.0)).ok
+    s = size_entry(_in(**kw, maintenance_margin=0.05))
+    assert not s.ok and "liquidation" in s.skipped
 
 
 def test_guarantee_3_never_refuses_a_stopless_entry_the_1x_cap_governs_it():
@@ -321,7 +365,10 @@ def test_guarantee_3_never_refuses_a_stopless_entry_the_1x_cap_governs_it():
 
 
 def test_guarantee_3_exactly_half_way_is_allowed_and_past_it_refused():
-    assert size_entry(_in(perp=True, leverage=3.0, stop_to_liquidation=0.5)).ok
+    # 2x long, no maintenance margin: liquidation is exactly 50% away, so a 25% stop is exactly half way.
+    kw = dict(perp=True, leverage=2.0, position_cap_pct=1.0, maintenance_margin=0.0, risk_per_trade=0.9)
+    assert size_entry(_in(**kw, stop_frac=0.25)).ok
+    assert "liquidation" in size_entry(_in(**kw, stop_frac=0.2501)).skipped
     with pytest.raises(ValueError, match="at most 50% of the way"):
         size_entry(_in(perp=True, leverage=3.0, stop_to_liquidation=0.6))
 
