@@ -87,5 +87,5 @@ def test_a_reset_asked_before_a_liquidation_is_dropped_and_the_halt_stays(tmp_pa
     s = store.sleeve("s1")
     assert (s.status, s.status_reason) == ("halted", halt) and liquidation_head(store, "s1") == halt
     (ev,) = [e for e in store.events("s1", limit=100) if e["kind"] == "reset_dropped"]
-    assert "only a reset after liquidation clears that" in ev["message"]
+    assert "only a reset after liquidation clears that" in ev["message"]  # the supervisor's own words
     assert [d for d in store.decisions("s1") if d["action"] == "drop reset"]

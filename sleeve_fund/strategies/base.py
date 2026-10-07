@@ -33,7 +33,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of
-from sleeve_fund.paper.runtime import WIPED_OUT, liquidation_reason
+from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, WIPED_OUT, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma
 
@@ -47,8 +47,8 @@ LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 MINUTE_NS = 60_000_000_000
 DAY_NS = 86_400_000_000_000
 SAFETY_STOP_SHARE = 0.5  # of the way from the mark to the liquidation price (_safety_stop_on_restore)
-# The status reason the supervisor gives a refused start that still holds a position: it runs for its exits only.
-EXITS_ONLY = "exits only"
+# The status reason the supervisor gives a refused start that still holds a position: it runs for its exits only
+# (EXITS_ONLY, from the runtime).
 
 
 @dataclass(frozen=True)
@@ -1637,14 +1637,15 @@ class LongFlatStrategy(Strategy):
         if missing is None:
             self._noted.discard("degraded_bar")
             if self.runtime is not None:
-                self.runtime.holds.pop("data", None)
+                self.runtime.holds.pop("degraded_candle", None)
         else:
             self._no_entry_ts, self._degraded_missing = bar.ts_event, missing
             if self.runtime is not None:
                 # CHOKE (Advisor 22:29): while the latest candle is degraded nothing opens, and resting entries are
                 # cancelled at once, as for a halt; stops and exits still run on the last good data.
-                self.runtime.holds["data"] = (f"the latest {bar_minutes(self._cfg.bar_type)}-minute candle is degraded "
-                                              f"(missing {missing} of its minutes), and the next whole one clears that")
+                self.runtime.holds["degraded_candle"] = (
+                    f"the latest {bar_minutes(self._cfg.bar_type)}-minute candle is missing {missing} of its minutes. "
+                    "The next whole candle clears it")
                 self._cancel_resting_entries()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
@@ -3006,7 +3007,7 @@ class LongFlatStrategy(Strategy):
         for coid in kept:  # paper's kept post-only entry: no more slices of it go at market
             k = self._kept[coid]
             self._part_filled(coid, float(k["sent"]), k["order"].quantity.as_double(), why)
-            self._close_kept(coid, f"cancelled: nothing may open now, as {why}")
+            self._close_kept(coid, f"cancelled: nothing may open now. {why}")
 
     def _part_filled(self, coid: str, filled: float, qty: float, why: str) -> None:
         """Advisor 20:56: an entry part filled when the block starts has its rest cancelled and keeps what filled, with
@@ -3017,7 +3018,7 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         rt.store.event(rt.name, "error", "incident",
                        f"Incident, {rt.name}: an entry was part filled ({filled:g} of {qty:g}) when nothing could open "
-                       f"any more ({why}). Its rest is cancelled; what filled is kept with its stop, not closed; you "
+                       f"any more. {why} Its rest is cancelled; what filled is kept with its stop, not closed; you "
                        "decide what to do with it.", ts=rt.now())
 
     def _gated_fill(self, coid: str, qty: float, px: float) -> None:
@@ -3035,12 +3036,12 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         # Advisor 23:05 (SG7): a raced fill is treated as the block treats a position already held. A halt, a
         # liquidation and the daily pause flatten, so it is sold at once; Stop, stale data, funding and retire keep it.
-        sells = getattr(why, "code", None) in ("halted", "liquidated", "daily_pause")
+        sells = bool({*RESUMABLE, "liquidated", "daily_pause"} & set(getattr(why, "codes", ())))
         if sells:
             rt.raced = why
         rt.store.event(rt.name, "error", "incident",
-                       f"Incident, {rt.name}: an order that adds to the position filled while nothing may open ({why}): "
-                       f"{qty:g} at {px:,.6g}. "
+                       f"Incident, {rt.name}: an order that adds to the position filled while nothing may open: "
+                       f"{qty:g} at {px:,.6g}. {why} "
                        + ("It is sold at once through the exit path, as that block flattens what it holds." if sells else
                           "It is kept with its stop, not closed; you decide what to do with it."),
                        ts=rt.now())

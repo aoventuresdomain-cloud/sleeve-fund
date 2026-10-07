@@ -10,6 +10,7 @@ concurrency inside it.
 from __future__ import annotations
 
 import math
+import re
 
 from decimal import Decimal
 
@@ -33,6 +34,7 @@ LIQ_STUCK_HEAD = "A liquidation order is still working"
 
 WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
 RESET_AFTER_LIQUIDATION = LIQUIDATION_RESET  # what a reset after liquidation journals (#164)
+EXITS_ONLY = "exits only"  # how the status of a strategy run for its exits only begins (P1-U35)
 
 
 def liquidation_reason(head: str, covered: float) -> str:
@@ -47,71 +49,137 @@ def fold(text: str | None) -> str:
 LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a liquidation's halt, in any wording
 
 
-class Why(str):
-    """Why nothing opens, in words, with `code` saying which state it is, so callers key off the code and never the
-    words: liquidated, halted, daily_pause, retired, hold (the engine's own: stale data, missing funding), paused or
-    stopped. It compares and prints as its words."""
-    code: str
+# Reason codes (Advisor 7 Oct 00:20; QA pins them): stable, and listed in this order when several apply. Callers key
+# off the codes, never the words. Each cause's text for the PM starts with its label, gives the figure where there is
+# one, and says what alone clears it; no venue names.
+CODES = ("liquidated", "drawdown_halt", "halted", "daily_pause", "retired", "winding_down", "stopped", "paused",
+         "exits_only", "stale_data", "degraded_candle", "funding_missing")
+LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
+          "daily_pause": "Daily loss pause", "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
+          "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
+          "degraded_candle": "Degraded candle", "funding_missing": "No funding rate"}
+# The engine's holds (SleeveRuntime.holds) by key: a code, or an older key for one.
+HOLD_CODES = {"data": "degraded_candle", "stale": "stale_data", "funding": "funding_missing"}
+RESUMABLE = ("drawdown_halt", "halted")  # the halts the PM's Resume clears
 
-    def __new__(cls, text: str, code: str) -> Why:
+
+class Why(str):
+    """Why nothing opens, in words for the PM, with `code` (the first cause) and `codes` (every cause that applies, in
+    CODES order). It compares and prints as its words."""
+    code: str
+    codes: tuple[str, ...]
+
+    def __new__(cls, text: str, code: str, codes: tuple[str, ...] | None = None) -> Why:
         why = super().__new__(cls, text)
-        why.code = code
+        why.code, why.codes = code, tuple(codes or (code,))
         return why
 
+    @classmethod
+    def of(cls, causes: list[Why]) -> Why | None:
+        """Every cause in one, in CODES order, or None when there are none."""
+        if not causes:
+            return None
+        causes = sorted(causes, key=lambda w: CODES.index(w.code))
+        return cls(" ".join(causes), causes[0].code, tuple(w.code for w in causes))
 
-LIQUIDATED = Why("it was liquidated, and only a reset after liquidation clears that", "liquidated")
+
+def _cause(code: str, text: str) -> Why:
+    return Why(f"{LABELS[code]}: {text}", code)
 
 
-def clearing_action(sleeve, now: datetime | None = None) -> Why | None:
+def liquidated_why(head: str | None = None) -> Why:
+    """A liquidation, with its figures when the halt has them ("Position margin lost (liquidated): X, Y% ...")."""
+    figures = (head or "").partition("): ")[2].strip()
+    return _cause("liquidated", f"position margin lost{', ' + figures if figures else ''}. Only a reset after "
+                  "liquidation clears it.")
+
+
+LIQUIDATED = liquidated_why()
+
+
+def clearing_action(sleeve, now: datetime | None = None, since: datetime | None = None) -> Why | None:
     """What alone clears the halt a strategy is in, in words, or None when it isn't halted or paused for the day
     (Independent Quant Advisor, 6 Oct 18:17, HC): a liquidation only a reset after liquidation; a drawdown halt only a
     resume; a daily-loss pause only the next 00:00 UTC roll. Stop, Start and restarts never do. Without `now` a daily
     pause counts until the runtime itself rolls it; with it, one whose roll has passed doesn't, so a strategy stopped
-    across the roll can still be started (its first tick then lifts the pause)."""
+    across the roll can still be started (its first tick then lifts the pause). `since`: when the halt began."""
     reason = sleeve.status_reason or ""
     if sleeve.status == "halted":
         if fold(reason).startswith(LIQUIDATED_WORDS):
-            return LIQUIDATED
-        return Why(f"it is halted ({reason or 'by its risk limits'}), and only a resume clears that", "halted")
+            return liquidated_why(reason.split(";")[0])
+        at = f" since {since:%H:%M} UTC" if since else ""
+        if (m := re.search(r"drawdown ([\d.]+%) hit the ([\d.]+%) limit", reason)):
+            return _cause("drawdown_halt", f"down {m[1]} against a {m[2]} limit{at}. Only you can clear it, with Resume.")
+        if "drawdown" in fold(reason):
+            return _cause("drawdown_halt", f"{reason}{at}. Only you can clear it, with Resume.")
+        return _cause("halted", f"{reason or 'by its risk limits'}{at}. Only you can clear it, with Resume.")
     if sleeve.status == "paused" and sleeve.paused_until is not None and (now is None or sleeve.paused_until > now):
-        return Why(f"it is paused for the day's loss until {sleeve.paused_until:%d %b %H:%M} UTC, and only the next "
-                   "00:00 UTC roll clears that", "daily_pause")
+        roll = f"It clears at the 00:00 UTC roll on {sleeve.paused_until:%d %b}."
+        if (m := re.search(r"daily loss ([\d.]+%) hit the ([\d.]+%) limit", reason)):
+            return _cause("daily_pause", f"down {m[1]} today against a {m[2]} limit. {roll}")
+        return _cause("daily_pause", f"paused for the day's loss. {roll}")
     return None
 
 
 # A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
-BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens: "
+BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
 REFUSED = "entry_blocked"  # the decision log's action for an order the gate refused (QA's exposure-gate master)
-RETIRED = Why("it is retired (archived), and only Restore clears that", "retired")
+RETIRED = _cause("retired", "cannot be started. Only Restore brings it back.")
+STOPPED = _cause("stopped", "only Start clears it.")
+
+
+def _hold(key: str, text: str) -> Why:
+    code = HOLD_CODES.get(key, key if key in LABELS else "stale_data")
+    if key == "data" and "stale" in text:
+        code = "stale_data"
+    text = text.strip().rstrip(".")
+    return Why(text + "." if text.startswith(LABELS[code] + ":") else f"{LABELS[code]}: {text}.", code)
+
+
+def held_causes(text: str | None) -> dict[str, str]:
+    """The engine's holds named in a journaled why (an open block episode), as holds: {code: its words}."""
+    out = {}
+    labels = "|".join(re.escape(LABELS[c]) for c in CODES)
+    for part in re.split(rf"(?=\b(?:{labels}): )", text or ""):
+        for code in ("stale_data", "degraded_candle", "funding_missing"):
+            if part.startswith(LABELS[code] + ":"):
+                out[code] = part.strip()
+    return out
 
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
-                  holds: dict[str, str] | None = None, starting: bool = False) -> tuple[bool, Why | None]:
-    """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why in words). Blocked: liquidated
-    until a reset after liquidation (`liquidated`, from the journal: liquidation_head), a drawdown halt, the daily-loss
-    pause, then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
-    themselves) a pause with no end time, stopped, or a hold the engine has raised (`holds`, e.g. no funding rate or
-    stale data). The engine checks every order that would make the position bigger,
-    at submit and at fill; the supervisor and the dashboard's Start and Resume read the same answer. Stops,
-    reduce-only orders, the PM's close and a liquidation are never gated. The why carries a code (Why)."""
+                  holds: dict[str, str] | None = None, starting: bool = False,
+                  since: datetime | None = None) -> tuple[bool, Why | None]:
+    """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
+    reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
+    then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
+    themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
+    candle, no funding rate). The why lists every cause that applies (Advisor 00:20). The engine checks every order
+    that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
+    read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
+    causes = []
     if liquidated is not None:
-        return True, LIQUIDATED
-    why = clearing_action(sleeve, now)
-    if why is not None:
-        return True, why
+        causes.append(liquidated_why(liquidated))
+    halt = clearing_action(sleeve, now, since)
+    if halt is not None and not (liquidated is not None and halt.code == "liquidated"):
+        causes.append(halt)
     if archived:
-        return True, RETIRED
-    if starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
-        return False, None
-    for why in (holds or {}).values():  # the engine's own (stale data, missing funding), ahead of pause and stop
-        return True, Why(why, "hold")
-    if sleeve.status == "paused" and sleeve.paused_until is None:  # the PM's pause, a flatten, the kill switch, or
-        # started for its exits only (a daily-loss pause past its roll is lifted by the runtime's next tick)
-        return True, Why("it is paused", "paused")
-    if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
-        return True, Why("it is stopped, and only Start clears that", "stopped")
-    return False, None
+        causes.append(RETIRED)
+    if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
+        if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
+            causes.append(STOPPED)
+        if sleeve.status == "paused" and sleeve.paused_until is None:  # the PM's pause, a flatten, the kill switch,
+            # or started for its exits only (a daily-loss pause past its roll is lifted by the runtime's next tick)
+            reason = sleeve.status_reason or ""
+            if reason.startswith(EXITS_ONLY):
+                causes.append(_cause("exits_only", "it still holds a position it was stopped or refused with, so only "
+                                     "its exits run. Flatten closes it; Start lets it trade again."))
+            else:
+                causes.append(_cause("paused", f"{reason or 'by you'}. Only Resume clears it."))
+        causes += [_hold(k, v) for k, v in (holds or {}).items()]
+    why = Why.of(causes)
+    return why is not None, why
 
 
 def liquidation_head(store, name: str) -> str | None:
@@ -159,10 +227,18 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     """The gate for a strategy as its journal has it (blocked_state), for the supervisor, the dashboard and QA's
     exposure-gate set, with no process needed: the engine's own holds (stale data, missing funding) are read from the
     block episode it left open."""
-    held = None if starting else open_block(store, name, now)
-    return blocked_state(store.sleeve(name), now, liquidated=liquidation_head(store, name),
-                         archived=name in store.archived(), holds={"engine": held} if held else None,
-                         starting=starting)
+    held = None if starting else held_causes(open_block(store, name, now))
+    sleeve = store.sleeve(name)
+    return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
+                         holds=held or None, starting=starting, since=_halted_since(store, name, sleeve))
+
+
+def _halted_since(store, name: str, sleeve) -> datetime | None:
+    """When the halt a strategy is in began (its risk_halt event), for the PM's words."""
+    if sleeve is None or sleeve.status != "halted":
+        return None
+    last = store.last_event(name, ("risk_halt",))
+    return last["ts"] if last else None
 
 
 class SleeveRuntime:
@@ -336,7 +412,7 @@ class SleeveRuntime:
         blocked, why = blocked_state(state, self.now(),
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
-                                     holds=self.holds)
+                                     holds=self.holds, since=_halted_since(self.store, self.name, state))
         self._episode(why if blocked else None)
         return blocked, why
 
@@ -394,7 +470,7 @@ class SleeveRuntime:
     def refused(self, why: str, what: str) -> None:
         """One decision row for an order the gate refused (Advisor 22:29); the episode's cleared event counts them."""
         self._refused += 1
-        self.store.decide("system", REFUSED, f"Order not sent: {what}, and {why}", self.name)
+        self.store.decide("system", REFUSED, f"Order not sent: {what}. {why}", self.name)
 
     def can_open(self) -> bool:
         if self.wiped_out:

@@ -11,7 +11,7 @@ import test_replay
 from fastapi.testclient import TestClient
 
 from sleeve_fund.paper.journal import MemoryJournal
-from sleeve_fund.paper.runtime import WIPED_OUT, SleeveRuntime, blocked_state, entry_blocked
+from sleeve_fund.paper.runtime import CODES, LABELS, WIPED_OUT, SleeveRuntime, blocked_state, entry_blocked
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.strategies.base import LongFlatStrategy
@@ -24,26 +24,41 @@ def _state(status="running", reason="", paused_until=None, desired="running"):
     return SimpleNamespace(status=status, status_reason=reason, paused_until=paused_until, desired_state=desired)
 
 
-@pytest.mark.parametrize("state,kw,why", [
-    (_state(), {}, None),
-    (_state(), {"liquidated": WIPED_OUT}, "only a reset after liquidation clears that"),
-    (_state("halted", f"{WIPED_OUT}: 3,328.70, 33% of strategy equity at entry"), {}, "only a reset after liquidation"),
-    (_state("halted", "drawdown 21% from peak"), {}, "it is halted (drawdown 21% from peak), and only a resume clears"),
-    (_state("paused", "daily loss", NOW + timedelta(hours=12)), {}, "only the next 00:00 UTC roll clears that"),
-    (_state("paused", "daily loss", NOW - timedelta(minutes=1)), {}, None),  # past its roll: the runtime lifts it
-    (_state("paused", "paused by PM"), {}, "it is paused"),
-    (_state("paused", "paused by PM"), {"starting": True}, None),  # Start and Resume act on it themselves
-    (_state("stopped", desired="stopped"), {}, "it is stopped, and only Start clears that"),
-    (_state(desired="stopped"), {}, "it is stopped"),  # a Stop the supervisor hasn't acted on yet
-    (_state("stopped", desired="stopped"), {"starting": True}, None),  # Start is what clears a stop
-    (_state(), {"holds": {"funding": "no funding rate for the next settlement"}}, "no funding rate"),
-    (_state("paused", "paused by PM"), {"holds": {"data": "the latest candle is degraded"}}, "candle is degraded"),
-    (_state(), {"archived": True}, "it is retired (archived), and only Restore clears that"),
-    (_state("stopped", desired="stopped"), {"archived": True, "starting": True}, "retired"),
+@pytest.mark.parametrize("state,kw,codes,words", [
+    (_state(), {}, (), None),
+    (_state(), {"liquidated": WIPED_OUT}, ("liquidated",),
+     "Liquidated: position margin lost. Only a reset after liquidation clears it."),
+    (_state("halted", f"{WIPED_OUT}: 3,328.70, 33% of strategy equity at entry"), {}, ("liquidated",),
+     "Liquidated: position margin lost, 3,328.70, 33% of strategy equity at entry. Only a reset after liquidation"),
+    (_state("halted", "drawdown 15.3% hit the 15% limit"), {"since": NOW - timedelta(hours=2)}, ("drawdown_halt",),
+     "Drawdown halt: down 15.3% against a 15% limit since 10:00 UTC. Only you can clear it, with Resume."),
+    (_state("halted", "invalid equity data"), {}, ("halted",), "Halted: invalid equity data. Only you can clear it, with Resume."),
+    (_state("paused", "daily loss 3.2% hit the 3% limit", NOW + timedelta(hours=12)), {}, ("daily_pause",),
+     "Daily loss pause: down 3.2% today against a 3% limit. It clears at the 00:00 UTC roll on 07 Oct."),
+    (_state("paused", "daily loss", NOW - timedelta(minutes=1)), {}, (), None),  # past its roll: the runtime lifts it
+    (_state("paused", "paused by PM: news"), {}, ("paused",), "Paused: paused by PM: news. Only Resume clears it."),
+    (_state("paused", "paused by PM"), {"starting": True}, (), None),  # Start and Resume act on it themselves
+    (_state("paused", "exits only: stopped"), {}, ("exits_only",), "Exits only: it still holds a position"),
+    (_state("stopped", desired="stopped"), {}, ("stopped",), "Stopped: only Start clears it."),
+    (_state(desired="stopped"), {}, ("stopped",), "Stopped"),  # a Stop the supervisor hasn't acted on yet
+    (_state("stopped", desired="stopped"), {"starting": True}, (), None),  # Start is what clears a stop
+    (_state(), {"holds": {"funding": "no funding rate for the next settlement"}}, ("funding_missing",),
+     "No funding rate: no funding rate for the next settlement."),
+    (_state("paused", "paused by PM"), {"holds": {"data": "the latest candle is degraded"}},
+     ("paused", "degraded_candle"), "Paused: paused by PM. Only Resume clears it. Degraded candle: the latest candle"),
+    (_state(), {"holds": {"data": "the last candle is stale"}}, ("stale_data",), "Stale data: the last candle is stale."),
+    (_state(), {"archived": True}, ("retired",), "Retired: cannot be started."),
+    (_state("stopped", desired="stopped"), {"archived": True, "starting": True}, ("retired",), "Retired"),
+    # Every cause that applies, in the codes' order (Advisor 00:20)
+    (_state("halted", "drawdown 21% hit the 20% limit", desired="stopped"), {"archived": True,
+     "holds": {"funding": "none yet"}}, ("drawdown_halt", "retired", "stopped", "funding_missing"), "Drawdown halt"),
 ])
-def test_blocked_state_names_what_alone_clears_each_state(state, kw, why):
+def test_blocked_state_lists_every_cause_with_its_code_figure_and_what_clears_it(state, kw, codes, words):
     blocked, said = blocked_state(state, NOW, **kw)
-    assert blocked == (why is not None) and (said is None if why is None else why in said), said
+    assert blocked == bool(codes) and (said is None if not codes else said.codes == codes), said
+    if codes:
+        assert said.code == codes[0] and said.startswith(words), said
+        assert all(f"{LABELS[c]}:" in said for c in codes) and set(codes) <= set(CODES)
 
 
 def test_a_paper_runtime_is_blocked_by_a_stop_not_yet_acted_on_and_by_a_hold(store):
@@ -53,10 +68,10 @@ def test_a_paper_runtime_is_blocked_by_a_stop_not_yet_acted_on_and_by_a_hold(sto
     rt.on_start(0.008)
     assert rt.entry_blocked() == (False, None)
     rt.holds["data"] = "the last candle is stale"
-    assert rt.entry_blocked() == (True, "the last candle is stale")
+    assert rt.entry_blocked() == (True, "Stale data: the last candle is stale.")
     rt.holds.clear()
     store.set_desired_state("s1", "stopped")
-    assert rt.entry_blocked() == (True, "it is stopped, and only Start clears that")
+    assert rt.entry_blocked() == (True, "Stopped: only Start clears it.")
 
 
 def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(prices, instrument, monkeypatch):
@@ -77,7 +92,7 @@ def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(pric
     if before[-1]["intent"] == "entry":  # it held a position when the gate closed: its exit still went
         assert after and after[0]["intent"] != "entry"
     refused = [d for d in res.journal.decisions_ if d["action"] == "entry_blocked"]
-    assert refused and all(d["reason"].endswith("would open or add to the position, and held for the test")
+    assert refused and all(d["reason"].endswith("would open or add to the position. held for the test")
                            for d in refused), refused[:2]
 
 
@@ -92,7 +107,7 @@ def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_inciden
     for coid in ("e1", "e1", "x1", "s1", "s2"):  # two fills of an entry, an exit, two slices of one kept entry
         LongFlatStrategy._gated_fill(me, coid, 0.1, 60_000.0)
     inc, kept = [e for e in j.events_ if e["kind"] == "incident"]  # one for the entry, one for the kept order
-    assert inc["level"] == "error" and "filled while nothing may open (it is halted" in inc["message"]
+    assert inc["level"] == "error" and "filled while nothing may open: 0.1 at 60,000. it is halted" in inc["message"]
     assert "kept with its stop, not closed" in inc["message"]
 
 
@@ -118,8 +133,8 @@ def test_start_reads_the_journal_so_a_liquidation_overwritten_by_a_stop_is_still
     c, store = client
     store.event("s1", "error", "risk_halt", f"{WIPED_OUT}: 3,328.70, 33% of strategy equity at entry")
     store.set_status("s1", "stopped", "stopped by PM")  # an older supervisor wrote over the halt
-    assert entry_blocked(store, "s1", starting=True) == (
-        True, "it was liquidated, and only a reset after liquidation clears that")
+    blocked, why = entry_blocked(store, "s1", starting=True)
+    assert blocked and why.codes == ("liquidated",) and why.endswith("Only a reset after liquidation clears it.")
     assert "command_error" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
 
 
@@ -225,7 +240,8 @@ def test_a_block_episode_is_one_alert_and_one_cleared_event_with_its_refusals_an
         rt.entry_blocked()
     rt.refused("the latest candle is degraded", "entry buy 0.1 would open or add to the position")
     rt.refused("the latest candle is degraded", "entry buy 0.1 would open or add to the position")
-    assert entry_blocked(store, "s1") == (True, "the latest candle is degraded")  # no process needed
+    assert entry_blocked(store, "s1") == (True, "Degraded candle: the latest candle is degraded.")  # no process needed
+    assert entry_blocked(store, "s1")[1].codes == ("degraded_candle",)
     assert entry_blocked(store, "s1", starting=True) == (False, None)
     rt.holds.clear()
     assert rt.entry_blocked() == (False, None)
@@ -239,8 +255,8 @@ def test_a_block_episode_is_one_alert_and_one_cleared_event_with_its_refusals_an
 def test_an_archived_strategy_refuses_start_and_resume_naming_it_retired(client):
     c, store = client
     store.archive("s1")
-    assert "retired" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
-    assert "retired" in _cmd(c, "resume")
+    assert "Retired" in _cmd(c, "start") and store.sleeve("s1").desired_state == "stopped"
+    assert "Retired" in _cmd(c, "resume")
 
 
 @pytest.mark.parametrize("status,reason,until", [
@@ -260,7 +276,7 @@ def test_a_strategys_own_reset_never_clears_its_halt_or_daily_pause(store, statu
     s = store.sleeve("s1")
     assert s.status == status and store.pending_reset("s1") is None
     blocked, why = entry_blocked(store, "s1", starting=True)
-    assert blocked and ("only a resume" in why if status == "halted" else "00:00 UTC" in why), why
+    assert blocked and ("Only you can clear it" in why if status == "halted" else "00:00 UTC" in why), why
 
 
 @pytest.mark.no_open_risk_limit(reason="guards off: the 2x short must open in session 1 to be carried")

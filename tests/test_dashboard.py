@@ -2486,7 +2486,7 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
         assert "Its position margin was lost (liquidated)" not in page and "Nothing trades until you resume" in page
         r = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "carry on"}, auth=AUTH,
                    headers=SAME, follow_redirects=False)
-        assert "only+a+resume+clears+that" in r.headers["location"] and store.sleeve("btc-test").desired_state == "stopped"
+        assert "Only+you+can+clear+it%2C+with+Resume" in r.headers["location"] and store.sleeve("btc-test").desired_state == "stopped"
         r = c.post("/sleeves/btc-test/command", data={"command": "resume", "reason": "carry on"}, auth=AUTH,
                    headers=SAME, follow_redirects=False)
         assert "command_error" not in r.headers["location"]
