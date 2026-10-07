@@ -89,10 +89,11 @@ class Intent:
 
     def core(self) -> _Intent:
         """Per unit: margin at the leverage (spot: the full price); risk from the expected fill to the planned stop,
-        or the stopless measure, by open_risk.position_risk, plus both fees and the stop's slippage."""
+        or the stopless measure, by open_risk.position_risk. Fees and slippage stay in sizing, not in the open-risk
+        measure (HoE 20:12 UK; QA's cells all use none)."""
         px = D(self.price)
         stop = None if self.stop_frac is None else px * (1 - self.side * D(self.stop_frac))
-        risk = position_risk(Decimal(self.side), px, stop, self.atr_frac) + px * D(2 * self.fee_rate + self.slippage)
+        risk = position_risk(Decimal(self.side), px, stop, self.atr_frac)
         margin = px / D(self.leverage) if self.leverage else px
         return _Intent(underlying(self.instrument), self.side, D(self.qty), px, margin, risk, D(self.lot),
                        D(self.min_qty))

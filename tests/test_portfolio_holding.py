@@ -52,9 +52,10 @@ def test_g14_a_resting_hard_stop_bounds_a_trailing_position_and_without_one_it_i
     assert holding_for(_long(), D("110"), 0.02).risk == D("22.0")
 
 
-def test_exit_costs_add_to_the_risk_and_spot_margin_is_the_full_notional():
-    h = holding_for(_long(stop="95", lev=None), D("100"), None, exit_cost=0.001)
-    assert (h.margin, h.risk) == (D("200"), D("10") + D("0.200"))
+def test_spot_counts_its_risk_to_stop_and_its_full_notional_as_margin():
+    """Advisor GATE-SPOT (20:20 UK): the book-wide 5% counts spot positions' risk to their stop too."""
+    h = holding_for(_long(stop="95", lev=None), D("100"), None)
+    assert (h.margin, h.risk) == (D("200"), D("10"))
 
 
 def test_net_counts_by_underlying_with_a_venues_own_code_mapped():

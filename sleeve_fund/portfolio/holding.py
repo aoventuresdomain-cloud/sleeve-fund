@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sleeve_fund.money import money, scale
+from sleeve_fund.money import money
 from sleeve_fund.open_risk import position_risk
 from sleeve_fund.portfolio.limits import Holding
 from sleeve_fund.research.holdout import _ALIASES, underlying_of
@@ -46,13 +46,14 @@ class Position:
             raise ValueError(f"side is +1 or -1, not {self.side!r}")
 
 
-def holding_for(position: Position, mark, atr_pct: float | None, exit_cost: float = 0.0) -> Holding:
+def holding_for(position: Position, mark, atr_pct: float | None) -> Holding:
     """The book's Holding for `position` at `mark`: signed notional, margin (notional / leverage on a perp, the full
     notional on spot) and open risk from the mark (open_risk.position_risk: to the resting stop, or the stopless
-    measure when none rests or the price is through it) plus `exit_cost` (exit fee and stop slippage, a share of the
-    notional). Raises ValueError when a stopless position's daily ATR isn't known."""
+    measure when none rests or the price is through it). Costs and slippage stay in sizing, never in the open-risk
+    measure (HoE 20:12 UK, note v4 section 2). Spot counts too (Advisor GATE-SPOT, 20:20 UK). Raises ValueError when
+    a stopless position's daily ATR isn't known."""
     mark = money(mark, "mark")
     notional = position.side * position.qty * mark
     margin = abs(notional) / Decimal(repr(float(position.leverage))) if position.leverage else abs(notional)
     risk = position_risk(position.side * position.qty, mark, position.stop_price, atr_pct)
-    return Holding(underlying(position.instrument), notional, margin, risk + scale(abs(notional), exit_cost))
+    return Holding(underlying(position.instrument), notional, margin, risk)

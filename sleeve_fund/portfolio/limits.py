@@ -7,16 +7,16 @@ rejected. It never sees an exit, a stop, a reduce-only order, a close-now or a l
 book_breach() is the book-wide drawdown halt and daily pause. Paper and backtest call the same functions with the
 same inputs, so they give the same answer (QA's parity pins).
 
-Money and quantities are exact Decimals (sleeve_fund.money; day-0 interface note v4): a float for money is a
+Money and quantities are exact Decimals (sleeve_fund.money, PE1's #196; day-0 interface note v4): a float for money is a
 TypeError, NaN or Infinity a ValueError, both raised when the dataclass is built. Limits compare exactly; the
 figures in a decision are "x book" ratios and stay float."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
-from sleeve_fund.money import floor_to, money, scale
+from sleeve_fund.money import money, scale
 from sleeve_fund.risk import PortfolioProfile
 
 # The order limits are checked in, so a tie names the same limit every time (QA's limit_hit names).
@@ -100,6 +100,13 @@ class Decision:
     limit_hit: str | None  # the limit that bound it, if any (LIMITS, or a portfolio block)
     reason: str  # one sentence for the journal and the strategy page
     figures: dict = field(default_factory=dict)  # each limit: book before, after (at approved_qty), cap; x book
+
+
+def floor_to(qty: Decimal, step: Decimal) -> Decimal:
+    """`qty` rounded down to a whole number of `step`s (quantities round down to the lot); 0 when not above 0."""
+    if qty <= 0:
+        return ZERO
+    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
 def rejected(requested: Decimal, limit_hit: str | None, reason: str, figures: dict | None = None) -> Decision:
