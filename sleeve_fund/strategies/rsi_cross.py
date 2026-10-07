@@ -111,9 +111,10 @@ class RsiCross(LongFlatStrategy):
 
     def target_side(self, rsi: float, prev: float | None) -> int:
         """The side the rules want from this bar's RSI and the bar before's: +1 long, -1 short, 0 flat."""
-        c, ended = self.c, False
+        c, ended = self.c, 0
         if self._side:
             self._held += 1
+            leg_side = self._side
             if self._side == 1 and rsi >= c.long_exit:
                 self._side, self._why = 0, (f"RSI {rsi:.1f} reached {c.long_exit:g}: the long ends", {})
             elif self._side == -1 and rsi <= c.short_exit:
@@ -124,10 +125,15 @@ class RsiCross(LongFlatStrategy):
                                             "time stop", {})
             if self._side:
                 return self._side
-            ended = True
+            ended = leg_side
         cross = 1 if prev is not None and prev < c.long_entry <= rsi else (
             -1 if prev is not None and prev > c.short_entry >= rsi else 0)
-        if cross:
+        if cross and cross == ended:
+            # LEG-RE (Advisor 22:37): a leg closed on this candle's close is not re-entered on the same side on that
+            # candle; the earliest re-entry is the next one, on a fresh cross. The opposite side is a declared
+            # reversal and stays.
+            self._why = (f"{self._why[0]}; a new {'long' if cross > 0 else 'short'} waits for the next candle", {})
+        elif cross:
             allowed = self._trend_allows(cross)
             words = (f"RSI crossed back above {c.long_entry:g} ({prev:.1f} to {rsi:.1f})" if cross > 0 else
                      f"RSI crossed back below {c.short_entry:g} ({prev:.1f} to {rsi:.1f})")

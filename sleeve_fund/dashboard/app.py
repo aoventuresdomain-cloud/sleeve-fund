@@ -229,7 +229,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"],
-                        unbounded=len(positions["unbounded"]))
+                        unbounded=len(positions["unbounded"]), trailing=len(positions["trailing"]))
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
@@ -321,16 +321,22 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?kill_error=reason", status_code=303)
         _, _, summaries = book_data()
         targets = _kill_targets(summaries)
-        if not targets["all"]:
+        # P1-KR-1: one whose reset is under way, its flatten waiting, is not skipped: the reset's flatten makes the
+        # sale, and the kill switch is kept as the fresh run's pause.
+        held = [name for name in targets["flattening"]
+                if st().hold_on_reset(name, "flatten", f"Book kill switch: {why}")]
+        if not targets["all"] and not held:
             # Fired again, or nothing to sell: no decision to log, as nothing was done (review round 9, N1).
             return RedirectResponse("/risk?killed=0", status_code=303)
+        for name in held:
+            st().decide(actor, "flatten", f"Book kill switch: {why}", name)
         for x in targets["all"]:
             name = x["sleeve"].name
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
             if x["sleeve"].desired_state != "running":
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
-        n = len(targets["all"])
+        n = len(targets["all"]) + len(held)
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
@@ -501,6 +507,31 @@ def create_app(store: Store | None = None) -> FastAPI:
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
+    def _strategy_indicators(name: str) -> list[dict]:
+        """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):
+        as the platform recorded them, passed on untouched and never recomputed here. The store gives them once
+        the Quant Developer's recording lands; until then, or if it fails, the chart has none and still draws."""
+        source = getattr(st(), "chart_indicators", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart indicators for %s", name)
+            return []
+
+    def _strategy_decisions(name: str) -> list[dict]:
+        """Fills and missed entries the strategy recorded (P1-3m): [{kind: fill|missed, side, t, signal_t, price,
+        reason, code}], passed on untouched. Empty until the platform's journal read lands, or if it fails."""
+        source = getattr(st(), "chart_decisions", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart decisions for %s", name)
+            return []
+
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
         from sleeve_fund.dashboard import charts
@@ -540,6 +571,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
                               limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        data["indicators"] = _strategy_indicators(name)
+        data["decisions"] = _strategy_decisions(name)
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
@@ -654,6 +687,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
                     # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
+                    st().hold_on_reset(name, command, reason)  # P1-KR-3: a reset under way leaves it stopped
                 st().decide(actor, command, reason, name, ts=accepted)
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and not set(why.codes) <= set(RESUMABLE)):
@@ -663,8 +697,11 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
                 raise ValueError("it is already running, so there is nothing to resume")
             elif command == "flatten" and any(c["command"] == "flatten" for c in st().pending_commands(name)):
-                # A second would sell again whatever the first left (review round 10, m5).
-                raise ValueError("a flatten is already waiting for the strategy to act on it")
+                # A second would sell again whatever the first left (review round 10, m5). With a reset under way,
+                # the reset's flatten makes the sale and the PM's is kept as the fresh run's pause (P1-KR-1).
+                if not st().hold_on_reset(name, command, reason):
+                    raise ValueError("a flatten is already waiting for the strategy to act on it")
+                st().decide(actor, command, reason, name)
             elif command == "flatten" and st().sleeve(name).desired_state != "running":
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
