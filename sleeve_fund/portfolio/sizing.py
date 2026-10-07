@@ -2,7 +2,7 @@
 #165 (Independent Quant Advisor, 7 Oct 17:03), to the frozen day-0 interface note v4: money and quantities are Decimal,
 ratios are float, and nothing here reads a clock, a venue or the database.
 
-The risk budget is the strategy's allocated equity x its risk per trade (the caller passes the side's own, B1) x the
+The risk budget is the strategy's allocated equity x its risk per trade (per side, B1) x the
 regime weight fixed at entry x the definition's fraction of full size (A8). The quantity is that budget over what one
 unit loses if the stop is hit, costs and the stop's slippage included. Volatility targeting (B2) sizes the notional
 from the instrument's volatility instead, and still declares a stop; with both, the smaller size is taken, never their
@@ -47,7 +47,7 @@ OVERLAYS = ("stop", "vol_target")
 _MONEY = ("allocated_equity", "price", "lot", "min_qty", "atr", "max_notional", "volume_notional")
 _RATIOS = ("leg_cost", "half_spread", "risk_per_trade", "position_cap_pct", "leverage", "maintenance_margin",
            "stop_frac", "stop_slippage", "regime_weight", "fraction", "vol_target", "instrument_vol", "vol_floor",
-           "stop_to_liquidation")
+           "stop_to_liquidation", "risk_long", "risk_short")
 
 
 def rounds_up_too_often(entries: int, rounded_up: int) -> bool:
@@ -71,7 +71,7 @@ class SizingInputs:
     min_qty: Decimal
     leg_cost: float  # taker fee + half spread, share of notional
     half_spread: float
-    risk_per_trade: float  # share of allocated equity lost at the stop (the caller passes risk_long / risk_short)
+    risk_per_trade: float  # share of allocated equity lost at the stop, both sides unless overridden below
     position_cap_pct: float  # profile cap, on margin (perp) or notional (spot)
     leverage: float = 1.0
     perp: bool = False
@@ -88,6 +88,8 @@ class SizingInputs:
     max_notional: Decimal | None = None
     volume_notional: Decimal | None = None
     stop_to_liquidation: float | None = None  # None: the PM's half way
+    risk_long: float | None = None  # B1: per-side risk overrides, each defaulting to risk_per_trade
+    risk_short: float | None = None
 
     def __post_init__(self) -> None:
         # Money is refused as a float (TypeError) and as NaN or Infinity; ratios are refused as NaN or Infinity.
@@ -124,11 +126,20 @@ class Sizing:
         return self.qty > 0 and not self.skipped
 
 
+def _risk(i: SizingInputs) -> tuple[float, str]:
+    if i.side > 0 and i.risk_long is not None:
+        return i.risk_long, "risk per trade, long"
+    if i.side < 0 and i.risk_short is not None:
+        return i.risk_short, "risk per trade, short"
+    return i.risk_per_trade, "risk per trade"
+
+
 def _stop(i: SizingInputs) -> tuple[float | None, str]:
     if i.stop_frac is not None:
         return i.stop_frac, ""
     # No stop declared: the fallback, when there is an ATR to set it from; a zero or unknown one skips the entry.
     if i.atr is not None and i.atr > 0:
+        # The stop is a ratio (a share of the price), so it leaves Decimal here; it is never stored as money (SZ-F1).
         return float(i.atr * Decimal(repr(ATR_STOP_MULTIPLE)) / i.price), \
             f"stop {ATR_STOP_MULTIPLE:g} x ATR(14), none declared"
     return None, ""
@@ -145,7 +156,10 @@ def _validate(i: SizingInputs) -> None:
         raise ValueError(f"the fraction of full size is between 0 and 1, got {i.fraction}")
     if i.price <= 0 or i.lot <= 0 or i.min_qty < 0:
         raise ValueError(f"price and lot must be above 0 and min_qty not below it, got {i.price}, {i.lot}, {i.min_qty}")
-    for name in ("leg_cost", "half_spread", "risk_per_trade", "position_cap_pct", "maintenance_margin"):
+    for name in ("leg_cost", "half_spread", "risk_per_trade", "position_cap_pct", "maintenance_margin", "risk_long",
+                 "risk_short"):
+        if getattr(i, name) is None:
+            continue
         if getattr(i, name) < 0:
             raise ValueError(f"{name} must not be negative, got {getattr(i, name)}")
     if not i.leverage > 0:
@@ -169,6 +183,7 @@ def size_entry(i: SizingInputs) -> Sizing:
     """The quantity for one new entry, the limit that set it, and its risk, or why it is skipped."""
     _validate(i)
     zero = Decimal(0)
+    risk_pct, risk_name = _risk(i)
     stop, stop_note = _stop(i)
     equity = i.allocated_equity
     if stop is None:
@@ -176,8 +191,8 @@ def size_entry(i: SizingInputs) -> Sizing:
     if equity <= 0:
         return Sizing(zero, "", stop, zero, zero, skipped="no allocated equity to size from")
     loss = loss_at_stop(stop, i.leg_cost, i.side) + (1 - i.side * stop) * stop_slippage(i)  # per unit of notional
-    budget = scale(equity, i.risk_per_trade * i.regime_weight * i.fraction)
-    limits: dict[str, Decimal] = {"risk per trade": budget / Decimal(repr(loss))}
+    budget = scale(equity, risk_pct * i.regime_weight * i.fraction)
+    limits: dict[str, Decimal] = {risk_name: budget / Decimal(repr(loss))}
     if i.overlay == "vol_target":
         # No volatility, or no floor under it, skips the entry rather than sizing on a guess (Advisor, 16:45).
         known = [v for v in (i.instrument_vol, i.vol_floor) if v is not None]
@@ -210,7 +225,7 @@ def size_entry(i: SizingInputs) -> Sizing:
     least = (i.min_qty / i.lot).to_integral_value(rounding=ROUND_UP) * i.lot if i.min_qty > 0 else i.lot
     least_notional = least * i.price
     least_risk = least * per_unit_loss
-    hard = {k: v for k, v in limits.items() if k not in ("volatility target", "risk per trade")}  # caps, not sizes
+    hard = {k: v for k, v in limits.items() if k not in ("volatility target", risk_name)}  # caps, not sizes
     broken = [k for k, v in hard.items() if least_notional > v]
     if budget > 0 and least_risk <= scale(budget, ROUND_UP_RISK) and not broken:
         return Sizing(least, f"venue minimum (rounded up from {qty})", stop, budget, least_risk, limits,
@@ -227,12 +242,12 @@ def margin_per_unit(i: SizingInputs) -> Decimal:
 
 
 def risk_per_unit(s: Sizing, i: SizingInputs, atr_pct: float | None = None) -> Decimal:
-    """What one unit risks, for the gate's Intent.risk_per_unit, so sizing and the gate never differ. With a stop: the
-    loss to it from the expected fill, costs and the stop's slippage included, as size_entry sized it. With none: the
-    stopless measure, price x max(10%, 3 x the daily ATR share), from open_risk.stopless_move (Advisor guarantee 2)."""
+    """What one unit risks for the gate's Intent.risk_per_unit, by open_risk.position_risk's rule (note v4 section 2), so
+    the gate counts an entry as it counts the position once held. With a stop: the distance from the expected fill to
+    it, |price - stop price|. With none: the stopless measure, price x max(10%, 3 x the daily ATR share), from
+    open_risk.stopless_move (Advisor guarantee 2). Costs and slippage are sizing's, in Sizing.risk_amount."""
     if s.stop_frac is not None:
-        return scale(i.price, loss_at_stop(s.stop_frac, i.leg_cost, i.side)
-                     + (1 - i.side * s.stop_frac) * stop_slippage(i))
+        return scale(i.price, s.stop_frac)
     from sleeve_fund.open_risk import stopless_move
 
     if atr_pct is None or not math.isfinite(atr_pct):

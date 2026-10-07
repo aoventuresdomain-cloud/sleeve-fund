@@ -2,8 +2,7 @@
 against hand calculations; Decimal money; and the Independent Quant Advisor's three guarantees (MUST FIX, 7 Oct 17:03).
 
 Ported from #165's tests/test_sizing.py. Inputs are now Decimal money, per the frozen day-0 interface note v4; every
-expected value is unchanged. #165's per-side fields (risk_long, risk_short) left the interface: the caller passes the
-side's risk as risk_per_trade, so that test now passes each side's own."""
+expected value is unchanged."""
 
 import ast
 import dataclasses
@@ -78,9 +77,10 @@ def test_a_strategy_rounding_up_on_more_than_a_fifth_of_its_entries_is_flagged()
 
 
 def test_shorts_can_carry_half_the_risk_of_longs():
-    """B1: the caller passes each side's own risk; a short at 0.5% risks half what a long at 1% does."""
-    long_ = size_entry(_in(risk_per_trade=0.01))
-    short = size_entry(_in(side=-1, risk_per_trade=0.005))
+    """B1: everything else equal, a short at 0.5% risks half what a long at 1% does."""
+    long_ = size_entry(_in(risk_long=0.01, risk_short=0.005))
+    short = size_entry(_in(side=-1, risk_long=0.01, risk_short=0.005))
+    assert short.sized_by == "risk per trade, short" and long_.sized_by == "risk per trade, long"
     assert short.risk_budget == long_.risk_budget / 2
     assert float(short.risk_amount) == pytest.approx(float(short.risk_budget), rel=1e-3)
 
@@ -222,7 +222,7 @@ def test_the_inputs_keep_the_frozen_interface():
         "allocated_equity", "price", "side", "lot", "min_qty", "leg_cost", "half_spread", "risk_per_trade",
         "position_cap_pct", "leverage", "perp", "maintenance_margin", "stop_frac", "atr", "stop_slippage",
         "regime_weight", "fraction", "overlay", "vol_target", "instrument_vol", "vol_floor", "max_notional",
-        "volume_notional", "stop_to_liquidation"]
+        "volume_notional", "stop_to_liquidation", "risk_long", "risk_short"]
     assert [f.name for f in dataclasses.fields(sizing.Sizing)] == [
         "qty", "sized_by", "stop_frac", "risk_budget", "risk_amount", "limits", "rounded_up", "skipped"]
 
@@ -275,11 +275,17 @@ def test_guarantee_2_stopless_open_risk_counts_at_notional_times_max_of_10pct_an
         risk_per_unit(stopless, i, None)
 
 
-def test_guarantee_2_a_stopped_entry_risks_what_sizing_sized_it_to_lose():
-    """Sizing and the gate use one number: the gate's risk per unit x qty is the sizing's risk amount."""
-    i = _in(perp=True, leverage=3.0, half_spread=0.0004, stop_slippage=None)
+@pytest.mark.parametrize("side", [1, -1])
+def test_guarantee_2_a_stopped_entry_counts_as_open_risk_counts_the_position(side):
+    """Note v4 section 2: the gate's per-unit risk is open_risk.position_risk's, the distance to the stop, so an entry
+    counts as its position will once held. Sizing's costs and slippage stay in its own risk amount, above it."""
+    from sleeve_fund.open_risk import position_risk
+
+    i = _in(side=side, perp=True, leverage=3.0, stop_frac=0.03, half_spread=0.0004, stop_slippage=None)
     s = size_entry(i)
-    assert risk_per_unit(s, i) * s.qty == s.risk_amount
+    held = position_risk(side * float(s.qty), 100.0, 100 * (1 - side * 0.03), 0.02)
+    assert float(risk_per_unit(s, i) * s.qty) == pytest.approx(held, abs=1e-9)
+    assert risk_per_unit(s, i) * s.qty < s.risk_amount
     assert margin_per_unit(i) == D(100) / 3 and margin_per_unit(_in()) == D(100)
 
 
@@ -298,7 +304,24 @@ def test_guarantee_3_on_a_perp_the_stop_is_never_further_than_half_the_distance_
     assert any(k.startswith("liquidation rule") for k in s.limits)
 
 
-def test_guarantee_3_a_share_past_half_way_is_refused():
+def test_guarantee_3_the_venues_maintenance_margin_counts():
+    """Advisor 20:08 UK (a): liquidation is measured with the venue's maintenance margin, never a zero approximation:
+    10,000 / (0.2 / 0.5 + mm) at mm 0 and 0.05."""
+    kw = dict(perp=True, leverage=3.0, position_cap_pct=1.0, stop_frac=0.2, risk_per_trade=0.9)
+    assert size_entry(_in(**kw, maintenance_margin=0.0)).qty == D("250.00")
+    assert size_entry(_in(**kw, maintenance_margin=0.05)).qty == D("222.22")
+
+
+def test_guarantee_3_never_refuses_a_stopless_entry_the_1x_cap_governs_it():
+    """Advisor 20:08 UK (b): the half-way check needs a stop. A stopless entry never reaches it: it is skipped for having
+    no stop (guarantee 1), never refused by the liquidation rule."""
+    s = size_entry(_in(perp=True, leverage=5.0, stop_frac=None, atr=None))
+    assert not s.ok and "no sizing without a stop" in s.skipped and "liquidation" not in s.skipped
+    assert not any(k.startswith("liquidation rule") for k in s.limits)
+
+
+def test_guarantee_3_exactly_half_way_is_allowed_and_past_it_refused():
+    assert size_entry(_in(perp=True, leverage=3.0, stop_to_liquidation=0.5)).ok
     with pytest.raises(ValueError, match="at most 50% of the way"):
         size_entry(_in(perp=True, leverage=3.0, stop_to_liquidation=0.6))
 
