@@ -37,6 +37,7 @@ from sqlalchemy import (
     insert,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -171,10 +172,14 @@ commands_t = Table(
     metadata,
     Column("id", Integer, primary_key=True),
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
-    Column("command", String(16), nullable=False),
+    Column("command", String(32), nullable=False),
     Column("reason", Text, nullable=False),
     Column("created_at", TS, nullable=False),
     Column("applied_at", TS),
+    # The liquidation incident (events.id) a reset after liquidation answers; one command per incident (P1-RAL).
+    Column("incident", Integer, ForeignKey("events.id", ondelete="RESTRICT")),
+    Index("commands_incident", "incident", unique=True, postgresql_where=text("incident IS NOT NULL"),
+          sqlite_where=text("incident IS NOT NULL")),
 )
 
 decisions_t = Table(
@@ -1760,9 +1765,12 @@ class Store:
 
     # --- PM commands and decisions ----------------------------------------------
 
-    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True) -> None:
+    def command(self, sleeve: str, command: str, reason: str, actor: str = "PM", holds_through_reset: bool = True,
+                incident: int | None = None) -> None:
         """holds_through_reset: a pause or flatten asked for while a reset is under way is kept on the fresh run, as
-        one in force before the reset is (m13-U5); the reset's own flatten passes False."""
+        one in force before the reset is (m13-U5); the reset's own flatten passes False. `incident`: the liquidation
+        event a reset after liquidation answers; a second command for the same incident raises IntegrityError
+        (commands_incident), so a retry or a double click never resets twice."""
         if command not in COMMANDS:
             raise ValueError(f"bad command {command!r}")
         if not reason.strip():
@@ -1772,7 +1780,7 @@ class Store:
         self.sleeve(sleeve)  # raises if unknown
         with self.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve=sleeve, command=command, reason=reason.strip(),
-                                                created_at=utcnow()))
+                                                created_at=utcnow(), incident=incident))
             if holds_through_reset and command in ("pause", "flatten"):
                 self._hold_on_reset(c, sleeve, command, reason)
         self.decide(actor, command, reason, sleeve)
