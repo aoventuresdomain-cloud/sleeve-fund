@@ -100,6 +100,8 @@ def strategies(tearsheets: Path, sleeves: list) -> list[dict]:
     out = []
     for name in sorted(REGISTRY):
         spec = importlib.import_module(f"sleeve_fund.strategies.{name}").SPEC
+        if not spec.listed:
+            continue
         mine = [s for s in sheets if s["strategy"] == name]
         real = _real(sheets, name)
         # The newest verdict per instrument and bar length; a pass lists where it holds.
