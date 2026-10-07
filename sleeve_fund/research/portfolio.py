@@ -82,6 +82,9 @@ class CloseBatch:
         """Queue an intent for the close `ts`; the first one for that close arms the alert on `clock`."""
         if item.strategy not in self.order:
             raise ValueError(f"{item.strategy!r} is not in this run")
+        if any(t == ts for t, _ in self.passes):
+            # Fail loudly: re-arming would put an alert in the past and the intent would skip the close's one pass.
+            raise ValueError(f"the close {ts} has already been gated")
         first = ts not in self.pending
         self.pending.setdefault(ts, []).append(item)
         if first:

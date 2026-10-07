@@ -16,8 +16,15 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund.data import bar_type_for, synthetic_ohlcv, to_bars
 from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
 from sleeve_fund.research import portfolio
-from sleeve_fund.research.portfolio import (BATCH_DELAY_NS, CloseBatch, Pending, clone_instrument, clone_venue,
-                                            fill_price, strategy_order)
+from sleeve_fund.research.portfolio import (
+    BATCH_DELAY_NS,
+    CloseBatch,
+    Pending,
+    clone_instrument,
+    clone_venue,
+    fill_price,
+    strategy_order,
+)
 
 FEES = FeeSchedule(D("0.001"), D("0.002"))
 
@@ -36,11 +43,11 @@ def test_a_clone_is_the_same_instrument_on_its_own_venue(make):
 
 
 def test_the_expected_fill_is_the_close_plus_half_the_spread_for_the_side():
-    assert fill_price(D("100"), 1, 0.0005) == D("100.0500")
-    assert fill_price(D("100"), -1, 0.0005) == D("99.9500")
+    assert fill_price(D(100), 1, 0.0005) == D("100.0500")
+    assert fill_price(D(100), -1, 0.0005) == D("99.9500")
     # ACT-DRIFT (Advisor 20:05 UK): one hook, zero until the parity data says otherwise.
     assert portfolio.ACT_DRIFT_BP == 0.0
-    assert fill_price(D("100"), 1, 0.0005, drift_bp=2.5) == D("100.075000")
+    assert fill_price(D(100), 1, 0.0005, drift_bp=2.5) == D("100.075000")
     with pytest.raises(TypeError):
         fill_price(100.0, 1, 0.0005)
 
@@ -85,6 +92,16 @@ def test_a_close_is_gated_once_in_the_runs_order_whatever_order_the_intents_came
         batch.post(clock, 2_000, Pending("gamma", "x", lambda i, d: None))
 
 
+def test_an_intent_for_a_close_already_gated_is_refused_loudly():
+    batch = CloseBatch(("alpha",), gate=lambda s, i, t: SimpleNamespace(approved_qty=D(1)))
+    clock = _Clock()
+    batch.post(clock, 1_000, Pending("alpha", "a1", lambda i, d: None))
+    clock.alerts[0][2](None)
+    with pytest.raises(ValueError, match="already been gated"):
+        batch.post(clock, 1_000, Pending("alpha", "late", lambda i, d: None))
+    assert len(clock.alerts) == 1 and not batch.pending  # no alert re-armed in the past, nothing queued
+
+
 # --- in one engine: clones, close + 1 ns, determinism ----------------------------------------------------------------
 
 class _LegConfig(StrategyConfig):
@@ -127,7 +144,8 @@ def _run():
     spot = spot_pair("BTC", "USD", FEES, Venue("KRAKEN"))
     perp = perpetual("BTC", "USD", FEES, Venue("KRAKEN"), symbol="PF_XBTUSD")
     legs = {"alpha": [clone_instrument(spot, clone_venue("KRAKEN", 1))],
-            "beta": [clone_instrument(spot, clone_venue("KRAKEN", 2)), clone_instrument(perp, clone_venue("KRAKEN", 3))]}
+            "beta": [clone_instrument(spot, clone_venue("KRAKEN", 2)),
+                     clone_instrument(perp, clone_venue("KRAKEN", 3))]}
     prices = synthetic_ohlcv(days=30, seed=1)
     batch = CloseBatch(strategy_order(legs), gate=lambda s, i, t: SimpleNamespace(approved_qty=D(1)))
     strategies = {}
