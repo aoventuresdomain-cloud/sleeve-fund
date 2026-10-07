@@ -14,7 +14,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund.instruments import FeeSchedule
-from sleeve_fund.margin import isolated_liquidation, isolated_margin, liquidation_price  # noqa: F401 (re-exported)
+from sleeve_fund.margin import (  # noqa: F401 (re-exported)
+    isolated_liquidation,
+    isolated_margin,
+    liquidation_price,
+)
 
 SPOT = "spot"
 PERP = "perp"

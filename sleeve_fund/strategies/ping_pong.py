@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from nautilus_trader.model import Bar
 
-from sleeve_fund.strategies.base import Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import EXIT_LEGS, Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
     summary="Buys at the start, sells once the close rises {rise} above the close it bought on (0.01 = 1%), "
@@ -52,8 +52,7 @@ class PingPong(LongFlatStrategy):
         self._ref: float | None = None
         self._why = ("", {})
 
-    def on_start(self) -> None:
-        super().on_start()
+    def resume_cycle(self) -> None:
         if self.runtime is None or self.runtime.backtest:
             return
         # After a restart, pick the cycle up from the journal: long from the average entry, or waiting to buy
@@ -65,6 +64,15 @@ class PingPong(LongFlatStrategy):
             self._side, self._ref = (1 if qty > 0 else -1), float(entry)
             return
         last = self.runtime.last_fill_this_run()
+        # A stop or target that closed the leg doesn't move the cycle on: straight through it stays on that leg, from
+        # the entry, under the exit lock (R-I5-1), so it is picked up there, not from the exit's fill. A liquidation
+        # isn't: it is picked up from its fill, or afresh once the PM's reset after it has come (RAL-ANCHOR).
+        filled = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000) if (o["filled_qty"] or 0) > 0]
+        if last and filled and filled[0]["intent"] in EXIT_LEGS:
+            entry = next((o for o in filled if o["intent"] == "entry"), None)
+            if entry is not None and entry["avg_px"]:
+                self._side, self._ref = (1 if entry["side"] == "BUY" else -1), float(entry["avg_px"])
+                return
         if last:
             self._side, self._ref = (-1 if last["side"] == "SELL" else 1), float(last["price"])
 

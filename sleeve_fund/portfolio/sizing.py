@@ -10,7 +10,9 @@ product. Then the caps, smallest first wins:
 
 - position cap: on a perpetual the margin is at most the profile's cap x allocated equity, and notional = margin x
   leverage (the PM's perp rule); on spot the cap applies to the notional;
-- leverage cap: notional at most allocated equity x leverage, less room for the fee;
+- leverage cap, on a perpetual: the margin plus the round trip's taker fees fit the allocated equity, so notional is
+  at most equity / (1/leverage + 2 x the taker rate) (SZ-LEV-FEE, Advisor 7 Oct 21:53 UK). The rate is the fill model's
+  own (FeeSchedule.taker), never a constant here; a perpetual entry without it is refused;
 - largest order cap, and a share of the bar's volume;
 - on a perpetual, the PM's liquidation rule: the stop sits no further than half the way to the liquidation price
   (or the profile's tighter share). The engine posts ISOLATED margin, notional / the leverage (markets.isolated_margin),
@@ -34,10 +36,10 @@ stays within 1.5 x the budget and no cap is broken; otherwise it is skipped, say
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from types import MappingProxyType
-from collections.abc import Mapping
 
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.money import money, scale
@@ -95,6 +97,7 @@ class SizingInputs:
     stop_to_liquidation: float | None = None  # None: the PM's half way
     risk_long: float | None = None  # B1: per-side risk overrides, each defaulting to risk_per_trade
     risk_short: float | None = None
+    taker_fee: Decimal | None = None  # the fill model's taker rate (FeeSchedule.taker); a perp entry needs it
 
     def __post_init__(self) -> None:
         # Money is refused as a float (TypeError) and as NaN or Infinity; ratios are refused as NaN or Infinity.
@@ -220,7 +223,13 @@ def size_entry(i: SizingInputs) -> Sizing:
         limits["volatility target"] = scale(equity, i.vol_target / vol * i.regime_weight * i.fraction)
     limits["margin cap" if i.perp else "position cap"] = scale(equity, i.position_cap_pct * i.leverage)
     if i.perp:
-        limits[f"{i.leverage:g}x leverage cap"] = scale(equity, i.leverage * (1 - i.leg_cost))
+        taker = i.taker_fee
+        if not isinstance(taker, Decimal) or not taker.is_finite() or taker < 0:
+            return Sizing(zero, "", stop, budget, zero, limits, skipped=(
+                "entry refused: the venue's taker fee rate isn't known, so the leverage cap can't make room for the "
+                "fees"))
+        # Margin (notional / L) plus the taker fee in and out (2 x rate x notional) fit the equity (SZ-LEV-FEE).
+        limits[f"{i.leverage:g}x leverage cap"] = equity / (1 / Decimal(repr(i.leverage)) + 2 * taker)
         share = STOP_TO_LIQUIDATION if i.stop_to_liquidation is None else i.stop_to_liquidation
         distance = liquidation_distance(i)
         if stop > share * distance:
