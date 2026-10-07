@@ -561,3 +561,47 @@ def test_results_page_shows_the_guardrail_figures_and_says_not_judged_under_100_
     text = page.locator("main").inner_text()
     assert "150 of 100 needed" in text and "Not judged. 150" not in text and errors == []
     page.context.close()
+
+
+def test_a_liquidated_strategy_says_what_clears_it_and_its_reset_shows_refusals(site, browser):
+    """P1-RAL screen: the page names why it is halted and the one thing that clears it; the dialog shows the loss, asks
+    for the incident note, refuses a reset without it in words, and sends the reset once the note is written."""
+    import httpx
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+
+    form = {"name": "liq-trend", "strategy": "trend_filter", "instrument": "ETH/USD", "bar_spec": "1-DAY-LAST-EXTERNAL",
+            "starting_balance": "5000", "risk_profile": "balanced", "warmup_bars": "0",
+            "p_trend_filter__fast": "10", "p_trend_filter__slow": "30", "reason": "browser test"}
+    r = httpx.post(f"{site}/sleeves/new", data=form, auth=("pm", PASSWORD), headers={"origin": site})
+    assert r.status_code in (200, 303), r.text[:300]
+    store = Store(f"sqlite:///{app_mod.TEARSHEETS}/b.db")
+    store.set_desired_state("liq-trend", "running")
+    store.event("liq-trend", "error", "liquidation", "Liquidated: the price 2,000 gapped through 2,100")
+    store.set_status("liq-trend", "halted",
+                     "Position margin lost (liquidated): 3,328.70, 112.4% of strategy equity at entry (includes adds)")
+    store.event("liq-trend", "error", "incident", "Incident: liquidated; 1,671.30 left")
+
+    page, errors = _open(browser, f"{site}/sleeves/liq-trend")
+    assert "Only a reset after liquidation clears it" in page.inner_text("[data-live=banners]")
+    assert page.locator("button[data-open=dlg-resume]").count() == 0
+    page.click("button[data-open=dlg-ral]")
+    dialog = page.locator("#dlg-ral")
+    assert dialog.is_visible()
+    assert "3,328.70" in dialog.inner_text() and "112.4% of its equity when the position was opened" in dialog.inner_text()
+    dialog.locator("form").nth(1).locator("button[name=command]").click()  # reset before the note
+    page.wait_for_load_state()
+    assert "Not done:" in page.inner_text("main") and "no note yet" in page.inner_text("main")
+    page.click("button[data-open=dlg-ral]")
+    dialog.locator("input[name=author]").fill("PM")
+    dialog.locator("textarea[name=why_stop_did_not_protect]").fill("The price gapped past the half-liquidation stop")
+    dialog.locator("form").nth(0).locator("button").click()
+    page.wait_for_load_state()
+    page.click("button[data-open=dlg-ral]")
+    assert "Written by PM" in dialog.inner_text()
+    dialog.locator("form").nth(1).locator("button[name=command]").click()
+    page.wait_for_load_state()
+    assert any(c["command"] == "reset_after_liquidation" for c in store.pending_commands("liq-trend"))
+    assert "Not done:" not in page.inner_text("main") and errors == []
+    page.context.close()

@@ -97,8 +97,9 @@ def _notional(fills):
 
 def _rate(order):
     """What the venue charges this order on its notional, as the journal books it: the maker fee on a
-    post-only order, else the taker fee plus the half spread (a backtest books the spread as a cost)."""
-    return MAKER if order["order_type"] == "POST-ONLY LIMIT" else TAKER + HALF
+    post-only order, else the taker fee. A backtest's taker fill is booked at the ask or bid, half the spread
+    in its price (Advisor 6 Oct 20:55), and a stop's slippage likewise (P1-D13), so neither is in the fee."""
+    return MAKER if order["order_type"] == "POST-ONLY LIMIT" else TAKER
 
 
 def _assert_every_fee(j):
@@ -119,7 +120,8 @@ def test_every_fill_pays_its_rate_on_its_own_notional(name, capital):
     j = _run(_bars(px), inst, capital=capital).journal
     _assert_every_fee(j)
     total = sum(f["fee"] for f in j.fills_)
-    assert total == pytest.approx(_notional(j.fills_) * (TAKER + HALF), rel=1e-3, abs=CENT * len(j.fills_))
+    # The half spread is in each price, not the fee (Advisor 6 Oct 20:55).
+    assert total == pytest.approx(_notional(j.fills_) * TAKER, rel=1e-3, abs=CENT * len(j.fills_))
 
 
 # Each sizing knob, at two settings: the entry's notional must follow the knob by the expected ratio,
@@ -153,7 +155,7 @@ def test_fees_follow_the_size_whatever_sets_it(knob):
     traded = [_notional(j.fills_) for j in runs]
     assert fees[1] / fees[0] == pytest.approx(traded[1] / traded[0], rel=0.01), (fees, traded)
     for f, t in zip(fees, traded):
-        assert f / t == pytest.approx(TAKER + HALF, rel=1e-3), (f, t)
+        assert f / t == pytest.approx(TAKER, rel=1e-3), (f, t)  # the half spread is in the price (20:55)
 
 
 def _maker_run(px, inst, vol_per_minute, capital=10_000.0):
@@ -187,7 +189,11 @@ def test_post_only_orders_filled_in_slices_still_pay_the_maker_rate_overall(capi
     maker = [f for f in j.fills_ if j.orders_[f["order_id"]]["order_type"] == "POST-ONLY LIMIT"]
     assert len(maker) > len({f["order_id"] for f in maker}), "expected slices"
     _assert_every_fee(j)
-    assert sum(f["fee"] for f in maker) / _notional(maker) == pytest.approx(MAKER, rel=0.01)
+    # Each fee is rounded to the cent with the remainder carried to the next, whichever order that is; a taker fill's
+    # journal fee keeps its exact spread out (the spread is in its price, Advisor 6 Oct 20:55), so up to a cent per
+    # taker fill can carry into the maker ones.
+    takers = len(j.fills_) - len(maker)
+    assert sum(f["fee"] for f in maker) == pytest.approx(_notional(maker) * MAKER, rel=0.01, abs=CENT * takers)
 
 
 # --- the books --------------------------------------------------------------------------------------
@@ -259,11 +265,25 @@ def _drops(px, stop, n=200, minutes=60):
                          "close": c, "volume": 1e9 / px}, index=idx)
 
 
+def _minutes_of(hours):
+    """Minute bars inside each hour bar, moving in a straight line from its open to its close."""
+    rows = []
+    for ts, b in hours.iterrows():
+        path = np.linspace(b["open"], b["close"], 61)
+        for k in range(60):
+            o, c = path[k], path[k + 1]
+            rows.append((ts - pd.Timedelta(minutes=59 - k), o, max(o, c), min(o, c), c, b["volume"] / 60))
+    return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+
+
 @pytest.mark.parametrize("risk", [0.005, 0.02])
 def test_one_r_is_the_loss_at_the_stop_and_a_stop_loses_one_r(risk):
     inst, px = INSTRUMENTS["BTC"]
     stop = 0.02
-    j = _run(_drops(px, stop), inst, {"period": 2, "stop_loss": stop, "risk_per_trade": risk}).journal
+    # With minute execution bars: on hour bars alone the stop is booked at the bar's low, past its level (P1-D13).
+    hours = _drops(px, stop)
+    j = _run(hours, inst, {"period": 2, "stop_loss": stop, "risk_per_trade": risk}, exec_prices=_minutes_of(hours),
+             exec_minutes=1).journal
     entries = _entries(j)
     assert entries
     for o in entries:
@@ -281,8 +301,8 @@ def test_one_r_is_the_loss_at_the_stop_and_a_stop_loses_one_r(risk):
         got = sum(f["qty"] * f["price"] - f["fee"] for f in by_order[o["order_id"]])
         realised_r = (got - cost) / entry["signal"]["risk_amount"]
         assert realised_r == pytest.approx(-1.0, abs=0.02), (entry, o, realised_r)
-        # And the stop sold at its level, not somewhere else on the bar.
-        assert o["avg_px"] == pytest.approx(entry["avg_px"] * (1 - stop), rel=2e-4), o
+        # And the stop sold at its level less its slippage, max(half spread, 0.05%), not somewhere else on the bar.
+        assert o["avg_px"] == pytest.approx(entry["avg_px"] * (1 - stop) * (1 - max(HALF, 0.0005)), rel=2e-4), o
 
 
 # --- paper and the backtest on the same prices ------------------------------------------------------
@@ -321,9 +341,18 @@ def _record(path, prices, params, profile="aggressive", size=1.0, strategy="prob
     return pd.Series(np.round(prices, 1), index=pd.to_datetime(stamps, utc=True))
 
 
-def _per_order(fills, intents):
-    """(side, intent, minute, qty, all-in price, fee) per order, in fill order. The all-in price
-    includes the fee and spread: paper pays the spread in its price and the backtest with its fee."""
+def _stop_level(order):
+    """A stop's level from its order's signal, as both paths set it: the entry price less (long) or plus (short) the
+    stop distance; None for any other order."""
+    sig = (order or {}).get("signal") or {}
+    if order is None or order.get("intent") != "stop_loss" or "entry_px" not in sig:
+        return None
+    return sig["entry_px"] * (1 - sig["stop_loss"] if order["side"] == "SELL" else 1 + sig["stop_loss"])
+
+
+def _per_order(fills, intents, orders=None):
+    """(side, intent, minute, qty, all-in price, fee, fill price, stop level) per order, in fill order. The all-in
+    price includes the fee and spread: paper pays the spread in its price and the backtest with its fee."""
     out = {}
     for f in fills:
         side, qty, notional, fee, _ = out.get(f["order_id"], (f["side"], 0.0, 0.0, 0.0, None))
@@ -332,20 +361,21 @@ def _per_order(fills, intents):
     for k, (side, qty, notional, fee, ts) in out.items():
         t = pd.Timestamp(ts).tz_convert(timezone.utc)
         minute = t if t == t.floor("1min") else t.ceil("1min")
-        rows.append((side, intents[k], minute, qty, (notional + fee if side == "BUY" else notional - fee) / qty, fee))
+        rows.append((side, intents[k], minute, qty, (notional + fee if side == "BUY" else notional - fee) / qty, fee,
+                     notional / qty, _stop_level((orders or {}).get(k))))
     return rows
 
 
 def _paper_and_backtest(tmp_path, prices, params, strategy="probe", profile="aggressive"):
     trades = _record(tmp_path / "s.jsonl.gz", prices, params, profile=profile, strategy=strategy)
     orders, fills = replay(tmp_path / "s.jsonl.gz", with_fills=True)
-    paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders})
+    paper = _per_order(fills, {o["order_id"]: o["intent"] for o in orders}, {o["order_id"]: o for o in orders})
     bars = trades.resample("1min", closed="left", label="right").ohlc()
     bars["volume"] = 60 / BOOK_SHARE  # the same trades as liquidity on both paths
     res = run_backtest(strategy, bars, TICK_INST, params=params, starting_capital=10_000, risk_profile=profile,
                        bar_minutes=1, half_spread=SPREAD / 2 / float(prices[0]))
     j = res.journal
-    return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()})
+    return paper, _per_order(j.fills_, {k: o["intent"] for k, o in j.orders_.items()}, j.orders_)
 
 
 def test_paper_and_backtest_enter_and_exit_at_the_same_prices(tmp_path):
@@ -360,9 +390,8 @@ def test_paper_and_backtest_enter_and_exit_at_the_same_prices(tmp_path):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
         assert abs(b[4] / p[4] - 1) * 1e4 <= 0.3, (p, b)
     fee_p, fee_b = sum(r[5] for r in paper), sum(r[5] for r in bt)
-    # Paper's fee is the venue's alone (its price carries the spread); the backtest's includes the spread.
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert fee_b - spread_b == pytest.approx(fee_p, rel=0.005), (fee_p, fee_b, spread_b)
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert fee_b == pytest.approx(fee_p, rel=0.005), (fee_p, fee_b)
 
 
 def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
@@ -375,11 +404,22 @@ def test_paper_and_backtest_take_profit_and_stop_in_the_same_minute(tmp_path):
     intents = {r[1] for r in paper}
     assert {"entry", "stop_loss"} <= intents or {"entry", "take_profit"} <= intents, intents
     assert [r[:2] for r in paper] == [r[:2] for r in bt]
-    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+    tol = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "take_profit": (-6.0, 1.0)}
+    slip = max(SPREAD / 2 / 60_000, 0.0005)  # P1-D13: a backtest stop fills at its level less this
     for p, b in zip(paper, bt):
         assert b[3] == pytest.approx(p[3], rel=2e-3), (p, b)
-        lo, hi = tol[p[1]]
-        assert lo <= (b[4] / p[4] - 1) * 1e4 <= hi, (p, b)
+        if p[1] == "stop_loss":
+            # D13-STOP-PARITY, split as tests/test_hub_path_parity.py and tests/test_tick_bar_parity.py: the
+            # backtest's stop at its level less the slippage, to 0.1 bp; its all-in price never better than paper's
+            # but by paper's own trade past the level beyond that floor (a jump a minute bar can't see), nor worse
+            # by more than the floor plus 7 bp.
+            worse = -1 if p[0] == "SELL" else 1
+            assert abs(b[6] / (b[7] * (1 + worse * slip)) - 1) * 1e4 <= 0.1, (p, b)
+            past = max(0.0, (p[6] / p[7] - 1) * 1e4 * worse - slip * 1e4)
+            assert -0.3 - past <= (b[4] / p[4] - 1) * 1e4 * worse <= slip * 1e4 + 7.0, (p, b, past)
+        else:
+            lo, hi = tol[p[1]]
+            assert lo <= (b[4] / p[4] - 1) * 1e4 <= hi, (p, b)
         # Signal orders in the same minute; a stop or target in the same minute or the next (paper's
         # stop sits off its fill at the ask, the backtest's off the bar's trade price: half a spread apart).
         late = (b[2] - p[2]).total_seconds()
@@ -421,9 +461,9 @@ def test_test_strategies_enter_exit_and_pay_fees_alike_in_paper_and_backtest(tmp
             assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
-    for side, intent, _, qty, px, fee in paper:  # paper's fee is the venue's taker fee alone
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    for side, intent, _, qty, px, fee in (r[:6] for r in paper):  # paper's fee is the venue's taker fee alone
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * TAKER, abs=CENT)
 
 
@@ -715,10 +755,10 @@ def test_long_and_short_on_a_perp_enter_exit_and_pay_fees_alike_in_paper_and_bac
             assert -0.3 <= gap * (1 if p[0] == "BUY" else -1) <= 15, (p, b)
         else:
             assert abs(gap) <= 0.3, (p, b)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in paper), rel=0.005)
+    # Both fees are the venue's alone: both prices carry the spread (the backtest's since Advisor 6 Oct 20:55).
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in paper), rel=0.005)
     taker = float(PERP_FEES.fees.taker)
-    for side, _, _, qty, px, fee in paper:
+    for side, _, _, qty, px, fee in (r[:6] for r in paper):
         assert fee == pytest.approx(qty * (px - fee / qty if side == "BUY" else px + fee / qty) * taker, abs=CENT)
 
 
@@ -928,9 +968,14 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
         o, ts = orders[f["order_id"]], pd.Timestamp(f["ts"])
         if o["intent"] in ("risk_pause", "risk_halt"):
             trigger = o["signal"]["trigger"]
-            assert f["price"] == pytest.approx(trigger, abs=1e-6), (o, f)  # at its level
             bar = bars.loc[ts]
             assert bar["low"] <= trigger <= bar["high"] and trigger != bar["close"], (o, bar)
+            # Hour bars alone can't say what traded first inside one, so the stop is booked at the bar's worst price
+            # (or its open on a gap) less its slippage, never kinder than its level (P1-D13).
+            sell = f["side"] == "SELL"
+            gapped = bar["open"] <= trigger if sell else bar["open"] >= trigger
+            worst = bar["open"] if gapped else (bar["low"] if sell else bar["high"])
+            assert f["price"] == pytest.approx(worst * (1 - HALF if sell else 1 + HALF), abs=0.1), (o, f, bar)
             equity = cash + sum(a for t, a in funding if t <= ts) + qty * trigger
             if o["intent"] == "risk_halt":
                 peak = max(10_000.0, res.equity[res.equity.index < ts].max())
@@ -943,7 +988,10 @@ def test_a_backtest_risk_exit_fills_at_the_level_where_its_limit_is_breached(pro
         qty += sign * f["qty"]
     assert seen and seen[0] == "risk_pause", seen  # the first day's limit was reached and checked
     if (profile, strategy) != ("aggressive", "probe_short"):  # its pauses alone keep it short of the halt
-        assert "risk_halt" in seen, seen
+        # The halt fires; when the bar that fills a pause at its worst price (P1-D13) also crosses the drawdown
+        # limit, the pause's order has already flattened and the halt leaves no order to fill (HoE OK, 7 Oct).
+        halts = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+        assert "risk_halt" in seen or (halts and f"{prof.max_drawdown:.0%} limit" in halts[0]["message"]), (seen, halts)
 
 
 def test_every_perp_exit_closes_to_exactly_zero_and_the_next_entry_rests_its_stop_and_target():
@@ -989,15 +1037,17 @@ def test_a_perp_target_judged_on_the_bar_is_booked_at_its_level_in_the_report_th
     entry, tp = sorted(j.orders_.values(), key=lambda o: o["id"])
     assert (entry["intent"], tp["intent"]) == ("entry", "take_profit")
     level = tp["signal"]["book_px"]
-    assert tp["signal"]["target_px"] == pytest.approx(60_000.0 * (1 + side * 0.05))  # 5 % from the venue's fill
-    assert level == pytest.approx(60_000.0 * (1 + side * 0.05) * (1 - side * max(HALF, 0.0005)))
+    # 5 % from the entry's fill at the ask (a short's at the bid), half the spread in its price (Advisor 20:55).
+    filled = 60_000.0 * (1 + side * HALF)
+    assert tp["signal"]["target_px"] == pytest.approx(filled * (1 + side * 0.05))
+    assert level == pytest.approx(filled * (1 + side * 0.05) * (1 - side * max(HALF, 0.0005)))
     (fill,) = [f for f in j.fills_ if f["order_id"] == tp["order_id"]]
     (efill,) = [f for f in j.fills_ if f["order_id"] == entry["order_id"]]
     qty = fill["qty"]
     assert fill["price"] == level  # the target less its slippage, not the 60,000 close
-    # The entry paid the taker fee and the half spread; the target pays the taker fee alone, on its booked price,
-    # its slippage being in that price (Advisor L12).
-    taker = efill["fee"] / (efill["qty"] * efill["price"]) - HALF
+    # Each pays the taker fee alone, on its booked price: the entry's half spread and the target's slippage are in
+    # those prices (Advisor L12 and 20:55).
+    taker = efill["fee"] / (efill["qty"] * efill["price"])
     assert fill["fee"] == pytest.approx(qty * level * taker, abs=CENT)
     report = res.fills.loc[tp["order_id"]]
     # The slippage is in the booked price already, with the cent the fee's rounding left (QA m-G7).
@@ -1261,7 +1311,9 @@ def test_a_reconcile_halt_in_a_backtest_keeps_the_resting_stop(prices, instrumen
     fills = res.fills.sort_values("ts_last")
     intents = [res.decisions[o]["intent"] for o in fills.index]
     assert intents == ["entry", "stop_loss"], intents
-    assert float(fills.loc[fills.index[1], "avg_px"]) == pytest.approx(98.0, rel=1e-3)
+    # Bars only: the stop is booked at the low of the bar that traded through it, less its slippage (P1-D13).
+    low = float(_path(prices, closes)["low"].loc[fills.loc[fills.index[1], "ts_last"]])
+    assert low < 98.0 and float(fills.loc[fills.index[1], "avg_px"]) == pytest.approx(low * (1 - 0.0005), rel=1e-4)
 
 
 def test_a_sub_cent_instrument_holding_1e8_units_never_halts_on_float_noise():

@@ -708,7 +708,7 @@ def test_the_engines_incident_records_the_equity_remaining_after_the_liquidation
     assert f"{f.rem:,.2f}" in found[0]["message"], (found[0]["message"], f.rem)
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 @pytest.mark.parametrize("missing", ["why", "author"])
 def test_the_note_needs_why_the_half_liquidation_stop_did_not_protect_the_position_and_its_author(store, tmp_path,
                                                                                                  missing):
@@ -724,7 +724,7 @@ def test_the_note_needs_why_the_half_liquidation_stop_did_not_protect_the_positi
     _nothing_changed(store, before, f.rem)
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 @pytest.mark.parametrize("which", ["no_incident_named", "incident_without_its_note"])
 def test_ral_without_a_written_note_is_refused_and_changes_nothing(store, tmp_path, client, which):
     """[R17:57] "reset requires an incident note"; [R18:17] "RAL refused until incident has written cause": with no
@@ -741,7 +741,7 @@ def test_ral_without_a_written_note_is_refused_and_changes_nothing(store, tmp_pa
     _nothing_changed(store, before, f.rem)
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 @pytest.mark.parametrize("which", ["another_strategys", "before_this_liquidation", "not_an_incident", "no_such_event"])
 def test_ral_with_an_incident_that_is_not_about_this_liquidation_is_refused(store, tmp_path, which):
     """[R17:57] the note is on THIS liquidation: another strategy's noted incident, a noted incident from before this
@@ -769,21 +769,23 @@ def test_ral_with_an_incident_that_is_not_about_this_liquidation_is_refused(stor
 
 # --- RAL with the note [R17:57, HoE17:55, R18:17] -----------------------------------------------------------------
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_with_the_note_sets_it_running_and_it_trades_again(store, tmp_path):
     """[R17:57] the PM's explicit RAL lifts the halt: the next process runs it and it trades on its next signal
     (ping_pong buys on the first bar). The recorded session then ends, so its process stops ("process stopped"):
     the status is read as not halted here, and as running in the tests that tick a runtime."""
     f = _liquidate(tmp_path, store)
     _ral(store, incident=_noted(store, f.liq))
-    new = _restart(tmp_path, store, [(5, 0.0)], hours=25)
+    # Set-up (HoQA re-pin, RAL-ANCHOR): the restart's prices start where the liquidation was booked (the bankruptcy
+    # price since GAP-LIQ-CAP), so ping_pong's cycle, picked up from that fill or started afresh, buys first.
+    new = _restart(tmp_path, store, [(5, 0.0)], hours=25, px=float(f.close["avg_px"]))
     assert [(o["side"], o["intent"]) for o in new][:1] == [("BUY", "entry")], new
     s = store.sleeve(NAME)
     assert s.status != "halted" and s.desired_state == "running", (s.status, s.status_reason)
     assert len(_ral_events(store)) == 1
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_starts_a_new_high_water_mark_at_the_remaining_equity(store, tmp_path):
     """[R17:57] "new high-water mark from remainder"; [R18:17] "RAL resets strategy HWM ... to remaining equity":
     straight after, the drawdown reads 0%, the drawdown halt doesn't act, a restart keeps it, and a 3% fall (35% below
@@ -802,7 +804,7 @@ def test_ral_starts_a_new_high_water_mark_at_the_remaining_equity(store, tmp_pat
     assert rt.status == "running" and store.sleeve(NAME).status == "running", store.sleeve(NAME).status_reason
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_resets_the_day_baseline_to_the_remaining_equity(store, tmp_path):
     """[R18:17] "RAL resets strategy ... day baseline to remaining equity": on the liquidation's own UTC day (which
     opened at about 10,000, 33% above the remainder) it runs, not paused; a 4% fall stays running, a restart keeps
@@ -839,7 +841,7 @@ def test_ral_keeps_the_old_high_water_mark_in_history(store, tmp_path):
     assert store.last_event(NAME, ("pm_resume",)) is None
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_is_journalled_with_who_when_the_incident_and_the_equity_before_and_after(store, tmp_path, client):
     """[R18:17] "journal who/when/incident id/equity before+after"; [HoE17:55] a labelled action. Sent from the
     dashboard by the PM: one decision row, action RAL, actor PM, its time, naming the incident; the applied event
@@ -863,7 +865,7 @@ def test_ral_is_journalled_with_who_when_the_incident_and_the_equity_before_and_
     assert store.sleeve(NAME).status == "running"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON)
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_writes_exactly_one_liquidation_reset_event_with_its_author_and_time_after_the_liquidation(store,
                                                                                                          tmp_path):
     """[R18:17] "journal who/when"; #164 (e14acec) judges "liquidated" from the journal: a liquidation stays live until
@@ -888,7 +890,7 @@ def test_ral_writes_exactly_one_liquidation_reset_event_with_its_author_and_time
     assert re.search(r"\bPM\b", e["message"]) and AUTHOR in e["message"], e["message"]
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_never_resets_the_book_level_figures(store, tmp_path):
     """[R18:17] "NEVER book-level limits (15% DD, 3% daily, open-risk total)", and the loss stays in the book's
     figures: the book curve the book-level limits read still has the loss (drawdown from 10,000 to the remainder,
@@ -955,7 +957,7 @@ def _ordinary(store, kind, name=NAME, t=datetime(2025, 10, 3, 10, 0, tzinfo=time
     return rt
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 @pytest.mark.parametrize("kind", ["drawdown_halt", "daily_pause", "drawdown_halt_after_an_earlier_ral"])
 def test_ral_is_refused_on_an_ordinary_halt(store, tmp_path, kind):
     """[R17:57], [R18:17] "a halt is cleared only by its own action": RAL is the liquidation's. On a drawdown halt or
@@ -1000,7 +1002,7 @@ def test_guard_retire_still_works_instead_of_ral(store, tmp_path, client):
     assert started == []
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_a_second_ral_on_the_same_liquidation_is_a_no_op(store, tmp_path):
     """[R18:17] "repeat = no-op": a second RAL (sent twice before it applied, again once running, or through a
     restart) is refused or ignored; there is one RAL event and the mark it set is not moved again."""
@@ -1026,7 +1028,7 @@ def test_a_second_ral_on_the_same_liquidation_is_a_no_op(store, tmp_path):
     assert store.sleeve(NAME).status == "running"
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_a_second_liquidation_after_a_reset_needs_a_new_note(store, tmp_path):
     """[R17:57] the note is per liquidation: reset after the first, liquidated again (a long, a 60% gap down), the
     first note no longer serves; a note on the second liquidation's incident does, and the new mark is the second
@@ -1034,7 +1036,9 @@ def test_a_second_liquidation_after_a_reset_needs_a_new_note(store, tmp_path):
     f = _liquidate(tmp_path, store)
     first = _noted(store, f.liq)
     _ral(store, incident=first)
-    new = _restart(tmp_path, store, [(5, 0.0), (0, -0.6), (5, 0.0)], hours=25, tag="second")
+    # Set-up (HoQA re-pin, RAL-ANCHOR): as above, from the booked liquidation price, so the long is opened first.
+    new = _restart(tmp_path, store, [(5, 0.0), (0, -0.6), (5, 0.0)], hours=25, tag="second",
+                   px=float(f.close["avg_px"]))
     _gap_closed(new, "SELL")  # a long this time
     assert store.sleeve(NAME).status == "halted"
     liq2 = _gap_event(store, after_id=f.liq["id"])
@@ -1048,7 +1052,7 @@ def test_a_second_liquidation_after_a_reset_needs_a_new_note(store, tmp_path):
     assert len(_ral_events(store)) == 2
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 @pytest.mark.parametrize("actor", ["system", "supervisor", "replay"])
 def test_only_the_pm_can_reset_after_liquidation(store, tmp_path, actor):
     """[R17:57] "PM explicit", [R18:17] "never replay/automation": from any actor but the PM it is refused, naming the
@@ -1061,7 +1065,7 @@ def test_only_the_pm_can_reset_after_liquidation(store, tmp_path, actor):
     _nothing_changed(store, before, f.rem)
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_ral_comes_only_from_a_pm_ui_action_so_retries_are_refused(store, tmp_path, client):
     """[R18:17] "RAL only from a PM UI action (never ... API retry)": the PM's form post is taken; the same post sent
     again (before or after it applied) is refused in words, and a cross-site post is refused outright. One decision,
@@ -1081,7 +1085,7 @@ def test_ral_comes_only_from_a_pm_ui_action_so_retries_are_refused(store, tmp_pa
     assert len(_ral_decisions(store)) == 1 and len(_ral_events(store)) == 1
 
 
-@xf
+# PE2 (P1-RAL, master c57e8d5e): passes (mark removed)
 def test_the_dashboard_offers_ral_and_the_note_only_on_a_liquidated_strategy(store, tmp_path, client):
     """[R17:57] / [R18:17]: the liquidated strategy's page offers Reset after liquidation with a field for the
     incident, and the note with its required field and author, and doesn't promise that a resume trades again; a

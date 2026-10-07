@@ -29,6 +29,10 @@ STUDY_MINUTES = (1440, 240, 60, 15, 5)
 # matched on the shortest bars that keep each run within this (as the backtest page does).
 EXEC_BAR_BUDGET = 150_000
 EXEC_STEPS = (1, 5, 15, 60)
+# The out-of-sample windows and the holdout (with the training bars that warm each window up) run on 1-minute bars for
+# G1 (P1-D13): a few runs, not one per setting and fee, so their cap is higher. About five and a half years of minutes;
+# past it they run on 5-minute bars, a one-way test (study.ONE_WAY_MINUTES).
+OOS_EXEC_BUDGET = 3_000_000
 # Stored history ending longer ago than this is still being backfilled; a study says so.
 STALE_HISTORY = pd.Timedelta(days=1)
 
@@ -123,7 +127,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if prices.empty:
         raise ValueError(f"the stored history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
-    spread = spreads.resolve(profile.name, req.pair, store)
+    spread = spreads.series(profile.name, req.pair, store)  # each run charges the one in force at each time
     base, quote = req.pair.split("/")
     # Price decimals from the stored prices, as the backtest page does: the default 2 rounded every
     # sub-$10 instrument to the cent (review round 9, B9-2).
@@ -133,6 +137,15 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     step = exec_step(prices.index[-1] - prices.index[0], req.minutes)
     if step is not None:
         exec_prices = history.read(profile.name, req.pair, step, start=prices.index[0] - pd.Timedelta(minutes=req.minutes))
+    oos_exec, start = None, prices.index[0] - pd.Timedelta(minutes=req.minutes)
+    for oos_step in (1, 5):
+        if oos_step < req.minutes and (prices.index[-1] - start) / pd.Timedelta(minutes=oos_step) <= OOS_EXEC_BUDGET:
+            oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step, start=start)
+            break
+
+    def minutes_between(lo, hi):
+        return history.read(profile.name, req.pair, 1, start=lo, end=hi)
+
     ledger = IdeaLedger(ledger_path or LEDGER)
     register = TrialsRegister(store) if store is not None else None
     dataset = dataset_name(profile.name, req.pair, req.minutes)
@@ -140,14 +153,15 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
         train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
         exits=req.exits(),
-        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress,
-        register=register,
+        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
+        oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
         locks=HoldoutLocks(store) if store is not None else None)
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
         f"{float(paid.maker):.2%} maker, {float(paid.taker):.2%} taker (the perpetual market's)"
-    result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text}"
+    span = int((prices.index[0] - pd.Timedelta(minutes=req.minutes)).value), int(prices.index[-1].value)
+    result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text(*span)}"
     if result.breakeven:
         result.fee_note += f"; break-even: {result.breakeven}"
     cov = history.coverage(profile.name, req.pair)

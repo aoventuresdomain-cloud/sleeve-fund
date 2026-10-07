@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from sleeve_fund.research.ledger import GAP_STAGE
 from sleeve_fund.research.metrics import deflated_sharpe_probability
 from sleeve_fund.store import Store
 
@@ -121,6 +122,8 @@ class TrialsRegister:
             if not line.strip():
                 continue
             e = json.loads(line)
+            if e.get("stage") == GAP_STAGE:
+                continue  # a record of the fills, not a variant tried
             rows.append({
                 "id": line_id(line),
                 "definition_hash": legacy_definition_hash(e["idea"], e["params"]),

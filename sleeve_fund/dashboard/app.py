@@ -38,6 +38,7 @@ from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
 from sleeve_fund.instruments import price_decimals
 from sleeve_fund.spreads import resolve as resolve_spread
+from sleeve_fund.spreads import series as spread_series
 from sleeve_fund.paper.config import (
     ALLOWED_BAR_SPECS,
     VENUE_WARMUP_BARS,
@@ -51,8 +52,8 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
-from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import RESUMABLE, entry_blocked
+from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
+from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -470,6 +471,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Its position's margin was lost (liquidated): no Start, Resume or Reset until the PM resets it after
         # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.
         liquidated = not bt_id and _liquidated(name)
+        ral = _ral_view(st(), name) if liquidated else None
+        clearing = None if bt_id else _clearing(s)
+        reset_dropped = False if bt_id else _reset_dropped(name)
         q = request.query_params
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
@@ -486,7 +490,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
         return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
-                    order_total=order_total, liquidated=liquidated,
+                    order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
+                    reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
                     timing=None if bt_id else trading.timing_view(st().timings(name)),
                     price_feed=None if bt_id else _price_feed(s, st().last_feed(name)),
@@ -581,6 +586,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
+        elif not data["indicators"]:  # nothing recorded: the strategy's own indicators, as it read them (P1-3s)
+            data["indicators"], why = charts.indicators(s, df.iloc[-720:], minutes)
+            if why:
+                data["indicators_note"] = why
         return JSONResponse(data)
 
     @app.get("/api/instruments")
@@ -651,7 +660,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.post("/sleeves/{name}/command")
     def sleeve_command(name: str, command: str = Form(...), reason: str = Form(""),
                        reason_pick: str | None = Form(None), reason_note: str = Form(""), reason_for: str = Form(""),
-                       then: str = Form(""), actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+                       then: str = Form(""), incident: str = Form(""), actor: str = Depends(require_pm),
+                       _o: None = Depends(same_origin)):
         """A PM command, with its reason: picked from the action's own list (reasons.py) or typed. Flatten with
         then=stop is the Stop dialog's "Flatten and stop": the flatten goes now, and the page asks to stop once
         the strategy is flat, as a stop sent now would drop the waiting flatten."""
@@ -694,6 +704,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
                     st().hold_on_reset(name, command, reason)  # P1-KR-3: a reset under way leaves it stopped
                 st().decide(actor, command, reason, name, ts=accepted)
+                if command == "stop":  # after the Stop is held and logged, whatever this does (QA D-1)
+                    st().apply_waiting_ral(name)  # QA RAL-F2: a waiting reset after liquidation can't lapse
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and not set(why.codes) <= set(RESUMABLE)):
                 raise ValueError(f"a resume can't clear it. {why}")
@@ -717,6 +729,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                 st().command(name, command, reason, actor=actor)
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Started to sell its position: {reason.strip()}", name)
+            elif command == RAL:
+                if not incident.strip().isdigit():
+                    raise ValueError("name the liquidation's incident: a reset after liquidation answers one incident")
+                st().command(name, command, reason, actor=actor, incident=int(incident))
             else:
                 st().command(name, command, reason, actor=actor)
         except KeyError:
@@ -725,11 +741,50 @@ def create_app(store: Store | None = None) -> FastAPI:
             # Back on the page, in words: a stale page can reach these, and raw JSON is no answer (round 9, N8).
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         done = {"pause": "Pause sent", "resume": "Resume sent", "stop": "Stopped", "start": "Started",
+                RAL: "Reset after liquidation sent",
                 "flatten": "Close sent: it sells at market, then pauses" if reason_for == "close" else
                 "Flatten sent: it closes at market, then pauses"}.get(command, "Sent")
         # Flatten and stop keeps then_stop in the address (the page asks to stop once flat), so no one-off toast.
         q = {"then_stop": then_stop} if then_stop else {"done": f"{done}. Reason: {reason}."}
         return RedirectResponse(f"/sleeves/{name}?{urlencode(q)}", status_code=303)
+
+    @app.post("/sleeves/{name}/incident-note")
+    def incident_note(name: str, incident: str = Form(""), author: str = Form(""),
+                      why_stop_did_not_protect: str = Form(""), actor: str = Depends(require_pm),
+                      _o: None = Depends(same_origin)):
+        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17)."""
+        try:
+            ev = st().event_by_id(int(incident)) if incident.strip().isdigit() else None
+            if ev is None or ev["sleeve"] != name:
+                raise ValueError("that incident is not this strategy's")
+            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect)
+        except ValueError as exc:
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note saved.'})}", status_code=303)
+
+    def _clearing(s) -> dict | None:
+        """What alone clears a strategy that isn't trading, for its page (Advisor 6 Oct 18:17): `kind` is liquidated
+        (only a reset after liquidation), drawdown (only a resume), daily (only the 00:00 UTC roll) or exits_only
+        (stopped while holding: only a flatten ends it). `why` is the engine's own words (clearing_action), so the
+        page and the refusals never disagree. None when nothing needs clearing."""
+        why = clearing_action(s, utcnow())
+        if why is not None:
+            kind = {"liquidated": "liquidated", "daily_pause": "daily"}.get(why.code, "drawdown")
+            return {"kind": kind, "why": str(why)}
+        if s.status == "paused" and (s.status_reason or "").startswith(EXITS_ONLY):
+            return {"kind": "exits_only", "why": s.status_reason}
+        return None
+
+    def _reset_dropped(name: str) -> bool:
+        """Whether a reset the PM asked for was cancelled because the strategy was liquidated first (P1-D24, HoE 7 Oct):
+        the page says so until the next reset, asked again or after liquidation, replaces it."""
+        dropped = st().last_event(name, ("reset_dropped",))
+        if dropped is None:
+            return False
+        after = st().last_event(name, (LIQUIDATION_RESET,))
+        if after and after["id"] > dropped["id"]:
+            return False
+        return not any(r["sleeve"] == name for r in st().pending_resets())
 
     def _liquidated(name: str) -> bool:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
@@ -766,16 +821,42 @@ def create_app(store: Store | None = None) -> FastAPI:
             error = "a reason is required"
         if not reason:
             return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        gone, liquidated = set(st().archived()), []
-        for s in st().sleeves():
-            if s.name in gone or st().pending_reset(s.name):
-                continue
-            if _liquidated(s.name):  # put away unanswered otherwise; it waits for Reset after liquidation
-                liquidated.append(s.name)
-                continue
-            st().request_reset(s.name, reason, actor=actor)
-        q = {"reset": "1", **({"not_reset": ", ".join(liquidated)} if liquidated else {})}
-        return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
+        liquidated = [s.name for s in _book_to_reset() if _liquidated(s.name)]
+        if liquidated:
+            # Advisor 20:41 (U27): while a strategy is liquidated a book reset resets nothing until the PM confirms
+            # the named list; it then also ends each liquidation (confirm below), never its incident.
+            q = {"confirm_liquidated": ", ".join(liquidated), "confirm_reason": reason}
+            return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
+        for s in _book_to_reset():
+            st().request_reset(s.name, reason, actor=actor, book=True)
+        return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
+
+    @app.post("/book/reset/confirm")
+    def book_reset_confirm(reason: str = Form(""), liquidated: list[str] = Form([]),
+                           actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The PM's confirmation of a book reset with the named list of liquidated strategies (U27): each gets one
+        liquidation_reset (the PM's, "book reset"), then every strategy on the book is reset. Its liquidation
+        incident stays open until its note is written and the PM acknowledges it."""
+        reason = (reason or "").strip()
+        named = sorted(s.name for s in _book_to_reset() if _liquidated(s.name))
+        if not reason:
+            return RedirectResponse(f"/setup?{urlencode({'reset_error': 'a reason is required'})}", status_code=303)
+        if sorted(set(liquidated)) != named:
+            error = (f"the liquidated strategies are now {', '.join(named) or 'none'}; confirm that list"
+                     if named else "nothing is liquidated now; use Reset book")
+            return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
+        for name in named:
+            st().event(name, "info", LIQUIDATION_RESET, f"Reset after liquidation by the PM in a book reset (book "
+                       f"reset): {reason}")
+            st().decide(actor, "reset after liquidation", f"Book reset, liquidation confirmed: {reason}", name)
+        for s in _book_to_reset():
+            st().request_reset(s.name, reason, actor=actor, book=True)
+        return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
+
+    def _book_to_reset() -> list:
+        """The strategies a book reset covers: not archived, not a backtest, none already resetting."""
+        gone = set(st().archived())
+        return [s for s in st().sleeves() if s.name not in gone and not st().pending_reset(s.name)]
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1542,6 +1623,7 @@ def run_backtest_job(progress, run_id: str, store: Store | str, args: dict, key:
                          days=args["days"], detail=True, minutes=args["minutes"], risk_profile=args["risk_profile"],
                          venue=args["venue"], fee_quote=resolve_fees(args["venue"], store),
                          spread_quote=resolve_spread(args["venue"], args["pair"], store),
+                         spread_series=spread_series(args["venue"], args["pair"], store),
                          progress=progress, keep=keep)
     result.pop("trips", None)  # rebuilt from the saved journal, as the Trades screen does
     trial, uncounted = _trial(_backtest_trial_metrics, store, args, result, run_id,
@@ -1840,6 +1922,29 @@ def _reason(action: str, reason: str, pick: str | None, note: str) -> str:
     words what is missing), or the plain reason field older forms send."""
     return reasons.compose(action, pick, note) if pick is not None else (reason or "").strip()
 
+
+
+def _ral_view(store, name: str) -> dict | None:
+    """What a liquidated strategy's page offers for its reset after liquidation (Advisor 17:57, 18:17, 20:37): the
+    liquidation's incident (the newest since it) and its note; X and Y% read from the liquidation halt's own words
+    ("... lost (liquidated): X, Y% of strategy equity at entry", with "includes adds" when the position was added
+    to); and the equity left, the journal's cash. Whatever isn't there reads as None, and the dialog says so."""
+    liq = liquidation_event(store, name)
+    if liq is None:
+        return None
+    found = store.sleeve_events_since(name, ("incident",), since=liq["ts"])
+    incident = found[-1] if found else None
+    s = store.sleeve(name)
+    # The halt's own words (its event), as a Stop replaces the status reason with "stopped by PM" (CR on #194).
+    halts = [e["message"] for e in store.sleeve_events_since(name, ("risk_halt",), since=liq["ts"])
+             if "(liquidated)" in e["message"]]
+    reason = halts[-1] if halts else s.status_reason or ""
+    m = re.search(r"\(liquidated\):\s*([\d,]+(?:\.\d+)?),\s*([\d,]+(?:\.\d+)?)%", reason)
+    return {"liquidation": liq, "incident": incident,
+            "note": store.incident_note(incident["id"]) if incident is not None else None,
+            "x": m.group(1) if m else None, "y": m.group(2) if m else None,
+            "adds": "includes adds" in reason.lower(),
+            "left": store.journal_book(name, s.starting_balance)["cash"]}
 
 
 def _demo_copy(store, s) -> dict | None:

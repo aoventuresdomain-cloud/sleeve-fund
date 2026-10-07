@@ -429,7 +429,8 @@ def restart(prices, down_from: float, back_at: float, *, entry_px=None, qty=0.05
     """The process was down from minute `down_from` (its last heartbeat, unless `heartbeat` says otherwise) to
     `back_at`; the journal holds a position entered at minute 5. The new process gets trades and live hub minutes
     from back_at on, and the store's minutes up to back_at."""
-    entry_px = entry_px or float(prices[5 * 60])
+    # Paper enters at the touch (mid + side x half spread) and derives its levels from the booked entry (D13 #178).
+    entry_px = entry_px or float(prices[5 * 60]) + side * SPREAD / 2
     gone = frozenset(range(0, int(back_at * 60)))
     lost = {START + k * M for k in range(0, int(back_at) + 1)}
     hb = START + int((heartbeat if heartbeat is not None else down_from) * M)
@@ -1091,7 +1092,6 @@ _D13_STOP_XF = pytest.mark.xfail(strict=True, reason="NA-1 backtest side (Adviso
                                  "stop; stop slippage lands with D13, which stacks on #146: not built yet")
 
 
-@_D13_STOP_XF
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02))
@@ -1114,7 +1114,6 @@ def test_l6_na1_a_gap_through_the_stop_fills_at_the_open_of_the_crossing_minute(
     assert is_modelled(o["signal"]), o["signal"]
 
 
-@_D13_STOP_XF
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_na1_the_backtest_fills_a_gapped_stop_at_the_crossing_minutes_open(label, perp, profile, side):
     """Was true on ebe39c5 at the bare open; Advisor 20:39 moves it to the open less TP_SLIP (D13, strict xfail)."""
@@ -1129,7 +1128,7 @@ _D13_ENTRY_XF = pytest.mark.xfail(strict=True, raises=AssertionError, reason="D1
 
 # PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
-@pytest.mark.parametrize("path", [pytest.param("reconnect", marks=_D13_ENTRY_XF), "restart"])
+@pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_backtest(path, label, perp, profile,
                                                                                      side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, favourable(side, 0.03))
