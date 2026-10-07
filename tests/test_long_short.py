@@ -321,6 +321,10 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o2", trade_id="t2")
     store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o3", trade_id="t3")
     store.record_equity("pp-ls", equity=10_050.0, cash=13_057.0, qty=-0.05, price=60_140.0, benchmark=10_000)
+    # The short's entry is journaled with its stop, as paper journals it: the open-risk limit reads the stop from
+    # there, and so does Risk to stop (FE v2: one formula with the gate).
+    store.record_order("pp-ls", order_id="o3", side="SELL", qty=0.05, intent="entry", reason="Rose 1% above the last buy",
+                       signal={"stop_frac": 0.02})
     page = c.get("/sleeves/pp-ls", auth=AUTH)
     assert page.status_code == 200
     html = page.text
