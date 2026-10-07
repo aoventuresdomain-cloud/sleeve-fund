@@ -68,7 +68,7 @@ class MemoryJournal:
         row = self.sleeve(name)
         row.status, row.status_reason, row.paused_until = status, reason, paused_until
 
-    def heartbeat(self, name: str) -> None:
+    def heartbeat(self, name: str, at: datetime | None = None) -> None:
         pass  # nobody watches a backtest's pulse
 
     def pending_commands(self, sleeve: str) -> list[dict]:

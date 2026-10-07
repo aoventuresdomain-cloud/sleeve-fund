@@ -621,7 +621,7 @@ class SleeveRuntime:
         wait, so a resume queued while paused is never applied on the liquidating tick (QA P1-U34); the next tick has
         the liquidation's halt, which a resume doesn't clear."""
         now = self.now()
-        self.store.heartbeat(self.name)
+        self.store.heartbeat(self.name, now)
         if self.progress is not None:
             self.progress(now)
         if price <= 0:
