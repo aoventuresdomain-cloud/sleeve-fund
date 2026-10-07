@@ -1715,6 +1715,7 @@ class LongFlatStrategy(Strategy):
             # The venue's order closed the position in that minute: no settlement after it is the position's,
             # though the order goes now (QA P1-L19).
             self._funding_skip = (datetime.fromtimestamp(at / 1e9, tz=timezone.utc), False)
+            self._reverse_funding_after(self._funding_skip[0])
         try:
             if intent in EXIT_LEGS:
                 self._exit_lock = side if self._margin else True
@@ -2541,6 +2542,30 @@ class LongFlatStrategy(Strategy):
     # ...and holds a settlement back for missed minutes at most this long (DA 7 Oct): on a market that trades less often
     # than UNSEEN_GAP_NS the hold would otherwise never end.
     FUNDING_DEFER_MAX = timedelta(minutes=15)
+
+    def _reverse_funding_after(self, closed: datetime) -> None:
+        """Paper: a replay found the venue's order closed the position at `closed`, but a settlement after it was
+        already charged (held past FUNDING_DEFER_MAX). Journal it as funding_charged_while_flat, which fills-against-
+        model counts, and reverse it with a separate correcting entry at the same settlement time; the original row is
+        never edited (Advisor 7 Oct 00:40). A settlement already corrected nets to zero and is left alone."""
+        store = self.runtime.store
+        net: dict = {}
+        for r in store.funding(self.runtime.name):
+            ts = r["ts"] if r["ts"].tzinfo else r["ts"].replace(tzinfo=timezone.utc)
+            if ts > closed:
+                was = net.get(ts)
+                net[ts] = (r if was is None else was[0], (0.0 if was is None else was[1]) + r["amount"])
+        for ts, (row, amount) in sorted(net.items(), key=lambda kv: kv[0]):
+            if abs(amount) < 1e-9:
+                continue
+            self._cash_adj -= amount
+            self.funding_log.append((ts, -amount))
+            store.record_funding(self.runtime.name, qty=row["qty"], price=row["price"], rate=row["rate"],
+                                 amount=round(-amount, 8), ts=ts)
+            store.event(self.runtime.name, "warning", "funding_charged_while_flat",
+                        f"Funding of {abs(amount):,.2f} {'paid' if amount < 0 else 'received'} at the {ts:%H:%M} "
+                        f"settlement was booked before the replay found the position closed at {closed:%H:%M}: "
+                        f"reversed by a separate correcting entry of {-amount:+,.2f}", ts=self.runtime.now())
 
     def _funding_overdue(self, terms, now: datetime) -> bool:
         """A settlement held back for missed minutes is charged anyway once FUNDING_DEFER_MAX has passed and a trade
