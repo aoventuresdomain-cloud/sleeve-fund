@@ -98,6 +98,9 @@ def test_a_refill_after_the_deadline_showing_a_stop_before_it_reverses_the_charg
     flat = run.kinds("funding_charged_while_flat")
     assert len(flat) == 1 and flat[0]["level"] == "warning", flat
     assert f"{abs(charged['amount']):,.2f}" in flat[0]["message"], flat[0]["message"]
+    # The replayed close is journaled on the exit's order, for a restart before the next booking (CR #179)
+    closes = [o["signal"].get("replayed_close") for o in run.orders if (o.get("signal") or {}).get("replayed_close")]
+    assert closes and closes[0] < SETTLED.isoformat(), [o["signal"] for o in run.orders]
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
@@ -107,3 +110,97 @@ def test_a_refill_after_the_deadline_that_leaves_the_position_open_never_charges
     assert len(rows) == 1, rows
     assert rows[0]["amount"] == pytest.approx(-rows[0]["qty"] * rows[0]["price"] * 0.0001)
     assert run.kinds("funding_charged_while_flat") == []
+
+
+# ================================================= CR #179: a later settlement keeps its own deadline; a restart
+
+
+def _booked_at(monkeypatch) -> list:
+    """(strategy clock, settlement time) at each funding booking."""
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    seen, live = [], {}
+    on_start, record = LongFlatStrategy.on_start, Store.record_funding
+
+    def started(self):
+        live["s"] = self
+        return on_start(self)
+
+    def booking(self, *a, **kw):
+        seen.append((pd.Timestamp(live["s"].clock.utc_now()), pd.Timestamp(kw["ts"])))
+        return record(self, *a, **kw)
+
+    monkeypatch.setattr(LongFlatStrategy, "on_start", started)
+    monkeypatch.setattr(Store, "record_funding", booking)
+    return seen
+
+
+def test_a_settlement_younger_than_the_deadline_is_not_booked_with_an_older_one(monkeypatch):
+    """Hourly settlements; trades at :10 and :40 of each minute, none 07:59-09:00. At 09:00:30 the 08:00 settlement is
+    past its deadline and booked; 09:00 is 30 s old and waits for its own, 09:15."""
+    import dataclasses
+
+    from sleeve_fund import markets
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    monkeypatch.setattr(markets, "LOW_FEE_PERP", dataclasses.replace(markets.LOW_FEE_PERP, funding_hours=tuple(range(24))))
+    monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)
+    booked = _booked_at(monkeypatch)
+    n = 90
+    p = flat_prices(n)
+    gone = frozenset(s for s in range(n * 60) if s % 60 not in (10, 40)) | frozenset(range(9 * 60, 70 * 60))
+    run = paper(p, side=1, perp=True, profile="aggressive", leave=85, gone=gone)
+    assert [r for r in run.sequence() if r[0] == "entry"], run.sequence()
+    nine = SETTLED + pd.Timedelta(hours=1)
+    assert sorted(t for _, t in booked) == [SETTLED, nine], booked
+    at = dict((t, c) for c, t in booked)
+    assert at[SETTLED] <= nine + pd.Timedelta(minutes=2), booked
+    assert nine + pd.Timedelta(minutes=15) <= at[nine] <= nine + pd.Timedelta(minutes=16), booked
+    said = [e["message"] for e in run.kinds("funding_deadline_booked")]
+    assert any(m.startswith("The 09:00 settlement was booked 15 minutes after it") for m in said), said
+
+
+@pytest.mark.parametrize("replayed", [True, False], ids=["replayed-close", "closed-after"])
+def test_after_a_restart_a_settlement_after_the_replayed_close_is_not_charged(replayed, monkeypatch):
+    """The previous process held a long from 07:55; the replay of an outage found the venue's stop closed it at 07:58,
+    and our exit was journaled at 08:05, before 08:00 was booked; then it stopped. The new process (from 08:06, trades
+    from 08:08) reads the replayed close from the exit's journaled order, so 08:00 is not charged. The control: an exit at 08:05 with no replay
+    behind it charges the long held at 08:00, once."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    start = int(pd.Timestamp("2025-10-03 08:06", tz="UTC").value)  # the new process
+    monkeypatch.setattr(qa, "START", start)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)
+    p = flat_prices(20)
+    at = lambda hhmm: datetime.fromisoformat(f"2025-10-03T{hhmm}:00+00:00")  # noqa: E731
+    create = Store.create_sleeve
+
+    def create_and_seed(self, *a, **kw):
+        out = create(self, *a, **kw)
+        px = float(p[0])
+        self.record_order("q146", order_id="O-in", side="BUY", qty=0.05, intent="entry", reason="held", ts=at("07:55"),
+                          signal={"stop_frac": 0.01})
+        self.record_fill("q146", side="BUY", qty=0.05, price=px, fee=0.0, order_id="O-in", trade_id="T-in",
+                         ts=at("07:55"))
+        self.record_funding("q146", qty=0.05, price=px, rate=0.0001, amount=round(-0.05 * px * 0.0001, 8),
+                            ts=datetime(2025, 10, 3, 0, 0, tzinfo=timezone.utc))  # the last settlement booked
+        sig = {"price_source": "replay_model", "replayed_close": at("07:58").isoformat()} if replayed else {}
+        self.record_order("q146", order_id="O-out", side="SELL", qty=0.05, intent="stop_loss", reason="stop",
+                          ts=at("08:05"), signal=sig)
+        self.record_fill("q146", side="SELL", qty=0.05, price=px * 0.98, fee=0.0, order_id="O-out", trade_id="T-out",
+                         ts=at("08:05"))
+        return out
+
+    monkeypatch.setattr(Store, "create_sleeve", create_and_seed)
+    run = paper(p, side=1, enter=10**6, perp=True, profile="aggressive", leave=10**6,
+                gone=frozenset(range(0, 2 * 60)), heartbeat=start - 30 * qa.S)
+    rows = [r for r in run.store.funding("q146") if pd.Timestamp(r["ts"]) == SETTLED]
+    if replayed:
+        assert rows == [], rows
+    else:
+        assert len(rows) == 1 and rows[0]["qty"] == pytest.approx(0.05), rows

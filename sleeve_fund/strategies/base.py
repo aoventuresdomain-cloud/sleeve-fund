@@ -635,6 +635,7 @@ class LongFlatStrategy(Strategy):
         self._funding_skip: tuple[datetime, bool] | None = None
         # An outage's replayed exit: when the venue's order closed the position (_held_at).
         self._replayed_close: datetime | None = None
+        self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -849,6 +850,8 @@ class LongFlatStrategy(Strategy):
                 fills = self.runtime.store.fills(self.runtime.name, limit=1) if book["qty"] else []
                 marks = [r["ts"] for r in (*last, *fills)]
                 self._funding_since = max(marks) if marks else self.runtime.now()
+                if not self.runtime.backtest:
+                    self._replayed_close = self._journaled_replayed_close()
             if self.runtime.backtest:
                 # A backtest marks and guards from its bars: every execution bar when it is fed shorter
                 # bars than it decides on (paper does every 30 s), otherwise every decision bar.
@@ -1870,6 +1873,8 @@ class LongFlatStrategy(Strategy):
         self._outage_book = {"book_px": round(px, 8), "price_source": "replay_model", "market_on_return": now,
                              "outage_level": round(level, 8), "outage_while": while_, "breached_at": _hhmm(at),
                              "half_spread_booked": spread, "half_spread_live": self._half_spread()}
+        if intent in EXIT_LEGS or intent == "liquidation":  # read back after a restart (_position_at, CR #179)
+            self._outage_book["replayed_close"] = datetime.fromtimestamp(at / 1e9, tz=timezone.utc).isoformat()
         if intent in EXIT_LEGS or intent == "liquidation":
             # The venue's order closed the position in that minute: no settlement after it is the position's,
             # though the order goes now (QA P1-L19).
@@ -2761,6 +2766,8 @@ class LongFlatStrategy(Strategy):
             self._funding_since = self._rescan_from(now)
             return
         for ts, qty, px in held:
+            if deadline and now - ts < self.FUNDING_DEFER_MAX:
+                return  # a later settlement keeps its own deadline: held until it is that old too (CR #179)
             inside = self._intrabar is not None and self._intrabar[0] < int(ts.timestamp()) * 1_000_000_000 <= self._intrabar[1]
             if qty == 0 or (inside and self._intrabar[2]):  # a gap fill at the bar's open held nothing after it
                 self._funding_since = ts
@@ -2779,7 +2786,7 @@ class LongFlatStrategy(Strategy):
             if deadline and self.runtime is not None:
                 self.runtime.store.event(
                     self.runtime.name, "info", "funding_deadline_booked",
-                    f"The {ts:%H:%M} settlement was booked {self.FUNDING_DEFER_MAX.seconds // 60} minutes after it, "
+                    f"The {ts:%H:%M} settlement was booked {(now - ts).total_seconds() // 60:.0f} minutes after it, "
                     f"though no trade had reached the strategy in the last {UNSEEN_GAP_NS // 10**9} s: a quiet market "
                     "holds funding back no longer than that", ts=self.runtime.now())
         self._funding_since = max(self._funding_since, self._rescan_from(now))
@@ -2792,7 +2799,11 @@ class LongFlatStrategy(Strategy):
         if self.runtime is None:
             return current if noted is None else noted
         held, last = Decimal(repr(float(current))), None
-        for f in self.runtime.store.fills(self.runtime.name, limit=10_000):  # newest first
+        store, name = self.runtime.store, self.runtime.name
+        seen = store.last_fill_id(name)  # read the journal again only when a fill has been added (CR #179)
+        if self._fills_read is None or self._fills_read[0] != seen:
+            self._fills_read = (seen, store.fills(name, limit=10_000))
+        for f in self._fills_read[1]:  # newest first
             at = f["ts"] if f["ts"].tzinfo else f["ts"].replace(tzinfo=timezone.utc)
             if at < ts:  # a fill at the settlement instant is after it, as the snapshot has it (_snap_settlements)
                 last = at
@@ -2804,6 +2815,15 @@ class LongFlatStrategy(Strategy):
         if noted is not None:
             return noted
         return 0.0 if abs(held) < self._lot() / 2 else float(held)  # under half a lot is flat
+
+    def _journaled_replayed_close(self) -> datetime | None:
+        """After a restart: when the last outage replay found the venue's order closed the position, from the replayed
+        exit's journaled order (_outage_book), so a settlement after it is still held flat (_position_at, CR #179)."""
+        for o in self.runtime.store.orders(self.runtime.name, limit=200):  # newest first
+            at = (o.get("signal") or {}).get("replayed_close")
+            if at:
+                return datetime.fromisoformat(at)
+        return None
 
     def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float) -> None:
         self._cash_adj += amount
