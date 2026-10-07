@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 
 from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
+from sleeve_fund.exact import float_view
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
@@ -97,7 +98,7 @@ def check_funding_schedule(s: Sleeve) -> None:
 
 class Supervisor:
     def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
-        self.store = store
+        self.store = float_view(store)  # its figures are floats: the journal's exact ones (DA-9) read as floats
         self.python = python
         self.clear_path = clear_path  # a clean slate still waiting on a flatten finishes here, not on a redeploy
         self.procs: dict[str, Proc] = {}
@@ -501,8 +502,8 @@ def book_figures(store: Store) -> str:
     earlier = store.previous_book()
     current = [s for s in store.sleeves() if s.name not in earlier]
     start = sum(s.starting_balance for s in current)
-    equity = sum((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"] for s in current)
-    fees = sum(f["fee"] for s in current for f in store.fills(s.name, limit=1_000_000))
+    equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
+    fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
     return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "

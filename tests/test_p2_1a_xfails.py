@@ -421,8 +421,6 @@ def test_g2_open_risk_formula_on_main_is_the_stopless_rule():
     assert position_risk(2.0, 100.0, 95.0, 0.05) == pytest.approx(10.0)  # with a stop: to the stop
 
 
-@xf("G2: the portfolio seam counts a stopless position at notional x max(10%, 3 daily ATR), through the same function "
-    "as open_risk.position_risk, in Decimal [G2, V4 section 2]")
 @pytest.mark.parametrize("qty, atr_pct, risk", [(D(2), 0.02, D(20)), (D(-2), 0.05, D(30)), (D("0.5"), 0.0333, D(5))])
 def test_g2_holding_for_counts_a_stopless_position_at_the_stopless_move(qty, atr_pct, risk):
     (holding_for,) = _need("holding_for", module="sleeve_fund.portfolio")

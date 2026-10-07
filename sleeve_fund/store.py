@@ -43,6 +43,9 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from sleeve_fund.exact import EXACT
+from sleeve_fund.money import stored, to_decimal
+
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
 # The PM's reset after a liquidation (P1-RAL): ends a liquidation halt, from a new high-water mark at the remaining
@@ -70,7 +73,7 @@ sleeves_t = Table(
     Column("instrument", String(32), nullable=False),
     Column("bar_spec", String(64), nullable=False),
     Column("params", JSON, nullable=False, default=dict),
-    Column("starting_balance", Float, nullable=False),
+    Column("starting_balance", EXACT, nullable=False),
     Column("risk_profile", String(32), nullable=False, default="balanced"),
     Column("warmup_bars", Integer, nullable=False, default=0),
     Column("desired_state", String(16), nullable=False, default="running"),  # set by the PM
@@ -88,11 +91,11 @@ equity_t = Table(
     Column("id", Integer, primary_key=True),
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
     Column("ts", TS, nullable=False),
-    Column("equity", Float, nullable=False),
-    Column("cash", Float, nullable=False),
-    Column("qty", Float, nullable=False),
-    Column("price", Float, nullable=False),
-    Column("benchmark", Float, nullable=False),
+    Column("equity", EXACT, nullable=False),
+    Column("cash", EXACT, nullable=False),
+    Column("qty", EXACT, nullable=False),
+    Column("price", EXACT, nullable=False),
+    Column("benchmark", EXACT, nullable=False),
     Index("equity_sleeve_ts", "sleeve", "ts"),
 )
 
@@ -103,9 +106,9 @@ fills_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
     Column("ts", TS, nullable=False),
     Column("side", String(8), nullable=False),
-    Column("qty", Float, nullable=False),
-    Column("price", Float, nullable=False),
-    Column("fee", Float, nullable=False),
+    Column("qty", EXACT, nullable=False),
+    Column("price", EXACT, nullable=False),
+    Column("fee", EXACT, nullable=False),
     Column("order_id", String(64), nullable=False),
     Column("trade_id", String(64), nullable=False),
     Index("fills_sleeve_ts", "sleeve", "ts"),
@@ -123,10 +126,10 @@ funding_t = Table(
     Column("id", Integer, primary_key=True),
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
     Column("ts", TS, nullable=False),
-    Column("qty", Float, nullable=False),
-    Column("price", Float, nullable=False),
+    Column("qty", EXACT, nullable=False),
+    Column("price", EXACT, nullable=False),
     Column("rate", Float, nullable=False),
-    Column("amount", Float, nullable=False),
+    Column("amount", EXACT, nullable=False),
     # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
     # correction to the venue's rate), QA P1-O17.
     Column("kind", String(16), nullable=False, server_default="settled"),
@@ -142,8 +145,8 @@ insurance_t = Table(
     Column("id", Integer, primary_key=True),
     Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
     Column("ts", TS, nullable=False),
-    Column("price", Float, nullable=False),
-    Column("amount", Float, nullable=False),
+    Column("price", EXACT, nullable=False),
+    Column("amount", EXACT, nullable=False),
     Index("insurance_sleeve_ts", "sleeve", "ts"),
 )
 
@@ -158,8 +161,8 @@ mirror_t = Table(
     Column("ts", TS, nullable=False),
     Column("status", String(16), nullable=False),  # start, filled, skipped, error
     Column("instrument", String(32), nullable=False, server_default=""),
-    Column("amount", Float, nullable=False, server_default="0"),  # signed, in the mirror venue's units
-    Column("price", Float),
+    Column("amount", EXACT, nullable=False, server_default="0"),  # signed, in the mirror venue's units
+    Column("price", EXACT),
     Column("order_id", String(64), nullable=False, server_default=""),
     Column("message", Text, nullable=False, server_default=""),
     Index("demo_mirror_sleeve_fill", "sleeve", "fill_id"),
@@ -224,11 +227,11 @@ orders_t = Table(
     Column("updated_at", TS, nullable=False),
     Column("side", String(8), nullable=False),
     Column("order_type", String(16), nullable=False),
-    Column("qty", Float, nullable=False),
+    Column("qty", EXACT, nullable=False),
     Column("status", String(16), nullable=False),  # one of ORDER_STATUSES
-    Column("filled_qty", Float, nullable=False, default=0.0),
-    Column("avg_px", Float),
-    Column("fee", Float, nullable=False, default=0.0),
+    Column("filled_qty", EXACT, nullable=False, default=0.0),
+    Column("avg_px", EXACT),
+    Column("fee", EXACT, nullable=False, default=0.0),
     Column("intent", String(16), nullable=False),  # one of INTENTS: what the order was for
     Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
@@ -268,7 +271,7 @@ exit_plans_t = Table(
     Column("tp_frac", Float),
     Column("basis", Text, nullable=False, default=""),  # how the stop was set, in words
     Column("stop_cfg", JSON),  # the stop settings it was set from
-    Column("risk_amount", Float),  # the trade's 1R from now on: the larger of the entry's and this plan's
+    Column("risk_amount", EXACT),  # the trade's 1R from now on: the larger of the entry's and this plan's
     Column("planned_r", Float),
     Column("event_id", Integer),  # the newest settings-change event it applies
     Index("exit_plans_entry", "sleeve", "entry_order", "id"),
@@ -542,10 +545,10 @@ DUST_NOTIONAL = 1.0
 
 def is_dust(book: dict) -> bool:
     """A journal book (replay_book) holding a position too small for any venue to take an order for."""
-    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0.0) < DUST_NOTIONAL
+    return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0) < DUST_NOTIONAL
 
 
-def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance: float = 0.0) -> dict:
+def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
 
@@ -556,36 +559,39 @@ def replay_book(fills, starting_balance: float, funding: float = 0.0, insurance:
     Decimal from each fill as written: a float sum of many XRP-sized fills carries noise of a few 1e-12
     that could tip a one-lot difference over reconcile's tolerance. A long-only strategy's journal never
     goes negative; if it does, the negative stays visible so reconciliation catches it. entry_fees: the fees paid
-    to open the position still held, pro-rated to what is left of it after a reduction."""
-    cash, qty, entry, n, fees = float(starting_balance), Decimal(0), None, 0, 0.0
+    to open the position still held, pro-rated to what is left of it after a reduction.
+
+    Exact (DA-9): every figure is a Decimal, each fill taken as written (a float as the decimal it prints as)."""
+    D = to_decimal
+    cash, qty, entry, n, fees = D(starting_balance, "starting balance"), D(0), None, 0, D(0)
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
-        price = float(f["price"])
-        q = Decimal(repr(float(f["qty"])))
+        price, q, fee = D(f["price"], "price"), D(f["qty"], "qty"), D(f["fee"], "fee")
         sign = 1 if f["side"] == "BUY" else -1
-        cash -= sign * float(f["qty"]) * price + float(f["fee"])
+        cash -= sign * q * price + fee
         new = qty + sign * q
-        big, legs = max(big, abs(float(f["qty"]))), legs + 1
+        big, legs = max(big, abs(float(q))), legs + 1
         # Float residue from the fills' own arithmetic: below DUST, or for fills too large for a float to hold
         # every lot (1.6e8 units: one float step is 3e-8, wider than a 1e-8 lot) within a few float steps per
         # fill since flat. Left in, an exit back to flat read as 3e-8 held (review round 13, E13-2).
         if abs(new) < DUST or abs(new) <= (legs + 2) * Decimal(math.ulp(big)):
-            new = Decimal(0)
+            new = D(0)
         if new == 0:
             legs = 0
-            entry, fees = None, 0.0
+            entry, fees = None, D(0)
         elif qty == 0 or (qty > 0) == (sign > 0):  # opening or adding
-            entry = ((entry or 0.0) * float(abs(qty)) + float(q) * price) / float(abs(new))
-            fees += float(f["fee"])
+            entry = ((entry or 0) * abs(qty) + q * price) / abs(new)
+            fees += fee
         elif (new > 0) != (qty > 0):  # through flat: what is left opened at this fill's price
             entry = price
-            fees = float(f["fee"]) * float(abs(new)) / float(q)
+            fees = fee * abs(new) / q
         else:  # reducing
-            fees *= float(abs(new)) / float(abs(qty))
+            fees *= abs(new) / abs(qty)
         qty = new
-    return {"cash": cash + float(funding) + float(insurance), "qty": float(qty), "entry_px": entry, "fills": n,
-            "funding": float(funding), "insurance": float(insurance), "entry_fees": fees}
+    funding, insurance = D(funding, "funding"), D(insurance, "insurance")
+    return {"cash": cash + funding + insurance, "qty": qty, "entry_px": entry, "fills": n,
+            "funding": funding, "insurance": insurance, "entry_fees": fees}
 
 
 def is_backtest(name: str | None) -> bool:
@@ -642,6 +648,8 @@ class Sleeve:
         for k in ("paused_until", "heartbeat_at", "created_at", "updated_at"):
             d[k] = _aware(d[k])
         d["params"] = dict(d["params"] or {})
+        # A configured balance, read by the engine's float figures: the journal (journal_book) takes it exactly.
+        d["starting_balance"] = float(d["starting_balance"])
         return cls(**d, venue=venue)
 
 
@@ -842,6 +850,8 @@ class Store:
 
     def record_equity(self, sleeve: str, *, equity: float, cash: float, qty: float, price: float,
                       benchmark: float, ts: datetime | None = None) -> None:
+        equity, cash, qty, price, benchmark = _exact(equity=equity, cash=cash, qty=qty, price=price,
+                                                     benchmark=benchmark)
         with self.engine.begin() as c:
             c.execute(insert(equity_t).values(sleeve=sleeve, ts=ts or utcnow(), equity=equity, cash=cash,
                                               qty=qty, price=price, benchmark=benchmark))
@@ -871,6 +881,7 @@ class Store:
         return booked
 
     def _book(self, sleeve, side, qty, price, fee, order_id, trade_id, ts, with_order: bool) -> str:
+        qty, price, fee = _exact(qty=qty, price=price, fee=fee)
         key = (fills_t.c.sleeve == sleeve) & (fills_t.c.order_id == order_id) & (fills_t.c.trade_id == trade_id)
         for _ in range(2):  # a concurrent writer of the same fill: the second pass reads its row
             try:
@@ -956,11 +967,12 @@ class Store:
         if qty is not None:  # resized at the venue (a backtest's resting stop growing with its entry)
             values["qty"] = qty
         if fill_qty:
-            filled = exact_sum(row.filled_qty, fill_qty)
-            values["avg_px"] = ((row.avg_px or 0.0) * row.filled_qty + fill_qty * fill_px) / filled
+            fill_qty, fill_px, fee = _exact(fill_qty=fill_qty, fill_px=fill_px, fee=fee)
+            filled = to_decimal(row.filled_qty) + fill_qty
+            values["avg_px"] = ((to_decimal(row.avg_px or 0)) * to_decimal(row.filled_qty) + fill_qty * fill_px) / filled
             values["filled_qty"] = filled
-            values["fee"] = row.fee + fee
-            values["status"] = "filled" if filled >= row.qty - 1e-12 else "partially_filled"
+            values["fee"] = to_decimal(row.fee) + fee
+            values["status"] = "filled" if filled >= to_decimal(row.qty) - Decimal("1e-12") else "partially_filled"
         if status is not None and row.status not in FINISHED_ORDER_STATUSES:
             values["status"] = status  # a late "accepted" never reopens a finished order
         if message:
@@ -1291,7 +1303,8 @@ class Store:
         if since is not None:
             q = q.where(equity_t.c.ts >= since)
         with self.engine.connect() as c:
-            return c.execute(q).scalar()
+            v = c.execute(q).scalar()
+        return float(v) if v is not None else None
 
     def max_drawdown(self, sleeve: str, start: float | None = None) -> float:
         """The deepest fall from a running peak over every mark kept, however many: the screens read only
@@ -1333,7 +1346,7 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(fills_t.c.ts.desc(), fills_t.c.id.desc()).limit(limit)))
 
-    def journal_book(self, sleeve: str, starting_balance: float) -> dict:
+    def journal_book(self, sleeve: str, starting_balance: Decimal | float) -> dict:
         """Cash, signed position and average entry implied by the journal: the paper book's source of
         truth (replay_book), with the perp's funding and any insurance-fund cover booked to cash."""
         q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
@@ -1343,6 +1356,7 @@ class Store:
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
                        ts: datetime | None = None, kind: str = "settled") -> None:
+        qty, price, amount = _exact(qty=qty, price=price, amount=amount)
         with self.engine.begin() as c:
             c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
                                                 amount=amount, kind=kind))
@@ -1352,15 +1366,16 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
         """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
-        q = select(func.coalesce(func.sum(funding_t.c.amount), 0.0)).where(funding_t.c.sleeve == sleeve)
+        q = select(func.sum(funding_t.c.amount)).where(funding_t.c.sleeve == sleeve)
         if before is not None:
             q = q.where(funding_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(q).scalar() or 0.0)
+            return to_decimal(c.execute(q).scalar() or 0)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
+        price, amount = _exact(price=price, amount=amount)
         with self.engine.begin() as c:
             c.execute(insurance_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), price=price, amount=amount))
 
@@ -1369,13 +1384,13 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
         """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
-        q = select(func.coalesce(func.sum(insurance_t.c.amount), 0.0)).where(insurance_t.c.sleeve == sleeve)
+        q = select(func.sum(insurance_t.c.amount)).where(insurance_t.c.sleeve == sleeve)
         if before is not None:
             q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
-            return float(c.execute(q).scalar() or 0.0)
+            return to_decimal(c.execute(q).scalar() or 0)
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -2174,9 +2189,16 @@ class Store:
             return _rows(c.execute(q.order_by(decisions_t.c.id.desc()).limit(limit)))
 
 
-def _same_fill(row, side: str, qty: float, price: float, fee: float) -> bool:
-    """The booked fill and the offered one are the same fill: side equal, figures equal to 12 significant figures."""
-    return row.side == side and all(math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=1e-15)
+def _exact(**values) -> list[Decimal]:
+    """Each money or quantity figure as the exact Decimal the store writes (DA-9): NaN or infinity raises ValueError,
+    anything not a number TypeError, before anything is written."""
+    return [to_decimal(v, k) for k, v in values.items()]
+
+
+def _same_fill(row, side: str, qty, price, fee) -> bool:
+    """The booked fill and the offered one are the same fill: side equal, and each figure exactly equal as the
+    journal stores it (DA-9: 18 places, half-even)."""
+    return row.side == side and all(stored(a) == stored(b)
                                     for a, b in ((row.qty, qty), (row.price, price), (row.fee, fee)))
 
 

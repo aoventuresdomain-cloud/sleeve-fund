@@ -142,7 +142,7 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
             continue
         if pos == ZERO and sign < 0 and not shorts:
             continue  # a sell with nothing open (e.g. journal started mid-trip)
-        fee_per = r["fee"] / float(q)
+        fee_per = float(r["fee"]) / float(q)
         while q > ZERO:
             if pos == ZERO:
                 trip = {"side": sign, "bought": 0.0, "sold": 0.0, "entry": 0.0, "exit": 0.0, "fees": 0.0,
@@ -154,10 +154,10 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
             trip["fees"] += f
             if sign == side:
                 trip["bought" if side > 0 else "sold"] += n
-                trip["entry"] += n * r["price"]
+                trip["entry"] += n * float(r["price"])
             else:
                 trip["sold" if side > 0 else "bought"] += n
-                trip["exit"] += n * r["price"]
+                trip["exit"] += n * float(r["price"])
             pos += part * sign
             q -= part
             if pos == ZERO:
@@ -174,7 +174,7 @@ def trades(rows: list[dict], shorts: bool = False, funding: list[dict] | None = 
 
 def _book_flows(trips: list[dict], flows: list[dict], key: str) -> None:
     """Add each cash flow to the trip open at its time (oldest-first trips; each flow once)."""
-    pays = sorted((f["ts"], f["amount"]) for f in flows if f.get("ts") is not None)
+    pays = sorted((f["ts"], float(f["amount"])) for f in flows if f.get("ts") is not None)
     i = 0
     for t in trips:
         if t["opened"] is None or t["closed"] is None:
