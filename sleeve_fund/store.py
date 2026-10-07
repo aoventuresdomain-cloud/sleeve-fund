@@ -1999,12 +1999,13 @@ class Store:
 
         s = self.sleeve(sleeve)
         book = self.journal_book(sleeve, s.starting_balance)
-        if s.desired_state == "running" or abs(book["qty"]) > 1e-12:
-            return None
+        liq = liquidation_event(self, sleeve)
+        if s.desired_state == "running" or abs(book["qty"]) > 1e-12 or liq is None:
+            return None  # liq None: nothing left to reset (a book reset ended it), so it isn't applied (QA D-1)
         equity = book["cash"]
         last = self.equity_at_or_before(sleeve, utcnow())
         cmd = {"incident": incident, "reason": reason}
-        words = ral_words(self, sleeve, cmd, liquidation_event(self, sleeve), SleeveRuntime(self, sleeve).peak, equity)
+        words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
         mark = (None if last is None else
                 {"equity": equity, "cash": equity, "qty": 0.0, "price": last["price"], "benchmark": last["benchmark"]})
         return {"words": words, "mark": mark}

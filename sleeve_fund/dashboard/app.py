@@ -585,6 +585,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
+        elif not data["indicators"]:  # nothing recorded: the strategy's own indicators, as it read them (P1-3s)
+            data["indicators"], why = charts.indicators(s, df.iloc[-720:], minutes)
+            if why:
+                data["indicators_note"] = why
         return JSONResponse(data)
 
     @app.get("/api/instruments")
@@ -700,6 +704,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     st().apply_waiting_ral(name)  # QA RAL-F2: a waiting reset after liquidation can't lapse
                     st().hold_on_reset(name, command, reason)  # P1-KR-3: a reset under way leaves it stopped
                 st().decide(actor, command, reason, name, ts=accepted)
+                if command == "stop":  # after the Stop is held and logged, whatever this does (QA D-1)
+                    st().apply_waiting_ral(name)  # QA RAL-F2: a waiting reset after liquidation can't lapse
             elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
                   and not set(why.codes) <= set(RESUMABLE)):
                 raise ValueError(f"a resume can't clear it. {why}")

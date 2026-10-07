@@ -89,6 +89,17 @@ class RsiPullback(LongFlatStrategy):
             self._peak = close
         return entry
 
+    def indicator_meta(self) -> dict[str, dict]:
+        c = self.c
+        return {"rsi": {"label": f"RSI({c.rsi_period})", "pane": "lower", "levels": [c.rsi_entry]},
+                f"ema_{c.ema_period}": {"label": f"EMA({c.ema_period})", "pane": "price"},
+                "atr": {"label": f"ATR({c.atr_period}) simple", "pane": "lower"}}
+
+    def indicator_values(self) -> dict[str, float | None]:
+        def v(ind):
+            return ind.value if ind.initialized else None
+        return {"rsi": v(self.rsi), f"ema_{self.c.ema_period}": v(self.ema), "atr": v(self.atr)}
+
     def explain(self, bar: Bar, target: bool) -> tuple[str, dict]:
         c, close = self.c, bar.close.as_double()
         rsi, vol, avg = self.rsi.value, bar.volume.as_double(), self._prev_vol_avg or 0.0
