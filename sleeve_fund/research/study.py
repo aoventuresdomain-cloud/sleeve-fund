@@ -604,7 +604,7 @@ def run_study(
         alt_folds, alt_oos, alt_bench = list(folds), list(oos_parts), list(bench_parts)
         for k, window, _ in windows:
             alt_folds[k], alt_oos[k], alt_bench[k], flipped = scored(*window, bt(spec.name, window[1], window[3],
-                                                                                 flip=True))
+                                                                                 flip=True, count_from=window[2][0]))
             first_touch["opposite_resolved"] = _resolved([flipped])
         ruled, opposite = pd.concat(oos_parts), pd.concat(alt_oos)
         first_touch["as_ruled"], first_touch["opposite"] = summary(ruled), summary(opposite)
