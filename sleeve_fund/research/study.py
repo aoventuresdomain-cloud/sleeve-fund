@@ -190,9 +190,13 @@ class StudyResult:
 FIRST_TOUCH_FLIP_SHARE = FIRST_TOUCH_RERUN
 
 
-def first_touch_share(runs) -> float | None:
-    """Ambiguous candles over the candles that reached either level, across every first_touch rule of these runs;
-    None when none of them has a first_touch rule."""
+# R2-G1-F1 (Advisor 7 Oct): too few out-of-sample level-reaching candles to trust the share also forces the re-run.
+FIRST_TOUCH_MIN_REACHED = 20
+
+
+def first_touch_counts(runs) -> tuple[int, int] | None:
+    """(ambiguous, reached) candles across every first_touch rule of these runs: ambiguous is same_minute + unknown,
+    reached is the candles that reached either level. None when none of them has a first_touch rule."""
     ambiguous = reached = 0
     seen = False
     for run in runs:
@@ -200,8 +204,16 @@ def first_touch_share(runs) -> float | None:
             seen = True
             ambiguous += st["same_minute"] + st["unknown"]
             reached += st["reached"]
-    if not seen:
+    return (ambiguous, reached) if seen else None
+
+
+def first_touch_share(runs) -> float | None:
+    """Ambiguous candles over the candles that reached either level, across every first_touch rule of these runs;
+    None when none of them has a first_touch rule."""
+    counts = first_touch_counts(runs)
+    if counts is None:
         return None
+    ambiguous, reached = counts
     return ambiguous / reached if reached else 0.0
 
 
@@ -214,9 +226,13 @@ def _resolved(runs) -> str:
     return "; ".join(f"{p} {r}" for p, r in sorted(out.items()))
 
 
-def needs_flip(share: float | None) -> bool:
-    """Whether G1 must also judge the opposite resolution: strictly over FIRST_TOUCH_FLIP_SHARE."""
-    return share is not None and share > FIRST_TOUCH_FLIP_SHARE
+def needs_flip(share: float | None, fold_shares=(), reached: int | None = None) -> bool:
+    """Whether G1 must also judge the opposite resolution (Advisor 7 Oct): the pooled out-of-sample share or any
+    fold's strictly over FIRST_TOUCH_FLIP_SHARE, or fewer than FIRST_TOUCH_MIN_REACHED level-reaching candles."""
+    if share is None:
+        return False
+    return (share > FIRST_TOUCH_FLIP_SHARE or any(f > FIRST_TOUCH_FLIP_SHARE for f in fold_shares)
+            or (reached is not None and reached < FIRST_TOUCH_MIN_REACHED))
 
 
 def _worse(a: pd.Series, b: pd.Series) -> bool:
@@ -408,8 +424,10 @@ def run_study(
     done = [0]
 
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
-           fees: FeeSchedule | None = None, slippage: float = 0.0, flip: bool = False) -> BacktestResult:
-        """One run. flip: a first_touch rule's ambiguous candles resolve the other way (R2-G1)."""
+           fees: FeeSchedule | None = None, slippage: float = 0.0, flip: bool = False,
+           count_from: pd.Timestamp | None = None) -> BacktestResult:
+        """One run. flip: a first_touch rule's ambiguous candles resolve the other way (R2-G1); count_from: its
+        report counts only the candles closing from then on (a window's test candles)."""
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
@@ -425,7 +443,7 @@ def run_study(
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
                            exec_minutes=exec_minutes or 1, half_spread=half_spread + slippage, fees=fees,
-                           first_touch_flip=flip)
+                           first_touch_flip=flip, first_touch_count_from=count_from)
         if res.handler_errors:
             errors.append((f"{name} {df.index[0]:%d %b %Y} to {df.index[-1]:%d %b %Y}", *res.handler_errors[0]))
             error_count[0] += res.handler_error_count or len(res.handler_errors)
@@ -561,19 +579,27 @@ def run_study(
         # Trade the chosen params continuously through the test window so the
         # position carried in from training is realistic, then score only the test days.
         window = (train, through_test, test_idx, best, best_sharpe, surface)
-        fold, test_ret, b_ret, run = scored(*window, bt(spec.name, through_test, best))
+        # The run's first_touch report counts the test candles only: the share G1 reads is out of sample (CR #171).
+        fold, test_ret, b_ret, run = scored(*window, bt(spec.name, through_test, best, count_from=test_idx[0]))
         windows.append((len(folds), window, run))
         folds.append(fold)
         oos_parts.append(test_ret)
         bench_parts.append(b_ret)
         start += test_bars
 
+    # R2-G1-F1: each window run counts its test candles only, so these are out-of-sample counts, pooled and per fold.
     first_touch = {}
-    share = first_touch_share(run for _, _, run in windows)
-    if share is not None:
-        first_touch = {"share": share, "threshold": FIRST_TOUCH_FLIP_SHARE, "flipped": needs_flip(share),
+    counts = first_touch_counts(run for _, _, run in windows)
+    share = flip = None
+    if counts is not None:
+        ambiguous, reached = counts
+        share = ambiguous / reached if reached else 0.0
+        fold_shares = [first_touch_share([run]) or 0.0 for _, _, run in windows]
+        flip = needs_flip(share, fold_shares, reached)
+        first_touch = {"share": share, "ambiguous": ambiguous, "reached": reached, "fold_shares": fold_shares,
+                       "threshold": FIRST_TOUCH_FLIP_SHARE, "min_reached": FIRST_TOUCH_MIN_REACHED, "flipped": flip,
                        "judged_on": "as ruled", "resolved": _resolved(run for _, _, run in windows)}
-    if needs_flip(share):
+    if flip:
         # Every window again with its ambiguous candles resolved the other way; G1 then judges the worse.
         alt_folds, alt_oos, alt_bench = list(folds), list(oos_parts), list(bench_parts)
         for k, window, _ in windows:

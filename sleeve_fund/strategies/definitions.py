@@ -886,6 +886,7 @@ class FirstTouch(Node):
         self.kx, self.ky, self.kc, self.timeframe, self.exit_rule = kx, ky, kc, timeframe, exit_rule
         self.path = path or f"first_touch(reach {kx}, before {ky})"
         self.flip = False
+        self.count_from: int | None = None  # count only candles closing at or after this (ns): a study's test window
         self.judged_ts: int | None = None
         self.last: Touch | None = None  # None: this candle's levels weren't settled, so it wasn't judged
         self.levels: tuple[float, float] | None = None
@@ -906,7 +907,7 @@ class FirstTouch(Node):
                                     start=env.ts - env.minutes_due * MINUTE_NS, step=env.minutes_due)
         self.levels = (x, y)
         self.result = (self.exit_rule != self.flip) if t.ambiguous else t.holds
-        st = self.stats
+        st = self.stats if self.count_from is None or env.ts >= self.count_from else dict(self.stats)
         st["judged"] += 1
         st["true"] += self.result
         st["reached"] += t.reached

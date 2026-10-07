@@ -223,8 +223,9 @@ def first_touch_words(r: StudyResult) -> str:
     """R2-G1: how many out-of-sample candles a first_touch rule settled by its fixed resolution, and over the
     threshold, both resolutions' results and which one G1 judged."""
     ft = r.first_touch
-    words = (f"{ft['share']:.1%} of the out-of-sample candles that reached a level were ambiguous "
-             f"(threshold {ft['threshold']:.0%})")
+    words = (f"{ft['ambiguous']} of {ft['reached']} out-of-sample level-reaching candles ({ft['share']:.1%}) were "
+             f"same-minute ambiguous (threshold {ft['threshold']:.0%} pooled or in any fold, or under "
+             f"{ft['min_reached']} candles)")
     if not ft["flipped"]:
         return words + ": judged as ruled"
     ruled, opposite = ft["as_ruled"], ft["opposite"]

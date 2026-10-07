@@ -83,8 +83,9 @@ def test_over_5_percent_g1_shows_both_results_and_judges_the_worse(tmp_path, ins
 def test_at_4_9_percent_g1_judges_as_ruled_and_never_re_runs(tmp_path, instrument, monkeypatch):
     flips = _patched(monkeypatch, 49)
     r = _study(tmp_path, instrument)
-    assert r.first_touch == {"share": pytest.approx(0.049), "threshold": 0.05, "flipped": False,
-                             "judged_on": "as ruled", "resolved": "long.entry false when ambiguous"}
+    assert r.first_touch == {"share": pytest.approx(0.049), "ambiguous": 98, "reached": 2000,
+                             "fold_shares": [pytest.approx(0.049)] * 2, "threshold": 0.05, "min_reached": 20,
+                             "flipped": False, "judged_on": "as ruled", "resolved": "long.entry false when ambiguous"}
     assert not any(flips)
     row = next(c for c in g1_checks(r, IdeaLedger(tmp_path / "l.jsonl")) if c[0] == FIRST_TOUCH_CHECK)
     assert row[2].endswith("judged as ruled")
@@ -107,3 +108,38 @@ def test_over_5_percent_the_holdout_is_judged_on_the_worse_too(tmp_path, instrum
     assert r.first_touch["holdout_judged_on"] == "opposite"
     row = next(c for c in g1_checks(r, IdeaLedger(tmp_path / "l.jsonl")) if c[0] == FIRST_TOUCH_CHECK)
     assert row[2].endswith("the holdout on the opposite")
+
+
+def test_a_runs_first_touch_report_counts_only_the_candles_from_the_test_window_on(instrument):
+    """CR #171: the share G1 reads is out of sample. The ambiguous candle (the second, candle B) is counted when the
+    count starts at its own close, and not when it starts at the next candle's."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies.definitions import to_params
+    from test_first_touch import DEFN, FLAT, _frames
+
+    candles, minutes = _frames(FLAT * 4 + [(101.5, 98.5)] + FLAT * 10)
+
+    def stats(count_from):
+        res = run_backtest("rules", candles, instrument, params=to_params(DEFN), bar_minutes=15, half_spread=0,
+                           exec_prices=minutes, exec_minutes=1, first_touch_count_from=count_from)
+        (st,) = res.first_touch.values()
+        return st
+
+    whole, from_it, after_it = stats(None), stats(candles.index[1]), stats(candles.index[2])
+    assert whole["same_minute"] == from_it["same_minute"] == 1 and after_it["same_minute"] == 0
+    assert after_it["judged"] < from_it["judged"] <= whole["judged"]
+
+
+def test_each_windows_share_is_counted_from_its_first_test_candle(tmp_path, instrument, monkeypatch):
+    starts = []
+    real = study_mod.run_backtest
+
+    def fake(*a, first_touch_count_from=None, **kw):
+        if first_touch_count_from is not None:
+            starts.append(first_touch_count_from)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(study_mod, "run_backtest", fake)
+    res = _study(tmp_path, instrument)
+    assert starts and len(starts) == len(res.folds)
+    assert all(f.train_end < s <= f.test_end for f, s in zip(res.folds, starts))  # each window's first test candle
