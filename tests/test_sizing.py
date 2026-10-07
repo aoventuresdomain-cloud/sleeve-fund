@@ -7,20 +7,28 @@ expected value is unchanged."""
 import ast
 import dataclasses
 import inspect
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import pytest
 
 from sleeve_fund.money import money, scale
 from sleeve_fund.portfolio import sizing
-from sleeve_fund.portfolio.sizing import (ATR_STOP_MULTIPLE, DEFAULT_STOP_SLIPPAGE, SizingInputs, loss_at_stop,
-                                          margin_per_unit, risk_per_unit, rounds_up_too_often, size_entry)
+from sleeve_fund.portfolio.sizing import (
+    ATR_STOP_MULTIPLE,
+    DEFAULT_STOP_SLIPPAGE,
+    SizingInputs,
+    loss_at_stop,
+    margin_per_unit,
+    risk_per_unit,
+    rounds_up_too_often,
+    size_entry,
+)
 
 D = Decimal
 
 
 def _in(**kw) -> SizingInputs:
-    base = dict(allocated_equity=D(10_000), price=D(100), side=1, leg_cost=0.001, half_spread=0.0, risk_per_trade=0.01,
+    base = dict(allocated_equity=D(10_000), price=D(100), side=1, leg_cost=0.001, taker_fee=D("0.001"), half_spread=0.0, risk_per_trade=0.01,
                 position_cap_pct=0.5, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02, stop_slippage=0.0,
                 vol_floor=0.0)  # no slippage and no floor unless a test sets them, so each limit is hand-checkable
     return SizingInputs(**{**base, **kw})
@@ -41,8 +49,34 @@ def test_the_margin_cap_binds_on_a_perp_and_notional_is_margin_times_leverage():
 
 
 def test_the_leverage_cap_binds_on_a_tight_stop():
+    # SZ-LEV-FEE (Advisor 21:53 UK): notional = equity / (1/L + 2 x taker), computed here from the formula.
     s = size_entry(_in(perp=True, leverage=2.0, position_cap_pct=1.0, stop_frac=0.002))
-    assert s.sized_by == "2x leverage cap" and s.qty == D("199.80")  # 10,000 x 2 x (1 - 0.001)
+    expected = (D(10_000) / (1 / D(2) + 2 * D("0.001")) / D(100)).quantize(D("0.01"), rounding=ROUND_DOWN)
+    assert s.sized_by == "2x leverage cap" and s.qty == expected
+
+
+@pytest.mark.parametrize("lev", [1.0, 1.5, 2.0, 3.0, 5.0, 20.0])
+@pytest.mark.parametrize("taker", ["0", "0.0002", "0.0005", "0.001", "0.0026"])
+@pytest.mark.parametrize("side", [1, -1])
+def test_at_the_leverage_cap_margin_and_both_taker_fees_fit_the_equity(lev, taker, side):
+    """The finding: equity x L x (1 - cost) let margin + fees pass the balance at a 100% cap. Now they never do."""
+    s = size_entry(_in(side=side, perp=True, leverage=lev, position_cap_pct=1.0, stop_frac=0.001, risk_per_trade=0.9,
+                       taker_fee=D(taker)))
+    assert s.sized_by in (f"{lev:g}x leverage cap", "margin cap")  # a tie at a zero rate names the margin cap first
+    notional = s.qty * D(100)
+    assert notional / D(repr(lev)) + 2 * D(taker) * notional <= D(10_000)
+    assert s.limits[f"{lev:g}x leverage cap"] == D(10_000) / (1 / D(repr(lev)) + 2 * D(taker))
+
+
+@pytest.mark.parametrize("taker", [None, 0.001, "0.001", D("NaN"), D("-0.001")])
+def test_a_perp_entry_without_a_known_taker_rate_is_refused(taker):
+    """Fail closed (Advisor 21:53 UK): the rate comes from the fill model's fee config; missing or not a Decimal refuses."""
+    s = size_entry(_in(perp=True, leverage=2.0, taker_fee=taker))
+    assert not s.ok and s.qty == 0 and "taker fee rate" in s.skipped
+
+
+def test_a_spot_entry_needs_no_taker_rate():
+    assert size_entry(_in(taker_fee=None)) == size_entry(_in())
 
 
 def test_the_spot_position_cap_binds():
@@ -222,7 +256,7 @@ def test_the_inputs_keep_the_frozen_interface():
         "allocated_equity", "price", "side", "lot", "min_qty", "leg_cost", "half_spread", "risk_per_trade",
         "position_cap_pct", "leverage", "perp", "maintenance_margin", "stop_frac", "atr", "stop_slippage",
         "regime_weight", "fraction", "overlay", "vol_target", "instrument_vol", "vol_floor", "max_notional",
-        "volume_notional", "stop_to_liquidation", "risk_long", "risk_short"]
+        "volume_notional", "stop_to_liquidation", "risk_long", "risk_short", "taker_fee"]
     assert [f.name for f in dataclasses.fields(sizing.Sizing)] == [
         "qty", "sized_by", "stop_frac", "risk_budget", "risk_amount", "limits", "rounded_up", "skipped"]
 

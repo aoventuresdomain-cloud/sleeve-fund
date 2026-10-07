@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pandas as pd
+
 
 LIMIT = 0.05  # of the book
 STOPLESS_FLOOR = 0.10  # the smallest move a position with no placed stop counts at
@@ -27,16 +29,22 @@ ATR_DAYS = 14
 ATR_WINDOW = ATR_DAYS * 3  # whole days the daily ATR is measured over, in paper and backtest alike
 
 
-def position_risk(qty: float, mark: float, stop: float | None = None, atr_pct: float | None = None) -> float:
-    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move."""
+def position_risk(qty, mark, stop=None, atr_pct: float | None = None):
+    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move.
+    Floats in, a float out (the interim check); Decimal qty, mark and stop in, an exact Decimal out (the portfolio
+    gate, through portfolio.holding_for): one formula for both."""
+    exact = isinstance(mark, Decimal)
     if not qty or mark <= 0:
-        return 0.0
+        return Decimal(0) if exact else 0.0
     if stop is not None and (mark - stop) * qty > 0:
         return (mark - stop) * qty  # a short (qty < 0) loses as the price rises to its stop
     # No stop, or one the price has gone through with the position still open (its exit not filled yet): it counts
     # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9).
     if atr_pct is None or not math.isfinite(atr_pct):
         raise ValueError("the daily ATR isn't known, so a position with no stop can't be measured")
+    if exact:  # the move from its terms exactly, so 3 x 5% is 15%, not 0.15000000000000002
+        move = max(Decimal(repr(STOPLESS_FLOOR)), Decimal(repr(STOPLESS_ATRS)) * Decimal(repr(float(atr_pct))))
+        return abs(qty) * mark * move
     return abs(qty) * mark * stopless_move(atr_pct)
 
 
@@ -128,6 +136,42 @@ def _journal_stop(store, sleeve, qty: float) -> float | None:
 def gapped(qty: float, mark: float, stop: float | None) -> bool:
     """A position whose stop the price has already gone through while it is still open."""
     return bool(qty) and stop is not None and (mark - stop) * qty <= 0
+
+
+def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
+    """Read-only, for the dashboard's Open risk (FE v2, signature agreed with PE2 7 Oct): what the limit counts for
+    each open perp position, by the same rules as account_book, so the tile equals the gate. One row per strategy
+    that isn't archived, is a perpetual and holds a position, in store.sleeves() order, on `account` (None: every
+    account): {sleeve, risk, basis, atr_pct}. basis is "stop" (measured to its journaled stop), "stopless" (no
+    placed stop, a close-checked trail included) or "gapped" (the price has gone through its stop, still open).
+    `atr_pct(sleeve)` is asked only for stopless and gapped rows; risk is None when it gives nothing. Never raises."""
+    from sleeve_fund import markets
+
+    archived = store.archived()
+    rows = []
+    for s in store.sleeves():
+        if s.name in archived or (account is not None and store.account_of(s.name) != account):
+            continue
+        last = store.last_equity(s.name)
+        if last is None or not last["qty"] or not markets.is_perp(s.params):
+            continue
+        qty, mark = last["qty"], last["price"]
+        stop = _journal_stop(store, s, qty)
+        basis = "gapped" if gapped(qty, mark, stop) else ("stop" if stop is not None else "stopless")
+        atr = None
+        if basis != "stop":
+            try:
+                atr = atr_pct(s)
+            except Exception:  # noqa: BLE001 - the caller's lookup failing reads as not known, so the row is still shown
+                atr = None
+            if atr is not None and not math.isfinite(atr):
+                atr = None
+        try:
+            risk = position_risk(qty, mark, stop if basis == "stop" else None, atr)
+        except ValueError:  # stopless or gapped with no daily ATR: can't be measured
+            risk = None
+        rows.append({"sleeve": s.name, "risk": risk, "basis": basis, "atr_pct": atr})
+    return rows
 
 
 def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[float, float, list[str]]:

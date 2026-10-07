@@ -32,6 +32,12 @@ ASSUMED INTERFACES (adapt names, never assertions): note v4 section 1.
 - sleeve_fund.portfolio.holding_for(position, mark, atr_pct) -> Holding with .risk (note v4 section 2); position has
   .qty (signed Decimal) and .stop (Decimal or None).
 A module or name not built yet fails as AssertionError ("not built"), so each cell is a strict xfail until it is.
+
+TEST CORRECTIONS
+- 22:30 UK 7 Oct (HoQA; Advisor SZ-LEV-FEE 21:53 UK, interface note v6): the bases pass taker_fee=D(0) when the build
+  has the field (_fee_basis), so every hand-worked quantity keeps its no-fee basis; two new cells pin the fee-aware
+  leverage cap and the fail-closed refusal. No existing assertion changed. QD's proposal (md5 280c0190) adopted in
+  substance; marks kept.
 """
 
 import math
@@ -65,7 +71,17 @@ def _in(**kw):
     base = dict(allocated_equity=D(10_000), price=D(100), side=1, leg_cost=0.0, half_spread=0.0, risk_per_trade=0.01,
                 position_cap_pct=0.9, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02)
     kw = {k: (D(str(v)) if k in MONEY and isinstance(v, float) else v) for k, v in kw.items()}  # [V4] str, never float
-    return SizingInputs(**{**base, **kw})
+    return SizingInputs(**_fee_basis(SizingInputs, {**base, **kw}))
+
+
+def _fee_basis(SizingInputs, kw):
+    """[SZ-LEV-FEE] note v6 adds SizingInputs.taker_fee (None refuses a perp entry). These cells keep their "no fees"
+    basis with a zero rate; a build before v6 has no such field and gets none."""
+    import inspect
+
+    if "taker_fee" in inspect.signature(SizingInputs).parameters:
+        return {"taker_fee": D(0), **kw}
+    return {k: v for k, v in kw.items() if k != "taker_fee"}
 
 
 def _size(**kw):
@@ -184,6 +200,49 @@ def test_the_cap_is_measured_on_margin_at_each_leverage(lev, qty):
     assert float(s.qty) * 100 <= 10_000 * lev  # never past the leverage cap either
 
 
+def _need_fee_field():
+    (SizingInputs,) = _need("SizingInputs")
+    import inspect
+
+    if "taker_fee" not in inspect.signature(SizingInputs).parameters:
+        raise AssertionError("not built: SizingInputs.taker_fee (interface note v6, SZ-LEV-FEE)")
+
+
+@pytest.mark.parametrize("lev", [1.0, 2.0, 3.0])
+@pytest.mark.parametrize("taker", [D("0.0005"), D("0.0010")])
+def test_a_perps_leverage_cap_leaves_room_for_the_round_trip_taker_fee(lev, taker):
+    from decimal import ROUND_DOWN
+
+    _need_fee_field()
+    s = _size(perp=True, leverage=lev, position_cap_pct=1.0, risk_per_trade=0.5, taker_fee=taker)  # risk ~243,900
+    cap = D(10_000) / (1 / D(str(lev)) + 2 * taker)
+    want = (cap / 100).quantize(D("0.01"), rounding=ROUND_DOWN)
+    assert s.qty == want and "leverage" in s.sized_by, (s.qty, want, s.sized_by)
+
+    def fits(q):
+        notional = q * 100
+        return notional / D(str(lev)) + 2 * taker * notional <= D(10_000)
+
+    assert fits(s.qty) and not fits(s.qty + D("0.01")), s.qty
+
+
+@pytest.mark.parametrize("rate", [None, 0.0005])
+def test_a_perp_entry_without_a_decimal_taker_rate_is_refused(rate):
+    (SizingInputs, size_entry) = _need("SizingInputs", "size_entry")
+    _need_fee_field()
+    base = dict(allocated_equity=D(10_000), price=D(100), side=1, leg_cost=0.0, half_spread=0.0, risk_per_trade=0.01,
+                position_cap_pct=0.9, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02, perp=True, leverage=2.0,
+                taker_fee=rate)
+    try:
+        s = size_entry(SizingInputs(**base))
+    except (TypeError, ValueError):
+        pass  # refused at the boundary
+    else:
+        assert s.qty == 0 and not _ok(s) and s.skipped, (s.qty, s.sized_by, s.skipped)
+    spot = {**base, "perp": False, "leverage": 1.0, "taker_fee": None}
+    assert size_entry(SizingInputs(**spot)).qty > 0  # spot sizes without a rate
+
+
 def test_on_spot_the_cap_is_on_the_notional():
     s = _size(position_cap_pct=0.2, risk_per_trade=0.5)
     assert s.qty == D("20.00")
@@ -297,6 +356,7 @@ def test_float_money_is_refused_and_int_str_decimal_agree(field):
     (SizingInputs, size_entry) = _need("SizingInputs", "size_entry")
     base = dict(allocated_equity=D(10_000), price=D(100), side=1, leg_cost=0.0, half_spread=0.0, risk_per_trade=0.01,
                 position_cap_pct=0.9, lot=D("0.01"), min_qty=D("0.01"), stop_frac=0.02)
+    base = _fee_basis(SizingInputs, base)
     with pytest.raises(TypeError):
         SizingInputs(**{**base, field: float(base[field])})
     sizes = {size_entry(SizingInputs(**{**base, field: v})).qty for v in (int(base[field]), str(base[field]),
@@ -361,8 +421,6 @@ def test_g2_open_risk_formula_on_main_is_the_stopless_rule():
     assert position_risk(2.0, 100.0, 95.0, 0.05) == pytest.approx(10.0)  # with a stop: to the stop
 
 
-@xf("G2: the portfolio seam counts a stopless position at notional x max(10%, 3 daily ATR), through the same function "
-    "as open_risk.position_risk, in Decimal [G2, V4 section 2]")
 @pytest.mark.parametrize("qty, atr_pct, risk", [(D(2), 0.02, D(20)), (D(-2), 0.05, D(30)), (D("0.5"), 0.0333, D(5))])
 def test_g2_holding_for_counts_a_stopless_position_at_the_stopless_move(qty, atr_pct, risk):
     (holding_for,) = _need("holding_for", module="sleeve_fund.portfolio")

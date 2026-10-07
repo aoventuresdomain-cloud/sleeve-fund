@@ -14,6 +14,9 @@ from pathlib import Path
 from sleeve_fund.paper.recorder import read
 
 
+WARMUP_BARS = 200  # candles a replay with history warms up on, at most
+
+
 def _instrument(h: dict, fees):
     from nautilus_trader.model import Currency, CurrencyPair, InstrumentId, Money, Price, Quantity, Symbol
 
@@ -56,9 +59,36 @@ def _data(instrument, rows: list[dict]) -> list:
     return out
 
 
-def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict] | tuple[list[dict], list[dict]]:
+def _history(path: Path | str, before_ns: int):
+    """A warm-up history loader, as the paper node attaches (paper.node.history_loader), from a recording of the market
+    the hub saw: its trades built into candles, those closed by `before_ns` (the replay's first event), the latest
+    `limit` of them. It lets a replayed restart warm up, and decide the candles it missed, as the node does (R-I5-2)."""
+    from nautilus_trader.model import Bar, Price, Quantity
+
+    from sleeve_fund.data import bar_minutes
+
+    trades = [(r["e"], float(r["p"]), float(r["s"])) for r in read(path)[1] if r["k"] == "t" and r["e"] < before_ns]
+
+    def load(instrument, bar_type, limit: int):
+        step = bar_minutes(bar_type) * 60_000_000_000
+        candles: dict[int, list[float]] = {}
+        for ts, px, size in trades:
+            c = candles.setdefault((ts // step + 1) * step, [px, px, px, px, 0.0])
+            c[1], c[2], c[3], c[4] = max(c[1], px), min(c[2], px), px, c[4] + size
+        p, q = instrument.price_precision, instrument.size_precision
+        return [Bar(bar_type, Price(o, p), Price(h, p), Price(lo, p), Price(c, p), Quantity(v, q), close, close)
+                for close, (o, h, lo, c, v) in sorted(candles.items()) if close <= before_ns][-limit:]
+
+    load.source = "the replayed market's history"
+    return load
+
+
+def replay(path: Path | str, with_fills: bool = False, store=None,
+           history: Path | str | None = None) -> list[dict] | tuple[list[dict], list[dict]]:
     """The orders the recorded sleeve sends when replayed, oldest first, as the journal stores them;
-    with_fills, the fills too, oldest first. store: the journal to replay into (in memory by default)."""
+    with_fills, the fills too, oldest first. store: the journal to replay into (in memory by default). history: a
+    recording of the market over the same span or longer, as the hub's history store holds it: a restart warms up
+    from its candles before the recording's first event, as the paper node does (none: no warm-up)."""
     from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
     from nautilus_trader.common import LoggerConfig, LogLevel
     from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
@@ -93,9 +123,11 @@ def replay(path: Path | str, with_fills: bool = False, store=None) -> list[dict]
         engine.add_data(data)
         strategy_cls, config_cls = REGISTRY[s["strategy"]]
         config = config_cls(instrument_id=instrument.id, bar_type=BarType.from_str(f"{instrument.id}-{s['bar_spec']}"),
-                            max_notional=s.get("max_notional"), assumed_taker_fee=float(fees.taker), warmup_bars=0,
-                            **s["params"])
+                            max_notional=s.get("max_notional"), assumed_taker_fee=float(fees.taker),
+                            warmup_bars=WARMUP_BARS if history is not None else 0, **s["params"])
         strategy = strategy_cls(config).attach_runtime(runtime)
+        if history is not None:
+            strategy.attach_history(_history(history, min(d.ts_event for d in data)))
         strategy.simulated_venue = True  # as the paper node does
         strategy.fee_model = fee_model
         engine.add_strategy(strategy)

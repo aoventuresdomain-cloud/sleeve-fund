@@ -81,11 +81,24 @@ def _px(v: float) -> str:
     return f"{v:,.2f}" if abs(v) >= 100 else f"{v:,.4f}" if abs(v) >= 1 else f"{v:,.6f}"
 
 
+def stop_past_liquidation(order: dict | None) -> str | None:
+    """A liquidation the engine booked from a stop whose fill, after slippage, was at or past the liquidation price
+    (GAP-LIQ: the venue would have liquidated first), in the Advisor's words (7 Oct 18:50 UK), or None. Read from the
+    order's stop_relabelled flag (QD FU-STOP-RELABEL-FLAG), never from its reason text."""
+    sig = (order or {}).get("signal") or {}
+    if order is None or order.get("intent") != "liquidation" or not sig.get("stop_relabelled"):
+        return None
+    stop = sig.get("stop_px")
+    return (f"Liquidated: stop at {stop:,.6g} would have filled past liquidation" if stop is not None
+            else "Liquidated: the stop would have filled past liquidation")
+
+
 def order_view(o: dict) -> dict:
     o = dict(o)
     o["status_label"] = STATUS_LABELS.get(o["status"], o["status"])
     o["tone"] = STATUS_TONES.get(o["status"], "stopped")
     o["intent_label"] = INTENTS.get(o["intent"], o["intent"])
+    o["relabelled"] = stop_past_liquidation(o)
     o["notional"] = (o["avg_px"] or 0.0) * o["filled_qty"]
     o["sig"] = signal_items(o["signal"])
     o["is_open"] = o["status"] in OPEN_ORDER_STATUSES
@@ -146,6 +159,7 @@ def trips(fills: list[dict], events: list[dict], orders: dict[str, dict],
         t.update(
             exit_kind=kind,
             reason=INTENTS.get(kind, "Signal exit"),
+            relabelled=stop_past_liquidation(exit_),
             entry_why=entry["reason"] if entry else None,
             exit_why=exit_["reason"] if exit_ else None,
             entry_items=signal_items(entry["signal"]) if entry else [],
@@ -242,21 +256,138 @@ def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | Non
     return abs(qty) * max(side * (price - stop_px), 0.0)
 
 
+def stop_to_liquidation(price: float, stop_px: float | None, liq_px: float | None) -> float | None:
+    """How far a stop sits along the way from the mark to liquidation: 0 at the mark, 1 at the liquidation
+    price, over 1 past it (the venue would liquidate first). None without both, or once the price has gone
+    through the stop (the Risk cell says so). A stop must sit no more than half way (Independent Quant Advisor;
+    readout ruled 7 Oct 18:50 UK)."""
+    if stop_px is None or not liq_px or price == liq_px:
+        return None
+    share = (price - stop_px) / (price - liq_px)
+    return share if share > 0 else None
+
+
 # Strategies whose stop trails the market inside the strategy and isn't journaled (A2-T will journal it).
 TRAILING_STOP = {"rsi_pullback"}
 
 
-def open_risk(positions: list[dict]) -> dict:
-    """Margin and open risk across positions (open_position's dicts): margin put up, the sum of their Risk to
-    stop, the strategies whose position has no stop of any kind, which leave open risk unbounded, and those
-    with a trailing stop, whose level isn't shown yet: they are bounded, but not counted until the engine
-    gives their risk (UI v2 P1-U24)."""
+def _atr_pct(now):
+    """The engine's daily ATR share for a strategy (open_risk.history_atr_pct, as the open-risk limit reads it), asked
+    once per strategy per call."""
+    from sleeve_fund import open_risk as limit
+    from sleeve_fund.venues import venue as venue_profile
+
+    seen: dict[str, float | None] = {}
+
+    def atr(s):
+        if s.name not in seen:
+            try:
+                seen[s.name] = limit.history_atr_pct(venue_profile(s.venue).name, s.instrument, now)
+            except (KeyError, ValueError):
+                seen[s.name] = None
+        return seen[s.name]
+    return atr
+
+
+def risk_cell(p: dict, row: dict | None) -> dict:
+    """What a position's Risk column reads and how it adds into Open risk. A perpetual reads what the open-risk limit
+    counts for it (open_risk.book_open_risk), so the rows add up to the gate's figure: kind stop (measured to its
+    stop), estimated (no stop, or a trail checked at the close: the stopless measure) or through (the price has gone
+    through its stop, still open: the stopless measure); unknown (no daily ATR yet) and none (archived, the limit
+    doesn't count it) are left out. Spot is outside the limit and reads its risk to stop as before (P1-U24); left
+    out: trailing (level not journaled), unbounded (no stop) and spot_through (past its stop, still open)."""
+    if p.get("perp_limit"):
+        if row is None:
+            return {"kind": "none", "amount": None}
+        if row["risk"] is None:
+            return {"kind": "unknown", "amount": None, "through": row["basis"] == "gapped"}
+        kind = {"stop": "stop", "stopless": "estimated", "gapped": "through"}[row["basis"]]
+        return {"kind": kind, "amount": row["risk"], "trailing": bool(p.get("trailing_model"))}
+    if p.get("trailing"):
+        return {"kind": "trailing", "amount": None}
+    if p["stop_px"] is None:
+        return {"kind": "unbounded", "amount": None}
+    if (p["price"] - p["stop_px"]) * p["qty"] <= 0:
+        return {"kind": "spot_through", "amount": None}
+    return {"kind": "stop", "amount": p["risk_to_stop"]}
+
+
+# Why a part is left out of Open risk, by risk_cell kind, as the hover says it.
+LEFT_OUT = {"unknown": "no stop to measure and its daily ATR isn't known yet, so not counted",
+            "none": "not counted by the open-risk limit (archived)",
+            "trailing": "trailing stop, level not shown, not counted",
+            "unbounded": "no stop, so unbounded",
+            "spot_through": "the price has gone through its stop and the position is still open, not counted"}
+STOPLESS_WORDS = "counted at the larger of 10% and 3 daily ATRs"
+
+
+def _tally(cells: list[tuple[str, dict]]) -> tuple[float, int, list[str], list[str], dict[str, list[str]]]:
+    """(total, parts counted, estimated, through, left out by kind) over (strategy, risk cell) pairs."""
+    total, counted, estimated, through, left_out = 0.0, 0, [], [], {}
+    for name, cell in cells:
+        if cell["amount"] is None:
+            left_out.setdefault(cell["kind"], []).append(name)
+            continue
+        total, counted = total + cell["amount"], counted + 1
+        if cell["kind"] == "estimated":
+            estimated.append(name)
+        elif cell["kind"] == "through":
+            through.append(name)
+    return total, counted, estimated, through, left_out
+
+
+def open_risk(positions: list[dict], store: Store | None = None) -> dict:
+    """Margin and Open risk across positions (open_position's dicts), each position given its "risk" cell
+    (risk_cell). Open risk is the 5% open-risk limit's figure and nothing else, so the tile equals the gate
+    (open_risk.book_open_risk, one formula; Advisor 7 Oct 18:50 UK; QA R200-1): perpetuals only, a stop measured
+    from the mark; no stop, a trail checked at the close or a stop the price has gone through at the stopless
+    measure, named as estimated. Spot is outside the limit and has its own line, its risk to stop (spot_risk).
+    Whatever can't be measured is left out and named, so the figure carries the "+" (P1-U24-1); with nothing
+    measured at all it has no figure (None) rather than a 0."""
+    from sleeve_fund import open_risk as limit
+
+    rows = {}
+    if store is not None and any(p.get("perp_limit") for p in positions):
+        rows = {r["sleeve"]: r for r in limit.book_open_risk(store, _atr_pct(utcnow()))}
+    for p in positions:
+        p["risk"] = risk_cell(p, rows.get(p["sleeve"]))
+    perps = [(p["sleeve"], p["risk"]) for p in positions if p.get("perp_limit")]
+    spots = [(p["sleeve"], p["risk"]) for p in positions if not p.get("perp_limit")]
+    total, counted, estimated, through, left_out = _tally(perps)
+    spot_total, spot_counted, _, _, spot_left = _tally(spots)
+    trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
     return {
         "margin": sum(p["margin"] for p in positions),
-        "open_risk": sum(p["risk_to_stop"] for p in positions if p["risk_to_stop"] is not None),
-        "unbounded": [p["sleeve"] for p in positions if p["risk_to_stop"] is None and not p.get("trailing")],
+        "open_risk": total if counted or not left_out else None,
+        "estimated": estimated,
+        "through": through,
+        "left_out": [n for names in left_out.values() for n in names],
         "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
+        "hint": open_risk_hint(estimated, through, left_out, trailing) or (
+            "Money lost if every stop is hit, as the 5% open-risk limit counts it" if perps else
+            "No perpetual positions: the 5% open-risk limit counts perpetuals only"),
+        "spot": [n for n, _ in spots],
+        "spot_risk": (spot_total if spot_counted or not spot_left else None) if spots else None,
+        "spot_left_out": [n for names in spot_left.values() for n in names],
+        "spot_hint": open_risk_hint([], [], spot_left, trailing) or "Money lost if every spot stop is hit",
     }
+
+
+def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str, list[str]],
+                   trailing: list[str]) -> str:
+    """The hover on an Open risk figure: each strategy whose part is estimated or left out, and why."""
+    parts = []
+    if through:
+        parts.append(f"{', '.join(through)}: the price has gone through its stop and the position is still open, "
+                     f"so it is {STOPLESS_WORDS}")
+    if nostop := [n for n in estimated if n not in trailing]:
+        parts.append(f"{', '.join(nostop)}: no stop, {STOPLESS_WORDS}")
+    if trail := [n for n in estimated if n in trailing]:
+        parts.append(f"{', '.join(trail)}: trailing stop checked at the close, {STOPLESS_WORDS}")
+    for kind in ("unbounded", "trailing", "spot_through", "unknown", "none"):
+        if left_out.get(kind):
+            parts.append(f"{', '.join(left_out[kind])}: {LEFT_OUT[kind]}")
+    return " · ".join(parts)
 
 
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
@@ -296,6 +427,9 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "liq_px": liq,
         "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
         "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
+        "stop_liq": stop_to_liquidation(x["price"], stop_px, liq),
+        "perp_limit": markets.is_perp(x["sleeve"].params),
+        "trailing_model": x["sleeve"].strategy in TRAILING_STOP,
         "trailing": stop_px is None and x["sleeve"].strategy in TRAILING_STOP,
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
@@ -365,7 +499,7 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
         "stats": stats,
         "unrealised": sum(p["unrealised"] for p in positions),
         "exposure": sum(p["value"] for p in positions),
-        **open_risk(positions),
+        **open_risk(positions, store),
     }
 
 
@@ -398,7 +532,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
         "notional": sum(abs(r["value"]) for r in rows),
         "realised": sum(r["realised"] for r in rows),
         "fees": sum(r["fees"] for r in rows),
-        **open_risk(rows),
+        **open_risk(rows, store),
     }
 
 
