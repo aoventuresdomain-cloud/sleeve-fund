@@ -18,7 +18,10 @@
     {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
     {% elif s.desired_state == 'running' %}
-      {% if s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
+      {# Only a drawdown halt or a PM pause is cleared by Resume; a liquidation waits for its reset and a day's-loss pause for the 00:00 UTC roll (Advisor 18:17). #}
+      {% if clearing and clearing.kind == 'liquidated' %}<button type="button" data-open="dlg-ral" title="{{ clearing.why }}">Reset after liquidation</button>
+      {% elif clearing and clearing.kind == 'daily' %}<span class="chip paused" title="{{ clearing.why }}">Clears at 00:00 UTC</span>
+      {% elif s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not x.qty %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
     {% else %}<button type="button" data-open="dlg-start">Start</button>
@@ -42,29 +45,9 @@
   {% if s.status == 'halted' and liquidated %}Its position margin was lost (liquidated), so nothing trades until you use Reset after liquidation, which asks for an incident note. Resuming doesn't restart it.{% elif s.status == 'halted' %}Nothing trades until you resume. Resuming resets the drawdown reference to today's equity.{% elif s.paused_until %}Trading again {{ s.paused_until|ts }}.{% endif %}
 </div>
 {% endif %}
-{% if ral %}
-<section class="panel" aria-labelledby="ral-h">
-  <h2 id="ral-h">Reset after liquidation</h2>
-  {% if ral.incident %}
-  <p>Incident #{{ ral.incident.id }}: {{ ral.incident.message }}</p>
-  <form method="post" action="/sleeves/{{ s.name }}/incident-note">
-    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
-    <label>Why the half-liquidation stop did not protect the position <textarea name="why_stop_did_not_protect" required>{{ ral.note.message.split(': ', 2)[2] if ral.note else '' }}</textarea></label>
-    <label>Author <input name="author" required value="{{ ral.note.author if ral.note else '' }}"></label>
-    <button type="submit" class="secondary">{{ 'Update the note' if ral.note else 'Save the note' }}</button>
-  </form>
-  <form method="post" action="/sleeves/{{ s.name }}/command">
-    <input type="hidden" name="command" value="reset_after_liquidation">
-    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
-    <label>Reason <input name="reason" required></label>
-    <button type="submit" {% if not ral.note %}disabled title="Write the incident note first"{% endif %}>Reset after liquidation</button>
-    <p class="muted">It starts a new high-water mark and day baseline at the remaining equity. The book's own limits and the track record are not reset.</p>
-  </form>
-  {% else %}
-  <p>No incident has been written for this liquidation yet, so it can't be reset.</p>
-  {% endif %}
-</section>
-{% endif %}
+{% if reset_dropped %}<div class="banner warn" role="status">Your reset was cancelled because the strategy was liquidated first. The halt stays until you reset again.</div>{% endif %}
+{% if clearing and clearing.kind == 'exits_only' %}<div class="banner warn" role="status"><strong>Exits only:</strong> it was stopped while it still holds a position, so nothing new opens and it stops once it is flat. Flatten ends it now.</div>{% endif %}
+{% if clearing and clearing.kind in ['liquidated', 'drawdown', 'daily'] %}<div class="banner" role="status"><strong>What clears it:</strong> {{ clearing.why }}{% if clearing.kind == 'daily' %} Start and Resume don't lift it.{% endif %}</div>{% endif %}
 {% set waiting = pending|rejectattr('command', 'equalto', 'reload')|list %}
 {% if waiting %}<div class="banner warn" role="status">{{ waiting|length }} command{{ 's' if waiting|length != 1 }} waiting for the strategy to pick up ({{ waiting|map(attribute='command')|join(', ') }}).</div>{% endif %}
 {% if reload %}<div class="banner warn" role="status">Restarting to trade under the changed settings.</div>{% endif %}
@@ -380,6 +363,32 @@
   </form>
 </dialog>
 {% endfor %}
+{% if ral and not archived %}<dialog id="dlg-ral" aria-labelledby="dlg-ral-h">
+  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name }}</h2>
+  <p>{% if ral.x %}Its position margin was lost: {{ ral.x }} {{ quote }}, {{ ral.y }}% of its equity when the position was opened{% if ral.adds %} (includes adds){% endif %}.{% else %}Its position margin was lost.{% endif %} It has {{ ral.left|money }} {{ quote }} left.</p>
+  {% if not ral.incident %}<div class="warnbox"><b>No incident is open for this liquidation yet.</b> The engine opens one; the reset needs it, and its note, before it will go ahead.</div>
+  {% else %}
+  <form method="post" action="/sleeves/{{ s.name }}/incident-note">
+    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
+    <h3>1. The incident note{% if ral.note %} <span class="chip ok">Written by {{ ral.note.author }}</span>{% endif %}</h3>
+    <label>Written by <input name="author" required maxlength="80" value="{{ ral.note.author if ral.note else '' }}"></label>
+    <label>Why the half-liquidation stop did not protect the position <textarea name="why_stop_did_not_protect" required maxlength="2000" rows="4"></textarea></label>
+    <div class="dlg-actions"><button>{{ 'Replace the note' if ral.note else 'Save the note' }}</button></div>
+  </form>
+  <form method="post" action="/sleeves/{{ s.name }}/command">
+    <input type="hidden" name="incident" value="{{ ral.incident.id }}">
+    <h3>2. Reset it</h3>
+    <ul class="reset-plan">
+      <li>Its drawdown reference and the day's loss baseline start again from the {{ ral.left|money }} {{ quote }} left, and it trades again.</li>
+      <li>Nothing else is reset: the book's limits, its track record, its trades and the old high-water mark stay as they are.</li>
+      <li>The incident stays open until the note is written and you acknowledge it.</li>
+    </ul>
+    <label>Reason <input name="reason" required maxlength="200" value="Incident note written"></label>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button>
+      <button name="command" value="reset_after_liquidation" class="danger">Reset after liquidation</button></div>
+  </form>{% endif %}
+  {% if ral.incident %}<div class="dlg-actions"><button type="button" class="secondary" data-close>Close</button></div>{% endif %}
+</dialog>{% endif %}
 {% if not archived %}<dialog id="dlg-reset" aria-labelledby="dlg-reset-h">
   <form method="post" action="/sleeves/{{ s.name }}/reset">
     <h2 id="dlg-reset-h">Reset {{ s.name }}</h2>
