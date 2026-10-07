@@ -227,8 +227,12 @@ BOTH = {(1, 5): (101.5, 100.0), (1, 12): (100.0, 98.5)}  # X at minute 5, then Y
     ("the minute that held the first reach is the one missing -> unknown", BOTH, {(1, 5)}, False, 1),
     ("the last minute holds both levels and is missing, nothing reached earlier -> unknown",
      {(1, 15): (101.5, 98.5)}, {(1, 15)}, False, 1),
-    ("only X in range: decided without the minutes even with gaps -> true", {(1, 9): (101.5, 100.0)},
-     {(1, 2), (1, 3), (1, 9)}, True, 0),
+    ("only X in range: decided without the minutes even with a gap -> true", {(1, 9): (101.5, 100.0)},
+     {(1, 9)}, True, 0),
+    # #155's degraded-bar gate: 3 of 15 minutes missing = 20% (> 10%) makes the decision bar degraded, so the entry
+    # that the candle's own high/low decides is held to the next close (candle 2), not lost and not unknown.
+    ("only X in range, 3 of 15 minutes missing: degraded-bar holds entry to next-close", {(1, 9): (101.5, 100.0)},
+     {(1, 2), (1, 3), (1, 9)}, 2, 0),
     ("only Y in range: false without the minutes, and not unknown", {(1, 9): (100.0, 98.5)}, {(1, 2), (1, 3)},
      False, 0),
     ("neither in range: false without the minutes, and not unknown", {}, {(1, 2), (1, 3)}, False, 0),
@@ -237,7 +241,8 @@ def test_a_missing_minute_matters_only_when_both_levels_are_in_the_range_and_it_
         name, spikes, drop, fires, unknown, instrument):
     res = _run(_defn(), _minutes(3, spikes=spikes), instrument, drop=drop)  # c2 follows so c1 closes even if its last minute is missing
     ft = _ft(res)
-    assert _fired(res) == ([1] if fires else []) and ft["unknown"] == unknown, name
+    want = [] if not fires else [2] if fires == 2 else [1]  # fires: False, True (candle 1) or 2 (held to candle 2)
+    assert _fired(res) == want and ft["unknown"] == unknown, name
 
 
 def test_a_missing_minute_in_an_earlier_candle_does_not_spoil_the_next_one(instrument):
