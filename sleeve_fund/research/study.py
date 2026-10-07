@@ -241,6 +241,10 @@ class StudyResult:
                     f"of {len(self.folds)} test windows flat or without a trade, and out-of-sample closed "
                     f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so at least half of it sat flat "
                     "rather than testing the idea")
+        # Funding's reason first, so it is never hidden behind D13's no-1-minute one.
+        verdict, words = _funding_check(self)
+        if verdict == "NOT JUDGED":
+            return f"its funding isn't the venue's: {words}"
         if getattr(self, "resting_exits", False):
             minutes = getattr(self, "oos_exec_minutes", None)
             if minutes is None or minutes > ONE_WAY_MINUTES:
@@ -258,9 +262,6 @@ class StudyResult:
             if one_way == "unchecked":
                 return ("the 5-minute pass couldn't be spot-checked: no 1-minute bars for the window drawn "
                         f"({check.get('window')}, seed {check.get('seed')}); it counts once one holds on them")
-        verdict, words = _funding_check(self)
-        if verdict == "NOT JUDGED":
-            return f"its funding isn't the venue's: {words}"
         return ""
 
     @property
