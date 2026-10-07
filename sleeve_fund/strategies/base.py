@@ -598,6 +598,8 @@ class LongFlatStrategy(Strategy):
         # exit closed the position then, though its order goes later (all skipped); P1-L11: the bar a backtest's
         # target traded in, when is unknown (credits only, D9).
         self._funding_skip: tuple[datetime, bool] | None = None
+        # An outage's replayed exit: when the venue's order closed the position (_held_at).
+        self._replayed_close: datetime | None = None
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -1716,6 +1718,7 @@ class LongFlatStrategy(Strategy):
             # though the order goes now (QA P1-L19).
             self._funding_skip = (datetime.fromtimestamp(at / 1e9, tz=timezone.utc), False)
             self._reverse_funding_after(self._funding_skip[0])
+            self._replayed_close = self._funding_skip[0]
         try:
             if intent in EXIT_LEGS:
                 self._exit_lock = side if self._margin else True
@@ -2504,21 +2507,35 @@ class LongFlatStrategy(Strategy):
         if terms is None or price <= 0:
             return
         now = self.clock.utc_now()
-        if not self._backtest and self._entry_px is not None and (
-                self._awaiting is not None
-                or (self._trade_ns is not None and self._now_ns() - self._trade_ns > UNSEEN_GAP_NS)) and not (
-                self._funding_overdue(terms, now)):
+        deadline = False
+        if not self._backtest:
             # No trade is reaching the strategy, or the minutes it missed are still to come: they may show the
             # venue's stop closed the position before a settlement in them. Settled once they are replayed (QA
-            # P1-L19); a settlement after the replayed exit is not the position's (_funding_skip).
-            return
+            # P1-L19); a settlement after the replayed exit is not the position's (_funding_skip). Held flat or
+            # not, as a settlement is owed on the position held at it (_held_at). Missed minutes awaited are always
+            # waited for (they land within LATE_DECISION_NS, _still_awaiting); a market only trading sparsely is
+            # held to FUNDING_DEFER_MAX (Advisor 7 Oct 00:40, QA FD-F2).
+            if self._awaiting is not None:
+                return
+            if self._trade_ns is not None and self._now_ns() - self._trade_ns > UNSEEN_GAP_NS:
+                if not self._funding_overdue(terms, now):
+                    return
+                deadline = True
         since, self._funding_since = self._funding_since, now
         if since is None:
             return
-        qty = self._net_position()[0]
-        if qty == 0:
+        times = markets.funding_times(since, now, terms.funding_hours)
+        if not times:
             return
-        for ts in markets.funding_times(since, now, terms.funding_hours):
+        current = self._net_position()[0]
+        if current == 0 and self._backtest:
+            return
+        for ts in times:
+            # Owed on the position held at the settlement instant, not on the one held when it is booked: a close
+            # or a reversal after it is taken back out (Advisor 7 Oct 00:40, QA FD-F1).
+            qty = current if self._backtest else self._held_at(ts, current)
+            if qty == 0:
+                continue
             rate = self._funding_rate(terms, ts, now)
             if rate is None:  # paper, just after a settlement the venue hasn't published yet: try on the next tick
                 self._funding_since = ts - timedelta(seconds=1)
@@ -2536,6 +2553,31 @@ class LongFlatStrategy(Strategy):
                                          f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                          f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
                                          f"{price:,.6g} ({rate:.4%})", ts=ts)
+                if deadline:
+                    self.runtime.store.event(
+                        self.runtime.name, "info", "funding_deadline_booked",
+                        f"The {ts:%H:%M} settlement was booked {self.FUNDING_DEFER_MAX.seconds // 60} minutes after "
+                        "it, though no trade had reached the strategy in the last "
+                        f"{UNSEEN_GAP_NS // 10**9} s: a quiet market holds funding back no longer than that",
+                        ts=self.runtime.now())
+
+    def _held_at(self, ts: datetime, current: float) -> float:
+        """Paper: the position held at the settlement instant `ts`, from the position now less the journal's fills
+        after it (a close, a reduction or a reversal since). A close an outage's replay found before it counts at the
+        minute the venue's order traded, not when ours was journaled (QA P1-L19)."""
+        if self.runtime is None:
+            return current
+        held, last = Decimal(repr(float(current))), None
+        for f in self.runtime.store.fills(self.runtime.name, limit=10_000):  # newest first
+            at = f["ts"] if f["ts"].tzinfo else f["ts"].replace(tzinfo=timezone.utc)
+            if at <= ts:
+                last = at
+                break
+            held -= Decimal(repr(float(f["qty"]))) * (1 if f["side"] == "BUY" else -1)
+        closed = self._replayed_close
+        if closed is not None and closed < ts and (last is None or last <= closed):
+            return 0.0  # the venue's order closed it first; ours, journaled after the settlement, went on return
+        return 0.0 if abs(held) < self._lot() / 2 else float(held)  # under half a lot is flat
 
     # Paper waits this long after a settlement for the venue to publish its rate before charging the baseline.
     FUNDING_WAIT = timedelta(minutes=15)
