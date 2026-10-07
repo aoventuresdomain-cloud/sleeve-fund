@@ -17,7 +17,7 @@ def _quiet(monkeypatch, every: int, side: int, offset: int = 0):
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now: 0.0001)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
     p = flat_prices(40)
     quiet = frozenset(s for s in range(len(p)) if (s - offset) % every)  # one trade every `every` seconds, nothing else
     return paper(p, side=side, perp=True, profile="aggressive", leave=35, gone=quiet)
@@ -48,7 +48,7 @@ def test_without_a_trade_after_the_settlement_it_stays_held_however_long(monkeyp
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now: 0.0001)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
     p = flat_prices(40)
     run = paper(p, side=1, perp=True, profile="aggressive", leave=35, gone=frozenset(range(8 * 60, len(p))))
     assert [r for r in run.sequence() if r[0] == "entry"], run.sequence()
@@ -68,7 +68,7 @@ def _late_refill(monkeypatch, *, side, stop_in_outage: bool):
 
     start = int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value)
     monkeypatch.setattr(qa, "START", start)
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now: 0.0001)
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: 0.0001)  # #155 passes the wait too
     p = flat_prices(40)
     if stop_in_outage:
         p = shape(p, 7.5, 7 + 50 / 60, adverse(side, 0.02))  # 07:57:30-07:57:50 through the 1 % stop

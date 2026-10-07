@@ -2751,10 +2751,12 @@ class LongFlatStrategy(Strategy):
         held = [(ts, *self._held_at.get(int(ts.timestamp()) * 1_000_000_000, (self._net_position()[0], price)))
                 for ts in times]
         if not self._backtest and held:
-            # Paper: the position held at each settlement as the journal has it (QA FD-F1), so a close the outage
-            # replay found before it, or a restart since, is counted; the price stays the last trade before it.
+            # Paper: a settlement this process saw pass keeps the position it noted then (_snap_settlements); one it
+            # didn't (a restart since) is read from the journal; and one the outage replay found the venue's order
+            # had closed the position before is held flat (QA FD-F1, P1-L19).
             current = self._net_position()[0]
-            held = [(ts, self._position_at(ts, current), px) for ts, _, px in held]
+            held = [(ts, self._position_at(ts, current, q if int(ts.timestamp()) * 1_000_000_000 in self._held_at
+                                           else None), px) for ts, q, px in held]
         if not any(q for _, q, _ in held):
             self._funding_since = self._rescan_from(now)
             return
@@ -2782,12 +2784,13 @@ class LongFlatStrategy(Strategy):
                     "holds funding back no longer than that", ts=self.runtime.now())
         self._funding_since = max(self._funding_since, self._rescan_from(now))
 
-    def _position_at(self, ts: datetime, current: float) -> float:
-        """Paper: the position held at the settlement instant `ts`, from the position now less the journal's fills
-        after it (a close, a reduction or a reversal since). A close an outage's replay found before it counts at the
-        minute the venue's order traded, not when ours was journaled (QA P1-L19)."""
+    def _position_at(self, ts: datetime, current: float, noted: float | None = None) -> float:
+        """Paper: the position held at the settlement instant `ts`: `noted` when this process noted it as the
+        settlement passed, else the position now less the journal's fills from then on (a close, a reduction or a
+        reversal since). Flat when the outage replay found the venue's order closed the position before `ts`, though
+        ours, journaled after the settlement, went on return (QA P1-L19)."""
         if self.runtime is None:
-            return current
+            return current if noted is None else noted
         held, last = Decimal(repr(float(current))), None
         for f in self.runtime.store.fills(self.runtime.name, limit=10_000):  # newest first
             at = f["ts"] if f["ts"].tzinfo else f["ts"].replace(tzinfo=timezone.utc)
@@ -2797,7 +2800,9 @@ class LongFlatStrategy(Strategy):
             held -= Decimal(repr(float(f["qty"]))) * (1 if f["side"] == "BUY" else -1)
         closed = self._replayed_close
         if closed is not None and closed < ts and (last is None or last <= closed):
-            return 0.0  # the venue's order closed it first; ours, journaled after the settlement, went on return
+            return 0.0
+        if noted is not None:
+            return noted
         return 0.0 if abs(held) < self._lot() / 2 else float(held)  # under half a lot is flat
 
     def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float) -> None:
