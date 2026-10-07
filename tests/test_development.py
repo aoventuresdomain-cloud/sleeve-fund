@@ -277,3 +277,18 @@ def test_a_study_without_trades_reads_no_trades_not_a_loss(tmp_path):
     s = read_sheet(tmp_path / "idle.md")
     assert s["breakeven_kind"] == "idle" and breakeven_text(s) == "No trades"
     assert banner(s).startswith("It made no trades, so there is no fee to break even on.")
+
+
+def test_too_few_out_of_sample_trades_reads_as_not_judged_and_the_pages_link_to_the_results(client):
+    """Results page follow-up (#191): the banner says "Not judged" for under 100 trades, as the Results page does, and
+    the Results list and the tear sheet link into /results/<sheet>."""
+    c, _, tmp = client
+    few = _sheet(g1="PASS").replace(
+        "| Enough out-of-sample trades to judge | PASS | 1284 closed in the 1 walk-forward test windows (bar: 10) |",
+        "| Enough out-of-sample trades to judge | FAIL | 84 closed in the 1 walk-forward test windows (bar: 100) |")
+    (tmp / "few.md").write_text(few)
+    page = c.get("/research/few", auth=AUTH).text
+    assert "Not judged: 84 out-of-sample trades is fewer than the 100 needed." in page
+    assert "G1 failed on: enough out-of-sample trades" not in page
+    assert 'href="/results/few"' in page
+    assert 'href="/results/few"' in c.get("/research", auth=AUTH).text
