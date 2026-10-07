@@ -605,3 +605,54 @@ def test_a_liquidated_strategy_says_what_clears_it_and_its_reset_shows_refusals(
     assert any(c["command"] == "reset_after_liquidation" for c in store.pending_commands("liq-trend"))
     assert "Not done:" not in page.inner_text("main") and errors == []
     page.context.close()
+
+
+def test_the_portfolio_positions_table_fits_a_desktop_with_every_risk_readout(tmp_path, browser, monkeypatch):
+    """QA R200-5: at 1440 wide the Portfolio fits with perpetuals that carry a stop-to-liquidation readout, an
+    estimate, a past-stop estimate and spot's own line: the readout's words wrap under the price."""
+    import uvicorn
+
+    from sleeve_fund import open_risk
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.dashboard import trading
+    from sleeve_fund.store import Store
+    from tests.test_risk_readouts import PERP, _hold
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", PASSWORD)
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
+    margin = trading.position_margin
+    monkeypatch.setattr(trading, "position_margin",
+                        lambda x: (1_000.0, 56_400.0) if x["sleeve"].name in ("within", "past") else margin(x))
+    store = Store(f"sqlite:///{tmp_path}/w.db")
+    _hold(store, "within", 0.1, price=61_000, stop_frac=0.02)  # stop within half way to liquidation
+    _hold(store, "past", 0.1, stop_frac=0.048)  # past half way
+    _hold(store, "nostop", 0.1, price=61_000)
+    _hold(store, "through", 0.1, price=58_000, stop_frac=0.02)
+    _hold(store, "trail", 0.1, price=61_000, strategy="rsi_pullback", params={**PERP, "atr_mult": 2.5})
+    _hold(store, "spot", 0.1, params={}, price=61_000, stop_frac=0.02)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app_mod.create_app(store), port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                                  viewport={"width": 1440, "height": 900})
+        page = ctx.new_page()
+        for path in ("/", "/risk", "/trades"):
+            page.goto(f"http://127.0.0.1:{port}{path}")
+            page.wait_for_load_state("networkidle")
+            assert page.locator("text=stop within half way to liquidation").count(), path
+            width = page.evaluate("() => document.documentElement.scrollWidth")
+            assert width <= 1440, (path, width)
+        ctx.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)

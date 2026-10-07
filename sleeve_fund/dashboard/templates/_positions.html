@@ -12,7 +12,7 @@
 {% macro _liq(p) -%}
 {%- set liq = p.liq_px if p.liq_px is defined else (p.perp.liq_px if p.perp else none) -%}
 {%- set to_liq = p.to_liq if p.to_liq is defined else (p.perp.to_liq if p.perp else none) -%}
-{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>{% if p.stop_liq is defined and p.stop_liq is not none %}<div class="sub">{{ stop_liq(p.stop_liq) }}</div>{% endif %}
+{%- if liq -%}<span class="{{ 'loss' if to_liq is not none and to_liq < 0.1 else ('warn' if to_liq is not none and to_liq < 0.25) }}"{% if to_liq is not none %} title="{{ to_liq|pct1 }} from the mark"{% endif %}>{{ liq|px }}</span>{% if p.stop_liq is defined and p.stop_liq is not none %}<div class="sub liq">{{ stop_liq(p.stop_liq) }}</div>{% endif %}
 {%- elif p.perp %}<span class="faint" title="At this size the isolated margin is never used up, so there is no liquidation price">none</span>
 {%- else %}<span class="faint" title="A spot position can't be liquidated">–</span>{% endif -%}
 {%- endmacro %}
