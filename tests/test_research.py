@@ -698,3 +698,86 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
     # The Quant Researcher's line: the benchmark at each rung's own fee, costlier rungs never better for random entry.
     rand = [rung.random_return for rung in r.cost_ladder]
     assert None not in rand and rand == sorted(rand, reverse=True) and rand[0] > rand[-1]
+
+
+def _perp_study(tmp_path, instrument, prices, **kw):
+    from dataclasses import replace
+
+    perp = replace(SPEC, param_grid={k: v[:2] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
+                   default_params={**SPEC.default_params, "market": "perp"})
+    return run_study(perp, prices, instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"), synthetic=True,
+                     holdout_days=0, train_days=365, test_days=365, **kw)
+
+
+def test_a_simulated_perps_buy_and_hold_is_a_perp_with_spot_beside_it_and_a_funding_stress_line(tmp_path, instrument):
+    """Advisor (7 Oct 2026, RE-COST): a perp strategy is compared with a 1x long perp hold paying the perp's fees and
+    funding; holding spot is shown beside it, labelled; a simulated perp's assumed funding gets a stress line."""
+    from sleeve_fund.research.tearsheet import SHARPE_CHECK, g1_checks
+
+    r = _perp_study(tmp_path, instrument, synthetic_ohlcv(days=1100, seed=3))
+    assert r.hold_market == "perp" and not r.hold_insufficient and r.hold_full_period
+    assert len(r.oos_benchmark_returns) == len(r.compare_returns) == len(r.oos_returns)
+    assert r.spot_hold_returns is not None and len(r.spot_hold_returns) == len(r.oos_returns)
+    # The perp hold pays 0.05% to open, not the spot venue's 0.80%, and funding as it goes: not the spot hold.
+    assert not np.allclose(r.oos_benchmark_returns.to_numpy(), r.spot_hold_returns.to_numpy())
+    assert "1x long perpetual" in r.hold_note and "assumed funding" in r.hold_note
+    stress = r.funding_stress
+    assert stress["rate"] == 0.0003 and stress["hold"][1] < stress["hold"][0]  # a long pays more funding
+    text = render(r, IdeaLedger(tmp_path / "l"))
+    assert "Holding spot instead" in text and "Funding stress" in text
+    assert dict((n, v) for n, v, _ in g1_checks(r, IdeaLedger(tmp_path / "l")))[SHARPE_CHECK] != "N/A"
+
+
+def _native(tmp_path, monkeypatch, kept_from):
+    """Binance's own perpetual, its settled funding kept from `kept_from` on (every 8 hours, 0.01%)."""
+    import json
+
+    from sleeve_fund import funding
+    from sleeve_fund.venues import venue
+
+    prices = synthetic_ohlcv(days=1100, seed=3)
+    due = pd.date_range(_utc_ts(prices.index[0]).ceil("8h"), _utc_ts(prices.index[-1]), freq="8h")
+    d = tmp_path / "BINANCE" / "BTC-USDT"
+    d.mkdir(parents=True)
+    (d / "funding.json").write_text(json.dumps({"rates": [[int(t.timestamp() * 1000), 0.0001] for t in due
+                                                          if t >= kept_from]}))
+    monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path)
+    funding._cache.clear()
+    return prices, venue("BINANCE").instrument("BTC", "USDT")
+
+
+def _utc_ts(t):
+    t = pd.Timestamp(t)
+    return t.tz_localize("UTC") if t.tzinfo is None else t
+
+
+def test_a_venues_perp_hold_is_priced_only_on_windows_whose_funding_is_all_known(tmp_path, monkeypatch):
+    """Advisor (7 Oct 2026): coverage is judged per window; a window with a missing settlement has no hold line and
+    its days leave the comparison; under half the out-of-sample days covered, the hold gives no verdict."""
+    from sleeve_fund.research.tearsheet import SHARPE_CHECK, g1_checks
+
+    prices, inst = _native(tmp_path, monkeypatch, kept_from=pd.Timestamp("1900-01-01", tz="UTC"))
+    whole = _perp_study(tmp_path / "a", inst, prices)
+    assert not whole.hold_insufficient and whole.hold_full_period and whole.spot_hold_returns is None
+    assert len(whole.oos_benchmark_returns) == len(whole.oos_returns)
+
+    last_fold = whole.folds[-1]
+    prices, inst = _native(tmp_path / "b", monkeypatch, kept_from=_utc_ts(last_fold.train_end))
+    part = _perp_study(tmp_path / "b", inst, prices)
+    assert not part.hold_full_period and part.folds[0].benchmark_test is None
+    assert part.folds[-1].benchmark_test is not None
+    assert part.oos_benchmark_returns.index.equals(part.compare_returns.index)
+    assert len(part.compare_returns) < len(part.oos_returns)
+    covered = len(part.compare_returns) / len(part.oos_returns)
+    assert part.hold_insufficient == (covered < 0.5)
+    checks = dict((n, (v, ev)) for n, v, ev in g1_checks(part, IdeaLedger(tmp_path / "l")))
+    if part.hold_insufficient:
+        assert checks[SHARPE_CHECK][0] == "N/A" and "insufficient funding history" in checks[SHARPE_CHECK][1]
+    assert checks["Holds up when parameters move"][0] == "N/A"
+
+    prices, inst = _native(tmp_path / "c", monkeypatch, kept_from=_utc_ts(last_fold.test_end) - pd.Timedelta(days=100))
+    none = _perp_study(tmp_path / "c", inst, prices)
+    assert none.hold_insufficient and len(none.oos_benchmark_returns) == 0
+    checks = dict((n, (v, ev)) for n, v, ev in g1_checks(none, IdeaLedger(tmp_path / "l")))
+    assert checks[SHARPE_CHECK][0] == "N/A" and "insufficient funding history" in checks[SHARPE_CHECK][1]
+    assert "insufficient funding history" in render(none, IdeaLedger(tmp_path / "l"))

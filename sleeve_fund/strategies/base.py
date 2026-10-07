@@ -370,7 +370,7 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        if market not in markets.MARKETS:
+        if market not in markets.MARKETS and market != markets.PERP_FUNDING_STRESS:  # research only
             raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
         if allow_short and market == markets.SPOT:
             raise ValueError("short positions need a perpetual: set market to perp (or perp-venue-fees)")
