@@ -223,6 +223,11 @@ def run_backtest(
             strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
             thin = built[built["degraded"]]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+            part = built[built["missing"] > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+        if "missing" in prices.columns:  # every bar's absent minutes, for the slower candles built from them (P1-4)
+            part = prices[prices["missing"].fillna(0).astype(int) > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
         if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
             thin = prices[prices["degraded"].astype(bool)]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))

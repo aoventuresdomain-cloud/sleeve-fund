@@ -397,6 +397,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
+            for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
+                _check_slower_history(cfg.venue, cfg.instrument, minutes, candles)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -1636,6 +1638,19 @@ def _research_venue(name: str | None = None):
     return venue(name or None)
 
 
+def _check_slower_history(venue: str, pair: str, minutes: int, candles: int) -> None:
+    """A model reading slower candles warms them up from the history store at their own size (v2 P1-4): refused
+    when the store holds fewer than its look-back, rather than run on a filter that isn't settled."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.strategies.timeframes import span
+
+    cov = HistoryStore().coverage(venue, pair)
+    have = 0 if cov is None else int((cov.last - cov.first).total_seconds() // (minutes * 60))
+    if have < candles:
+        raise ValueError(f"history: the model's {span(minutes)} candles need {candles:,} closed ones of stored "
+                         f"history and the store holds {have:,} for {pair}; load more history first")
+
+
 def _venue_name(value) -> str:
     """A venue picked on a form (any case; blank is the default venue), as its profile names it. Raises
     ValueError on a venue with no profile."""
@@ -2403,8 +2418,12 @@ def _signals_view(s, row: dict | None) -> dict:
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
-            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
-    if not view["supported"]:
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False,
+            "notes": []}
+    if not view["supported"]:  # a model that lists no conditions may still send notes on its slower candles (P1-4)
+        if row is not None and s.desired_state == "running" and \
+                (utcnow() - row["ts"]).total_seconds() <= SIGNALS_FRESH_SECONDS:
+            view["notes"] = [str(n) for n in row["payload"].get("notes") or []]
         return view
     if s.desired_state != "running":
         view["state"] = "stopped"
@@ -2428,6 +2447,7 @@ def _signals_view(s, row: dict | None) -> dict:
     view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
                      _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
     view["warming"] = not view["cards"][0]["rows"]
+    view["notes"] = [str(n) for n in p.get("notes") or []]  # slower candles degraded or recorded missing (P1-4)
     view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
     view["state"] = "live"
     # The model acts at its bar's close: the next one after the last bar it decided on.
