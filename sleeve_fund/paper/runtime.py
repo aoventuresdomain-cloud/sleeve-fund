@@ -431,10 +431,11 @@ class SleeveRuntime:
         self._episode(why if blocked else None)
         return blocked, why
 
-    def block_began(self, why) -> datetime:
-        """When the block a raced fill met began, for the ms it is journaled with (P1-SG15, Advisor 7 Oct 05:01): a PM
-        Stop's own acceptance (its decision), else the start of the block episode in the journal, else now."""
-        now = self.now()
+    def block_began(self, why, now: datetime | None = None) -> datetime:
+        """When the block a raced fill or a resting entry's cancel met began, for the ms they are journaled with (P1-SG15,
+        Advisor 7 Oct 05:01, 05:47): a PM Stop's own acceptance (its decision), else the start of the block episode in
+        the journal, else now. `now` to the microsecond, from the engine's clock (self.now() is to the second)."""
+        now = now or self.now()
         if "stopped" in block_codes(why):
             stop = self.store.decisions(self.name, limit=1, action="stop")
             if stop and stop[0]["ts"] <= now:

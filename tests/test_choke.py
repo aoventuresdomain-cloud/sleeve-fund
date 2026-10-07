@@ -99,9 +99,9 @@ def test_nothing_opens_or_adds_while_the_gate_is_closed_and_exits_still_run(pric
 def test_a_fill_that_adds_while_the_gate_is_closed_is_kept_and_opens_one_incident():
     """An entry sent before the gate closed and filled after it: kept (never flattened), one incident per order."""
     j = MemoryJournal()
-    rt = SimpleNamespace(store=j, name="s", now=lambda: NOW, block_began=lambda why: NOW - timedelta(milliseconds=40),
+    rt = SimpleNamespace(store=j, name="s", now=lambda: NOW,
                          entry_blocked=lambda: (True, "it is halted, and only a resume clears that"))
-    me = SimpleNamespace(runtime=rt, _gated_fills=set(), _slices={"s1": "k1", "s2": "k1"},
+    me = SimpleNamespace(runtime=rt, _gated_fills=set(), _slices={"s1": "k1", "s2": "k1"}, _ms_since_block=lambda why: 40,
                          decisions={"e1": {"intent": "entry"}, "x1": {"intent": "exit"}, "s1": {"intent": "entry"},
                                     "s2": {"intent": "entry"}})
     for coid in ("e1", "e1", "x1", "s1", "s2"):  # two fills of an entry, an exit, two slices of one kept entry

@@ -3843,8 +3843,7 @@ class LongFlatStrategy(Strategy):
             self.cancel_order(order.client_order_id)
         if resting and not self._backtest:
             # Advisor 7 Oct 05:47: how long after the block (a Stop: its acceptance) the cancel went out, on record.
-            rt = self.runtime
-            ms = max(0, round((rt.now() - rt.block_began(why)).total_seconds() * 1000))
+            rt, ms = self.runtime, self._ms_since_block(why)
             rt.store.event(rt.name, "info", ENTRY_CANCELLED, f"{len(resting)} resting opening order"
                            f"{'s' if len(resting) != 1 else ''} cancelled {ms} ms after nothing could open any more "
                            f"({', '.join(block_codes(why)) or why}).", ts=rt.now())
@@ -3852,6 +3851,11 @@ class LongFlatStrategy(Strategy):
             k = self._kept[coid]
             self._part_filled(coid, float(k["sent"]), k["order"].quantity.as_double(), why)
             self._close_kept(coid, f"cancelled: nothing may open now. {why}")
+
+    def _ms_since_block(self, why) -> int:
+        """Milliseconds from the block's start (a Stop: its acceptance) to now, on the engine's own clock."""
+        now = datetime.fromtimestamp(self.clock.timestamp_ns() / 1e9, tz=timezone.utc)
+        return max(0, round((now - self.runtime.block_began(why, now)).total_seconds() * 1000))
 
     def _part_filled(self, coid: str, filled: float, qty: float, why: str) -> None:
         """Advisor 20:56: an entry part filled when the block starts has its rest cancelled and keeps what filled, with
@@ -3890,7 +3894,7 @@ class LongFlatStrategy(Strategy):
                           "It is kept with its stop, not closed; you decide what to do with it."),
                        ts=rt.now())
         # Advisor 7 Oct 05:01: each raced fill is on record with how long after the block it filled, for fills-vs-model.
-        ms = max(0, round((rt.now() - rt.block_began(why)).total_seconds() * 1000))
+        ms = self._ms_since_block(why)
         rt.store.event(rt.name, "info", RACED_FILL, f"Raced fill: {qty:g} at {px:,.6g}, {ms} ms after nothing could "
                        f"open any more ({', '.join(block_codes(why)) or why}).", ts=rt.now())
 
