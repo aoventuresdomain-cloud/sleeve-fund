@@ -74,9 +74,12 @@ def test_open_risk_is_the_sum_of_risk_to_stop_and_a_position_without_a_stop_is_n
     short = next(r for r in port["rows"] if r["sleeve"] == "pp-short")
     # Long 1 at 3,000 with a 2% stop (2,940), marked at 2,970: 30 to lose if the stop is hit. The short has none.
     assert long_["risk_to_stop"] == pytest.approx(30.0) and short["risk_to_stop"] is None
+    # FE v2 (Advisor 7 Oct 18:50 UK): a perp with no stop is counted at the open-risk limit's stopless estimate,
+    # as the gate counts it, and named as estimated, not left out as unbounded.
+    assert short["risk"]["kind"] == "estimated" and short["risk"]["amount"] > 0
     for view in (port, risk, trades):
-        assert view["open_risk"] == pytest.approx(sum(r["risk_to_stop"] or 0.0 for r in port["rows"])) == 30.0
-        assert view["unbounded"] == ["pp-short"]
+        assert view["open_risk"] == pytest.approx(30.0 + short["risk"]["amount"])
+        assert view["estimated"] == ["pp-short"] and view["left_out"] == []
         assert view["margin"] == pytest.approx(long_["margin"] + short["margin"])
 
 

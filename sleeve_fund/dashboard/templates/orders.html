@@ -38,7 +38,7 @@
       <td class="reason" data-m="hide" title="{{ o.reason|no_venues }}">{{ o.reason|no_venues }}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="11"><div class="why-grid">
-      {{ why(o.intent_label ~ ' · ' ~ ('buy' if o.side == 'BUY' else 'sell') ~ ' ' ~ (o.qty|qty), o.reason|no_venues, o.sig) }}
+      {{ why((o.relabelled or o.intent_label) ~ ' · ' ~ ('buy' if o.side == 'BUY' else 'sell') ~ ' ' ~ (o.qty|qty), o.reason|no_venues, o.sig) }}
       <div class="why-block"><div class="k">Order</div>
         <dl class="sig">
           <div><dt>Order id</dt><dd class="mono">{{ o.order_id }}</dd></div>

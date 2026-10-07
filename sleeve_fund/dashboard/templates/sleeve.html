@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import stop_words, trail_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share %}
+{% from "_macros.html" import stop_words, trail_words, chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share, stop_liq %}
 {% from "_signals.html" import signals_tab, signals_panel, signals_side %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
@@ -188,7 +188,8 @@
     <div class="pos-card"><h3>Exits</h3><dl>
       <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away{% if position and position.stop_basis %} · {{ position.stop_basis }}{% endif %}</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% elif trail_words(s)|trim %}<span class="muted trail-stop" title="{{ trail_words(s) }}">Trailing stop · Trail level not shown</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
       <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% {{ "below" if position and position.side < 0 else "above" }} entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
-      <div><dt>At risk</dt><dd>{% if position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      {% if perp and position and position.stop_liq is not none %}<div><dt>To liquidation</dt><dd>{{ stop_liq(position.stop_liq) }}</dd></div>{% endif %}
+      <div><dt>At risk</dt><dd>{% if position and risk.stop_px and position.qty * (x.price - risk.stop_px) <= 0 %}<span class="warn" title="The price has gone through its stop and the position is still open: the open-risk limit counts it as if it had no stop">past stop</span>{% elif position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
       <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>

@@ -2374,7 +2374,7 @@ def test_a_trailing_stop_is_not_unbounded_and_open_risk_says_what_it_leaves_out(
         assert "unbounded" not in page.replace("so unbounded", ""), url
     assert trailing in c.get("/risk", auth=AUTH).text and trailing in c.get("/trades", auth=AUTH).text
     assert "rp: trailing stop, level not shown, not counted" in c.get("/risk", auth=AUTH).text
-    assert "1 with a trailing stop, level not shown, not counted" in c.get("/", auth=AUTH).text
+    assert "rp: trailing stop, level not shown, not counted" in c.get("/", auth=AUTH).text
     # A position with no stop of any kind is still unbounded, and the hover lists both.
     store.create_sleeve(name="nostop", strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=5_000, params={})
