@@ -35,7 +35,8 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
-from sleeve_fund.strategies.indicators import AtrSma
+from sleeve_fund.strategies.indicators import AtrSma, warmup_for
+from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -587,6 +588,8 @@ class LongFlatStrategy(Strategy):
         # A short's swing stop sits at the highest high (review round 11, M11-7).
         self._highs: deque[float] | None = deque(maxlen=config.stop_swing_bars) if config.stop_swing_bars else None
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
+        self._slower: list[SlowerCandles] = []  # slower candles the model reads (slower(), v2 P1-4)
+        self._short_history: str | None = None  # why the slower candles' warm-up isn't met yet: no new entries
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
@@ -660,6 +663,10 @@ class LongFlatStrategy(Strategy):
         # sleeve_fund.bars.DEGRADED_ABOVE of their minutes absent. Indicators update and exits run on them;
         # no new entry is decided on one. Given by mark_degraded(); each is dropped once its bar is seen.
         self._degraded: dict[int, int] = {}
+        # Every bar with minutes missing, degraded or not: close time (ns) -> minutes missing, so the slower candles
+        # built from it count them (Independent Quant Advisor 6 Oct 16:40, 4.2). Given by mark_missing().
+        self._bar_missing: dict[int, int] = {}
+        self._missed_said: dict[int, int] = {}  # per slower candles (index): the latest missing one journaled
         self._no_entry_ts: int | None = None  # the close time of the degraded bar being decided on
         self._degraded_missing = 0
         # Paper on its own trade feed builds its decision bars itself: the minutes (open time, in minutes since the
@@ -765,6 +772,13 @@ class LongFlatStrategy(Strategy):
         builder each one as it closes, before handing the bar over."""
         self._degraded.update({int(ts): int(m) for ts, m in bars.items()})
 
+    def mark_missing(self, bars: dict[int, int]) -> None:
+        """Bars, by close time in ns, built with some of their minutes missing, degraded or not, with how many: the
+        slower candles built from them add these up (v2 P1-4, Advisor 4.2). Entries are held only on the degraded
+        ones (mark_degraded)."""
+        if self._slower:  # only slower candles read them
+            self._bar_missing.update({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
+
     def expect_bars(self, closes) -> "LongFlatStrategy":
         """Backtest on execution bars: the close times (ns) of the decision bars they build. The engine makes up any
         other one flat at the last price from nothing, and it is dropped (runner.decision_bars, QA P1-D1)."""
@@ -815,6 +829,10 @@ class LongFlatStrategy(Strategy):
         if self.hub_status is not None and self.hub_status.degraded:
             self._degraded.update(self.hub_status.degraded)
             self.hub_status.degraded.clear()
+        if self.hub_status is not None and self.hub_status.missing:
+            if self._slower:
+                self._bar_missing.update(self.hub_status.missing)
+            self.hub_status.missing.clear()
         if str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
             return False
         if self._backtest:
@@ -824,9 +842,7 @@ class LongFlatStrategy(Strategy):
             return True
         if self.hub_fed or not str(bar.bar_type).endswith("INTERNAL"):
             return False
-        minutes = bar_minutes(self._cfg.bar_type)
-        if minutes <= 1:
-            return False
+        minutes = bar_minutes(self._cfg.bar_type)  # 1-minute bars too: a minute with no data isn't built (P1-4 5a)
         end = bar.ts_event // MINUTE_NS
         seen = sum(1 for m in self._minutes_seen if end - minutes <= m < end)
         self._minutes_seen = {m for m in self._minutes_seen if m >= end}
@@ -836,6 +852,8 @@ class LongFlatStrategy(Strategy):
             self.log.info(f"bar {bar} dropped: no data in any of its minutes, so it isn't built (board 5a)")
             return True
         missing = minutes - seen
+        if missing > 0 and self._slower:
+            self._bar_missing.setdefault(bar.ts_event, missing)
         if bar_rule.degraded(missing, minutes):
             self._degraded.setdefault(bar.ts_event, missing)
         return False
@@ -912,6 +930,8 @@ class LongFlatStrategy(Strategy):
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
         self._plan_resume()
+        if self._slower and self.history_loader is not None:
+            self._warm_slower()  # before the decision bars, which then complete the slower candle forming now
         if self._cfg.warmup_bars:
             if self.history_loader is not None and (str(self._cfg.bar_type).endswith("INTERNAL") or self.hub_fed):
                 self._warm_from_history()
@@ -1039,6 +1059,18 @@ class LongFlatStrategy(Strategy):
     def update_indicators(self, bar: Bar) -> None:
         """Override to feed indicators. Called once per bar, historical or live, in time order."""
 
+    def slower(self, minutes: int, *blocks) -> SlowerCandles:
+        """Slower candles of this instrument for the model to read, e.g. self.slower(240, Sma(50)) for a 4-hour
+        trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
+        decision on the bar that closed it. Warm-up loads them from the history store at their own size."""
+        from sleeve_fund.venues import VENUES
+
+        profile = VENUES.get(self._cfg.instrument_id.venue.value)
+        s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks,
+                          profile.daily_anchor_minutes if profile is not None else 0)
+        self._slower.append(s)
+        return s
+
     def _accept(self, bar: Bar) -> bool:
         # Indicators are fed by hand rather than registered, so warm-up bars and live
         # bars can't double-count. Anything at or before the last bar seen is ignored.
@@ -1051,8 +1083,34 @@ class LongFlatStrategy(Strategy):
         if self._lows is not None:
             self._lows.append(bar.low.as_double())
             self._highs.append(bar.high.as_double())
+        missing = self._bar_missing.pop(bar.ts_event, None)
+        if self._bar_missing and min(self._bar_missing) < bar.ts_event:  # bars never decided on (dropped): forgotten
+            self._bar_missing = {t: m for t, m in self._bar_missing.items() if t > bar.ts_event}
+        if self._slower:
+            missing = self._degraded.get(bar.ts_event, 0) if missing is None else missing
+            for s in self._slower:
+                s.handle_bar(bar, missing)
+            self._journal_missed()
         self.update_indicators(bar)
         return True
+
+    def _journal_missed(self) -> None:
+        """Each slower candle with no decision candles at all is recorded missing as it is found, never made up
+        (Advisor 5 Oct 19:48; 6 Oct 16:40, 4.5): a journal event, the source of truth, and the Signals tab."""
+        for k, s in enumerate(self._slower):
+            said = self._missed_said.get(k, 0)
+            new = [end for end in s.missed if end > said]
+            if not new:
+                continue
+            self._missed_said[k] = new[-1]
+            if self.runtime is None or self._backtest:
+                continue
+            when = ", ".join(f"{_hhmm(end - s.period)}-{_hhmm(end)}" for end in new[-6:])
+            more = f" (and {len(new) - 6} earlier)" if len(new) > 6 else ""
+            self.runtime.store.event(self.runtime.name, "warning", "slower_candle_missing",
+                                     f"Recorded missing: no {span(s.minutes)} candle {when} UTC{more}. No trades "
+                                     "reached the strategy in it, so none is made up and its indicators skip it",
+                                     ts=self.runtime.now())
 
     def _hold_gap(self, bar: Bar) -> bool:
         """Paper: a candle with no volume was built while no trades reached this process, a flat candle at the
@@ -1095,6 +1153,7 @@ class LongFlatStrategy(Strategy):
         if own is not None and own.volume.as_double() >= bar.volume.as_double():
             bar = own
             self._degraded.pop(bar.ts_event, None)  # the venue's whole candle: no longer a part bar (CR minor)
+            self._bar_missing.pop(bar.ts_event, None)
         if (rebuilt or unchecked) and self.runtime is not None:
             step = bar_minutes(self._cfg.bar_type)
             first = datetime.fromtimestamp(held[0].ts_event / 1e9 - step * 60, tz=timezone.utc)
@@ -1558,6 +1617,40 @@ class LongFlatStrategy(Strategy):
                 upcoming = self.clock.timestamp_ns() // step * step + step
                 self.resume_leg(r["side"], max(int((upcoming - r["bar"]) // step) - 1, 0))
 
+    def _warm_slower(self) -> None:
+        """Each slower timeframe's warm-up (v2 P1-4): its blocks' look-back in candles of its own size from the
+        history store, up to the last closed one; the decision bars loaded after this carry on from there. When
+        the store can't cover it the model opens and adds nothing until the candles have closed live
+        (_short_history, _entry_held), rather than enter on a filter that isn't settled, and says why. Stops,
+        targets and exits still run: a position held across a restart is still managed (Independent Quant
+        Advisor, 5 Oct)."""
+        short = []
+        for s in self._slower:
+            s.need = need = warmup_for(s.blocks)
+            if not need:
+                continue
+            if s.anchor:
+                short.append(f"its {span(s.minutes)} candles start at the venue's day start, and the history store "
+                             "builds them from 00:00 UTC, so they warm up live")
+                continue
+            bar_type = BarType.from_str(f"{self._cfg.instrument_id}-{bar_spec(s.minutes)}")
+            try:
+                bars, why = self.history_loader(self.instrument, bar_type, need), "the history store has fewer"
+            except Exception as exc:  # noqa: BLE001 - said below, with what is missing
+                bars, why = [], str(exc)
+            s.seed(Candle(b.open.as_double(), b.high.as_double(), b.low.as_double(), b.close.as_double(),
+                          b.volume.as_double(), b.ts_event) for b in sorted(bars, key=lambda b: b.ts_event))
+            if len(bars) < need:
+                short.append(f"its {span(s.minutes)} candles need {need} closed ones of history and {len(bars)} "
+                             f"loaded ({why})")
+        if short:
+            self._short_history = "; ".join(short)
+            msg = (f"No new entries: {self._short_history}. Stops, targets and exits still run; entries start once "
+                   "those candles have closed live, or after a restart once the history store covers them.")
+            self.log.error(msg)
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "error", "warmup_short", msg)
+
     def _warm_from_history(self) -> None:
         """Feed the indicators the latest stored bars, so a model on bars built from live trades
         is ready on its first live bar instead of waiting out its longest look-back."""
@@ -1619,6 +1712,12 @@ class LongFlatStrategy(Strategy):
         longest = max((v for v in params.values() if isinstance(v, int) and not isinstance(v, bool)), default=0)
         return 2 * longest
 
+    @classmethod
+    def slower_needs(cls, params: dict) -> dict[int, int]:
+        """The slower candles the model reads with these settings (slower()), as {minutes: closed candles its
+        warm-up needs}, so a strategy the history store can't warm up is refused when it is created (P1-4)."""
+        return {}
+
     def target_weight(self, bar: Bar) -> float | None:
         """Share of the sleeve to hold from this bar's close, 0 to 1; None = not enough data yet.
         The default maps want_long() to all (1) or nothing (0)."""
@@ -1679,9 +1778,13 @@ class LongFlatStrategy(Strategy):
     def signal_state(self, price: float | None = None) -> dict | None:
         """What the Signals tab shows, as JSON-ready data: both sides' conditions on the forming candle at
         `price` (the latest price when None), and the open position's stop and target. None when the model
-        doesn't list its conditions. Reads only: nothing the model trades by changes."""
+        doesn't list its conditions and reads no slower candles; a model that only reads slower candles sends their
+        notes alone (v2 P1-4). Reads only: nothing the model trades by changes."""
         if type(self).conditions is LongFlatStrategy.conditions:
-            return None
+            if not self._slower:
+                return None
+            return {"price": None, "bar_ts": self._last_bar_ts or None, "bar_minutes": bar_minutes(self._cfg.bar_type),
+                    "long": None, "short": None, "held": 0, "guards": [], "notes": self._slower_notes()}
         price = price if price is not None else self._price()
         sides = {}
         for side, key in ((1, "long"), (-1, "short")):
@@ -1689,7 +1792,24 @@ class LongFlatStrategy(Strategy):
             sides[key] = None if rows is None else [_condition_json(r) for r in rows]
         held = self._entry_side if self._entry_px is not None else 0
         return {"price": price, "bar_ts": self._last_bar_ts or None, "bar_minutes": bar_minutes(self._cfg.bar_type),
-                **sides, "held": held, "guards": [_condition_json(r) for r in self.guard_conditions(price)]}
+                **sides, "held": held, "guards": [_condition_json(r) for r in self.guard_conditions(price)],
+                "notes": self._slower_notes()}
+
+    def _slower_notes(self) -> list[str]:
+        """The Signals tab's lines on the slower candles (v2 P1-4): the latest closed one when it is degraded, and
+        the latest recorded missing in the last day (Advisor 4.1, 4.5)."""
+        notes = []
+        for s in self._slower:
+            last, size = s.last, span(s.minutes)
+            if last is not None and last.degraded(s.minutes):
+                notes.append(f"The latest {size} candle, to {_hhmm(last.end)} UTC, is missing {last.missing} of its "
+                             f"{s.minutes} minutes (over 10%): no entries or additions until a fuller one closes")
+            recent = [end for end in s.missed if self._last_bar_ts - end < 86_400_000_000_000]
+            if recent:
+                notes.append(f"The {size} candle {_hhmm(recent[-1] - s.period)}-{_hhmm(recent[-1])} UTC had no trades: "
+                             "recorded missing, none made up" + (f" ({len(recent)} in the last day)"
+                                                                  if len(recent) > 1 else ""))
+        return notes
 
     def _publish_signals(self) -> None:
         """Paper: write the model's conditions on the forming candle for the Signals tab, at most every
@@ -1734,13 +1854,13 @@ class LongFlatStrategy(Strategy):
         values = {**values, "close": close}
         if current != 0:
             # Late, a reversal only closes: the new side would open on a stale signal.
-            flip = side != 0 and not self._late_entry(bar, f"{_side_word(side)} entry after closing the "
+            flip = side != 0 and not self._entry_held(bar, f"{_side_word(side)} entry after closing the "
                                                            f"{_side_word(current)}")
             self._flip = (side, bar, reason, values) if flip else None
             self._late_exit(bar)
             self._sell_all("exit", reason, values)
             return
-        if self._late_entry(bar, f"{_side_word(side)} entry"):
+        if self._entry_held(bar, f"{_side_word(side)} entry"):
             return
         self._open(side, bar, reason, values)
 
@@ -1956,6 +2076,30 @@ class LongFlatStrategy(Strategy):
 
     def _now_ns(self) -> int:
         return self.clock.timestamp_ns()
+
+    def _entry_held(self, bar: Bar, what: str) -> bool:
+        """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
+        (v2 P1-4), the latest closed slower candle is degraded (over 10% of its minutes missing: Advisor 6 Oct
+        16:40, 4.1), or the decision is late (_late_entry). Exits and reductions are never held."""
+        if self._short_history is not None:
+            if any(s.count < s.need for s in self._slower):
+                self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "
+                           f"{self._short_history}. Said once until entries open again")
+                return True
+            self._short_history = None
+            self._noted.discard("entry_held")
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "info", "warmup_met",
+                                         "Entries open again: its slower candles now have the closed ones they need")
+        thin = next((s for s in self._slower if s.last is not None and s.last.degraded(s.minutes)), None)
+        if thin is not None:
+            self._note("slower_degraded", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: the latest "
+                       f"{span(thin.minutes)} candle, to {_hhmm(thin.last.end)}, is missing {thin.last.missing} of its "
+                       f"{thin.minutes} minutes (over 10%), so nothing new is opened on it; exits still run",
+                       level="info")
+            return True
+        self._noted.discard("slower_degraded")
+        return self._late_entry(bar, what)
 
     def _late_entry(self, bar: Bar, what: str) -> bool:
         """True when this decision is too late to open or add (LATE_DECISION_NS after its bar's close). The first
@@ -2282,7 +2426,7 @@ class LongFlatStrategy(Strategy):
         is_long = self._is_long()
         close = bar.close.as_double()
         if w > 0 and not is_long:
-            if self._exit_lock or self._entry_blocked(bar) or self._late_entry(bar, "long entry"):
+            if self._exit_lock or self._entry_blocked(bar) or self._entry_held(bar, "long entry"):
                 return
             if self._cannot_open("a long entry"):
                 return
@@ -2319,7 +2463,7 @@ class LongFlatStrategy(Strategy):
                 equity, _, qty, _ = self._mark()
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
-                if w > self._held_w and (self._entry_blocked(bar, "an addition") or self._late_entry(bar, "addition")):
+                if w > self._held_w and (self._entry_blocked(bar, "an addition") or self._entry_held(bar, "addition")):
                     return  # adding to the position is an entry; trimming it still runs
                 if w < self._held_w:
                     self._late_exit(bar)
@@ -2451,8 +2595,8 @@ class LongFlatStrategy(Strategy):
         side = self.want_side(bar)
         if side is None or int(side) != -held or (side < 0 and not self._cfg.allow_short):
             return
-        if self._late_entry(bar, f"{_side_word(int(side))} entry after the target"):
-            return
+        if self._entry_held(bar, f"{_side_word(int(side))} entry after the target"):
+            return  # an entry like any other: held while late or while the slower candles are short of history
         reason, values = self.explain(bar, int(side))
         self._flip = (int(side), bar, reason, {**values, "close": bar.close.as_double()})
 
@@ -4422,8 +4566,8 @@ class LongFlatStrategy(Strategy):
         elif book and kept_id is None:
             # A replayed exit (Advisor NA-1): journaled at the price the venue's resting order would have had. The
             # account's cash keeps the journal's, as for a restore; the fee is the venue's rate on that price.
-            fee = fee * book / px if px else fee
-            self._cash_adj += sign * qty * (px - book)
+            charged, fee = fee, (fee * book / px if px else fee)
+            self._cash_adj += sign * qty * (px - book) + (charged - fee)  # the fee too, as journaled (QA P1-D25)
             px = book
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:

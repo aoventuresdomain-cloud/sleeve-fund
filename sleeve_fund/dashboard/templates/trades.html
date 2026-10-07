@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, help, book_tabs %}
+{% from "_macros.html" import signed, money_signed, tag, why, why_toggle, help, book_tabs, trailing_risk, open_risk_hint, open_risk_text %}
 {% block title %}Trades · Multi-Strategy Fund{% endblock %}
 {% block content %}
 {% set st = h.stats %}
@@ -21,7 +21,7 @@
   <div><div class="k">Open positions</div><div class="v lead">{{ h.positions|length }}</div></div>
   <div><div class="k">Open P&amp;L {{ help('unrealised') }}</div><div class="v">{{ money_signed(h.unrealised) }}</div><div class="s">unrealised</div></div>
   <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ h.margin|money }}</div></div>
-  <div{% if h.unbounded %} title="{{ h.unbounded|join(', ') }}: no stop, so unbounded"{% else %} title="Money lost if every stop is hit"{% endif %}><div class="k">Open risk</div><div class="v{{ ' warn' if h.unbounded }}">{{ h.open_risk|money }}{{ '+' if h.unbounded }}</div></div>
+  <div title="{{ open_risk_hint(h.unbounded, h.trailing) }}"><div class="k">Open risk</div><div class="v{{ ' warn' if h.unbounded or h.trailing }}">{{ open_risk_text(h.open_risk, (h.unbounded|length) + (h.trailing|length)) }}</div></div>
   <div><div class="k">Closed trades</div><div class="v">{{ st.trades }}</div><div class="s">{{ st.wins }} won, {{ st.losses }} lost</div></div>
   <div><div class="k">Win rate {{ help('win_rate') }}</div><div class="v">{{ st.win_rate|pctn0 }}</div><div class="s">{% if st.trades < 10 %}too few to judge{% else %}after fees{% endif %}</div></div>
   <div><div class="k">Realised P&amp;L {{ help('realised') }}</div><div class="v">{{ money_signed(st.pnl) }}</div><div class="s">after {{ st.fees|money }} fees</div></div>
@@ -45,7 +45,7 @@
       <td class="num" data-m="hide">{{ p.stop_px|px if p.stop_px else '–' }} / {{ p.target_px|px if p.target_px else '–' }}</td>
       <td class="num" data-m="hide">{{ p.margin|money }}</td>
       <td class="num" data-m="hide">{% if p.liq_px %}<span class="{{ 'loss' if p.to_liq is not none and p.to_liq < 0.1 else ('warn' if p.to_liq is not none and p.to_liq < 0.25) }}"{% if p.to_liq is not none %} title="{{ p.to_liq|pct1 }} from the mark"{% endif %}>{{ p.liq_px|px }}</span>{% else %}<span class="faint" title="No liquidation price: spot, or margin never used up at this size">–</span>{% endif %}</td>
-      <td class="num" data-m="hide">{% if not p.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ p.risk_to_stop|money }}{% endif %}</td>
+      <td class="num" data-m="hide">{% if p.trailing %}{{ trailing_risk() }}{% elif not p.stop_px %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>{% else %}{{ p.risk_to_stop|money }}{% endif %}</td>
       <td data-m="right">{{ why_toggle(rid) }}</td></tr>
     <tr class="detail" id="{{ rid }}" hidden><td colspan="12"><div class="why-grid">{{ why('Why it was bought' ~ (' · ' ~ p.opened|ts if p.opened else ''), p.why, p.sig) }}</div></td></tr>
     {% endfor %}</tbody>

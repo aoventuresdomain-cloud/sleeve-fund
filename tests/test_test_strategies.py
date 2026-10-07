@@ -145,15 +145,16 @@ def test_rsi_cross_warm_up_settles_the_rsi_and_fills_the_trend_average():
 
 
 def test_rsi_cross_trend_filter_takes_only_legs_with_the_larger_trend():
+    from sleeve_fund.strategies.timeframes import Candle
+
+    def closed(*closes):  # closed 4-hour candles, as a warm-up seeds them
+        return [Candle(c, c, c, c, 1.0, k * 4 * 3_600_000_000_000) for k, c in enumerate(closes, 1)]
+
     s = _cross(trend_sma=2, trend_minutes=240)
-    s.trend.update_raw(100.0)
-    s.trend.update_raw(110.0)  # average 105
-    s._trend_close = 110.0  # above: longs only
+    s._trend_candles.seed(closed(100.0, 110.0))  # last close 110 above its 105 average: longs only
     assert _walk(s, [25, 31]) == [0, 1]
     s = _cross(trend_sma=2, trend_minutes=240)
-    s.trend.update_raw(110.0)
-    s.trend.update_raw(100.0)
-    s._trend_close = 100.0  # below its average: no long
+    s._trend_candles.seed(closed(110.0, 100.0))  # below its average: no long
     assert _walk(s, [25, 31]) == [0, 0] and "average: no position" in s._why[0]
 
 
