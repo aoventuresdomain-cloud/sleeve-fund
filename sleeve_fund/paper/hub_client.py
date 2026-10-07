@@ -74,6 +74,9 @@ class HubStatus:
         # Bars sent with too many minutes missing (sleeve_fund.bars), by close ns -> minutes missing: the strategy
         # takes them before deciding on the bar, so no entry is opened on one, as in a backtest (board 5a, QA P1-D2).
         self.degraded: dict[int, int] = {}
+        # Every bar sent with minutes missing, degraded or not (close ns -> minutes missing), for the strategy's slower
+        # candles to count (v2 P1-4, Advisor 4.2).
+        self.missing: dict[int, int] = {}
         # instrument -> closes of 1-minute bars lost to the hub being away (in a gap it announced, or before one it
         # announced without them: a hub restarted without its gap state, QA P1-L16) and not refilled yet. The
         # strategy opens nothing while any are (the L16 condition); minutes no trade happened in aren't here.
@@ -367,8 +370,10 @@ class Decoder:
             self.report("warning", "bar_incomplete",
                         f"{iid}: the bar closing {_hhmm(b.end)} was sent missing {missing} of its "
                         f"{self.period // MINUTE_NS} minutes")
-            if self.status is not None and bar_rule.degraded(missing, self.period // MINUTE_NS):
-                self.status.degraded[b.end] = missing
+            if self.status is not None:
+                self.status.missing[b.end] = missing
+                if bar_rule.degraded(missing, self.period // MINUTE_NS):
+                    self.status.degraded[b.end] = missing
         bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
         px, qty = self._digits(iid, b.minutes.values())
         *prices, v = b.ohlcv()

@@ -156,7 +156,13 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread.half_spread, progress=progress,
         oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
         locks=HoldoutLocks(store) if store is not None else None)
-    result.fee_note = f"{fees.text}; the maker rate on post-only orders only; spread: {spread.text}"
+    # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
+    paid = result.fee_basis
+    fee_words = fees.text if paid is None or paid == fees.fees else \
+        f"{float(paid.maker):.2%} maker, {float(paid.taker):.2%} taker (the perpetual market's)"
+    result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text}"
+    if result.breakeven:
+        result.fee_note += f"; break-even: {result.breakeven}"
     cov = history.coverage(profile.name, req.pair)
     if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last > STALE_HISTORY:
         result.notes.append(f"The stored history ends {cov.last:%d %b %Y %H:%M} UTC: the collector is still catching "

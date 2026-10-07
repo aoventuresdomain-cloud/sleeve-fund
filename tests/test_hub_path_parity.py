@@ -88,9 +88,10 @@ def _ticks(prices, gone=()):
 
 
 def _minutes(prices) -> pd.DataFrame:
-    """The hub's 1-minute bars from the same trades, by open time (the store's convention)."""
+    """The hub's 1-minute bars from the same trades, by open time (the store's convention); a minute with no
+    trades at all (NaN prices: a hole neither the hub nor the store has) has no bar."""
     s = pd.Series(np.round(prices, 1), index=pd.to_datetime(START + np.arange(len(prices)) * S, unit="ns", utc=True))
-    m = s.resample("1min", closed="left", label="left").ohlc()
+    m = s.resample("1min", closed="left", label="left").ohlc().dropna()
     m["volume"] = 60.0
     return m
 

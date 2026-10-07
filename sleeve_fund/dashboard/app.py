@@ -16,7 +16,7 @@ import os
 import re
 import secrets
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import markets
+from sleeve_fund import liquidation, markets
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -52,16 +52,12 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES
 from sleeve_fund.store import BACKTEST_PREFIX, Store, is_backtest, utcnow
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing
+from sleeve_fund.paper.runtime import RESUMABLE, entry_blocked
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
 HERE = Path(__file__).resolve().parent
-# How the engine's halt message starts after a liquidation (#155's runtime.WIPED_OUT; import it once that lands).
-LIQUIDATED_HALT = "Position margin lost (liquidated)"
-# Why Start, Resume and Reset are refused then, in the page's words (QA P1-U25, U27, U31).
-LIQUIDATED_REFUSAL = ("its position margin was lost (liquidated), so it can't start, resume or be reset: it trades "
-                      "again only after you use Reset after liquidation, which asks for an incident note")
 ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
@@ -233,7 +229,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"],
-                        unbounded=len(positions["unbounded"]))
+                        unbounded=len(positions["unbounded"]), trailing=len(positions["trailing"]))
         return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
@@ -401,6 +397,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
+            for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
+                _check_slower_history(cfg.venue, cfg.instrument, minutes, candles)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -503,6 +501,31 @@ def create_app(store: Store | None = None) -> FastAPI:
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
 
+    def _strategy_indicators(name: str) -> list[dict]:
+        """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):
+        as the platform recorded them, passed on untouched and never recomputed here. The store gives them once
+        the Quant Developer's recording lands; until then, or if it fails, the chart has none and still draws."""
+        source = getattr(st(), "chart_indicators", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart indicators for %s", name)
+            return []
+
+    def _strategy_decisions(name: str) -> list[dict]:
+        """Fills and missed entries the strategy recorded (P1-3m): [{kind: fill|missed, side, t, signal_t, price,
+        reason, code}], passed on untouched. Empty until the platform's journal read lands, or if it fails."""
+        source = getattr(st(), "chart_decisions", None)
+        if source is None:
+            return []
+        try:
+            return list(source(name))
+        except Exception:  # an overlay must never take the chart down
+            logging.getLogger(__name__).exception("chart decisions for %s", name)
+            return []
+
     @app.get("/api/sleeves/{name}/candles")
     def candles_json(name: str, interval: str = "", pair: str = "", _: str = Depends(require_pm)):
         from sleeve_fund.dashboard import charts
@@ -542,6 +565,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         data = charts.payload(df, minutes, fills, orders, charts.position_lines(position), source,
                               limit=None if is_backtest(name) else 720)
         data["intervals"], data["chosen"] = list(charts.INTERVALS), interval
+        data["indicators"] = _strategy_indicators(name)
+        data["decisions"] = _strategy_decisions(name)
         data.update(pair=s.instrument, home=s.instrument, pairs=_chart_pairs(s.instrument, [b.instrument for b in st().sleeves()]))
         if is_backtest(name):
             data["note"] = "Candles built from the run's price marks."
@@ -627,12 +652,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = _reason(action, reason, reason_pick, reason_note)
             if not reason:
                 raise ValueError("every command needs a reason")
-            if command == "stop" and _flatten_waits(name):
-                raise ValueError("a flatten is still waiting for the strategy to act on it, and stopping now would "
-                                 "drop it; stop it once it is flat")
             if command in ("start", "resume") and _liquidated(name):
                 # The page says so too; a stale page or a direct post must not restart it (QA P1-U25, U31).
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             if command == "flatten" and then == "stop":
                 then_stop = reason
             if command in ("start", "stop"):
@@ -644,12 +666,25 @@ def create_app(store: Store | None = None) -> FastAPI:
                 if command == "start":
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
+                    check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    blocked, why = entry_blocked(st(), name, utcnow(), starting=True)  # CHOKE
+                    if blocked and not (s.status == "halted" and any(
+                            c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
+                        raise ValueError(f"not started. {why}")  # a halt is cleared only by its own action (HC)
+                # A Stop's acceptance, stamped to the microsecond just before it is committed: the time a raced fill
+                # and a resting entry's cancel are measured from (P1-SG15, Advisor 7 Oct 05:01 and 05:47).
+                accepted = datetime.now(timezone.utc) if command == "stop" else None
                 st().set_desired_state(name, "running" if command == "start" else "stopped")
                 if command == "stop":
                     # A command still waiting when its process stops would act on the next start, maybe
-                    # weeks later; it lapses instead, and the decision log says so.
+                    # weeks later; it lapses instead, and the decision log says so. Stop is always taken, a
+                    # waiting flatten included (QA P1-D23): a strategy still holding runs for its exits only, its
+                    # stop or a safety stop watching the position (P1-U35).
                     st().drop_pending(name, "lapsed: the strategy was stopped before it acted")
-                st().decide(actor, command, reason, name)
+                st().decide(actor, command, reason, name, ts=accepted)
+            elif (command == "resume" and (why := entry_blocked(st(), name, utcnow(), starting=True)[1])
+                  and not set(why.codes) <= set(RESUMABLE)):
+                raise ValueError(f"a resume can't clear it. {why}")
             elif (command == "resume" and st().sleeve(name).status == "running"
                   and not any(c["command"] in ("pause", "flatten") for c in st().pending_commands(name))):
                 # Nothing to resume, and the runtime would reset the day's loss baseline (review round 10, m10-3).
@@ -685,15 +720,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """The dashboard half of the CHOKE gate: whether Start, Resume and Reset are refused because the
         strategy's position margin was lost with no Reset after liquidation since. The routes and the page
         both ask this, so they can't disagree. To read the engine's entry_blocked state once #155 has it."""
-        return trading.liquidated_since_reset(st(), name, LIQUIDATED_HALT)
-
-    def _flatten_waits(name: str) -> bool:
-        """A flatten waits for this strategy's process to act on it, and the process is reporting (a stop would
-        drop it). A process that has gone quiet can't act on it anyway, so stopping it is left to the PM."""
-        if not any(c["command"] == "flatten" for c in st().pending_commands(name)):
-            return False
-        hb = st().sleeve(name).heartbeat_at
-        return bool(hb and utcnow() - hb < STALE)
+        return trading.liquidated_since_reset(st(), name)
 
     @app.post("/sleeves/{name}/reset")
     def sleeve_reset(name: str, reason: str = Form(""), reason_pick: str | None = Form(None),
@@ -703,7 +730,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         puts the run so far away under Previous book, and restarts it at its starting capital."""
         try:
             if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
-                raise ValueError(LIQUIDATED_REFUSAL)
+                raise ValueError(liquidation.REFUSAL)
             st().request_reset(name, _reason("reset", reason, reason_pick, reason_note), actor=actor)
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
@@ -1611,6 +1638,19 @@ def _research_venue(name: str | None = None):
     return venue(name or None)
 
 
+def _check_slower_history(venue: str, pair: str, minutes: int, candles: int) -> None:
+    """A model reading slower candles warms them up from the history store at their own size (v2 P1-4): refused
+    when the store holds fewer than its look-back, rather than run on a filter that isn't settled."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.strategies.timeframes import span
+
+    cov = HistoryStore().coverage(venue, pair)
+    have = 0 if cov is None else int((cov.last - cov.first).total_seconds() // (minutes * 60))
+    if have < candles:
+        raise ValueError(f"history: the model's {span(minutes)} candles need {candles:,} closed ones of stored "
+                         f"history and the store holds {have:,} for {pair}; load more history first")
+
+
 def _venue_name(value) -> str:
     """A venue picked on a form (any case; blank is the default venue), as its profile names it. Raises
     ValueError on a venue with no profile."""
@@ -2378,8 +2418,12 @@ def _signals_view(s, row: dict | None) -> dict:
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     view = {"supported": cls is not None and cls.conditions is not LongFlatStrategy.conditions, "state": "waiting",
-            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False}
-    if not view["supported"]:
+            "age": "", "cards": [], "lights": [], "every": "", "close_in": "", "close_at": 0, "warming": False,
+            "notes": []}
+    if not view["supported"]:  # a model that lists no conditions may still send notes on its slower candles (P1-4)
+        if row is not None and s.desired_state == "running" and \
+                (utcnow() - row["ts"]).total_seconds() <= SIGNALS_FRESH_SECONDS:
+            view["notes"] = [str(n) for n in row["payload"].get("notes") or []]
         return view
     if s.desired_state != "running":
         view["state"] = "stopped"
@@ -2403,6 +2447,7 @@ def _signals_view(s, row: dict | None) -> dict:
     view["cards"] = [_signal_card(1, p.get("long"), p.get("guards") or [], held, ""),
                      _signal_card(-1, p.get("short"), p.get("guards") or [], held, short_flat)]
     view["warming"] = not view["cards"][0]["rows"]
+    view["notes"] = [str(n) for n in p.get("notes") or []]  # slower candles degraded or recorded missing (P1-4)
     view["lights"] = [r["met"] for r in view["cards"][0]["rows"]]
     view["state"] = "live"
     # The model acts at its bar's close: the next one after the last bar it decided on.
@@ -2425,6 +2470,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     from nautilus_trader.model import BarType, InstrumentId
 
     check_perp_sizing(cfg.strategy, cfg.params)
+    check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)

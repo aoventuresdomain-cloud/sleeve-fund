@@ -72,6 +72,10 @@ class VenueProfile:
     # A market data hub (sleeve_fund.hub) feeds paper here: every bar is built from its minutes, so the venue's
     # own candles (EXTERNAL bar specs) aren't offered until slower bars are built from minutes (v2 P1-4)
     hub: bool = False
+    # Where the venue's trading day starts, in minutes after 00:00 UTC. A strategy's slower candles (v2 P1-4) align
+    # to it, so a daily candle closes there. 00:00 UTC on every venue so far (Independent Quant Advisor, 5 Oct); the
+    # history store's resample assumes it, so a venue set otherwise can't warm slower candles from the store.
+    daily_anchor_minutes: int = 0
 
     @property
     def venue(self) -> Venue:

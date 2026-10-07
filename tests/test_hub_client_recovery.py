@@ -376,7 +376,7 @@ def test_the_price_watchdog_waits_while_the_hub_is_up_but_has_lost_its_venue():
                                 bar_type=BarType.from_str(f"{inst.id}-15-MINUTE-LAST-EXTERNAL")))
     events = []
     s._last_market_ns, s._price = T0, lambda: 60_000.0
-    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False,
+    s.runtime = SimpleNamespace(name="s1", now=lambda: now, backtest=False, holds={},
                                 store=SimpleNamespace(event=lambda *a, **k: events.append(a[2])))
     s.hub_status = HubStatus()
     s.hub_status.heartbeat_ns, s.hub_status.venue_up = now - 3 * S, False
@@ -409,7 +409,7 @@ def test_the_dashboard_refuses_a_hub_venue_strategy_on_the_venues_own_candles(cl
 
     c, store = client
     form = {"name": "daily-b", "strategy": "trend_filter", "instrument": "BTC/USDT", "venue": "binance",
-            "bar_spec": "1-DAY-LAST-EXTERNAL", "starting_balance": "5000", "risk_profile": "balanced",
+            "bar_spec": "1-DAY-LAST-EXTERNAL", "starting_balance": "5000", "risk_profile": "conservative",
             "warmup_bars": "0", "reason": "test", "market": "perp"}
     r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
     error = parse_qs(urlparse(r.headers["location"]).query)["error"][0]

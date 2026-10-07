@@ -495,7 +495,7 @@ _NA1_XF = pytest.mark.xfail(strict=True, reason="P1-L6 (#146, Advisor NA-1): the
                             "replayed missed minutes: a stop at its level or worse, on a gap at the open of the "
                             "crossing minute, a target at its level, with the market-on-return price recorded beside "
                             "the fill; ebe39c5 books market on return")
-OUTAGE_CASES = [pytest.param(w, id=w) for w in ("stop", "target", "both_one_minute", "gap_through_stop")]
+OUTAGE_CASES = [pytest.param(w, id=w) for w in ("stop", "target", "both_one_minute", "gap_through_stop")]  # PE2 (stop-safety, master 02845fb6): _NA1_XF removed, these pass
 
 
 def _outage_prices(what: str, side: int, n_minutes: int):
@@ -575,6 +575,7 @@ def test_c1_short_outage_the_backtest_stops_out_in_the_minute_to_00_07(label, pe
     assert first_exit(backtest(p, side=side, perp=perp, profile=profile, leave=20))[:1] == ("stop_loss",)
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=SETUP_IDS)
 def test_l1_short_outage_the_refilled_minute_on_time_still_has_its_stop_checked(label, perp, profile, side):
     p, gone, away, back = _short_outage(side)
@@ -598,6 +599,7 @@ def test_c1_15m_the_backtest_stops_out_in_the_minute_to_00_21(label, perp, profi
     assert first_exit(bt)[0] == "stop_loss" and first_exit(bt)[2] == minute(21)
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS[:1] + SETUPS[3:4] + SETUPS[5:], ids=["spot-long",
                          "perp-3x-long", "perp-3x-short"])
 def test_l1_15m_a_stop_crossed_inside_an_on_time_bar_while_the_hub_was_away_runs(label, perp, profile, side):
@@ -627,6 +629,7 @@ def test_c1_refill_after_the_live_minute_is_caught_when_the_store_already_has_it
     no_late_entries(run)
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS[:1] + SETUPS[5:], ids=["spot-long", "perp-3x-short"])
 def test_l2_refill_after_the_live_minute_with_the_store_not_yet_written_still_checks_the_stop(label, perp, profile,
                                                                                               side):
@@ -664,6 +667,7 @@ def test_c1_restart_checks_the_stored_minutes_since_the_last_heartbeat(label, pe
     assert_na1_price(run, p, what, side, back=price_at(p, 12))
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", RESTART_SETUPS[:1] + RESTART_SETUPS[3:],
                          ids=["spot-long", "perp-3x-short"])
 def test_l3_restart_after_a_hub_outage_checks_from_the_last_market_data_not_the_last_heartbeat(label, perp,
@@ -759,6 +763,7 @@ def test_the_decoder_tells_a_run_of_late_bars_once_then_its_extent():
     assert len(late) == 2 and "exits only" in late[1]["message"] and "5 bars" in late[1]["message"]
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 def test_l4_a_run_of_late_bars_skips_its_entry_with_one_warning():
     run = late_run(enter=5, leave=20)
     assert len(run.kinds("late_entry_skipped")) == 1, [e["message"][:60] for e in run.kinds("late_entry_skipped")]
@@ -829,6 +834,7 @@ def test_refills_sent_again_after_a_reconnect_are_never_sent_twice(minutes):
     assert len({k[0] for k in key}) == len(key)
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("minutes", [1, 15])
 def test_l2_refills_after_the_live_minute_without_the_store_still_reach_the_indicators(minutes):
     run = paper(WAVY, enter=10**6, leave=10**6 + 1, minutes=minutes, stop=None, away=(START + 26 * M, START + 33 * M),
@@ -1013,6 +1019,7 @@ def test_c10_the_weight_guard_fixture_change_is_setup_only():
 # ===================================================== orders: the journal write is off the decision path
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 def test_l5_a_failed_order_journal_write_still_stops_the_order_before_the_venue():
     from sleeve_fund.paper.queued import QueuedStore
     from sleeve_fund.store import Store
@@ -1065,6 +1072,7 @@ def _gap_prices(side):
     return shape(shape(flat_prices(30), 7.0, 9.0, adverse(side, 0.03)), 9.0, 30, adverse(side, 0.015))
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_an_outage_stop_fills_at_its_level_like_the_backtest(path, label, perp, profile, side):
@@ -1093,6 +1101,7 @@ def test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor(labe
     assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_a_gap_through_the_stop_fills_at_the_open_of_the_crossing_minute(path, label, perp, profile, side):
@@ -1117,6 +1126,7 @@ def test_na1_the_backtest_fills_a_gapped_stop_at_the_crossing_minutes_open(label
 _D13_ENTRY_XF = pytest.mark.xfail(strict=True, raises=AssertionError, reason="D13")  # Advisor 20:55: see below
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_backtest(path, label, perp, profile,
@@ -1133,6 +1143,7 @@ def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_back
     assert abs(ex[3] / bt[3] - 1) < 1e-4, (ex, bt)
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_the_market_on_return_price_is_recorded_beside_the_fill(path):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, 0.98)
@@ -1143,6 +1154,7 @@ def test_l6_na1_the_market_on_return_price_is_recorded_beside_the_fill(path):
     assert found and all(abs(float(v) / back - 1) < 2e-3 for v in found.values()), ex["signal"]
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", [NA_SETUPS[0], NA_SETUPS[4]], ids=[NA_IDS[0], NA_IDS[4]])
 def test_l6_na1_no_backfill_falls_back_to_market_on_return_and_flags_the_trade(label, perp, profile, side):
     def unavailable(prices, upto):
@@ -1186,6 +1198,7 @@ def test_na2_paper_takes_the_stop_when_one_missed_minute_crossed_both_open_neare
     assert first_exit(run.sequence())[0] == "stop_loss", run.sequence()
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_l7_na2_the_backtest_takes_the_stop_when_one_minute_crossed_both_open_nearer_the_target(label, perp, profile,
                                                                                               side):
@@ -1204,6 +1217,7 @@ LIQ_DEPTH = {"balanced": 0.60, "aggressive": 0.40}  # beyond the isolated liquid
 LIQ_PATHS = [pytest.param("reconnect", marks=LIQUIDATION_MECHANICS, id="reconnect"), "restart"]
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
 @pytest.mark.parametrize("path", LIQ_PATHS)
 def test_l8_na3_a_missed_minute_opening_beyond_liquidation_liquidates(path, label, perp, profile, side):
@@ -1222,6 +1236,7 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
     assert first_exit(run.sequence())[0] == "stop_loss", run.sequence()
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
 @pytest.mark.parametrize("path", LIQ_PATHS)
 def test_l8_na3_a_stopless_perp_wicked_through_liquidation_in_the_outage_is_liquidated(path, label, perp, profile,
@@ -1231,6 +1246,7 @@ def test_l8_na3_a_stopless_perp_wicked_through_liquidation_in_the_outage_is_liqu
     assert first_exit(run.sequence())[0] == "liquidation", run.sequence()
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("path", LIQ_PATHS)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("depth, kind", [(0.07, "risk_pause"), (0.235, "risk_halt")], ids=["daily-pause", "dd-halt"])
@@ -1275,6 +1291,7 @@ def _raise(*a, **k):
 _L2_FIX = "P1-L2 fix not pushed yet (PE1 17:48): the relay sends no {'t': 'filled'}"
 
 
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("case", ["found", "nothing_found", "refill_raises", "instrument_not_relayed"])
 def test_l2_relay_says_filled_after_every_refill_found_or_not(monkeypatch, case):
     since, until = START + 7 * M, START + 10 * M
@@ -1393,7 +1410,7 @@ def test_u35_a_fired_stop_has_one_watched_row_and_one_filled_market_stop_loss_pr
         assert abs(market["avg_px"] / tp_model(level, side) - 1) < 1e-4, (market["avg_px"], tp_model(level, side))
 
 
-@_U35_TRIGGERED_XF
+# PE2 (stop-safety, master 02845fb6): passes (mark removed)
 @pytest.mark.parametrize("label, perp, profile, side", U35_SETUPS, ids=U35_IDS)
 @pytest.mark.parametrize("path", ["live", "reconnect"])
 def test_u35_a_fired_stops_watched_row_ends_triggered_and_links_to_its_market_stop_loss(path, label, perp, profile,

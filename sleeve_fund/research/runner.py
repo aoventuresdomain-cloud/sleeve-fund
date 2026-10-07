@@ -17,7 +17,7 @@ from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, OmsType, TraderId
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets
+from sleeve_fund import markets, open_risk
 from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.store import utcnow as _utcnow
@@ -52,6 +52,14 @@ class BacktestResult:
     # How far the fills can be trusted, when they relied on what traded first inside a bar (P1-D13): e.g.
     # "bars-only: stop fills pessimistic". Empty when no resting level ever lay inside a bar.
     labels: list = field(default_factory=list)
+    # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
+    # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
+    open_risk_binds: int = 0
+    # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
+    open_risk_max: float = 0.0
+    # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
+    # still goes ahead so the risk can be measured, labelled (QA P1-S8).
+    paper_refusal: str | None = None
 
     @property
     def shorts(self) -> bool:
@@ -90,6 +98,22 @@ def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
     v = feed["volume"].astype(float)
     shown = (v * BOOK_SHARE).where(v <= 0, (v * BOOK_SHARE).clip(lower=step))
     return feed.assign(volume=shown)
+
+
+PAPER_REFUSED = "would be refused on paper (stopless above 1x)"
+
+
+def paper_refusal(strategy: str, params: dict | None, risk_profile: str | None) -> str | None:
+    """PAPER_REFUSED when paper wouldn't start these settings (strategies.check_perp_stop), else None."""
+    from sleeve_fund.strategies import check_perp_stop
+
+    if risk_profile is None:
+        return None
+    try:
+        check_perp_stop(strategy, params, risk_profile)
+    except ValueError:
+        return PAPER_REFUSED
+    return None
 
 
 def run_backtest(
@@ -225,9 +249,16 @@ def run_backtest(
             strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
             thin = built[built["degraded"]]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+            part = built[built["missing"] > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+        if "missing" in prices.columns:  # every bar's absent minutes, for the slower candles built from them (P1-4)
+            part = prices[prices["missing"].fillna(0).astype(int) > 0]
+            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
         if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
             thin = prices[prices["degraded"].astype(bool)]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+        if perp:
+            strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
         for i in range(0, len(feed), CHUNK_BARS):
@@ -263,6 +294,9 @@ def run_backtest(
             handler_errors=list(strategy.handler_errors),
             handler_error_count=strategy.handler_error_count,
             labels=fills_label(exec_minutes, fee_model.intrabar) if coarse else [],
+            open_risk_binds=strategy.open_risk_binds,
+            open_risk_max=strategy.open_risk_max,
+            paper_refusal=paper_refusal(strategy_name, params, risk_profile),
         )
     finally:
         if runtime is not None:
