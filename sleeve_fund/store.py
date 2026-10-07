@@ -618,7 +618,7 @@ gate_reservations_t = Table(
     Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id"), primary_key=True, autoincrement=False),
     Column("sleeve_id", Integer, ForeignKey("sleeves.id", ondelete="RESTRICT"), nullable=False),  # outlives a strategy
     Column("underlying", String(16), nullable=False),
-    Column("remaining_qty", EXACT, nullable=False),  # signed; reduced by partial fills
+    Column("remaining_qty", EXACT, nullable=False),  # unsigned, >= 0, side on the decision; reduced by partial fills
     Column("notional", EXACT, nullable=False),  # what it counts against each limit
     Column("margin", EXACT, nullable=False),
     Column("open_risk", EXACT, nullable=False),
