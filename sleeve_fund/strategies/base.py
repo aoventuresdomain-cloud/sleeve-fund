@@ -945,6 +945,9 @@ class LongFlatStrategy(Strategy):
             return
         if self.recorder is not None:
             self.recorder.start(self.instrument)
+        if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
+            # DA-9: the journal takes this instrument's quantities to its lot.
+            self.runtime.store.set_grid(lot_decimals=self.instrument.size_precision)
         self._last_market_ns = self.clock.timestamp_ns()  # the watchdog counts from the start
         if self.runtime is not None and not self._backtest:
             # P1-SG21 (Advisor STALE-5MIN): a process has no fresh price until its first trade or quote, so a restart on
@@ -4207,14 +4210,14 @@ class LongFlatStrategy(Strategy):
         window = fills[flat:]
         liq = [f for f in window if f["order_id"] in liquidations]
         rest = [f for f in window if f["order_id"] not in liquidations]
-        fees = (replay_book(rest, 0.0)["entry_fees"] + sum(float(f["fee"]) for f in liq)
+        fees = (float(replay_book(rest, 0.0)["entry_fees"]) + sum(float(f["fee"]) for f in liq)
                 + notional * self.runtime.taker_fee)
         at_entry = None
         if window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
             opened = window[0]["ts"]
-            at_entry = replay_book(fills[:flat], self.runtime.starting_balance,
-                                   store.funding_total(name, before=opened), store.insurance_total(name, before=opened)
-                                   )["cash"]
+            at_entry = float(replay_book(fills[:flat], self.runtime.starting_balance,
+                                         store.funding_total(name, before=opened),
+                                         store.insurance_total(name, before=opened))["cash"])
         journaled = trade_id is None or any(str(f.get("trade_id")) == trade_id for f in liq)
         return fees, sum(float(f["qty"]) for f in liq), at_entry, journaled
 
@@ -4247,7 +4250,7 @@ class LongFlatStrategy(Strategy):
         book = rt.store.journal_book(rt.name, rt.starting_balance)
         # The journal's own cash once the position is gone, to the cent the PM reads elsewhere (QA SG8); the mark
         # only while the journal still holds part of it.
-        left = book["cash"] if abs(book["qty"]) < 1e-12 else self._mark()[0]
+        left = float(book["cash"]) if abs(book["qty"]) < 1e-12 else self._mark()[0]
         rt.store.event(rt.name, "error", "incident",
                        f"Incident, {rt.name}: {self._liquidated or WIPED_OUT}; {max(left, 0.0):,.2f} of equity left. It "
                        "stays halted until you reset it after liquidation, which needs a note on why the "
@@ -4258,7 +4261,7 @@ class LongFlatStrategy(Strategy):
         the halt says how much before the close journals it (fix re-check, mF-1)."""
         covered = sum(a for _, a in self.insurance_log)
         if not covered and self.runtime is not None:  # since a restart: the journal has it
-            covered = self.runtime.store.insurance_total(self.runtime.name)
+            covered = float(self.runtime.store.insurance_total(self.runtime.name))
         why = self._liquidated or (self.runtime.liquidated if self.runtime is not None else None) or WIPED_OUT
         if covered > 0:
             return liquidation_reason(why, covered)

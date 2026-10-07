@@ -11,7 +11,9 @@ from __future__ import annotations
 import itertools
 from types import SimpleNamespace
 from datetime import datetime
+from decimal import Decimal
 
+from sleeve_fund.money import to_decimal
 from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
                                 _check_rebook, _conflict_words, _rebook_words, _same_fill, exact_sum,
                                 utcnow)
@@ -22,6 +24,10 @@ KEEP_ALL_MARKS = 5000  # a run with at most this many marks saves every one
 
 class MemoryJournal:
     """The subset of Store a SleeveRuntime uses, in memory, for one sleeve."""
+
+    # Figures are kept as floats, each the decimal the engine's journal boundary made exact (EngineJournal): a float
+    # prints as that decimal, so the copy save_backtest writes to the store is exact again (DA-9).
+    keeps_floats = True
 
     def __init__(self) -> None:
         self.sleeve_row: Sleeve | None = None
@@ -258,8 +264,8 @@ class MemoryJournal:
     def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.funding_))[:limit]
 
-    def funding_total(self, sleeve: str, before: datetime | None = None) -> float:
-        return float(sum(f["amount"] for f in self.funding_ if before is None or f["ts"] < before))
+    def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
+        return sum((to_decimal(f["amount"]) for f in self.funding_ if before is None or f["ts"] < before), Decimal(0))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
         self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount})
@@ -267,8 +273,8 @@ class MemoryJournal:
     def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.insurance_))[:limit]
 
-    def insurance_total(self, sleeve: str, before: datetime | None = None) -> float:
-        return float(sum(f["amount"] for f in self.insurance_ if before is None or f["ts"] < before))
+    def insurance_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
+        return sum((to_decimal(f["amount"]) for f in self.insurance_ if before is None or f["ts"] < before), Decimal(0))
 
     # --- into the real journal ---------------------------------------------------------
 
