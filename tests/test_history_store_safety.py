@@ -93,7 +93,8 @@ def test_the_same_difference_offered_again_is_recorded_once(tmp_path):  # F7
     s = HistoryStore(tmp_path)
     s.append_bars(V, P, _rows("2026-10-05 12:00", 1), "live")
     for _ in range(3):
-        assert s.append_bars(V, P, _rows("2026-10-05 12:00", 1, 99.0), "refill").conflicts == 1
+        # a live bar: a refill is the venue's candle and replaces the stored bar (P1-1-CANON, HoE test correction)
+        assert s.append_bars(V, P, _rows("2026-10-05 12:00", 1, 99.0), "live").conflicts == 1
     assert sum(e["kind"] == "conflict" for e in s.provenance(V, P)) == 1
 
 
