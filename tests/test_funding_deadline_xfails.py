@@ -452,12 +452,22 @@ PUBLISHED = [pytest.param("08:00", RATE, id="published-at-settlement"),
 O17_TRADES = [pytest.param(30, id="sparse"), pytest.param(5, id="dense")]
 
 
+# Stop safety (#182): the open-risk limit refuses a stopless 3x perp entry (aggressive profile, as o17_harness runs it).
+# These cells are about funding, not liquidation, so they run guarded: a 1 % stop, inside half the distance to
+# liquidation, open risk about 300 on the 10,000 book (under 5 %), and never reached on the harness's rising ramp.
+GUARDED_STOP = 0.01
+
+
+def guarded(params: dict) -> dict:
+    return {**params, "stop_loss": GUARDED_STOP}
+
+
 def native_run(tmp_path, monkeypatch, binance, *, step, published):
     """Binance's own perp, long 07:55-08:45; the 08:00 rate is 0.03%, published when `published` says; a trade every
     `step` s from 07:50:10 to 08:50 (30 s: at :10 and :40)."""
     pub = {f"{DAY} 08:00": NEVER if published == "never" else utc(f"{DAY} {published}")}
-    return o17_paper(tmp_path, monkeypatch, binance, win((f"{DAY} 07:55", f"{DAY} 08:45", 1)), f"{DAY} 07:50:10", 60,
-                     published=pub, rates={f"{DAY} 08:00": RATE}, step=step)
+    return o17_paper(tmp_path, monkeypatch, binance, guarded(win((f"{DAY} 07:55", f"{DAY} 08:45", 1))), f"{DAY} 07:50:10",
+                     60, published=pub, rates={f"{DAY} 08:00": RATE}, step=step)
 
 
 @pytest.mark.parametrize("published, want", PUBLISHED)
@@ -483,7 +493,7 @@ def test_trades_30_or_60_s_apart_book_every_settlement_once_by_its_bound(step, t
     60 s apart). Binance's own perp, long 23:55 to 16:45 over the 00:00, 08:00 and 16:00 settlements (+0.03%, -0.02%,
     +0.01%, each published at its settlement); a trade every `step` s from 23:50:10. Each settlement is charged exactly
     once, at its own rate, booked no later than its settlement + 15 min (+ 61 s). 10 s apart is the control."""
-    out = o17_paper(tmp_path, monkeypatch, binance, win((f"2025-10-02 23:55", f"{DAY} 16:45", 1)),
+    out = o17_paper(tmp_path, monkeypatch, binance, guarded(win((f"2025-10-02 23:55", f"{DAY} 16:45", 1))),
                     "2025-10-02 23:50:10", 16 * 60 + 55, rates=MULTI, step=step)
     assert out["fills"] and out["fills"][0][1] == "BUY", out["fills"]
     qty = out["fills"][0][2]

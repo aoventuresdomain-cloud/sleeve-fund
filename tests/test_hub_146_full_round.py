@@ -23,9 +23,9 @@ import pandas as pd
 import pytest
 
 import test_hub_146_qa as qa
-from test_hub_146_qa import (  # noqa: F401 - _probe is the autouse fixture that registers the probe strategy
-    BASE, M, S, SPREAD, START, TP_SLIP, _probe, adverse, favourable, first_exit, flat_prices, is_modelled, minute,
-    minutes_of, paper, recover_from, shape, tp_model)
+from test_hub_146_qa import (  # noqa: F401 - autouse: _probe registers the probe strategy, _guard_marks the guard marks
+    BASE, M, S, SPREAD, START, TP_SLIP, _guard_marks, _probe, adverse, favourable, first_exit, flat_prices, is_modelled,
+    minute, minutes_of, paper, recover_from, shape, tp_model)
 
 HALF = SPREAD / 2 / BASE
 CENT = 0.0100001
@@ -128,8 +128,8 @@ def test_na2_a_booked_target_agrees_to_the_cent_in_report_journal_and_cash(label
     qty = tf["qty"]
     assert tf["fee"] == pytest.approx(qty * tf["price"] * taker, abs=CENT)  # taker alone: the slippage is in the price
     rep = res.fills.loc[tp["order_id"]]
-    assert float(rep["avg_px"]) == pytest.approx(tf["price"], abs=CENT / qty)
-    assert commission(rep) == pytest.approx(tf["fee"], abs=CENT)
+    assert float(rep["avg_px"]) == pytest.approx(tf["price"], abs=1.5 * CENT / qty + 1e-9)
+    assert commission(rep) == pytest.approx(tf["fee"], abs=1.5 * CENT)  # report: round(exact fee, 2); journal: charge with its carry
     # the report's proceeds (price x qty less commission) equal the journal's to the cent
     sign = -side  # the closing fill's side: a sell closes a long
     j_cash = -sign * qty * tf["price"] - tf["fee"]
@@ -158,7 +158,7 @@ def test_l20_a_booked_target_uses_max_half_spread_or_5bp_as_taker_slippage(label
     assert TP_SLIP == 0.0005  # this harness's half spread is 0.01 %, so the 0.05 % floor applies
     assert tf["price"] == pytest.approx(level * (1 - side * TP_SLIP), abs=0.1), (tf["price"], level)
     assert tf["fee"] == pytest.approx(tf["qty"] * tf["price"] * taker, abs=CENT)
-    assert float(res.fills.loc[tp["order_id"]]["avg_px"]) == pytest.approx(tf["price"], abs=CENT / tf["qty"])
+    assert float(res.fills.loc[tp["order_id"]]["avg_px"]) == pytest.approx(tf["price"], abs=1.5 * CENT / tf["qty"] + 1e-9)
 
 
 def Price_level(res, side, tp=0.02):
@@ -187,13 +187,15 @@ def _stop_after_target(side):
     return p
 
 
-@pytest.mark.xfail(strict=True, reason="NA-1/D13 (Advisor 20:39): the backtest books a stop at its level less "
-                   "max(half spread, 0.05 %); stop slippage lands with D13, which stacks on #146: not built yet")
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="NA-1/D13 (Advisor 20:39): the backtest books a stop at "
+                   "its level less max(half spread, 0.05 %); built in #178, not on main yet: the mark comes off when "
+                   "#178 merges")
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=IDS)
 def test_d13_the_backtest_books_the_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
+    """Tightened to 0.1 bp (Advisor D13-STOP-PARITY (a), HoQA 7 Oct 01:07). Mark kept until #178 is on main."""
     seq = bt_seq(bt_res(_stop_after_target(side), side=side, perp=perp, profile=profile, leave=30)[0])
     ex, level = first_exit(seq), seq[0][3] * (1 - side * 0.01)
-    assert ex[0] == "stop_loss" and abs(ex[3] / qa.tp_model(level, side) - 1) < 1e-4, (ex, qa.tp_model(level, side))
+    assert ex[0] == "stop_loss" and abs(ex[3] / qa.tp_model(level, side) - 1) < 1e-5, (ex, qa.tp_model(level, side))
 
 
 def _open_past_target_then_stop(side, k=10):
@@ -341,12 +343,21 @@ def _funding_bars(side, wick_in_bar: bool):
     return df
 
 
+def _funding_rate_stub(strategy_cls, rate):
+    """A fixed funding rate for `_funding_rate`, on either signature (harness only, 7 Oct 00:35): before #163 it takes
+    (terms, ts, now) and returns the rate; from #163 it also takes held= and returns (rate, is_baseline)."""
+    import inspect
+
+    if "held" in inspect.signature(strategy_cls._funding_rate).parameters:
+        return lambda self, terms, ts, now, held=True, *_, **__: (rate, False)
+    return lambda self, terms, ts, now, *_, **__: rate
+
 def _funding_run(side, wick_in_bar, monkeypatch, rate=0.0001):
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.strategies.base import LongFlatStrategy
     from sleeve_fund.venues import venue
 
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: rate)  # harness: #155 passes the wait too
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, rate))
     inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
     params = {"enter": 180, "leave": 10**6, "side": side, "take_profit": 0.02, "market": "perp",
               "allow_short": True}
@@ -402,7 +413,7 @@ def test_c5_a_target_traded_through_shows_the_same_fill_in_paper_and_backtest(la
     bt = next(r for r in bt_seq(res) if r[0] == "take_profit")
     level = Price_level(res, side)
     assert bt[3] == pytest.approx(tp_model(level, side), abs=0.1), (bt, level)
-    assert 0 <= side * (pp[3] - bt[3]) / bt[3] < 1e-3, (pp, bt)
+    assert 0 <= side * (pp[3] - bt[3]) / bt[3] <= TP_SLIP + 7e-4, (pp, bt)  # D13-STOP-PARITY (b): floor + 7 bp, low bound 0
     (o,) = [o for o in run.orders if o["intent"] == "take_profit"]
     assert records_level(o["signal"], qa.fill_px(run, "entry") * (1 + side * 0.02)), o["signal"]
 
@@ -875,7 +886,7 @@ def _funding_paper(monkeypatch, *, side, stop_in_outage: bool, rate=0.0001):
 
     start = int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value)
     monkeypatch.setattr(qa, "START", start)
-    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", lambda self, terms, ts, now, *_: rate)  # harness: #155 passes the wait too
+    monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, rate))
     p = flat_prices(40)
     if stop_in_outage:
         p = shape(p, 7.5, 7 + 50 / 60, adverse(side, 0.02))  # 07:57:30-07:57:50 through the 1 % stop
@@ -911,8 +922,8 @@ def test_l19_outage_stop_booked_before_the_settlement_pays_and_receives_no_08_00
 # ================================================== NA-3: a liquidation found by the replay opens an incident, halts
 
 
-# P1-L18: passes with #155's incident and halt on the liquidation fill (PE2): its xfail mark removed
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+# P1-L18 mark removed 7 Oct: built in #155 (45e2a4f, on main 1582c3a).
+@pytest.mark.parametrize("path", qa.LIQ_PATHS)  # reconnect: guards off, liquidation mechanics only
 @pytest.mark.parametrize("label, perp, profile, side", qa.LIQ_SETUPS, ids=qa.LIQ_IDS)
 def test_l18_a_liquidation_found_by_the_replay_opens_an_incident_and_halts(path, label, perp, profile, side):
     p = shape(flat_prices(30), 7.0, 8.0, adverse(side, qa.LIQ_DEPTH[profile]))
@@ -922,7 +933,7 @@ def test_l18_a_liquidation_found_by_the_replay_opens_an_incident_and_halts(path,
     assert run.store.sleeve("q146").status == "halted"
 
 
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", qa.LIQ_PATHS)  # reconnect: guards off, liquidation mechanics only
 @pytest.mark.parametrize("label, perp, profile, side", qa.LIQ_SETUPS, ids=qa.LIQ_IDS)
 def test_na3_a_liquidation_found_by_the_replay_is_journaled_as_an_error_and_never_re_entered(path, label, perp,
                                                                                               profile, side):
