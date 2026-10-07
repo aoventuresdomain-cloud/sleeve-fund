@@ -153,6 +153,8 @@ def _top_up(df: pd.DataFrame, recent, pair: str, minutes: int) -> pd.DataFrame:
     r = r.iloc[:-1]  # the newest candle is still forming
     r = r.set_axis(r.index + pd.Timedelta(minutes=minutes))
     newer = r[r.index > df.index[-1]]
+    whole = {"missing": 0, "degraded": False}  # the venue's own candles: none of their minutes absent (board 5a)
+    newer = newer.assign(**{c: v for c, v in whole.items() if c in df.columns})
     return pd.concat([df, newer[list(df.columns)]]) if len(newer) else df
 
 
@@ -277,6 +279,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         # outage; refreshed hourly as new measurements land (SPREAD-PIT).
         runtime.spread_loader = partial(spreads.series, profile.name, sleeve.instrument, runtime.store, strict=True)
         strategy.spread_series = spreads.series(profile.name, sleeve.instrument, runtime.store)
+    if hub is None:  # its first bar after a start is built from the stored minutes, as the hub client's is (R1)
+        strategy.attach_minutes(stored_minutes(profile.name, sleeve.instrument))
     strategy.hub_fed = hub is not None
     strategy.hub_status = hub_status if hub is not None else None
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).

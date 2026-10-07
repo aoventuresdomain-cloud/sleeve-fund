@@ -94,6 +94,36 @@ def _probe(monkeypatch):
     monkeypatch.setitem(REGISTRY, "probe", _probe_classes())
 
 
+# Stop safety (PE2's PR, merged with #146): a stopless perp above 1x is refused at start (check_perp_stop), a new perp
+# entry is refused past the 5 % open-risk limit (open_risk.LIMIT), and a restart holding a stopless position places a
+# safety stop. A cell whose subject is liquidation mechanics needs a position those guards would refuse or close, so it
+# lifts them with the repo's per-cell marks, saying why (as #155's QA cells do); every other cell runs guarded, its
+# set-up made to comply (1x, a stop inside half the distance to liquidation, or the conservative profile).
+GUARDS_OFF = "guards off: liquidation mechanics only"
+LIQUIDATION_MECHANICS = (pytest.mark.no_open_risk_limit(reason=GUARDS_OFF),
+                         pytest.mark.no_restart_safety_stop(reason=GUARDS_OFF))
+GUARDED_STOP = 0.02  # a stop for a perp above 1x: inside half its distance to liquidation, never reached by WAVY
+
+
+@pytest.fixture(autouse=True)
+def _guard_marks(monkeypatch, request):
+    """The guard-lift marks, applied here as the repo's tests/conftest.py does, so these files behave the same run
+    from QA's shared folder (where that conftest isn't loaded); as it does, open risk reads a calm 2 % daily ATR
+    unless real_daily_atr. A head without stop safety (main) has nothing to lift."""
+    try:
+        from sleeve_fund import open_risk
+    except ImportError:
+        return
+    if request.node.get_closest_marker("real_daily_atr") is None:
+        monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: 0.02)
+    if request.node.get_closest_marker("no_open_risk_limit") is not None:
+        monkeypatch.setattr(open_risk, "LIMIT", float("inf"))
+    if request.node.get_closest_marker("no_restart_safety_stop") is not None:
+        from sleeve_fund.strategies.base import LongFlatStrategy
+
+        monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
+
+
 # ----------------------------------------------------------------------------------------------- the data
 
 
@@ -399,7 +429,8 @@ def restart(prices, down_from: float, back_at: float, *, entry_px=None, qty=0.05
     """The process was down from minute `down_from` (its last heartbeat, unless `heartbeat` says otherwise) to
     `back_at`; the journal holds a position entered at minute 5. The new process gets trades and live hub minutes
     from back_at on, and the store's minutes up to back_at."""
-    entry_px = entry_px or float(prices[5 * 60])
+    # Paper enters at the touch (mid + side x half spread) and derives its levels from the booked entry (D13 #178).
+    entry_px = entry_px or float(prices[5 * 60]) + side * SPREAD / 2
     gone = frozenset(range(0, int(back_at * 60)))
     lost = {START + k * M for k in range(0, int(back_at) + 1)}
     hb = START + int((heartbeat if heartbeat is not None else down_from) * M)
@@ -428,6 +459,14 @@ def fill_px(run: Run, intent: str) -> float:
     return next(r[3] for r in run.sequence() if r[0] == intent)
 
 
+def filled_orders(run: Run, intent: str) -> list[dict]:
+    """The journal rows of `intent` that filled. Paper's stop is also journaled as a row of its own (P1-U35: intent
+    stop_loss, order_type 'STOP (watched)', never filled, closed when the position closes); the market stop-loss sent
+    when it fires is the row that fills, and the one these cells mean."""
+    filled = {f["order_id"] for f in run.fills}
+    return [o for o in run.orders if o["intent"] == intent and o["order_id"] in filled]
+
+
 def price_at(prices, minute_k: float) -> float:
     return float(prices[int(minute_k * 60)])
 
@@ -452,6 +491,10 @@ def is_modelled(signal: dict | None) -> bool:
 # ======================================================== check 2: C1 on reconnect (hub away, node running)
 
 
+_NA1_XF = pytest.mark.xfail(strict=True, reason="P1-L6 (#146, Advisor NA-1): the outage exit is booked from the "
+                            "replayed missed minutes: a stop at its level or worse, on a gap at the open of the "
+                            "crossing minute, a target at its level, with the market-on-return price recorded beside "
+                            "the fill; ebe39c5 books market on return")
 OUTAGE_CASES = [pytest.param(w, id=w) for w in ("stop", "target", "both_one_minute", "gap_through_stop")]
 
 
@@ -488,7 +531,7 @@ def assert_na1_price(run: Run, p, what: str, side: int, back: float) -> None:
     else:  # Advisor 20:39: the level less max(half spread, 0.05 %)
         level = entry * (1 - side * 0.01)
         assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
-    (o,) = [o for o in run.orders if o["intent"] == ex[0]]
+    (o,) = filled_orders(run, ex[0])
     assert is_modelled(o["signal"]), o["signal"]  # Advisor 20:39: every replayed exit row is marked modelled
     found = {k: v for k, v in (o["signal"] or {}).items() if "return" in k.lower()}
     assert found and all(abs(float(v) / back - 1) < 2e-3 for v in found.values()), o["signal"]
@@ -639,8 +682,14 @@ LATE_BACK = START + 10 * M + 5 * S  # are over 90 s late, the one to 00:09 is 65
 LATE_GONE = frozenset(range(3 * 60, 10 * 60))
 
 
-def late_run(**kw) -> Run:
-    return paper(flat_prices(30), gone=LATE_GONE, away=LATE_AWAY, back_at=LATE_BACK, stop=None, **kw)
+def late_run(stop=None, **kw) -> Run:
+    return paper(flat_prices(30), gone=LATE_GONE, away=LATE_AWAY, back_at=LATE_BACK, stop=stop, **kw)
+
+
+def guarded_stop(perp: bool, profile: str) -> float | None:
+    """Set-up for stop safety: a perp above 1x gets GUARDED_STOP (a stopless one is refused); spot and 1x stay
+    stopless. These prices never reach it, so the cell decides as it did stopless."""
+    return GUARDED_STOP if perp and profile != "conservative" else None
 
 
 def timing_of(run: Run, intent: str, side: str | None = None) -> dict:
@@ -655,7 +704,7 @@ def hhmm(ts) -> str:
 @pytest.mark.parametrize("label, perp, profile, side", [SETUPS[0], SETUPS[3], SETUPS[4]],
                          ids=["spot-long", "perp-3x-long", "perp-1x-short"])
 def test_late_bars_never_open_the_first_on_time_bar_does(label, perp, profile, side):
-    run = late_run(enter=5, leave=20, side=side, perp=perp, profile=profile)
+    run = late_run(enter=5, leave=20, side=side, perp=perp, profile=profile, stop=guarded_stop(perp, profile))
     assert run.decoder.late == 5
     no_late_entries(run)
     t = timing_of(run, "entry")
@@ -684,7 +733,7 @@ def test_a_reduction_on_a_late_bar_runs():
 @pytest.mark.parametrize("label, perp, profile, side", [SETUPS[0], SETUPS[2], SETUPS[5]],
                          ids=["spot-long", "perp-2x-long", "perp-3x-short"])
 def test_an_exit_on_a_late_bar_runs_and_is_said_with_its_lag(label, perp, profile, side):
-    run = late_run(enter=2, leave=6, side=side, perp=perp, profile=profile)
+    run = late_run(enter=2, leave=6, side=side, perp=perp, profile=profile, stop=guarded_stop(perp, profile))
     t = timing_of(run, "exit")
     assert hhmm(t["bar_close"]) == "00:06" and (t["bar_recv"] - t["bar_close"]).total_seconds() == 245
     (said,) = run.kinds("late_exit")
@@ -693,7 +742,8 @@ def test_an_exit_on_a_late_bar_runs_and_is_said_with_its_lag(label, perp, profil
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long-to-short", "short-to-long"])
 def test_a_reversal_on_a_late_bar_only_closes_the_new_side_waits_for_an_on_time_bar(side):
-    run = late_run(enter=2, leave=6, side=side, perp=True, profile="aggressive", extra={"after": -side})
+    run = late_run(enter=2, leave=6, side=side, perp=True, profile="aggressive", extra={"after": -side},
+                   stop=GUARDED_STOP)
     assert hhmm(timing_of(run, "exit")["bar_close"]) == "00:06"  # closed on the late bar
     opened = [o for o in run.orders if o["intent"] == "entry"]
     assert [o["side"] for o in opened] == (["BUY", "SELL"] if side > 0 else ["SELL", "BUY"])
@@ -800,7 +850,7 @@ def _same_decisions(hub, bt, slack_minutes=0):
 @pytest.mark.parametrize("label, perp, profile, side", [SETUPS[0], SETUPS[3], SETUPS[5]],
                          ids=["spot-long", "perp-3x-long", "perp-3x-short"])
 def test_parity_whole_feed_hub_paper_decides_as_the_backtest(label, perp, profile, side):
-    kw = dict(enter=5, leave=25, side=side, perp=perp, profile=profile, stop=None)
+    kw = dict(enter=5, leave=25, side=side, perp=perp, profile=profile, stop=guarded_stop(perp, profile))
     _same_decisions(paper(WAVY[:40 * 60], **kw).sequence(), backtest(WAVY[:40 * 60], **kw))
 
 
@@ -809,7 +859,7 @@ def test_parity_a_hole_neither_the_hub_nor_the_store_has_gives_the_same_decision
     """The minutes to 00:05 (the entry bar) and 00:19-00:21 never existed (no trades): both decide on the next
     bar there is."""
     holes = (4, 18, 19, 20)
-    kw = dict(enter=5, leave=20, side=side, perp=perp, profile=profile, stop=None, holes=holes)
+    kw = dict(enter=5, leave=20, side=side, perp=perp, profile=profile, stop=guarded_stop(perp, profile), holes=holes)
     run = paper(WAVY[:40 * 60], recover=recover_from(minutes_of(WAVY[:40 * 60]).drop(
         [minutes_of(WAVY[:40 * 60]).index[k] for k in holes])), **kw)
     bt = backtest(WAVY[:40 * 60], **kw)
@@ -823,7 +873,7 @@ def test_parity_late_case_same_decisions_entries_only_on_the_first_on_time_bar(l
     """Hub away 00:03-00:10 (refills at 00:10:05). Exit side: the exit signalled on the late bar to 00:06 runs
     when it arrives. Entry side: the backtest enters at 00:05; paper skips the late bars and enters on the bar to
     00:09 (the Advisor's late rule): the same decisions, the entry later by design."""
-    kw = dict(side=side, perp=perp, profile=profile, stop=None)
+    kw = dict(side=side, perp=perp, profile=profile, stop=guarded_stop(perp, profile))
     p = WAVY[:30 * 60]
     out = paper(p, enter=2, leave=6, gone=LATE_GONE, away=LATE_AWAY, back_at=LATE_BACK, **kw).sequence()
     ref = backtest(p, enter=2, leave=6, **kw)
@@ -844,9 +894,10 @@ def _supervised(tmp_path, monkeypatch, sleeves):
     from sleeve_fund.store import Store
 
     store = Store(f"sqlite:///{tmp_path}/c10.db")
-    for name, venue_, spec, strategy, params in sleeves:
+    for name, venue_, spec, strategy, params, *profile in sleeves:  # profile: the risk profile, when set
         store.create_sleeve(name=name, strategy=strategy, instrument="BTC/USDT" if venue_ == "binance" else "BTC/USD",
-                            bar_spec=spec, starting_balance=1_000, venue=venue_, params=params)
+                            bar_spec=spec, starting_balance=1_000, venue=venue_, params=params,
+                            **({"risk_profile": profile[0]} if profile else {}))
     started = []
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: started.append(a[0][-1]) or
                         SimpleNamespace(pid=1, poll=lambda: None, send_signal=lambda *a: None, wait=lambda **k: 0))
@@ -861,7 +912,8 @@ def test_c10_a_saved_binance_strategy_on_venue_candles_is_refused_at_start_with_
                                                                                                   monkeypatch, spec):
     store, sup, started = _supervised(tmp_path, monkeypatch, [
         ("old", "binance", spec, "trend_filter", {"market": "perp"}),
-        ("hub-hourly", "binance", "1-HOUR-LAST-INTERNAL", "buy_and_hold", {"market": "perp"}),
+        # conservative (1x): a stopless perp above 1x is refused by stop safety (check_perp_stop), not by C10
+        ("hub-hourly", "binance", "1-HOUR-LAST-INTERNAL", "buy_and_hold", {"market": "perp"}, "conservative"),
         ("kraken-daily", "kraken", "1-DAY-LAST-EXTERNAL", "buy_and_hold", {}),
     ])
     for _ in range(5):
@@ -888,6 +940,28 @@ def test_c10_the_pm_starting_it_again_is_refused_again_once_per_start(tmp_path, 
     assert started == [] and [e["kind"] for e in store.events("old", limit=100)].count("start_refused") == 2
 
 
+# Stop safety (NA-4, "S6 applies to every refused start that holds a position") supersedes this pin's "not started,
+# an engineer needs to close it": on the stop-safety branch the supervisor starts a stopped holder for its exits only
+# (supervisor.STOPPED_HOLDING) on the next step, at any risk profile. For a venue-candle strategy that is the C10
+# exits-only build (owner PE1; build_node on the hub's minutes), not in the stop-safety PR: the same strict condition
+# as NA-4's venue-candle cells. Rewrite this cell's start assertions when that build lands.
+def _stopped_holders_run_exits_only() -> bool:
+    """Whether the supervisor under test starts a stopped holder for its exits only (stop safety; not on main)."""
+    try:
+        from sleeve_fund import supervisor
+
+        return hasattr(supervisor, "STOPPED_HOLDING")
+    except Exception:  # noqa: BLE001 - a head that can't say has not built it
+        return False
+
+
+_C10_EXITS_ONLY_XF = pytest.mark.xfail(
+    condition=_stopped_holders_run_exits_only(), strict=True, raises=AssertionError,
+    reason="QA P1-C10, owner PE1 (the C10 exits-only build, not in the stop-safety PR): with stop safety a refused "
+    "venue-candle holder is started for its exits only on the next step (NA-4)")
+
+
+@_C10_EXITS_ONLY_XF
 def test_c10_refused_while_holding_a_position_says_so_never_flattens_and_leaves_the_journal_alone(tmp_path,
                                                                                                 monkeypatch):
     """The CR minor (ebe39c5). It is refused even with a flatten waiting, and a PM reset can't get round it:
@@ -999,7 +1073,7 @@ def test_l6_na1_an_outage_stop_fills_at_its_level_like_the_backtest(path, label,
     ex = first_exit(run.sequence())
     level = _entry(run) * (1 - side * 0.01)  # Advisor 20:39: the level less TP_SLIP, the row marked modelled
     assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
-    (o,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    (o,) = filled_orders(run, "stop_loss")
     assert is_modelled(o["signal"]), o["signal"]
     # The backtest-side comparison moved to test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor
     # (strict xfail until D13 lands), not a loosened tolerance here.
@@ -1010,7 +1084,6 @@ _D13_STOP_XF = pytest.mark.xfail(strict=True, reason="NA-1 backtest side (Adviso
                                  "stop; stop slippage lands with D13, which stacks on #146: not built yet")
 
 
-@_D13_STOP_XF
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02))
@@ -1028,11 +1101,10 @@ def test_l6_na1_a_gap_through_the_stop_fills_at_the_open_of_the_crossing_minute(
     ex = first_exit(run.sequence())
     gap_open = tp_model(price_at(p, 7.0), side)  # Advisor 20:39: the open less TP_SLIP, the row marked modelled
     assert ex[0] == "stop_loss" and abs(ex[3] / gap_open - 1) < 1e-4, (ex, gap_open)
-    (o,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    (o,) = filled_orders(run, "stop_loss")
     assert is_modelled(o["signal"]), o["signal"]
 
 
-@_D13_STOP_XF
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
 def test_na1_the_backtest_fills_a_gapped_stop_at_the_crossing_minutes_open(label, perp, profile, side):
     """Was true on ebe39c5 at the bare open; Advisor 20:39 moves it to the open less TP_SLIP (D13, strict xfail)."""
@@ -1046,7 +1118,7 @@ _D13_ENTRY_XF = pytest.mark.xfail(strict=True, raises=AssertionError, reason="D1
 
 
 @pytest.mark.parametrize("label, perp, profile, side", NA_SETUPS, ids=NA_IDS)
-@pytest.mark.parametrize("path", [pytest.param("reconnect", marks=_D13_ENTRY_XF), "restart"])
+@pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_backtest(path, label, perp, profile,
                                                                                      side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, favourable(side, 0.03))
@@ -1065,7 +1137,7 @@ def test_l6_na1_an_outage_target_traded_through_fills_at_its_level_like_the_back
 def test_l6_na1_the_market_on_return_price_is_recorded_beside_the_fill(path):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, 0.98)
     run = _outage(path, p, side=1, perp=False, profile="aggressive", tp=0.02)
-    (ex,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    (ex,) = filled_orders(run, "stop_loss")
     back = price_at(p, 12 + 5 / 60 if path == "reconnect" else 12)
     found = {k: v for k, v in (ex["signal"] or {}).items() if "return" in k.lower()}
     assert found and all(abs(float(v) / back - 1) < 2e-3 for v in found.values()), ex["signal"]
@@ -1086,7 +1158,7 @@ def test_l6_na1_no_backfill_falls_back_to_market_on_return_and_flags_the_trade(l
     run = restart(p, 6, 12, side=side, perp=perp, profile=profile, leave=30, history=unavailable(p, 0))
     ex = first_exit(run.sequence())
     assert ex[0] == "stop_loss" and abs(ex[3] / price_at(p, 12) - 1) < 2e-3  # market on return
-    (o,) = [o for o in run.orders if o["intent"] == "stop_loss"]
+    (o,) = filled_orders(run, "stop_loss")
     assert any("fallback" in k.lower() or "fallback" in str(v).lower() for k, v in (o["signal"] or {}).items()), \
         o["signal"]
 
@@ -1127,10 +1199,13 @@ LIQ_SETUPS = [("perp-2x-long", True, "balanced", 1), ("perp-3x-long", True, "agg
               ("perp-3x-short", True, "aggressive", -1)]
 LIQ_IDS = [s[0] for s in LIQ_SETUPS]
 LIQ_DEPTH = {"balanced": 0.60, "aggressive": 0.40}  # beyond the isolated liquidation price at 2x (~-50 %) / 3x
+# Liquidation mechanics: on reconnect the position is opened in the run, past what stop safety allows (the open-risk
+# limit refuses it), so those cells lift the guards; the restart cells carry it from the journal and run guarded.
+LIQ_PATHS = [pytest.param("reconnect", marks=LIQUIDATION_MECHANICS, id="reconnect"), "restart"]
 
 
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", LIQ_PATHS)
 def test_l8_na3_a_missed_minute_opening_beyond_liquidation_liquidates(path, label, perp, profile, side):
     p = shape(flat_prices(30), 7.0, 8.0, adverse(side, LIQ_DEPTH[profile]))  # the minute to 00:08, then back
     run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25)
@@ -1138,7 +1213,7 @@ def test_l8_na3_a_missed_minute_opening_beyond_liquidation_liquidates(path, labe
 
 
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", LIQ_PATHS)
 def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_first(path, label, perp, profile, side):
     """Already true on ebe39c5 (the stop is checked, liquidation isn't): pinned. The minute opens flat and wicks
     beyond liquidation; the 10 % stop is reached first."""
@@ -1148,7 +1223,7 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
 
 
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", LIQ_PATHS)
 def test_l8_na3_a_stopless_perp_wicked_through_liquidation_in_the_outage_is_liquidated(path, label, perp, profile,
                                                                                        side):
     p = shape(flat_prices(30), 7.25, 7.5, adverse(side, LIQ_DEPTH[profile]))
@@ -1156,7 +1231,7 @@ def test_l8_na3_a_stopless_perp_wicked_through_liquidation_in_the_outage_is_liqu
     assert first_exit(run.sequence())[0] == "liquidation", run.sequence()
 
 
-@pytest.mark.parametrize("path", ["reconnect", "restart"])
+@pytest.mark.parametrize("path", LIQ_PATHS)
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 @pytest.mark.parametrize("depth, kind", [(0.07, "risk_pause"), (0.235, "risk_halt")], ids=["daily-pause", "dd-halt"])
 def test_l8_na3_the_replay_applies_the_daily_pause_and_the_drawdown_halt(path, side, depth, kind):
@@ -1228,3 +1303,136 @@ def test_l2_relay_announces_the_gap_before_its_live_minute(monkeypatch):
     r.on_bar({**live, "ts": START + 11 * M})
     assert [m["t"] for m in sent] == ["gap", "bar"], sent
     assert (sent[0]["since"], sent[0]["until"]) == (START + 7 * M, START + 10 * M)
+
+
+# ==================== P1-U35: paper's watched stop is ONE journal row per stop, and it ends as its position does
+#
+# Stop safety (PE2) journals the stop paper watches in the process as an order row (intent stop_loss, order_type
+# "STOP (watched)"), and a stop that fires sends its own market stop-loss, journaled as the row that fills. Pinned per
+# stop (QA brief 7 Oct; ruling of the Head of QA with the HoE, 7 Oct): exactly one watched row and exactly one filled
+# market stop_loss row, priced from the watched level (live: the level the market row records; outage replay: the
+# modelled price, the level less TP_SLIP). When the stop FIRED the watched row ends "triggered" and links to that
+# market order (a parent order or a reference field: whatever PE2 builds); when the position closed by another exit
+# (target, signal, PM flatten) it ends cancelled, with its reason. On a head without P1-U35 (main 0a5cd8f) there is no
+# watched row at all: the cells fail on their first assertion, "not built: watched stop row", a strict xfail there.
+
+WATCHED = "STOP (watched)"
+U35_SETUPS = [SETUPS[0], SETUPS[3], SETUPS[5]]  # spot, perp 3x long and short, each with the 1 % stop (guarded)
+U35_IDS = [s[0] for s in U35_SETUPS]
+
+
+def _u35_built() -> bool:
+    """Whether the code under test journals paper's watched stop (the label is in the strategy's source)."""
+    try:
+        import inspect
+
+        from sleeve_fund.strategies import base
+
+        return WATCHED in inspect.getsource(base)
+    except Exception:  # noqa: BLE001 - a head that can't say has not built it
+        return False
+
+
+_U35_XF = pytest.mark.xfail(condition=not _u35_built(), strict=True, raises=AssertionError,
+                            reason="not built: watched stop row (P1-U35, the stop-safety PR): this head journals no "
+                                   "'STOP (watched)' row")
+_U35_TRIGGERED_XF = pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="not built: the watched stop row ends 'triggered', linked to the market "
+    "stop-loss it fired (P1-U35 ruling, HoQA + HoE 7 Oct; PE2 carries the label change in the gate). ee2b414 ends it "
+    "'canceled'; main has no watched row")
+
+
+def _watched_rows(run: Run) -> list[dict]:
+    rows = [o for o in run.orders if o.get("order_type") == WATCHED]
+    assert rows, f"not built: watched stop row (P1-U35): no {WATCHED!r} row in {[o['intent'] for o in run.orders]}"
+    return rows
+
+
+def _u35_fired(path: str, perp: bool, profile: str, side: int) -> Run:
+    """live: 2 % against from 00:10:30 on, through the 1 % stop on the hub-fed trades. reconnect: the same dip inside
+    the hub outage (00:07:30-00:07:50, recovered), found by the outage replay on return (NA-1)."""
+    if path == "live":
+        return paper(shape(flat_prices(30), 10.5, 30, adverse(side, 0.02)), side=side, perp=perp, profile=profile,
+                     leave=25, stop=0.01)
+    return _outage("reconnect", shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02)), side=side, perp=perp,
+                   profile=profile, tp=0.02)
+
+
+def _the_stop_rows(run: Run) -> tuple[dict, dict]:
+    (watched,) = _watched_rows(run)
+    markets = [o for o in filled_orders(run, "stop_loss") if o.get("order_type") != WATCHED]
+    (market,) = markets
+    assert market["status"] == "filled", market
+    return watched, market
+
+
+def _links(a: dict, b: dict) -> bool:
+    """Row a names row b's order id in a field of its own or of its signal (a parent order, a reference)."""
+    fields = {k: v for k, v in a.items() if k not in ("order_id", "message", "reason", "signal")}
+    fields.update({f"signal.{k}": v for k, v in (a.get("signal") or {}).items()})
+    return any(v == b["order_id"] for v in fields.values())
+
+
+@_U35_XF
+@pytest.mark.parametrize("label, perp, profile, side", U35_SETUPS, ids=U35_IDS)
+@pytest.mark.parametrize("path", ["live", "reconnect"])
+def test_u35_a_fired_stop_has_one_watched_row_and_one_filled_market_stop_loss_priced_from_its_level(path, label, perp,
+                                                                                                  profile, side):
+    run = _u35_fired(path, perp, profile, side)
+    assert first_exit(run.sequence())[0] == "stop_loss", run.sequence()
+    watched, market = _the_stop_rows(run)
+    level = float(watched["signal"]["stop_px"])
+    entry = fill_px(run, "entry")
+    assert level == pytest.approx(entry * (1 - side * 0.01), rel=1e-9), (level, entry)
+    assert watched["side"] == market["side"] and watched["qty"] == pytest.approx(market["qty"], rel=1e-9)
+    if path == "live":  # the market stop-loss records the level it fired at: the watched one
+        sig = market["signal"] or {}
+        assert sig["entry_px"] * (1 - side * sig["stop_loss"]) == pytest.approx(level, rel=1e-9), (sig, level)
+    else:  # the replay's modelled price: the watched level less TP_SLIP (NA-1, Advisor 20:39)
+        assert is_modelled(market["signal"]), market["signal"]
+        assert abs(market["avg_px"] / tp_model(level, side) - 1) < 1e-4, (market["avg_px"], tp_model(level, side))
+
+
+@_U35_TRIGGERED_XF
+@pytest.mark.parametrize("label, perp, profile, side", U35_SETUPS, ids=U35_IDS)
+@pytest.mark.parametrize("path", ["live", "reconnect"])
+def test_u35_a_fired_stops_watched_row_ends_triggered_and_links_to_its_market_stop_loss(path, label, perp, profile,
+                                                                                       side):
+    run = _u35_fired(path, perp, profile, side)
+    watched, market = _the_stop_rows(run)
+    assert watched["status"] == "triggered", watched
+    assert _links(watched, market) or _links(market, watched), (watched, market)
+
+
+def _flatten_once_in_position(monkeypatch):
+    """The PM flattens once the position is open: the command reaches the runtime's next look at its commands."""
+    from sleeve_fund.store import Store
+
+    pending, sent = Store.pending_commands, []
+
+    def with_flatten(self, sleeve):
+        if not sent and self.fills(sleeve, limit=1):
+            sent.append(sleeve)
+            self.command(sleeve, "flatten", "QA: flatten while the stop is watched")
+        return pending(self, sleeve)
+
+    monkeypatch.setattr(Store, "pending_commands", with_flatten)
+
+
+@_U35_XF
+@pytest.mark.parametrize("label, perp, profile, side", [U35_SETUPS[0], U35_SETUPS[2]], ids=[U35_IDS[0], U35_IDS[2]])
+@pytest.mark.parametrize("exit_by, intent", [("target", "take_profit"), ("signal", "exit"), ("flatten", "pm_flatten")])
+def test_u35_a_position_closed_by_another_exit_cancels_its_watched_row_with_its_reason(exit_by, intent, label, perp,
+                                                                                      profile, side, monkeypatch):
+    """target: 3 % in favour from 00:10:30 through the 2 % target; signal: the probe's exit at 00:25 on flat prices;
+    flatten: the PM's flatten once the position is open. The stop never fires."""
+    p = shape(flat_prices(30), 10.5, 30, favourable(side, 0.03)) if exit_by == "target" else flat_prices(30)
+    if exit_by == "flatten":
+        _flatten_once_in_position(monkeypatch)
+    run = paper(p, side=side, perp=perp, profile=profile, leave=25, stop=0.01,
+                tp=0.02 if exit_by == "target" else None)
+    (watched,) = _watched_rows(run)
+    assert first_exit(run.sequence())[0] == intent, run.sequence()
+    assert not filled_orders(run, "stop_loss"), run.sequence()
+    assert watched["status"] in ("canceled", "cancelled"), watched
+    assert (watched["message"] or "").strip(), watched  # with its reason

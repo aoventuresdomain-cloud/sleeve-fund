@@ -327,6 +327,14 @@ class ScheduleFeeModel(FeeModel):
             self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
         return self._charge(charge + shift, instrument.quote_currency)
 
+    @staticmethod
+    def _liquidation_close(info: dict, filled: float) -> bool:
+        """A liquidation: the market close at the liquidation price, or a risk stop filled at or through it."""
+        if info.get("kind") == "liquidation" or info.get("liquidation"):
+            return True
+        liq = info.get("liq_px")
+        return liq is not None and (filled <= liq if info["side"] > 0 else filled >= liq)
+
     def _exit_commission(self, order, info: dict, fill_quantity, fill_px, instrument) -> Money:
         """A resting exit's fill, booked at its price (exit_price), the stop's slippage included: the venue's fee is
         charged on that price, and the difference from the venue's fill rides with it, to be moved into the price as
@@ -334,6 +342,16 @@ class ScheduleFeeModel(FeeModel):
         coid = str(order.client_order_id)
         qty, filled = fill_quantity.as_decimal(), float(fill_px.as_decimal())
         side = info["side"]
+        if self._liquidation_close(info, filled):
+            # Advisor 7 Oct 03:23 (D13-F2): a liquidation close, gapped or not, pays no half spread and no 0.05 %
+            # floor: booked at the venue's fill, as before D13. Inside a bar's range it still relied on the
+            # liquidation check, so the run keeps its label.
+            if self.bars is not None and self.now is not None and self.bars.at(self.now()) is not None:
+                self.intrabar.add("liq")
+            fee = qty * fill_px.as_decimal() * self.rate_for(order)
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(fee)
+            self.booked_fills.setdefault(coid, []).append((filled, 0.0))
+            return self._charge(fee, instrument.quote_currency)
         base = info.get("base")
         bar = self.bars.at(self.now()) if self.bars is not None and self.now is not None else None
         if base is not None:

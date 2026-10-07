@@ -16,7 +16,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from sleeve_fund import risk
-from sleeve_fund.store import OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
+from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RELOAD, Store, utcnow
 
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
@@ -25,6 +25,14 @@ SPREAD_EVERY = timedelta(hours=1)
 FEED_WRITE_EVERY = timedelta(seconds=3)  # the price feed age on the strategy page is at most this stale
 SPREAD_MIN_SAMPLES = 100
 
+
+WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
+RESET_AFTER_LIQUIDATION = LIQUIDATION_RESET  # what a reset after liquidation journals (#164)
+
+
+def liquidation_reason(head: str, covered: float) -> str:
+    """A liquidation's halt once flat: its head, and what the venue's insurance fund covered, if anything."""
+    return head + (f"; the venue's insurance fund covered the {covered:,.2f} shortfall" if covered > 0 else "")
 
 class SleeveRuntime:
     # True when replaying history: no live trade feed, so the strategy ticks once a bar and
@@ -65,6 +73,8 @@ class SleeveRuntime:
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
         self.peak = self._restored_peak(sleeve.starting_balance)
+        self.liquidated = self._last_liquidation()  # its halt, when the last one was a liquidation
+        self.wiped_out = self.liquidated is not None
         first = store.first_equity(sleeve_name)
         self.bench_base_price = first["price"] if first else None
         self.taker_fee = 0.008
@@ -88,6 +98,22 @@ class SleeveRuntime:
         # The smallest position the strategy can close (its lot or the venue's minimum, set at start): less
         # than this is dust a flatten can't sell, so it owes nothing (sanity, 4 Oct).
         self.close_floor = 0.0
+
+    def _last_liquidation(self) -> str | None:
+        """The head of its liquidation halt while it is liquidated (Independent Quant Advisor, 6 Oct 17:57): it stays
+        halted through a resume, Stop/Start and restarts until the PM resets it after the liquidation. The journal
+        decides, not the latest halt's reason, which a later halt or stop can overwrite (QA on #164): liquidated is
+        a liquidation event, or a liquidation's halt, with no reset after liquidation since. None otherwise."""
+        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+        since = self.store.sleeve_events_since(self.name, ("liquidation", "risk_halt"), reset["id"] if reset else 0)
+        heads = [e["message"].split(";")[0] for e in since
+                 if e["kind"] == "risk_halt" and e["message"].startswith(WIPED_OUT)]
+        if heads:
+            return heads[-1]
+        if any(e["kind"] == "liquidation" or e["message"].startswith(("wiped out", "position margin lost"))
+               for e in since):  # liquidated without the ruled halt (an older wording, or a drawdown halt first)
+            return WIPED_OUT
+        return None
 
     def _restored_peak(self, starting_balance: float) -> float:
         """The drawdown reference after a (re)start: the highest mark since the PM last resumed from a
@@ -167,6 +193,8 @@ class SleeveRuntime:
     # --- gates ----------------------------------------------------------------
 
     def can_open(self) -> bool:
+        if self.wiped_out:
+            return False  # liquidated: nothing opens until the PM resets it after the liquidation
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
             self._set("running", "daily-loss pause expired")
             self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
@@ -178,13 +206,17 @@ class SleeveRuntime:
     # --- periodic tick ----------------------------------------------------------
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
-             guard_equity: float | None = None, busy: bool = False, ruined: str | None = None) -> str | None:
+             guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
+             liquidating: bool = False) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
         a perp), which the guard judges by when lower; the mark is still this tick's equity.
         busy: the strategy has an order working, so a flatten still owed waits for it rather than send another.
         ruined: why the strategy has nothing left (a gap past the bankruptcy price took its equity to zero): it
-        halts, from running or paused, and flattens whatever is still open."""
+        halts, from running or paused, and flattens whatever is still open.
+        liquidating: a liquidation order is working (the price went through the liquidation price): the PM's commands
+        wait, so a resume queued while paused is never applied on the liquidating tick (QA P1-U34); the next tick has
+        the liquidation's halt, which a resume doesn't clear."""
         now = self.now()
         self.store.heartbeat(self.name)
         if self.progress is not None:
@@ -216,11 +248,12 @@ class SleeveRuntime:
 
         flatten = False
         self.flatten_why = None
-        if ruined and self.status != "halted":
+        if ruined and (self.status != "halted" or self.liquidated is None):  # a liquidation outranks a drawdown halt
+            self.wiped_out, self.liquidated = True, ruined.split(";")[0]
             self._set("halted", ruined)
             held = abs(qty) >= max(self.close_floor, 1e-12)  # still open: past its liquidation price
             self.store.event(self.name, "error", "risk_halt",
-                             ruined + ("; flattened" if held else "; nothing left to trade") + ", PM must resume",
+                             ruined + ("; flattened" if held else "") + "; PM must reset it after the liquidation",
                              ts=self.now())
             if held:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
@@ -237,7 +270,7 @@ class SleeveRuntime:
                 self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened for 24 hours", ts=self.now())
                 flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
 
-        for cmd in self.store.pending_commands(self.name):
+        for cmd in [] if liquidating else self.store.pending_commands(self.name):
             if cmd["command"] == RELOAD:
                 continue  # the supervisor's: it restarts this process under the new settings
             if cmd["command"] == "flatten":
@@ -256,7 +289,23 @@ class SleeveRuntime:
                 continue
             elif cmd["command"] == "resume":
                 # Both resets are journaled (this tick's mark, and the events below) so a restart keeps them.
-                if self.status == "halted":
+                if self.wiped_out:
+                    # A liquidation is not cleared by a resume (HoE and QA, 6 Oct; Advisor 18:17): it stays halted,
+                    # not running for even a tick, drawdown still measured from the peak before the gap, and the
+                    # halt is journaled again in its own words. Only a reset after liquidation starts it.
+                    self.store.event(self.name, "info", "drawdown_kept",
+                                     f"drawdown still measured from {self.peak:,.2f}: the halt was a liquidation, "
+                                     "which a resume doesn't clear", ts=self.now())
+                    why = liquidation_reason(self.liquidated or WIPED_OUT, self.store.insurance_total(self.name))
+                    if self.status != "halted" or self.store.sleeve(self.name).status_reason != why:
+                        self._set("halted", why)
+                    self.store.event(self.name, "error", "risk_halt",
+                                     f"{why}; a resume doesn't clear it, PM must reset it after the liquidation",
+                                     ts=self.now())
+                    self.store.event(self.name, "info", "pm_resume", cmd["reason"], ts=self.now())
+                    self.store.mark_applied(cmd["id"])
+                    continue
+                elif self.status == "halted":
                     self.peak = equity  # a resume after a halt resets the drawdown reference
                     self.store.event(self.name, "info", "drawdown_reset",
                                      f"drawdown measured from {equity:,.2f}, the equity when the PM resumed "
@@ -376,11 +425,14 @@ class SleeveRuntime:
         if status in ("rejected", "denied"):
             self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}", ts=self.now())
 
-    def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str) -> None:
+    def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str,
+                ts: datetime | None = None) -> None:
+        """ts: when it filled, when that isn't now (a backtest's fill on a gap, at the bar's open)."""
+        ts = ts or self.now()
         self.store.record_fill(self.name, side=side, qty=qty, price=price, fee=fee, order_id=order_id,
-                               trade_id=trade_id, ts=self.now())
+                               trade_id=trade_id, ts=ts)
         self.store.update_order(order_id, fill_qty=qty, fill_px=price, fee=fee)
-        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=self.now())
+        self.store.event(self.name, "info", "fill", f"{side} {qty:g} @ {price:,.2f}, fee {fee:,.2f}", ts=ts)
 
     def on_timing(self, order_id: str, **stamps: int | None) -> None:
         """Paper and live (v2 P1-2): when the order's bar closed and arrived, the decision, the send, the venue's

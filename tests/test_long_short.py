@@ -6,6 +6,7 @@ import shutil
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pandas as pd
 import pytest
 
 from sleeve_fund import markets
@@ -458,6 +459,25 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_backtest(
     assert "liquidation" in {e["kind"] for e in res.risk_events}
 
 
+def test_a_liquidation_halts_in_the_advisors_words_and_its_gap_fill_is_journaled_at_the_bar_open(prices, instrument,
+                                                                                                   full_margin):
+    """Independent Quant Advisor, 6 Oct 17:57: the halt reads "Position margin lost (liquidated): X, Y% of strategy
+    equity", X the position's isolated margin. QA P1-D12: a fill on a gap took the bar's open price, so the journal
+    stamps it at the open, not the bar's close."""
+    import re
+
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 160.0, 160.0, 160.0]
+    feed = _gapped(prices, closes)
+    res = run_backtest("ping_pong", feed, instrument, PERP, half_spread=0, risk_profile="aggressive")
+    (halt,) = [e for e in res.risk_events if e["kind"] == "risk_halt"]
+    assert re.match(r"Position margin lost \(liquidated\): [\d,]+\.\d\d, \d+% of strategy equity at entry[;$]",
+                    halt["message"]), \
+        halt["message"]
+    liq = next(f for f in res.journal.fills_ if res.decisions[f["order_id"]]["intent"] == "liquidation")
+    bar = feed.index[feed["close"] == 160.0][0]  # the bar it gapped in, stamped at its close
+    assert pd.Timestamp(liq["ts"]) == bar - pd.Timedelta(days=1)
+
+
 def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp_path, full_margin):
     """The same in paper: a gap past the liquidation price leaves the book under water, which used to read
     as "can't value the book yet" and returned before any guard. It is liquidated and the strategy halts."""
@@ -472,6 +492,78 @@ def test_a_short_gapped_through_its_liquidation_price_is_liquidated_in_paper(tmp
     assert liq["filled_qty"] > 0 and liq["status"] == "filled"
     # Nothing after it: the strategy is halted with the book closed.
     assert orders[-1] is liq
+
+
+def _liquidated_after_a_restart(tmp_path, carried):
+    """A paper restart carrying the short the `carried` fills (side, qty, price, fee) left, then a +60% gap through its
+    liquidation price. Returns the halt text, the open position's fills, the liquidation's fills and the equity
+    marked before the gap."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from test_replay import START
+
+    store = Store.in_memory()
+    create = store.create_sleeve
+    at = datetime.fromtimestamp(START / 1e9 - 60, tz=timezone.utc)
+
+    def create_with_a_short(**kw):
+        s = create(**kw)
+        for i, (side, qty, price, fee) in enumerate(carried):
+            store.record_fill(kw["name"], side=side, qty=qty, price=price, fee=fee, order_id=f"carried{i}",
+                              trade_id=f"carried{i}", ts=at)
+        return s
+
+    store.create_sleeve = create_with_a_short
+    book = replay_book([_fill(side, qty, price, fee) for side, qty, price, fee in carried], 10_000.0)
+    path = tmp_path / "restart.jsonl.gz"
+    _record(path, _meta(book["cash"] + book["qty"] * book["entry_px"], {"rise": 0.01, "dip": 0.005, **PERP}),
+            [(1, 0.0), (0, 0.6), (5, 0.0)])
+    orders = replay(path, store=store)
+    assert orders and orders[-1]["intent"] == "liquidation", [(o["side"], o["intent"]) for o in orders]
+    name = "ping-pong-test"
+    s = store.sleeve(name)
+    assert s.status == "halted", (s.status, s.status_reason)
+    fills = store.fills(name, limit=1000)
+    liq = [f for f in fills if f["order_id"] == orders[-1]["order_id"]]
+    gap = min(f["ts"] for f in liq)
+    before = [m for m in store.equity_series(name) if pd.Timestamp(m["ts"]) < pd.Timestamp(gap)][-1]["equity"]
+    return s.status_reason, book, liq, before
+
+
+def _says_margin_lost(text, want, before):
+    m = re.search(r"Position margin lost \(liquidated\): ([\d,]+\.\d\d), (\d+)% of strategy equity", text)
+    assert m, text
+    assert float(m.group(1).replace(",", "")) == pytest.approx(want, abs=0.005), (m.group(1), want)
+    assert int(m.group(2)) == round(100 * want / before), (m.group(2), 100 * want / before)
+
+
+def test_a_liquidation_after_a_restart_counts_the_entry_fee_from_the_journal(tmp_path, full_margin):
+    """HoE and the Code Reviewer on #155 at 26fd993: X (Advisor 18:17 point 4: margin, entry fee and liquidation fee,
+    as QA's D15 computes it) for a position carried over a restart still counts the fee paid to open it, which the
+    process that paid it no longer holds."""
+    text, book, liq, before = _liquidated_after_a_restart(tmp_path, [("SELL", 0.3, 60_000.0, 9.0)])
+    want = round(0.3 * 60_000.0 / 2 + 9.0 + sum(f["fee"] for f in liq), 2)
+    _says_margin_lost(text, want, before)
+
+
+def test_a_liquidation_after_a_partial_reduce_counts_only_the_entry_fee_of_what_is_still_open(tmp_path, full_margin):
+    """HoE and the Code Reviewer on #155 at 26fd993: after a short of 0.4 is cut to 0.3, X counts three quarters of
+    its entry fees, the share of the position the liquidation took, not all of them."""
+    carried = [("SELL", 0.3, 60_000.0, 9.0), ("SELL", 0.1, 60_000.0, 3.0), ("BUY", 0.1, 60_000.0, 3.0)]
+    text, book, liq, before = _liquidated_after_a_restart(tmp_path, carried)
+    assert book["entry_fees"] == pytest.approx(9.0)
+    want = round(0.3 * 60_000.0 / 2 + (9.0 + 3.0) * 0.3 / 0.4 + sum(f["fee"] for f in liq), 2)
+    _says_margin_lost(text, want, before)
+
+
+def test_replay_book_pro_rates_the_entry_fees_of_what_is_still_open():
+    """The fees paid to open the position held: added on an add, cut in proportion on a reduce, gone when flat, and
+    only the remainder's share of a fill that crosses through flat."""
+    fills = [_fill("SELL", 2, 100.0, 0.2), _fill("SELL", 2, 100.0, 0.2)]
+    assert replay_book(fills, 1_000.0)["entry_fees"] == pytest.approx(0.4)
+    assert replay_book(fills + [_fill("BUY", 1, 100.0, 0.1)], 1_000.0)["entry_fees"] == pytest.approx(0.3)
+    assert replay_book(fills + [_fill("BUY", 4, 100.0, 0.4)], 1_000.0)["entry_fees"] == 0.0
+    assert replay_book(fills + [_fill("BUY", 5, 100.0, 0.5)], 1_000.0)["entry_fees"] == pytest.approx(0.1)
 
 
 def _ls_run(prices, instrument, seed, params, profile="balanced", n=600, volume=1.0):
@@ -666,6 +758,35 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
 
 
+def test_a_perps_stress_loss_stops_at_its_isolated_margin_and_the_liquidation_fee(client):  # noqa: F811
+    """Round 13, m13-U6: the stress table capped a perp's loss at the strategy's whole equity, but on isolated
+    margin it is liquidated once its margin is gone: a 3x short of 6,000 can lose 2,000 and the closing fee."""
+    from sleeve_fund import markets
+    from sleeve_fund.dashboard.riskops import most_it_can_lose, risk_view
+    from sleeve_fund.risk import profile
+    from sleeve_fund.venues import venue as venue_profile
+
+    _, store = client
+    store.create_sleeve(name="pp-3x", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP})
+    s, aggressive = store.sleeve("pp-3x"), profile("aggressive")
+    x = {"sleeve": s, "profile": aggressive, "equity": 10_000.0, "qty": -0.1, "price": 60_000.0, "entry_px": 60_000.0,
+         "cash": 16_000.0, "unrealised": 0.0, "position_value": -6_000.0, "dd_used": 0.0, "day_ret": 0.0,
+         "exposure": -0.6, "room": 1_000.0, "pnl": 0.0, "fees": 0.0}
+    mm = markets.terms(s.params, s.venue).maintenance_margin
+    taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
+    assert aggressive.max_leverage == 3.0
+    # Margin 6,000 / 3 = 2,000; liquidated at (2,000 + 6,000) / (0.1 x (1 + mm)), paying the taker fee there.
+    cap = 2_000.0 + taker * 0.1 * 80_000.0 / (1 + mm)
+    assert most_it_can_lose(x) == pytest.approx(cap)
+    view = risk_view(store, [x], {"equity": 10_000.0, "allocation": []})
+    losses = dict(zip((sc["shock"] for sc in view["scenarios"]), (sh["loss"] for sh in view["rows"][0]["shocks"])))
+    assert losses[0.50] == pytest.approx(cap)  # not 3,000: the rest of the 10,000 isn't at stake
+    assert losses[0.20] == pytest.approx(1_200.0) and losses[-0.50] == pytest.approx(-3_000.0)  # inside it: as before
+    # Spot, or flat: at most the equity, as before.
+    assert most_it_can_lose({**x, "qty": 0.0}) == 10_000.0
+
+
 def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     """Review round 11, M11-5: the Position tab and header show what a perp adds, and every trade's P&L
     is after fees and funding, in the Trades tab, the header and the export alike."""
@@ -764,17 +885,23 @@ def test_an_open_shorts_exits_form_and_decision_log_say_above(client):  # noqa: 
 
 def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     """Sanity 5 Oct: a gap far past the liquidation price booked a loss beyond the strategy's equity. Under
-    isolated margin the venue's insurance fund takes the rest: equity ends at zero, not below, and the trade's
-    P&L (after fees, funding and the insurance fund) is the margin lost, as equity says."""
+    isolated margin the venue's insurance fund takes the rest: the position loses its margin and its fees, no more
+    (Independent Quant Advisor, QA P1-D3), and the trade's P&L (after fees, funding and the insurance fund) is
+    what equity says."""
     closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
     res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
     assert res.insurance and res.insurance[0]["amount"] > 0
-    assert res.equity.min() >= 0 and res.equity.iloc[-1] < 0.05
+    fills = res.fills.sort_values("ts_last")
+    qty, entry = float(fills["filled_qty"].iloc[-1]), float(fills["avg_px"].iloc[-2])
+    before = float(res.equity[res.equity.index < pd.Timestamp(fills["ts_last"].iloc[-1])].iloc[-1])
+    lost = before - res.equity.iloc[-1]
+    margin = qty * entry / 3  # aggressive: 3x
+    assert res.equity.min() > 0 and margin < lost < margin * 1.01  # the margin, plus the close's fee and funding
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     assert trips[-1]["insurance"] == pytest.approx(res.insurance[0]["amount"])
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
-    assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(0, abs=0.05)
+    assert res.journal.journal_book("backtest", res.starting_capital)["cash"] == pytest.approx(res.equity.iloc[-1], abs=0.05)
 
 
 def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(prices, instrument, full_margin):
@@ -846,11 +973,13 @@ def test_a_short_take_profit_rests_below_the_entry(prices, instrument):
     assert float(fills.loc[fills.index[3], "avg_px"]) == pytest.approx(101.5 * 0.98 * 1.0005, rel=1e-4)
 
 
-def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_restart(tmp_path, full_margin):
+def test_a_strategy_wiped_out_by_a_gap_keeps_only_what_was_not_margined_and_stays_halted_through_a_restart(
+        tmp_path, full_margin):
     """Review round 12, B12-1: a paper short gapped through its bankruptcy price ended flat at zero equity, which
     read as a book that couldn't be valued yet: no mark, no risk check, no halt, even after a restart, so the
     dashboard kept its last mark before the gap (running, in profit, still short) and the alerts showed raw
-    account text. Wiped out is a state: marked at zero, halted with the reason, through a resume and a restart."""
+    account text. Wiped out is a state: halted with the reason, through a resume and a restart. Since the Advisor's
+    P1-D3 ruling it loses the position's isolated margin and no more: what wasn't margined is kept."""
     from sleeve_fund.research.replay import replay
     from sleeve_fund.store import Store
 
@@ -862,26 +991,29 @@ def test_a_strategy_wiped_out_by_a_gap_is_marked_at_zero_and_halted_through_a_re
     covered = store.insurance_total(name)
     assert covered > 0
     s = store.sleeve(name)
-    assert s.status == "halted" and s.status_reason.startswith("wiped out: a gap took the price past"), s.status_reason
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): "), s.status_reason
     assert "insurance fund covers the shortfall, about" in s.status_reason  # halted while open: an estimate (mF-1)
     last = store.equity_series(name)[-1]
-    assert (last["equity"], last["qty"]) == (0.0, 0.0)  # the book counts it at zero, not its last mark
     book = store.journal_book(name, 10_000)
-    assert book["qty"] == 0 and book["cash"] == pytest.approx(0, abs=0.01)
+    left = book["cash"]
+    assert 0 < left < 100  # full margin: all but the cash buffer was margin, and that is lost
+    assert last["qty"] == 0.0 and last["equity"] == pytest.approx(left, abs=0.01)  # not its last mark before the gap
+    assert book["qty"] == 0
     assert "mark_unavailable" not in {e["kind"] for e in store.events(name, limit=500)}
 
-    # The PM resumes it and the process restarts: still nothing to trade, so it halts again, at zero.
+    # The PM resumes it and the process restarts: down about 99% from its peak, it halts again on drawdown, places
+    # nothing, and marks at what it kept.
     store.command(name, "resume", "try again")
     store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
     seen = len(store.equity_series(name))
     restart = tmp_path / "restart.jsonl.gz"
-    _record(restart, _meta(book["cash"], params), [(5, 0.0)], px=97_440.0)
+    _record(restart, _meta(left, params), [(5, 0.0)], px=97_440.0)
     assert len(replay(restart, store=store)) == len(orders)  # no new order
     s = store.sleeve(name)
     assert s.status == "halted", (s.status, s.status_reason)
     assert f"the venue's insurance fund covered the {covered:,.2f} shortfall" in s.status_reason, s.status_reason
     marks = store.equity_series(name)[seen:]
-    assert marks and all((m["equity"], m["qty"]) == (0.0, 0.0) for m in marks)
+    assert marks and all(m["qty"] == 0.0 and m["equity"] == pytest.approx(left, abs=0.01) for m in marks)
     events = store.events(name, limit=500)
     assert "mark_unavailable" not in {e["kind"] for e in events}
     assert [e["kind"] for e in events].count("risk_halt") == 2
@@ -1125,3 +1257,65 @@ def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
                      "btc-rsi-long's exposure is 104% of its entry cap because the price moved; no action"]
     texts = [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2, "cap_used": 0.85}], health)]
     assert texts == ["btc-rsi-long has used 85% of its position cap"]
+
+
+def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_last_flat():
+    """Code Reviewer on 6047b50: a risk stop journaled as a liquidation can take part of the position and the guard's
+    close the rest; X counts both (quantity and fees), the entry fee of what was held, and nothing from an earlier,
+    closed trade. Y's base is the equity when the position opened (Advisor 20:37, P1-D20): flat then, so the
+    journal's cash, the earlier trade's profit and fees included; not a mark while it was held. A fill not yet in the journal is reported as such, so the halt keeps its estimate."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.paper.journal import MemoryJournal
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    j = MemoryJournal()
+    j.create_sleeve(name="s", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                    starting_balance=10_000, risk_profile="balanced", params={})
+    t0 = datetime(2025, 10, 3, tzinfo=timezone.utc)
+    for i, (oid, intent, side, qty, px, fee) in enumerate([
+            ("old-in", "entry", "BUY", 0.2, 60_000.0, 6.0), ("old-out", "exit", "SELL", 0.2, 60_500.0, 6.05),
+            ("in", "entry", "SELL", 0.3, 60_000.0, 9.0), ("stop", "liquidation", "BUY", 0.1, 90_000.0, 4.5),
+            ("guard", "liquidation", "BUY", 0.2, 97_440.0, 9.74)]):
+        at = t0 + pd.Timedelta(minutes=i)
+        j.record_order("s", order_id=oid, side=side, qty=qty, intent=intent, reason="", ts=at)
+        j.record_fill("s", side=side, qty=qty, price=px, fee=fee, order_id=oid, trade_id=f"t-{oid}", ts=at)
+    j.record_equity("s", equity=9_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
+                    ts=t0 + pd.Timedelta(minutes=2, seconds=30))  # holding it
+    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005, starting_balance=10_000.0))
+    fees, taken, before, journaled = LongFlatStrategy._liquidation_figures(me, "t-guard")
+    assert fees == pytest.approx(9.0 + 4.5 + 9.74) and taken == pytest.approx(0.3)
+    assert before == pytest.approx(10_000 - 12_000 - 6.0 + 12_100 - 6.05) and journaled
+    assert LongFlatStrategy._liquidation_figures(me, "t-not-yet")[3] is False
+
+
+def test_a_liquidation_fill_not_yet_journaled_still_counts_in_x():
+    """Code Reviewer on eb737bd: the guard's close whose fill row is still to be written (a retry) is counted from the
+    event itself, quantity and fee, so X covers the whole position and every fee all the same."""
+    from types import SimpleNamespace
+
+    from sleeve_fund import risk
+    from sleeve_fund.paper.journal import MemoryJournal
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    j = MemoryJournal()
+    j.create_sleeve(name="s", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                    starting_balance=10_000, risk_profile="balanced", params={})
+    t0 = datetime(2025, 10, 3, tzinfo=timezone.utc)
+    for i, (oid, intent, side, qty, px, fee) in enumerate([
+            ("in", "entry", "SELL", 0.3, 60_000.0, 9.0), ("stop", "liquidation", "BUY", 0.1, 90_000.0, 4.5)]):
+        at = t0 + pd.Timedelta(minutes=i)
+        j.record_order("s", order_id=oid, side=side, qty=qty, intent=intent, reason="", ts=at)
+        j.record_fill("s", side=side, qty=qty, price=px, fee=fee, order_id=oid, trade_id=f"t-{oid}", ts=at)
+    j.record_order("s", order_id="guard", side="BUY", qty=0.2, intent="liquidation", reason="",
+                   ts=t0 + pd.Timedelta(minutes=2))  # filled, but its fill row isn't written yet
+    j.record_equity("s", equity=18_000.0, cash=27_000.0, qty=-0.3, price=60_000.0, benchmark=10_000.0,
+                    ts=t0 + pd.Timedelta(seconds=30))
+    me = SimpleNamespace(runtime=SimpleNamespace(store=j, name="s", taker_fee=0.0005, profile=risk.profile("balanced"),
+                                                 _last_equity=None, peak=10_000.0, starting_balance=10_000.0))
+    me._liquidation_figures = lambda *a, **k: LongFlatStrategy._liquidation_figures(me, *a, **k)
+    me._margin_lost = lambda *a, **k: LongFlatStrategy._margin_lost(me, *a, **k)
+    text, journaled = LongFlatStrategy._liquidation_margin(me, "t-guard", 0.2, 9.74, (0.2, 60_000.0))
+    assert not journaled
+    # No mark before the short opened: Y's base is the cash the journal had then, the 10,000 it started with.
+    assert text.startswith("Position margin lost (liquidated): 9,023.24, 90% of strategy equity at entry"), text

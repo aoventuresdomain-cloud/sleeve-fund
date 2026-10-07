@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from sleeve_fund import venues
-from sleeve_fund.history import HistoryStore, refresh, trades_to_minutes
+from sleeve_fund.history import OHLCV, HistoryStore, _load, _save, refresh, trades_to_minutes
 
 
 def _minutes(start, n, price=100.0):
@@ -36,7 +36,61 @@ def test_bars_read_month_by_month_match_one_resample_of_all_minutes(tmp_path):
         whole = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
         whole = whole[g["close"].count() == minutes]
         whole = whole.set_axis(whole.index + pd.Timedelta(minutes=minutes))
-        pd.testing.assert_frame_equal(store.read("X", "ABC/USD", minutes), whole, check_names=False, check_freq=False)
+        read = store.read("X", "ABC/USD", minutes)
+        pd.testing.assert_frame_equal(read[OHLCV], whole, check_names=False, check_freq=False)
+        assert (read["missing"] == 0).all() and not read["degraded"].any()
+
+
+def test_a_bar_missing_a_minute_inside_the_series_is_kept_and_only_part_bars_at_the_ends_are_dropped(tmp_path):
+    store = HistoryStore(tmp_path)
+    bars = _minutes("2026-01-30 07:00", 4 * 1440)  # spans two months; part-days at both ends
+    gone = [pd.Timestamp("2026-01-31 12:34", tz="UTC"), pd.Timestamp("2026-02-01 00:00", tz="UTC")]
+    store.append("X", "ABC/USD", bars, cursor="c")
+    for month in ("2026-01", "2026-02"):  # minutes lost to a write that never finished
+        path = store._dir("X", "ABC/USD") / f"{month}.npz"
+        df = _load(path)
+        _save(path, df[~df.index.isin(gone)])
+    # 31 Jan, 1 and 2 Feb are whole days; 30 Jan from 07:00 and 3 Feb to 06:58 (06:59 may still be forming) are
+    # not, so the part bars at both ends go: 68 + 288 + 27 quarter-hours, 4 + 18 + 1 four-hour bars, 3 days.
+    for minutes, n in ((15, 383), (240, 23), (1440, 3)):
+        assert len(store.read("X", "ABC/USD", minutes)) == n, minutes
+    days = store.read("X", "ABC/USD", 1440)
+    jan31, feb1 = days.loc[pd.Timestamp("2026-02-01", tz="UTC")], days.loc[pd.Timestamp("2026-02-02", tz="UTC")]
+    # Each a minute short and built from the 1,439 it has; 1 Feb opens at its second minute.
+    assert jan31["volume"] == feb1["volume"] == 1439.0
+    assert jan31["open"] == bars.loc["2026-01-31 00:00", "open"] and jan31["close"] == bars.loc["2026-01-31 23:59", "close"]
+    assert feb1["open"] == bars.loc["2026-02-01 00:01", "open"]
+    assert jan31["missing"] == feb1["missing"] == 1 and days["missing"].sum() == 2
+
+
+def test_one_bar_build_rule_whole_frames_match_bar_by_bar_with_missing_counted_and_degraded_past_a_tenth():
+    """Board 5a: the store's vectorised reads and the live paths' bar-at-a-time builds are the same rule."""
+    import numpy as np
+
+    from sleeve_fund import bars
+
+    rng = np.random.default_rng(4)
+    df = _minutes("2026-01-30 07:00", 2 * 1440)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 1e-3, len(df))))
+    df = df.assign(open=c * (1 + rng.normal(0, 1e-4, len(c))), high=c * 1.001, low=c * 0.999, close=c,
+                   volume=rng.uniform(0.5, 2, len(c)))
+    holes = df.index[(df.index >= "2026-01-31 03:00") & (df.index < "2026-01-31 03:20")]  # 20 minutes
+    df = df.drop(holes.union(df.index[[100, 101, 900]]))
+    for minutes in (15, 60, 240):
+        whole = bars.build_bars(df, minutes, pd.Timestamp("2026-01-30 07:00", tz="UTC"))
+        for t, row in whole.iterrows():
+            part = df[(df.index >= t) & (df.index < t + pd.Timedelta(minutes=minutes))]
+            one = bars.combine(part[OHLCV].itertuples(index=False), minutes)
+            assert (one.open, one.high, one.low, one.close, one.missing) == (
+                row.open, row.high, row.low, row.close, row.missing)
+            assert one.volume == pytest.approx(row.volume, rel=1e-12)
+        if minutes == 15:  # the hour from 03:00 has a quarter with no minutes at all: not built, missing
+            assert pd.Timestamp("2026-01-31 03:00", tz="UTC") not in whole.index
+            assert whole.loc[pd.Timestamp("2026-01-31 03:15", tz="UTC"), "missing"] == 5
+    hour = bars.build_bars(df, 60).loc[pd.Timestamp("2026-01-31 03:00", tz="UTC")]
+    assert hour["missing"] == 20 and hour["degraded"] and bars.degraded(20, 60)  # a third of the hour: degraded
+    assert not bars.degraded(6, 60) and bars.degraded(7, 60)  # a tenth is still a normal bar
+    assert bars.combine([], 15) is None
 
 
 def test_appends_continue_across_months_and_fill_quiet_minutes(tmp_path):
@@ -148,7 +202,7 @@ def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path
     strategy's, starting where the request says rather than at the instrument's listing."""
     from dataclasses import replace
 
-    from sleeve_fund.history import CORE_PAIRS, _pairs_in_use, refresh
+    from sleeve_fund.history import _pairs_in_use, refresh
     from sleeve_fund.store import Store
     from sleeve_fund.venues import KRAKEN
 
@@ -157,7 +211,7 @@ def test_the_collector_backfills_what_research_asked_for_from_its_start(tmp_path
     assert store.request_history("KRAKEN", "ADA/EUR", since.to_pydatetime())
     assert not store.request_history("kraken", "ADA/EUR", since.to_pydatetime())  # asked once
     pairs = dict(_pairs_in_use("KRAKEN", store))
-    assert all(pairs[p] is None for p in CORE_PAIRS) and pairs["ADA/EUR"] == since
+    assert all(pairs[p] is None for p in KRAKEN.core_pairs) and pairs["ADA/EUR"] == since
     assert "ADA/EUR" not in dict(_pairs_in_use("OTHER", store))
 
     asked = []
