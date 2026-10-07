@@ -722,10 +722,6 @@ def test_p1_rule_c_applies_to_a_resting_entry_touched_inside_a_bar(tmp_path, mon
     assert float(bo.equity.iloc[-1]) <= float(rf.equity.iloc[-1]) + 0.01  # nor on equity
 
 
-@pytest.mark.xfail(strict=True, reason="P1-D13 MAJOR, pre-existing (outside rule (c), which covers funding): on daily bars "
-                   "only, a 2% stop touched inside the day by a 5% gap at 10:00:01 fills at its trigger (58,819.1), "
-                   "while the market traded through to 57,000 and the 1-minute reference fills there: bars-only ends "
-                   "about 193 (1.9% of capital) better than the reference. Advisor ruled 18:16 (pessimistic bars-only stop fills, G1 never judges bars-only resting exits); not built in #155")
 def test_d13_a_bars_only_stop_gapped_through_inside_the_bar_is_never_better_than_the_1_minute_run(tmp_path):
     times = (pd.date_range("2025-10-01 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
              .append(pd.date_range("2025-10-03 20:00", "2025-10-06 00:00", freq="4h", tz="UTC")))

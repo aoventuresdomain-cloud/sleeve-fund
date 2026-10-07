@@ -23,7 +23,7 @@ from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of
 from sleeve_fund import markets
 from sleeve_fund.markets import PERP
-from sleeve_fund.research.ledger import IdeaLedger, opened_words
+from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -36,9 +36,18 @@ from sleeve_fund.research.metrics import (
     whole_days,
 )
 from sleeve_fund.research.runner import BacktestResult, run_backtest
+from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.strategies import check_perp_sizing
-from sleeve_fund.strategies.base import IdeaSpec
+from sleeve_fund.strategies.base import STOP_INTENTS, IdeaSpec
 from sleeve_fund.strategies.rules import FIRST_TOUCH_RERUN
+
+# P1-D13 (Advisor 6 Oct 18:16 to 19:16): G1 stands on fills that don't depend on what traded first inside a bar. With a
+# resting exit (a stop, a target, the risk guard's stops, a perpetual's liquidation price) the out-of-sample windows
+# and the holdout must run on 1-minute bars; 5-minute ones are a one-way test (a pass counts once a 1-minute spot check
+# holds; a fail must be re-run at 1 minute); anything coarser can't be judged.
+NO_1M = "no 1-minute execution data"
+ONE_WAY_MINUTES = 5
+RESTING_INTENTS = (*STOP_INTENTS, "take_profit")
 
 
 log_ = logging.getLogger(__name__)
@@ -167,6 +176,18 @@ class StudyResult:
     # sides (v2 P1-7, C3 and C3b).
     random_entry: RandomEntryResult | None = None
     random_side: RandomSideResult | None = None
+    # P1-D13: what the out-of-sample windows and the holdout were matched on (None: their decision bars alone), whether
+    # any resting level took part (NO_1M), the fill labels the strategy's runs carried, and on 5-minute bars the one-way
+    # rule: "fail" (not final), "void" (the 1-minute spot check broke one-sidedness) or "unchecked" (no 1-minute bars
+    # for it), with the spot check's window, seed and gap.
+    oos_exec_minutes: int | None = None
+    resting_exits: bool = False
+    fill_labels: list = field(default_factory=list)
+    one_way: str = ""
+    spot_check: dict | None = None
+    # The falsifier (Advisor 18:16): the 1-minute run's end equity less the coarse run's, over starting capital, for the
+    # research period at the default settings; None when the study's own runs were on 1-minute bars or none were stored.
+    bars_only_gap: float | None = None
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
@@ -227,9 +248,27 @@ class StudyResult:
                     f"of {len(self.folds)} test windows flat or without a trade, and out-of-sample closed "
                     f"{self.oos_trades} trade{'s' if self.oos_trades != 1 else ''}, so at least half of it sat flat "
                     "rather than testing the idea")
+        # Funding's reason first, so it is never hidden behind D13's no-1-minute one.
         verdict, words = _funding_check(self)
         if verdict == "NOT JUDGED":
             return f"its funding isn't the venue's: {words}"
+        if getattr(self, "resting_exits", False):
+            minutes = getattr(self, "oos_exec_minutes", None)
+            if minutes is None or minutes > ONE_WAY_MINUTES:
+                return (f"{NO_1M}: its resting exits fill inside a bar, and "
+                        + ("on bars alone" if minutes is None else f"on {minutes}-minute bars")
+                        + " what traded first is unknown, so the out-of-sample windows and the holdout need 1-minute bars")
+            one_way, check = getattr(self, "one_way", ""), getattr(self, "spot_check", None) or {}
+            if one_way == "fail":
+                return ("the out-of-sample windows ran on 5-minute bars, where a fail is not final: re-run them on "
+                        "1-minute bars before dropping the idea")
+            if one_way == "void":
+                return (f"the 5-minute pass did not hold on 1-minute bars in the window {check.get('window')} (drawn "
+                        f"with seed {check.get('seed')}), so it is void: the whole out-of-sample must run on 1-minute "
+                        "bars before G1")
+            if one_way == "unchecked":
+                return ("the 5-minute pass couldn't be spot-checked: no 1-minute bars for the window drawn "
+                        f"({check.get('window')}, seed {check.get('seed')}); it counts once one holds on them")
         return ""
 
     @property
@@ -453,8 +492,10 @@ def run_study(
     position_cap: float | None = None,
     risk_profile: str | None = None,
     exec_prices: pd.DataFrame | None = None,
-    half_spread: float | None = None,
+    half_spread: float | SpreadSeries | None = None,
     progress=None,
+    oos_exec_prices: pd.DataFrame | None = None,
+    minute_loader=None,
     register=None,
     locks=None,
 ) -> StudyResult:
@@ -468,8 +509,11 @@ def run_study(
     pause. The benchmark is held at the same cap but never halted: it is what holding would have done.
     exec_prices: shorter bars over the same period (from the history store), which the engine matches
     resting orders against and the risk guard values the book on, between decision bars.
-    half_spread: the spread charged on orders that take liquidity (sleeve_fund.spreads.resolve gives
-    the measured one); None uses the venue's assumption.
+    oos_exec_prices: the bars the out-of-sample windows and the holdout run on instead, 1-minute ones for G1 (P1-D13);
+    None runs them on exec_prices too. Each window and the holdout starts flat.
+    minute_loader: (start, end) -> 1-minute bars over that span, for the spot check of a 5-minute pass.
+    half_spread: the spread charged on orders that take liquidity: sleeve_fund.spreads.series gives the measured
+    ones, each run charging the one in force at each time (SPREAD-PIT); None uses the venue's assumption.
     progress: called with the share of the study's backtests done, 0 to 1."""
     from sleeve_fund.venues import VENUES
 
@@ -513,7 +557,12 @@ def run_study(
         from sleeve_fund.venues import venue as venue_profile
 
         half_spread = venue_profile(str(instrument.id.venue)).assumed_half_spread
-    spread_used = half_spread
+    series = half_spread if isinstance(half_spread, SpreadSeries) else None
+    # One figure where a single value is needed (the setup's cost, the random-entry benchmarks): the spread in force
+    # at the end of the data, as the latest measurement was before SPREAD-PIT. The runs charge each in its time.
+    spread_used = series.at(int(prices.index[-1].value)) if series is not None else half_spread
+    spread_words = (series.text(int((prices.index[0] - bar).value), int(prices.index[-1].value))
+                    if series is not None else f"{spread_used:.3%} of the price as half the bid-ask spread")
 
     def paid(params: dict) -> FeeSchedule:
         """The schedule a run with these settings pays (runner.run_backtest's own default: its market's, or the
@@ -525,6 +574,14 @@ def run_study(
     exec_minutes = bar_minutes_of(exec_prices) if exec_prices is not None and len(exec_prices) else None
     if exec_minutes is not None and (exec_minutes >= minutes or minutes % exec_minutes):
         raise ValueError(f"{exec_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
+    if oos_exec_prices is None or not len(oos_exec_prices):
+        oos_exec_prices, oos_minutes = exec_prices, exec_minutes
+    else:
+        oos_minutes = bar_minutes_of(oos_exec_prices)
+        if oos_minutes >= minutes or minutes % oos_minutes:
+            raise ValueError(f"{oos_minutes}-minute execution bars don't divide the {minutes}-minute decision bars")
+    labels: list[str] = []
+    resting = [perpetual]  # a perpetual's liquidation price always rests (Advisor 19:00)
 
     errors: list = []
     error_count = [0]
@@ -534,10 +591,13 @@ def run_study(
     done = [0]
 
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
-           fees: FeeSchedule | None = None, slippage: float = 0.0, flip: bool = False,
+           fees: FeeSchedule | None = None, slippage: float = 0.0, oos: bool = False, trade_from=None,
+           feed: pd.DataFrame | None = None, flip: bool = False,
            count_from: pd.Timestamp | None = None) -> BacktestResult:
-        """One run. flip: a first_touch rule's ambiguous candles resolve the other way (R2-G1); count_from: its
-        report counts only the candles closing from then on (a window's test candles)."""
+        """One run. oos: an out-of-sample window or the holdout, on oos_exec_prices, flat until trade_from (a bar's
+        close time). feed: these execution bars instead. flip: a first_touch rule's ambiguous candles resolve the
+        other way (R2-G1); count_from: its report counts only the candles closing from then on (a window's test
+        candles)."""
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
@@ -547,13 +607,20 @@ def run_study(
             params = {**params, **exits}
         if position_cap is not None and not guarded:
             params = {**params, "position_cap_pct": position_cap}
+        if trade_from is not None:
+            params = {**params, "trade_from": pd.Timestamp(trade_from).value}
+        source = feed if feed is not None else oos_exec_prices if oos else exec_prices
         fine = None
-        if exec_minutes is not None and not benchmark:  # nothing rests, nothing to guard
-            fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
+        if source is not None and len(source) and not benchmark:  # nothing rests, nothing to guard
+            fine = source[(source.index > df.index[0] - bar) & (source.index <= df.index[-1])]
         res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
                            risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                           exec_minutes=exec_minutes or 1, half_spread=half_spread + slippage, fees=fees,
+                           exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
+                           half_spread=series.plus(slippage) if series is not None else half_spread + slippage,
                            first_touch_flip=flip, first_touch_count_from=count_from)
+        if not benchmark:
+            labels.extend(x for x in res.labels if x not in labels)
+            resting[0] = resting[0] or any(d.get("intent") in RESTING_INTENTS for d in res.decisions.values())
         if res.handler_errors:
             errors.append((f"{name} {df.index[0]:%d %b %Y} to {df.index[-1]:%d %b %Y}", *res.handler_errors[0]))
             error_count[0] += res.handler_error_count or len(res.handler_errors)
@@ -668,7 +735,8 @@ def run_study(
     # 2. Walk-forward.
     def scored(k, train, through_test, test_idx, best, best_sharpe, surface, run):
         """Test window k's fold from its run: its days, not the train's, scored alone."""
-        test_ret = whole_days(daily_returns(run.equity), test_idx[0], bar)
+        # The test window's days, not the train's, its first measured from the flat capital it started with (P1-D13).
+        test_ret = whole_days(daily_returns(_flat_until(run, test_idx[0] - bar)), test_idx[0], bar)
         b_ret, parts = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
         return (
             Fold(
@@ -679,7 +747,7 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=_summary_or_none(b_ret),
-                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0]),
+                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0] - bar),
                 window_bars=len(test_idx),
                 in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
@@ -692,6 +760,7 @@ def run_study(
         )
 
     folds: list[Fold] = []
+    fold_runs: list = []
     windows = []  # (index in folds, inputs, run) of each window that chose a setting
     oos_parts, bench_parts, compare_by = [], [], []  # compare_by: fold_benchmark's parts, per window
     start = 0
@@ -722,12 +791,13 @@ def run_study(
             compare_by.append(parts)
             start += test_bars
             continue
-        # Trade the chosen params continuously through the test window so the
-        # position carried in from training is realistic, then score only the test days.
+        # The chosen params over training and the test window, trading only from the window's first bar: it starts
+        # flat (P1-D13 19:00), and the training bars before it warm the model up. Scored on the test days alone.
         window = (train, through_test, test_idx, best, best_sharpe, surface)
         # The run's first_touch report counts the test candles only: the share G1 reads is out of sample (CR #171).
-        fold, test_ret, b_ret, parts, run = scored(len(folds), *window,
-                                                   bt(spec.name, through_test, best, count_from=test_idx[0]))
+        run = bt(spec.name, through_test, best, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
+        fold_runs.append((through_test, test_idx, best, run))
+        fold, test_ret, b_ret, parts, run = scored(len(folds), *window, run)
         windows.append((len(folds), window, run))
         folds.append(fold)
         compare_by.append(parts)
@@ -752,7 +822,8 @@ def run_study(
         alt_folds, alt_oos, alt_bench, alt_compare = list(folds), list(oos_parts), list(bench_parts), list(compare_by)
         for k, window, _ in windows:
             alt_folds[k], alt_oos[k], alt_bench[k], alt_compare[k], flipped = scored(
-                k, *window, bt(spec.name, window[1], window[3], flip=True, count_from=window[2][0]))
+                k, *window, bt(spec.name, window[1], window[3], oos=True,
+                                trade_from=window[2][0] - bar, flip=True, count_from=window[2][0]))
             first_touch["opposite_resolved"] = _resolved([flipped])
         ruled, opposite = pd.concat(oos_parts), pd.concat(alt_oos)
         first_touch["as_ruled"], first_touch["opposite"] = summary(ruled), summary(opposite)
@@ -810,20 +881,21 @@ def run_study(
         ladder_slippage=slip,
         chosen_params=chosen,
         breakeven=breakeven,
+        oos_exec_minutes=oos_minutes,
+        fill_labels=labels,
         fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
-                  f"on every other order, plus {spread_used:.3%} of the price as half the bid-ask spread on orders "
-                  f"that take liquidity; break-even: {breakeven}"),
+                  f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
     leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
     result.random_entry, result.random_side = _benchmarks(
-        research, folds, test_bars, float(run_fees.taker) + spread_used, full_default.shorts,
-        leverage, market.get("market"))
+        research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
+        full_default.shorts, leverage, market.get("market"))
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
-        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + spread_used + slip, False, leverage,
-                                 market.get("market"))
+        at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
+                                 series if series is not None else spread_used, False, leverage, market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -855,6 +927,8 @@ def run_study(
         result.notes.append(
             f"Resting orders (stops, targets, post-only orders) are matched on {exec_minutes}-minute bars between "
             f"decisions, and the risk guard values the book on each, as the backtest page does.")
+    if oos_minutes is not None and oos_minutes != exec_minutes:
+        result.notes.append(f"The out-of-sample windows and the holdout are matched on {oos_minutes}-minute bars.")
     elif risk_profile is not None:
         result.notes.append(f"The risk guard values the book once a {_bar_words(minutes)}; paper does every 30 seconds.")
     if minutes < 1440:
@@ -868,10 +942,22 @@ def run_study(
         result.notes.append(
             "Exits on top of the signal: " + _exit_words(exits)
             + ". The stop rests at the venue and fills at its level (at market at once if the price is already "
-            "through it); the target fills at its level when the price trades through it. A bar that reaches "
-            "both takes the stop: the adverse side goes first. "
-            "Paper watches both on every trade."
+            "through it), with its slippage; the target fills when the price reaches it, at its level less the "
+            "slippage. A bar that reaches both takes the stop, unless it opened through the target. On bars coarser "
+            "than a minute, where what traded first inside a bar is unknown, a stop the bar traded through fills at "
+            "the bar's worst price. Paper watches both on every trade."
         )
+    result.resting_exits = resting[0]
+    if result.resting_exits and oos_minutes is not None and 1 < oos_minutes <= ONE_WAY_MINUTES and not result.not_judged:
+        _one_way(result, ledger, fold_runs, bt, minute_loader, bar)
+    if minutes > 1 and (exec_minutes or minutes) > 1 and oos_minutes == 1:
+        # The falsifier: the research period at the default settings on 1-minute bars against the coarse run.
+        ref = bt(spec.name, research, default_params, feed=oos_exec_prices)
+        if len(ref.equity) and len(full_default.equity):
+            result.bars_only_gap = float(ref.equity.iloc[-1] - full_default.equity.iloc[-1]) / starting_capital
+            ledger.record(idea=spec.name, family=spec.family, params={**default_params, **exits}, dataset=dataset,
+                          stage=GAP_STAGE, sharpe=summary(daily_returns(full_default.equity))["sharpe"],
+                          extra={"bars_only_gap": round(result.bars_only_gap, 8)})
 
     if register is not None:
         from sleeve_fund.research.trials import legacy_idea_hash
@@ -916,14 +1002,14 @@ def run_study(
                                    f"{underlying} while this one ran")
     elif use_holdout and holdout_days:
         chosen = folds[-1].chosen
+        h_start = prices.index[-holdout_bars]
         try:
-            h_start = prices.index[-holdout_bars]
-            run = bt(spec.name, prices, chosen)
-            h_ret = whole_days(daily_returns(run.equity), h_start, bar)
+            run = bt(spec.name, prices, chosen, oos=True, trade_from=h_start - bar)  # starts flat, as each window does
+            h_ret = whole_days(daily_returns(_flat_until(run, h_start - bar)), h_start, bar)
             if first_touch.get("flipped"):
                 # The one look covers both resolutions, and the holdout too is judged on the worse (R2-G1).
-                flipped = bt(spec.name, prices, chosen, flip=True)
-                other = whole_days(daily_returns(flipped.equity), h_start, bar)
+                flipped = bt(spec.name, prices, chosen, oos=True, trade_from=h_start - bar, flip=True)
+                other = whole_days(daily_returns(_flat_until(flipped, h_start - bar)), h_start, bar)
                 worse = _worse(other, h_ret)
                 result.first_touch["holdout_judged_on"] = "opposite" if worse else "as ruled"
                 if worse:
@@ -952,6 +1038,15 @@ def run_study(
         if locks is not None:
             locks.settle(idea_hash, underlying, trial)
     return result
+
+
+def _flat_until(run: BacktestResult, start) -> pd.Series:
+    """A window's equity, flat at the run's starting capital up to and at `start`, the close of the bar before the
+    window: a state rule enters at that close, so the entry's fee and spread fall on the window's first day, which
+    the window pays for itself (P1-D13 [flat-rule])."""
+    equity = run.equity.copy()
+    equity[equity.index <= start] = run.starting_capital
+    return equity
 
 
 STOP_MISSING = "missing"
@@ -1028,6 +1123,37 @@ def _holdout_trades(run: BacktestResult, start) -> int:
                if t["closed"] is not None and _utc(t["opened"]) >= _utc(start))
 
 
+def _one_way(result: StudyResult, ledger: IdeaLedger, fold_runs: list, bt, minute_loader, bar: pd.Timedelta) -> None:
+    """The 5-minute one-way rule (Advisor 18:36 and 19:00): a fail is not final until re-run on 1-minute bars; a pass
+    counts once one out-of-sample window, drawn at random with its seed recorded, ends no better on 5-minute bars than
+    on 1-minute ones (fees only). If it ends better, the pass is void."""
+    import secrets
+
+    import numpy as np
+
+    from sleeve_fund.research.tearsheet import g1_checks, g1_verdict
+
+    verdict, _ = g1_verdict(g1_checks(result, ledger))
+    if verdict == "FAIL":
+        result.one_way = "fail"
+        return
+    if verdict != "PASS" or not fold_runs:
+        return
+    seed = secrets.randbelow(2**31)
+    through, test_idx, params, coarse = fold_runs[int(np.random.default_rng(seed).integers(len(fold_runs)))]
+    window = f"{test_idx[0]:%d %b %Y} to {test_idx[-1]:%d %b %Y}"
+    fine = minute_loader(through.index[0] - bar, through.index[-1]) if minute_loader is not None else None
+    if fine is None or not len(fine):
+        result.one_way, result.spot_check = "unchecked", {"window": window, "seed": seed}
+        return
+    exact = bt(result.spec.name, through, params, trade_from=test_idx[0] - bar, feed=fine)
+    gap = float(exact.equity.iloc[-1] - coarse.equity.iloc[-1])
+    tolerance = abs(exact.fees_paid - coarse.fees_paid) + 0.01
+    result.spot_check = {"window": window, "seed": seed, "gap": round(gap, 2)}
+    if -gap > tolerance:
+        result.one_way = "void"
+
+
 def _window_trips(trips: list[dict], test_start) -> dict:
     """A test-window run's round trips sorted into the counted ones and those at the window's edges."""
     start = _utc(test_start)
@@ -1048,15 +1174,17 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
     return int((inside.abs() > 1e-9).sum())
 
 
-def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, cost_per_side: float, shorts: bool,
+def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
                 leverage: float | None = None, market: str | None = None):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
-    are priced on those bars' closes, so the benchmark compares timing, not fills. leverage: the risk profile's cap,
-    for a fold that traded the perpetual (its chosen market, else `market`): its trips and their draws are
-    liquidated as the engine books one, losing the margin and fees, never the move past it (Independent Quant
-    Advisor 7 Oct 00:19 (4))."""
+    are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
+    SpreadSeries whose value in force at each bar's close is charged there, for the strategy's trips and the draws
+    alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
+    else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
+    never the move past it (Independent Quant Advisor 7 Oct 00:19 (4))."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
+    cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
 
     def bar(ts) -> int:
         return max(int(index.searchsorted(ts, side="right")) - 1, 0)
@@ -1095,7 +1223,6 @@ def missing_funding(params: dict, instrument, after: pd.Timestamp, until: pd.Tim
     for: None when the market is spot, 0 for a simulated perp, which charges its terms' fixed rate as its runs do.
     The perp buy and hold is priced only over a window with none missing; a missing rate is never filled in
     (Advisor, 7 Oct 2026)."""
-    from datetime import timedelta
 
     from sleeve_fund import funding
 

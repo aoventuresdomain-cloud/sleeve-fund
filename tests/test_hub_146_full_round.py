@@ -187,9 +187,6 @@ def _stop_after_target(side):
     return p
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="NA-1/D13 (Advisor 20:39): the backtest books a stop at "
-                   "its level less max(half spread, 0.05 %); built in #178, not on main yet: the mark comes off when "
-                   "#178 merges")
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=IDS)
 def test_d13_the_backtest_books_the_stop_at_its_level_less_the_slippage_floor(label, perp, profile, side):
     """Tightened to 0.1 bp (Advisor D13-STOP-PARITY (a), HoQA 7 Oct 01:07). Mark kept until #178 is on main."""

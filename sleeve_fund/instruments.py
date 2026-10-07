@@ -165,6 +165,36 @@ def target_fill_px(level, long: bool, half_spread) -> Decimal:
     return level * (1 - slip) if long else level * (1 + slip)
 
 
+class ExecBars:
+    """The bars a backtest's venue matched orders against, looked up by their close time, for booking a resting
+    exit's fill when the bar alone can't say what traded first (ScheduleFeeModel.exit_price)."""
+
+    def __init__(self, df) -> None:
+        import numpy as np
+
+        idx = df.index if df.index.tz is None else df.index.tz_convert("UTC")
+        self.ts = idx.as_unit("ns").asi8  # nanoseconds, as the engine's clock reads, whatever unit the index holds
+        self.ohlc = np.column_stack([df[c].to_numpy(dtype=float) for c in ("open", "high", "low", "close")])
+
+    def at(self, ts_ns: int) -> tuple[float, float, float, float] | None:
+        import numpy as np
+
+        i = int(np.searchsorted(self.ts, ts_ns))
+        return tuple(self.ohlc[i]) if i < len(self.ts) and self.ts[i] == ts_ns else None
+
+
+def exit_price(side: int, trigger: float, bar: tuple, rested: bool) -> float:
+    """Where a resting stop that traded inside `bar` (open, high, low, close) is booked, before its slippage, when only
+    the bar is known (bars longer than a minute, or execution bars longer than a minute). Pessimistic (Advisor, P1-D13
+    18:16 and 18:36): at the open when the price gapped through it there, else at the bar's adverse extreme (its low
+    for a long; side is the position's), never at its trigger: inside the bar the price may have run on past it.
+    `rested`: the stop rested before the bar opened. One placed inside the bar (its entry filled there) can't have
+    gapped: it is stopped out at the extreme."""
+    o, h, low, _ = bar
+    gap = rested and (o <= trigger if side > 0 else o >= trigger)
+    return o if gap else (low if side > 0 else h)
+
+
 class ScheduleFeeModel(FeeModel):
     """Charges a FeeSchedule on every fill, regardless of what the instrument says.
 
@@ -180,6 +210,9 @@ class ScheduleFeeModel(FeeModel):
         # with the commission on fills that take liquidity, and kept apart per order so reports can
         # show the venue's fee and the spread separately. Paper fills on real quotes and passes 0.
         self.half_spread = Decimal(str(half_spread))
+        # Backtests with measured spreads (SPREAD-PIT): the series BarOpens reads half_spread from at each bar's open,
+        # so a fill pays the spread in force when its bar began, never a later measurement.
+        self.spread_series = None
         self.spread_paid: dict[str, float] = {}
         # The venue's own fee on those same orders, unrounded, so a report can show it alone to the cent and put
         # what rounding left in the charged commission into the price with the spread (QA m-G7).
@@ -203,6 +236,9 @@ class ScheduleFeeModel(FeeModel):
         # The commission carries the difference from the price the market order filled at; fee_paid keeps the
         # venue's fee apart so the report can move the rest into the price, as it does the spread.
         self.booked: dict[str, tuple[Decimal, bool]] = {}
+        # Those targets by their level, priced when the market order fills, with the half spread in force then (SPREAD-PIT:
+        # the bar it fills in, not the bar it was decided on); the price goes into booked for the strategy's journal.
+        self.booked_targets: dict[str, tuple[Decimal, bool]] = {}
         # Backtests: a resting stop's target level, by the stop's order id. A bar that opens through the target
         # takes the target before anything later in the bar can reach the stop (Advisor NA-2): if the venue fills
         # the stop in such a bar, it is booked as the target (rebooked), at target_fill_px, never the open (L12),
@@ -220,6 +256,18 @@ class ScheduleFeeModel(FeeModel):
         # $2.44 slices 0.41% (sanity S-1). The rounding left over is carried into the next fee instead, so
         # the total charged stays within a cent of the schedule however small the fills.
         self._carry = Decimal(0)
+        # Backtests: how each resting stop's fill is booked. exit_info(order) (the strategy's) says what an order is:
+        # {"kind": "stop", "side": the position's, "trigger", "rested", "liq"} or, for a stop-out the strategy sent at
+        # market to be booked elsewhere, {"kind": "stop", "side", "base"}; None for anything else. Every stop pays
+        # taker_slippage in place of the half spread. With `bars` (bars or execution bars longer than a minute) it is
+        # booked at exit_price against the bar it traded in; `now` gives that bar's close time.
+        self.exit_info = None
+        self.bars: ExecBars | None = None
+        self.now = None
+        # Each taker fill's (price booked, the part of its charge moved into that price), in fill order: the venue
+        # can match several slices before the strategy hears of the first.
+        self.booked_fills: dict[str, list[tuple[float, float]]] = {}
+        self.intrabar: set[str] = set()  # "fill" / "liq": a booking relied on the order inside a bar (labels)
 
     def _charge(self, exact: Decimal, currency) -> Money:
         total = exact + self._carry
@@ -243,6 +291,9 @@ class ScheduleFeeModel(FeeModel):
             return self._charge(qty * limit * self.fees.maker + shift, instrument.quote_currency)
         shift = Decimal(0)
         booked = self.booked.get(str(order.client_order_id))
+        if booked is None and str(order.client_order_id) in self.booked_targets:
+            level, buy = self.booked_targets.pop(str(order.client_order_id))
+            booked = self.booked[str(order.client_order_id)] = (target_fill_px(level, not buy, self.half_spread), buy)
         target, since = self.open_targets.get(str(order.client_order_id), (None, None))
         if booked is None and target is not None and self.bar_open is not None and since < self.bar_seq:
             buy = order.side == OrderSide.BUY  # a short's stop buys back; its target sits below
@@ -255,30 +306,93 @@ class ScheduleFeeModel(FeeModel):
             # A sell that filled below its level gets the difference back here, a buy above it the same.
             shift = qty * (level - fill_px.as_decimal()) * (1 if buy else -1)
             notional = qty * level
-        charge = notional * self.rate_for(order)
+        if booked is None:
+            info = self.exit_info(order) if self.exit_info is not None else None
+            if info is not None:
+                return self._exit_commission(order, info, fill_quantity, fill_px, instrument)
         coid = str(order.client_order_id)
-        paid = self.half_spread + self.slippage.get(coid, 0)
-        if booked is not None or (paid and not getattr(order, "is_post_only", False)):
-            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
-        if booked is None and paid and not getattr(order, "is_post_only", False):
-            # A booked target's price already carries its slippage (target_fill_px), half the spread included.
+        paid = self.half_spread + self.slippage.get(coid, 0)  # with a rule-builder order's extra slippage
+        taker_spread = booked is None and paid and not getattr(order, "is_post_only", False)
+        if taker_spread:
+            # Filled at the ask or the bid, mid plus or minus half the spread, in the price (Advisor 20:55): the venue's
+            # fee is on that price, the journal and every level derived from the fill take it, and the spread is
+            # never charged again as a cost of its own. Any extra slippage the order carries goes the same way.
+            filled, buy = float(fill_px.as_decimal()), order.side == OrderSide.BUY
+            half = float(paid)
+            px = filled * (1 + half) if buy else filled * (1 - half)
             spread = notional * paid
+            charge = (notional + spread) * self.rate_for(order) if buy else (notional - spread) * self.rate_for(order)
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
             self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(spread)
-            charge += spread
+            self.booked_fills.setdefault(coid, []).append((px, float(spread)))
+            return self._charge(charge + spread, instrument.quote_currency)
+        charge = notional * self.rate_for(order)
+        if booked is not None:
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(charge)
         return self._charge(charge + shift, instrument.quote_currency)
+
+    @staticmethod
+    def _liquidation_close(info: dict, filled: float) -> bool:
+        """A liquidation: the market close at the liquidation price, or a risk stop filled at or through it."""
+        if info.get("kind") == "liquidation" or info.get("liquidation"):
+            return True
+        liq = info.get("liq_px")
+        return liq is not None and (filled <= liq if info["side"] > 0 else filled >= liq)
+
+    def _exit_commission(self, order, info: dict, fill_quantity, fill_px, instrument) -> Money:
+        """A resting exit's fill, booked at its price (exit_price), the stop's slippage included: the venue's fee is
+        charged on that price, and the difference from the venue's fill rides with it, to be moved into the price as
+        the half spread is (runner._spread_into_prices). Never booked better than the venue filled it."""
+        coid = str(order.client_order_id)
+        qty, filled = fill_quantity.as_decimal(), float(fill_px.as_decimal())
+        side = info["side"]
+        if self._liquidation_close(info, filled):
+            # Advisor 7 Oct 03:23 (D13-F2): a liquidation close, gapped or not, pays no half spread and no 0.05 %
+            # floor: booked at the venue's fill, as before D13. Inside a bar's range it still relied on the
+            # liquidation check, so the run keeps its label.
+            if self.bars is not None and self.now is not None and self.bars.at(self.now()) is not None:
+                self.intrabar.add("liq")
+            fee = qty * fill_px.as_decimal() * self.rate_for(order)
+            self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(fee)
+            self.booked_fills.setdefault(coid, []).append((filled, 0.0))
+            return self._charge(fee, instrument.quote_currency)
+        base = info.get("base")
+        bar = self.bars.at(self.now()) if self.bars is not None and self.now is not None else None
+        if base is not None:
+            self.intrabar.add("fill")
+        elif bar is not None:
+            base = exit_price(side, info["trigger"], bar, info.get("rested", True))
+            self.intrabar.add("liq" if info.get("liq") else "fill")
+        else:
+            base = filled
+        px = base * (1 - side * float(taker_slippage(self.half_spread)))
+        px = min(px, filled) if side > 0 else max(px, filled)  # an exit sells a long: never above the venue's fill
+        fee = qty * Decimal(str(px)) * self.rate_for(order)
+        moved = qty * Decimal(str((filled - px) * side))  # paid on top of the venue's price, as the spread is
+        self.spread_paid[coid] = self.spread_paid.get(coid, 0.0) + float(moved)
+        self.fee_paid[coid] = self.fee_paid.get(coid, 0.0) + float(fee)
+        self.booked_fills.setdefault(coid, []).append((px, float(moved)))
+        return self._charge(fee + moved, instrument.quote_currency)
 
 
 class BarOpens(SimulationModule):
     """Backtests: hands the fee model the open of each bar before the simulated venue matches it, so a resting
-    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets)."""
+    stop filled in a bar that opened through the target is booked at the target (ScheduleFeeModel.open_targets), and
+    the half spread in force when the bar opened (ScheduleFeeModel.spread_series)."""
 
     def __init__(self, fee_model: ScheduleFeeModel) -> None:
         self.fee_model = fee_model
 
     def pre_process(self, data) -> None:
         if isinstance(data, Bar):
-            self.fee_model.bar_open = data.open.as_decimal()
-            self.fee_model.bar_seq += 1
+            fm = self.fee_model
+            fm.bar_open = data.open.as_decimal()
+            fm.bar_seq += 1
+            if fm.spread_series is not None:
+                opened = int(data.ts_event) - int(data.bar_type.spec.timedelta.total_seconds()) * 1_000_000_000
+                now = fm.spread_series.at(opened)
+                if now != float(fm.half_spread):
+                    fm.half_spread = Decimal(str(now))
 
     def process(self, ts_now, context):
         return None

@@ -67,7 +67,10 @@ def test_stop_rests_at_the_venue_and_is_journaled(prices, instrument):
                        risk_profile="aggressive")
     assert list(res.fills["side"]) == ["BUY", "SELL"]
     stop = res.fills.iloc[1]
-    assert float(stop["avg_px"]) == pytest.approx(10_000 * 0.95, rel=0.002)  # at the level, not a bar close
+    # Bars only: booked at the low of the bar it traded through, less the stop's slippage, not at the level or a
+    # close (P1-D13).
+    low = float(_path(prices, closes)["low"].loc[stop["ts_last"]])
+    assert low < 10_000 * 0.95 and float(stop["avg_px"]) == pytest.approx(low * (1 - res.half_spread), rel=1e-6)
     assert res.decisions[res.fills.index[1]]["intent"] == "stop_loss"
 
 
@@ -88,8 +91,9 @@ def test_a_runtime_passed_in_rests_its_stop_like_every_backtest(instrument):
                         starting_balance=10_000, params={"stop_loss": 0.10}, risk_profile="aggressive")
     rt = SleeveRuntime(store, "x", tick_seconds=86_400)
     guarded = run_backtest("buy_and_hold", df, instrument, {"stop_loss": 0.10}, runtime=rt, half_spread=0)
-    assert float(plain.fills["avg_px"].iloc[-1]) == pytest.approx(90.0)
-    assert float(guarded.fills["avg_px"].iloc[-1]) == pytest.approx(90.0)
+    # Bars only, the stop is booked at the bar's 79 low less its slippage (P1-D13), the same with or without a runtime.
+    assert float(plain.fills["avg_px"].iloc[-1]) == pytest.approx(79.0 * (1 - 0.0005), abs=1e-3)  # to the tick
+    assert float(guarded.fills["avg_px"].iloc[-1]) == pytest.approx(79.0 * (1 - 0.0005), abs=1e-3)
     assert [(o["intent"], o["side"]) for o in reversed(store.orders("x"))] == [("entry", "BUY"), ("stop_loss", "SELL")]
 
 
@@ -228,15 +232,16 @@ def test_a_buy_the_volume_cap_blocks_says_so(prices, instrument):
 def test_a_halt_on_the_bar_an_entry_fills_cancels_its_stop_and_target(instrument):
     """A maker entry filled and the drawdown halt fired on the same minute, while the entry's stop and
     target were not yet at the venue. The halt sold the position, and the target, still resting, sold it
-    again hours later: a short in a cash account and a phantom exit (review round 6, N6-1). This path is
-    the reviewer's seed 5 that found it."""
+    again hours later: a short in a cash account and a phantom exit (review round 6, N6-1). The reviewer's
+    seed 5 found it; since P1-D13 the stop's slippage moves seed 5's halt onto a stop fill, with nothing left
+    to flatten, so seed 2 keeps a halt that sells a held position while exits rest."""
     import numpy as np
 
     from sleeve_fund.venues import venue
 
     eth = venue("kraken").instrument("ETH", "USD")
     n = 87 * 1440
-    rng = np.random.default_rng(5)
+    rng = np.random.default_rng(2)
     r = rng.normal(0, 0.06 / np.sqrt(1440), 90 * 1440)
     jumps = rng.random(90 * 1440) < 2 / 1440
     r[jumps] += rng.normal(0, 0.06, jumps.sum())

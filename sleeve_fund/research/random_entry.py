@@ -99,17 +99,33 @@ class RandomSideResult:
 
 
 def _trade_returns(closes: np.ndarray, entries: np.ndarray, holds: np.ndarray, sides: np.ndarray,
-                   cost: float, levs: np.ndarray | None = None) -> np.ndarray:
+                   cost, levs: np.ndarray | None = None) -> np.ndarray:
     gross = closes[entries + holds] / closes[entries] - 1
-    out = sides * gross - 2 * cost
+    out = sides * gross - _round_trip(cost, entries, holds)
     if levs is None:
         return out
     for k in np.flatnonzero(~np.isnan(levs)):
         trigger = _liquidated_at(closes, int(entries[k]), int(holds[k]), int(sides[k]), float(levs[k]))
         if trigger is not None:
             # Booked at the bankruptcy price: the margin and no more, the liquidation fee on the trigger price.
-            out[k] = -1 / levs[k] - cost - cost * trigger
+            c_in, c_out = _side_costs(cost, int(entries[k]), int(entries[k] + holds[k]))
+            out[k] = -1 / levs[k] - c_in - c_out * trigger
     return out
+
+
+def _round_trip(cost, entries: np.ndarray, holds: np.ndarray):
+    """Both sides' cost: one figure per side, or one per bar (the spread in force at each bar, SPREAD-PIT), charged
+    at the entry's bar and the exit's."""
+    if np.ndim(cost) == 0:
+        return 2 * cost
+    return cost[entries] + cost[entries + holds]
+
+
+def _side_costs(cost, entry: int, exit_: int) -> tuple[float, float]:
+    """One trade's cost per side at its entry's bar and its exit's: the one figure, or the bars' own (SPREAD-PIT)."""
+    if np.ndim(cost) == 0:
+        return float(cost), float(cost)
+    return float(cost[entry]), float(cost[exit_])
 
 
 def _liquidated_at(closes: np.ndarray, entry: int, hold: int, side: int, lev: float) -> float | None:
@@ -174,7 +190,7 @@ def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
     return per_window, test_bars, held
 
 
-def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side,
                 draws: int = DRAWS, seed: int = 0, leverage: float | None = None) -> RandomSideResult:
     """As random_entry, but the entries stay put and each trade's side is drawn at random, long or short. A
     perpetual's draws are liquidated as the engine books one, as random_entry's (Trade.leverage)."""
@@ -196,12 +212,12 @@ def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cos
                             median_random_return=float(np.median(rets)), trades=len(holds), draws=draws)
 
 
-def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side: float,
+def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], cost_per_side,
                  draws: int = DRAWS, seed: int = 0, in_market: float | None = None,
                  leverage: float | None = None) -> RandomEntryResult:
     """closes: the bar closes the strategy traded on. trades: its out-of-sample round trips. windows: each
     walk-forward test window as (first bar, last bar), inclusive. cost_per_side: fee plus half the spread, as a
-    fraction, charged on entry and exit alike. in_market: the share of the windows' bars the strategy held any
+    fraction, charged on entry and exit alike: one figure, or one per bar of closes (the spread in force then). in_market: the share of the windows' bars the strategy held any
     position, trades carried in and still open at the end included, though those stay out of the comparison
     (Independent Quant Advisor, 6 Oct 2026); without it, the bars the given trades held. leverage: for trades that
     don't carry their own, a perpetual's: the strategy's trades and every draw are liquidated as the engine books

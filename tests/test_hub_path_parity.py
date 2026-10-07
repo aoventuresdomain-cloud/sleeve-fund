@@ -206,7 +206,9 @@ def _final_qty(fills):
     return sum(f["qty"] * (1 if f["side"] == "BUY" else -1) for f in fills)
 
 
-TOL = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-2.5, 7.0), "take_profit": (-6.0, 1.0)}
+# Stops: Advisor D13-STOP-PARITY (7 Oct 00:20), one-sided: the backtest is never better than paper and is worse by
+# at most the 0.05 % floor plus 7 bp.
+TOL = {"entry": (-0.3, 0.3), "exit": (-0.3, 0.3), "stop_loss": (-12.0, 0.3), "take_profit": (-6.0, 1.0)}
 
 
 def _assert_same(hub, ref, minute_slack=0):
@@ -243,8 +245,7 @@ def test_c2_c5_hub_paper_sends_the_same_orders_and_fills_as_own_feed_paper_and_t
         assert h[5] == pytest.approx(p[5], abs=0.0100001)
     # and against the backtest: same minute, size and all-in price to 0.3 bp (test_sanity.py's bar)
     _assert_same(hub, bt)
-    spread_b = sum(r[3] * SPREAD / 2 for r in bt)
-    assert sum(r[5] for r in bt) - spread_b == pytest.approx(sum(r[5] for r in hub), rel=0.005)
+    assert sum(r[5] for r in bt) == pytest.approx(sum(r[5] for r in hub), rel=0.005)
     assert _final_qty(f) == pytest.approx(_final_qty(bf), abs=1e-8)
 
 

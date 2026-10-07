@@ -2291,8 +2291,9 @@ class TestChoke2:
 
     @pytest.mark.parametrize("reason_name,path_name",
                              [pytest.param(r, p, id=f"choke2-backtest-{r}-{p}",
-                                           marks=[xf(GAP_LIQ)] if r == "liquidation_gap" else
-                                           XFAIL_CHOKE2.get(("backtest", r, p), []))
+                                           # #178 (D13): a bars-only stop gapped past the liquidation price
+                                           # books as the liquidation, so the GAP-LIQ mark is lifted here.
+                                           marks=XFAIL_CHOKE2.get(("backtest", r, p), []))
                               for r, p in CHOKE2_BACKTEST])
     def test_backtest_adds_no_exposure_while_blocked(self, monkeypatch, reason_name, path_name):
         """CHOKE-2, backtest/study mode [R113; P1-D21 in backtest]: the same gate in a backtest with the paper

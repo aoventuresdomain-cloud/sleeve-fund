@@ -104,8 +104,10 @@ def test_1x_dip_buy_a_set_stop_and_spot_are_allowed(strategy, params, profile):
 
 
 def test_guard_rsi_pullbacks_pct_stop_fills_intrabar_at_its_level(instrument):
-    """GUARD (passes on main) for R-S9: rsi_pullback's % stop is the base class's resting stop, so it fills at its
-    trigger inside the bar, not at the close: that is why it may count as stopped."""
+    """GUARD for R-S9: rsi_pullback's % stop is the base class's resting stop, so it fills inside the bar that traded
+    through it, not at a later close: that is why it may count as stopped. Re-pinned 7 Oct (HoQA, with #178): on
+    bars alone the fill is the bar's worst price (its open on a gap) less the stop's slippage, never kinder than its
+    level (P1-D13, the formula OK'd for test_sanity 08:30)."""
     from sleeve_fund.data import synthetic_ohlcv
     from sleeve_fund.research.runner import run_backtest
 
@@ -119,8 +121,10 @@ def test_guard_rsi_pullbacks_pct_stop_fills_intrabar_at_its_level(instrument):
         ts = res.fills.loc[o, "ts_last"]
         bar = p[p.index >= ts].iloc[0]
         px = float(res.fills.loc[o, "avg_px"])
-        # at its level (or the open on a gap), never deferred to a close below it
-        assert px == pytest.approx(min(trigger, bar.open), rel=0.002) or px >= bar.close, (px, trigger, bar.close)
+        # in the bar that traded through it, at that bar's worst (or the open on a gap), never kinder than its level
+        assert bar.low <= trigger, ("filled in a bar that never reached the stop", trigger, bar.low)
+        worst = bar.open if bar.open <= trigger else bar.low
+        assert px <= trigger and px == pytest.approx(worst, rel=0.002), (px, trigger, worst, bar.open, bar.low)
 
 
 def _stored(store, name, strategy="rsi_bands", params=None, profile="balanced", state="running"):
@@ -344,10 +348,14 @@ def test_paper_counts_a_gapped_through_position_at_the_stopless_measure_and_aler
 def test_a_single_backtest_reports_open_risk_and_is_not_gated(prices, instrument, full_margin):
     from sleeve_fund.research.runner import run_backtest
 
-    res = run_backtest("ping_pong", prices.iloc[:30], instrument, PING, risk_profile="conservative")
+    # Re-pointed 7 Oct (HoQA, with #178): the model carries a 10% stop, so its open risk is measured at the first
+    # entry (mark to stop) without waiting for a daily ATR. Stopless, P1-D13's bars-only pessimism halts the run
+    # (day 8) before the ATR exists (day 14), so nothing is ever measured. Same claim: reported, never gated.
+    res = run_backtest("ping_pong", prices.iloc[:30], instrument, {**PING, "stop_loss": 0.10},
+                       risk_profile="conservative")
     first = res.fills.sort_values("ts_last").iloc[0]
     assert float(first.filled_qty) * float(first.avg_px) > 5_000  # same entry as today: not gated (~9,900 on main)
-    assert res.open_risk_max > 0.05  # reported: >= 10% of equity at that entry
+    assert res.open_risk_max > 0.05  # reported: ~10% of equity at that entry (~0.099 on main b7368b5)
     assert res.open_risk_binds >= 1  # and counted as an entry paper would refuse
 
 

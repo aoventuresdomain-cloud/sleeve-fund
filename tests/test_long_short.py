@@ -203,7 +203,9 @@ def test_a_short_stop_rests_above_the_entry(prices, instrument):
     stop = [o for o in fills.index if res.decisions[o]["intent"] == "stop_loss"]
     assert stop, intents
     assert fills.loc[stop[0], "side"] == "BUY"
-    assert float(fills.loc[stop[0], "avg_px"]) == pytest.approx(101.5 * 1.02, rel=0.002)
+    # Bars only, booked at the bar's high plus the stop's slippage, never at the level (P1-D13).
+    high = float(_path(prices, closes)["high"].loc[fills.loc[stop[0], "ts_last"]])
+    assert float(fills.loc[stop[0], "avg_px"]) == pytest.approx(high * 1.0005, rel=1e-6)
 
 
 def test_entry_refused_when_its_stop_sits_too_near_liquidation():
@@ -939,12 +941,16 @@ def test_a_risk_exit_in_a_backtest_fills_where_it_was_judged_not_at_the_close(pr
     assert [o["intent"] for o in orders][:2] == ["entry", "risk_pause"], orders
     exit_ = orders[1]
     assert "Risk stop" in exit_["reason"] and exit_["order_type"] == "STOP"
-    # Balanced: 2x, a 5% daily loss, so the level is about 2.5% under the entry, far above the 90 low.
-    assert 97.0 < exit_["avg_px"] < 98.0, exit_
+    # Balanced: 2x, a 5% daily loss, so the level is about 2.5% under the entry. On bars alone the stop is booked
+    # at the bar's 90 low less its slippage, whatever the level (P1-D13: pessimistic, never kinder than paper).
+    assert exit_["avg_px"] == pytest.approx(90.0 * (1 - 0.0005)), exit_
     buy, sell = res.journal.fills_[:2]
     loss = buy["qty"] * (buy["price"] - sell["price"]) + buy["fee"] + sell["fee"]
-    # The 5% daily loss, plus the exit's fee and a day's funding: not the 20% the wick reached.
-    assert res.starting_capital * 0.05 <= loss <= res.starting_capital * 0.053
+    # On bars alone the wick's whole fall is taken at 2x, about 20%, not the 5% daily loss the level stands for: what
+    # traded first inside the bar is unknown, so the run is labelled and G1 never judges it without 1-minute bars
+    # (P1-D13). On minute bars the stop fills at its level (test_d13).
+    assert res.starting_capital * 0.19 <= loss <= res.starting_capital * 0.21
+    assert res.labels == ["bars-only: stop fills pessimistic"]
 
 
 # --- review round 11, M11-9: tests for the mutations that survived the suite ------------------------

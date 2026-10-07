@@ -284,6 +284,28 @@ def _daily(prices, closes, lows=None, opens=None) -> pd.DataFrame:
     return df
 
 
+def _with_minutes(df) -> pd.DataFrame:
+    """Set-up (HoQA 7 Oct, with #178 / P1-D13): minute execution bars inside each daily bar, open -> low -> high ->
+    close in straight lines, for run_backtest(exec_prices=...). A resting exit is then matched minute by minute and
+    fills at its level, which is what these cells pin; on daily bars alone D13 books every stop at the bar's worst
+    price, which can't tell one level from another."""
+    rows = []
+    for ts, b in df.iterrows():
+        pts = [b["open"], b["low"], b["high"], b["close"]]
+        path = np.concatenate([np.linspace(pts[i], pts[i + 1], 481)[:-1] for i in range(3)] + [[b["close"]]])
+        for k in range(1440):
+            o, c = float(path[k]), float(path[k + 1])
+            rows.append((ts - pd.Timedelta(minutes=1439 - k), o, max(o, c), min(o, c), c, float(b["volume"]) / 1440))
+    out = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+    out.index.name = df.index.name
+    return out
+
+
+def _day(df, ts) -> pd.Timestamp:
+    """The daily bar (indexed by close time) a minute-execution fill at `ts` falls in."""
+    return df.index[df.index.searchsorted(ts)]
+
+
 def _run(defn, df, instrument, minutes=1, params=None, **kw):
     from sleeve_fund.research.runner import run_backtest
 
@@ -514,7 +536,10 @@ def test_the_explicit_resting_exit_fills_at_the_previous_closes_level_and_curren
              exits={"exit_at_level": {"level": "sma", "rest": "previous_close"}})
     df = _rising_with_wick(prices, 111.0)
     (sell, *_) = [x for x in _fills(_run(defn, df, instrument, minutes=1440)) if x[1] == "SELL"]
-    assert sell[2] == df.index[15] and sell[4] == pytest.approx(112.0)
+    # Re-pinned 7 Oct (HoQA, with #178): on daily bars alone P1-D13 books it at bar 15's worst price (its low, 111;
+    # no gap: it opens at 114) less max(half spread, 0.05%), never kinder than the 112 level. That the level is the
+    # previous close's 112 (not bar 15's own 113) stays pinned by the 112.5 dip above, which must not exit.
+    assert sell[2] == df.index[15] and sell[4] == pytest.approx(111.0 * (1 - 0.0005)) and sell[4] <= 112.0
     bad = D({"sma": B("sma", period=5)}, long=SIDE(ALWAYS),
             exits={"exit_at_level": {"level": "sma", "rest": "current_bar"}})
     with pytest.raises(ValueError):
@@ -932,11 +957,12 @@ def test_a_stop_at_a_structure_level_fills_at_that_level(prices, instrument):
     assert (with_entry_bar, without) == (94.0, 95.0)  # the case tells the two readings apart
     defn = D({"dc": B("donchian", period=10)}, long=SIDE(C("close", ">", 101.5)),
              exits={"stop": {"level": "dc.lower"}})
-    fills = _fills(_run(defn, df, instrument, minutes=1440))
+    # With minute execution bars (set-up, P1-D13): the level is what is pinned, not D13's bars-only price.
+    fills = _fills(_run(defn, df, instrument, minutes=1440, exec_prices=_with_minutes(df)))
     assert fills[0][:3] == ("entry", "BUY", df.index[12])
     sells = [x for x in fills if x[1] == "SELL"]
-    assert sells[0][2] == df.index[16] and sells[0][4] == pytest.approx(with_entry_bar)
-    assert sells[0][4] != pytest.approx(without)
+    assert _day(df, sells[0][2]) == df.index[16] and sells[0][4] == pytest.approx(with_entry_bar, rel=1e-3)
+    assert sells[0][4] != pytest.approx(without, rel=1e-3)
 
 
 def test_breakout_slippage_costs_only_entries_on_the_breakout_candle(instrument):
@@ -986,17 +1012,19 @@ def test_a_channel_trailing_stop_ratchets_up_and_never_follows_the_channel_down(
     assert (level, stale, ahead) == (105.0, 104.0, 103.0)
     defn = D({"dc": B("donchian", period=5)}, long=SIDE(ALWAYS),
              exits={"trail": {"level": "dc.lower", "ratchet": True}})
-    sells = [x for x in _fills(_run(defn, df, instrument, minutes=1440)) if x[1] == "SELL"]
-    assert sells and sells[0][2] == df.index[11], "a stop resting on bars 7-11 (103) would not fill on bar 11"
-    assert sells[0][4] != pytest.approx(stale), "one bar stale: the channel must take in bar 10, the bar just closed"
-    assert sells[0][4] == pytest.approx(level)
+    # With minute execution bars (set-up, P1-D13): the level is what is pinned, not D13's bars-only price.
+    sells = [x for x in _fills(_run(defn, df, instrument, minutes=1440, exec_prices=_with_minutes(df)))
+             if x[1] == "SELL"]
+    assert sells and _day(df, sells[0][2]) == df.index[11], "a stop resting on bars 7-11 (103) wouldn't fill on bar 11"
+    assert sells[0][4] != pytest.approx(stale, rel=1e-3), "one bar stale: the channel must take in bar 10 (just closed)"
+    assert sells[0][4] == pytest.approx(level, rel=1e-3)
 
     df = _daily(prices, [100.0 + i for i in range(22)], lows={17: 112.5}, opens={6: 121.0})
     mid = [(float(df["high"].iloc[k - 10:k].max()) + float(df["low"].iloc[k - 10:k].min())) / 2 for k in (16, 17)]
     assert mid == [113.5, 111.0]  # the channel's mid falls between bar 16 and bar 17
     defn = D({"dc": B("donchian", period=10)}, long=SIDE(C("close", ">", 111.5)),
              exits={"trail": {"level": "dc.mid", "ratchet": True}})
-    fills = _fills(_run(defn, df, instrument, minutes=1440))
+    fills = _fills(_run(defn, df, instrument, minutes=1440, exec_prices=_with_minutes(df)))
     assert fills[0][:3] == ("entry", "BUY", df.index[12])
     sell = next(x for x in fills if x[1] == "SELL")
-    assert sell[2] == df.index[17] and sell[4] == pytest.approx(113.5)
+    assert _day(df, sell[2]) == df.index[17] and sell[4] == pytest.approx(113.5, rel=1e-3)

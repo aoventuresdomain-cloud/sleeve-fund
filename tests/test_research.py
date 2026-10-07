@@ -298,24 +298,24 @@ def test_the_sheet_says_when_out_of_sample_halted_and_counts_test_trades(tmp_pat
     r = run_study(HOLD, daily, instrument, dataset="syn", ledger=ledger, synthetic=True, holdout_days=0,
                   train_days=60, test_days=60, risk_profile="conservative")
     first, second = r.folds
-    # The halt closed the trade in the test window, but it was opened in training: carried in, so it is left out
-    # of the out-of-sample count (Advisor, 5 Oct 2026, C3).
-    assert "in the test window" in first.halted and first.test_trades == 0 and first.carried_in == 1
-    assert "in the training stretch" in second.halted and second.test_trades == 0
-    assert r.oos_trades == 0 and r.excluded_trades == 1
+    # Each test window starts flat (P1-D13 [flat-rule]): the first enters on its own first bar and the halt closes
+    # that trade inside the window, so it counts; nothing is carried in from training, where no run halts now.
+    assert "in the test window" in first.halted and first.test_trades == 1 and first.carried_in == 0
+    assert not second.halted and second.test_trades == 0
+    assert not any(f.halted_before_test for f in r.folds)
+    assert r.oos_trades == 1 and r.excluded_trades == 1
     gaps = oos_gaps(r)
     assert "No trades out-of-sample in 1 of 2 test windows" in gaps
-    # Round 9, N6: halts before and inside a test window are told apart, so the counts agree.
-    assert ("The conservative risk profile halted the strategy in 2 of 2 folds: 1 in the training stretch, so "
-            "that test window sat flat at +0.0% throughout and 1 inside the test window, flat from then on "
-            "(1 of them closed a trade first)") in gaps
+    assert ("The conservative risk profile halted the strategy in 1 of 2 folds: 1 inside the test window, flat "
+            "from then on (1 of them closed a trade first)") in gaps
+    assert "Each test window starts flat" in gaps
     enough = next(c for c in g1_checks(r, ledger) if c[0] == "Enough out-of-sample trades to judge")
     # One of two windows blind, so half: not judged since round 10 (M10-1), and the trade count can't fail.
-    assert enough[1] == "N/A" and enough[2].startswith("not judged: 0 closed in the 2 walk-forward test windows")
+    assert enough[1] == "N/A" and enough[2].startswith("not judged: 1 closed in the 2 walk-forward test windows")
     assert "1 left out at the windows' edges" in enough[2]
     sheet = render(r, ledger)
     assert "> **No trades out-of-sample in 1 of 2 test windows.**" in sheet
-    assert "| 0 (halted 29 Mar 2022) |" in sheet and "| 1 (halted 27 Mar 2022) |" in sheet  # halt dates per fold
+    assert "| 1 (halted 29 Mar 2022) |" in sheet  # the halt date on its fold
     assert "**G1: NOT JUDGED**" in sheet  # the one window left traded into its halt
     assert "kept in the repository" not in sheet
     import sleeve_fund.research.tearsheet as tearsheet
@@ -364,10 +364,11 @@ def _crashes(days=200, at=(20, 75)):
     return pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1e6}, index=idx)
 
 
-def test_a_study_halted_before_every_test_window_is_not_judged_and_keeps_its_holdout(tmp_path, instrument):
+def test_a_study_g1_cannot_judge_is_not_judged_and_keeps_its_holdout(tmp_path, instrument):
     """Review round 8, M8-4: a study whose runs all halted in training read G1 FAIL on test windows that
     sat flat, and opened (spent) the holdout on it. It now reads "not judged", which is neither a pass
-    nor a fail, and the holdout it asked for stays closed."""
+    nor a fail, and the holdout it asked for stays closed. Since P1-D13 every test window starts flat, so no run
+    halts before one; this study is not judged because the risk guard's resting stops need 1-minute bars."""
     from sleeve_fund.dashboard.pipeline import sheet_facts
     from sleeve_fund.research.tearsheet import NOT_JUDGED, g1_checks, g1_verdict
     from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
@@ -375,8 +376,8 @@ def test_a_study_halted_before_every_test_window_is_not_judged_and_keeps_its_hol
     ledger = IdeaLedger(tmp_path / "l.jsonl")
     r = run_study(HOLD, _crashes(), instrument, dataset="syn-1440m", ledger=ledger, synthetic=True, holdout_days=20,
                   train_days=60, test_days=60, risk_profile="conservative", use_holdout=True)
-    assert len(r.folds) == 2 and all(f.halted_before_test for f in r.folds)
-    assert r.not_judged.startswith("the risk guard halted the strategy in 2 of 2 folds, leaving 2 of 2 test windows")
+    assert len(r.folds) == 2 and not any(f.halted_before_test for f in r.folds)
+    assert r.not_judged.startswith("no 1-minute execution data")
     assert r.holdout is None and "left closed, though asked for" in r.holdout_withheld
     assert not ledger.holdout_used("buy_and_hold", "syn-1440m")
     assert g1_verdict(g1_checks(r, ledger))[0] == NOT_JUDGED
@@ -480,7 +481,7 @@ def test_checks_resting_on_missing_out_of_sample_are_not_failed_on_a_not_judged_
     rows = {name: (verdict, ev) for name, verdict, ev in checks}
     assert all(rows[name][0] in (NOT_APPLICABLE, "PASS") for name in OOS_CHECKS)
     assert rows["Enough out-of-sample trades to judge"][0] == NOT_APPLICABLE
-    assert rows["Enough out-of-sample trades to judge"][1].startswith("not judged: 0 closed")
+    assert rows["Enough out-of-sample trades to judge"][1].startswith("not judged: 1 closed")  # windows start flat
     assert "| FAIL |" not in render(r, ledger)
 
 

@@ -36,6 +36,24 @@ from sleeve_fund import funding
 # (QA 7 Oct, same set-up as the O17 masters). The open-risk limit has its own pins in the gate 5 masters.
 pytestmark = pytest.mark.no_open_risk_limit(reason="funding mechanics with a stopless perp; open-risk limit pinned in gate 5")
 
+
+@pytest.fixture(autouse=True)
+def _no_1m_lifted(monkeypatch):
+    """#178 (D13): a daily-bars perp study has a resting exit (the liquidation price), so G1 marks it NOT JUDGED for
+    "no 1-minute execution data" and its funding verdicts are never read. Lift only that reason, so these cells judge
+    funding alone; every other not-judged reason stands. A no-op before #178."""
+    try:
+        from sleeve_fund.research import study
+    except Exception:
+        return
+    no_1m = getattr(study, "NO_1M", None)
+    prop = getattr(getattr(study, "StudyResult", None), "not_judged", None)
+    if no_1m and isinstance(prop, property):
+        def _not_judged(self, _get=prop.fget):
+            why = _get(self)
+            return "" if why.startswith(no_1m) else why
+        monkeypatch.setattr(study.StudyResult, "not_judged", property(_not_judged))
+
 DAY = "2025-10-03"
 D = pd.Timedelta(days=1)
 
