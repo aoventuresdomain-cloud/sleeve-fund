@@ -1927,7 +1927,10 @@ def _ral_view(store, name: str) -> dict | None:
     found = store.sleeve_events_since(name, ("incident",), since=liq["ts"])
     incident = found[-1] if found else None
     s = store.sleeve(name)
-    reason = s.status_reason or ""
+    # The halt's own words (its event), as a Stop replaces the status reason with "stopped by PM" (CR on #194).
+    halts = [e["message"] for e in store.sleeve_events_since(name, ("risk_halt",), since=liq["ts"])
+             if "(liquidated)" in e["message"]]
+    reason = halts[-1] if halts else s.status_reason or ""
     m = re.search(r"\(liquidated\):\s*([\d,]+(?:\.\d+)?),\s*([\d,]+(?:\.\d+)?)%", reason)
     return {"liquidation": liq, "incident": incident,
             "note": store.incident_note(incident["id"]) if incident is not None else None,

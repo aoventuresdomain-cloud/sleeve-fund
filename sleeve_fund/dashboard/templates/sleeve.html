@@ -24,7 +24,7 @@
       {% elif s.status in ['paused', 'halted'] %}<button type="button" data-open="dlg-resume">Resume</button>{% else %}<button type="button" class="secondary" data-open="dlg-pause">Pause</button>{% endif %}
       <button type="button" class="secondary" data-open="dlg-flatten" {% if flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not x.qty %}disabled{% endif %}>Flatten</button>
       <button type="button" class="secondary" data-open="dlg-stop">Stop</button>
-    {% else %}<button type="button" data-open="dlg-start">Start</button>
+    {% else %}{% if ral %}<button type="button" data-open="dlg-ral" title="Its position margin was lost (liquidated): only a reset after liquidation clears it">Reset after liquidation</button>{% endif %}<button type="button" data-open="dlg-start">Start</button>
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}<button type="button" class="secondary" data-open="dlg-archive" {% if x.qty %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}

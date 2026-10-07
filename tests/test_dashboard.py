@@ -2758,3 +2758,19 @@ def test_a_reset_dropped_after_a_liquidation_is_named_until_the_next_reset(clien
     assert sentence in c.get("/sleeves/btc-test", auth=AUTH).text
     store.event("btc-test", "info", "liquidation_reset", "PM reset it after liquidation")
     assert sentence not in c.get("/sleeves/btc-test", auth=AUTH).text
+
+
+def test_a_stopped_liquidated_strategy_still_offers_reset_after_liquidation_with_its_figures(client):
+    """CR on #194: Start is refused for a liquidated strategy the PM stopped, so the page must offer the reset it points
+    to, and the dialog keeps X and Y% though the stop replaced the halt's status reason."""
+    c, store = client
+    _new(c)
+    store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
+    store.event("btc-test", "error", "risk_halt", LIQUIDATED_HALT_TEXT)
+    store.event("btc-test", "error", "incident", "Incident: liquidated; 6,733.22 left")
+    store.set_desired_state("btc-test", "stopped")
+    store.set_status("btc-test", "stopped", "stopped by PM")
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    assert 'data-open="dlg-ral"' in page and 'data-open="dlg-start"' in page
+    dialog = page.split('id="dlg-ral"')[1].split("</dialog>")[0]
+    assert "3,328.70" in dialog and "112.4% of its equity when the position was opened" in dialog
