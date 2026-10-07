@@ -4614,7 +4614,10 @@ class LongFlatStrategy(Strategy):
         if mine.order_type == OrderType.STOP_MARKET and intent in STOP_INTENTS:
             return {"kind": "stop", "side": side, "trigger": mine.trigger_price.as_double(), "rested": mine.ts_init < now,
                     "liq": intent in ("liquidation_cut", "liquidation"),
-                    "liq_px": self.decisions[coid].get("liq") if intent != "liquidation" else None,
+                    # A model stop carries its liquidation price in its signal (GAP-LIQ), so a gapped one is a
+                    # liquidation close to the fee model and pays no floor (D13-F2).
+                    "liq_px": (self.decisions[coid].get("liq") or (self.decisions[coid].get("signal") or {})
+                               .get("liquidation_px")) if intent != "liquidation" else None,
                     "liquidation": intent == "liquidation"}
         if intent == "liquidation":  # the market close at the liquidation price (_check_liquidation)
             return {"kind": "liquidation", "side": side}
