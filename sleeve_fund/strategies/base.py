@@ -2123,7 +2123,7 @@ class LongFlatStrategy(Strategy):
     def _spread_in_force(self, ts_ns: int) -> float:
         """The measured half spread in force at a past minute, for a replay: paper reads its store, so a measurement
         that landed after the node started is used (SPREAD-PIT); otherwise, or if the read fails, _assumed_spread."""
-        if self.runtime is not None and not self.runtime.backtest:
+        if self.runtime is not None and not getattr(self.runtime, "backtest", False):
             try:
                 from sleeve_fund import spreads
 
