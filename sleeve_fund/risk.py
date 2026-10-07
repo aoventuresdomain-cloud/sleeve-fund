@@ -39,6 +39,22 @@ PROFILES: dict[str, RiskProfile] = {
 }
 
 
+@dataclass(frozen=True)
+class PortfolioProfile:
+    """The limits across the whole book (v2 P2-2), each a share of the fund's marked equity. The defaults are the
+    balanced ones the PM accepted on 6 Oct 2026. version: the profile a decision was taken under, journaled with it."""
+    version: int = 1
+    gross: float = 1.5  # sum of every position's notional
+    net_instrument: float = 0.5  # long less short notional in one underlying, across venues and contract types
+    margin: float = 0.5  # posted isolated margin, spot at its full notional
+    open_risk: float = 0.05  # loss if every stop is hit, stopless positions at their measured move
+    drawdown: float = 0.15  # from the high-water mark: flatten and halt every strategy; only the PM restarts
+    daily_loss: float = 0.03  # from the 00:00 UTC book: no new entries until the next 00:00 UTC
+
+
+PORTFOLIO = PortfolioProfile()
+
+
 def profile(name: str) -> RiskProfile:
     try:
         return PROFILES[name]
