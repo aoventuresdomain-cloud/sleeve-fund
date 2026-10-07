@@ -516,14 +516,15 @@ def test_paper_reverses_the_baseline_for_a_foreseen_settlement_the_venue_never_m
                 stored={"2025-10-03 00:00": "2025-10-03 00:00", "2025-10-03 04:00": "2025-10-03 04:00",
                         "2025-10-03 08:00": "2025-10-03 08:00", "2025-10-03 16:00": "2025-10-03 16:01",
                         "2025-10-04 00:00": "2025-10-04 00:01"})
-    at12 = [r for r in out["funding"] if utc(r["ts"]) == utc("2025-10-03 12:00")]
+    at12 = sorted((r for r in out["funding"] if utc(r["ts"]) == utc("2025-10-03 12:00")), key=lambda r: r["id"])
     assert [r.get("kind") for r in at12] == ["baseline", "reversal"], at12
     assert at12[0]["amount"] < 0 and at12[1]["amount"] == pytest.approx(-at12[0]["amount"])
     stale = [e for e in store.events(None, limit=500) if e["kind"] == "funding_stale"]
     assert stale and utc("2025-10-03 12:15") <= pd.Timestamp(stale[-1]["ts"]) < utc("2025-10-03 12:17")
     # 16:00 foresees 20:00 at the 4 h step (the shorter, adverse one, counting 12:00): missed too, its own episode
     # (16:00 kept between them), and reversed with 12:00 once 00:00 shows the 8 h step
-    at20 = [r.get("kind") for r in out["funding"] if utc(r["ts"]) == utc("2025-10-03 20:00")]
+    at20 = [r.get("kind") for r in sorted(out["funding"], key=lambda r: r["id"])
+            if utc(r["ts"]) == utc("2025-10-03 20:00")]  # by id: the journal orders rows at one time arbitrarily
     assert at20 == ["baseline", "reversal"], out["funding"]
     got = [e["kind"] for e in reversed(store.events(None, limit=500)) if e["kind"].startswith("funding_stale")]
     assert sorted(got) == ["funding_stale"] * 2 + ["funding_stale_cleared"] * 2, got
