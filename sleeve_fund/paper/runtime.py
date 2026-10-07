@@ -264,6 +264,19 @@ def ral_refusal(store, name: str, incident: int | None, actor: str) -> str | Non
     return None
 
 
+def ral_words(store, name: str, cmd: dict, liq: dict, old: float, equity: float) -> str:
+    """What a reset after liquidation journals (Advisor 17:57, 18:17): the PM, the incident, the note's author, the old
+    and new high-water marks and the equity before and after the liquidation. The engine's and the store's (a stopped
+    strategy, which no process applies it for) say the same."""
+    note = store.incident_note(cmd["incident"]) if cmd.get("incident") is not None else None
+    before = store.equity_at_or_before(name, liq["ts"] - timedelta(seconds=1))
+    return (f"Reset after liquidation by the PM, answering incident #{cmd['incident']} (note by "
+            f"{note['author'] if note else 'nobody'}): high-water mark {old:,.2f} becomes {equity:,.2f}, "
+            "the remaining equity, which is also the day's loss baseline. Equity "
+            + (f"{before['equity']:,.2f}" if before else "unknown")
+            + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}")
+
+
 def said_since_last_fill(store, name: str, head: str) -> bool:
     """Whether an incident starting with `head` was written since the position last changed (its last fill): one
     incident per position, read only back to that fill (CR 13)."""
@@ -524,21 +537,15 @@ class SleeveRuntime:
         self.store.mark_applied(cmd["id"])
         liq = liquidation_event(self.store, self.name)
         if liq is None:
-            self.store.event(self.name, "info", "pm_reset_after_liquidation_ignored",
+            self.store.event(self.name, "info", "ral_ignored",  # events.kind is String(32) (QA RAL-F1)
                              f"reset after liquidation ignored, nothing to reset: {cmd['reason']}", ts=self.now())
             return
-        note = self.store.incident_note(cmd["incident"]) if cmd.get("incident") is not None else None
-        before = self.store.equity_at_or_before(self.name, liq["ts"] - timedelta(seconds=1))
         old = self.peak
         self.peak, self._day_open = equity, equity
         self.wiped_out, self.liquidated = False, None
         self._set("running", "")
         self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
-                         f"Reset after liquidation by the PM, answering incident #{cmd['incident']} (note by "
-                         f"{note['author'] if note else 'nobody'}): high-water mark {old:,.2f} becomes {equity:,.2f}, "
-                         "the remaining equity, which is also the day's loss baseline. Equity "
-                         + (f"{before['equity']:,.2f}" if before else "unknown")
-                         + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}", ts=self.now())
+                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
         for request in self.store.pending_resets():
             if request["sleeve"] == self.name and request["created_at"] <= cmd["created_at"]:
                 self.store.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
