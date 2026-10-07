@@ -417,28 +417,29 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later
 
 
-def _restarted(strategy, closes, orders, book_qty=0.0, **params):
+def _restarted(strategy, closes, orders, book_qty=0.0, minutes=1, **params):
     """A model after a deploy restart: the journal holds `orders` (oldest first) and the warm-up is `closes`, one
-    1-minute bar each; what on_start does with them before the first live bar."""
+    `minutes` bar each; what on_start does with them before the first live bar."""
     from datetime import datetime, timezone
 
     from sleeve_fund.strategies import REGISTRY
     from sleeve_fund.venues import venue
 
     instrument = venue("kraken").instrument("BTC", "USD")
-    bt = BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL")
-    t0 = 1_790_000_000 // 60 * 60
+    bt = BarType.from_str("BTC/USD.KRAKEN-1-DAY-LAST-INTERNAL" if minutes == 1440 else
+                          f"BTC/USD.KRAKEN-{minutes}-MINUTE-LAST-INTERNAL")
+    t0 = 1_790_000_000 // 86_400 * 86_400
 
-    def at(i, seconds=0):  # bar i closes at t0 + i minutes; an order goes out a few seconds after its bar
-        return datetime.fromtimestamp(t0 + 60 * i + seconds, tz=timezone.utc)
+    def at(i, seconds=0):  # bar i closes at t0 + i bars; an order goes out a few seconds after its bar
+        return datetime.fromtimestamp(t0 + 60 * minutes * i + seconds, tz=timezone.utc)
 
     rows = [{"intent": intent, "side": side, "ts": at(i, sec)} for intent, side, i, sec in orders][::-1]
     store = type("S", (), {"orders": lambda self, name, limit=500: rows, "event": lambda self, *a, **k: None})()
     runtime = type("R", (), {"name": "s1", "backtest": False, "store": store,
                              "book": {"qty": book_qty, "entry_px": 100.0 if book_qty else None}})()
     cls, cfg = REGISTRY[strategy]
-    s = cls(cfg(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005, market="perp", allow_short=True,
-                **params))
+    s = cls(cfg(instrument_id=instrument.id, bar_type=bt, assumed_taker_fee=0.0005,
+                **{"market": "perp", "allow_short": True, **params}))
     s.instrument, s.runtime = instrument, runtime
     bars = [Bar(bt, Price(c, 1), Price(c, 1), Price(c, 1), Price(c, 1), Quantity(1, 8), int(at(i).timestamp() * 1e9),
                 int(at(i).timestamp() * 1e9)) for i, c in enumerate(closes)]
@@ -534,3 +535,24 @@ def test_the_paper_node_names_its_strategy_with_the_hashed_id(monkeypatch):
     node.dispose()
     assert [str(i) for i in made] == [str(real("TrendFilter", "rsi-bands-test"))]
     assert str(made[0]).startswith("TrendFilter-RSI-BANDS-TEST-") and len(str(made[0]).rsplit("-", 1)[1]) == 8
+
+
+@pytest.mark.parametrize("strategy", ["buy_and_hold", "donchian", "ping_pong", "rsi_pullback", "trend_filter"])
+def test_a_restart_after_a_stop_keeps_the_exit_lock_for_a_model_that_keeps_no_leg(strategy, monkeypatch):
+    """R-I5-1 (QA Tester 2, 7 Oct): the exit lock was rebuilt after a restart only for models that override
+    resume_leg, so these re-entered the side a stop had just closed. The base now rebuilds it from the journal for
+    every model; it holds until the signal moves off that side, as straight through. Each model's signal is pinned
+    here, so the cell checks the base's rebuild for every model and not the model's own rules."""
+    from sleeve_fund.strategies import REGISTRY
+
+    cls = REGISTRY[strategy][0]
+    # the Donchian ensemble is long only, on daily candles
+    params = {"allow_short": False, "minutes": 1440} if strategy == "donchian" else {}
+    closes = [100_000.0] * 200
+    stopped = [("entry", "BUY", 150, 1), ("stop_loss", "SELL", 160, 30)]
+    for want, lock in ((1, 1), (0, False)):  # still long: the lock holds; the signal moved off: it clears
+        monkeypatch.setattr(cls, "want_side", lambda self, bar, want=want: want)
+        assert _restarted(strategy, closes, stopped, **params)._exit_lock == lock
+    monkeypatch.setattr(cls, "want_side", lambda self, bar: 1)
+    assert _restarted(strategy, closes, [("entry", "BUY", 150, 1), ("exit", "SELL", 160, 30)],
+                      **params)._exit_lock is False

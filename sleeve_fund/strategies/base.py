@@ -1596,8 +1596,7 @@ class LongFlatStrategy(Strategy):
         exit after it that locked re-entry. The journal is the only record of them; nothing else is kept."""
         self._resume = None
         self._resume_entry_ns = None  # the close of the candle the journal's last entry was decided on
-        if (self.runtime is None or self.runtime.backtest
-                or type(self).resume_leg is LongFlatStrategy.resume_leg):
+        if self.runtime is None or self.runtime.backtest:
             return
         step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
         orders = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000)  # newest first

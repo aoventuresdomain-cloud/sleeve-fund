@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from nautilus_trader.model import Bar
 
-from sleeve_fund.strategies.base import Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import LOCKING_INTENTS, Condition, IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 SPEC = IdeaSpec(
     summary="Buys at the start, sells once the close rises {rise} above the close it bought on (0.01 = 1%), "
@@ -63,6 +63,14 @@ class PingPong(LongFlatStrategy):
         if qty and entry:
             self._side, self._ref = (1 if qty > 0 else -1), float(entry)
             return
+        # A stop, target or liquidation that closed the leg doesn't move the cycle on: straight through it stays on
+        # that leg, from the entry, under the exit lock (R-I5-1), so it is picked up there, not from the exit's fill.
+        filled = [o for o in self.runtime.store.orders(self.runtime.name, limit=1000) if (o["filled_qty"] or 0) > 0]
+        if filled and filled[0]["intent"] in LOCKING_INTENTS:
+            entry = next((o for o in filled if o["intent"] == "entry"), None)
+            if entry is not None and entry["avg_px"]:
+                self._side, self._ref = (1 if entry["side"] == "BUY" else -1), float(entry["avg_px"])
+                return
         last = self.runtime.store.fills(self.runtime.name, limit=1)
         if last:
             self._side, self._ref = (-1 if last[0]["side"] == "SELL" else 1), float(last[0]["price"])
