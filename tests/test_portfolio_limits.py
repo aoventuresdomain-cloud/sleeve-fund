@@ -116,3 +116,23 @@ def test_the_book_halts_at_15_percent_below_its_reference_and_pauses_at_3_percen
     # after a PM Resume the reference is the book at the resume: no halt again at once
     assert book_breach(PORTFOLIO, D(16_900), D(16_900), D(16_900)) is None
     assert book_breach(PORTFOLIO, D("NaN"), D(20_000), D(20_000)).action == "halt"
+
+
+@pytest.mark.parametrize("held, margin_per_unit, risk_per_unit", [
+    (Holding("ETH", D(1_000), D(100), D(500)), D(100), D(0)),  # open risk at 5% already; risk per unit 0
+    (Holding("ETH", D(1_000), D(6_000), D(0)), D(0), D(10)),  # margin at 60% already; margin per unit 0
+])
+def test_cr208_1_a_zero_per_unit_margin_or_risk_is_refused_never_a_limit_switched_off(held, margin_per_unit,
+                                                                                        risk_per_unit):
+    """CR208-1: every order that raises a position has margin and risk above 0, so a zero is a broken input. Taken
+    as is, it would drop that limit from the check and approve the whole order past the PM's 5% or 50%."""
+    intent = Intent("BTC", 1, D(10), D(100), margin_per_unit, risk_per_unit, D(1), D(1))
+    d = decide(Book(D(10_000), (held,)), intent, PORTFOLIO)
+    assert (d.outcome, d.approved_qty) == ("rejected", D(0)) and "can't be used" in d.reason
+
+
+def test_cr208_2_float_money_into_the_book_check_halts_not_raises():
+    """CR208-2: a float for money is a TypeError at the boundary; the book check turns it into the halt it documents,
+    like NaN, rather than raising past the supervisor's marking."""
+    b = book_breach(PORTFOLIO, 17_000.0, D(20_000), D(20_000))
+    assert b.action == "halt" and "aren't usable" in b.reason

@@ -75,9 +75,10 @@ class Book:
 class Intent:
     """An order that raises a position. side: +1 buys, -1 sells. price: its expected fill, close x (1 ± half spread)
     for the side, the same number sizing used (Advisor 17:20 UK). Per unit of quantity: margin_per_unit (price /
-    leverage on a perp, price on spot) and risk_per_unit (from the expected fill to its planned stop plus the entry
-    and exit fees and the stop's slippage, or the stopless measure; Advisor 5), from sizing's intent_for. step and
-    min_qty: the venue's quantity step and minimum."""
+    leverage on a perp, price on spot) and risk_per_unit (from the expected fill to its planned stop, or the stopless
+    measure; open_risk.position_risk, as holding_for uses it), from sizing's intent_for. Both are above 0 for any order
+    that raises a position: a zero would switch its limit off, so it is refused (CR208-1). Fees and slippage stay in
+    sizing, out of the open-risk measure (HoE 20:12 UK). step and min_qty: the venue's quantity step and minimum."""
 
     underlying: str
     side: int
@@ -138,7 +139,7 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     already over its limit from marks alone forces nothing down: only what raises it is held back (Advisor 2). A
     landing exactly on a limit passes. Inputs that can't be used fail closed."""
     if (book.equity <= 0 or intent.qty <= 0 or intent.price <= 0 or intent.step <= 0 or intent.side not in (1, -1)
-            or intent.margin_per_unit < 0 or intent.risk_per_unit < 0 or intent.min_qty < 0):
+            or intent.margin_per_unit <= 0 or intent.risk_per_unit <= 0 or intent.min_qty < 0):
         return rejected(intent.qty, None, "Entry rejected: the book or the order had a figure that can't be used "
                                           f"(book {book.equity}, order {intent!r}), so nothing is sent")
     e, u = book.equity, intent.underlying
@@ -186,7 +187,7 @@ def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, 
     try:
         equity, reference, day_start = (money(equity, "equity"), money(reference, "reference"),
                                         money(day_start, "day_start"))
-    except ValueError as e:
+    except (TypeError, ValueError) as e:  # a float for money (TypeError) fails closed like NaN
         return BookBreach("halt", f"the book's figures aren't usable ({e})")
     if equity <= 0 or reference <= 0 or day_start <= 0:
         return BookBreach("halt", f"the book's figures aren't usable (book {equity}, reference {reference}, "
