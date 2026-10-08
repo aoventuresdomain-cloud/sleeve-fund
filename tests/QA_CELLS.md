@@ -14,7 +14,8 @@ only names, imports and helper paths were adapted. Source paths are under
 - Squash-merged PR heads were fetched as `refs/pull/<n>/head` (#151, #155, #182, #193), so the pre-fix commits inside a
   PR are reachable: eddc1bc, 81e6d6f, 998631d, 3732498, 7bac37b.
 - SQLite. Every red is an `AssertionError` (or the cell's own `AssertionError` subclass) at the cell's own assertion,
-  never an ImportError, AttributeError or TypeError.
+  never an ImportError, AttributeError or TypeError. One exception: QA-193-F3 (p6b) is red with the `ValueError` its
+  source's strict mark names, raised where the cell sends the reset again.
 - Line numbers refer to the ported file.
 
 ## Cells
@@ -65,6 +66,8 @@ only names, imports and helper paths were adapted. Source paths are under
 | test_qa_ral_probes.py::test_p7_…[stop_then_ral] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F2 | 7bac37b (pr/193; parent of fix 746bcae) | :120 Start refused, RAL still pending |
 | test_qa_ral_probes.py::test_p7_…[ral_then_stop] | same | QA-193-F2 | 7bac37b | :120 Start refused, Stop dropped the RAL |
 | test_qa_ral_probes.py::test_p7c_stopped_and_liquidated_then_the_note_then_ral_then_start_trades_again | same | QA-193-F2 | 7bac37b | :149 Start refused, RAL never applied |
+| test_qa_ral_f3f4.py::test_p5b_the_process_applies_a_ral_row_only_with_its_noted_incident | same | QA-193-F4 | 60d49e7 (main before this fix) | :54 the raw row was carried out: running, not halted |
+| test_qa_ral_f3f4.py::test_p6b_a_failure_inside_the_ral_step_leaves_a_way_to_reset | same | QA-193-F3 | 60d49e7 (main before this fix) | :78 `ValueError` "already reset for this liquidation" (the source's strict mark raises ValueError): the incident was used up |
 | test_qa_ir_parity.py::test_ir1_…[1] | v2-p1/integration-1709cd9-scripts/test_ir_parity.py | ir1 | 1918f8b | :34 fees 780.68 vs 771.05 |
 | test_qa_ir_parity.py::test_ir1_…[15] | same | ir1 | 1918f8b | :34 fees 203.58 vs 201.07 |
 | test_qa_ir_l6_restart.py::test_ir3_…[spot-long] | v2-p1/integration-1709cd9-scripts/test_ir_l6_restart.py | ir3 | 1918f8b | :33 restart fill not one seeded half spread from the backtest |
@@ -127,7 +130,7 @@ collection in #178.
 
 ## Not ported
 
-Never red at their own assertion on any pre-fix SHA:
+Never red at their own assertion on any pre-fix SHA; kept in QA masters as guards (Head of QA, 8 Oct), not obsolete:
 
 - **ADV-7, 10 params** (every guard-path `flatten`/`start`, every full-margin param): no finding mark; pass on 81e6d6f,
   3a2e439, 998631d and 45e2a4f.
@@ -140,6 +143,5 @@ Never red at their own assertion on any pre-fix SHA:
 
 Left out for another reason:
 
-- **QA-193-F3, F4**: still open on main (strict xfails in the source), so not regression cells yet.
-- **P1-O7, second half** (`test_a_series_never_kept_is_raised_across_restarts`): its set-up patches `oi._STARTED`,
-  which main no longer has; porting it needs a set-up change.
+- **P1-O7, second half** (`test_a_series_never_kept_is_raised_across_restarts`): obsolete (Head of QA, 8 Oct). It
+  asserts nothing beyond `test_open_interest.py::test_never_kept_counts_from_the_first_try_across_restarts`.
