@@ -98,7 +98,7 @@ def same_origin(request: Request) -> None:
 def create_app(store: Store | None = None) -> FastAPI:
     _password()  # fail at start-up, not on first request
     app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.store = store or Store()
+    app.state.store = store or Store(portfolio_gate=True)  # the server's journal: CHOKE reads the portfolio too
     app.state.jobs = Jobs()
     try:
         study_run.seed(LEDGER, TEARSHEETS)

@@ -1390,10 +1390,13 @@ class LongFlatStrategy(Strategy):
         # Held while nothing may open (halted, paused, stopped, liquidated: a fill that raced the block's cancel):
         # never left unwatched (P1-U35, Advisor 20:56), so it gets the safety stop and an incident too.
         orphan, held = self.runtime.entry_blocked()
-        if orphan and set(block_codes(held)) <= {"stale_data"}:
+        if orphan and set(block_codes(held)) <= {"stale_data", "portfolio_stale", "portfolio_pause"}:
             # Stale data alone is not a block a position was held under: a process holds entries from its first moment
             # until its first trade or quote (P1-SG21), so every restart would otherwise swap the model's restored stop
-            # for a safety stop and raise an incident before the feed has had a second to arrive.
+            # for a safety stop and raise an incident before the feed has had a second to arrive. The same for the
+            # fund's book not marked yet (a restart before the supervisor's first mark: limits unchecked) and for the
+            # portfolio's daily pause, which keeps positions; a portfolio halt flattens, so it stays a block (CR F229-1,
+            # HoQA MF229-1).
             orphan = False
         if not (unrestored or self._exits_only or orphan):
             return
@@ -4682,7 +4685,8 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         # Advisor 23:05 (SG7): a raced fill is treated as the block treats a position already held. A halt, a
         # liquidation and the daily pause flatten, so it is sold at once; Stop, stale data, funding and retire keep it.
-        sells = bool({*RESUMABLE, "liquidated", "daily_pause"} & set(getattr(why, "codes", ())))
+        # The portfolio's halt flattens every strategy, so it sells too; its pause and stale book keep it (P2-2 plan).
+        sells = bool({*RESUMABLE, "liquidated", "daily_pause", "portfolio_halt"} & set(getattr(why, "codes", ())))
         if sells:
             rt.raced = why
         rt.store.event(rt.name, "error", "incident",

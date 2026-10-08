@@ -192,9 +192,9 @@ class Checked:
     reservation: int | None  # attach it to the order; the order's fill, reject or cancel releases it
 
 
-def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
-    """entry_block's answer; the caller holds the ledger's lock."""
-    st = ledger.state()
+def block_reason(st: PortfolioState, now: datetime) -> tuple[str, str] | None:
+    """entry_block's answer from one read of the state, without telling the stale spell: CHOKE's lock-free read
+    (runtime.portfolio_block, CR F229-2), which takes the lock through entry_block only when a spell is untold."""
     if st.halted:
         return "halt", f"Portfolio halted: {st.halted}; no strategy opens anything, and only the PM clears that"
     if st.paused_until is not None and now < st.paused_until:
@@ -202,14 +202,24 @@ def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
                                    f"{st.paused_until:%H:%M} UTC, when the day's start resets")
     if st.mark_ts is None or now - st.mark_ts > MARK_STALE:
         age = "never" if st.mark_ts is None else f"{(now - st.mark_ts).total_seconds():.0f} s ago"
-        why = (f"No new entries: the fund's book was last marked {age}, over {MARK_STALE.seconds} s, so the "
-               "portfolio limits can't be checked")
-        spell = st.mark_ts or NEVER
-        if st.stale_told != spell:
-            ledger.set_state(replace(st, stale_told=spell))
-            ledger.alert("portfolio_state_stale", why, now)
-        return "portfolio_state_stale", why
+        return "portfolio_state_stale", (f"No new entries: the fund's book was last marked {age}, over "
+                                         f"{MARK_STALE.seconds} s, so the portfolio limits can't be checked")
     return None
+
+
+def stale_untold(st: PortfolioState) -> bool:
+    """Whether the stale spell of this state's mark hasn't been alerted yet."""
+    return st.stale_told != (st.mark_ts or NEVER)
+
+
+def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
+    """entry_block's answer; the caller holds the ledger's lock."""
+    st = ledger.state()
+    hit = block_reason(st, now)
+    if hit is not None and hit[0] == "portfolio_state_stale" and stale_untold(st):
+        ledger.set_state(replace(st, stale_told=st.mark_ts or NEVER))
+        ledger.alert("portfolio_state_stale", hit[1], now)
+    return hit
 
 
 def entry_block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
@@ -323,17 +333,19 @@ def apply_flow(ledger: Ledger, amount) -> None:
 
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None],
-          ttl: timedelta = RESERVATION_TTL) -> list[Reservation]:
+          ttl: timedelta = RESERVATION_TTL, is_acked: Callable[[str], bool] | None = None) -> list[Reservation]:
     """Orphans only (Advisor MUST FIX, 17:20 UK; refined 20:25 UK): a reservation lives as long as its order. Past
     `ttl`, one whose order is still live has that order cancelled and keeps its reservation until the cancel is
     confirmed: the order's own cancel releases it, or, if the order filled first, its fill converts the reservation
     into the position once (reduce, in the same transaction as the fill). An unconfirmed cancel is never released
     blind: every CANCEL_CONFIRM it is sent again with an alert, the reservation kept. A reservation with no order, or
-    whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those."""
+    whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those. is_acked (paper): the TTL covers send to venue ack only, so a reservation whose order the venue has
+    acked is skipped whatever its age; it lives with its order, released on a confirmed cancel or converted on a fill
+    (Advisor 8 Oct 06:10 UK)."""
     gone = []
     with ledger.lock():
         for r in ledger.reservations():
-            if now - r.at <= ttl:
+            if now - r.at <= ttl or (is_acked is not None and r.order_id is not None and is_acked(r.order_id)):
                 continue
             if r.order_id is not None and is_live(r.order_id):
                 if r.cancel_sent is not None and now - r.cancel_sent <= CANCEL_CONFIRM:

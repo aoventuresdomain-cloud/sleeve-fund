@@ -919,20 +919,25 @@ class BookResetRefused(ValueError):
 
 
 class Store:
-    def __init__(self, url: str | None = None, engine: Engine | None = None) -> None:
+    def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
+        """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
+        blocked (runtime.portfolio_block). Paper and live open their journal with it, and their startup refuses one
+        without it (paper.safety.assert_portfolio_gate); a research backtest's or a tool's journal doesn't."""
         self.engine = engine or make_engine(url)
+        self.portfolio_gate = portfolio_gate
         # For another process to open the same journal; an in-memory database can't be shared.
         url = None if engine is not None else (url or os.environ.get("DATABASE_URL", DEFAULT_URL))
         self.url = None if url in (None, "sqlite://", "sqlite:///:memory:") else url
         metadata.create_all(self.engine)
 
     @classmethod
-    def in_memory(cls) -> "Store":
+    def in_memory(cls, portfolio_gate: bool = False) -> "Store":
         """A private, throwaway store (one connection shared, so every call sees the same tables):
         the journal a backtest's runtime writes to."""
         from sqlalchemy.pool import StaticPool
 
-        return cls(engine=create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}))
+        return cls(engine=create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}),
+                   portfolio_gate=portfolio_gate)
 
     # --- sleeves -----------------------------------------------------------------
 
