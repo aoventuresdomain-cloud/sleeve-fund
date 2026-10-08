@@ -79,7 +79,9 @@ def test_the_collector_does_not_alert_an_episode_a_strategy_already_opened(tmp_p
     from sleeve_fund.venues import venue
 
     H8 = pd.Timedelta(hours=8)
-    now = pd.Timestamp.now(tz="UTC").floor("8h")
+    now = pd.Timestamp("2026-10-07 16:00", tz="UTC")  # a settlement; the collector looks mid-interval after it, not
+    # at the wall clock, which just after a boundary saw the newest settlement as due (HoE, Test corrections)
+    monkeypatch.setattr(history, "_now", lambda: now + pd.Timedelta(hours=4))
     path = funding._path("BINANCE", "BTC/USDT", tmp_path)
     path.parent.mkdir(parents=True)
     kept = [now - (6 - i) * H8 for i in range(3)]
