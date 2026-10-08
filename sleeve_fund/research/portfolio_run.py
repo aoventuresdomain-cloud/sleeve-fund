@@ -31,6 +31,7 @@ from sleeve_fund.research.portfolio import (
     BATCH_DELAY_NS,
     CloseBatch,
     PortfolioGate,
+    _utc,
     clone_instrument,
     clone_venue,
     strategy_order,
@@ -85,7 +86,9 @@ class PortfolioResult:
     pauses: list[dict]
     worst_intrabar_drawdown: float  # the deepest the book went inside an hour, from its high-water mark (R1)
     intrabar_halt_risk: dict  # {"halt": days, "pause": days}: crossed inside an hour, never on a mark (R1)
-    data_gaps: list[dict]  # orders refused inside the window because a figure couldn't be measured (R5)
+    # Inside the window, what couldn't be measured (R5, CR F227-1): {ts, strategy, why, what}, what "entry" for an order
+    # refused, "mark" for an hourly mark skipped (a held stopless position's daily ATR missing).
+    data_gaps: list[dict]
     unallocated: float = 0.0
     # Every refusal, by Strategy and why: a limit, "halt", "pause", "portfolio_state_stale", or "unmeasurable" (the
     # gate couldn't measure the order, e.g. a stopless entry with no daily ATR yet: CR F220-1, R5).
@@ -215,7 +218,10 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
                 continue
             close = float(h["close"].iloc[at])
             atr = leg.strategy._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
-            equity, holding = leg.strategy.portfolio_book(spec.name, close, atr)
+            try:
+                equity, holding = leg.strategy.portfolio_book(spec.name, close, atr)
+            except ValueError as e:  # named, so the gap reads as the Strategy whose figure is missing
+                raise ValueError(f"{spec.name}: {e}") from e
             total += equity
             if holding is not None:
                 held.append(holding)
@@ -224,8 +230,15 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
         return total, tuple(held)
 
     def mark(hour_ns: int) -> None:
-        """The hourly mark (R1): the gate marks the book, and the run keeps it for the result."""
-        gate.mark(hour_ns + BATCH_DELAY_NS)
+        """The hourly mark (R1): the gate marks the book, and the run keeps it for the result. A book that can't be
+        measured (a held stopless position whose daily ATR is missing mid-window) fails closed (CR F227-1): no mark
+        that hour, a portfolio_mark_failed alert reported as a data gap, and every entry refused by the gate's own
+        check until the figure exists; exits and stops carry on."""
+        try:
+            gate.mark(hour_ns + BATCH_DELAY_NS)
+        except Exception as e:  # noqa: BLE001 - the run goes on; the gap is reported, never papered over
+            gate.ledger.alert("portfolio_mark_failed", f"{e}", _utc(hour_ns + BATCH_DELAY_NS))
+            return
         marks[hour_ns] = last["book"]
 
     def act(ts_ns: int, what: str) -> None:
@@ -293,9 +306,10 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
     decisions = [{"strategy": r.strategy, "ts": r.at, "outcome": r.decision.outcome,
                   "approved": r.decision.approved_qty, "requested": r.decision.requested_qty,
                   "limit": r.decision.limit_hit, "reason": r.decision.reason} for r in gate.ledger.records]
-    gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip()}
+    gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
+             "what": "entry" if kind == "portfolio_check_failed" else "mark"}
             for kind, msg, at in gate.ledger.alerts
-            if kind == "portfolio_check_failed" and int(pd.Timestamp(at).value) >= window]
+            if kind in ("portfolio_check_failed", "portfolio_mark_failed") and int(pd.Timestamp(at).value) >= window]
     refusals: dict[str, dict[str, int]] = {}
     for d in decisions:
         if d["outcome"] == "rejected":

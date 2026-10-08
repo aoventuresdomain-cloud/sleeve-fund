@@ -374,3 +374,22 @@ def test_f223_1_on_the_real_store_a_recorded_run_is_kind_portfolio_run_and_outsi
     assert stored[run_id]["kind"] == "portfolio_run" and stored[a["id"]]["kind"] == "single"  # 0012's default
     assert register.counts()["evaluations"] == 2 and run_id not in register.counted_ids()
     assert halted.portfolio_runs_tried == register.portfolio_runs() == 1
+
+
+def test_f227_1_a_mid_window_atr_gap_under_a_held_stopless_position_fails_closed_and_is_a_data_gap(monkeypatch):
+    s = _spec("a", 2)
+    entry = pd.Timestamp(run_portfolio([s], LOOSE).legs["a"].fills["ts_last"].iloc[0])
+    cut = int((entry.floor("D") + pd.Timedelta("1D")).value)  # no ATR from the day after the first entry
+    real = open_risk.daily_atr_lookup
+    monkeypatch.setattr(open_risk, "daily_atr_lookup", lambda prices: {k: v for k, v in real(prices).items() if k < cut})
+    run = run_portfolio([_spec("a", 2)], LOOSE)  # finishes: nothing raises inside the hourly mark
+    marks = [g for g in run.data_gaps if g["what"] == "mark"]
+    assert marks and all(g["strategy"] == "a" and "daily ATR" in g["why"] for g in marks)
+    assert all(int(pd.Timestamp(g["ts"]).value) > cut for g in marks)
+    skipped = {pd.Timestamp(g["ts"]).floor("h") for g in marks}
+    assert not skipped & set(run.book.index)  # no mark is made up for an hour that couldn't be measured
+    after = [d for d in run.decisions if int(pd.Timestamp(d["ts"]).value) > cut]
+    assert not [d for d in after if d["outcome"] == "approved"]  # no new entry until the figure exists
+    assert [g for g in run.data_gaps if g["what"] == "entry"]  # each refused entry is a gap too (R5)
+    sells = run.legs["a"].fills[run.legs["a"].fills["side"] == "SELL"]
+    assert (pd.to_datetime(sells["ts_last"]) > pd.Timestamp(cut, tz="UTC")).any()  # the exit still went through
