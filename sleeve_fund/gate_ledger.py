@@ -207,9 +207,10 @@ class DbLedger:
 
     # --- a reservation's life ------------------------------------------------------------------------------------------
 
-    def _active(self, conn: Connection, reservation_id: int):
+    def _active(self, conn: Connection, reservation_id: int, for_update: bool = False):
         r = gate_reservations_t
-        return conn.execute(select(r).where(r.c.decision_id == reservation_id, r.c.released_at.is_(None))).first()
+        q = select(r).where(r.c.decision_id == reservation_id, r.c.released_at.is_(None))
+        return conn.execute(q.with_for_update() if for_update else q).first()
 
     def attach_order(self, reservation_id: int, order_id: str) -> None:
         with self._tx() as conn:
@@ -225,11 +226,13 @@ class DbLedger:
 
     def reduce(self, reservation_id: int, filled_qty: Decimal) -> None:
         """A partial fill: what is left reserves its share of the notional, margin and risk. Filled to nothing, it is
-        released as 'fill'. Call it in the fill's transaction (using())."""
+        released as 'fill'. filled_qty is this fill's quantity, not the order's cumulative fill. Call it in the fill's
+        transaction (using()). The row is locked for the read (DA F219-1): a second fill or the sweep's release waits
+        for this one, so no fill is lost and a released row is never written to."""
         r = gate_reservations_t
         filled = money(filled_qty, "filled_qty")
         with self._tx() as conn:
-            row = self._active(conn, reservation_id)
+            row = self._active(conn, reservation_id, for_update=True)
             if row is None:
                 return
             qty = money(row.remaining_qty)
@@ -238,7 +241,7 @@ class DbLedger:
                 self._release(conn, reservation_id, "fill")
                 return
             share = left / qty
-            conn.execute(update(r).where(r.c.decision_id == reservation_id).values(
+            conn.execute(update(r).where(r.c.decision_id == reservation_id, r.c.released_at.is_(None)).values(
                 remaining_qty=stored(left), notional=stored(money(row.notional) * share),
                 margin=stored(money(row.margin) * share), open_risk=stored(money(row.open_risk) * share)))
 

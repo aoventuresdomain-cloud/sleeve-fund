@@ -249,6 +249,47 @@ def test_a_release_joins_the_fills_transaction_and_rolls_back_with_it():
     assert not ledger.reserved and ledger.released == [(a.reservation, "fill")]
 
 
+def _row(ledger, rid):
+    with ledger.engine.connect() as c:
+        return c.execute(select(gate_reservations_t).where(gate_reservations_t.c.decision_id == rid)).one()
+
+
+def test_da_f219_1_a_fill_after_the_release_leaves_the_row_released_and_unchanged():
+    ledger = _marked()
+    a = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    ledger.release(a.reservation, "cancel")
+    before = _row(ledger, a.reservation)
+    ledger.reduce(a.reservation, D("0.04"))
+    assert _row(ledger, a.reservation) == before and ledger.released == [(a.reservation, "cancel")]
+
+
+def test_da_f219_1_two_fills_at_once_lose_neither_and_a_fill_waits_for_the_release():
+    """Postgres: the second fill (or a fill behind the sweep's release) waits on the first one's row lock, then
+    re-reads the row: both fills count, and a released row is never written to."""
+    if not PG:
+        pytest.skip("row locks are Postgres's; SQLite's writes are serialised whole")
+    import threading
+
+    def behind(first, then):
+        """Run first() in an open transaction, start then() in a thread, check it waits, commit, let it finish."""
+        done = threading.Event()
+        with ledger.engine.begin() as conn, ledger.using(conn):
+            first()
+            t = threading.Thread(target=lambda: (then(), done.set()))
+            t.start()
+            assert not done.wait(0.5)  # blocked on the row
+        t.join(5)
+        assert done.is_set()
+
+    ledger = _marked()
+    a = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    behind(lambda: ledger.reduce(a.reservation, D("0.03")), lambda: ledger.reduce(a.reservation, D("0.03")))
+    assert money(_row(ledger, a.reservation).remaining_qty) == D("0.04")
+    behind(lambda: ledger.release(a.reservation, "cancel"), lambda: ledger.reduce(a.reservation, D("0.01")))
+    row = _row(ledger, a.reservation)
+    assert (money(row.remaining_qty), row.release_reason) == (D("0.04"), "cancel")
+
+
 def test_the_state_row_round_trips_and_exists_before_the_first_mark():
     ledger = CellLedger(D(20_000))
     entry_block(ledger, T0)  # never marked: one alert, remembered in the row
