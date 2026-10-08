@@ -4,7 +4,9 @@ name: golden-export
 # Run it by hand from main, once the Data Architect has picked the window. For each instrument it exports the candles
 # and the canon backfill's replacement records in the window (refused unless their count is the canon run's), then
 # gzips both and uploads them as this run's artifact with a sha256 list, for the fixture PR. Same secrets and variable
-# as canon.
+# as canon. With print_fixtures, a separate read-only job also prints each .csv.gz base64-encoded in its log, between
+# BEGIN and END lines, for sessions that can read job logs but cannot download artifacts; the fixture PR re-checks
+# every decoded file against SHA256SUMS, so a cut or garbled log fails instead of passing.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +26,11 @@ on:
       expect_replaced:
         description: The canon run's replaced count per instrument, comma-separated in the same order as pairs
         required: true
+      print_fixtures:
+        description: Also print the files base64-encoded in a separate job's log (read-only)
+        type: boolean
+        required: true
+        default: false
 jobs:
   export:
     runs-on: ubuntu-24.04
@@ -89,3 +96,23 @@ jobs:
           path: golden/
           if-no-files-found: error
           retention-days: 30
+  print:
+    needs: export
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ inputs.print_fixtures }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: golden-${{ inputs.venue }}-${{ github.run_id }}
+          path: golden-dl
+      - name: Print the files base64-encoded
+        run: |
+          set -euo pipefail
+          cd golden-dl
+          cat SHA256SUMS
+          for f in *.csv.gz; do
+            echo "BEGIN $f $(sha256sum < "$f" | cut -d' ' -f1) $(stat -c %s "$f")"
+            base64 -w 1000 < "$f"
+            echo "END $f"
+          done
