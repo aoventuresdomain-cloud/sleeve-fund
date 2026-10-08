@@ -272,7 +272,10 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
     """The supervisor's mark of the whole fund. Returns "halt" when it has just halted the portfolio (the caller
     flattens every position through the exit path and halts every strategy), "pause" when it has just paused it,
     else None. The day's start is the last mark before 00:00 UTC (risk.trading_day); the HWM and the halt's reference
-    only rise, until a book reset (or, for the reference, a PM Resume) re-bases them."""
+    only rise, until a book reset (or, for the reference, a PM Resume) re-bases them. At 00:00 UTC the order is the old
+    day's final mark, then the new day's start, then decisions (Advisor, 8 Oct): a mark at exactly 00:00 never pauses
+    (its pause would end as it starts, with a second alert), and a decision from 00:00 on never sees the old day's
+    pause, which does not carry over (F220-3)."""
     equity = money(equity, "equity")
     with ledger.lock():
         st = ledger.state()
@@ -286,7 +289,8 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
         if breach is not None and breach.action == "halt" and not st.halted:
             st, acted = replace(st, halted=breach.reason), "halt"
             ledger.alert("portfolio_halt", f"Portfolio halted: {breach.reason}", now)
-        elif breach is not None and breach.action == "pause" and not (st.paused_until and now < st.paused_until):
+        elif (breach is not None and breach.action == "pause" and not (st.paused_until and now < st.paused_until)
+              and next_utc_midnight(now) > now):  # the mark at 00:00 is its day's last: a pause there blocks nothing
             st, acted = replace(st, paused_until=next_utc_midnight(now), paused=breach.reason), "pause"
             ledger.alert("portfolio_pause", f"Portfolio paused for the day: {breach.reason}", now)
         ledger.set_state(st)
