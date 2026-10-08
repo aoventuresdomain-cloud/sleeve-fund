@@ -3,7 +3,9 @@ name: parity
 # server and prints the report. Read-only: no --out, so it writes nothing; it reads the history store and the
 # venue's public candles. Run it by hand from main; it uses the deploy workflow's secrets (DEPLOY_HOST,
 # DEPLOY_SSH_KEY) and variable DEPLOY_USER, like status. The script is sent from this checkout over ssh's stdin,
-# so the report always uses main's version. The run goes red when any instrument differs (exit 1) or the store
+# so the report always uses main's version. With sample, it also prints that many of the hub bars the CANON
+# backfill replaced per instrument, both values and the bar stored now: the provenance spot-check. The run goes
+# red when any instrument differs or a sampled minute no longer holds the venue's bar (exit 1), or the store
 # holds nothing for the venue (exit 2).
 on:
   workflow_dispatch:
@@ -16,6 +18,10 @@ on:
         description: Hours of closed 1-minute bars to compare, counting back from now
         required: true
         default: "24"
+      sample:
+        description: Also print this many CANON replacements per instrument, with both values (0 for none)
+        required: false
+        default: "0"
 jobs:
   parity:
     runs-on: ubuntu-24.04
@@ -28,7 +34,9 @@ jobs:
         env:
           VENUE: ${{ inputs.venue }}
           HOURS: ${{ inputs.hours }}
+          SAMPLE: ${{ inputs.sample || '0' }}
         run: |
+          [[ "$SAMPLE" =~ ^[0-9]{1,2}$ ]] || { echo "sample must be a whole number from 0 to 99"; exit 1; }
           [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
           [[ "$HOURS" =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ ]] || { echo "hours must be a number"; exit 1; }
           awk -v h="$HOURS" 'BEGIN { exit !(h > 0 && h <= 720) }' || { echo "hours must be above 0 and at most 720"; exit 1; }
@@ -46,7 +54,8 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           VENUE: ${{ inputs.venue }}
           HOURS: ${{ inputs.hours }}
+          SAMPLE: ${{ inputs.sample || '0' }}
         run: |
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python - --venue $VENUE --hours $HOURS" \
+            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python - --venue $VENUE --hours $HOURS --sample $SAMPLE" \
             < scripts/hub_parity.py

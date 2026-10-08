@@ -33,6 +33,7 @@ class Parity:
     venue_only: list[pd.Timestamp] = field(default_factory=list)  # the store is missing these minutes
     store_only: list[pd.Timestamp] = field(default_factory=list)  # the venue has no candle for these
     price_diffs: int = 0
+    price_minutes: list[pd.Timestamp] = field(default_factory=list)  # the minutes behind price_diffs
     volume_diffs: int = 0
     worst_price: float = 0.0  # the largest OHLC difference, in price units
     worst_volume: float = 0.0  # the largest relative volume difference
@@ -88,7 +89,8 @@ def compare(pair: str, ours: pd.DataFrame, theirs: pd.DataFrame, start: pd.Times
         price = (a[["open", "high", "low", "close"]] - b[["open", "high", "low", "close"]]).abs().max(axis=1)
         vol = (a["volume"] - b["volume"]).abs() / b["volume"].abs().clip(lower=1e-12)
         vol[(a["volume"] == 0) & (b["volume"] == 0)] = 0.0
-        p.price_diffs = int((price > price_tolerance).sum())
+        p.price_minutes = list(price.index[price > price_tolerance])
+        p.price_diffs = len(p.price_minutes)
         p.volume_diffs = int((vol > VOLUME_TOLERANCE).sum())
         p.worst_price = float(price.max())
         p.worst_volume = float(vol.max())
@@ -100,6 +102,10 @@ def compare(pair: str, ours: pd.DataFrame, theirs: pd.DataFrame, start: pd.Times
         elif rec["kind"] == "replaced" and start <= pd.Timestamp(rec["minute"]) < end:
             p.replaced += 1
     return p
+
+
+def _bar(values) -> str:
+    return "none" if values is None else " ".join(f"{x:g}" for x in values)
 
 
 def _runs(minutes: list[pd.Timestamp]) -> str:
@@ -138,6 +144,39 @@ def markdown(venue: str, results: list[Parity]) -> str:
     for p in results:
         if p.venue_only or p.store_only:
             lines += ["", f"**{p.pair}**: missing in store: {_runs(p.venue_only)}. Store only: {_runs(p.store_only)}."]
+    for p in results:
+        if p.price_minutes:
+            lines += ["", f"**{p.pair}**: OHLC differs at {_runs(p.price_minutes)}."]
+    return "\n".join(lines) + "\n"
+
+
+def canon_sample(store: HistoryStore, venue: str, pair: str, n: int) -> list[dict]:
+    """`n` of the hub bars the CANON backfill replaced (provenance kind "replaced", source "canon"), spread evenly
+    from the first to the last, each with the hub's old bar, the venue's bar and the bar the store holds now
+    (None when it no longer holds that minute). `now_is_offered` is the check: the store keeps the venue's bar."""
+    recs = [r for r in store.provenance(venue, pair) if r["kind"] == "replaced" and r["source"] == "canon"]
+    if n <= 0 or not recs:
+        return []
+    picks = [recs[round(i * (len(recs) - 1) / max(n - 1, 1))] for i in range(min(n, len(recs)))]
+    out = []
+    for r in picks:
+        minute = pd.Timestamp(r["minute"])
+        held = store_minutes(store, venue, pair, minute, minute + pd.Timedelta("1min"))
+        now = held.iloc[0][OHLCV].astype(float).tolist() if len(held) else None
+        out.append({"minute": minute, "at": r["at"], "stored": r["stored"], "offered": r["offered"], "now": now,
+                    "now_is_offered": now is not None and all(abs(a - b) <= 1e-12 * max(abs(b), 1.0)
+                                                              for a, b in zip(now, r["offered"]))})
+    return out
+
+
+def markdown_sample(pair: str, rows: list[dict], total: int) -> str:
+    """The canon spot-check for one instrument: each picked minute's hub bar, venue bar and the bar stored now."""
+    lines = [f"## {pair}: {len(rows)} of {total} canon replacements", "",
+             "| Minute (UTC, open) | Replaced at | Hub's bar (O H L C V) | Venue's bar | Stored now | Now = venue's |",
+             "|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['minute']:%d %b %H:%M} | {r['at']} | {_bar(r['stored'])} | {_bar(r['offered'])} | "
+                     f"{_bar(r['now'])} | {'yes' if r['now_is_offered'] else 'NO'} |")
     return "\n".join(lines) + "\n"
 
 
