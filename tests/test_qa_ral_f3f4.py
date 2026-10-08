@@ -97,7 +97,8 @@ def test_a_ral_row_with_no_noted_incident_is_refused_in_words_and_a_proper_one_s
 
 def test_a_failure_after_the_reset_is_journaled_does_not_reset_twice(store, tmp_path, monkeypatch):
     """QA-193-F3, the other side: journaled but not yet marked applied, the restart takes the command again, finds
-    nothing left to reset and marks it, so the journal keeps one liquidation_reset."""
+    its reset journaled and marks it, so the journal keeps one liquidation_reset and never calls it ignored (CR on
+    #217)."""
     from sleeve_fund.store import Store
 
     f = _liquidate(tmp_path, store)
@@ -115,6 +116,7 @@ def test_a_failure_after_the_reset_is_journaled_does_not_reset_twice(store, tmp_
     rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
     assert rt.status == "running" and not _liquidated(store)
     assert not store.pending_commands(NAME) and len(_ral_events(store)) == 1
+    assert not [e for e in store.events(NAME, limit=50) if e["kind"] in ("ral_ignored", "ral_finished")]
 
 
 def test_a_failure_after_the_journal_but_before_the_halt_lifts_finishes_the_reset_on_restart(store, tmp_path,
@@ -141,3 +143,89 @@ def test_a_failure_after_the_journal_but_before_the_halt_lifts_finishes_the_rese
     rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
     assert rt.status == "running" and store.sleeve(NAME).status == "running"
     assert not store.pending_commands(NAME) and len(_ral_events(store)) == 1
+
+
+# --- QA F217-1 (Head of QA on #217): both crash windows still lapse a reset asked before the liquidation -------------
+# Source: /mnt/project-files/sleeve-fund/quant-review/v2-p2/pr217/test_217_ral_window_probes.py (W0, W1)
+
+def _stale_reset(store):
+    """A reset asked for before the liquidation (a page left open, ADV-9): it must lapse when the RAL answers."""
+    from sleeve_fund.store import resets_t, utcnow
+
+    with store.engine.begin() as c:
+        c.execute(insert(resets_t).values(sleeve=NAME, reason="QA: asked before the liquidation", actor="PM",
+                                          restart=1, created_at=utcnow() - timedelta(minutes=5)))
+
+
+def _open_resets(store):
+    return [r for r in store.pending_resets() if r["sleeve"] == NAME]
+
+
+def test_w0_a_normal_ral_lapses_the_earlier_reset(store, tmp_path):
+    f = _liquidate(tmp_path, store)
+    _stale_reset(store)
+    _ral(store, incident=_noted(store, f.liq))
+    rt = _runtime(store, NEXT_DAY, f.rem)
+    assert rt.status == "running" and not _open_resets(store)
+
+
+@pytest.mark.parametrize("window", ["before_halt_lifts", "before_marked_applied"])
+def test_w1_a_crash_inside_the_ral_step_still_lapses_the_earlier_reset(store, tmp_path, monkeypatch, window):
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import Store
+
+    f = _liquidate(tmp_path, store)
+    _stale_reset(store)
+    _ral(store, incident=_noted(store, f.liq))
+    if window == "before_halt_lifts":
+        real = SleeveRuntime._set
+        monkeypatch.setattr(SleeveRuntime, "_set", lambda self, status, *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("QA: dies")) if status == "running" else real(self, status, *a, **kw))
+        target, attr = SleeveRuntime, "_set"
+    else:
+        real = Store.mark_applied
+        monkeypatch.setattr(Store, "mark_applied", lambda self, cid: (_ for _ in ()).throw(RuntimeError("QA: dies")))
+        target, attr = Store, "mark_applied"
+    with pytest.raises(RuntimeError):
+        _runtime(store, NEXT_DAY, f.rem)
+    monkeypatch.setattr(target, attr, real)
+    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert rt.status == "running" and len(_ral_events(store)) == 1
+    assert not _open_resets(store), "a reset asked before the liquidation is still pending after the RAL finished"
+
+
+def test_a_stray_ral_with_nothing_to_reset_lapses_nothing(store, tmp_path):
+    """F217-1's limit: only a RAL whose incident the journal has answered lapses earlier resets. One sent again after
+    its reset (a stale page) is ignored, as before, and a reset asked since is left to run."""
+    f = _liquidate(tmp_path, store)
+    _ral(store, incident=(iid := _noted(store, f.liq)))
+    _runtime(store, NEXT_DAY, f.rem)
+    _stale_reset(store)
+    _raw(store, RAL, incident=None)
+    _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert len(_open_resets(store)) == 1 and len(_ral_events(store)) == 1
+    assert any(e["kind"] == "ral_ignored" for e in store.events(NAME, limit=50)), iid
+
+
+def test_a_crash_before_the_halt_lifts_is_finished_from_the_journal_whatever_the_halt_now_says(store, tmp_path,
+                                                                                                 monkeypatch):
+    """PE2 on #217: the recovery is keyed on the liquidation_reset journaled for this command, not on the halt's
+    reason, so a later halt that rewrote the reason (here a drawdown halt) can't leave the strategy halted with its
+    reset spent. The journal says what happened: one liquidation_reset, then ral_finished, never ral_ignored."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    f = _liquidate(tmp_path, store)
+    _stale_reset(store)
+    _ral(store, incident=_noted(store, f.liq))
+    real = SleeveRuntime._set
+    monkeypatch.setattr(SleeveRuntime, "_set", lambda self, status, *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("QA: dies")) if status == "running" else real(self, status, *a, **kw))
+    with pytest.raises(RuntimeError):
+        _runtime(store, NEXT_DAY, f.rem)
+    monkeypatch.setattr(SleeveRuntime, "_set", real)
+    store.set_status(NAME, "halted", "drawdown 33.1% hit the 25.0% limit")
+    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert rt.status == "running" and store.sleeve(NAME).status == "running"
+    assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
+    kinds = [e["kind"] for e in store.events(NAME, limit=50)]
+    assert "ral_finished" in kinds and "ral_ignored" not in kinds

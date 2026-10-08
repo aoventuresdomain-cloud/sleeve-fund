@@ -68,6 +68,9 @@ only names, imports and helper paths were adapted. Source paths are under
 | test_qa_ral_probes.py::test_p7c_stopped_and_liquidated_then_the_note_then_ral_then_start_trades_again | same | QA-193-F2 | 7bac37b | :149 Start refused, RAL never applied |
 | test_qa_ral_f3f4.py::test_p5b_the_process_applies_a_ral_row_only_with_its_noted_incident | same | QA-193-F4 | 60d49e7 (main before this fix) | :54 the raw row was carried out: running, not halted |
 | test_qa_ral_f3f4.py::test_p6b_a_failure_inside_the_ral_step_leaves_a_way_to_reset | same | QA-193-F3 | 60d49e7 (main before this fix) | :78 `ValueError` "already reset for this liquidation" (the source's strict mark raises ValueError): the incident was used up |
+| test_qa_ral_f3f4.py::test_w1_…[before_halt_lifts] | v2-p2/pr217/test_217_ral_window_probes.py | QA F217-1 | d7875ef (#217 before this fix) | :192 the reset asked before the liquidation still pending |
+| test_qa_ral_f3f4.py::test_w1_…[before_marked_applied] | same | QA F217-1 | d7875ef | :192 the reset asked before the liquidation still pending |
+| test_qa_ral_f3f4.py::test_w0_a_normal_ral_lapses_the_earlier_reset | same | QA F217-1 (control) | none: passes on 60d49e7 and d7875ef | the Head of QA's control for W1, kept as a guard |
 | test_qa_ir_parity.py::test_ir1_…[1] | v2-p1/integration-1709cd9-scripts/test_ir_parity.py | ir1 | 1918f8b | :34 fees 780.68 vs 771.05 |
 | test_qa_ir_parity.py::test_ir1_…[15] | same | ir1 | 1918f8b | :34 fees 203.58 vs 201.07 |
 | test_qa_ir_l6_restart.py::test_ir3_…[spot-long] | v2-p1/integration-1709cd9-scripts/test_ir_l6_restart.py | ir3 | 1918f8b | :33 restart fill not one seeded half spread from the backtest |
