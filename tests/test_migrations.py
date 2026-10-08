@@ -374,3 +374,52 @@ def test_0011_an_error_row_never_blocks_the_retry_but_a_second_real_decision_is_
                                              _gate_row(sid, seq=3, bar_ts=bar)])
     with pytest.raises(IntegrityError), engine.begin() as c:  # a replay of the real one fails closed
         c.execute(insert(gate_decisions_t), [_gate_row(sid, seq=4, bar_ts=bar, outcome="rejected", approved_qty=0)])
+
+
+def test_0012_trials_before_it_are_single_and_a_kind_outside_the_three_is_refused(engine):
+    # DA 8 Oct (QD M4): kind records what was evaluated; every row before it was one strategy's variant.
+    from alembic import command
+    from sqlalchemy.exc import IntegrityError
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0011")
+        conn.execute(text("INSERT INTO trials (id, definition_hash, idea_hash, code_version, definition_name, family, "
+                          "settings, dataset, stage, source, created_at) VALUES ('old', 'd', 'i', 'c', 'n', 'f', "
+                          "'{}', 'ds', 'in_sample', 'study', CURRENT_TIMESTAMP)"))
+    schema.migrate(engine, log=lambda _: None)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT kind FROM trials WHERE id = 'old'")).scalar() == "single"
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(text("UPDATE trials SET kind = 'basket' WHERE id = 'old'"))
+
+
+def test_0012_on_a_database_a_newer_store_already_opened_keeps_its_column(engine):
+    from alembic import command
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0011")
+    with engine.begin() as conn:  # a Store on this code adds the column before the migration runs
+        conn.execute(text("ALTER TABLE trials ADD COLUMN kind VARCHAR(16) DEFAULT 'single' NOT NULL"))
+    schema.migrate(engine, log=lambda _: None)
+    assert "kind" in {c["name"] for c in inspect(engine).get_columns("trials")}
+
+
+def test_0012_a_halt_before_the_first_mark_is_kept_and_a_pause_still_needs_a_mark(engine):
+    # CR F219-3: 0011's CHECK let an unmarked book be 'ok' only, so a halt before the first mark was refused (fail open).
+    from alembic import command
+    from sqlalchemy.exc import IntegrityError
+
+    halt = ("INSERT INTO portfolio_state (id, status, halt_reason, profile_version, updated_at) "
+            "VALUES (1, 'halted', 'drawdown', 1, CURRENT_TIMESTAMP)")
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0011")
+    with pytest.raises(IntegrityError), engine.begin() as conn:  # what 0012 changes
+        conn.execute(text(halt))
+    schema.migrate(engine, log=lambda _: None)
+    with engine.begin() as conn:
+        conn.execute(text(halt))
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(text("UPDATE portfolio_state SET status = 'paused', halt_reason = NULL, "
+                          "paused_until = CURRENT_TIMESTAMP, pause_reason = 'daily loss' WHERE id = 1"))
+    sql = {c["name"]: c["sqltext"] for c in inspect(engine).get_check_constraints("portfolio_state")}
+    assert "'paused'" in sql["portfolio_state_marked"]
