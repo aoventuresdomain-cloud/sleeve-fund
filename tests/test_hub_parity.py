@@ -132,7 +132,7 @@ def test_the_canon_sample_shows_both_values_and_that_the_store_now_holds_the_ven
     assert all(r["now"] == r["offered"] and r["now_is_offered"] for r in rows)
     assert sorted((f.name, f.stat().st_mtime_ns) for f in tmp_path.rglob("*") if f.is_file()) == before
     md = markdown_sample(P, rows, 10)
-    assert "3 of 10 canon replacements" in md and "| 100 100.5 99.5 100 1.5 | 100 100.5 99.5 100 2 |" in md
+    assert "3 of 10 minutes canon replaced" in md and "| 100 100.5 99.5 100 1.5 | 100 100.5 99.5 100 2 |" in md
     assert canon_sample(store, V, P, 0) == [] and len(canon_sample(store, V, P, 50)) == 10
 
 
@@ -148,3 +148,18 @@ def test_a_sampled_minute_that_no_longer_holds_the_venues_bar_is_flagged(tmp_pat
                                              '"offered": [100.0, 100.5, 99.5, 100.0, 9.0]'))
     (row,) = canon_sample(store, V, P, 1)
     assert not row["now_is_offered"] and "| NO |" in markdown_sample(P, [row], 4)
+
+
+def test_a_minute_canon_replaced_twice_is_sampled_once_by_its_latest_record(tmp_path):
+    """CR F224-1: a later run offering a newer venue bar leaves the first record's offered bar stale; not an alarm."""
+    venue = _frame(3)
+    hub = venue.copy()
+    hub["volume"] = 1.5
+    store = HistoryStore(tmp_path, clock=lambda: START + pd.Timedelta("1h"))
+    store.append_bars(V, P, _rows(hub), "live")
+    store.canonise(V, P, venue)
+    revised = venue.copy()
+    revised["volume"] = 2.5
+    assert store.canonise(V, P, revised).replaced == 3
+    rows = canon_sample(store, V, P, 10)
+    assert len(rows) == 3 and all(r["now_is_offered"] and r["stored"][-1] == 2.0 for r in rows)

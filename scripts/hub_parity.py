@@ -46,7 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     kept = True
     for pair in pairs if args.sample > 0 else []:
         rows = canon_sample(store, profile.name, pair, args.sample)
-        total = sum(r["kind"] == "replaced" and r["source"] == "canon" for r in store.provenance(profile.name, pair))
+        total = len({r["minute"] for r in store.provenance(profile.name, pair)
+                     if r["kind"] == "replaced" and r["source"] == "canon"})
         sample = markdown_sample(pair, rows, total)
         print(sample)
         report += "\n" + sample

@@ -151,10 +151,12 @@ def markdown(venue: str, results: list[Parity]) -> str:
 
 
 def canon_sample(store: HistoryStore, venue: str, pair: str, n: int) -> list[dict]:
-    """`n` of the hub bars the CANON backfill replaced (provenance kind "replaced", source "canon"), spread evenly
+    """`n` of the minutes the CANON backfill replaced (provenance kind "replaced", source "canon"), spread evenly
     from the first to the last, each with the hub's old bar, the venue's bar and the bar the store holds now
     (None when it no longer holds that minute). `now_is_offered` is the check: the store keeps the venue's bar."""
-    recs = [r for r in store.provenance(venue, pair) if r["kind"] == "replaced" and r["source"] == "canon"]
+    # the latest record per minute: a later CANON run over the same span replaces the bar again (CR F224-1)
+    recs = list({r["minute"]: r for r in store.provenance(venue, pair)
+                 if r["kind"] == "replaced" and r["source"] == "canon"}.values())
     if n <= 0 or not recs:
         return []
     picks = [recs[round(i * (len(recs) - 1) / max(n - 1, 1))] for i in range(min(n, len(recs)))]
@@ -171,7 +173,7 @@ def canon_sample(store: HistoryStore, venue: str, pair: str, n: int) -> list[dic
 
 def markdown_sample(pair: str, rows: list[dict], total: int) -> str:
     """The canon spot-check for one instrument: each picked minute's hub bar, venue bar and the bar stored now."""
-    lines = [f"## {pair}: {len(rows)} of {total} canon replacements", "",
+    lines = [f"## {pair}: {len(rows)} of {total} minutes canon replaced", "",
              "| Minute (UTC, open) | Replaced at | Hub's bar (O H L C V) | Venue's bar | Stored now | Now = venue's |",
              "|---|---|---|---|---|---|"]
     for r in rows:
