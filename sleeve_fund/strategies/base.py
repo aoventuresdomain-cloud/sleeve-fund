@@ -729,8 +729,11 @@ class LongFlatStrategy(Strategy):
         self._replayed_close: datetime | None = None
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
+        self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): opening orders wait for its gate pass
+        # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
+        # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
+        self.portfolio_gate: dict[str, int] = {}
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
-        self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): entries wait for its gate pass
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
         self._failed_handlers: set[str] = set()  # handlers already journaled as failed (see _report)
@@ -2637,6 +2640,12 @@ class LongFlatStrategy(Strategy):
                            f"volume is worth {cap:,.2f}, below the smallest order the venue takes")
             return False
         self._noted.discard("buy_skipped")
+        if self._portfolio is not None and self._adds(side):
+            # An addition opens risk like an entry (OPENING_INTENTS), so it waits for the gate too (QA F213-1); the
+            # held weight moves when it is sent, as below: in full to w, trimmed to what is then actually held.
+            self._send_entry(side, size, reason, signal, what="rebalance",
+                             sent=lambda trimmed: setattr(self, "_held_w", None if trimmed else w))
+            return False
         return self._submit(side, size, "rebalance", reason, signal)
 
     def _bar_target(self, bar: Bar) -> bool:
@@ -2875,11 +2884,12 @@ class LongFlatStrategy(Strategy):
         self._portfolio = (batch, name)
         return self
 
-    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict) -> None:
-        """Send an entry, or in a portfolio run post it to the run's gate pass at now + 1 ns (research.portfolio
-        .CloseBatch) and send only what that approves, never more than was sized here. Exits never wait for it."""
+    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
+        """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
+        run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
+        than was sized here, then call sent(trimmed). Exits and reductions never wait for it."""
         if self._portfolio is None:
-            self._submit(side, qty, "entry", reason, signal)
+            self._submit(side, qty, what, reason, signal)
             return
         from sleeve_fund.research.portfolio import Pending
 
@@ -2887,18 +2897,27 @@ class LongFlatStrategy(Strategy):
         if self._deciding_bar is not None:
             signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
         intent = {"side": 1 if side == OrderSide.BUY else -1, "qty": qty, "price": signal["close"],
-                  "stop_frac": self._stop_frac}
+                  "stop_frac": self._stop_frac, "what": what}
+
+        def count(outcome: str) -> None:
+            key = f"{what}_{outcome}"
+            self.portfolio_gate[key] = self.portfolio_gate.get(key, 0) + 1
 
         def send(intent, decision) -> None:
             approved = min(qty, Decimal(str(decision.approved_qty))).quantize(self._lot(), rounding=ROUND_DOWN)
             if approved < max(self._min_qty(), self._lot()):
-                self._note("entry_trimmed_below_minimum", f"Entry skipped: the portfolio limits allowed {approved}, "
-                           f"below the smallest order the venue takes ({self._min_qty()})")
+                count("below_minimum")
+                self._note(f"{what}_trimmed_below_minimum", f"{what.capitalize()} skipped: the portfolio limits "
+                           f"allowed {approved}, below the smallest order the venue takes ({self._min_qty()})")
                 return
-            trimmed = {} if approved == qty else {"portfolio_trimmed_from": str(qty)}
-            self._submit(side, approved, "entry", reason, {**signal, **trimmed})
+            self._noted.discard(f"{what}_trimmed_below_minimum")
+            trimmed = approved != qty
+            count("trimmed" if trimmed else "sent")
+            if self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
+                                                                          if trimmed else {})}) and sent is not None:
+                sent(trimmed)
 
-        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send))
+        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees

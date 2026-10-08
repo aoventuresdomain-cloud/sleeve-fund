@@ -272,3 +272,49 @@ def test_a_gate_that_trims_sends_only_what_it_approved_and_says_so():
 def test_a_gate_that_refuses_sends_no_entry_and_no_exit():
     joined, _ = _portfolio_run("rsi_cross", {}, _Gate(D(0)))
     assert joined.fills is None or joined.fills.empty
+
+
+class _FirstOnly(_Gate):
+    """A gate that approves the first opening order in full and refuses every one after, as a halt would."""
+
+    def __call__(self, strategy, intent, ts):
+        super().__call__(strategy, intent, ts)
+        return SimpleNamespace(approved_qty=intent["qty"] if len(self.seen) == 1 else D(0))
+
+
+def _buys(result):
+    return [(o, r) for o, r in result.fills.iterrows() if str(r["side"]).upper().endswith("BUY")]
+
+
+BANDED = {"rebalance_band": 0.05}  # a weight model that adds to its holding by rebalance (QA F213-1)
+
+
+def test_an_approve_all_gate_trades_a_weight_models_additions_exactly_as_the_ordinary_run():
+    plain, _ = _portfolio_run("donchian", BANDED, None)
+    gate = _Gate()
+    joined, _ = _portfolio_run("donchian", BANDED, gate)
+    adds = [o for o, _ in _buys(plain) if plain.decisions[o]["intent"] == "rebalance"]
+    assert adds, "the model must add by rebalance for this to test anything"
+    cols = ["side", "filled_qty", "avg_px"]
+    assert joined.fills[cols].reset_index(drop=True).equals(plain.fills[cols].reset_index(drop=True))
+    assert len(gate.seen) == len(_buys(plain))  # every entry and every addition went through the gate
+    assert joined.portfolio_gate == {"entry_sent": len(_buys(plain)) - len(adds), "rebalance_sent": len(adds)}
+
+
+def test_an_addition_to_a_weight_models_holding_waits_for_the_gate_and_respects_a_halt():
+    gate = _FirstOnly()
+    joined, _ = _portfolio_run("donchian", BANDED, gate)
+    assert len(_buys(joined)) == 1, "an addition went out without the gate"
+    assert len(gate.seen) > 1 and joined.portfolio_gate["entry_sent"] == 1
+    assert joined.portfolio_gate.get("rebalance_refused", 0) + joined.portfolio_gate.get("entry_refused", 0) \
+        == len(gate.seen) - 1
+    assert joined.portfolio_gate.get("rebalance_refused", 0) >= 1  # the gate was asked about the additions
+
+
+def test_the_result_counts_refused_and_below_minimum_entries():
+    refused, _ = _portfolio_run("rsi_cross", {}, gate := _Gate(D(0)))
+    assert refused.portfolio_gate == {"entry_refused": len(gate.seen)} and gate.seen
+    tiny, _ = _portfolio_run("rsi_cross", {}, gate := _Gate(D("1e-12")))
+    assert tiny.portfolio_gate == {"entry_below_minimum": len(gate.seen)} and gate.seen
+    plain, _ = _portfolio_run("rsi_cross", {}, None)
+    assert plain.portfolio_gate == {}  # an ordinary run has no gate to count

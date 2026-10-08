@@ -59,11 +59,12 @@ def fill_price(close: Decimal, side: int, half_spread: float, drift_bp: float | 
 
 @dataclass(frozen=True)
 class Pending:
-    """One strategy's entry intent at a close, waiting for the gate pass."""
+    """One strategy's opening intent (an entry, or an addition to a holding) at a close, waiting for the gate pass."""
 
     strategy: str
     intent: Any  # the gate's Intent (P2-2), or any payload the submit callback understands
     submit: Callable[[Any, Any], None]  # (intent, decision) -> sends what the gate approved; never called on a refusal
+    refused: Callable[[Any, Any], None] | None = None  # (intent, decision) on a refusal, so the strategy can count it
 
 
 # The gate pass: (strategy, intent, ts_ns) -> a decision with .approved_qty (P2-2's check_order over the MemoryLedger).
@@ -106,6 +107,8 @@ class CloseBatch:
             decision = self.gate(p.strategy, p.intent, ts + BATCH_DELAY_NS)
             if getattr(decision, "approved_qty", 0) > 0:
                 p.submit(p.intent, decision)
+            elif p.refused is not None:
+                p.refused(p.intent, decision)
             out.append((p, decision))
         return out
 
