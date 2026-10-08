@@ -318,13 +318,25 @@ def portfolio_block(store, now: datetime | None = None) -> Why | None:
     """The whole fund's reason nothing opens (v2 P2-2: halted, paused for the day, or its book's mark older than 60 s),
     as a CHOKE cause, or None. In force on every paper or live journal (Store.portfolio_gate, which their startup
     requires): one with no state row has never been marked, so it is stale and blocks entries, with an alert (fail
-    closed, Advisor 8 Oct 06:10 UK). Only the journal's mode decides, never the row being absent."""
+    closed, Advisor 8 Oct 06:10 UK). Only the journal's mode decides, never the row being absent.
+    Read without the gate lock, which every tick, fill check and dashboard read would otherwise queue on; the lock is
+    taken only to tell a stale spell once. A state that can't be read is stale, never an error out of CHOKE (CR
+    F229-2)."""
     from sleeve_fund.gate_ledger import DbLedger
-    from sleeve_fund.portfolio.gate import entry_block
+    from sleeve_fund.portfolio.gate import block_reason, entry_block, stale_untold
 
     if not getattr(store, "portfolio_gate", False):
         return None
-    hit = entry_block(DbLedger(store, _no_positions), now or utcnow())
+    now = now or utcnow()
+    try:
+        led = DbLedger(store, _no_positions)
+        st = led.state()
+        hit = block_reason(st, now)
+        if hit is not None and hit[0] == "portfolio_state_stale" and stale_untold(st):
+            hit = entry_block(led, now)
+    except Exception as exc:  # noqa: BLE001 - fail closed: unchecked limits open nothing
+        return _cause("portfolio_stale", f"No new entries: the portfolio's state couldn't be read "
+                      f"({type(exc).__name__}: {exc}), so the portfolio limits can't be checked")
     if hit is None:
         return None
     code, lead = PORTFOLIO_CODES[hit[0]]

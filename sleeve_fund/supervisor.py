@@ -45,6 +45,7 @@ ALERT_EVERY = 12  # polls between alert sends and uptime pings: about a minute
 CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
+HALT_RETELL = timedelta(minutes=1)  # a holder still holding under a portfolio halt is told to flatten again after this
 MAX_BACKOFF = 300
 # Flattens a reset or a clean slate queues for one strategy before it stops asking and says the PM must close
 # it: a position below the venue's smallest order can't be closed by an order, and asking again every step
@@ -136,6 +137,7 @@ class Supervisor:
         # The portfolio gate on the exact journal; the supervisor never runs an entry check, so it reads no positions
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
+        self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
 
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
@@ -381,16 +383,37 @@ class Supervisor:
                 except NotImplementedError:
                     pass  # no holdings yet (P2-1b W2): the cache row waits; the state row above is the gate's
             if acted == "halt":
-                self._halt_every_strategy(st.halted)
+                self._flatten_told.clear()  # a new halt tells every holder at once
+        st = led.state()
+        if st.halted:
+            self._halt_every_strategy(st.halted, now)
+        else:
+            self._flatten_told.clear()
         sweep(led, now, self._order_live, self._cancel_order, is_acked=self._order_acked)
 
-    def _halt_every_strategy(self, why: str) -> None:
+    def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
-        path, once per halt; CHOKE blocks every entry from the state row until the PM resumes the portfolio."""
+        path; CHOKE blocks every entry from the state row until the PM resumes the portfolio. Asked on every poll while
+        the portfolio is halted, not only the one that halted it, so a holder a failed command skipped, or one still
+        holding after its flatten, is told again: never while a flatten waits for it, and at most once a minute (CR
+        F229-3). One strategy's failure never stops the rest."""
         reason = f"Portfolio halted: {why}"
         for s in self.store.sleeves():
-            if _holding(self.store, s):
+            told = self._flatten_told.get(s.name)
+            if not _holding(self.store, s):
+                self._flatten_told.pop(s.name, None)
+                continue
+            if told is not None and now - told < HALT_RETELL:
+                continue
+            try:
+                if any(c["command"] == "flatten" for c in self.store.pending_commands(s.name)):
+                    continue
                 self.store.command(s.name, "flatten", reason, actor="supervisor")
+                self._flatten_told[s.name] = now
+            except Exception as exc:  # noqa: BLE001 - asked again in a minute
+                self._flatten_told[s.name] = now
+                self.store.event(s.name, "error", "supervisor_error", "couldn't tell it to flatten for the portfolio "
+                                 f"halt, asked again in a minute: {exc!r}")
 
     def _order_live(self, order_id: str) -> bool:
         """Whether an order may still fill, read through the ledger's own transaction: inside the sweep's lock a second
