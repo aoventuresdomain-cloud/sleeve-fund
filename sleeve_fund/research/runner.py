@@ -194,6 +194,72 @@ def run_backtest(
     first_touch_flip: resolve a rule-builder first_touch the other way when a candle is ambiguous (true in an entry,
     false in an exit), for the G1 check on the worse of the two (Advisor, 6 Oct ~22:07). first_touch_count_from: its
     report counts only the candles closing from then on, so a study reads a window's test candles alone."""
+    plan = plan_run(strategy_name, prices, instrument, params, starting_capital, runtime, bar_minutes, exec_prices,
+                    exec_minutes, risk_profile, half_spread, progress, fees, warmup_prices, first_touch_flip,
+                    first_touch_count_from)
+    engine = new_engine(log_level)
+    legs = []
+    try:
+        legs.append(add_leg(engine, plan))
+        feed_legs(engine, legs)
+        return leg_result(engine, legs[0])
+    finally:
+        for leg in legs:
+            release_leg(leg)
+        engine.dispose()
+
+
+@dataclass
+class RunPlan:
+    """One strategy's run as run_backtest works it out before any engine exists: checked, with its fees, spread
+    and runtime settled. A portfolio run (research.portfolio_run) plans each strategy so and adds them all to one
+    engine, each on its own venue clone, so a strategy trades there exactly as it would alone."""
+
+    strategy_name: str
+    strategy_cls: type
+    config_cls: type
+    prices: pd.DataFrame
+    instrument: CurrencyPair
+    params: dict
+    starting_capital: float
+    runtime: object
+    risk_profile: str | None
+    bar_minutes: int
+    exec_prices: pd.DataFrame | None
+    exec_minutes: int
+    fees: FeeSchedule
+    series: SpreadSeries
+    half_spread: float
+    perp: bool
+    touches: bool
+    minutes_in: bool
+    fine: bool
+    start_ns: int
+    end_ns: int
+    warmup_prices: pd.DataFrame | None
+    first_touch_flip: bool
+    first_touch_count_from: pd.Timestamp | None
+
+
+@dataclass
+class Leg:
+    """A planned strategy added to an engine: the instrument as the engine lists it (the plan's own, or its venue
+    clone in a portfolio run), the strategy and its venue's fee model, and the bars it is fed."""
+
+    plan: RunPlan
+    instrument: CurrencyPair
+    strategy: object
+    fee_model: ScheduleFeeModel
+    feed: pd.DataFrame
+    feed_type: object
+    coarse: bool
+    exec_minutes: int | None
+
+
+def plan_run(strategy_name, prices, instrument, params=None, starting_capital=10_000.0, runtime=None,
+             bar_minutes=1440, exec_prices=None, exec_minutes=1, risk_profile=None, half_spread=None, progress=None,
+             fees=None, warmup_prices=None, first_touch_flip=False, first_touch_count_from=None) -> RunPlan:
+    """run_backtest's checks and settings, before the engine (its arguments, as it documents them)."""
     if strategy_name not in REGISTRY:
         raise KeyError(f"unknown strategy {strategy_name!r}; known: {sorted(REGISTRY)}")
     check_perp_sizing(strategy_name, params)
@@ -244,159 +310,211 @@ def run_backtest(
         # stops must rest at the simulated venue (as in every backtest), not wait for a trade that never
         # comes and go at the next close. Same bars, same stop, same fill, with or without a runtime.
         runtime.backtest = True
+    return RunPlan(strategy_name, strategy_cls, config_cls, prices, instrument, params, starting_capital, runtime,
+                   risk_profile, bar_minutes, exec_prices, exec_minutes, fees, series, half_spread, perp, touches,
+                   minutes_in, fine, start_ns, end_ns, warmup_prices, first_touch_flip, first_touch_count_from)
 
-    fee_model = ScheduleFeeModel(fees, half_spread=half_spread)
-    engine = BacktestEngine(
+
+def new_engine(log_level: str = "ERROR") -> BacktestEngine:
+    return BacktestEngine(
         BacktestEngineConfig(
             trader_id=TraderId.from_str("RESEARCH-001"),
             logging=LoggerConfig(stdout_level=getattr(LogLevel, log_level)),
         )
     )
-    try:
-        quote: Currency = instrument.quote_currency
-        base: Currency = instrument.base_currency
-        engine.add_venue(
-            venue=instrument.id.venue,
-            oms_type=OmsType.NETTING,
-            # A perp trades on margin (it can go short); the venue's leverage is set above every profile's
-            # cap so our own leverage and liquidation guards, not the simulated venue, decide.
-            account_type=AccountType.MARGIN if perp else AccountType.CASH,
-            default_leverage=markets.VENUE_LEVERAGE if perp else None,
-            base_currency=None,
-            starting_balances=_opening_balances(starting_capital, quote, base, runtime, perp),
-            fee_model=fee_model,
-            modules=[BarOpens(fee_model)],  # a stop filled in a bar that opened through the target: the target
-            fill_model=fill_model(),
-            # Within a bar, the extreme nearer the open trades first for orders resting here (a post-only
-            # entry, the stops). The stop and target don't race on it: the target is judged after the bar,
-            # so the stop goes first (Advisor NA-2, LongFlatStrategy._bar_target).
-            bar_adaptive_high_low_ordering=True,
-        )
-        engine.add_instrument(instrument)
-        if fine:
-            bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
-            feed, feed_type = exec_prices, bar_type_for(instrument, exec_minutes)
-            coarse = exec_minutes > 1
-        else:
-            bar_type = bar_type_for(instrument, bar_minutes)
-            feed, feed_type = prices, bar_type
-            # Bars alone: a minute bar is the finest there is, so only longer ones are booked pessimistically.
-            coarse, exec_minutes = bar_minutes > 1, None
-        feed = _book_volume(feed, instrument)
-        config = config_cls(
-            instrument_id=instrument.id,
-            bar_type=bar_type,
-            assumed_taker_fee=float(fees.taker),
-            assumed_half_spread=half_spread,  # the value at the start: a series then gives the one in force
-            volume_scale=BOOK_SHARE,
-            **params,
-        )
-        strategy = strategy_cls(config).attach_runtime(runtime)
-        if minutes_in:
-            strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
-        for node in getattr(getattr(strategy, "rules", None), "touches", ()):
-            node.flip = first_touch_flip
-            node.count_from = None if first_touch_count_from is None else int(pd.Timestamp(first_touch_count_from).value)
-        strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
-        if series.points:  # each bar's fills charge the measurement in force when it opened (BarOpens)
-            fee_model.spread_series = strategy.spread_series = series
-        # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
-        spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
-        strategy.settle_bars_needed = strategy_cls.warmup_needed(
-            {**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
-        if warmup_prices is not None and not warmup_prices.empty:
-            if warmup_prices.index[-1] >= prices.index[0]:
-                raise ValueError("warmup_prices must end before the backtest's first bar")
-            strategy.preload = list(to_bars(_book_volume(warmup_prices, instrument), instrument,
-                                            bar_type_for(instrument, bar_minutes)))
-        engine.add_strategy(strategy)
-        # Every resting stop is booked by the fee model with its slippage, and on bars too coarse to say what traded
-        # first inside one, pessimistically against the bar (P1-D13).
-        strategy.pessimistic = coarse
-        fee_model.exit_info = strategy._exit_booking
-        fee_model.now = strategy.clock.timestamp_ns
-        if coarse:
-            fee_model.bars = ExecBars(feed)
-        if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
-            built = decision_bars(exec_prices, bar_minutes, exec_minutes)
-            strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
-            thin = built[built["degraded"]]
-            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
-            part = built[built["missing"] > 0]
-            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
-        if "missing" in prices.columns:  # every bar's absent minutes, for the slower candles built from them (P1-4)
-            part = prices[prices["missing"].fillna(0).astype(int) > 0]
-            strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
-        if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
-            thin = prices[prices["degraded"].astype(bool)]
-            strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
-        if perp or strategy._portfolio is not None:  # the portfolio gate measures a stopless spot entry too (P2-7)
-            strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
-        # Fed in slices so memory stays at one slice of engine bars however long the run: five years
-        # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.
-        for i in range(0, len(feed), CHUNK_BARS):
-            engine.add_data(to_bars(feed.iloc[i:i + CHUNK_BARS], instrument, feed_type))
+
+
+def add_leg(engine: BacktestEngine, plan: RunPlan, instrument: CurrencyPair | None = None, before_add=None,
+            **config) -> Leg:
+    """Add the planned strategy to `engine` on `instrument` (default: the plan's own; a portfolio run passes the
+    plan's venue clone), with its own venue, account, fee model and bars. before_add(strategy): called before the
+    engine takes the strategy (a portfolio run joins its gate there). config: more strategy settings (an
+    order_id_tag, so several strategies in one engine keep their order ids apart)."""
+    instrument = instrument or plan.instrument
+    params, prices, runtime = plan.params, plan.prices, plan.runtime
+    exec_prices, exec_minutes, bar_minutes = plan.exec_prices, plan.exec_minutes, plan.bar_minutes
+    quote: Currency = instrument.quote_currency
+    base: Currency = instrument.base_currency
+    fee_model = ScheduleFeeModel(plan.fees, half_spread=plan.half_spread)
+    engine.add_venue(
+        venue=instrument.id.venue,
+        oms_type=OmsType.NETTING,
+        # A perp trades on margin (it can go short); the venue's leverage is set above every profile's
+        # cap so our own leverage and liquidation guards, not the simulated venue, decide.
+        account_type=AccountType.MARGIN if plan.perp else AccountType.CASH,
+        default_leverage=markets.VENUE_LEVERAGE if plan.perp else None,
+        base_currency=None,
+        starting_balances=_opening_balances(plan.starting_capital, quote, base, runtime, plan.perp),
+        fee_model=fee_model,
+        modules=[BarOpens(fee_model)],  # a stop filled in a bar that opened through the target: the target
+        fill_model=fill_model(),
+        # Within a bar, the extreme nearer the open trades first for orders resting here (a post-only
+        # entry, the stops). The stop and target don't race on it: the target is judged after the bar,
+        # so the stop goes first (Advisor NA-2, LongFlatStrategy._bar_target).
+        bar_adaptive_high_low_ordering=True,
+    )
+    engine.add_instrument(instrument)
+    if plan.fine:
+        bar_type = decision_bar_type(instrument, bar_minutes, exec_minutes)
+        feed, feed_type = exec_prices, bar_type_for(instrument, exec_minutes)
+        coarse = exec_minutes > 1
+    else:
+        bar_type = bar_type_for(instrument, bar_minutes)
+        feed, feed_type = prices, bar_type
+        # Bars alone: a minute bar is the finest there is, so only longer ones are booked pessimistically.
+        coarse, exec_minutes = bar_minutes > 1, None
+    feed = _book_volume(feed, instrument)
+    cfg = plan.config_cls(
+        instrument_id=instrument.id,
+        bar_type=bar_type,
+        assumed_taker_fee=float(plan.fees.taker),
+        assumed_half_spread=plan.half_spread,  # the value at the start: a series then gives the one in force
+        volume_scale=BOOK_SHARE,
+        **config,
+        **params,
+    )
+    strategy = plan.strategy_cls(cfg).attach_runtime(runtime)
+    if plan.minutes_in:
+        strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
+    for node in getattr(getattr(strategy, "rules", None), "touches", ()):
+        node.flip = plan.first_touch_flip
+        node.count_from = (None if plan.first_touch_count_from is None
+                           else int(pd.Timestamp(plan.first_touch_count_from).value))
+    strategy.fee_model = fee_model  # a target booked at its level (ScheduleFeeModel.booked)
+    if plan.series.points:  # each bar's fills charge the measurement in force when it opened (BarOpens)
+        fee_model.spread_series = strategy.spread_series = plan.series
+    # A model defined outside the library (a test's probe) has no SPEC: its params are all it has.
+    spec = getattr(importlib.import_module(plan.strategy_cls.__module__), "SPEC", None)
+    strategy.settle_bars_needed = plan.strategy_cls.warmup_needed(
+        {**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
+    warmup_prices = plan.warmup_prices
+    if warmup_prices is not None and not warmup_prices.empty:
+        if warmup_prices.index[-1] >= prices.index[0]:
+            raise ValueError("warmup_prices must end before the backtest's first bar")
+        strategy.preload = list(to_bars(_book_volume(warmup_prices, instrument), instrument,
+                                        bar_type_for(instrument, bar_minutes)))
+    if before_add is not None:
+        before_add(strategy)
+    engine.add_strategy(strategy)
+    # Every resting stop is booked by the fee model with its slippage, and on bars too coarse to say what traded
+    # first inside one, pessimistically against the bar (P1-D13).
+    strategy.pessimistic = coarse
+    fee_model.exit_info = strategy._exit_booking
+    fee_model.now = strategy.clock.timestamp_ns
+    if coarse:
+        fee_model.bars = ExecBars(feed)
+    if exec_prices is not None and not exec_prices.empty:  # the engine builds the decision bars from them: store rule
+        built = decision_bars(exec_prices, bar_minutes, plan.exec_minutes)
+        strategy.expect_bars(built.index.as_unit("ns").asi8.tolist())
+        thin = built[built["degraded"]]
+        strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+        part = built[built["missing"] > 0]
+        strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+    if "missing" in prices.columns:  # every bar's absent minutes, for the slower candles built from them (P1-4)
+        part = prices[prices["missing"].fillna(0).astype(int) > 0]
+        strategy.mark_missing(dict(zip(part.index.as_unit("ns").asi8.tolist(), part["missing"].astype(int))))
+    if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
+        thin = prices[prices["degraded"].astype(bool)]
+        strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
+    if strategy._portfolio is not None:
+        # The portfolio gate measures a stopless spot entry too, and from the window's first day: the ATR is read
+        # over the warm-up as well (Advisor 8 Oct 03:05, R5).
+        strategy.set_daily_atr(open_risk.daily_atr_lookup(
+            prices if warmup_prices is None or warmup_prices.empty else pd.concat([warmup_prices, prices])))
+    elif plan.perp:
+        strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
+    return Leg(plan, instrument, strategy, fee_model, feed, feed_type, coarse, exec_minutes)
+
+
+def feed_legs(engine: BacktestEngine, legs: list[Leg]) -> None:
+    """Run the engine over every leg's bars. Fed in slices so memory stays at one slice of engine bars however long
+    the run: five years of minutes at once is about 2.6 million bar objects. Streaming gives the same result. Each
+    slice covers the same span of time for every leg, so the engine never goes back in time between slices."""
+    if len(legs) == 1:
+        leg = legs[0]
+        for i in range(0, len(leg.feed), CHUNK_BARS):
+            engine.add_data(to_bars(leg.feed.iloc[i:i + CHUNK_BARS], leg.instrument, leg.feed_type))
             engine.run(streaming=True)
             engine.clear_data()
-        engine.end()
+    else:
+        stamps = sorted(set().union(*(leg.feed.index for leg in legs)))
+        for i in range(0, len(stamps), CHUNK_BARS):
+            lo, hi = stamps[i], stamps[min(i + CHUNK_BARS, len(stamps)) - 1]
+            for leg in legs:
+                part = leg.feed.loc[lo:hi]
+                if len(part):
+                    engine.add_data(to_bars(part, leg.instrument, leg.feed_type))
+            engine.run(streaming=True)
+            engine.clear_data()
+    engine.end()
 
-        fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
-        fills = _liquidations_booked(fills, strategy.liquidation_books)
-        account = engine.generate_account_report(instrument.id.venue)
-        if perp:
-            equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
-                                                    _opening_cash(starting_capital, runtime),
-                                                    list(strategy.insurance_log))
-        else:
-            equity, exposure = _mark_to_market(account, prices, quote.code, base.code, starting_capital)
-        fees_paid = _fees_paid(fills)
-        touched = strategy.first_touch_stats() if touches else {}
-        if touches and bar_minutes > 1 and not minutes_in and any(st["missing"] for st in touched.values()):
-            raise ValueError(
-                f"the first_touch rule needed the 1-minute bars of {sum(st['missing'] for st in touched.values())}"
-                " candles that reached both its levels, and the run had none: run it with those minutes (exec_prices, "
-                "exec_minutes = 1)")
-        return BacktestResult(
-            strategy=strategy_name,
-            params=params,
-            equity=equity,
-            exposure=exposure,
-            fills=fills,
-            fees_paid=fees_paid,
-            starting_capital=starting_capital,
-            decisions=dict(strategy.decisions),
-            risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
-            spread_paid=sum(fee_model.spread_paid.values()),
-            half_spread=half_spread,
-            spreads_used=series.report(start_ns, end_ns),
-            spread_text=series.text(start_ns, end_ns),
-            journal=runtime.store if risk_profile is not None else None,
-            funding=[_funding_row(strategy, ts, a, k) for ts, a, k in strategy.funding_log],
-            funding_marks=list(strategy.funding_marks),
-            funding_simulated=strategy._cfg.perp is not None and strategy._cfg.perp.funding_venue is None,
-            funding_schedule=_funding_schedule(strategy, instrument, prices),
-            **dict(zip(("funding_at_baseline", "funding_held", "funding_baseline_longest"),
-                       funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
-            insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
-            handler_errors=list(strategy.handler_errors),
-            unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
-                                if strategy.decisions.get(o, {}).get("unsettled")),
-            handler_error_count=strategy.handler_error_count,
-            labels=fills_label(exec_minutes, fee_model.intrabar) if coarse else [],
-            first_touch=touched,
-            reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, bar_minutes),
-            open_risk_binds=strategy.open_risk_binds,
-            open_risk_max=strategy.open_risk_max,
-            paper_refusal=paper_refusal(strategy_name, params, risk_profile),
-            portfolio_gate=dict(strategy.portfolio_gate),
-        )
-    finally:
-        if runtime is not None:
-            # The runtime's clock is a closure over the strategy, a reference cycle the garbage
-            # collector would otherwise free on whatever thread it runs on, which the engine forbids.
-            runtime.now = _utcnow
-        fee_model.exit_info = fee_model.now = None  # closures over the strategy: the same cycle
-        engine.dispose()
+
+def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
+    """The leg's BacktestResult, once the engine has run: what run_backtest returns for it."""
+    plan, strategy, fee_model, instrument = leg.plan, leg.strategy, leg.fee_model, leg.instrument
+    prices, runtime, starting_capital = plan.prices, plan.runtime, plan.starting_capital
+    fills = _spread_into_prices(engine.generate_order_fills_report(), fee_model.spread_paid, fee_model.fee_paid)
+    if fills is not None and not fills.empty and "instrument_id" in fills.columns:
+        fills = fills[fills["instrument_id"].astype(str) == str(instrument.id)]  # this leg's own, in one engine
+    fills = _liquidations_booked(fills, strategy.liquidation_books)
+    account = engine.generate_account_report(instrument.id.venue)
+    if plan.perp:
+        equity, exposure = _perp_mark_to_market(fills, strategy.funding_log, prices,
+                                                _opening_cash(starting_capital, runtime),
+                                                list(strategy.insurance_log))
+    else:
+        equity, exposure = _mark_to_market(account, prices, instrument.quote_currency.code,
+                                           instrument.base_currency.code, starting_capital)
+    fees_paid = _fees_paid(fills)
+    touched = strategy.first_touch_stats() if plan.touches else {}
+    if (plan.touches and plan.bar_minutes > 1 and not plan.minutes_in
+            and any(st["missing"] for st in touched.values())):
+        raise ValueError(
+            f"the first_touch rule needed the 1-minute bars of {sum(st['missing'] for st in touched.values())}"
+            " candles that reached both its levels, and the run had none: run it with those minutes (exec_prices, "
+            "exec_minutes = 1)")
+    return BacktestResult(
+        strategy=plan.strategy_name,
+        params=plan.params,
+        equity=equity,
+        exposure=exposure,
+        fills=fills,
+        fees_paid=fees_paid,
+        starting_capital=starting_capital,
+        decisions=dict(strategy.decisions),
+        risk_events=runtime.risk_events() if runtime is not None and runtime.backtest else [],
+        spread_paid=sum(fee_model.spread_paid.values()),
+        half_spread=plan.half_spread,
+        spreads_used=plan.series.report(plan.start_ns, plan.end_ns),
+        spread_text=plan.series.text(plan.start_ns, plan.end_ns),
+        journal=runtime.store if plan.risk_profile is not None else None,
+        funding=[_funding_row(strategy, ts, a, k) for ts, a, k in strategy.funding_log],
+        funding_marks=list(strategy.funding_marks),
+        funding_simulated=strategy._cfg.perp is not None and strategy._cfg.perp.funding_venue is None,
+        funding_schedule=_funding_schedule(strategy, instrument, prices),
+        **dict(zip(("funding_at_baseline", "funding_held", "funding_baseline_longest"),
+                   funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
+        insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
+        handler_errors=list(strategy.handler_errors),
+        unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
+                            if strategy.decisions.get(o, {}).get("unsettled")),
+        handler_error_count=strategy.handler_error_count,
+        labels=fills_label(leg.exec_minutes, fee_model.intrabar) if leg.coarse else [],
+        first_touch=touched,
+        reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
+        open_risk_binds=strategy.open_risk_binds,
+        open_risk_max=strategy.open_risk_max,
+        paper_refusal=paper_refusal(plan.strategy_name, plan.params, plan.risk_profile),
+        portfolio_gate=dict(strategy.portfolio_gate),
+    )
+
+
+def release_leg(leg: Leg) -> None:
+    if leg.plan.runtime is not None:
+        # The runtime's clock is a closure over the strategy, a reference cycle the garbage
+        # collector would otherwise free on whatever thread it runs on, which the engine forbids.
+        leg.plan.runtime.now = _utcnow
+    leg.fee_model.exit_info = leg.fee_model.now = None  # closures over the strategy: the same cycle
 
 
 def ranges_from(df: pd.DataFrame):
