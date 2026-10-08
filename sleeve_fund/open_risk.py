@@ -174,6 +174,19 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
     return rows
 
 
+def account_equity(store, account: str) -> float:
+    """The book the limit measures an account's open risk against: the current equity of every strategy on the
+    account that isn't archived (its starting balance before its first mark), as account_book adds it up."""
+    archived = store.archived()
+    book = 0.0
+    for s in store.sleeves():
+        if s.name in archived or store.account_of(s.name) != account:
+            continue
+        last = store.last_equity(s.name)
+        book += s.starting_balance if last is None else last["equity"]
+    return book
+
+
 def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[float, float, list[str]]:
     """Paper: (the book, the open risk of the other perp strategies on the account, those of them whose stop the
     price has gone through while still open). `atr_pct(sleeve)` gives a strategy's daily ATR share. Raises
