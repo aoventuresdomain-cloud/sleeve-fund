@@ -360,3 +360,17 @@ def test_f223_1_only_single_runs_count_in_the_trials_total_never_a_portfolio_run
     assert counts["evaluations"] == 1 and counts["ideas"] == 1
     assert TrialsRegister(_Rows([run])).counts() == {"ideas": 0, "variants": 0, "evaluations": 0,
                                                       "n_uncertain": False}
+
+
+def test_f223_1_on_the_real_store_a_recorded_run_is_kind_portfolio_run_and_outside_n(halted, tmp_path):
+    from sleeve_fund.research.trials import TrialsRegister
+    from sleeve_fund.store import Store
+
+    register = TrialsRegister(Store(f"sqlite:///{tmp_path}/t.db"))
+    a, b = _member_row(halted, "a"), _member_row(halted, "b")
+    register.store.add_trials([a, b])
+    run_id = halted.record(register, "synthetic-hourly", {"a": a["id"], "b": b["id"]})
+    stored = {t["id"]: t for t in register.store.trials()}
+    assert stored[run_id]["kind"] == "portfolio_run" and stored[a["id"]]["kind"] == "single"  # 0012's default
+    assert register.counts()["evaluations"] == 2 and run_id not in register.counted_ids()
+    assert halted.portfolio_runs_tried == register.portfolio_runs() == 1
