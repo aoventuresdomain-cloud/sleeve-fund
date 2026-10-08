@@ -562,16 +562,23 @@ class SleeveRuntime:
         liq = liquidation_event(self.store, self.name)
         if liq is None and self._ral_journaled(cmd):
             # The process died after journaling this reset and before marking it applied: finish it from the journal,
-            # whatever the halt's reason says now (a later halt can rewrite it; PE2 on #217), and never journal it
-            # twice or call it ignored.
+            # never journal it twice or call it ignored. Lift the halt only when it is the liquidation's (its reason,
+            # as clearing_action reads it) and no halt has been journaled since the reset (a reconciliation mismatch
+            # on the restart); any other halt stays for its own reason (HoE on #217: PE2, QA F217-2).
             self._lapse_resets_before(cmd)
             self.peak, self._day_open = equity, equity
             self.wiped_out, self.liquidated = False, None
             if self.status == "halted":
-                self._set("running", "")
+                reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+                why = self.store.sleeve(self.name).status_reason or ""
+                if (not fold(why).startswith(LIQUIDATED_WORDS)
+                        or self.store.sleeve_events_since(self.name, ("risk_halt", "reconcile_mismatch"), reset["id"])):
+                    words = f"the halt stays for its own reason: {why}"
+                else:
+                    self._set("running", "")
+                    words = "the halt it answered is lifted"
                 self.store.event(self.name, "info", "ral_finished",  # events.kind is String(32)
-                                 "reset after liquidation finished after a restart: the halt it answered is lifted",
-                                 ts=self.now())
+                                 f"reset after liquidation finished after a restart; {words}", ts=self.now())
             self.store.mark_applied(cmd["id"])
             return
         if liq is None:

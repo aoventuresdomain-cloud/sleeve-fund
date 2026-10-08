@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import insert
 
 from tests.test_ral_xfails import (  # noqa: F401  (store is a fixture)
+    GAP_PX,
     NAME,
     NEXT_DAY,
     RAL,
@@ -207,15 +208,64 @@ def test_a_stray_ral_with_nothing_to_reset_lapses_nothing(store, tmp_path):
     assert any(e["kind"] == "ral_ignored" for e in store.events(NAME, limit=50)), iid
 
 
-def test_a_crash_before_the_halt_lifts_is_finished_from_the_journal_whatever_the_halt_now_says(store, tmp_path,
-                                                                                                 monkeypatch):
-    """PE2 on #217: the recovery is keyed on the liquidation_reset journaled for this command, not on the halt's
-    reason, so a later halt that rewrote the reason (here a drawdown halt) can't leave the strategy halted with its
-    reset spent. The journal says what happened: one liquidation_reset, then ral_finished, never ral_ignored."""
+def _die_before_the_halt_lifts(store, monkeypatch, f):
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    real = SleeveRuntime._set
+    monkeypatch.setattr(SleeveRuntime, "_set", lambda self, status, *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("QA: dies")) if status == "running" else real(self, status, *a, **kw))
+    with pytest.raises(RuntimeError):
+        _runtime(store, NEXT_DAY, f.rem)
+    monkeypatch.setattr(SleeveRuntime, "_set", real)
+
+
+def test_a_crash_before_the_halt_lifts_keeps_a_halt_whose_reason_is_not_the_liquidations(store, tmp_path,
+                                                                                          monkeypatch):
+    """HoE on #217 (PE2, QA F217-2): the retry is keyed on the liquidation_reset journaled for this command, so it
+    always finishes the reset (earlier resets lapse, the command is applied, one liquidation_reset, never ral_ignored),
+    but lifts only a halt whose reason is the liquidation's. A drawdown halt that rewrote the reason stays for its own
+    reason, which Resume clears; the journal says so."""
+    f = _liquidate(tmp_path, store)
+    store.set_status(NAME, "halted", "drawdown 33.1% hit the 25.0% limit")
+    store.event(NAME, "error", "risk_halt", "drawdown 33.1% hit the 25.0% limit")
+    _stale_reset(store)
+    _ral(store, incident=_noted(store, f.liq))
+    _die_before_the_halt_lifts(store, monkeypatch, f)
+    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert rt.status == "halted" and store.sleeve(NAME).status_reason.startswith("drawdown")
+    assert not _liquidated(store)
+    assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
+    kinds = [e["kind"] for e in store.events(NAME, limit=50)]
+    assert "ral_ignored" not in kinds
+    finished = [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_finished"]
+    assert len(finished) == 1 and "stays for its own reason: drawdown" in finished[0]["message"]
+
+
+def test_a_halt_journaled_after_the_reset_is_not_lifted_by_the_retry(store, tmp_path, monkeypatch):
+    """PE2 on #217: the reset is journaled, the process dies before lifting the halt, and on the restart a
+    reconciliation mismatch halts it again before the command loop. That halt is new: the retry finishes the reset
+    (earlier resets lapse, the command is applied, one liquidation_reset) and leaves the halt for the PM."""
+    f = _liquidate(tmp_path, store)
+    _stale_reset(store)
+    _ral(store, incident=_noted(store, f.liq))
+    _die_before_the_halt_lifts(store, monkeypatch, f)
+    store.set_status(NAME, "halted", "reconciliation mismatch")
+    store.event(NAME, "error", "reconcile_mismatch", "QA: engine cash vs journal")
+    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert rt.status == "halted" and store.sleeve(NAME).status_reason == "reconciliation mismatch"
+    assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
+    finished = [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_finished"]
+    assert len(finished) == 1 and "stays for its own reason: reconciliation mismatch" in finished[0]["message"]
+
+
+def test_w2_a_retried_ral_does_not_lift_a_reconcile_halt_taken_on_the_restart(store, tmp_path, monkeypatch):
+    """The base strategy reconciles before its first tick after a restart (reconcile_due with no last_reconciled).
+    A crash after the RAL's journal entry, then a restart whose reconcile finds a mismatch: the retry finishes the
+    reset but must not lift the reconcile halt (no new trades on a book nobody can vouch for).
+    QA F217-2; source: quant-review/v2-p2/pr217/test_217_ral_window_probes.py (W2)."""
     from sleeve_fund.paper.runtime import SleeveRuntime
 
     f = _liquidate(tmp_path, store)
-    _stale_reset(store)
     _ral(store, incident=_noted(store, f.liq))
     real = SleeveRuntime._set
     monkeypatch.setattr(SleeveRuntime, "_set", lambda self, status, *a, **kw: (_ for _ in ()).throw(
@@ -223,9 +273,13 @@ def test_a_crash_before_the_halt_lifts_is_finished_from_the_journal_whatever_the
     with pytest.raises(RuntimeError):
         _runtime(store, NEXT_DAY, f.rem)
     monkeypatch.setattr(SleeveRuntime, "_set", real)
-    store.set_status(NAME, "halted", "drawdown 33.1% hit the 25.0% limit")
-    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
-    assert rt.status == "running" and store.sleeve(NAME).status == "running"
-    assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
-    kinds = [e["kind"] for e in store.events(NAME, limit=50)]
-    assert "ral_finished" in kinds and "ral_ignored" not in kinds
+    at = NEXT_DAY + timedelta(minutes=1)
+    rt = SleeveRuntime(store, NAME, now=lambda: at)
+    rt.on_start(0.0005)
+    assert rt.reconcile_due()
+    assert not rt.reconcile(cash=f.rem + 500.0, qty=0.0)  # a 500 cash gap: mismatch
+    assert store.sleeve(NAME).status_reason == "reconciliation mismatch"
+    rt.tick(equity=f.rem, cash=f.rem, qty=0.0, price=GAP_PX)
+    s = store.sleeve(NAME)
+    assert len(_ral_events(store)) == 1
+    assert (s.status, s.status_reason) == ("halted", "reconciliation mismatch"), (s.status, s.status_reason)
