@@ -330,7 +330,7 @@ def run_backtest(
         if "degraded" in prices.columns:  # bars built with too many minutes missing: no entries on them (board 5a)
             thin = prices[prices["degraded"].astype(bool)]
             strategy.mark_degraded(dict(zip(thin.index.as_unit("ns").asi8.tolist(), thin["missing"].astype(int))))
-        if perp:
+        if perp or strategy._portfolio is not None:  # the portfolio gate measures a stopless spot entry too (P2-7)
             strategy.set_daily_atr(open_risk.daily_atr_lookup(prices))
         # Fed in slices so memory stays at one slice of engine bars however long the run: five years
         # of minutes at once is about 2.6 million bar objects. Streaming gives the same result.

@@ -3,6 +3,7 @@ close + 1 ns in a fixed strategy order, and the one fill-cost hook. From the P2-
 
 import ast
 import inspect
+from datetime import datetime, timezone
 from decimal import Decimal as D
 from types import SimpleNamespace
 
@@ -15,14 +16,17 @@ from nautilus_trader.trading import Strategy
 
 from sleeve_fund.data import bar_type_for, synthetic_ohlcv, to_bars
 from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
+from sleeve_fund.portfolio.limits import LIMITS, Holding
 from sleeve_fund.research import portfolio
 from sleeve_fund.research.portfolio import (
     BATCH_DELAY_NS,
     CloseBatch,
     Pending,
+    PortfolioGate,
     clone_instrument,
     clone_venue,
     fill_price,
+    gate_intent,
     strategy_order,
 )
 
@@ -339,3 +343,123 @@ def test_a_trimmed_entry_of_a_weight_model_is_topped_up_on_the_next_bar():
     target = first["signal"]["target_weight"]
     assert abs(then["signal"]["to_weight"] - target) < BANDED["rebalance_band"] * target  # the target barely moved
     assert then["signal"]["from_weight"] < 0.6 * target  # what the trimmed entry actually holds
+
+
+# --- M3: P2-2's gate over the MemoryLedger, with reservations held for each order's life ----------------------------
+
+_ORDER = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
+              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+T0 = int(datetime(2026, 10, 8, 12, tzinfo=timezone.utc).timestamp() * 1e9)
+
+
+def test_the_gates_order_is_priced_at_the_expected_fill_and_counted_as_the_held_position_would_be():
+    """F213-3 to F213-5: the Intent's price is the hook's expected fill (never the raw close), all Decimal; a perp posts
+    price / leverage; a stop risks its distance from the fill; with no stop the risk is the stopless measure from the
+    daily ATR, max(10%, 3 x ATR), and with no ATR the order can't be measured."""
+    spot = gate_intent(_ORDER)
+    assert spot.underlying == "BTC" and spot.price == D("100.05") and spot.qty == D(2)
+    assert spot.margin_per_unit == D("100.05") and spot.risk_per_unit == D("100.05") * D("0.02")
+    perp = gate_intent({**_ORDER, "side": -1, "price": D("99.95"), "leverage": 2.0})
+    assert perp.side == -1 and perp.margin_per_unit == D("99.95") / 2 and perp.risk_per_unit == D("99.95") * D("0.02")
+    assert gate_intent({**_ORDER, "stop_frac": None, "atr_pct": 0.05}).risk_per_unit == D("100.05") * D("0.15")
+    assert gate_intent({**_ORDER, "stop_frac": None, "atr_pct": 0.01}).risk_per_unit == D("100.05") * D("0.1")
+    with pytest.raises(ValueError):
+        gate_intent({**_ORDER, "stop_frac": None})
+    with pytest.raises(TypeError):
+        gate_intent({**_ORDER, "price": 100.05})
+
+
+def test_the_gate_reserves_what_it_approves_so_the_next_strategy_sees_it_until_the_order_closes():
+    gate = PortfolioGate(lambda ts: (D(1000), ()))
+    a = gate("a", {**_ORDER, "qty": D(4)}, T0)  # 400.20 long BTC of the 500 net limit
+    assert a.decision.outcome == "approved" and a.approved_qty == D(4)
+    b = gate("b", {**_ORDER, "qty": D(4)}, T0)  # a's reservation counts as filled: 99.80 of room, 0.997 at 100.05
+    assert b.decision.outcome == "trimmed" and b.decision.limit_hit == "net_instrument" and b.approved_qty == D("0.997")
+    a.attach("O-a")
+    a.filled(D(1))
+    assert gate.ledger.reservations()[0].qty == D(3) and gate.ledger.reservations()[0].order_id == "O-a"
+    a.release("fill")
+    b.release("cancel")
+    assert not gate.ledger.reservations() and gate.ledger.released == [(1, "fill"), (2, "cancel")]
+    assert [r.seq for r in gate.ledger.records] == [1, 2]
+
+
+def test_a_drawdown_halt_from_the_book_blocks_the_entry_and_an_unreadable_order_fails_closed():
+    equity = {"now": D(1000)}
+    gate = PortfolioGate(lambda ts: (equity["now"], ()))
+    assert gate.mark(T0) is None
+    equity["now"] = D(840)  # 16% below the high-water mark
+    halted = gate("a", _ORDER, T0 + 10**9)
+    assert halted.decision.limit_hit == "halt" and halted.approved_qty == 0 and not gate.ledger.reservations()
+    fresh = PortfolioGate(lambda ts: (D(1000), ()))
+    bad = fresh("a", {**_ORDER, "stop_frac": None}, T0)  # stopless with no daily ATR
+    assert bad.approved_qty == 0 and "couldn't run" in bad.decision.reason
+    assert fresh.ledger.alerts[0][0] == "portfolio_check_failed" and not fresh.ledger.records
+    held = PortfolioGate(lambda ts: (D(1000), (Holding("BTC", D(1400), D(1400), D(10)),)))
+    assert held("a", _ORDER, T0).decision.outcome == "rejected"  # held positions count: 1.4x long BTC already
+    assert held.ledger.records[-1].decision.limit_hit == "net_instrument"
+
+
+def _gated_run(model: str, params: dict, equity: D):
+    gate = PortfolioGate(lambda ts: (equity, ()))
+    result, batch = _portfolio_run(model, params, gate)
+    return result, gate
+
+
+@pytest.mark.parametrize("params", [dict(), dict(market="perp", allow_short=True)], ids=["spot", "perp"])
+def test_the_real_gate_with_room_to_spare_trades_as_the_ordinary_run_and_releases_every_reservation(params):
+    plain, _ = _portfolio_run("rsi_cross", params, None)
+    joined, gate = _gated_run("rsi_cross", params, D(10**9))
+    cols = ["side", "filled_qty", "avg_px"]
+    assert _entries(plain)
+    assert joined.fills[cols].reset_index(drop=True).equals(plain.fills[cols].reset_index(drop=True))
+    records = gate.ledger.records
+    assert len(records) == len(_entries(plain)) and all(r.decision.outcome == "approved" for r in records)
+    assert not gate.ledger.reservations()
+    assert [why for _, why in gate.ledger.released] == ["fill"] * len(records)
+    for (oid, _), r in zip(_entries(joined), records):  # F213-3: the gate saw the expected fill, not the close
+        close = D(repr(float(joined.decisions[oid]["signal"]["close"])))
+        assert r.intent.price == fill_price(close, r.intent.side, joined.half_spread) != close
+
+
+def test_the_real_gate_trims_an_entry_to_the_books_limit_and_the_order_fills_at_that_size():
+    joined, gate = _gated_run("rsi_cross", {}, D(1000))
+    trims = [r for r in gate.ledger.records if r.decision.outcome == "trimmed"]
+    assert trims and all(r.decision.limit_hit in LIMITS for r in trims)
+    for (oid, row), r in zip(_entries(joined), gate.ledger.records):
+        assert D(str(row["filled_qty"])) == r.decision.approved_qty
+        assert r.decision.approved_qty * r.intent.price <= D(1500)
+    assert not gate.ledger.reservations()
+
+
+@pytest.mark.parametrize("status, reason", [("FILLED", "fill"), ("REJECTED", "reject"), ("DENIED", "reject"),
+                                            ("CANCELED", "cancel"), ("EXPIRED", "cancel")])
+def test_an_order_that_closes_releases_its_reservation_for_the_reason_its_status_gives(status, reason):
+    from nautilus_trader.model import OrderStatus
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    gate = PortfolioGate(lambda ts: (D(1000), ()))
+    gated = gate("a", _ORDER, T0)
+    order = SimpleNamespace(status=getattr(OrderStatus, status), is_closed=False, filled_qty=Quantity.from_str("0"))
+    me = SimpleNamespace(_reserved={}, cache=SimpleNamespace(order=lambda coid: order))
+    me._release_reservation = lambda coid: LongFlatStrategy._release_reservation(me, coid)
+    LongFlatStrategy._hold_reservation(me, gated, "O-1")
+    assert gate.ledger.reservations()[0].order_id == "O-1" and "O-1" in me._reserved
+    me._cancel_on_accept, me._pending_exit = set(), None
+    LongFlatStrategy._resume_exit(me, "O-1")  # every order-closed handler ends here
+    assert not gate.ledger.reservations() and gate.ledger.released == [(1, reason)] and not me._reserved
+
+
+def test_an_order_filled_while_it_was_being_sent_settles_its_reservation_at_once():
+    from nautilus_trader.model import OrderStatus
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    gate = PortfolioGate(lambda ts: (D(1000), ()))
+    gated = gate("a", _ORDER, T0)
+    order = SimpleNamespace(status=OrderStatus.FILLED, is_closed=True, filled_qty=Quantity.from_str("2"))
+    me = SimpleNamespace(_reserved={}, cache=SimpleNamespace(order=lambda coid: order))
+    me._release_reservation = lambda coid: LongFlatStrategy._release_reservation(me, coid)
+    LongFlatStrategy._hold_reservation(me, gated, "O-1")
+    assert not gate.ledger.reservations() and gate.ledger.released == [(1, "fill")] and not me._reserved

@@ -733,6 +733,7 @@ class LongFlatStrategy(Strategy):
         # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
+        self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -2894,13 +2895,22 @@ class LongFlatStrategy(Strategy):
         if self._portfolio is None:
             self._submit(side, qty, what, reason, signal)
             return
-        from sleeve_fund.research.portfolio import Pending
+        from sleeve_fund.research.portfolio import Pending, fill_price
 
         batch, name = self._portfolio
         if self._deciding_bar is not None:
             signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
-        intent = {"side": 1 if side == OrderSide.BUY else -1, "qty": qty, "price": signal["close"],
-                  "stop_frac": self._stop_frac, "what": what}
+        s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
+        base = getattr(self.instrument, "base_currency", None)
+        # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
+        # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
+        intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
+                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
+                  "instrument": str(base.code) if base is not None else str(self._cfg.instrument_id.symbol),
+                  "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
+                  if self._margin else None,
+                  "atr_pct": None if self._stop_frac else
+                  self._daily_atr.get((self.clock.timestamp_ns() - 1) // DAY_NS * DAY_NS)}
 
         def count(outcome: str) -> None:
             key = f"{what}_{outcome}"
@@ -2912,15 +2922,46 @@ class LongFlatStrategy(Strategy):
                 count("below_minimum")
                 self._note(f"{what}_trimmed_below_minimum", f"{what.capitalize()} skipped: the portfolio limits "
                            f"allowed {approved}, below the smallest order the venue takes ({self._min_qty()})")
+                if hasattr(decision, "release"):
+                    decision.release("cancel")  # never sent: its room goes back to the book
                 return
             self._noted.discard(f"{what}_trimmed_below_minimum")
             trimmed = approved != qty
             count("trimmed" if trimmed else "sent")
-            if self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
-                                                                          if trimmed else {})}) and sent is not None:
+            if not self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
+                                                                              if trimmed else {})}):
+                if hasattr(decision, "release"):
+                    decision.release("reject")
+                return
+            self._hold_reservation(decision, self._last_submitted)
+            if sent is not None:
                 sent(trimmed)
 
         batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+
+    def _hold_reservation(self, gated, coid: str) -> None:
+        """A portfolio run: the gate's reservation for an order now sent lives as long as the order (gate.check_order).
+        Its fills reduce it and its close releases it (_release_reservation); an order the venue already filled or
+        closed while it was being sent is settled here."""
+        if not hasattr(gated, "attach"):
+            return
+        gated.attach(coid)
+        self._reserved[coid] = gated
+        order = self.cache.order(ClientOrderId(coid))
+        if order is not None and order.filled_qty.as_decimal() > 0:
+            gated.filled(order.filled_qty.as_decimal())
+        if order is not None and order.is_closed:
+            self._release_reservation(coid)
+
+    def _release_reservation(self, coid: str) -> None:
+        """The order closed: release what is left of its reservation, for the reason its status gives."""
+        gated = self._reserved.pop(coid, None)
+        if gated is None:
+            return
+        order = self.cache.order(ClientOrderId(coid))
+        status = order.status if order is not None else None
+        gated.release("fill" if status == OrderStatus.FILLED else
+                      "reject" if status in (OrderStatus.REJECTED, OrderStatus.DENIED) else "cancel")
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
@@ -4682,6 +4723,7 @@ class LongFlatStrategy(Strategy):
 
     def _resume_exit(self, coid: str) -> None:
         """An order closed: if a sell was waiting for every working order to close, send it now."""
+        self._release_reservation(coid)
         self._cancel_on_accept.discard(coid)
         if self._pending_exit is not None and not self._working():
             intent, reason, values = self._pending_exit
@@ -4796,6 +4838,8 @@ class LongFlatStrategy(Strategy):
         coid = str(event.client_order_id)
         order = self.cache.order(event.client_order_id)
         done = order is None or order.is_closed
+        if coid in self._reserved:  # what filled is held now, so it leaves the portfolio reservation
+            self._reserved[coid].filled(event.last_qty.as_decimal())
         if coid == self._restore_id:
             # The carried-over position is back at the simulated venue, at today's price: keep the journal's
             # cash by taking up the difference from the journal's entry. Not a trade, so not journaled.
