@@ -219,26 +219,33 @@ def _die_before_the_halt_lifts(store, monkeypatch, f):
     monkeypatch.setattr(SleeveRuntime, "_set", real)
 
 
-def test_a_crash_before_the_halt_lifts_keeps_a_halt_whose_reason_is_not_the_liquidations(store, tmp_path,
-                                                                                          monkeypatch):
-    """HoE on #217 (PE2, QA F217-2): the retry is keyed on the liquidation_reset journaled for this command, so it
-    always finishes the reset (earlier resets lapse, the command is applied, one liquidation_reset, never ral_ignored),
-    but lifts only a halt whose reason is the liquidation's. A drawdown halt that rewrote the reason stays for its own
-    reason, which Resume clears; the journal says so."""
+def test_the_reset_lifts_the_liquidations_halt(store, tmp_path):
+    """F217-4, the plain case (Advisor 03:06 UK): a liquidation halt only, then the reset: the reset lifts it."""
+    f = _liquidate(tmp_path, store)
+    _ral(store, incident=_noted(store, f.liq))
+    rt = _runtime(store, NEXT_DAY, f.rem)
+    assert rt.status == "running" and store.sleeve(NAME).status == "running" and not _liquidated(store)
+    assert not [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_halt_kept"]
+
+
+def test_the_reset_keeps_a_drawdown_halt_journaled_after_the_liquidation_until_a_resume(store, tmp_path):
+    """F217-4 (Advisor 03:06 UK, MUST FIX): the reset lifts only the halt its liquidation raised. A drawdown halt
+    journaled after the liquidation stays: the reset is done (one liquidation_reset, earlier resets lapse, the command
+    applied) and the journal says the halt stays. The PM's Resume then lifts it."""
     f = _liquidate(tmp_path, store)
     store.set_status(NAME, "halted", "drawdown 33.1% hit the 25.0% limit")
     store.event(NAME, "error", "risk_halt", "drawdown 33.1% hit the 25.0% limit")
     _stale_reset(store)
     _ral(store, incident=_noted(store, f.liq))
-    _die_before_the_halt_lifts(store, monkeypatch, f)
-    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    rt = _runtime(store, NEXT_DAY, f.rem)
     assert rt.status == "halted" and store.sleeve(NAME).status_reason.startswith("drawdown")
-    assert not _liquidated(store)
-    assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
-    kinds = [e["kind"] for e in store.events(NAME, limit=50)]
-    assert "ral_ignored" not in kinds
-    finished = [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_finished"]
-    assert len(finished) == 1 and "stays for its own reason: drawdown" in finished[0]["message"]
+    assert not _liquidated(store) and not store.pending_commands(NAME) and not _open_resets(store)
+    assert len(_ral_events(store)) == 1
+    kept = [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_halt_kept"]
+    assert len(kept) == 1 and "stays for its own reason until a Resume: drawdown" in kept[0]["message"]
+    store.command(NAME, "resume", "QA: drawdown checked")
+    rt = _runtime(store, NEXT_DAY + timedelta(minutes=1), f.rem)
+    assert rt.status == "running" and store.sleeve(NAME).status == "running"
 
 
 def test_a_halt_journaled_after_the_reset_is_not_lifted_by_the_retry(store, tmp_path, monkeypatch):
@@ -255,7 +262,7 @@ def test_a_halt_journaled_after_the_reset_is_not_lifted_by_the_retry(store, tmp_
     assert rt.status == "halted" and store.sleeve(NAME).status_reason == "reconciliation mismatch"
     assert not store.pending_commands(NAME) and not _open_resets(store) and len(_ral_events(store)) == 1
     finished = [e for e in store.events(NAME, limit=50) if e["kind"] == "ral_finished"]
-    assert len(finished) == 1 and "stays for its own reason: reconciliation mismatch" in finished[0]["message"]
+    assert len(finished) == 1 and "stays for its own reason until a Resume: reconciliation mismatch" in finished[0]["message"]
 
 
 def test_w2_a_retried_ral_does_not_lift_a_reconcile_halt_taken_on_the_restart(store, tmp_path, monkeypatch):
