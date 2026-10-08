@@ -55,6 +55,35 @@ def test_restart_killed_10_s_after_a_close_before_its_decision_exits_once_on_tha
     assert not [o for o in run.orders if o["intent"] == "entry" and o["order_id"] != "O-held"]
 
 
+@pytest.mark.parametrize("perp, side", [(False, 1), (True, -1)])
+def test_restart_a_barless_stop_sent_after_a_close_does_not_mark_that_close_decided(perp, side, monkeypatch):
+    """Pin 6 (CR206-1): a stop order with no bar of its own, journaled at 00:15:03, a few seconds after the 00:15 close,
+    is the newest order; the process was killed before the 00:15 candle was decided (heartbeat 00:14:50), and that
+    close said exit. Back at 00:15:40: one market exit, "Late exit, missed candle 00:15", before the 00:16 close."""
+    from datetime import datetime
+
+    from test_hub_146_qa import M, START, S, flat_prices, restart
+
+    from sleeve_fund.paper import runtime as rt
+
+    real = rt.SleeveRuntime
+
+    def with_stop(store, name, **kw):
+        at = datetime.fromtimestamp((START + 15 * M + 3 * S) / 1e9, tz=timezone.utc)
+        store.record_order(name, order_id="O-stop", side="SELL" if side > 0 else "BUY", qty=0.05, intent="stop_loss",
+                           reason="stop re-placed", order_type="STOP_MARKET", ts=at)
+        store.update_order("O-stop", status="canceled")
+        return real(store, name, **kw)
+
+    monkeypatch.setattr(rt, "SleeveRuntime", with_stop)
+    run = restart(flat_prices(30), 10, 15 + 40 / 60, heartbeat=14 + 50 / 60, side=side, perp=perp, leave=15,
+                  warmup=30, stop=None)
+    exits = [o for o in run.orders if o["intent"] == "exit"]
+    assert len(exits) == 1 and exits[0]["reason"] == "Late exit, missed candle 00:15", exits
+    sent = exits[0]["ts"] if exits[0]["ts"].tzinfo else exits[0]["ts"].replace(tzinfo=timezone.utc)
+    assert sent.timestamp() * 1e9 < START + 16 * M
+
+
 @pytest.mark.parametrize("lag_s, opens", [(30, True), (120, False)])
 def test_running_a_late_bar_opens_under_90_s_and_is_skipped_past_it(lag_s, opens):
     """Pins 3 and 4: no restart, every bar `lag_s` late."""
