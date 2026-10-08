@@ -318,3 +318,24 @@ def test_the_result_counts_refused_and_below_minimum_entries():
     assert tiny.portfolio_gate == {"entry_below_minimum": len(gate.seen)} and gate.seen
     plain, _ = _portfolio_run("rsi_cross", {}, None)
     assert plain.portfolio_gate == {}  # an ordinary run has no gate to count
+
+
+def test_a_trimmed_entry_of_a_weight_model_is_topped_up_on_the_next_bar():
+    """CR213-1: the band compares the target with what is actually held after a trim, not with the target itself.
+    Here the target moves less than the band the next day, so only that comparison can send the addition."""
+
+    class TrimFirst(_Gate):
+        def __call__(self, strategy, intent, ts):
+            super().__call__(strategy, intent, ts)
+            return SimpleNamespace(approved_qty=intent["qty"] / 2 if len(self.seen) == 1 else intent["qty"])
+
+    joined, _ = _portfolio_run("donchian", BANDED, TrimFirst())
+    (entry, _), (add, row) = list(joined.fills.iterrows())[:2]
+    first, then = joined.decisions[entry], joined.decisions[add]
+    assert first["intent"] == "entry" and "portfolio_trimmed_from" in first["signal"]
+    assert then["intent"] == "rebalance" and str(row["side"]).upper().endswith("BUY")
+    day = pd.Timedelta(days=1)
+    assert pd.Timestamp(then["signal"]["bar"]["close_ts"]) - pd.Timestamp(first["signal"]["bar"]["close_ts"]) == day
+    target = first["signal"]["target_weight"]
+    assert abs(then["signal"]["to_weight"] - target) < BANDED["rebalance_band"] * target  # the target barely moved
+    assert then["signal"]["from_weight"] < 0.6 * target  # what the trimmed entry actually holds

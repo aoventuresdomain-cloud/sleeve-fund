@@ -2558,7 +2558,10 @@ class LongFlatStrategy(Strategy):
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
-            self._buy_all(bar, reason, {**values, **extra, "close": close}, weight=min(max(float(raw), 0.0), 1.0))
+            # In a portfolio run the gate may trim the entry after this (CR213-1): the held weight is then re-read
+            # from what is actually held, so the band can top it up.
+            self._buy_all(bar, reason, {**values, **extra, "close": close}, weight=min(max(float(raw), 0.0), 1.0),
+                          sent=lambda trimmed: trimmed and setattr(self, "_held_w", None))
             self._held_w = w
         elif w == 0 and is_long:
             reason, values = self.explain(bar, False)
@@ -2778,7 +2781,7 @@ class LongFlatStrategy(Strategy):
                 self.runtime.store.merge_order_signal(watched[0], {"triggered_order": oid})
 
     def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None,
-                 weight: float = 1.0) -> None:
+                 weight: float = 1.0, sent=None) -> None:
         account = self._account()
         if account is None:
             self.log.warning("no account yet; skipping buy")
@@ -2837,7 +2840,7 @@ class LongFlatStrategy(Strategy):
             signal["tp_frac"] = round(self._tp_frac, 6)
         if self._has_exits:
             signal["stop_cfg"] = self._stop_cfg()
-        self._send_entry(OrderSide.BUY, qty, reason, signal)
+        self._send_entry(OrderSide.BUY, qty, reason, signal, sent=sent)
 
     def _loss_at_stop(self, side: int = 1) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
