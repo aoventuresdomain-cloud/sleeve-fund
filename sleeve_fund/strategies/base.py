@@ -1602,14 +1602,16 @@ class LongFlatStrategy(Strategy):
         if self._last_alive is not None:
             # The last candle the journal shows decided. The tick timer stamps the heartbeat on its own, so a close up
             # to DECIDE_WINDOW_NS before it may not have been decided yet (R203-1), nor one after the last market data
-            # the process saw (it heartbeats through a hub outage). An order sent after a close was decided on it.
+            # the process saw (it heartbeats through a hub outage). The newest order's own candle was decided (CR206-1:
+            # its close, not when it was sent: a stop sent inside the next candle says nothing of that candle's close).
             # Counting a decided candle missed changes nothing: a missed candle only exits, only when it says the
             # held side is wrong, and a decided exit left its order. A first start missed nothing.
             alive = _ns(self._last_alive)
             if self._last_seen is not None:
                 alive = min(alive, _ns(self._last_seen))
             decided = (alive - DECIDE_WINDOW_NS) // step * step
-            self._missed_after = max([decided] + [_ns(o["ts"]) for o in orders[:1]])
+            bars = [((o.get("signal") or {}).get("bar") or {}).get("close_ts") for o in orders[:1]]
+            self._missed_after = max([decided] + [_ns(datetime.fromisoformat(t)) for t in bars if t])
         at = next((i for i, o in enumerate(orders) if o["intent"] == "entry"), None)
         qty = self.runtime.book["qty"]
         held = {"side": 1 if qty > 0 else -1, "bar": None, "step": step, "lock_ns": None, "on": False,

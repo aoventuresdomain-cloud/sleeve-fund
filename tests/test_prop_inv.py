@@ -311,7 +311,8 @@ def _largest_drift():
 
     if SIZE_DRIFT["rel"]:
         warnings.warn(f"PROP-INV I5 largest entry size difference after a restart {SIZE_DRIFT['rel']:.4%} (R-I5-4); "
-                      f"bound {QTY_REL:.1%} until it is fixed", stacklevel=1)
+                      + ("bound: within a cent of notional (SIZE_STRICT)" if SIZE_STRICT else f"bound {QTY_REL:.1%} until it is fixed"),
+                      stacklevel=1)
     if FEE_DRIFT["cents"]:
         warnings.warn(f"PROP-INV I5 largest fee difference after a restart {FEE_DRIFT['cents']} cents over "
                       f"{FEE_DRIFT['fills']} fills (R-I5-3); bound 1 cent a fill until CASH-ONE-PATH", stacklevel=1)
