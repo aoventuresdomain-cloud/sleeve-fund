@@ -293,3 +293,22 @@ def test_a_run_is_one_trials_row_of_kind_portfolio_run_listing_each_members_tria
     assert listed == {"a": "t-a", "b": members[0]["id"]} and len(members) == 1  # b had no row yet: it gets one
     assert run["sharpe"] == pytest.approx(halted.summary()["sharpe"])
     assert halted.summary()["days"] == len(halted.book.resample("1D").last()) - 1  # the whole window (R3)
+
+
+def test_f223_1_only_single_runs_count_in_the_trials_total_never_a_portfolio_run_or_an_ablation(halted):
+    from sleeve_fund.research.trials import TrialsRegister
+
+    class Rows:  # the store's trials(), with and without the kind column (migration 0012)
+        def __init__(self, rows):
+            self.rows = [{"status": "ok", **r} for r in rows]  # the column's default when a row has none
+
+        def trials(self, idea_hash=None):
+            return [r for r in self.rows if idea_hash is None or r["idea_hash"] == idea_hash]
+
+    run, member = halted.trials_rows("synthetic-hourly", member_trial_ids={"a": "t-a"})
+    ablation = {**member, "id": "t-abl", "kind": "ablation"}
+    before_0012 = {k: v for k, v in member.items() if k != "kind"}
+    counts = TrialsRegister(Rows([run, ablation, before_0012])).counts()
+    assert counts["evaluations"] == 1 and counts["ideas"] == 1
+    assert TrialsRegister(Rows([run])).counts() == {"ideas": 0, "variants": 0, "evaluations": 0,
+                                                     "n_uncertain": False}

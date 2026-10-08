@@ -58,9 +58,12 @@ class TrialsRegister:
         return row["id"]
 
     def _counted(self, idea_hash: str | None = None) -> list[dict]:
-        """Every evaluation that counts: not benchmarks, and not runs deliberately marked as engineering
-        (fixtures), which nothing marks by default (Advisor, 6 Oct 2026)."""
-        return [t for t in self.store.trials(idea_hash) if t["family"] != "benchmark" and t["source"] != "engineering"]
+        """Every evaluation that counts: not benchmarks, not runs deliberately marked as engineering (fixtures),
+        which nothing marks by default (Advisor, 6 Oct 2026), and only kind 'single': an ablation or a portfolio run
+        reuses settings already counted where they were tried (Advisor, 7 Oct 2026; CR F223-1). A row from before
+        trials.kind existed is a single run."""
+        return [t for t in self.store.trials(idea_hash) if t["family"] != "benchmark" and t["source"] != "engineering"
+                and t.get("kind", "single") == "single"]
 
     def counts(self, idea_hash: str | None = None) -> dict:
         """ideas: distinct ideas; variants: distinct (definition, indicator code, dataset); evaluations: rows.
