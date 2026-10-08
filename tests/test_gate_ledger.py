@@ -290,6 +290,37 @@ def test_da_f219_1_two_fills_at_once_lose_neither_and_a_fill_waits_for_the_relea
     assert (money(row.remaining_qty), row.release_reason) == (D("0.04"), "cancel")
 
 
+def test_hoqa_f219_q1_a_stalled_lock_holder_fails_the_check_closed_within_a_bounded_wait():
+    """Postgres (HoQA G1): another process holds the gate's lock, stalled, not dead. The entry check fails closed as
+    lock_error within the lock timeout, not after an unbounded wait, and leaves no reservation."""
+    if not PG:
+        pytest.skip("the advisory lock is Postgres's")
+    import threading
+
+    ledger = _marked()
+    out = {}
+    with ledger.engine.connect() as holder, holder.begin():
+        holder.execute(text("SELECT pg_advisory_xact_lock(hashtext('portfolio_gate'))"))
+        t = threading.Thread(target=lambda: out.setdefault("c", check_order(ledger, "a", _buy("0.1"), PORTFOLIO,
+                                                                              T0)), daemon=True)
+        started = time.monotonic()
+        t.start()
+        t.join(10)
+        waited, blocked = time.monotonic() - started, t.is_alive()
+    t.join(10)
+    assert not blocked and waited < 5, f"check_order waited {waited:.1f}s on the gate lock"
+    assert out["c"].decision.outcome == "rejected" and not ledger.reserved
+    assert [(r.decision.outcome, r.decision.limit_hit) for r in ledger.records] == [("error", "lock_error")]
+
+
+def test_cr_f219_4_an_entry_check_inside_a_fills_transaction_fails_closed_as_lock_error():
+    ledger = _marked()
+    with ledger.engine.begin() as conn, ledger.using(conn):
+        c = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    assert c.decision.outcome == "rejected" and not ledger.reserved
+    assert [(r.decision.outcome, r.decision.limit_hit) for r in ledger.records] == [("error", "lock_error")]
+
+
 def test_the_state_row_round_trips_and_exists_before_the_first_mark():
     ledger = CellLedger(D(20_000))
     entry_block(ledger, T0)  # never marked: one alert, remembered in the row
