@@ -524,6 +524,9 @@ PORTFOLIO_PROFILE_V1 = {
 event.listen(portfolio_profile_t, "after_create",
              lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
 # The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
+PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity", "marked_at")
+PORTFOLIO_STATE_MARKED = ("(" + " AND ".join(f"{c} IS NULL" for c in PORTFOLIO_STATE_FIGURES) + " AND status = 'ok') OR ("
+                          + " AND ".join(f"{c} IS NOT NULL" for c in PORTFOLIO_STATE_FIGURES) + ")")
 portfolio_state_t = Table(
     "portfolio_state",
     metadata,
@@ -531,18 +534,22 @@ portfolio_state_t = Table(
     Column("status", String(16), nullable=False),
     Column("paused_until", TS),  # with 'paused': the next 00:00 UTC
     Column("halt_reason", Text),  # with 'halted'
-    Column("reference_equity", EXACT, nullable=False),  # the halt reference: re-based at the PM's Resume
-    Column("hwm", EXACT, nullable=False),  # the true high-water mark; reset only by a book reset
-    Column("day_start_equity", EXACT, nullable=False),
-    Column("day_start", Date, nullable=False),  # the UTC day it belongs to
-    Column("book_equity", EXACT, nullable=False),  # the last mark: the whole fund, unallocated cash included
-    Column("marked_at", TS, nullable=False),  # older than 60 s: entries blocked as portfolio_state_stale
+    Column("pause_reason", Text),  # with paused_until (0011)
+    # The book's figures, null only before the first mark (0011): all set or all null.
+    Column("reference_equity", EXACT),  # the halt reference: re-based at the PM's Resume
+    Column("hwm", EXACT),  # the true high-water mark; reset only by a book reset
+    Column("day_start_equity", EXACT),
+    Column("day_start", Date),  # the UTC day it belongs to
+    Column("book_equity", EXACT),  # the last mark: the whole fund, unallocated cash included
+    Column("marked_at", TS),  # older than 60 s: entries blocked as portfolio_state_stale
+    Column("stale_told_at", TS),  # the mark a stale-book alert was raised for: once per spell, across processes (0011)
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
     CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name="portfolio_state_paused_until"),
     CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name="portfolio_state_halt_reason"),
+    CheckConstraint(PORTFOLIO_STATE_MARKED, name="portfolio_state_marked"),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.

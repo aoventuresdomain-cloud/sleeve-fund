@@ -95,7 +95,7 @@ class Intent:
 
 @dataclass(frozen=True)
 class Decision:
-    outcome: str  # "approved" | "trimmed" | "rejected"
+    outcome: str  # "approved" | "trimmed" | "rejected"; "error" only in the journal, for a check that couldn't run
     approved_qty: Decimal  # what may be sent: the request, less, or 0
     requested_qty: Decimal
     limit_hit: str | None  # what bound it, if any: LIMITS, "below_min", or a portfolio block (gate.entry_block)
