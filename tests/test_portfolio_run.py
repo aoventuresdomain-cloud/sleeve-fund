@@ -94,6 +94,44 @@ def test_the_book_is_the_whole_fund_unallocated_cash_included():
     assert run.book.iloc[0] == 25_000.0
 
 
+# --- F220-4 (HoQA, MUST): the gate is fed the real marked book and held positions at every close ------------------
+
+GROSS_60 = PortfolioProfile(gross=0.6, net_instrument=100, margin=100, open_risk=100, drawdown=0.99, daily_loss=0.99)
+
+
+@pytest.fixture(scope="module")
+def tight_gross():
+    gates = []
+
+    class Kept(portfolio_run.PortfolioGate):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            gates.append(self)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(portfolio_run, "PortfolioGate", Kept)
+        run = run_portfolio([_spec("a", 2), _spec("b", 10, PERP)], GROSS_60)
+    return run, gates[0]
+
+
+def test_f220_4_a_peak_between_entries_moves_the_high_water_mark(tight_gross):
+    run, gate = tight_gross
+    at_entries = {pd.Timestamp(d["ts"]).floor("h") for d in run.decisions}
+    peak = run.book.idxmax()
+    assert peak not in at_entries and run.book.max() > max(run.book[t] for t in at_entries)
+    assert float(gate.ledger.state().hwm) == pytest.approx(run.book.max())
+
+
+def test_f220_4_a_filled_position_counts_against_the_next_strategys_check(tight_gross):
+    run, _ = tight_gross
+    trimmed = [d for d in run.decisions if d["limit"] == "gross"]
+    assert trimmed and all(d["strategy"] == "a" and d["outcome"] == "trimmed" for d in trimmed)
+    first_b = min(pd.Timestamp(d["ts"]) for d in run.decisions if d["strategy"] == "b")
+    assert all(pd.Timestamp(d["ts"]) > first_b for d in trimmed)  # b's position, filled before, is what binds
+    alone = run_portfolio([_spec("a", 2)], GROSS_60, unallocated=10_000.0)  # the same book with b's capital idle
+    assert all(d["outcome"] == "approved" for d in alone.decisions)
+
+
 # --- R1: an hourly mark grid, whatever the Strategies trade -------------------------------------------------------
 
 def test_r1_the_book_is_marked_every_hour_though_every_strategy_decides_daily():
