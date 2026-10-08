@@ -3,6 +3,7 @@ cover the same window, it reports the span it covered, canon() caps where canoni
 series holds across processes, the funding file included."""
 
 import multiprocessing as mp
+import threading
 import time
 
 import pandas as pd
@@ -24,6 +25,7 @@ def test_until_leaves_every_minute_from_it_alone(tmp_path):
     assert _closes(store) == venue["close"].iloc[:4].tolist() + [104.0, 105.0, 106.0, 107.0]
     assert (out["first"], out["last"]) == (T0.isoformat(), (T0 + 3 * MIN).isoformat())
     assert (out["offered"], out["stored"], out["until"]) == (4, 4, (T0 + 4 * MIN).isoformat())
+    assert out["top"] == (T0 + 3 * MIN).isoformat()  # the window's newest minute, as the run took it (F212-2)
 
 
 def test_a_dry_run_and_the_real_run_over_the_same_bound_count_the_same(tmp_path):
@@ -40,6 +42,28 @@ def test_a_dry_run_and_the_real_run_over_the_same_bound_count_the_same(tmp_path)
 def test_until_must_be_after_since(tmp_path):
     with pytest.raises(ValueError, match="must be after"):
         history.canon(HistoryStore(tmp_path), _profile(_venue(3)), P, T0, until=T0)
+
+
+def test_an_until_past_the_newest_closed_minute_stored_is_refused(tmp_path):
+    """F212-2: the store vouches only for minutes up to its newest closed one, so a later until would quietly cover
+    less than asked, and the dry run and the real run could differ. Refused, nothing written."""
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, P, _rows(T0, 4), "live")  # closed to 12:03
+    with pytest.raises(ValueError, match="past the newest closed minute"):
+        history.canon(store, _profile(_venue(12)), P, T0, until=T0 + 5 * MIN)
+    assert store.provenance(V, P) == []
+    assert history.canon(store, _profile(_venue(12)), P, T0, until=T0 + 4 * MIN)["replaced"] == 4  # up to it: fine
+
+
+def test_the_command_checks_every_instrument_before_it_writes_any(tmp_path, capfd):
+    store = HistoryStore(tmp_path)
+    store.append_bars(V, "BTC/USDT", _rows(T0, 8), "live")
+    store.append_bars(V, "ETH/USDT", _rows(T0, 2), "live")  # closed to 12:01 only
+    before = store.read(V, "BTC/USDT", 1)
+    code = history.main(["--root", str(tmp_path), "canon", "BTC/USDT", "ETH/USDT", "--venue", "binance",
+                         "--since", "2026-10-05T12:00", "--until", "2026-10-05T12:05"])
+    assert code == 2 and "ETH/USDT: until" in capfd.readouterr().out
+    pd.testing.assert_frame_equal(store.read(V, "BTC/USDT", 1), before)  # BTC, though fine, left untouched
 
 
 def test_canon_caps_where_canonise_caps_when_no_minute_is_known_closed(tmp_path):
@@ -88,3 +112,53 @@ def test_a_funding_refresh_waits_for_the_series_writer_in_another_process(tmp_pa
     assert waited >= 0.5
     assert funding.rates(V, P, tmp_path).tolist() == [0.0001]
     assert not list(path.parent.glob("*.tmp"))  # its own temporary file, gone once renamed
+
+
+def test_a_minute_write_is_not_held_up_by_a_funding_fetch(tmp_path):
+    """F212-1: the venue is asked for funding outside the series lock, so the hub's minute writes don't queue behind
+    a slow page (stale bars mean no new trades)."""
+    store = HistoryStore(tmp_path)
+    asked, release = threading.Event(), threading.Event()
+
+    def slow(pair, start):
+        asked.set()
+        release.wait(30)
+        return [(int(T0.timestamp() * 1000), 0.0001)]
+
+    fetch = threading.Thread(target=funding.refresh, args=(V, P), kwargs={"root": tmp_path, "since": T0, "loader": slow})
+    fetch.start()
+    try:
+        assert asked.wait(30)
+        write = threading.Thread(target=store.append_bars, args=(V, P, _rows(T0, 2), "live"))
+        write.start()
+        write.join(5)
+        assert not write.is_alive()  # written while the page is still awaited
+    finally:
+        release.set()
+        fetch.join(30)
+    assert funding.rates(V, P, tmp_path).tolist() == [0.0001] and len(store.read(V, P, 1)) == 2
+
+
+def test_a_funding_backfill_asks_the_venue_outside_the_lock_and_keeps_what_is_new(tmp_path):
+    path = funding._path(V, P, tmp_path)
+    t = int(T0.timestamp() * 1000)
+    h8 = 8 * 3_600_000
+    funding.refresh(V, P, root=tmp_path, since=T0, loader=lambda pair, start: [(t, 0.0001), (t + 2 * h8, 0.0003)])
+    d = HistoryStore(tmp_path)._dir(V, P)
+    assert d == path.parent
+
+    wrote = []
+
+    def minute_write():
+        with _writing(d):
+            wrote.append(True)
+
+    def page(pair, start):  # a minute write while the venue is asked goes straight through: the lock isn't held
+        write = threading.Thread(target=minute_write, daemon=True)
+        write.start()
+        write.join(5)
+        return [(t, 0.0001), (t + h8, 0.0002), (t + 2 * h8, 0.0003)]
+
+    assert funding.backfill(V, P, T0, root=tmp_path, loader=page) == 1
+    assert wrote == [True]
+    assert funding.rates(V, P, tmp_path).tolist() == [0.0001, 0.0002, 0.0003]

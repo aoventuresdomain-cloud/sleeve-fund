@@ -599,8 +599,9 @@ def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_page
     the history files; the loader's cursor is left alone. Not for a venue whose pages are built from trades (they
     split minutes at their ends). dry_run: report the counts, write nothing (the HoE sees them before a real run).
     until: minutes opening at or after it are left alone, so a dry run and the real run cover the same closed window
-    however far apart they run (CANON-F3). The result says the window it covered: the first and last minute the venue
-    offered inside it, how many, and how many minutes the store holds in it."""
+    however far apart they run (CANON-F3); an until past the newest closed minute stored is refused, so the two can't
+    silently differ (F212-2). The result says the window it covered: its newest minute (top), the first and last
+    minute the venue offered inside it, how many, and how many minutes the store holds in it."""
     import time
 
     if profile.minute_loader is None or profile.minute_cursor_at is None:
@@ -611,14 +612,19 @@ def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_page
     if until is not None and pd.Timestamp(until) <= since:
         raise ValueError(f"until ({until}) must be after since ({since})")
     out = {"pair": pair, "pages": 0, "written": 0, "replaced": 0, "dry_run": dry_run,
-           "until": None if until is None else pd.Timestamp(until).isoformat(),
+           "until": None if until is None else pd.Timestamp(until).isoformat(), "top": None,
            "first": None, "last": None, "offered": 0, "stored": 0}
     cov = store.coverage(profile.name, pair)
     if cov is None:
         return out
     top = _canon_top(cov)
     if until is not None:
-        top = min(top, pd.Timestamp(until) - pd.Timedelta(minutes=1))
+        bound = pd.Timestamp(until) - pd.Timedelta(minutes=1)
+        if bound > top:  # the store can't vouch for minutes past its newest closed one, so the window would shrink
+            raise ValueError(f"until ({until}) is past the newest closed minute stored ({top.isoformat()}); "
+                             "a run now would cover less than the window asked for")
+        top = bound
+    out["top"] = top.isoformat()
     cursor, pages, written, replaced = profile.minute_cursor_at(since), 0, 0, 0
     first = last = None
     offered = 0
@@ -1052,7 +1058,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "canon":
         since = pd.Timestamp(args.since, tz="UTC")
         until = pd.Timestamp(args.until, tz="UTC") if args.until else None
-        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+        pairs = args.pairs or [p for p, _ in _pairs_in_use(profile.name)]
+        if until is not None:  # every instrument checked before any is written, so a refusal leaves none half done
+            late = [(p, top) for p in pairs if (cov := store.coverage(profile.name, p)) is not None
+                    and until - pd.Timedelta(minutes=1) > (top := _canon_top(cov))]
+            for pair, top in late:
+                print(f"{pair}: until {until.isoformat()} is past the newest closed minute stored ({top.isoformat()})")
+            if late:
+                return 2
+        for pair in pairs:
             print(canon(store, profile, pair, since, dry_run=args.dry_run, until=until))
         return 0
     if args.cmd == "refresh":
