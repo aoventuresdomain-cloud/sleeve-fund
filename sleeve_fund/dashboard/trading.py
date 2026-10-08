@@ -357,6 +357,7 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
     spot_total, spot_counted, _, _, spot_left = _tally(spots)
     trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
     return {
+        "accounts": _by_account(store, perps) if store is not None else [],
         "margin": sum(p["margin"] for p in positions),
         "open_risk": total if counted or not left_out else None,
         "estimated": estimated,
@@ -371,6 +372,24 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
         "spot_left_out": [n for names in spot_left.values() for n in names],
         "spot_hint": open_risk_hint([], [], spot_left, trailing) or "Money lost if every spot stop is hit",
     }
+
+
+def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
+    """The limit's figure for each account holding a strategy that isn't archived, against that account's own book
+    (open_risk.account_equity), as the gate measures it per account (RR-1): {name, open_risk, left_out, book}."""
+    from sleeve_fund import open_risk as limit
+
+    archived = store.archived()
+    out = []
+    for a in store.accounts():
+        if not [n for n in a["sleeves"] if n not in archived]:
+            continue
+        mine = [(n, c) for n, c in perps if store.account_of(n) == a["name"]]
+        total, counted, _, _, left_out = _tally(mine)
+        out.append({"name": a["name"], "open_risk": total if counted or not left_out else None,
+                    "left_out": [n for names in left_out.values() for n in names],
+                    "book": limit.account_equity(store, a["name"])})
+    return out
 
 
 def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str, list[str]],
