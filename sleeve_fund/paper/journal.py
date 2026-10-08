@@ -11,7 +11,7 @@ from __future__ import annotations
 import itertools
 from types import SimpleNamespace
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 from sleeve_fund.money import to_decimal
 from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
@@ -257,18 +257,36 @@ class MemoryJournal:
         return replay_book(self.fills_, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> None:
-        self.funding_.append({"sleeve": sleeve, "ts": ts or utcnow(), "qty": qty, "price": price, "rate": rate,
-                              "amount": amount, "kind": kind})
+                       ts: datetime | None = None, kind: str = "settled") -> str:
+        """Once per settlement, as Store.record_funding (CASH-1): "new", "same" or "differs"."""
+        from sleeve_fund.store import FUNDING_CHARGE_KINDS
 
-    def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
+        ts = ts or utcnow()
+        kinds = FUNDING_CHARGE_KINDS if kind in FUNDING_CHARGE_KINDS else (kind,)
+        for f in self.funding_:
+            if f["ts"] == ts and f["kind"] in kinds:
+                return "same" if f["kind"] == kind and to_decimal(f["amount"]) == to_decimal(amount) else "differs"
+        self.funding_.append({"sleeve": sleeve, "ts": ts, "qty": qty, "price": price, "rate": rate,
+                              "amount": amount, "kind": kind})
+        return "new"
+
+    def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         return list(reversed(self.funding_))[:limit]
 
     def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
         return sum((to_decimal(f["amount"]) for f in self.funding_ if before is None or f["ts"] < before), Decimal(0))
 
-    def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
-        self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount})
+    def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
+                         trade_id: str | None = None, ts: datetime | None = None) -> str:
+        """Once per closing fill, and up to the cent, as Store.record_insurance (CASH-1)."""
+        up = to_decimal(amount).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        amount = float(up) if isinstance(amount, float) else up
+        for f in self.insurance_ if order_id is not None else ():
+            if (f["order_id"], f["trade_id"]) == (order_id, trade_id):
+                return "same" if to_decimal(f["amount"]) == to_decimal(amount) else "differs"
+        self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount,
+                                "order_id": order_id, "trade_id": trade_id})
+        return "new"
 
     def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
         return list(reversed(self.insurance_))[:limit]
