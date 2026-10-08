@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from sleeve_fund.history import HistoryStore
-from sleeve_fund.parity import compare, markdown, run, venue_minutes, window
+from sleeve_fund.parity import canon_sample, compare, markdown, markdown_sample, run, venue_minutes, window
 
 V, P = "BINANCE", "BTC/USDT"
 START = pd.Timestamp("2026-10-05 12:00", tz="UTC")
@@ -104,3 +104,62 @@ def test_the_hubs_late_trade_counts_are_read_from_its_own_file_by_default(tmp_pa
     other = tmp_path / "other.json"
     other.write_text(json.dumps({"BTC/USDT": [1, 10]}))
     assert late_counts(store, "BINANCE", other) == {"BTC/USDT": (1, 10)}
+
+
+def test_the_minutes_whose_price_differs_are_listed(tmp_path):
+    venue = _frame(6)
+    store = HistoryStore(tmp_path)
+    hub = venue.copy()
+    hub.iloc[3, hub.columns.get_loc("close")] += 0.01
+    store.append_bars(V, P, _rows(hub), "live")
+    (p,) = run(store, _profile(venue), [P], START, START + pd.Timedelta("6min"))
+    assert p.price_minutes == [START + pd.Timedelta("3min")]
+    assert "OHLC differs at 05 Oct 12:03." in markdown("Binance", [p])
+
+
+def test_the_canon_sample_shows_both_values_and_that_the_store_now_holds_the_venues_bar(tmp_path):
+    """DA 8 Oct (HoE): the spot-check of the CANON run reads the provenance log and the store, and writes nothing."""
+    venue = _frame(10)
+    hub = venue.copy()
+    hub["volume"] = 1.5  # every live bar differs from the venue's
+    store = HistoryStore(tmp_path, clock=lambda: START + pd.Timedelta("1h"))
+    store.append_bars(V, P, _rows(hub), "live")
+    assert store.canonise(V, P, venue).replaced == 10
+    before = sorted((f.name, f.stat().st_mtime_ns) for f in tmp_path.rglob("*") if f.is_file())
+    rows = canon_sample(store, V, P, 3)
+    assert [r["minute"] for r in rows] == [START, START + pd.Timedelta("4min"), START + pd.Timedelta("9min")]
+    assert rows[0]["stored"] == [100.0, 100.5, 99.5, 100.0, 1.5] and rows[0]["offered"][-1] == 2.0
+    assert all(r["now"] == r["offered"] and r["now_is_offered"] for r in rows)
+    assert sorted((f.name, f.stat().st_mtime_ns) for f in tmp_path.rglob("*") if f.is_file()) == before
+    md = markdown_sample(P, rows, 10)
+    assert "3 of 10 minutes canon replaced" in md and "| 100 100.5 99.5 100 1.5 | 100 100.5 99.5 100 2 |" in md
+    assert canon_sample(store, V, P, 0) == [] and len(canon_sample(store, V, P, 50)) == 10
+
+
+def test_a_sampled_minute_that_no_longer_holds_the_venues_bar_is_flagged(tmp_path):
+    venue = _frame(4)
+    hub = venue.copy()
+    hub["volume"] = 1.5
+    store = HistoryStore(tmp_path, clock=lambda: START + pd.Timedelta("1h"))
+    store.append_bars(V, P, _rows(hub), "live")
+    store.canonise(V, P, venue)
+    path = tmp_path.rglob("provenance.jsonl").__next__()
+    path.write_text(path.read_text().replace('"offered": [100.0, 100.5, 99.5, 100.0, 2.0]',
+                                             '"offered": [100.0, 100.5, 99.5, 100.0, 9.0]'))
+    (row,) = canon_sample(store, V, P, 1)
+    assert not row["now_is_offered"] and "| NO |" in markdown_sample(P, [row], 4)
+
+
+def test_a_minute_canon_replaced_twice_is_sampled_once_by_its_latest_record(tmp_path):
+    """CR F224-1: a later run offering a newer venue bar leaves the first record's offered bar stale; not an alarm."""
+    venue = _frame(3)
+    hub = venue.copy()
+    hub["volume"] = 1.5
+    store = HistoryStore(tmp_path, clock=lambda: START + pd.Timedelta("1h"))
+    store.append_bars(V, P, _rows(hub), "live")
+    store.canonise(V, P, venue)
+    revised = venue.copy()
+    revised["volume"] = 2.5
+    assert store.canonise(V, P, revised).replaced == 3
+    rows = canon_sample(store, V, P, 10)
+    assert len(rows) == 3 and all(r["now_is_offered"] and r["stored"][-1] == 2.0 for r in rows)

@@ -69,12 +69,22 @@ def test_rows_are_stored_as_given_and_never_nan(reg):
 
 
 @pytest.mark.parametrize("bad", [{"stage": "sensitivity"}, {"source": "guess"}, {"sharpe": float("inf")},
-                                 {"status": "pending"}])
+                                 {"status": "pending"}, {"kind": "basket"}])
 def test_bad_trials_are_refused(reg, bad):
     row = {"id": "a" * 16, "definition_hash": "d", "idea_hash": "i", "code_version": "c", "definition_name": "n",
            "family": "f", "settings": "{}", "dataset": "ds", "stage": "holdout", "source": "study", "sharpe": 1.0}
     with pytest.raises(ValueError):
         reg.store.add_trials([dict(row, **bad)])
+
+
+def test_a_portfolio_run_is_kept_as_its_kind_and_older_rows_are_single(reg):
+    """DA 8 Oct (QD M4): source says where a row came from, kind what it evaluated. Rows written without a kind are
+    one strategy's variant."""
+    row = {"id": "p" * 16, "definition_hash": "d", "idea_hash": "i", "code_version": "c", "definition_name": "n",
+           "family": "f", "settings": '{"members": []}', "dataset": "ds", "stage": "in_sample", "source": "backtest",
+           "sharpe": 1.0}
+    reg.store.add_trials([dict(row, kind="portfolio_run"), dict(row, id="s" * 16)])
+    assert {r["id"][0]: r["kind"] for r in reg.store.trials()} == {"p": "portfolio_run", "s": "single"}
 
 
 def test_the_idea_counter_is_imported_once_and_left_in_place(reg, tmp_path):

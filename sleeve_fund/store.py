@@ -465,7 +465,10 @@ trials_t = Table(
     Column("data_end", TS),
     Column("status", String(16), nullable=False, server_default="ok"),
     Column("error", Text),  # why a failed row's count failed; NULL on an ok row
+    # What was evaluated (TRIAL_KINDS); source stays where the row came from (migration 0012, DA 8 Oct 2026).
+    Column("kind", String(16), nullable=False, server_default="single"),
     CheckConstraint("status IN ('ok', 'failed')", name="trials_status"),
+    CheckConstraint("kind IN ('single', 'ablation', 'portfolio_run')", name="trials_kind"),
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
@@ -548,7 +551,9 @@ portfolio_state_t = Table(
     CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name="portfolio_state_paused_until"),
     CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name="portfolio_state_halt_reason"),
     CheckConstraint("status <> 'paused' OR pause_reason IS NOT NULL", name="portfolio_state_pause_reason"),
-    CheckConstraint("marked_at IS NOT NULL OR status = 'ok'", name="portfolio_state_marked"),
+    # a halt is never refused, even before the first mark (refusing it would fail open); a pause follows a mark
+    # (DA 0012, CR F219-3)
+    CheckConstraint("marked_at IS NOT NULL OR status <> 'paused'", name="portfolio_state_marked"),
     # all of the book's figures set, or none (before the first mark): one CHECK per figure (DA, 0011)
     *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"portfolio_state_{c}_marked")
       for c in PORTFOLIO_STATE_FIGURES),
@@ -657,6 +662,10 @@ TRIAL_SOURCES = ("study", "backtest", "strategy", "optimiser", "engineering", "l
 # "ok": a counted evaluation. "failed": a run whose count failed (QA P1-T8), recorded against its idea under its own
 # source with its settings and the error, and no Sharpe, trades or dates (Data Architect, 6 Oct 2026).
 TRIAL_STATUSES = ("ok", "failed")
+# What a row evaluated: one strategy's variant ("single", every row before 0012), an ablation of one (P2, Q5), or a
+# multi-strategy portfolio run, whose member strategies' trial ids sit in its settings (QD M4). Whether ablations and
+# portfolio runs count in N is the Advisor's call (research.trials._counted); the kind only records what was run.
+TRIAL_KINDS = ("single", "ablation", "portfolio_run")
 # Events that say the strategy's own code raised: a handler, or the risk check's tick (see
 # LongFlatStrategy._report).
 ERROR_KINDS = ("handler_failed", "tick_failed")
@@ -852,6 +861,8 @@ def check_trial(r: dict) -> None:
         raise ValueError(f"a trial's source is one of {TRIAL_SOURCES}, got {r['source']!r}")
     if r.get("status", "ok") not in TRIAL_STATUSES:
         raise ValueError(f"a trial's status is one of {TRIAL_STATUSES}, got {r['status']!r}")
+    if r.get("kind", "single") not in TRIAL_KINDS:
+        raise ValueError(f"a trial's kind is one of {TRIAL_KINDS}, got {r['kind']!r}")
     if r["source"] != "ledger_import" and r["stage"] not in TRIAL_STAGES:
         raise ValueError(f"a trial's stage is one of {TRIAL_STAGES}, got {r['stage']!r}")
     sharpe = r.get("sharpe")
@@ -863,7 +874,8 @@ def _put_trials(c, rows: list[dict]) -> int:
     """Insert trials on an open transaction, skipping ids already there. Returns how many were added."""
     have = {i for (i,) in c.execute(select(trials_t.c.id).where(trials_t.c.id.in_([r["id"] for r in rows])))}
     new = [{**r, "created_at": r.get("created_at") or utcnow(), "data_start": r.get("data_start"),
-            "data_end": r.get("data_end"), "status": r.get("status", "ok"), "error": r.get("error")}
+            "data_end": r.get("data_end"), "status": r.get("status", "ok"), "error": r.get("error"),
+            "kind": r.get("kind", "single")}
            for r in rows if r["id"] not in have]
     new = list({r["id"]: r for r in new}.values())  # the same row twice in one call counts once
     if new:

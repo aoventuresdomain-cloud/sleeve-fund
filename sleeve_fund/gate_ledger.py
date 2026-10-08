@@ -45,6 +45,9 @@ from sleeve_fund.store import (
 )
 
 LOCK_SQL = text("SELECT pg_advisory_xact_lock(hashtext('portfolio_gate'))")
+# A stalled holder (a slow read, a hung connection) must not hold every strategy's entry checks without bound: past
+# this the lock raises and check_order fails closed as lock_error (HoQA F219-Q1). Exits never take this lock.
+LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '2s'")
 
 
 @dataclass(frozen=True)
@@ -82,11 +85,14 @@ class DbLedger:
     @contextmanager
     def lock(self) -> Iterator[None]:
         loc = self._local
-        if getattr(loc, "conn", None) is not None:  # already inside (re-entrant, as MemoryLedger's RLock)
-            yield
+        if getattr(loc, "conn", None) is not None:
+            if not getattr(loc, "locked", None):  # inside using(): no gate lock to re-enter (CR F219-4)
+                raise RuntimeError("lock() inside using(): an entry check never runs in a fill's transaction")
+            yield  # already inside (re-entrant, as MemoryLedger's RLock)
             return
         with nullcontext() if self._pg else self._process_lock, self.engine.begin() as conn:
             if self._pg:
+                conn.execute(LOCK_TIMEOUT)
                 conn.execute(LOCK_SQL)
             loc.conn, loc.locked, loc.book, loc.reserved, loc.pending = conn, True, None, None, None
             try:
