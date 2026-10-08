@@ -462,9 +462,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         orders = trading.orders_by_id(st(), name)
         plans = st().exit_plans(name)
         perp = markets.is_perp(s.params)
-        funding = st().funding(name, limit=100_000) if perp else []
+        funding = st().funding(name, limit=None) if perp else []
         trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None,
-                              st().insurance(name) if perp else None)
+                              st().insurance(name, limit=None) if perp else None)
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
         order_total = sum(st().order_counts(name).values())
@@ -1266,7 +1266,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 for t in trading.trips(st().fills(n, limit=1_000_000), st().events(n, limit=5000), orders,
                                        st().exit_plans(n), _shorts(st(), n),
                                        st().funding(n, limit=1_000_000) if _shorts(st(), n) else None,
-                                       st().insurance(n) if _shorts(st(), n) else None):
+                                       st().insurance(n, limit=None) if _shorts(st(), n) else None):
                     rows.append({"sleeve": n, **t, "held_hours": round(t["held"].total_seconds() / 3600, 2)
                                  if t["held"] else None})
             cols = ["sleeve", "opened", "closed", "held_hours", "side", "qty", "entry_px", "exit_px", "cost", "fees",
@@ -1406,7 +1406,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         result["trips"] = trading.trips(st().fills(name, limit=1_000_000), st().events(name, limit=10_000),
                                         trading.orders_by_id(st(), name), shorts=_shorts(st(), name),
                                         funding=st().funding(name, limit=1_000_000) if _shorts(st(), name) else None,
-                                        insurance=st().insurance(name) if _shorts(st(), name) else None)
+                                        insurance=st().insurance(name, limit=None) if _shorts(st(), name) else None)
         result["orders"] = sum(st().order_counts(name).values())
         rs = [t["r"] for t in result["trips"] if t["r"] is not None]
         result["expectancy_r"] = sum(rs) / len(rs) if rs else None

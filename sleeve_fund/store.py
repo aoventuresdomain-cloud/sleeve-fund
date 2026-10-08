@@ -38,6 +38,7 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    case,
     insert,
     or_,
     select,
@@ -776,6 +777,14 @@ def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     funding, insurance = D(funding, "funding"), D(insurance, "insurance")
     return {"cash": cash + funding + insurance, "qty": qty, "entry_px": entry, "fills": n,
             "funding": funding, "insurance": insurance, "entry_fees": fees}
+
+
+def fill_cash(side: str, qty, price, fee) -> Decimal:
+    """What one fill moved the strategy's cash by, as replay_book books it: a buy pays qty * price and the fee, a sell
+    receives qty * price less the fee."""
+    D = to_decimal
+    leg = D(qty, "qty") * D(price, "price")
+    return (-leg if side == "BUY" else leg) - D(fee, "fee")
 
 
 def is_backtest(name: str | None) -> bool:
@@ -1593,18 +1602,16 @@ class Store:
     def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
                          trade_id: str | None = None, ts: datetime | None = None) -> str:
         """Book the insurance fund's credit for the fill (order_id, trade_id) that left the strategy flat below zero,
-        once (CASH-1): "new", "same" or "differs", as record_funding. The engine always names the fill; a row without
-        one (an import, a hand-made journal) is unkeyed, as rows before 0013 are."""
+        once (CASH-1): "new", "same" or "differs", as record_funding. A credit that names no fill could not be
+        refused the second time, so it is refused now (CR F226-2); only rows from before 0013 are unkeyed."""
         price, amount = _exact(price=price, amount=amount)
+        if not order_id or not trade_id:
+            raise ValueError(f"an insurance credit for {sleeve} must name the fill it covers (order_id and trade_id)")
         # Up to the cent, here in the one write path so no caller can skip it: it exists to bring equity back to zero
         # or above (Advisor 8 Oct 04:10, ruling 3)
         amount = amount.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         ts = ts or utcnow()
-        if order_id is None:
-            with self.engine.begin() as c:
-                c.execute(insert(insurance_t).values(sleeve=sleeve, ts=ts, price=price, amount=amount))
-            return "new"
-        key = ((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
+        key =((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
                & (insurance_t.c.trade_id == trade_id))
         booked = self._book_once(insurance_t, key, dict(sleeve=sleeve, ts=ts, price=price, amount=amount,
                                                         order_id=order_id, trade_id=trade_id),
@@ -1615,7 +1622,7 @@ class Store:
                        "The booked credit is kept and nothing moved", ts=ts)
         return booked
 
-    def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
+    def insurance(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -1627,6 +1634,45 @@ class Store:
             q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
             return to_decimal(c.execute(q).scalar() or 0)
+
+    def strategy_cash_pnl(self, sleeve: str, since: datetime | None = None, at: datetime | None = None) -> Decimal:
+        """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
+        counted. That is each fill's cash leg less its fee, plus funding and the insurance fund's cover. since None
+        is from the first row and at None is to the last; a row at `at` counts and a row at `since` does not, so
+        consecutive windows add up to the whole. Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose
+        own sum would be a float's."""
+        def window(t):
+            w = t.c.sleeve == sleeve
+            if since is not None:
+                w &= t.c.ts > since
+            if at is not None:
+                w &= t.c.ts <= at
+            return w
+
+        f = fills_t.c
+        with self.engine.connect() as c:
+            if self.engine.dialect.name == "postgresql":
+                leg = case((f.side == "BUY", -(f.qty * f.price)), else_=f.qty * f.price) - f.fee
+                sums = [select(func.sum(leg)).where(window(fills_t)),
+                        select(func.sum(funding_t.c.amount)).where(window(funding_t)),
+                        select(func.sum(insurance_t.c.amount)).where(window(insurance_t))]
+                return sum((to_decimal(c.execute(q).scalar() or 0) for q in sums), Decimal(0))
+            total = sum((fill_cash(*r) for r in c.execute(select(f.side, f.qty, f.price, f.fee)
+                                                          .where(window(fills_t)))), Decimal(0))
+            for t in (funding_t, insurance_t):
+                total += sum((to_decimal(a) for a in c.execute(select(t.c.amount).where(window(t))).scalars()),
+                             Decimal(0))
+            return total
+
+    def fill_totals(self, sleeve: str) -> tuple[int, Decimal]:
+        """Every fill the strategy has and the fees they paid, uncapped (CASH-2), exact as strategy_cash_pnl."""
+        with self.engine.connect() as c:
+            if self.engine.dialect.name == "postgresql":
+                n, fees = c.execute(select(func.count(), func.sum(fills_t.c.fee))
+                                    .where(fills_t.c.sleeve == sleeve)).one()
+                return n, to_decimal(fees or 0)
+            fees = list(c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars())
+            return len(fees), sum((to_decimal(x) for x in fees), Decimal(0))
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""

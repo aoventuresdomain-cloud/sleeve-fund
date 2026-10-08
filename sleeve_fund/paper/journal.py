@@ -281,18 +281,32 @@ class MemoryJournal:
         """Once per closing fill, and up to the cent, as Store.record_insurance (CASH-1)."""
         up = to_decimal(amount).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         amount = float(up) if isinstance(amount, float) else up
-        for f in self.insurance_ if order_id is not None else ():
+        if not order_id or not trade_id:
+            raise ValueError(f"an insurance credit for {sleeve} must name the fill it covers (order_id and trade_id)")
+        for f in self.insurance_:
             if (f["order_id"], f["trade_id"]) == (order_id, trade_id):
                 return "same" if to_decimal(f["amount"]) == to_decimal(amount) else "differs"
         self.insurance_.append({"sleeve": sleeve, "ts": ts or utcnow(), "price": price, "amount": amount,
                                 "order_id": order_id, "trade_id": trade_id})
         return "new"
 
-    def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
+    def insurance(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         return list(reversed(self.insurance_))[:limit]
 
     def insurance_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
         return sum((to_decimal(f["amount"]) for f in self.insurance_ if before is None or f["ts"] < before), Decimal(0))
+
+    def strategy_cash_pnl(self, sleeve: str, since: datetime | None = None, at: datetime | None = None) -> Decimal:
+        """As Store.strategy_cash_pnl (CASH-2): the cash the journal moved over (since, at]."""
+        from sleeve_fund.store import fill_cash
+
+        def inside(r):
+            return (since is None or r["ts"] > since) and (at is None or r["ts"] <= at)
+
+        total = sum((fill_cash(f["side"], f["qty"], f["price"], f["fee"]) for f in self.fills_ if inside(f)),
+                    Decimal(0))
+        return total + sum((to_decimal(r["amount"]) for r in self.funding_ + self.insurance_ if inside(r)),
+                           Decimal(0))
 
     # --- into the real journal ---------------------------------------------------------
 
