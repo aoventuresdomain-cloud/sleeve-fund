@@ -91,27 +91,25 @@ class PortfolioResult:
     # gate couldn't measure the order, e.g. a stopless entry with no daily ATR yet: CR F220-1, R5).
     refusals: dict = field(default_factory=dict)
     profile: PortfolioProfile = PORTFOLIO
+    portfolio_runs_tried: int | None = None  # set by record(): every portfolio run in the project, this one included
 
     def summary(self) -> dict:
         """The fund's headline metrics from the book's daily closes, over the whole window: after a halt the flat
         days count too, never cut at the halt (R3)."""
         return metrics.summary(metrics.daily_returns(self.book))
 
-    def trials_rows(self, dataset: str, member_trial_ids: dict[str, str] | None = None) -> list[dict]:
+    def trials_rows(self, dataset: str, member_trial_ids: dict[str, str], counted_ids: set[str]) -> list[dict]:
         """The run for the trials register (Data Architect 8 Oct): one row, source 'backtest', kind 'portfolio_run',
-        whose settings list each member Strategy with its own trial id. member_trial_ids: the members' rows already
-        counted; any not given gets its own row here, returned after the run's. Whether a portfolio run counts in
-        the deflated Sharpe's N is the Advisor's call."""
-        ids, rows = dict(member_trial_ids or {}), []
+        whose settings list each member Strategy with its own trial id. It never counts in the deflated Sharpe's N,
+        and it is never evidence for one member's edge: each member's edge is judged on its own row (Advisor 8 Oct
+        04:05 UK). So every member must already have a counted row of its own (counted_ids, the register's
+        counted_ids()), and a run with a member that hasn't is refused (MUST)."""
+        missing = [n for n in self.legs if member_trial_ids.get(n) not in counted_ids]
+        if missing:
+            raise ValueError(f"a portfolio run is recorded only when every member has a counted trial of its own; "
+                             f"none for {', '.join(missing)}")
         start, end = self.book.index[0].to_pydatetime(), self.book.index[-1].to_pydatetime()
-        for name, r in self.legs.items():
-            if name not in ids:
-                row = trials.model_run_row(strategy=r.strategy, params=r.params, dataset=dataset, source="backtest",
-                                           setup={"portfolio_member": name}, data_start=start, data_end=end,
-                                           trades=0 if r.fills is None else len(r.fills))
-                ids[name] = row["id"]
-                rows.append(row)
-        members = [{"name": n, "strategy": r.strategy, "params": r.params, "trial_id": ids[n]}
+        members = [{"name": n, "strategy": r.strategy, "params": r.params, "trial_id": member_trial_ids[n]}
                    for n, r in self.legs.items()]
         settings = {"members": members, "profile": asdict(self.profile), "unallocated": self.unallocated}
         key = {k: v for k, v in settings.items() if k != "members"} | {
@@ -127,7 +125,16 @@ class PortfolioResult:
             stage="in_sample", source="backtest", sharpe=sharpe,
             trades=sum(0 if r.fills is None else len(r.fills) for r in self.legs.values()),
             data_start=start, data_end=end)
-        return [{**run, "kind": "portfolio_run"}, *rows]
+        return [{**run, "kind": "portfolio_run"}]
+
+    def record(self, register: trials.TrialsRegister, dataset: str, member_trial_ids: dict[str, str]) -> str:
+        """Write the run to the trials register (see trials_rows) and set portfolio_runs_tried: how many portfolio
+        runs the project has tried, this one included, since choosing members is itself selection (Advisor 8 Oct
+        04:05 UK). Returns the run's trial id."""
+        (row,) = self.trials_rows(dataset, member_trial_ids, register.counted_ids())
+        register.store.add_trials([row])
+        self.portfolio_runs_tried = register.portfolio_runs()
+        return row["id"]
 
 
 class _MarkerConfig(DataActorConfig):

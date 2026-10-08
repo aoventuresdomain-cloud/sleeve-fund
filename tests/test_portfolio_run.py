@@ -282,33 +282,81 @@ def test_at_midnight_the_old_day_is_marked_first_so_no_decision_sees_a_stale_dai
     assert gate.mark(midnight + hour + 1) is None  # 95 is 2.1% below 97: no pause (5% below a stale 100 would be)
 
 
+class _Rows:
+    """The store's trials() and add_trials(), with or without the kind column (migration 0012)."""
+
+    def __init__(self, rows=()):
+        self.rows = [{"status": "ok", **r} for r in rows]  # the column's server default
+
+    def trials(self, idea_hash=None):
+        return [r for r in self.rows if idea_hash is None or r["idea_hash"] == idea_hash]
+
+    def add_trials(self, rows):
+        self.rows += [{"status": "ok", **r} for r in rows]
+        return len(rows)
+
+
+def _member_row(run, name: str) -> dict:
+    from sleeve_fund.research import trials
+
+    r = run.legs[name]
+    return trials.model_run_row(strategy=r.strategy, params=r.params, dataset="synthetic-hourly", source="backtest",
+                                setup={"member": name}, data_start=run.book.index[0].to_pydatetime(),
+                                data_end=run.book.index[-1].to_pydatetime(), trades=len(r.fills))
+
+
 def test_a_run_is_one_trials_row_of_kind_portfolio_run_listing_each_members_trial_id(halted):
+    from sleeve_fund.research.trials import TrialsRegister
     from sleeve_fund.store import check_trial
 
-    rows = halted.trials_rows("synthetic-hourly", member_trial_ids={"a": "t-a"})
-    run, *members = rows
-    check_trial(run)
+    members = {n: _member_row(halted, n) for n in ("a", "b")}
+    register = TrialsRegister(_Rows(members.values()))
+    ids = {n: m["id"] for n, m in members.items()}
+    run_id = halted.record(register, "synthetic-hourly", ids)
+    run = next(r for r in register.store.rows if r["id"] == run_id)
+    check_trial({k: v for k, v in run.items() if k != "status"})
     assert run["source"] == "backtest" and run["kind"] == "portfolio_run" and run["family"] == "portfolio"
     listed = {m["name"]: m["trial_id"] for m in __import__("json").loads(run["settings"])["members"]}
-    assert listed == {"a": "t-a", "b": members[0]["id"]} and len(members) == 1  # b had no row yet: it gets one
+    assert listed == ids
     assert run["sharpe"] == pytest.approx(halted.summary()["sharpe"])
     assert halted.summary()["days"] == len(halted.book.resample("1D").last()) - 1  # the whole window (R3)
+
+
+def test_advisor_must_a_run_with_a_member_without_a_counted_trial_of_its_own_is_refused(halted):
+    from sleeve_fund.research.trials import TrialsRegister
+
+    a, b = _member_row(halted, "a"), _member_row(halted, "b")
+    for rows, ids in (([a], {"a": a["id"], "b": b["id"]}),  # b's row was never written
+                      ([a, {**b, "source": "engineering"}], {"a": a["id"], "b": b["id"]}),  # b's doesn't count
+                      ([a, b], {"a": a["id"]})):  # b not named
+        register = TrialsRegister(_Rows(rows))
+        with pytest.raises(ValueError, match="counted trial of its own; none for b"):
+            halted.record(register, "synthetic-hourly", ids)
+        assert not [r for r in register.store.rows if r.get("kind") == "portfolio_run"]
+
+
+def test_advisor_each_result_shows_how_many_portfolio_runs_the_project_has_tried(halted):
+    from sleeve_fund.research.trials import TrialsRegister
+
+    a, b = _member_row(halted, "a"), _member_row(halted, "b")
+    register = TrialsRegister(_Rows([a, b]))
+    ids = {"a": a["id"], "b": b["id"]}
+    halted.record(register, "synthetic-hourly", ids)
+    assert halted.portfolio_runs_tried == 1
+    halted.record(register, "synthetic-hourly-2", ids)  # another combination tried: still visible, never in N
+    assert halted.portfolio_runs_tried == 2
+    assert register.counts()["evaluations"] == 2
 
 
 def test_f223_1_only_single_runs_count_in_the_trials_total_never_a_portfolio_run_or_an_ablation(halted):
     from sleeve_fund.research.trials import TrialsRegister
 
-    class Rows:  # the store's trials(), with and without the kind column (migration 0012)
-        def __init__(self, rows):
-            self.rows = [{"status": "ok", **r} for r in rows]  # the column's default when a row has none
-
-        def trials(self, idea_hash=None):
-            return [r for r in self.rows if idea_hash is None or r["idea_hash"] == idea_hash]
-
-    run, member = halted.trials_rows("synthetic-hourly", member_trial_ids={"a": "t-a"})
+    member = _member_row(halted, "a")
+    (run,) = halted.trials_rows("synthetic-hourly", {"a": member["id"], "b": "t-b"}, {member["id"], "t-b"})
     ablation = {**member, "id": "t-abl", "kind": "ablation"}
+    novel = {**member, "id": "t-new", "kind": "some_new_kind"}  # an allowlist: a kind nobody ruled in stays out
     before_0012 = {k: v for k, v in member.items() if k != "kind"}
-    counts = TrialsRegister(Rows([run, ablation, before_0012])).counts()
+    counts = TrialsRegister(_Rows([run, ablation, novel, before_0012])).counts()
     assert counts["evaluations"] == 1 and counts["ideas"] == 1
-    assert TrialsRegister(Rows([run])).counts() == {"ideas": 0, "variants": 0, "evaluations": 0,
-                                                     "n_uncertain": False}
+    assert TrialsRegister(_Rows([run])).counts() == {"ideas": 0, "variants": 0, "evaluations": 0,
+                                                      "n_uncertain": False}
