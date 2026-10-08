@@ -323,17 +323,19 @@ def apply_flow(ledger: Ledger, amount) -> None:
 
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None],
-          ttl: timedelta = RESERVATION_TTL) -> list[Reservation]:
+          ttl: timedelta = RESERVATION_TTL, is_acked: Callable[[str], bool] | None = None) -> list[Reservation]:
     """Orphans only (Advisor MUST FIX, 17:20 UK; refined 20:25 UK): a reservation lives as long as its order. Past
     `ttl`, one whose order is still live has that order cancelled and keeps its reservation until the cancel is
     confirmed: the order's own cancel releases it, or, if the order filled first, its fill converts the reservation
     into the position once (reduce, in the same transaction as the fill). An unconfirmed cancel is never released
     blind: every CANCEL_CONFIRM it is sent again with an alert, the reservation kept. A reservation with no order, or
-    whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those."""
+    whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those. is_acked (paper): the TTL covers send to venue ack only, so a reservation whose order the venue has
+    acked is skipped whatever its age; it lives with its order, released on a confirmed cancel or converted on a fill
+    (Advisor 8 Oct 06:10 UK)."""
     gone = []
     with ledger.lock():
         for r in ledger.reservations():
-            if now - r.at <= ttl:
+            if now - r.at <= ttl or (is_acked is not None and r.order_id is not None and is_acked(r.order_id)):
                 continue
             if r.order_id is not None and is_live(r.order_id):
                 if r.cancel_sent is not None and now - r.cancel_sent <= CANCEL_CONFIRM:

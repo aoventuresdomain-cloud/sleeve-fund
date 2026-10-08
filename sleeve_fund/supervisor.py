@@ -31,7 +31,7 @@ from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO
-from sleeve_fund.paper.safety import credential_var
+from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
@@ -382,7 +382,7 @@ class Supervisor:
                     pass  # no holdings yet (P2-1b W2): the cache row waits; the state row above is the gate's
             if acted == "halt":
                 self._halt_every_strategy(st.halted)
-        sweep(led, now, self._order_live, self._cancel_order)
+        sweep(led, now, self._order_live, self._cancel_order, is_acked=self._order_acked)
 
     def _halt_every_strategy(self, why: str) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
@@ -396,6 +396,10 @@ class Supervisor:
         """Whether an order may still fill, read through the ledger's own transaction: inside the sweep's lock a second
         connection would, on SQLite's one shared connection, roll the sweep's own writes back (HoQA, P2-1b cells)."""
         return self.ledger.order_status(order_id) in OPEN_ORDER_STATUSES
+
+    def _order_acked(self, order_id: str) -> bool:
+        """Whether the venue has acked the order (resting or part filled): its reservation then lives with it."""
+        return self.ledger.order_status(order_id) in ("accepted", "partially_filled")
 
     def _cancel_order(self, order_id: str) -> None:
         raise NotImplementedError("asking a strategy's process to cancel one order comes with the paper gate (P2-1b "
@@ -603,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
-    store = Store()
+    store = Store(portfolio_gate=True)
     if args.cmd == "seed":
         print("added:", seed(store, args.paths) or "nothing new")
     elif args.cmd == "clear":
@@ -613,6 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         print("book:", book_line(store))
         print("book figures:", book_figures(store))
     else:
+        assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()
     return 0
 

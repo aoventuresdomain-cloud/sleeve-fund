@@ -316,20 +316,14 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
 
 def portfolio_block(store, now: datetime | None = None) -> Why | None:
     """The whole fund's reason nothing opens (v2 P2-2: halted, paused for the day, or its book's mark older than 60 s),
-    as a CHOKE cause, or None. In force from the supervisor's first portfolio pass, which writes the state row before
-    it reads the fund's equity, so a pass that can't read it leaves entries blocked as stale (fail closed); a journal
-    with no state row (a backtest's, or one no supervisor has run on) has no portfolio gate."""
-    from sqlalchemy import select
-
+    as a CHOKE cause, or None. In force on every paper or live journal (Store.portfolio_gate, which their startup
+    requires): one with no state row has never been marked, so it is stale and blocks entries, with an alert (fail
+    closed, Advisor 8 Oct 06:10 UK). Only the journal's mode decides, never the row being absent."""
     from sleeve_fund.gate_ledger import DbLedger
     from sleeve_fund.portfolio.gate import entry_block
-    from sleeve_fund.store import portfolio_state_t
 
-    if getattr(store, "engine", None) is None:  # a backtest's in-memory journal
+    if not getattr(store, "portfolio_gate", False):
         return None
-    with store.engine.connect() as c:
-        if c.execute(select(portfolio_state_t.c.id)).first() is None:
-            return None
     hit = entry_block(DbLedger(store, _no_positions), now or utcnow())
     if hit is None:
         return None

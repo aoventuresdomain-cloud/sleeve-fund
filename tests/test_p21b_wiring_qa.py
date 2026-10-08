@@ -17,13 +17,16 @@ W1 (the supervisor marks the fund; no fill-path change)
        exit path (one flatten command each, never repeated on later passes). A flat strategy gets no sale.
   w1e  a pause blocks entries only: CHOKE names it until 00:00 UTC, with no flatten and no strategy halted; it clears
        at 00:00.
-  w1f  sweep: a past-TTL reservation whose order row is finished is released as 'ttl'; one whose order row is live
-       is kept, with its cancel asked for.
+  w1f  sweep: a past-TTL reservation whose order row is finished is released as 'ttl'; one sent but never acked
+       is kept, with its cancel asked for (the TTL covers send to ack only: Advisor 8 Oct 06:10 UK).
+  w1g  an acked resting order's reservation outlives the TTL, hours on: never cancelled or expired by time.
 W2 (entry path)
   w2a  an approved entry's order row carries its reservation id.
   w2b  that order's fills reduce the reservation in book_fill's own transaction (partial: exact share; full:
        released 'fill'); reject and cancel release it with their reasons.
   w2c  the release is atomic with the fill: when the reservation write fails, the fill isn't booked either.
+  w2f  an unfilled resting entry is cancelled by its own process at its next bar close; the confirmed cancel
+       releases the reservation (a partial fill keeps what filled).
   w2d  the paper GateFn does no mark per check: portfolio_state.marked_at is unchanged by a check.
   w2e  exits, stops, the PM's close and liquidations never call check_order (HoQA F208-1): no decision row, no
        reservation, and the gate never blocks them, even while halted.
@@ -88,6 +91,13 @@ def record_entry_order(store, strategy: str, order_id: str, qty: D, reservation:
     """The engine's write of a gated entry's order row, with the reservation it holds."""
     store.record_order(strategy, order_id=order_id, side="BUY", qty=float(qty), intent="entry", reason="qa",
                        reservation=reservation)
+
+
+def cancel_resting_entries_at_bar_close(store, strategy: str, bar_close: datetime) -> None:
+    """The strategy's own process at its next bar close: cancel its unfilled resting entry, and the venue confirms."""
+    from sleeve_fund.paper import portfolio_gate
+
+    portfolio_gate.cancel_resting_entries(store, strategy, bar_close)
 
 
 # =====================================================================================================================
@@ -214,20 +224,40 @@ def test_w1e_a_pause_blocks_entries_only_until_midnight(store):
     assert not blocked or "portfolio" not in (why or "").lower()
 
 
-def test_w1f_the_sweep_reads_live_orders_from_the_orders_table(store):
+def test_w1f_past_the_ttl_a_finished_order_is_released_and_an_unacked_one_has_its_cancel_asked(store):
+    """The TTL covers send to venue ack only (Advisor 8 Oct 06:10 UK, MUST)."""
     portfolio_pass(store, T0, EQ)
     led = _ledger(store)
     gone = check_order(led, "a", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=1)).reservation
-    live = check_order(led, "b", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=2)).reservation
-    for rid, oid, status in ((gone, "o-gone", "canceled"), (live, "o-live", "accepted")):
-        led.attach_order(rid, oid)  # the harness writes the order row, as the engine's send does
-        store.update_order(oid, status=status)
+    unacked = check_order(led, "b", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=2)).reservation
+    for rid, oid, status in ((gone, "o-gone", "canceled"), (unacked, "o-sent", None)):
+        led.attach_order(rid, oid)  # the harness writes the order row ('submitted'), as the engine's send does
+        if status:
+            store.update_order(oid, status=status)
     later = T0 + gate_mod.RESERVATION_TTL + timedelta(minutes=1)
     for s in range(0, 15, 5):
         portfolio_pass(store, later + timedelta(seconds=s), EQ)
     assert _res(store, gone).release_reason == "ttl"
-    kept = _res(store, live)
+    kept = _res(store, unacked)
     assert kept.released_at is None and kept.cancel_sent_at is not None
+
+
+@pytest.mark.parametrize("status", ["accepted", "partially_filled"])
+def test_w1g_an_acked_resting_orders_reservation_outlives_the_ttl_and_is_never_cancelled_by_time(store, status):
+    """Once the venue acks, the reservation lives with the order: released on a confirmed cancel, converted on a fill,
+    never expired by time (Advisor 8 Oct 06:10 UK, MUST)."""
+    portfolio_pass(store, T0, EQ)
+    led = _ledger(store)
+    rid = check_order(led, "a", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=1)).reservation
+    led.attach_order(rid, "o-rest")
+    store.update_order("o-rest", status=status)
+    for later in (T0 + gate_mod.RESERVATION_TTL + timedelta(minutes=1), T0 + timedelta(hours=6)):
+        for s in range(0, 15, 5):
+            portfolio_pass(store, later + timedelta(seconds=s), EQ)
+    r = _res(store, rid)
+    assert r.released_at is None and r.cancel_sent_at is None
+    assert not _alerts(store, "reservation_expired") and not _alerts(store, "reservation_order_cancelled")
+    assert rid in {x.id for x in led.reservations()}  # still counted in the book
 
 
 # --- W2 ---------------------------------------------------------------------------------------------------------------
@@ -260,6 +290,22 @@ def test_w2b_fills_reduce_and_reject_or_cancel_release_the_reservation(store):
         record_entry_order(store, "b", oid, D("0.1"), g.checked.reservation)
         store.update_order(oid, status=status)
         assert _res(store, g.checked.reservation).release_reason == reason
+
+
+@cell("W2", "nothing cancels an unfilled resting entry at the strategy's next bar close")
+def test_w2f_an_unfilled_resting_entry_is_cancelled_at_the_next_bar_close_and_its_reservation_released(store):
+    """Advisor 8 Oct 06:10 UK: the strategy's own process cancels it at its next bar close; the confirmed cancel
+    releases the reservation as 'cancel'. A partly filled one keeps what filled, and its rest is released."""
+    rid = _approved(store)
+    store.update_order("o-1", status="accepted")
+    rid2 = _approved(store, strategy="b", oid="o-2")
+    store.update_order("o-2", status="accepted")
+    store.book_fill("b", side="BUY", qty=0.04, price=60000.0, fee=0.1, order_id="o-2", trade_id="t1", ts=T0)
+    for name in ("a", "b"):
+        cancel_resting_entries_at_bar_close(store, name, T0 + timedelta(hours=1))
+    assert _res(store, rid).release_reason == "cancel"
+    assert _res(store, rid2).release_reason == "cancel" and money(_res(store, rid2).remaining_qty) == D("0.06")
+    assert {o["order_id"]: o["status"] for o in store.orders()}["o-1"] == "canceled"
 
 
 @cell("W2", "book_fill doesn't reduce the reservation, so there's no shared transaction")

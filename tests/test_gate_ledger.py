@@ -60,14 +60,14 @@ def _engine(schema: str | None = None):
 
 def _store() -> Store:
     if not PG:
-        return Store.in_memory()
+        return Store.in_memory(portfolio_gate=True)  # a paper journal: the gate is in force
     name = f"gl_{uuid.uuid4().hex[:12]}"
     with _engine().begin() as c:
         c.execute(text(f"CREATE SCHEMA {name}"))
     _SCHEMAS.append(name)
     eng = _engine(name)
     _ENGINES.append(eng)
-    return Store(engine=eng)
+    return Store(engine=eng, portfolio_gate=True)
 
 
 @pytest.fixture(scope="module", autouse=True)

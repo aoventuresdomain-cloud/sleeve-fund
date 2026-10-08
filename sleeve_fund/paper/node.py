@@ -37,7 +37,7 @@ from sleeve_fund import markets, spreads
 from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
-from sleeve_fund.paper.safety import assert_keyless
+from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.venues import venue as venue_profile
 
@@ -310,7 +310,8 @@ def main(argv: list[str] | None = None) -> int:
 
         from sleeve_fund.fees import resolve
 
-        store = Store()
+        store = Store(portfolio_gate=True)
+        assert_portfolio_gate(store)
         row = store.sleeve(args.db_sleeve)
         quote = resolve(getattr(row, "venue", None), store)
         sleeve = from_store(row, fee_schedule=quote.fees)
