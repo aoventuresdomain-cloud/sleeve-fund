@@ -253,3 +253,22 @@ def test_with_two_accounts_each_has_its_own_headroom_as_the_gate_measures_it(cli
             assert line in c.get(url, auth=AUTH).text, (url, line)
         assert line.replace('<span class="loss">', "").replace("</span>", "") in c.get("/", auth=AUTH).text
     assert "second: over the 5% limit by 100.00" in c.get("/", auth=AUTH).text  # 600 against 500
+
+
+def test_a_spot_only_account_gets_no_headroom_line(client):
+    """QA-F215-1: the 5% limit counts perpetuals only, so an account holding only spot has no headroom to show. With
+    one perp account beside it, that account still reads against its own book, named, as the gate measures it."""
+    c, store = client
+    store.create_account("spot-only", "paper")
+    _hold(store, "a", 0.1)  # no stop: 600.00 on the default account
+    _hold(store, "s", 0.1, params={"market": "spot"}, stop_frac=0.02)
+    store.assign_account("s", "spot-only")
+    book, others, _ = open_risk.account_book(store, "a", store.last_equity("a")["equity"], lambda s: 0.02)
+    assert open_risk.account_equity(store, "paper") == pytest.approx(book) == pytest.approx(10_000)
+    assert open_risk.LIMIT * book - others - 600 == pytest.approx(-100)  # 600 against 500
+    for url in ("/risk", "/trades"):
+        page = c.get(url, auth=AUTH).text
+        assert "spot-only:" not in page, url
+        assert 'paper: <span class="loss">over the 5% limit by 100.00</span>' in page, url
+    page = c.get("/", auth=AUTH).text
+    assert "spot-only:" not in page and "paper: over the 5% limit by 100.00" in page

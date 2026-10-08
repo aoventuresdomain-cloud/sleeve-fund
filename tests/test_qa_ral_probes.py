@@ -1,29 +1,56 @@
 """QA adversarial probes for P1-RAL (reset after liquidation), ported from the Head of QA round on #193.
 
 Source: /mnt/project-files/sleeve-fund/quant-review/v2-p1/ral-193-scripts/test_qa_ral_193_probes.py
-Finding: QA-193-F2 (a stopped, liquidated strategy locked: the RAL was sent but never applied, and could not be sent
-again). It is fixed on main, so these cells carry no xfail mark.
+Findings: QA-193-F1 (events.kind too short for 'pm_reset_after_liquidation_ignored', Postgres only) and QA-193-F2
+(a stopped, liquidated strategy locked: the RAL was sent but never applied, and could not be sent again). Both are
+fixed on main, so these cells carry no xfail mark.
 
 Built on test_ral_xfails' helpers (a real liquidation replayed into the store, a paper runtime restarted on the
-journal).
+journal). With TEST_DATABASE_URL set (Postgres) the unique index and the foreign key are enforced too.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from sqlalchemy import insert, select
 
 from tests.test_ral_xfails import (  # noqa: F401  (store and client are fixtures)
     NAME,
     NEXT_DAY,
+    PARAMS,
     RAL,
     _liquidate,
     _noted,
+    _ordinary,
     _post,
     _ral,
+    _ral_events,
     _runtime,
+    _tick,
     client,
     store,
 )
+
+T = datetime(2025, 10, 3, 10, 0, tzinfo=timezone.utc)  # _ordinary's time
+
+
+def _raw(store, command, name=NAME, incident=None):
+    """A command row written without Store.command's checks: a stale page, a script, a row replayed from a backup."""
+    from sleeve_fund.store import commands_t, utcnow
+
+    with store.engine.begin() as c:
+        c.execute(insert(commands_t).values(sleeve=name, command=command, reason="QA raw row", created_at=utcnow(),
+                                            incident=incident))
+
+
+def _ral_rows(store, name=NAME):
+    from sleeve_fund.store import commands_t
+
+    with store.engine.connect() as c:
+        return c.execute(select(commands_t).where(commands_t.c.sleeve == name,
+                                                  commands_t.c.command == RAL)).all()
 
 
 def _liquidated(store, name=NAME):
@@ -32,9 +59,33 @@ def _liquidated(store, name=NAME):
     return liquidation_head(store, name) is not None
 
 
-# QA-193-F1's cell (test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing) is not
-# ported: its red is Postgres only (VARCHAR(32) on events.kind) and was not recorded on a pre-fix SHA. It stays in QA's
-# source script; see tests/QA_CELLS.md.
+# --- 1. a RAL on a strategy that was never liquidated: refused at the call, and a raw row is a no-op -------------
+
+@pytest.mark.parametrize("kind", ["running", "drawdown_halt", "daily_pause"])
+def test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing(store, kind):
+    """Source: quant-review/v2-p1/ral-193-scripts/test_qa_ral_193_probes.py; finding QA-193-F1 (fixed)."""
+    if kind == "running":
+        store.create_sleeve(name=NAME, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=10_000, params=PARAMS)
+        rt = _runtime(store, T - timedelta(minutes=5), 10_000.0, price=60_000.0)
+        equity = 10_000.0
+    else:
+        rt = _ordinary(store, kind)
+        equity = 7_900.0 if kind == "drawdown_halt" else 9_400.0
+    s0 = store.sleeve(NAME)
+    peak0, day0 = rt.peak, rt._day_open
+    iid = _noted(store, at=T + timedelta(minutes=1))
+    with pytest.raises(ValueError):
+        _ral(store, incident=iid)
+    assert not _ral_rows(store)
+    _raw(store, RAL, incident=iid)  # past the call's checks
+    _tick(rt, T + timedelta(minutes=2), equity, price=60_000.0)
+    s = store.sleeve(NAME)
+    assert (s.status, s.status_reason, s.paused_until) == (s0.status, s0.status_reason, s0.paused_until)
+    assert (rt.peak, rt._day_open) == (peak0, day0)
+    assert not _ral_events(store) and not store.pending_commands(NAME)
+    rt2 = _runtime(store, T + timedelta(minutes=3), equity, price=60_000.0)  # and through a restart
+    assert rt2.status == s0.status
 
 
 # --- 7. the PM stopped the liquidated strategy: the RAL must not be accepted into a dead end -----------------------
