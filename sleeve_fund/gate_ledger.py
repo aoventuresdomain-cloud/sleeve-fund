@@ -135,7 +135,8 @@ class DbLedger:
         """The lock's or the fill's transaction when inside one, else a transaction of its own. audit: a failed entry
         check's error row or alert. Inside a fill's transaction (using(), never the lock) only a failed check writes
         those, so on Postgres they take their own transaction and outlive a fill that rolls back (CR F219-5). SQLite
-        shares one connection, so there they join it."""
+        shares one connection, so there they join it. That own transaction can't see rows the fill's hasn't committed:
+        a strategy created inside it would fail the audit row's lookup (CR F228-1; strategies are created at setup)."""
         loc = self._local
         conn = getattr(loc, "conn", None)
         if conn is not None and not (audit and self._pg and not getattr(loc, "locked", None)):
