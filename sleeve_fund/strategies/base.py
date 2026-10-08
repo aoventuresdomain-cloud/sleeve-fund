@@ -3651,6 +3651,11 @@ class LongFlatStrategy(Strategy):
 
     def _book_funding(self, ts: datetime, qty: float, px: float, rate: float, amount: float,
                       kind: str = "settled", note: str = "") -> None:
+        # The journal first, and cash only for a movement it took (CASH-1): a settlement it already holds, from a
+        # second process or a restart that lost _funding_since, is never charged again.
+        if self.runtime is not None and self.runtime.store.record_funding(
+                self.runtime.name, qty=qty, price=px, rate=rate, amount=round(amount, 8), ts=ts, kind=kind) != "new":
+            return
         self._cash_adj += amount
         self.funding_log.append((ts, amount, kind))
         if note:
@@ -3658,8 +3663,6 @@ class LongFlatStrategy(Strategy):
         if kind == "baseline" and not self._backtest:
             self._funding_paid[ts] = (qty, px, rate, amount)  # reversed if the venue shows it was no settlement
         if self.runtime is not None:
-            self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
-                                              amount=round(amount, 8), ts=ts, kind=kind)
             self.runtime.store.event(self.runtime.name, "info", "funding",
                                      f"Funding {'received' if amount >= 0 else 'paid'}: {abs(amount):,.2f} on a "
                                      f"{_side_word(1 if qty > 0 else -1)} position of {abs(qty):.12g} at "
@@ -3745,7 +3748,7 @@ class LongFlatStrategy(Strategy):
             return
         store = self.runtime.store
         net: dict = {}
-        for r in store.funding(self.runtime.name):
+        for r in store.funding(self.runtime.name, limit=None):  # every row, not the newest 1,000 (CASH-1)
             ts = r["ts"] if r["ts"].tzinfo else r["ts"].replace(tzinfo=timezone.utc)
             if ts > closed:
                 was = net.get(ts)
@@ -3753,11 +3756,12 @@ class LongFlatStrategy(Strategy):
         for ts, (row, amount) in sorted(net.items(), key=lambda kv: kv[0]):
             if abs(amount) < 1e-9:
                 continue
-            self._cash_adj -= amount
             # Its own kind, so O17b never trues up a reversed baseline and the books read it as a correction (QA M-1)
+            if store.record_funding(self.runtime.name, qty=row["qty"], price=row["price"], rate=row["rate"],
+                                    amount=round(-amount, 8), ts=ts, kind="reversal") != "new":
+                continue  # reversed already (CASH-1): one reversal per settlement
+            self._cash_adj -= amount
             self.funding_log.append((ts, -amount, "reversal"))
-            store.record_funding(self.runtime.name, qty=row["qty"], price=row["price"], rate=row["rate"],
-                                 amount=round(-amount, 8), ts=ts, kind="reversal")
             # Nothing of the strategy's is owed at it now: it leaves the watch, and the hub alone judges the rate (M-1)
             when = pd_ts(ts)
             self._funding_missing.discard(when)
@@ -3915,11 +3919,13 @@ class LongFlatStrategy(Strategy):
             if paid is None:
                 continue
             qty, px, rate, amount = paid
+            if self.runtime is not None and self.runtime.store.record_funding(
+                    self.runtime.name, qty=qty, price=px, rate=rate, amount=round(-amount, 8), ts=when,
+                    kind="reversal") != "new":
+                continue  # reversed already (CASH-1)
             self._cash_adj -= amount
             self.funding_log.append((when, -amount, "reversal"))
             if self.runtime is not None:
-                self.runtime.store.record_funding(self.runtime.name, qty=qty, price=px, rate=rate,
-                                                  amount=round(-amount, 8), ts=when, kind="reversal")
                 self.runtime.store.event(self.runtime.name, "info", "funding",
                                          f"Funding reversed: {abs(amount):,.2f} back; the venue's records show no "
                                          f"settlement at {when:%d %b %Y %H:%M} UTC (its interval lengthened), so the "
@@ -3994,7 +4000,8 @@ class LongFlatStrategy(Strategy):
         step = markets.latest_interval(funding.rates(terms.funding_venue, pair_of(self.instrument)))
         opened = min(starts) - pd.Timedelta(step or markets.funding_interval(terms.funding_hours))
         rows: dict = {}
-        for row in self.runtime.store.funding(self.runtime.name):
+        # every row, not the newest 1,000 (CASH-1)
+        for row in self.runtime.store.funding(self.runtime.name, limit=None):
             ts = pd.Timestamp(row["ts"])
             rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
         for ts, booked in rows.items():
@@ -4246,7 +4253,7 @@ class LongFlatStrategy(Strategy):
                            f"{c['bankrupt']:,.6g}: the venue kept the {-past:,.2f} of margin in between. Booked at the "
                            "bankruptcy price: the strategy loses its margin and fees", ts=rt.now())
 
-    def _cover_shortfall(self, price: float, event=None) -> None:
+    def _cover_shortfall(self, price: float, fill: tuple[str, str]) -> None:
         """Once flat, equity never ends below zero: a liquidation is booked at the bankruptcy price, so it loses
         its isolated margin and fees and no more (_book_liquidation); should this book's own arithmetic still leave
         it below zero, the difference comes back to cash, journaled as the venue's insurance fund's."""
@@ -4254,12 +4261,16 @@ class LongFlatStrategy(Strategy):
         if credit <= 0:
             return
         credit = math.ceil(credit * 100) / 100  # to the cent, so no float residue leaves it a fraction below zero
+        # Keyed by the fill that left it flat, as the journal books it (CASH-1): one credit per closing fill, and
+        # cash only for a new one.
+        if self.runtime is not None and self.runtime.store.record_insurance(
+                self.runtime.name, price=price, amount=round(credit, 8), ts=self.runtime.now(),
+                order_id=fill[0], trade_id=fill[1]) != "new":
+            return
         self._cash_adj += credit
         now = self.clock.utc_now()
         self.insurance_log.append((now, credit))
         if self.runtime is not None:
-            self.runtime.store.record_insurance(self.runtime.name, price=price, amount=round(credit, 8),
-                                                ts=self.runtime.now())
             self.runtime.store.event(self.runtime.name, "error", "insurance_fund",
                                      f"Closed at {price:,.6g} with equity {credit:,.2f} below zero: the venue's "
                                      "insurance fund takes the shortfall, as isolated margin caps the loss at the "
@@ -5003,7 +5014,7 @@ class LongFlatStrategy(Strategy):
                         self.runtime._set("halted", reason.replace(old, margin, 1))
                 self._liquidated = margin
             self._liquidation_diagnostic()
-            self._cover_shortfall(px, event)
+            self._cover_shortfall(px, (journal_id, str(event.trade_id)))
             if self.decisions.get(coid, {}).get("intent") == "liquidation" and self.runtime is not None:
                 self._liquidation_incident()
         if coid == self._risk_stop_id:
