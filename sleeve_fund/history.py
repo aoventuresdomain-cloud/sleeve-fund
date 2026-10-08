@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 import threading
 import uuid
 from dataclasses import dataclass
@@ -559,6 +560,72 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
+GOLDEN_HEADER = "open_utc,open,high,low,close,volume,missing,degraded"
+GOLDEN_CANON_HEADER = ("minute_utc,at," + ",".join(f"stored_{c}" for c in OHLCV) + ","
+                       + ",".join(f"offered_{c}" for c in OHLCV))
+
+
+def _golden_window(start, end) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start
+    end = end.tz_localize("UTC") if end.tzinfo is None else end
+    if start.second or start.microsecond or end.second or end.microsecond or end <= start:
+        raise ValueError("start and end must be whole minutes, start before end")
+    return start, end
+
+
+def export_csv(store: HistoryStore, venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    """GOLDEN-VENUE: the stored 1-minute candles opening in [start, end), read through the store's own read() (via
+    parity.store_minutes, which shifts read()'s close stamps back to open times), as CSV with a fixed layout (open
+    time UTC, floats as repr, missing and degraded 0/1) so the same candles always give the same bytes and so the same
+    sha256. Read-only. A window with any minute absent, missing or degraded is not canonical and is refused rather
+    than exported."""
+    from sleeve_fund.parity import store_minutes  # parity imports this module
+
+    start, end = _golden_window(start, end)
+    if not store.coverage(venue, pair):
+        raise KeyError(f"no stored history for {venue} {pair}")
+    bars = store_minutes(store, venue, pair, start, end)
+    want = pd.date_range(start, end, freq="1min", inclusive="left")
+    if len(absent := want.difference(bars.index)):
+        raise ValueError(f"{venue} {pair}: {len(absent)} of {len(want)} minutes absent in the window, first "
+                         f"{absent[0]:%Y-%m-%dT%H:%MZ}; nothing exported")
+    for flag in ("missing", "degraded"):
+        if len(hit := bars.index[bars[flag].fillna(1).astype(bool).to_numpy()]):
+            raise ValueError(f"{venue} {pair}: {len(hit)} minutes {flag} in the window, first "
+                             f"{hit[0]:%Y-%m-%dT%H:%MZ}; the window is not canonical, nothing exported")
+    lines = [GOLDEN_HEADER]
+    for t, row in zip(bars.index, bars.itertuples(index=False)):
+        lines.append(f"{t:%Y-%m-%dT%H:%MZ},{float(row.open)!r},{float(row.high)!r},{float(row.low)!r},"
+                     f"{float(row.close)!r},{float(row.volume)!r},{int(bool(row.missing))},{int(bool(row.degraded))}")
+    return "\n".join(lines) + "\n"
+
+
+def export_canon_replaced(store: HistoryStore, venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp,
+                          expect: int | None = None) -> str:
+    """GOLDEN-VENUE provenance: for each minute opening in [start, end) that the canon backfill replaced, its latest
+    "replaced" record with source "canon" (CR F224-1), as CSV: minute, when, the stored bar and the venue's offered bar
+    (floats as repr). Read-only. expect: the count the canon run reported; a different count means something rewrote
+    the window since, and is refused."""
+    start, end = _golden_window(start, end)
+    latest: dict[pd.Timestamp, dict] = {}
+    for e in store.provenance(venue, pair):  # oldest first, so the last one per minute wins
+        if e.get("kind") == "replaced" and e.get("source") == "canon":
+            minute = pd.Timestamp(e["minute"])
+            minute = minute.tz_localize("UTC") if minute.tzinfo is None else minute.tz_convert("UTC")
+            if start <= minute < end:
+                latest[minute] = e
+    if expect is not None and len(latest) != expect:
+        raise ValueError(f"{venue} {pair}: {len(latest)} canon replacements in the window, the canon run reported "
+                         f"{expect}; something rewrote the window, nothing exported")
+    lines = [GOLDEN_CANON_HEADER]
+    for minute in sorted(latest):
+        e = latest[minute]
+        vals = ",".join(repr(float(v)) for v in [*e["stored"], *e["offered"]])
+        lines.append(f"{minute:%Y-%m-%dT%H:%MZ},{e['at']},{vals}")
+    return "\n".join(lines) + "\n"
+
+
 def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000, sleep=None, log=print,
             since: pd.Timestamp | None = None) -> dict:
     """Bring one instrument's stored history up to date from its venue, resuming from the cursor.
@@ -1043,6 +1110,15 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
+    exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
+    exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
+    exp.add_argument("--venue", default=None)
+    exp.add_argument("--start", required=True, help="first minute's open time, UTC, e.g. 2026-10-06T00:00")
+    exp.add_argument("--end", required=True, help="UTC minute to stop before, e.g. 2026-10-08T00:00")
+    exp.add_argument("--canon-replaced", action="store_true",
+                     help="instead of the candles, the canon backfill's latest replacement record per minute")
+    exp.add_argument("--expect", type=int, default=None,
+                     help="with --canon-replaced: the count the canon run reported; refuse any other")
     args = ap.parse_args(argv)
 
     store = HistoryStore(args.root)
@@ -1050,6 +1126,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in ("refresh", "run", "canon") and (problem := unwritable(store.root / profile.name.upper())):
         print(f"{profile.name}: history store can't start: {problem}")
         return 2
+    if args.cmd == "export":  # GOLDEN-VENUE: read-only, CSV to stdout, a refusal to stderr
+        try:
+            start, end = pd.Timestamp(args.start, tz="UTC"), pd.Timestamp(args.end, tz="UTC")
+            sys.stdout.write(export_canon_replaced(store, profile.name, args.pair, start, end, args.expect)
+                             if args.canon_replaced else export_csv(store, profile.name, args.pair, start, end))
+        except (KeyError, ValueError) as exc:
+            print(f"export refused: {exc}", file=sys.stderr)
+            return 2
+        return 0
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:
