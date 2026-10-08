@@ -10,6 +10,7 @@ be short: it says which side to be on (want_side, +1, 0 or -1).
 
 from __future__ import annotations
 
+import heapq
 import math
 import os
 import re
@@ -681,6 +682,9 @@ class LongFlatStrategy(Strategy):
         # Every bar with minutes missing, degraded or not: close time (ns) -> minutes missing, so the slower candles
         # built from it count them (Independent Quant Advisor 6 Oct 16:40, 4.2). Given by mark_missing().
         self._bar_missing: dict[int, int] = {}
+        # Their close times as a min-heap (_note_missing), so each bar forgets the older ones in log time rather than
+        # a min() over all of them: a backtest is given every part bar up front (P1-4-F1). May hold ones already gone.
+        self._missing_closes: list[int] = []
         self._missed_said: dict[int, int] = {}  # per slower candles (index): the latest missing one journaled
         self._no_entry_ts: int | None = None  # the close time of the degraded bar being decided on
         self._degraded_missing = 0
@@ -804,7 +808,13 @@ class LongFlatStrategy(Strategy):
         slower candles built from them add these up (v2 P1-4, Advisor 4.2). Entries are held only on the degraded
         ones (mark_degraded)."""
         if self._slower:  # only slower candles read them
-            self._bar_missing.update({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
+            self._note_missing({int(ts): int(m) for ts, m in bars.items() if int(m) > 0})
+
+    def _note_missing(self, bars: dict[int, int]) -> None:
+        for ts, m in bars.items():
+            if ts not in self._bar_missing:
+                heapq.heappush(self._missing_closes, ts)
+            self._bar_missing[ts] = m
 
     def expect_bars(self, closes) -> "LongFlatStrategy":
         """Backtest on execution bars: the close times (ns) of the decision bars they build. The engine makes up any
@@ -858,7 +868,7 @@ class LongFlatStrategy(Strategy):
             self.hub_status.degraded.clear()
         if self.hub_status is not None and self.hub_status.missing:
             if self._slower:
-                self._bar_missing.update(self.hub_status.missing)
+                self._note_missing(self.hub_status.missing)
             self.hub_status.missing.clear()
         if str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
             return False
@@ -880,7 +890,8 @@ class LongFlatStrategy(Strategy):
             return True
         missing = minutes - seen
         if missing > 0 and self._slower:
-            self._bar_missing.setdefault(bar.ts_event, missing)
+            if bar.ts_event not in self._bar_missing:
+                self._note_missing({bar.ts_event: missing})
         if bar_rule.degraded(missing, minutes):
             self._degraded.setdefault(bar.ts_event, missing)
         return False
@@ -1126,8 +1137,8 @@ class LongFlatStrategy(Strategy):
             self._lows.append(bar.low.as_double())
             self._highs.append(bar.high.as_double())
         missing = self._bar_missing.pop(bar.ts_event, None)
-        if self._bar_missing and min(self._bar_missing) < bar.ts_event:  # bars never decided on (dropped): forgotten
-            self._bar_missing = {t: m for t, m in self._bar_missing.items() if t > bar.ts_event}
+        while self._missing_closes and self._missing_closes[0] <= bar.ts_event:  # bars never decided on (dropped):
+            self._bar_missing.pop(heapq.heappop(self._missing_closes), None)  # forgotten
         if self._slower:
             missing = self._degraded.get(bar.ts_event, 0) if missing is None else missing
             for s in self._slower:
