@@ -551,19 +551,40 @@ class SleeveRuntime:
         the remaining equity, the halt lifted, one liquidation_reset event naming the PM, the incident, the note's
         author, the old and new marks and the equity before and after the liquidation. The old mark stays in the
         journal; the book's own limits and figures are untouched. A reset asked for before the liquidation lapses,
-        so it can't run without a fresh confirmation (#167 round). One already answered (a retry, a restart) is a no-op."""
-        self.store.mark_applied(cmd["id"])
+        so it can't run without a fresh confirmation (#167 round). One already answered (a retry, a restart) is a no-op.
+
+        The process checks the row as Store.command does (ral_refusal; QA-193-F4: a row with no noted incident, from a
+        restored backup or a script, is refused, not carried out). The command is marked applied only after
+        liquidation_reset is journaled (QA-193-F3): a failure in between leaves it pending and the incident unspent,
+        so the restart takes it again; one journaled but not yet marked finds nothing left to reset on the retry, and
+        finishes it if the strategy was still halted for the liquidation (no second liquidation_reset)."""
         liq = liquidation_event(self.store, self.name)
+        if liq is None and self.status == "halted" and fold(self.store.sleeve(self.name).status_reason).startswith(
+                LIQUIDATED_WORDS):
+            # The reset was journaled and the process died before lifting the halt: the journal has answered the
+            # liquidation, so finish it rather than leave a halt only a reset after liquidation clears, and none can.
+            self.peak, self._day_open = equity, equity
+            self.wiped_out, self.liquidated = False, None
+            self._set("running", "")
+            self.store.mark_applied(cmd["id"])
+            return
         if liq is None:
             self.store.event(self.name, "info", "ral_ignored",  # events.kind is String(32) (QA RAL-F1)
                              f"reset after liquidation ignored, nothing to reset: {cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
+            return
+        if (why := ral_refusal(self.store, self.name, cmd.get("incident"), "PM")) is not None:
+            self.store.event(self.name, "warning", "ral_refused",
+                             f"reset after liquidation refused: {why}. {cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
             return
         old = self.peak
+        self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
+                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
         self.peak, self._day_open = equity, equity
         self.wiped_out, self.liquidated = False, None
         self._set("running", "")
-        self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
-                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
+        self.store.mark_applied(cmd["id"])
         for request in self.store.pending_resets():
             if request["sleeve"] == self.name and request["created_at"] <= cmd["created_at"]:
                 self.store.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
