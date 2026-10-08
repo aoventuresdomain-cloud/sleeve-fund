@@ -27,6 +27,7 @@ from sleeve_fund.portfolio.limits import Holding, Intent, rejected
 from sleeve_fund.risk import PortfolioProfile
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
+DAY_NS = 86_400_000_000_000
 # ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the
 # close. No drift is modelled until the parity report shows mean adverse drift above 2.5 bp over 200 or more fills;
 # then this fixed figure is set, and every portfolio fill pays it through fill_price(), the one hook.
@@ -134,8 +135,10 @@ def gate_intent(d: dict) -> Intent:
 
 
 def _utc(ts_ns: int) -> datetime:
-    return datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=timezone.utc).replace(
-        microsecond=ts_ns % 1_000_000_000 // 1000)
+    """ts_ns as a datetime, rounded UP to the microsecond a datetime keeps, so a close + 1 ns stays after the close
+    (a gate pass at 00:00 + 1 ns belongs to the new day, never the old one)."""
+    us = -(-ts_ns // 1000)
+    return datetime.fromtimestamp(us // 1_000_000, tz=timezone.utc).replace(microsecond=us % 1_000_000)
 
 
 @dataclass(frozen=True)
@@ -179,12 +182,26 @@ class PortfolioGate:
     book: Callable[[int], tuple[Decimal, tuple[Holding, ...]]]
     profile: PortfolioProfile = field(default_factory=PortfolioProfile)
     ledger: MemoryLedger = field(default_factory=MemoryLedger)
+    on_action: Callable[[int, str], None] | None = None  # (ts_ns, "halt" | "pause"), whichever mark sets it
 
     def mark(self, ts_ns: int) -> str | None:
-        """Mark the fund at ts_ns: "halt" or "pause" when that mark has just set one, else None."""
+        """Mark the fund at ts_ns, a close + BATCH_DELAY_NS: "halt" or "pause" when that mark has just set one
+        (on_action hears it), else None. At 00:00 UTC the order is fixed (Advisor 8 Oct 03:25 UK): first the old
+        day's final mark at the close itself, then the new day's daily start from it, then the Strategies' decisions,
+        so no decision sees the old day's pause or a stale daily start, whichever alert at that instant runs first.
+        By design the daily pause lifts at 00:00 UTC, when a daily Strategy decides, so it never blocks one."""
         equity, held = self.book(ts_ns)
         self.ledger.equity, self.ledger.held = money(equity, "equity"), list(held)
-        return mark_book(self.ledger, self.ledger.equity, _utc(ts_ns), self.profile)
+        close = ts_ns - BATCH_DELAY_NS
+        marked = self.ledger.state().mark_ts
+        acts = []
+        if close % DAY_NS == 0 and (marked is None or marked < _utc(close)):
+            acts.append((close, mark_book(self.ledger, self.ledger.equity, _utc(close), self.profile)))
+        acts.append((ts_ns, mark_book(self.ledger, self.ledger.equity, _utc(ts_ns), self.profile)))
+        for at, acted in acts:
+            if acted is not None and self.on_action is not None:
+                self.on_action(at + (BATCH_DELAY_NS if at == close else 0), acted)
+        return next((a for _, a in reversed(acts) if a is not None), None)
 
     def __call__(self, strategy: str, intent: dict, ts_ns: int) -> Gated:
         now = _utc(ts_ns)

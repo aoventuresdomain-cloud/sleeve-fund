@@ -1116,9 +1116,9 @@ class LongFlatStrategy(Strategy):
         trend average (v2 P1-4): built from the decision bars, each fed to `blocks` once closed, before the
         decision on the bar that closed it. Warm-up loads them from the history store at their own size. Call it in
         __init__ (as rsi_cross does): missing minutes are only counted once a slower candle exists (mark_missing)."""
-        from sleeve_fund.venues import VENUES
+        from sleeve_fund.venues import VENUES, base_venue
 
-        profile = VENUES.get(self._cfg.instrument_id.venue.value)
+        profile = VENUES.get(base_venue(self._cfg.instrument_id.venue.value))
         s = SlowerCandles(minutes, bar_minutes(self._cfg.bar_type), blocks,
                           profile.daily_anchor_minutes if profile is not None else 0)
         self._slower.append(s)
@@ -2912,12 +2912,11 @@ class LongFlatStrategy(Strategy):
         if self._deciding_bar is not None:
             signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
         s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
-        base = getattr(self.instrument, "base_currency", None)
         # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
         # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
-                  "instrument": str(base.code) if base is not None else str(self._cfg.instrument_id.symbol),
+                  "instrument": self._base_code(),
                   "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else
@@ -2949,6 +2948,33 @@ class LongFlatStrategy(Strategy):
                 sent(trimmed)
 
         batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+
+    def _base_code(self) -> str:
+        """What the portfolio book counts this instrument's net in (portfolio.holding.underlying maps venue codes)."""
+        base = getattr(self.instrument, "base_currency", None)
+        return str(base.code) if base is not None else str(self._cfg.instrument_id.symbol)
+
+    def portfolio_book(self, name: str, close: float, atr_pct: float | None):
+        """A portfolio run's book (research.portfolio_run): this strategy's equity marked at `close`, and its position
+        as the gate counts it (portfolio.holding_for), or None when flat. The held stop is the one the interim open-risk
+        check counts, the entry less the stop distance; with none the position is stopless. Raises ValueError when a
+        stopless position's daily ATR isn't known."""
+        from sleeve_fund.portfolio.holding import Position, holding_for, underlying
+
+        equity, _, qty, _ = self._mark(close)
+        if abs(qty) < 1e-12:
+            return Decimal(repr(float(equity))), None
+        stop = (self._entry_px * (1 - (self._entry_side or 1) * self._stop_frac)
+                if self._entry_px and self._stop_frac is not None else None)
+        lev = (self.runtime.profile.max_leverage if self.runtime is not None else 1.0) if self._margin else None
+        pos = Position(name, underlying(self._base_code()), Decimal(repr(float(qty))),
+                       None if stop is None else Decimal(repr(float(stop))), lev)
+        return Decimal(repr(float(equity))), holding_for(pos, Decimal(repr(float(close))), atr_pct)
+
+    def portfolio_halt(self, reason: str) -> None:
+        """The portfolio's drawdown halt (research.portfolio_run): close the position now, through the exit path."""
+        if self._pos_side() != 0 or self._working():
+            self._sell_all("risk_halt", f"Portfolio halted: {reason}")
 
     def _hold_reservation(self, gated, coid: str) -> None:
         """A portfolio run: the gate's reservation for an order now sent lives as long as the order (gate.check_order).
@@ -4438,9 +4464,9 @@ class LongFlatStrategy(Strategy):
             account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
         return account
 
-    def _mark(self) -> tuple[float, float, float, float]:
-        """(equity, cash, position qty, price) in the quote currency."""
-        price = self._price()
+    def _mark(self, price: float | None = None) -> tuple[float, float, float, float]:
+        """(equity, cash, position qty, price) in the quote currency, at `price` (default: the last price)."""
+        price = self._price() if price is None else price
         account = self._account()
         if account is None or self.instrument is None:
             return 0.0, 0.0, 0.0, price
