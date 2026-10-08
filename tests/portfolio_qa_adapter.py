@@ -1,7 +1,7 @@
 """QA Tester 2's assumed P2-2 interface (quant-review/p2-2-xfails, 6 Oct), mapped onto the built gate so QA's cells
 run unchanged: their README says to adapt the names, never the assertions. Translation only: every decision is
 sleeve_fund.portfolio.gate.check_order on a ledger fed from QA's state snapshot, every holding comes from
-portfolio.holding_for, every halt and pause from mark_book / book_breach. QA's figures are floats; they become exact
+portfolio.holding_for, every halt and pause from mark_book, and Resume and cash flows from resume_after_halt and apply_flow (F208-1). QA's figures are floats; they become exact
 Decimals here, at the edge (Decimal(str(x)), DA's rule 1).
 
 What lives only here: QA's Gate object (paper's call sites hold the ledger and call check_order themselves), its
@@ -20,7 +20,7 @@ from sleeve_fund.portfolio import book as _book
 from sleeve_fund.portfolio import gate as _gate
 from sleeve_fund.portfolio.holding import Position as _Position
 from sleeve_fund.portfolio.holding import holding_for, underlying
-from sleeve_fund.portfolio.limits import LIMITS, book_breach
+from sleeve_fund.portfolio.limits import LIMITS
 from sleeve_fund.portfolio.limits import Intent as _Intent
 from sleeve_fund.risk import trading_day
 
@@ -188,19 +188,36 @@ class Verdict:
     reasons: list
 
 
+def _ledger(state: PortfolioState) -> _gate.MemoryLedger:
+    """A ledger holding QA's snapshot as the gate's last mark, so the book functions below are the product's own
+    (gate.mark_book, resume_after_halt, apply_flow; F208-1), not copies of them."""
+    led = _gate.MemoryLedger(equity=D(state.equity))
+    led.current = _gate.PortfolioState(
+        equity=D(state.equity), mark_ts=state.mark_ts, hwm=D(state.hwm), day=trading_day(state.mark_ts),
+        day_start_equity=D(state.day_start_equity),
+        halt_reference=None if state.halt_reference is None else D(state.halt_reference))
+    return led
+
+
+def _snapshot(state: PortfolioState, st: _gate.PortfolioState) -> PortfolioState:
+    return replace(state, equity=float(st.equity), hwm=float(st.hwm), day_start_equity=float(st.day_start_equity),
+                   halt_reference=None if st.halt_reference is None else float(st.halt_reference))
+
+
 def evaluate(state: PortfolioState, profile, now: datetime) -> Verdict:
-    ref = state.halt_reference if state.halt_reference is not None else state.hwm
-    b = book_breach(profile, D(state.equity), D(ref), D(state.day_start_equity))
-    halt = b is not None and b.action == "halt"
-    pause = b is not None and b.action == "pause"
-    return Verdict(halt, pause, halt, [b.reason] if b else [])
+    led = _ledger(state)
+    acted = _gate.mark_book(led, D(state.equity), now, profile)
+    st = led.state()
+    halt, pause = acted == "halt", acted == "pause"
+    return Verdict(halt, pause, halt, [st.halted] if halt else [st.paused] if pause else [])
 
 
 def resume(state: PortfolioState) -> PortfolioState:
-    return replace(state, halt_reference=state.equity)
+    led = _ledger(state)
+    return _snapshot(state, _gate.resume_after_halt(led))
 
 
 def apply_cash_flow(state: PortfolioState, amount: float) -> PortfolioState:
-    return replace(state, equity=state.equity + amount, hwm=state.hwm + amount,
-                   day_start_equity=state.day_start_equity + amount,
-                   halt_reference=None if state.halt_reference is None else state.halt_reference + amount)
+    led = _ledger(state)
+    _gate.apply_flow(led, D(amount))
+    return _snapshot(state, led.state())

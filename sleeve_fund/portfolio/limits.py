@@ -98,7 +98,7 @@ class Decision:
     outcome: str  # "approved" | "trimmed" | "rejected"
     approved_qty: Decimal  # what may be sent: the request, less, or 0
     requested_qty: Decimal
-    limit_hit: str | None  # the limit that bound it, if any (LIMITS, or a portfolio block)
+    limit_hit: str | None  # what bound it, if any: LIMITS, "below_min", or a portfolio block (gate.entry_block)
     reason: str  # one sentence for the journal and the strategy page
     figures: dict = field(default_factory=dict)  # each limit: book before, after (at approved_qty), cap; x book
 
@@ -160,6 +160,9 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
         return {k: {"before": float(used[k] / e), "after": float(after[k] / e), "cap": float(caps[k] / e)}
                 for k in LIMITS}
 
+    if limit is None and qty < intent.min_qty:  # nothing binds, but the request itself is under the minimum
+        return rejected(intent.qty, "below_min", f"Entry rejected: {qty.normalize():f} is below the venue minimum "
+                                                 f"of {intent.min_qty.normalize():f}", figures(ZERO))
     if limit is None:
         return Decision("approved", qty, intent.qty, None, "Entry within every portfolio limit", figures(qty))
     whole, now, cap = abs(used[limit] + intent.qty * per_unit[limit]) / e, abs(used[limit]) / e, caps[limit] / e

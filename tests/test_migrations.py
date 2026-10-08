@@ -159,3 +159,155 @@ def test_a_liquidation_incident_is_answered_by_one_command_only(engine):
     if engine.dialect.name == "postgresql":  # SQLite here doesn't enforce foreign keys
         with pytest.raises(IntegrityError), engine.begin() as c:  # the incident must be a real event
             c.execute(insert(commands_t).values(**{**row, "incident": 10**9}))
+
+
+def _gate_row(sleeve_id, **over):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from sleeve_fund.store import utcnow
+
+    return {"seq": 1, "sleeve_id": sleeve_id, "bar_ts": datetime(2026, 10, 7, tzinfo=timezone.utc), "intent_id": "i1",
+            "intent": "open_long", "underlying": "BTC", "profile_version": 1, "outcome": "approved", "limit_hit": None,
+            "requested_qty": Decimal("1"), "approved_qty": Decimal("1"), "price": Decimal("100"),
+            "regime_weight": Decimal("0.5"), "stage": "submit", "decided_at": utcnow(), **over}
+
+
+def test_0010_seeds_the_pms_accepted_limits_and_profiles_are_append_only(engine):
+    """P2-2: the migration and create_all both hold version 1, the limits the PM accepted (risk.PORTFOLIO); a change
+    is a new version and an old one is never rewritten (Store has no update for it)."""
+    from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    assert store.portfolio_profile() == PORTFOLIO == store.portfolio_profile(1)
+    got = store.portfolio_profile()  # Numeric(10,4) back as the floats the core's ratios are written in
+    assert (got.gross, got.net_instrument, got.margin, got.open_risk, got.drawdown, got.daily_loss) == \
+        (1.5, 0.5, 0.5, 0.05, 0.15, 0.03)
+    assert Store.in_memory().portfolio_profile() == PORTFOLIO
+    v2 = store.add_portfolio_profile(PortfolioProfile(version=9, gross=1.2), created_by="pm", note="tighter gross")
+    assert v2 == 2 and store.portfolio_profile() == PortfolioProfile(version=2, gross=1.2)
+    assert store.portfolio_profile(1) == PORTFOLIO
+    with pytest.raises(LookupError):
+        store.portfolio_profile(3)
+    assert [m for m in dir(Store) if "portfolio_profile" in m] == ["add_portfolio_profile", "portfolio_profile"]
+
+
+def test_0010_refuses_names_and_limits_outside_the_spec(engine):
+    """The CHECKs of v2/p2-2-tables.md: a gate decision's outcome, limit and stage, a reservation's release reason,
+    the supervisor's single row and status, and a profile whose halt is not above its pause."""
+    from datetime import date
+    from decimal import Decimal
+
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import (PORTFOLIO_PROFILE_V1, gate_decisions_t, gate_reservations_t, portfolio_profile_t,
+                                   portfolio_state_t, utcnow)
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    sid = store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD",
+                              bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
+
+    def refused(table, row):
+        with pytest.raises(IntegrityError), engine.begin() as c:
+            c.execute(insert(table), [row])
+
+    for bad in ({"outcome": "ok"}, {"limit_hit": "portfolio_halt"}, {"stage": "exit"}):
+        refused(gate_decisions_t, _gate_row(sid, **bad))
+    with engine.begin() as c:
+        did = c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id),
+                        [_gate_row(sid, outcome="trimmed", limit_hit="below_min")]).scalar_one()
+    refused(gate_decisions_t, _gate_row(sid, seq=2))  # one decision per strategy, bar, intent and stage
+    now = utcnow()
+    res = {"decision_id": did, "sleeve_id": sid, "underlying": "BTC", "remaining_qty": Decimal("1"),
+           "notional": Decimal("100"), "margin": Decimal("50"), "open_risk": Decimal("2"), "created_at": now,
+           "expires_at": now, "released_at": now}
+    refused(gate_reservations_t, {**res, "release_reason": "expired"})
+    with engine.begin() as c:
+        c.execute(insert(gate_reservations_t), [{**res, "release_reason": "ttl"}])
+    state = {"id": 1, "status": "ok", "reference_equity": Decimal("1000"), "hwm": Decimal("1000"),
+             "day_start_equity": Decimal("1000"), "day_start": date(2026, 10, 7), "book_equity": Decimal("1000"),
+             "marked_at": now, "profile_version": 1, "updated_at": now}
+    refused(portfolio_state_t, {**state, "id": 2})
+    refused(portfolio_state_t, {**state, "status": "stopped"})
+    refused(portfolio_state_t, {**state, "status": "paused"})  # paused needs its paused_until
+    refused(portfolio_state_t, {**state, "status": "halted"})  # halted needs its reason
+    refused(portfolio_profile_t, {**PORTFOLIO_PROFILE_V1, "version": 2, "drawdown_halt": Decimal("0.03")})
+    with engine.begin() as c:
+        c.execute(insert(portfolio_state_t), [state])
+
+
+def test_0010_refuses_impossible_quantities_and_half_released_reservations(engine):
+    """DA's review: approved is 0..requested and 0 when rejected; a reservation's release time and reason come
+    together; remaining_qty is never below 0."""
+    from decimal import Decimal
+
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import gate_decisions_t, gate_reservations_t, utcnow
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    sid = store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD",
+                              bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
+
+    def refused(table, row):
+        with pytest.raises(IntegrityError), engine.begin() as c:
+            c.execute(insert(table), [row])
+
+    refused(gate_decisions_t, _gate_row(sid, approved_qty=Decimal("2")))  # more than asked
+    refused(gate_decisions_t, _gate_row(sid, approved_qty=Decimal("-1")))
+    refused(gate_decisions_t, _gate_row(sid, outcome="rejected", limit_hit="gross"))  # rejected with a quantity
+    with engine.begin() as c:
+        did = c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id),
+                        [_gate_row(sid, outcome="trimmed", approved_qty=Decimal("0.5"), limit_hit="gross")]
+                        ).scalar_one()
+    now = utcnow()
+    res = {"decision_id": did, "sleeve_id": sid, "underlying": "BTC", "remaining_qty": Decimal("0.5"),
+           "notional": Decimal("50"), "margin": Decimal("25"), "open_risk": Decimal("1"), "created_at": now,
+           "expires_at": now}
+    refused(gate_reservations_t, {**res, "released_at": now})  # released with no reason
+    refused(gate_reservations_t, {**res, "release_reason": "fill"})  # a reason but still active
+    refused(gate_reservations_t, {**res, "remaining_qty": Decimal("-0.1")})
+    with engine.begin() as c:
+        c.execute(insert(gate_reservations_t), [res])
+
+
+def test_0010_seed_equals_the_stores_copy_field_by_field(engine):
+    """The migration's frozen seed and store.PORTFOLIO_PROFILE_V1 (create_all's) are deliberate copies that must
+    never drift (DA)."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from sleeve_fund.store import PORTFOLIO_PROFILE_V1, portfolio_profile_t
+
+    schema.migrate(engine)
+    with engine.connect() as c:
+        row = dict(c.execute(select(portfolio_profile_t).where(portfolio_profile_t.c.version == 1)).one()._mapping)
+    at = row["created_at"]
+    row["created_at"] = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    assert set(row) == set(PORTFOLIO_PROFILE_V1)
+    for k, want in PORTFOLIO_PROFILE_V1.items():
+        assert row[k] == want, (k, row[k], want)
+    assert isinstance(row["created_at"], datetime)
+
+
+def test_0010_on_a_database_a_newer_store_already_opened_keeps_its_tables_and_one_seed(engine):
+    """A Store opened on a database at 0009 builds the new tables itself (create_all, seeding v1); 0010 then leaves
+    them as they are, adds no second seed, and the result matches the code (DA-9's c1 cell opens one that way)."""
+    from alembic import command
+    from sqlalchemy import func, select
+
+    from sleeve_fund.store import portfolio_profile_t
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0009")
+    Store(engine=engine)
+    assert schema.migrate(engine, log=lambda _: None) == f"at migration {schema.head()}"
+    with engine.connect() as c:
+        assert c.execute(select(func.count()).select_from(portfolio_profile_t)).scalar() == 1
+    assert schema.report(engine)[1] == []
