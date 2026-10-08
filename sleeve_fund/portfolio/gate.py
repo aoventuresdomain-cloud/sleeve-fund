@@ -227,7 +227,8 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
     the approved quantity is reserved before the lock is let go, so the next strategy sees it. Every check is
     recorded. Any error, the lock's included, fails closed: no entry, with the reason, an alert, and an 'error' row
     in the journal (limit 'lock_error' when the lock itself failed), written on its own after the check rolled back
-    (p2-2-tables.md, Concurrency). Its seq stays None: the row holds no place in the first-come order."""
+    (p2-2-tables.md, Concurrency). The returned Checked has no seq. The error row takes one, outside the lock, so
+    it holds no place in the first-come order: a replay in seq order skips outcome 'error' (CR F219-2)."""
     lock_failed = False
     try:
         with ExitStack() as held:
