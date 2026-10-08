@@ -1,0 +1,79 @@
+name: golden-export
+# GOLDEN-VENUE: export stored 1-minute candles for the golden fixtures (python -m sleeve_fund.history export), inside the
+# venue's hub container on the paper server. Read-only: it reads the history files and writes nothing on the server.
+# Run it by hand from main, once the Data Architect has picked the window. Each instrument's CSV is gzipped and uploaded
+# as this run's artifact with a sha256 list, for the fixture PR. Same secrets and variable as canon.
+on:
+  workflow_dispatch:
+    inputs:
+      venue:
+        description: Venue whose stored history to export (lower-case letters only)
+        required: true
+        default: binance
+      pairs:
+        description: Instruments, comma-separated, e.g. BTC/USDT,ETH/USDT
+        required: true
+      start:
+        description: First minute's open time, UTC (YYYY-MM-DDTHH:MM)
+        required: true
+      end:
+        description: UTC minute to stop before (YYYY-MM-DDTHH:MM)
+        required: true
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          VENUE: ${{ inputs.venue }}
+          PAIRS: ${{ inputs.pairs }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
+          [[ "$PAIRS" =~ ^[A-Z0-9]{1,20}/[A-Z0-9]{1,20}(,[A-Z0-9]{1,20}/[A-Z0-9]{1,20}){0,19}$ ]] \
+            || { echo "pairs must be like BTC/USDT,ETH/USDT (upper-case, comma-separated, at most 20)"; exit 1; }
+          for t in "$START" "$END"; do
+            [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$ ]] || { echo "start and end must be YYYY-MM-DDTHH:MM"; exit 1; }
+          done
+          [[ "$START" < "$END" ]] || { echo "start must be before end"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Export each instrument
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          VENUE: ${{ inputs.venue }}
+          PAIRS: ${{ inputs.pairs }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          set -euo pipefail
+          mkdir -p golden
+          IFS=, read -ra LIST <<< "$PAIRS"
+          for PAIR in "${LIST[@]}"; do
+            NAME="$VENUE-$(echo "$PAIR" | tr '[:upper:]/' '[:lower:]-')-${START//:/}-${END//:/}.csv"
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+              "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -m sleeve_fund.history export --venue $VENUE --start $START --end $END $PAIR" \
+              > "golden/$NAME"
+            echo "$PAIR: $(($(wc -l < "golden/$NAME") - 1)) minutes"
+          done
+          cd golden
+          sha256sum -- *.csv | tee SHA256SUMS
+          gzip -n -- *.csv
+      - name: Upload the fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ inputs.venue }}-${{ github.run_id }}
+          path: golden/
+          if-no-files-found: error
+          retention-days: 30

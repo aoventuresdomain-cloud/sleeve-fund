@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 import threading
 import uuid
 from dataclasses import dataclass
@@ -559,6 +560,32 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
+GOLDEN_HEADER = "open_utc,open,high,low,close,volume,degraded"
+
+
+def export_csv(store: HistoryStore, venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    """GOLDEN-VENUE: the stored 1-minute candles opening in [start, end), read through the store's own read(), as CSV
+    with a fixed layout (open time UTC, floats as repr, degraded 0/1) so the same candles always give the same bytes
+    and so the same sha256. Read-only. A window with any minute missing is refused rather than exported short."""
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start
+    end = end.tz_localize("UTC") if end.tzinfo is None else end
+    if start.second or start.microsecond or end.second or end.microsecond or end <= start:
+        raise ValueError("start and end must be whole minutes, start before end")
+    bars = store.read(venue, pair, minutes=1, start=start, end=end)  # stamped at close: (start, end]
+    opens = bars.index - pd.Timedelta(minutes=1)
+    want = pd.date_range(start, end, freq="1min", inclusive="left")
+    held = opens[bars["missing"].fillna(0).to_numpy() == 0]
+    if len(absent := want.difference(held)):
+        raise ValueError(f"{venue} {pair}: {len(absent)} of {len(want)} minutes missing in the window, first "
+                         f"{absent[0]:%Y-%m-%dT%H:%MZ}; nothing exported")
+    lines = [GOLDEN_HEADER]
+    for t, row in zip(opens, bars.itertuples(index=False)):
+        lines.append(f"{t:%Y-%m-%dT%H:%MZ},{float(row.open)!r},{float(row.high)!r},{float(row.low)!r},"
+                     f"{float(row.close)!r},{float(row.volume)!r},{int(bool(row.degraded))}")
+    return "\n".join(lines) + "\n"
+
+
 def refresh(store: HistoryStore, profile, pair: str, max_pages: int = 1_000_000, sleep=None, log=print,
             since: pd.Timestamp | None = None) -> dict:
     """Bring one instrument's stored history up to date from its venue, resuming from the cursor.
@@ -1043,6 +1070,11 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
+    exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
+    exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
+    exp.add_argument("--venue", default=None)
+    exp.add_argument("--start", required=True, help="first minute's open time, UTC, e.g. 2026-10-06T00:00")
+    exp.add_argument("--end", required=True, help="UTC minute to stop before, e.g. 2026-10-08T00:00")
     args = ap.parse_args(argv)
 
     store = HistoryStore(args.root)
@@ -1050,6 +1082,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in ("refresh", "run", "canon") and (problem := unwritable(store.root / profile.name.upper())):
         print(f"{profile.name}: history store can't start: {problem}")
         return 2
+    if args.cmd == "export":  # GOLDEN-VENUE: read-only, CSV to stdout, a refusal to stderr
+        try:
+            sys.stdout.write(export_csv(store, profile.name, args.pair, pd.Timestamp(args.start, tz="UTC"),
+                                        pd.Timestamp(args.end, tz="UTC")))
+        except (KeyError, ValueError) as exc:
+            print(f"export refused: {exc}", file=sys.stderr)
+            return 2
+        return 0
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:
