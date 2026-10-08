@@ -375,14 +375,21 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
 
 
 def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
-    """The limit's figure for each account holding a strategy that isn't archived, against that account's own book
-    (open_risk.account_equity), as the gate measures it per account (RR-1): {name, open_risk, left_out, book}."""
+    """The limit's figure for each account holding a perpetual strategy that isn't archived, against that account's
+    own book (open_risk.account_equity), as the gate measures it per account (RR-1). A spot-only account has no 5%
+    limit to show headroom to, so it gets no line (QA-F215-1). {name, open_risk, left_out, book}. Empty when every
+    strategy is on one account: the tile then reads as it always has."""
+    from sleeve_fund import markets
     from sleeve_fund import open_risk as limit
 
     archived = store.archived()
+    live = [s for s in store.sleeves() if s.name not in archived]
+    if len({store.account_of(s.name) for s in live}) < 2:
+        return []
+    perp_names = {s.name for s in live if markets.is_perp(s.params)}
     out = []
     for a in store.accounts():
-        if not [n for n in a["sleeves"] if n not in archived]:
+        if not perp_names.intersection(a["sleeves"]):
             continue
         mine = [(n, c) for n, c in perps if store.account_of(n) == a["name"]]
         total, counted, _, _, left_out = _tally(mine)
