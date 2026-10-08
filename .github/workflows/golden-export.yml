@@ -1,8 +1,10 @@
 name: golden-export
 # GOLDEN-VENUE: export stored 1-minute candles for the golden fixtures (python -m sleeve_fund.history export), inside the
 # venue's hub container on the paper server. Read-only: it reads the history files and writes nothing on the server.
-# Run it by hand from main, once the Data Architect has picked the window. Each instrument's CSV is gzipped and uploaded
-# as this run's artifact with a sha256 list, for the fixture PR. Same secrets and variable as canon.
+# Run it by hand from main, once the Data Architect has picked the window. For each instrument it exports the candles
+# and the canon backfill's replacement records in the window (refused unless their count is the canon run's), then
+# gzips both and uploads them as this run's artifact with a sha256 list, for the fixture PR. Same secrets and variable
+# as canon.
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +21,9 @@ on:
       end:
         description: UTC minute to stop before (YYYY-MM-DDTHH:MM)
         required: true
+      expect_replaced:
+        description: The canon run's replaced count per instrument, comma-separated in the same order as pairs
+        required: true
 jobs:
   export:
     runs-on: ubuntu-24.04
@@ -33,6 +38,7 @@ jobs:
           PAIRS: ${{ inputs.pairs }}
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+          EXPECT: ${{ inputs.expect_replaced }}
         run: |
           [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
           [[ "$PAIRS" =~ ^[A-Z0-9]{1,20}/[A-Z0-9]{1,20}(,[A-Z0-9]{1,20}/[A-Z0-9]{1,20}){0,19}$ ]] \
@@ -41,6 +47,9 @@ jobs:
             [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$ ]] || { echo "start and end must be YYYY-MM-DDTHH:MM"; exit 1; }
           done
           [[ "$START" < "$END" ]] || { echo "start must be before end"; exit 1; }
+          [[ "$EXPECT" =~ ^[0-9]{1,7}(,[0-9]{1,7}){0,19}$ ]] || { echo "expect_replaced must be counts like 1500,1582"; exit 1; }
+          [[ $(tr -cd , <<< "$PAIRS" | wc -c) == $(tr -cd , <<< "$EXPECT" | wc -c) ]] \
+            || { echo "expect_replaced needs one count per instrument"; exit 1; }
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -56,16 +65,19 @@ jobs:
           PAIRS: ${{ inputs.pairs }}
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+          EXPECT: ${{ inputs.expect_replaced }}
         run: |
           set -euo pipefail
           mkdir -p golden
           IFS=, read -ra LIST <<< "$PAIRS"
-          for PAIR in "${LIST[@]}"; do
-            NAME="$VENUE-$(echo "$PAIR" | tr '[:upper:]/' '[:lower:]-')-${START//:/}-${END//:/}.csv"
-            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
-              "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -m sleeve_fund.history export --venue $VENUE --start $START --end $END $PAIR" \
-              > "golden/$NAME"
-            echo "$PAIR: $(($(wc -l < "golden/$NAME") - 1)) minutes"
+          IFS=, read -ra COUNTS <<< "$EXPECT"
+          for i in "${!LIST[@]}"; do
+            PAIR="${LIST[$i]}"
+            BASE="$VENUE-$(echo "$PAIR" | tr '[:upper:]/' '[:lower:]-')-${START//:/}-${END//:/}"
+            RUN="cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -m sleeve_fund.history export --venue $VENUE --start $START --end $END $PAIR"
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" "$RUN" > "golden/$BASE.csv"
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" "$RUN --canon-replaced --expect ${COUNTS[$i]}" > "golden/$BASE-canon.csv"
+            echo "$PAIR: $(($(wc -l < "golden/$BASE.csv") - 1)) minutes, $(($(wc -l < "golden/$BASE-canon.csv") - 1)) canon replacements"
           done
           cd golden
           sha256sum -- *.csv | tee SHA256SUMS

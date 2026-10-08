@@ -1,5 +1,8 @@
 {
-  "about": "GOLDEN-VENUE fixtures: stored 1-minute candles exported read-only from the venue hub (python -m sleeve_fund.history export, via the golden-export workflow). Each file is listed with the sha256 of its decompressed CSV; tests/test_golden_manifest.py is red if any candle changes or a file is added or removed without updating this list. Only change it with the Data Architect and Head of QA's sign-off.",
-  "header": "open_utc,open,high,low,close,volume,degraded",
+  "about": "GOLDEN-VENUE fixtures: stored 1-minute candles exported read-only from the venue hub (python -m sleeve_fund.history export, via the golden-export workflow), with the canon backfill's replacement records for the same window. Each file is listed with the sha256 of its decompressed CSV; tests/test_golden_manifest.py is red if any candle changes or a file is added or removed without updating this list. Only change it with the Data Architect and Head of QA's sign-off.",
+  "headers": {
+    "candles": "open_utc,open,high,low,close,volume,missing,degraded",
+    "canon_replaced": "minute_utc,at,stored_open,stored_high,stored_low,stored_close,stored_volume,offered_open,offered_high,offered_low,offered_close,offered_volume"
+  },
   "files": {}
 }
