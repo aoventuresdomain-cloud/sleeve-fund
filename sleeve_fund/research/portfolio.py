@@ -22,16 +22,18 @@ from nautilus_trader.model import CryptoPerpetual, CurrencyPair, InstrumentId, V
 from sleeve_fund.money import money, scale
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
-# ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the close.
-# No drift is modelled until the parity report shows mean adverse drift above 2.5 bp over 200 or more fills; then this
-# fixed figure is set, and every portfolio fill pays it through fill_price(), the one hook.
+# ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the
+# close. No drift is modelled until the parity report shows mean adverse drift above 2.5 bp over 200 or more fills;
+# then this fixed figure is set, and every portfolio fill pays it through fill_price(), the one hook.
 ACT_DRIFT_BP = 0.0
 
 _TYPES = {"CurrencyPair": CurrencyPair, "CryptoPerpetual": CryptoPerpetual}
 
 
 def clone_venue(base: Venue | str, index: int) -> Venue:
-    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: VENUE -> VENUE_P1 (no hyphen: an account id is venue-number, split on its hyphen)."""
+    """The simulated venue clone for the index-th strategy (or leg) of a portfolio run: VENUE -> VENUE_P1.
+
+    No hyphen: an account id is venue-number, split on its hyphen."""
     return Venue(f"{base}_P{index}")
 
 
@@ -57,11 +59,12 @@ def fill_price(close: Decimal, side: int, half_spread: float, drift_bp: float | 
 
 @dataclass(frozen=True)
 class Pending:
-    """One strategy's entry intent at a close, waiting for the gate pass."""
+    """One strategy's opening intent (an entry, or an addition to a holding) at a close, waiting for the gate pass."""
 
     strategy: str
     intent: Any  # the gate's Intent (P2-2), or any payload the submit callback understands
     submit: Callable[[Any, Any], None]  # (intent, decision) -> sends what the gate approved; never called on a refusal
+    refused: Callable[[Any, Any], None] | None = None  # (intent, decision) on a refusal, so the strategy can count it
 
 
 # The gate pass: (strategy, intent, ts_ns) -> a decision with .approved_qty (P2-2's check_order over the MemoryLedger).
@@ -82,12 +85,16 @@ class CloseBatch:
         """Queue an intent for the close `ts`; the first one for that close arms the alert on `clock`."""
         if item.strategy not in self.order:
             raise ValueError(f"{item.strategy!r} is not in this run")
+        if any(t == ts for t, _ in self.passes):
+            # Fail loudly: re-arming would put an alert in the past and the intent would skip the close's one pass.
+            raise ValueError(f"the close {ts} has already been gated")
         first = ts not in self.pending
         self.pending.setdefault(ts, []).append(item)
         if first:
             # set_time_alert_ns, never set_time_alert(datetime): a datetime keeps microseconds only, so the extra
             # nanosecond is lost and the alert lands on the close itself (P2-7a spike, trap 1).
-            clock.set_time_alert_ns(f"portfolio-gate-{ts}", ts + BATCH_DELAY_NS, callback=lambda event, t=ts: self.run(t))
+            clock.set_time_alert_ns(
+                f"portfolio-gate-{ts}", ts + BATCH_DELAY_NS, callback=lambda event, t=ts: self.run(t))
 
     def run(self, ts: int) -> list[tuple[Pending, Any]]:
         """The gate pass for the close `ts`: each intent in strategy order, then in the order it was posted."""
@@ -100,6 +107,8 @@ class CloseBatch:
             decision = self.gate(p.strategy, p.intent, ts + BATCH_DELAY_NS)
             if getattr(decision, "approved_qty", 0) > 0:
                 p.submit(p.intent, decision)
+            elif p.refused is not None:
+                p.refused(p.intent, decision)
             out.append((p, decision))
         return out
 

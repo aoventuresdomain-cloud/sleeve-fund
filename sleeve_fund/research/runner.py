@@ -86,6 +86,9 @@ class BacktestResult:
     # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
     # still goes ahead so the risk can be measured, labelled (QA P1-S8).
     paper_refusal: str | None = None
+    # In a portfolio run (P2-7): what its gate did to the opening orders, "<entry|rebalance>_<outcome>" -> count, with
+    # outcome sent, trimmed, below_minimum (trimmed under the venue's minimum, so not sent) or refused (QA F213-2).
+    portfolio_gate: dict = field(default_factory=dict)
 
     @property
     def shorts(self) -> bool:
@@ -385,6 +388,7 @@ def run_backtest(
             open_risk_binds=strategy.open_risk_binds,
             open_risk_max=strategy.open_risk_max,
             paper_refusal=paper_refusal(strategy_name, params, risk_profile),
+            portfolio_gate=dict(strategy.portfolio_gate),
         )
     finally:
         if runtime is not None:

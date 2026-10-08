@@ -199,8 +199,6 @@ def through_liquidation(side: int, price: float, liq: float | None) -> bool:
     return liq is not None and price > 0 and (price <= liq if side > 0 else price >= liq)
 
 
-
-
 def _utc(ns: int) -> datetime:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
 
@@ -731,6 +729,10 @@ class LongFlatStrategy(Strategy):
         self._replayed_close: datetime | None = None
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
+        self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): opening orders wait for its gate pass
+        # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
+        # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
+        self.portfolio_gate: dict[str, int] = {}
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -2065,7 +2067,7 @@ class LongFlatStrategy(Strategy):
             self._note("entry_refused_open_risk", f"Entry refused: {why}")
             return
         self._noted.discard("entry_refused_open_risk")
-        self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "entry", reason, signal)
+        self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal)
 
     def on_bar(self, bar: Bar) -> None:
         self._deciding = self._deciding_bar = None
@@ -2556,7 +2558,10 @@ class LongFlatStrategy(Strategy):
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
-            self._buy_all(bar, reason, {**values, **extra, "close": close}, weight=min(max(float(raw), 0.0), 1.0))
+            # In a portfolio run the gate may trim the entry after this (CR213-1): the held weight is then re-read
+            # from what is actually held, so the band can top it up.
+            self._buy_all(bar, reason, {**values, **extra, "close": close}, weight=min(max(float(raw), 0.0), 1.0),
+                          sent=lambda trimmed: trimmed and setattr(self, "_held_w", None))
             self._held_w = w
         elif w == 0 and is_long:
             reason, values = self.explain(bar, False)
@@ -2638,6 +2643,12 @@ class LongFlatStrategy(Strategy):
                            f"volume is worth {cap:,.2f}, below the smallest order the venue takes")
             return False
         self._noted.discard("buy_skipped")
+        if self._portfolio is not None and self._adds(side):
+            # An addition opens risk like an entry (OPENING_INTENTS), so it waits for the gate too (QA F213-1); the
+            # held weight moves when it is sent, as below: in full to w, trimmed to what is then actually held.
+            self._send_entry(side, size, reason, signal, what="rebalance",
+                             sent=lambda trimmed: setattr(self, "_held_w", None if trimmed else w))
+            return False
         return self._submit(side, size, "rebalance", reason, signal)
 
     def _bar_target(self, bar: Bar) -> bool:
@@ -2770,7 +2781,7 @@ class LongFlatStrategy(Strategy):
                 self.runtime.store.merge_order_signal(watched[0], {"triggered_order": oid})
 
     def _buy_all(self, bar: Bar, reason: str = "Signal to be long", values: dict | None = None,
-                 weight: float = 1.0) -> None:
+                 weight: float = 1.0, sent=None) -> None:
         account = self._account()
         if account is None:
             self.log.warning("no account yet; skipping buy")
@@ -2829,7 +2840,7 @@ class LongFlatStrategy(Strategy):
             signal["tp_frac"] = round(self._tp_frac, 6)
         if self._has_exits:
             signal["stop_cfg"] = self._stop_cfg()
-        self._submit(OrderSide.BUY, qty, "entry", reason, signal)
+        self._send_entry(OrderSide.BUY, qty, reason, signal, sent=sent)
 
     def _loss_at_stop(self, side: int = 1) -> float:
         """The share of a position's cost lost if its stop is hit: the stop distance, plus the taker fee
@@ -2869,6 +2880,47 @@ class LongFlatStrategy(Strategy):
         if self.spread_series is None:
             return self._cfg.assumed_half_spread
         return self.spread_series.at(self.clock.timestamp_ns() if ts_ns is None else ts_ns)
+
+    def join_portfolio(self, batch, name: str) -> "LongFlatStrategy":
+        """Trade as one strategy of a portfolio run (P2-7, research.portfolio): its entries wait for the run's gate
+        pass, which may trim or refuse them under the portfolio limits."""
+        self._portfolio = (batch, name)
+        return self
+
+    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
+        """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
+        run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
+        than was sized here, then call sent(trimmed). Exits and reductions never wait for it."""
+        if self._portfolio is None:
+            self._submit(side, qty, what, reason, signal)
+            return
+        from sleeve_fund.research.portfolio import Pending
+
+        batch, name = self._portfolio
+        if self._deciding_bar is not None:
+            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
+        intent = {"side": 1 if side == OrderSide.BUY else -1, "qty": qty, "price": signal["close"],
+                  "stop_frac": self._stop_frac, "what": what}
+
+        def count(outcome: str) -> None:
+            key = f"{what}_{outcome}"
+            self.portfolio_gate[key] = self.portfolio_gate.get(key, 0) + 1
+
+        def send(intent, decision) -> None:
+            approved = min(qty, Decimal(str(decision.approved_qty))).quantize(self._lot(), rounding=ROUND_DOWN)
+            if approved < max(self._min_qty(), self._lot()):
+                count("below_minimum")
+                self._note(f"{what}_trimmed_below_minimum", f"{what.capitalize()} skipped: the portfolio limits "
+                           f"allowed {approved}, below the smallest order the venue takes ({self._min_qty()})")
+                return
+            self._noted.discard(f"{what}_trimmed_below_minimum")
+            trimmed = approved != qty
+            count("trimmed" if trimmed else "sent")
+            if self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
+                                                                          if trimmed else {})}) and sent is not None:
+                sent(trimmed)
+
+        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
 
     def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
