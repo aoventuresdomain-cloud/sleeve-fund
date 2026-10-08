@@ -196,9 +196,9 @@ def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
     """entry_block's answer; the caller holds the ledger's lock."""
     st = ledger.state()
     if st.halted:
-        return "portfolio_halt", f"Portfolio halted: {st.halted}; no strategy opens anything, and only the PM clears that"
+        return "halt", f"Portfolio halted: {st.halted}; no strategy opens anything, and only the PM clears that"
     if st.paused_until is not None and now < st.paused_until:
-        return "portfolio_pause", (f"Portfolio paused for the day: {st.paused}; no new entries until "
+        return "pause", (f"Portfolio paused for the day: {st.paused}; no new entries until "
                                    f"{st.paused_until:%H:%M} UTC, when the day's start resets")
     if st.mark_ts is None or now - st.mark_ts > MARK_STALE:
         age = "never" if st.mark_ts is None else f"{(now - st.mark_ts).total_seconds():.0f} s ago"
@@ -213,7 +213,8 @@ def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
 
 
 def entry_block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
-    """The portfolio's reason no strategy may open or add now, as (kind, why), or None. Halted until the PM resumes;
+    """The portfolio's reason no strategy may open or add now, as (kind, why), or None; kind is the decision's
+    limit_hit ("halt", "pause" or "portfolio_state_stale", gate_decisions' CHECK names). Halted until the PM resumes;
     paused until the next 00:00 UTC; or the book's mark older than MARK_STALE (alerted once per stale spell, when it
     starts). Never asked for exits, stops, reduce-only orders, close-now or liquidations."""
     with ledger.lock():

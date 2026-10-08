@@ -182,13 +182,13 @@ def test_15_percent_below_the_reference_halts_until_the_pm_resumes_then_rebases(
     assert mark_book(ledger, D(17_850), T0 + timedelta(seconds=10), PORTFOLIO) == "halt"  # 15% below 21,000
     assert mark_book(ledger, D(17_800), T0 + timedelta(seconds=15), PORTFOLIO) is None  # already halted: once
     kind, why = entry_block(ledger, T0 + timedelta(seconds=15))
-    assert kind == "portfolio_halt" and "only the PM clears that" in why
+    assert kind == "halt" and "only the PM clears that" in why
     resume_after_halt(ledger)
     st = ledger.state()
     assert (st.halt_reference, st.hwm) == (D(17_800), D(21_000))  # re-based; the true HWM is kept
     # the day lost over 3% (from 20,000), so the pause, its own condition, takes over at the next mark
     assert mark_book(ledger, D(17_800), T0 + timedelta(seconds=20), PORTFOLIO) == "pause"
-    assert entry_block(ledger, T0 + timedelta(seconds=20))[0] == "portfolio_pause"
+    assert entry_block(ledger, T0 + timedelta(seconds=20))[0] == "pause"
 
 
 def test_3_percent_down_on_the_day_pauses_entries_until_the_next_midnight():
@@ -196,7 +196,7 @@ def test_3_percent_down_on_the_day_pauses_entries_until_the_next_midnight():
     assert mark_book(ledger, D(19_400), T0 + timedelta(seconds=5), PORTFOLIO) == "pause"
     st = ledger.state()
     assert st.paused_until == next_utc_midnight(T0) == datetime(2026, 10, 8, tzinfo=timezone.utc)
-    assert entry_block(ledger, T0 + timedelta(seconds=6))[0] == "portfolio_pause"
+    assert entry_block(ledger, T0 + timedelta(seconds=6))[0] == "pause"
     midnight = datetime(2026, 10, 8, 0, 0, 5, tzinfo=timezone.utc)
     mark_book(ledger, D(19_400), midnight, PORTFOLIO)  # a new day starts at the last mark before 00:00
     assert ledger.state().day_start_equity == D(19_400) and entry_block(ledger, midnight) is None
@@ -252,3 +252,21 @@ def test_g11_a_cancel_answered_already_filled_converts_the_reservation_once():
     ledger.release(a.reservation, "cancel")  # the cancel's late answer
     assert ledger.released == [(a.reservation, "fill")]
     assert sweep(ledger, late + 2 * CANCEL_CONFIRM, _nothing_live, _no_cancel) == []
+
+
+def test_cr208_3_every_name_the_gate_records_is_one_the_journal_accepts():
+    """gate_decisions' CHECKs (v2/p2-2-tables.md): each outcome and limit_hit the core can return, the entry block's
+    included, is a name the table takes, so the DB ledger never has to translate."""
+    from sleeve_fund.portfolio.limits import LIMITS
+    from sleeve_fund.store import GATE_LIMITS, GATE_OUTCOMES
+
+    assert {*LIMITS, "below_min", "halt", "pause", "portfolio_state_stale"} <= set(GATE_LIMITS)
+    assert {"approved", "trimmed", "rejected"} <= set(GATE_OUTCOMES)
+    stale = MemoryLedger(equity=D(20_000))
+    assert entry_block(stale, T0)[0] in GATE_LIMITS
+    paused = _marked()
+    assert mark_book(paused, D(19_400), T0 + timedelta(seconds=5), PORTFOLIO) == "pause"
+    assert entry_block(paused, T0 + timedelta(seconds=6))[0] in GATE_LIMITS
+    halted = _marked()
+    assert mark_book(halted, D(17_000), T0 + timedelta(seconds=5), PORTFOLIO) == "halt"
+    assert entry_block(halted, T0 + timedelta(seconds=6))[0] in GATE_LIMITS
