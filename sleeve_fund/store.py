@@ -493,6 +493,7 @@ HOLDOUT_SOURCES = ("study", "ledger_import")
 # The portfolio limits gate's tables (v2 P2-2; Data Architect's shapes, v2/p2-2-tables.md). Money and quantities are
 # EXACT; limits and ratios keep their own scales. Paper only: a backtest keeps its decisions in its result.
 LIMIT = Numeric(10, 4)
+LIMIT_PLACES = Decimal("0.0001")
 # A BIGINT key that still autoincrements on SQLite (which only does so for INTEGER PRIMARY KEY).
 BIG_ID = BigInteger().with_variant(Integer, "sqlite")
 # The PM's limits, one row per version, never updated: a change is a new version, the current one the highest.
@@ -523,6 +524,7 @@ PORTFOLIO_PROFILE_V1 = {
 event.listen(portfolio_profile_t, "after_create",
              lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
 # The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
+PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity")
 portfolio_state_t = Table(
     "portfolio_state",
     metadata,
@@ -530,18 +532,26 @@ portfolio_state_t = Table(
     Column("status", String(16), nullable=False),
     Column("paused_until", TS),  # with 'paused': the next 00:00 UTC
     Column("halt_reason", Text),  # with 'halted'
-    Column("reference_equity", EXACT, nullable=False),  # the halt reference: re-based at the PM's Resume
-    Column("hwm", EXACT, nullable=False),  # the true high-water mark; reset only by a book reset
-    Column("day_start_equity", EXACT, nullable=False),
-    Column("day_start", Date, nullable=False),  # the UTC day it belongs to
-    Column("book_equity", EXACT, nullable=False),  # the last mark: the whole fund, unallocated cash included
-    Column("marked_at", TS, nullable=False),  # older than 60 s: entries blocked as portfolio_state_stale
+    Column("pause_reason", Text),  # with paused_until (0011)
+    # The book's figures, null only before the first mark (0011): all set or all null.
+    Column("reference_equity", EXACT),  # the halt reference: re-based at the PM's Resume
+    Column("hwm", EXACT),  # the true high-water mark; reset only by a book reset
+    Column("day_start_equity", EXACT),
+    Column("day_start", Date),  # the UTC day it belongs to
+    Column("book_equity", EXACT),  # the last mark: the whole fund, unallocated cash included
+    Column("marked_at", TS),  # older than 60 s: entries blocked as portfolio_state_stale
+    Column("stale_told_at", TS),  # the mark a stale-book alert was raised for: once per spell, across processes (0011)
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
     CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name="portfolio_state_paused_until"),
     CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name="portfolio_state_halt_reason"),
+    CheckConstraint("status <> 'paused' OR pause_reason IS NOT NULL", name="portfolio_state_pause_reason"),
+    CheckConstraint("marked_at IS NOT NULL OR status = 'ok'", name="portfolio_state_marked"),
+    # all of the book's figures set, or none (before the first mark): one CHECK per figure (DA, 0011)
+    *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"portfolio_state_{c}_marked")
+      for c in PORTFOLIO_STATE_FIGURES),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.
@@ -607,7 +617,9 @@ gate_decisions_t = Table(
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
     CheckConstraint("approved_qty >= 0 AND approved_qty <= requested_qty", name="gate_decisions_approved_qty"),
     CheckConstraint("outcome <> 'rejected' OR approved_qty = 0", name="gate_decisions_rejected_none"),
-    UniqueConstraint("sleeve_id", "bar_ts", "intent_id", "stage", name="gate_decisions_sleeve_bar_intent_stage"),
+    # One real decision per strategy, bar, intent and stage; an 'error' row is audit and never blocks the retry (0011).
+    Index("gate_decisions_sleeve_bar_intent_stage", "sleeve_id", "bar_ts", "intent_id", "stage", unique=True,
+          sqlite_where=text("outcome <> 'error'"), postgresql_where=text("outcome <> 'error'")),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
 )
 # Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the
@@ -2136,8 +2148,13 @@ class Store:
 
     def add_portfolio_profile(self, limits, created_by: str, note: str | None = None) -> int:
         """Record new portfolio limits as the next version and return it. Append-only: there is no update, because
-        every gate decision names the version it was taken under. limits.version is ignored."""
+        every gate decision names the version it was taken under. limits.version is ignored. A limit finer than the
+        column's 4 places is refused, never rounded (QA F211-1: 0.00125 would be kept as a looser 0.0013)."""
         t = portfolio_profile_t
+        for name in ("gross", "net_instrument", "margin", "open_risk", "drawdown", "daily_loss"):
+            d = to_decimal(getattr(limits, name), name)
+            if d != d.quantize(LIMIT_PLACES):
+                raise ValueError(f"a portfolio limit has at most 4 decimal places: {name} is {d}")
         with self.engine.begin() as c:
             version = (c.execute(select(func.max(t.c.version))).scalar() or 0) + 1
             c.execute(insert(t), [{

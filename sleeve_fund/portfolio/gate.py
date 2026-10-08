@@ -22,7 +22,7 @@ from __future__ import annotations
 import itertools
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -225,15 +225,23 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
     """One order that raises `strategy`'s position. While the portfolio blocks entries it is rejected outright, never
     trimmed. Otherwise it is decided against the whole book with every unreleased reservation counted as filled, and
     the approved quantity is reserved before the lock is let go, so the next strategy sees it. Every check is
-    recorded. Any error, the lock's included, fails closed: no entry, with the reason."""
+    recorded. Any error, the lock's included, fails closed: no entry, with the reason, an alert, and an 'error' row
+    in the journal (limit 'lock_error' when the lock itself failed), written on its own after the check rolled back
+    (p2-2-tables.md, Concurrency). Its seq stays None: the row holds no place in the first-come order."""
+    lock_failed = False
     try:
-        with ledger.lock():
+        with ExitStack() as held:
+            try:
+                held.enter_context(ledger.lock())
+            except Exception:
+                lock_failed = True
+                raise
             block = _block(ledger, now)
             if block is not None:
                 decision = rejected(intent.qty, block[0], f"Entry rejected: {block[1]}")
             else:
-                equity, held = ledger.positions()
-                book = Book(equity, (*held, *(r.holding for r in ledger.reservations())))
+                equity, held_now = ledger.positions()
+                book = Book(equity, (*held_now, *(r.holding for r in ledger.reservations())))
                 decision = decide(book, intent, profile)
             rid = None
             if decision.approved_qty > 0:
@@ -249,7 +257,14 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
         except Exception:  # noqa: BLE001 - the refusal stands whether or not the alert lands
             pass
         qty = getattr(intent, "qty", Decimal(0))
-        return Checked(rejected(qty if isinstance(qty, Decimal) else Decimal(0), None, why), None, None)
+        qty = qty if isinstance(qty, Decimal) else Decimal(0)
+        try:
+            ledger.record(strategy, now, intent, Decision("error", Decimal(0), qty,
+                                                          "lock_error" if lock_failed else None, why),
+                          profile.version)
+        except Exception:  # noqa: BLE001 - as for the alert
+            pass
+        return Checked(rejected(qty, None, why), None, None)
 
 
 def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) -> str | None:
