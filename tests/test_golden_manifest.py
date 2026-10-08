@@ -1,9 +1,12 @@
 """GOLDEN-VENUE: the export writes the same bytes for the same candles, refuses a short window, writes nothing to the
 store; and the committed fixtures match their manifest exactly, so editing one candle turns this file red."""
 
+import base64
 import gzip
 import json
+import re
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -175,3 +178,74 @@ def test_a_dropped_row_turns_the_check_red(tmp_path):
     path.write_bytes(gzip.compress(b"".join(lines[:-1]), mtime=0))
     problems = golden_lib.check(root)
     assert any("sha256" in p for p in problems) and any("29 rows" in p for p in problems)
+
+
+# PR B: the committed fixtures (HoQA's conditions: a non-empty manifest, read only through load(), signed list).
+SIGNED = {  # HoQA golden-venue-manifest.md, 8 Oct 2026: sha256 of each uncompressed CSV
+    "binance-btc-usdt-2026-10-06T0000-2026-10-07T2224-canon.csv": "2c25d6873d1e9f4a8e30035a99e91ab0b823039a4b353a3d5e49e57565351eaa",
+    "binance-btc-usdt-2026-10-06T0000-2026-10-07T2224.csv": "4552d1167e3fe1fcce721aa63521ae3624e9dd65bce21e915a9d60ec17102f1b",
+    "binance-eth-usdt-2026-10-06T0000-2026-10-07T2224-canon.csv": "dd56227edd57cb364825a3bec9b5da72089573aef0b37ae30095cf2f04692d61",
+    "binance-eth-usdt-2026-10-06T0000-2026-10-07T2224.csv": "7a635a03b99b386af2cbf3276a1ee245e0839b7d04c5c602dbf7d0b808bfbb8f",
+    "binance-sol-usdt-2026-10-06T0000-2026-10-07T2224-canon.csv": "16b81f31ed9a401ce4bcc803c229411ae37cdfde9b34cc264491a69a057870b6",
+    "binance-sol-usdt-2026-10-06T0000-2026-10-07T2224.csv": "1b0aa0e6ef42548ab4d165b4be349af48d2b4d16bc87b232fac438351ec097bf",
+    "binance-sui-usdt-2026-10-06T0000-2026-10-07T2224-canon.csv": "b6bbdbb5693ee44bc25d195457f74a87ac69a5f95b3e298a6b7b04430ca5f1f7",
+    "binance-sui-usdt-2026-10-06T0000-2026-10-07T2224.csv": "7cff06a6254707cd2d0f71fef960ff8725eba975bb0b6b33454e42878dbe4dc2",
+    "binance-xrp-usdt-2026-10-06T0000-2026-10-07T2224-canon.csv": "e496e766948a7add51a265266c9672a666236b578cc1aa390bbc6cb82c9edc53",
+    "binance-xrp-usdt-2026-10-06T0000-2026-10-07T2224.csv": "8b89399ed47d249a28610f78bb764605571345f3351820d6ea8ac2dad9acf9b8",
+}
+CANON_COUNTS = {"BTC/USDT": 1500, "ETH/USDT": 1582, "SOL/USDT": 1516, "XRP/USDT": 1406, "SUI/USDT": 1123}
+
+
+def test_the_manifest_lists_exactly_the_signed_files():
+    files = golden_lib.manifest()["files"]
+    assert files, "the golden manifest is empty"
+    assert {name.removesuffix(".gz"): e["sha256"] for name, e in files.items()} == SIGNED
+
+
+def test_each_candle_fixture_is_the_whole_window_every_minute_whole():
+    window = pd.date_range("2026-10-06T00:00", "2026-10-07T22:24", freq="1min", inclusive="left", tz="UTC")
+    for name, e in golden_lib.manifest()["files"].items():
+        df = golden_lib.load(name)
+        if e["kind"] == "candles":
+            assert df.index.equals(pd.DatetimeIndex(window, name="open_utc")), name
+            assert not df[["missing", "degraded"]].any().any(), name
+            assert (df["high"] >= df[["open", "close", "low"]].max(axis=1)).all(), name
+            assert (df["low"] <= df[["open", "close"]].min(axis=1)).all(), name
+        else:
+            assert len(df) == CANON_COUNTS[e["pair"]] and df.index.isin(window).all(), name
+
+
+def test_nothing_reads_the_golden_fixtures_except_through_golden_lib():
+    root = Path(__file__).parent.parent
+    allowed = {Path(golden_lib.__file__).resolve(), Path(__file__).resolve()}
+    pattern = re.compile(r"""data["'/ ,]+golden|binance-[a-z]+-usdt-\d{4}.*\.csv""")
+    offenders = [str(p.relative_to(root)) for d in ("sleeve_fund", "tests", "scripts") for p in (root / d).rglob("*.py")
+                 if p.resolve() not in allowed and pattern.search(p.read_text(errors="ignore"))]
+    assert offenders == [], f"read golden fixtures through golden_lib.load(), not directly: {offenders}"
+
+
+def _printed_log(files: dict[str, bytes]) -> str:
+    """A print job's log as the API returns it: SHA256SUMS, then each .gz base64 between BEGIN and END, timestamped."""
+    lines = [f"{golden_lib.digest(raw)}  {name}" for name, raw in files.items()]
+    for name, raw in files.items():
+        gz = gzip.compress(raw, mtime=0)
+        b64 = base64.b64encode(gz).decode()
+        lines += [f"BEGIN {name}.gz {golden_lib.digest(gz)} {len(gz)}", *(b64[i:i + 1000] for i in range(0, len(b64), 1000)),
+                  f"END {name}.gz"]
+    return "\n".join(f"2026-10-08T06:53:48.{i:07d}Z {line}" for i, line in enumerate(lines)) + "\n"
+
+
+def test_decode_log_rebuilds_the_files_and_fails_closed(tmp_path):
+    files = {"a.csv": b"h\n" + b"1,2\n" * 5000, "b-canon.csv": b"h\n3\n"}
+    log = _printed_log(files)
+    assert sorted(golden_lib.decode_log(log, tmp_path / "ok")) == ["a.csv.gz", "b-canon.csv.gz"]
+    assert gzip.decompress((tmp_path / "ok" / "a.csv.gz").read_bytes()) == files["a.csv"]
+    no_begin = "\n".join(line for line in log.splitlines() if "BEGIN b-canon" not in line)
+    with pytest.raises(ValueError, match="b-canon.csv: listed in SHA256SUMS but not in the log"):
+        golden_lib.decode_log(no_begin, tmp_path / "x1")
+    lines = log.splitlines()
+    cut = "\n".join(lines[:3] + lines[4:])  # one base64 line of a.csv.gz lost
+    with pytest.raises(ValueError, match="a.csv.gz: does not match its BEGIN line"):
+        golden_lib.decode_log(cut, tmp_path / "x2")
+    with pytest.raises(ValueError, match="no END line"):
+        golden_lib.decode_log("\n".join(lines[:-1]), tmp_path / "x3")
