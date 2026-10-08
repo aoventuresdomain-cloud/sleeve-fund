@@ -16,8 +16,15 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund.data import bar_type_for, synthetic_ohlcv, to_bars
 from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
 from sleeve_fund.research import portfolio
-from sleeve_fund.research.portfolio import (BATCH_DELAY_NS, CloseBatch, Pending, clone_instrument, clone_venue,
-                                            fill_price, strategy_order)
+from sleeve_fund.research.portfolio import (
+    BATCH_DELAY_NS,
+    CloseBatch,
+    Pending,
+    clone_instrument,
+    clone_venue,
+    fill_price,
+    strategy_order,
+)
 
 FEES = FeeSchedule(D("0.001"), D("0.002"))
 
@@ -36,11 +43,11 @@ def test_a_clone_is_the_same_instrument_on_its_own_venue(make):
 
 
 def test_the_expected_fill_is_the_close_plus_half_the_spread_for_the_side():
-    assert fill_price(D("100"), 1, 0.0005) == D("100.0500")
-    assert fill_price(D("100"), -1, 0.0005) == D("99.9500")
+    assert fill_price(D(100), 1, 0.0005) == D("100.0500")
+    assert fill_price(D(100), -1, 0.0005) == D("99.9500")
     # ACT-DRIFT (Advisor 20:05 UK): one hook, zero until the parity data says otherwise.
     assert portfolio.ACT_DRIFT_BP == 0.0
-    assert fill_price(D("100"), 1, 0.0005, drift_bp=2.5) == D("100.075000")
+    assert fill_price(D(100), 1, 0.0005, drift_bp=2.5) == D("100.075000")
     with pytest.raises(TypeError):
         fill_price(100.0, 1, 0.0005)
 
@@ -85,6 +92,16 @@ def test_a_close_is_gated_once_in_the_runs_order_whatever_order_the_intents_came
         batch.post(clock, 2_000, Pending("gamma", "x", lambda i, d: None))
 
 
+def test_an_intent_for_a_close_already_gated_is_refused_loudly():
+    batch = CloseBatch(("alpha",), gate=lambda s, i, t: SimpleNamespace(approved_qty=D(1)))
+    clock = _Clock()
+    batch.post(clock, 1_000, Pending("alpha", "a1", lambda i, d: None))
+    clock.alerts[0][2](None)
+    with pytest.raises(ValueError, match="already been gated"):
+        batch.post(clock, 1_000, Pending("alpha", "late", lambda i, d: None))
+    assert len(clock.alerts) == 1 and not batch.pending  # no alert re-armed in the past, nothing queued
+
+
 # --- in one engine: clones, close + 1 ns, determinism ----------------------------------------------------------------
 
 class _LegConfig(StrategyConfig):
@@ -127,7 +144,8 @@ def _run():
     spot = spot_pair("BTC", "USD", FEES, Venue("KRAKEN"))
     perp = perpetual("BTC", "USD", FEES, Venue("KRAKEN"), symbol="PF_XBTUSD")
     legs = {"alpha": [clone_instrument(spot, clone_venue("KRAKEN", 1))],
-            "beta": [clone_instrument(spot, clone_venue("KRAKEN", 2)), clone_instrument(perp, clone_venue("KRAKEN", 3))]}
+            "beta": [clone_instrument(spot, clone_venue("KRAKEN", 2)),
+                     clone_instrument(perp, clone_venue("KRAKEN", 3))]}
     prices = synthetic_ohlcv(days=30, seed=1)
     batch = CloseBatch(strategy_order(legs), gate=lambda s, i, t: SimpleNamespace(approved_qty=D(1)))
     strategies = {}
@@ -188,3 +206,136 @@ def test_the_gate_pass_runs_at_close_plus_one_nanosecond_after_every_bar_of_that
 def test_two_runs_are_identical(runs):
     a, b = runs
     assert a["passes"] == b["passes"] and a["fills"] == b["fills"] and a["logs"] == b["logs"]
+
+
+# --- M2: the entry deferral hook in strategies.base -----------------------------------------------------------------
+
+class _Gate:
+    """A stand-in for P2-2's gate (M3): approves each entry at `share` of its quantity, keeping what it saw."""
+
+    def __init__(self, share: D = D(1)):
+        self.share, self.seen = share, []
+
+    def __call__(self, strategy, intent, ts):
+        self.seen.append((strategy, intent["side"], intent["qty"], ts))
+        return SimpleNamespace(approved_qty=intent["qty"] * self.share)
+
+
+def _portfolio_run(model: str, params: dict, gate: _Gate | None):
+    """run_backtest of `model`, joined to a one-strategy portfolio batch with `gate` (None: an ordinary run)."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies import REGISTRY
+
+    cls, config_cls = REGISTRY[model]
+    batch = CloseBatch(order=("a",), gate=gate) if gate is not None else None
+
+    class Joined(cls):
+        def __init__(self, config):
+            super().__init__(config)
+            if batch is not None:
+                self.join_portfolio(batch, "a")
+
+    REGISTRY["portfolio_probe"] = (Joined, config_cls)
+    try:
+        inst = spot_pair("BTC", "USD", FEES, Venue("KRAKEN"))
+        result = run_backtest("portfolio_probe", synthetic_ohlcv(days=240, seed=3), inst, params=params)
+    finally:
+        del REGISTRY["portfolio_probe"]
+    return result, batch
+
+
+def _entries(result):
+    return [(o, r) for o, r in result.fills.iterrows() if result.decisions[o]["intent"] == "entry"]
+
+
+@pytest.mark.parametrize("params", [dict(), dict(market="perp", allow_short=True)], ids=["spot", "perp"])
+def test_an_approve_all_gate_trades_exactly_as_the_ordinary_run(params):
+    """M2 parity: every entry waits for the gate pass at the decision + 1 ns and fills at the same price and size."""
+    plain, _ = _portfolio_run("rsi_cross", params, None)
+    gate = _Gate()
+    joined, batch = _portfolio_run("rsi_cross", params, gate)
+    assert _entries(plain), "the model must trade for this to test anything"
+    cols = ["side", "filled_qty", "avg_px"]
+    assert joined.fills[cols].reset_index(drop=True).equals(plain.fills[cols].reset_index(drop=True))
+    assert len(gate.seen) == len(_entries(plain))  # every entry went through the gate, and only entries
+    assert all(ts == close + 1 for (close, _), (_, _, _, ts) in zip(batch.passes, gate.seen))
+
+
+def test_a_gate_that_trims_sends_only_what_it_approved_and_says_so():
+    gate = _Gate(D("0.5"))
+    joined, _ = _portfolio_run("rsi_cross", {}, gate)
+    for (oid, row), (_, _, asked, _) in zip(_entries(joined), gate.seen):
+        assert D(str(row["filled_qty"])) <= asked / 2
+        assert joined.decisions[oid]["signal"]["portfolio_trimmed_from"] == str(asked)
+
+
+def test_a_gate_that_refuses_sends_no_entry_and_no_exit():
+    joined, _ = _portfolio_run("rsi_cross", {}, _Gate(D(0)))
+    assert joined.fills is None or joined.fills.empty
+
+
+class _FirstOnly(_Gate):
+    """A gate that approves the first opening order in full and refuses every one after, as a halt would."""
+
+    def __call__(self, strategy, intent, ts):
+        super().__call__(strategy, intent, ts)
+        return SimpleNamespace(approved_qty=intent["qty"] if len(self.seen) == 1 else D(0))
+
+
+def _buys(result):
+    return [(o, r) for o, r in result.fills.iterrows() if str(r["side"]).upper().endswith("BUY")]
+
+
+BANDED = {"rebalance_band": 0.05}  # a weight model that adds to its holding by rebalance (QA F213-1)
+
+
+def test_an_approve_all_gate_trades_a_weight_models_additions_exactly_as_the_ordinary_run():
+    plain, _ = _portfolio_run("donchian", BANDED, None)
+    gate = _Gate()
+    joined, _ = _portfolio_run("donchian", BANDED, gate)
+    adds = [o for o, _ in _buys(plain) if plain.decisions[o]["intent"] == "rebalance"]
+    assert adds, "the model must add by rebalance for this to test anything"
+    cols = ["side", "filled_qty", "avg_px"]
+    assert joined.fills[cols].reset_index(drop=True).equals(plain.fills[cols].reset_index(drop=True))
+    assert len(gate.seen) == len(_buys(plain))  # every entry and every addition went through the gate
+    assert joined.portfolio_gate == {"entry_sent": len(_buys(plain)) - len(adds), "rebalance_sent": len(adds)}
+
+
+def test_an_addition_to_a_weight_models_holding_waits_for_the_gate_and_respects_a_halt():
+    gate = _FirstOnly()
+    joined, _ = _portfolio_run("donchian", BANDED, gate)
+    assert len(_buys(joined)) == 1, "an addition went out without the gate"
+    assert len(gate.seen) > 1 and joined.portfolio_gate["entry_sent"] == 1
+    assert joined.portfolio_gate.get("rebalance_refused", 0) + joined.portfolio_gate.get("entry_refused", 0) \
+        == len(gate.seen) - 1
+    assert joined.portfolio_gate.get("rebalance_refused", 0) >= 1  # the gate was asked about the additions
+
+
+def test_the_result_counts_refused_and_below_minimum_entries():
+    refused, _ = _portfolio_run("rsi_cross", {}, gate := _Gate(D(0)))
+    assert refused.portfolio_gate == {"entry_refused": len(gate.seen)} and gate.seen
+    tiny, _ = _portfolio_run("rsi_cross", {}, gate := _Gate(D("1e-12")))
+    assert tiny.portfolio_gate == {"entry_below_minimum": len(gate.seen)} and gate.seen
+    plain, _ = _portfolio_run("rsi_cross", {}, None)
+    assert plain.portfolio_gate == {}  # an ordinary run has no gate to count
+
+
+def test_a_trimmed_entry_of_a_weight_model_is_topped_up_on_the_next_bar():
+    """CR213-1: the band compares the target with what is actually held after a trim, not with the target itself.
+    Here the target moves less than the band the next day, so only that comparison can send the addition."""
+
+    class TrimFirst(_Gate):
+        def __call__(self, strategy, intent, ts):
+            super().__call__(strategy, intent, ts)
+            return SimpleNamespace(approved_qty=intent["qty"] / 2 if len(self.seen) == 1 else intent["qty"])
+
+    joined, _ = _portfolio_run("donchian", BANDED, TrimFirst())
+    (entry, _), (add, row) = list(joined.fills.iterrows())[:2]
+    first, then = joined.decisions[entry], joined.decisions[add]
+    assert first["intent"] == "entry" and "portfolio_trimmed_from" in first["signal"]
+    assert then["intent"] == "rebalance" and str(row["side"]).upper().endswith("BUY")
+    day = pd.Timedelta(days=1)
+    assert pd.Timestamp(then["signal"]["bar"]["close_ts"]) - pd.Timestamp(first["signal"]["bar"]["close_ts"]) == day
+    target = first["signal"]["target_weight"]
+    assert abs(then["signal"]["to_weight"] - target) < BANDED["rebalance_band"] * target  # the target barely moved
+    assert then["signal"]["from_weight"] < 0.6 * target  # what the trimmed entry actually holds

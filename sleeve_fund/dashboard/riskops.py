@@ -60,7 +60,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
-            **{k: held[k] for k in ("margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
+            **{k: held[k] for k in ("accounts", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
                                        "spot_risk", "spot_left_out", "spot_hint")},
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
