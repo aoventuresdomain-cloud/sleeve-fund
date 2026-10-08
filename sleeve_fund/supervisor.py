@@ -22,13 +22,18 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
+from sleeve_fund.gate_ledger import DbLedger
+from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
+from sleeve_fund.portfolio.limits import Book, Holding
+from sleeve_fund.risk import PORTFOLIO
 from sleeve_fund.paper.safety import credential_var
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import DUST_NOTIONAL, Sleeve, Store, is_dust, utcnow
+from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
@@ -47,6 +52,31 @@ MAX_BACKOFF = 300
 SYSTEM_FLATTENS = 3
 # The exits-only reason of a stopped strategy that still holds a position (P1-U35): its process runs for its exits.
 STOPPED_HOLDING = "it was stopped while it still holds a position"
+
+
+def fund_equity(store: Store) -> Decimal:
+    """The whole fund's marked equity: every strategy's, running or not, plus the cash no strategy holds (Advisor 3).
+    It reads CASH-2's strategy_cash_pnl, the one cash reader; until that is on main it raises, so the portfolio's mark
+    fails, its book goes stale after 60 s and no strategy opens anything (fail closed)."""
+    raise NotImplementedError("the fund's equity reads CASH-2's strategy_cash_pnl, which isn't on main yet")
+
+
+def fund_holdings(store: Store) -> tuple[Holding, ...]:
+    """Every strategy's positions as the book's Holdings, for book_marks' figures. The paper gate's positions (P2-1b
+    W2) build them; until then a fund that holds nothing has none, and one that holds anything raises."""
+    if any(_holding(store, s) for s in store.sleeves()):
+        raise NotImplementedError("the book's holdings come with the paper gate's positions (P2-1b W2)")
+    return ()
+
+
+def _holding(store: Store, s: Sleeve) -> bool:
+    """Whether a strategy's journal holds a position an order can close (not dust)."""
+    book = store.journal_book(s.name, s.starting_balance)
+    return abs(book["qty"]) > 1e-12 and not is_dust(book)
+
+
+def _status(st: PortfolioState, now: datetime) -> str:
+    return "halted" if st.halted else "paused" if st.paused_until and now < st.paused_until else "ok"
 
 
 @dataclass
@@ -103,6 +133,9 @@ class Supervisor:
         self.clear_path = clear_path  # a clean slate still waiting on a flatten finishes here, not on a redeploy
         self.procs: dict[str, Proc] = {}
         self._stopping = False
+        # The portfolio gate on the exact journal; the supervisor never runs an entry check, so it reads no positions
+        self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
+        self._equity_failing = False  # a failed equity read is said once per spell
 
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
@@ -320,6 +353,54 @@ class Supervisor:
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
 
+    def mark_portfolio(self, now: datetime | None = None) -> None:
+        """The portfolio's poll (v2 P2-2): mark the whole fund (portfolio.gate.mark_book), a book_marks row each minute
+        and at every status change, act on a halt, and sweep orphaned reservations. The state row is written before
+        the equity is read, so a read that fails leaves the gate in force and entries blocked once the mark is 60 s
+        old. A pause needs nothing here: CHOKE reads it from the state (runtime.portfolio_block) until 00:00 UTC."""
+        now = now or utcnow()
+        led = self.ledger
+        led.ensure_state()
+        before = led.state()
+        try:
+            equity = fund_equity(self.ledger.store)
+        except Exception as exc:  # noqa: BLE001 - no mark: the book goes stale and entries stop (fail closed)
+            if not self._equity_failing:
+                self.store.event(None, "error", "supervisor_error", f"the fund's equity couldn't be read, so the "
+                                 f"portfolio isn't marked and entries stop once its mark is 60 s old: {exc!r}")
+            self._equity_failing = True
+        else:
+            self._equity_failing = False
+            acted = mark_book(led, equity, now, PORTFOLIO)
+            st = led.state()
+            last = led.last_book_mark()
+            minute = now.replace(second=0, microsecond=0)
+            if last is None or last.replace(second=0, microsecond=0) != minute or _status(before, now) != _status(st, now):
+                try:
+                    led.write_book_mark(now, Book(equity, fund_holdings(self.ledger.store)), st, PORTFOLIO.version)
+                except NotImplementedError:
+                    pass  # no holdings yet (P2-1b W2): the cache row waits; the state row above is the gate's
+            if acted == "halt":
+                self._halt_every_strategy(st.halted)
+        sweep(led, now, self._order_live, self._cancel_order)
+
+    def _halt_every_strategy(self, why: str) -> None:
+        """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
+        path, once per halt; CHOKE blocks every entry from the state row until the PM resumes the portfolio."""
+        reason = f"Portfolio halted: {why}"
+        for s in self.store.sleeves():
+            if _holding(self.store, s):
+                self.store.command(s.name, "flatten", reason, actor="supervisor")
+
+    def _order_live(self, order_id: str) -> bool:
+        """Whether an order may still fill, read through the ledger's own transaction: inside the sweep's lock a second
+        connection would, on SQLite's one shared connection, roll the sweep's own writes back (HoQA, P2-1b cells)."""
+        return self.ledger.order_status(order_id) in OPEN_ORDER_STATUSES
+
+    def _cancel_order(self, order_id: str) -> None:
+        raise NotImplementedError("asking a strategy's process to cancel one order comes with the paper gate (P2-1b "
+                                  "W2)")
+
     def check_keys(self) -> None:
         """Tell the dashboard which live accounts have their venue's key on this server (presence only)."""
         live = [a for a in self.store.accounts() if a["kind"] == "live"]
@@ -373,6 +454,7 @@ class Supervisor:
                     clear(self.store, self.clear_path)
                 loops += 1
                 self.step()
+                self.mark_portfolio()
             except Exception as exc:  # keep supervising; the dashboard shows the error
                 self.store.event(None, "error", "supervisor_error", repr(exc))
             time.sleep(POLL_SECONDS)

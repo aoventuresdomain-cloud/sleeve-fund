@@ -4682,7 +4682,8 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         # Advisor 23:05 (SG7): a raced fill is treated as the block treats a position already held. A halt, a
         # liquidation and the daily pause flatten, so it is sold at once; Stop, stale data, funding and retire keep it.
-        sells = bool({*RESUMABLE, "liquidated", "daily_pause"} & set(getattr(why, "codes", ())))
+        # The portfolio's halt flattens every strategy, so it sells too; its pause and stale book keep it (P2-2 plan).
+        sells = bool({*RESUMABLE, "liquidated", "daily_pause", "portfolio_halt"} & set(getattr(why, "codes", ())))
         if sells:
             rt.raced = why
         rt.store.event(rt.name, "error", "incident",

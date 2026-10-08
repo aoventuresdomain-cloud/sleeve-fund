@@ -54,12 +54,20 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # Reason codes (Advisor 7 Oct 00:20; QA pins them): stable, and listed in this order when several apply. Callers key
 # off the codes, never the words. Each cause's text for the PM starts with its label, gives the figure where there is
 # one, and says what alone clears it; no venue names.
-CODES = ("liquidated", "drawdown_halt", "halted", "daily_pause", "retired", "winding_down", "stopped", "paused",
-         "exits_only", "stale_data", "degraded_candle", "funding_missing")
+CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
+         "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
+         "portfolio_stale")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
-          "daily_pause": "Daily loss pause", "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
+          "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
+          "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
-          "degraded_candle": "Degraded candle", "funding_missing": "No funding rate"}
+          "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
+          "portfolio_stale": "Portfolio unchecked"}
+# The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
+# reason starts with, which the label already says.
+PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
+                   "pause": ("portfolio_pause", "Portfolio paused for the day: "),
+                   "portfolio_state_stale": ("portfolio_stale", "")}
 # The engine's holds (SleeveRuntime.holds) by key: a code, or an older key for one.
 HOLD_CODES = {"data": "degraded_candle", "stale": "stale_data", "funding": "funding_missing"}
 RESUMABLE = ("drawdown_halt", "halted")  # the halts the PM's Resume clears
@@ -167,12 +175,13 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
-                  since: datetime | None = None) -> tuple[bool, Why | None]:
+                  since: datetime | None = None, portfolio: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
-    candle, no funding rate). The why lists every cause that applies (Advisor 00:20). The engine checks every order
+    candle, no funding rate). `portfolio`: the whole fund's block (portfolio_block), which no Start or Resume of one
+    strategy clears. The why lists every cause that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
     causes = []
@@ -183,6 +192,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(halt)
     if archived:
         causes.append(RETIRED)
+    if portfolio is not None:
+        causes.append(portfolio)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -299,7 +310,35 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     held = None if starting else held_causes(open_block(store, name, now))
     sleeve = store.sleeve(name)
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
-                         holds=held or None, starting=starting, since=_halted_since(store, name, sleeve))
+                         holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
+                         portfolio=portfolio_block(store, now))
+
+
+def portfolio_block(store, now: datetime | None = None) -> Why | None:
+    """The whole fund's reason nothing opens (v2 P2-2: halted, paused for the day, or its book's mark older than 60 s),
+    as a CHOKE cause, or None. In force from the supervisor's first portfolio pass, which writes the state row before
+    it reads the fund's equity, so a pass that can't read it leaves entries blocked as stale (fail closed); a journal
+    with no state row (a backtest's, or one no supervisor has run on) has no portfolio gate."""
+    from sqlalchemy import select
+
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import entry_block
+    from sleeve_fund.store import portfolio_state_t
+
+    if getattr(store, "engine", None) is None:  # a backtest's in-memory journal
+        return None
+    with store.engine.connect() as c:
+        if c.execute(select(portfolio_state_t.c.id)).first() is None:
+            return None
+    hit = entry_block(DbLedger(store, _no_positions), now or utcnow())
+    if hit is None:
+        return None
+    code, lead = PORTFOLIO_CODES[hit[0]]
+    return _cause(code, hit[1].removeprefix(lead))
+
+
+def _no_positions():
+    raise RuntimeError("CHOKE reads the portfolio's state only, never the book")
 
 
 def _halted_since(store, name: str, sleeve) -> datetime | None:
@@ -498,7 +537,8 @@ class SleeveRuntime:
         blocked, why = blocked_state(state, self.now(),
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
-                                     holds=self.holds, since=_halted_since(self.store, self.name, state))
+                                     holds=self.holds, since=_halted_since(self.store, self.name, state),
+                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()))
         self._episode(why if blocked else None)
         return blocked, why
 
