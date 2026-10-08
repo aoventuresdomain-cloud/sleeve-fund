@@ -14,7 +14,8 @@ only names, imports and helper paths were adapted. Source paths are under
 - Squash-merged PR heads were fetched as `refs/pull/<n>/head` (#151, #155, #182, #193), so the pre-fix commits inside a
   PR are reachable: eddc1bc, 81e6d6f, 998631d, 3732498, 7bac37b.
 - SQLite. Every red is an `AssertionError` (or the cell's own `AssertionError` subclass) at the cell's own assertion,
-  never an ImportError, AttributeError or TypeError.
+  never an ImportError, AttributeError or TypeError. One exception: QA-193-F3 (p6b) is red with the `ValueError` its
+  source's strict mark names, raised where the cell sends the reset again.
 - Line numbers refer to the ported file.
 
 ## Cells
@@ -24,6 +25,7 @@ only names, imports and helper paths were adapted. Source paths are under
 | test_qa_gapliq_adversarial.py::test_adv7_…[isolated-10pct-guard-path-ping_pong-resume] | v2-p1/gate-stop-choke-gapliq-scripts/test_155_adv_v2_adapted_sgz.py | P1-U34 | 81e6d6f (#155 final head; fix 3a2e439) | :121 `raise RunningForATick(...)`: running on the liquidating tick, -0.0331 |
 | test_qa_gapliq_adversarial.py::test_adv7_…[isolated-10pct-guard-path-always-short-resume] | same | P1-U34 | 81e6d6f | :121 (same): -0.0333 |
 | test_qa_gapliq_adversarial.py::test_adv8_…[isolated-10pct] | same | P1-D22 | 998631d (#155 follow-up head; fix 45e2a4f); also 81e6d6f | :159 `assert li, intents`: a daily-loss pause, no liquidation |
+| test_qa_gapliq_adversarial.py::test_adv9_a_reset_requested_before_a_liquidation_does_not_clear_the_liquidation_halt | same | P1-D24 | 998631d; green on deb5f25 (the fix) and main | :260 `assert not new`: the halt was cleared and the strategy traded on the next day's process with no resume. Set-up re-pinned by the Head of QA (8 Oct 01:20 UK): the reset is asked while paused and holding, before the liquidation; the source asked it on the liquidating tick, where main now refuses it |
 | test_qa_gapliq_adversarial.py::test_adv10_…[flatten-waiting] | same | P1-D23 | 3732498 (pr/182, parent of fix deb5f25); also 998631d | :212 `assert s.desired_state == "stopped"`: Stop refused, "a flatten is still waiting" |
 | test_qa_liquidation_final.py::test_f2b_…[perp-2x-long-reconnect] | v2-p1/degraded-155-scripts/test_155_final_p155z.py | P1-D25 | 1582c3a (#155 as merged) | :79 equity left 6,032.78 vs journal 6,034.75 |
 | test_qa_liquidation_final.py::test_f2b_…[perp-2x-long-restart] | same | P1-D25 | 1582c3a | :79 984.80 vs 989.30 |
@@ -58,9 +60,18 @@ only names, imports and helper paths were adapted. Source paths are under
 | test_qa_kill_reset.py::test_kill_switch_route_acts_on_a_strategy_whose_reset_flatten_is_queued | same | P1-KR-1 | a83de76 | :287 the kill switch skipped it |
 | test_qa_kill_reset.py::test_per_strategy_flatten_route_while_the_reset_flatten_is_queued | same | P1-KR-1 | a83de76 | :300 "a flatten is already waiting" |
 | test_qa_kill_reset.py::test_two_resets_kill_switch_between_them_before_the_fresh_first_tick | same | P1-KR-2 | a83de76 | :321 kill switch lost across the second reset |
-| test_qa_ral_probes.py::test_p7_…[stop_then_ral] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F2 | 7bac37b (pr/193; parent of fix 746bcae) | :69 Start refused, RAL still pending |
-| test_qa_ral_probes.py::test_p7_…[ral_then_stop] | same | QA-193-F2 | 7bac37b | :69 Start refused, Stop dropped the RAL |
-| test_qa_ral_probes.py::test_p7c_stopped_and_liquidated_then_the_note_then_ral_then_start_trades_again | same | QA-193-F2 | 7bac37b | :98 Start refused, RAL never applied |
+| test_qa_ral_probes.py::test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing[running] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F1 (Postgres only) | 7bac37b on Postgres, recorded by the Head of QA; passes on SQLite | :82 `_tick(...)`: StringDataRightTruncation, varchar(32) on `events.kind` |
+| test_qa_ral_probes.py::test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing[drawdown_halt] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F1 (Postgres only) | 7bac37b on Postgres, recorded by the Head of QA; passes on SQLite | :82 `_tick(...)`: StringDataRightTruncation, varchar(32) on `events.kind` |
+| test_qa_ral_probes.py::test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing[daily_pause] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F1 (Postgres only) | 7bac37b on Postgres, recorded by the Head of QA; passes on SQLite | :82 `_tick(...)`: StringDataRightTruncation, varchar(32) on `events.kind` |
+| test_qa_ral_probes.py::test_p7_…[stop_then_ral] | v2-p1/ral-193-scripts/test_qa_ral_193_probes.py | QA-193-F2 | 7bac37b (pr/193; parent of fix 746bcae) | :120 Start refused, RAL still pending |
+| test_qa_ral_probes.py::test_p7_…[ral_then_stop] | same | QA-193-F2 | 7bac37b | :120 Start refused, Stop dropped the RAL |
+| test_qa_ral_probes.py::test_p7c_stopped_and_liquidated_then_the_note_then_ral_then_start_trades_again | same | QA-193-F2 | 7bac37b | :149 Start refused, RAL never applied |
+| test_qa_ral_f3f4.py::test_p5b_the_process_applies_a_ral_row_only_with_its_noted_incident | same | QA-193-F4 | 60d49e7 (main before this fix) | :54 the raw row was carried out: running, not halted |
+| test_qa_ral_f3f4.py::test_p6b_a_failure_inside_the_ral_step_leaves_a_way_to_reset | same | QA-193-F3 | 60d49e7 (main before this fix) | :78 `ValueError` "already reset for this liquidation" (the source's strict mark raises ValueError): the incident was used up |
+| test_qa_ral_f3f4.py::test_w1_…[before_halt_lifts] | v2-p2/pr217/test_217_ral_window_probes.py | QA F217-1 | d7875ef (#217 before this fix) | :192 the reset asked before the liquidation still pending |
+| test_qa_ral_f3f4.py::test_w1_…[before_marked_applied] | same | QA F217-1 | d7875ef | :192 the reset asked before the liquidation still pending |
+| test_qa_ral_f3f4.py::test_w0_a_normal_ral_lapses_the_earlier_reset | same | QA F217-1 (control) | none: passes on 60d49e7 and d7875ef | the Head of QA's control for W1, kept as a guard |
+| test_qa_ral_f3f4.py::test_w2_a_retried_ral_does_not_lift_a_reconcile_halt_taken_on_the_restart | same | QA F217-2 | 303b96f (#217 before this fix) | :285 the reconcile halt lifted: running |
 | test_qa_ir_parity.py::test_ir1_…[1] | v2-p1/integration-1709cd9-scripts/test_ir_parity.py | ir1 | 1918f8b | :34 fees 780.68 vs 771.05 |
 | test_qa_ir_parity.py::test_ir1_…[15] | same | ir1 | 1918f8b | :34 fees 203.58 vs 201.07 |
 | test_qa_ir_l6_restart.py::test_ir3_…[spot-long] | v2-p1/integration-1709cd9-scripts/test_ir_l6_restart.py | ir3 | 1918f8b | :33 restart fill not one seeded half spread from the backtest |
@@ -123,7 +134,7 @@ collection in #178.
 
 ## Not ported
 
-Never red at their own assertion on any pre-fix SHA:
+Never red at their own assertion on any pre-fix SHA; kept in QA masters as guards (Head of QA, 8 Oct), not obsolete:
 
 - **ADV-7, 10 params** (every guard-path `flatten`/`start`, every full-margin param): no finding mark; pass on 81e6d6f,
   3a2e439, 998631d and 45e2a4f.
@@ -136,11 +147,5 @@ Never red at their own assertion on any pre-fix SHA:
 
 Left out for another reason:
 
-- **ADV-9 (P1-D24)**: red on 998631d at the source's :562. On main its injected `request_reset` is refused (the
-  strategy is already liquidated), so the teardown check `_no_swallowed_strategy_errors` fails. Held for the Head of
-  QA's decision.
-- **QA-193-F1** (`test_p1_ral_on_a_strategy_never_liquidated_is_refused_and_a_raw_row_changes_nothing`, 3 params): the
-  bug is Postgres only (VARCHAR(32) on `events.kind`); it passes on 7bac37b on SQLite, and no Postgres red was recorded.
-- **QA-193-F3, F4**: still open on main (strict xfails in the source), so not regression cells yet.
-- **P1-O7, second half** (`test_a_series_never_kept_is_raised_across_restarts`): its set-up patches `oi._STARTED`,
-  which main no longer has; porting it needs a set-up change.
+- **P1-O7, second half** (`test_a_series_never_kept_is_raised_across_restarts`): obsolete (Head of QA, 8 Oct). It
+  asserts nothing beyond `test_open_interest.py::test_never_kept_counts_from_the_first_try_across_restarts`.

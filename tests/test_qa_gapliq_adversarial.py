@@ -1,5 +1,5 @@
 """QA regression cells ported from the #155 adversarial v2 probes, as QA agent sgz adapted them for the stop-safety
-branch (PR #182): ADV-7 (P1-U34), ADV-8 (P1-D22) and ADV-10 (P1-D23). Every finding is closed, so the
+branch (PR #182): ADV-7 (P1-U34), ADV-8 (P1-D22), ADV-9 (P1-D24) and ADV-10 (P1-D23). Every finding is closed, so the
 strict xfail marks are gone and each cell is a plain test. Assertions, expected values and set-ups are the source's.
 
 Source: /mnt/project-files/sleeve-fund/quant-review/v2-p1/gate-stop-choke-gapliq-scripts/test_155_adv_v2_adapted_sgz.py
@@ -9,6 +9,7 @@ autouse _reg fixture applies here too).
   ADV-7  P1-U34: a Resume, Flatten or Start queued while paused, landing on the liquidating tick: never running,
          nothing opens, and the command is taken up afterwards (no deadlock).
   ADV-8  P1-D22: a restart after downtime finds the price past the liquidation price (no stop resting).
+  ADV-9  P1-D24: a Reset asked while paused and holding, carried out after the liquidation, must not clear the halt.
   ADV-10 P1-D23: a liquidation order that never fills: the PM's commands wait; Stop must still work.
 """
 import dataclasses
@@ -165,6 +166,100 @@ def test_adv8_a_restart_after_downtime_past_the_liquidation_price_liquidates_hal
     assert len(inc) == 1, [e["message"] for e in inc]
     m = re.search(r"; ([\d,]+\.\d\d) of equity left", inc[0]["message"])
     assert m and float(m.group(1).replace(",", "")) == pytest.approx(max(left, 0.0), abs=0.011), (inc[0]["message"], left)
+
+
+# ---- ADV-9 (U34 with a Reset): a per-strategy reset requested while paused and holding, carried out by the
+# supervisor after the liquidation ------------------------------------------------------------------------------------
+
+class FakePopen:
+    pid, returncode = 4242, None
+    poll = lambda self: None  # noqa: E731
+    send_signal = wait = kill = lambda self, *a, **k: 0  # noqa: E731
+
+
+def test_adv9_a_reset_requested_before_a_liquidation_does_not_clear_the_liquidation_halt(tmp_path, monkeypatch):
+    """Advisor 20:41 (U27): an ordinary per-strategy Reset is refused while liquidated (it points to RAL). Here the PM
+    asked for the reset while the strategy was paused and holding; the supervisor's flatten for it is still pending on
+    the liquidating tick; once flat the supervisor would carry the reset out. It must not clear the liquidation halt:
+    after the supervisor steps and a new process runs the next day, still halted in the ruled words, nothing trades.
+
+    Source: quant-review/v2-p1/gate-stop-choke-gapliq-scripts/test_155_adv_v2_adapted_sgz.py (ADV-9); finding P1-D24.
+    Set-up re-pinned by the Head of QA (the reset is asked before the liquidation); assertions unchanged."""
+    import test_replay
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.research.replay import replay
+    for nm, p in list(risk.PROFILES.items()):
+        risk.PROFILES[nm] = dataclasses.replace(p, max_position_pct=0.1)
+    params = {"rise": 0.01, "dip": 0.005, **PERP}
+    store = Store(f"sqlite:///{tmp_path}/r.db")
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: FakePopen())
+    from sleeve_fund.paper import runtime as rt_mod
+    real_tick, injected, box = rt_mod.SleeveRuntime.tick, [], {}
+
+    def tick(self, **kw):  # the supervisor's flatten for the reset lands on the liquidating tick
+        if kw.get("price", 0) > 60_000.0 * 1.015 * 1.3 and not injected:
+            injected.append(self.now())
+            box["sv"].reset_pending()  # holding: it queues the flatten first
+        return real_tick(self, **kw)
+    monkeypatch.setattr(rt_mod.SleeveRuntime, "tick", tick)
+    start0 = test_replay.START
+    try:
+        s1 = tmp_path / "s1.jsonl.gz"
+        q._record_session(s1, q._session_meta(10_000, params), [(5, 0.0), (20, 0.015), (2, 0.0)])
+        replay(s1, store=store)
+        book = store.journal_book(NAME, 10_000)
+        assert book["qty"] < 0
+        store.create_sleeve = lambda **kw: store.sleeve(kw["name"])
+        store.command(NAME, "pause", "QA: paused while holding")
+        # Re-pinned (HoQA 7 Oct 00:55 UK): the reset is asked here, paused and holding, before the liquidation is
+        # booked; only the supervisor's step for it waits for the liquidating tick. The source asked it on that tick,
+        # where main now refuses a reset of a liquidated strategy (U27), so the D24 path was no longer reached.
+        store.request_reset(NAME, "QA: reset asked while paused and holding")
+        sv = box["sv"] = sup.Supervisor(store)
+        sv.procs[NAME] = sup.Proc()
+        sv.procs[NAME].popen, sv.procs[NAME].started_at = FakePopen(), sup.utcnow()
+        test_replay.START = start0 + 2 * 3600 * 10**9
+        s2 = tmp_path / "s2.jsonl.gz"
+        bal = book["cash"] + book["qty"] * book["entry_px"]
+        q._record_session(s2, q._session_meta(bal, params), [(5, 0.0), (0, 0.6), (5, 0.0)], px=60_000.0 * 1.015)
+        orders = replay(s2, store=store)
+        intents = [(o["intent"], o["side"]) for o in orders]
+        liquidated = any(o["intent"] == "liquidation" for o in orders)
+        before = (store.sleeve(NAME).status, store.sleeve(NAME).status_reason)
+        refused = None
+        try:
+            sv.reset_pending()  # flat now: the supervisor carries the reset out, or refuses it
+        except ValueError as exc:
+            refused = str(exc)
+        n = len(store.orders(NAME, limit=100_000))
+        test_replay.START = start0 + 26 * 3600 * 10**9  # the next day, past 00:00 UTC
+        s3 = tmp_path / "s3.jsonl.gz"
+        left = store.journal_book(NAME, 10_000)["cash"]
+        q._record_session(s3, q._session_meta(left, params), [(3, -0.02), (3, 0.03), (4, -0.02)],
+                          px=60_000.0 * 1.015 * 1.6)
+        replay(s3, store=store)
+        s = store.sleeve(NAME)
+        status3 = (s.status, s.status_reason)
+        n3 = len(store.orders(NAME, limit=100_000))
+        store.command(NAME, "resume", "QA: a plain resume after the reset")  # a liquidation halt would refuse it
+        test_replay.START = start0 + 28 * 3600 * 10**9
+        s4 = tmp_path / "s4.jsonl.gz"
+        q._record_session(s4, q._session_meta(left, params), [(3, -0.02), (3, 0.03), (4, -0.02)],
+                          px=60_000.0 * 1.015 * 1.6)
+        replay(s4, store=store)
+        after_resume = [(o["intent"], o["side"]) for o in store.orders(NAME, limit=100_000)][: len(store.orders(
+            NAME, limit=100_000)) - n3]
+    finally:
+        test_replay.START = start0
+    s = store.sleeve(NAME)
+    assert not after_resume, ("traded after a plain resume", after_resume, status3)
+    events = [(e["kind"], e["message"][:100]) for e in sorted(store.events(NAME, limit=5000), key=lambda e: e["id"])][-12:]
+    assert injected and liquidated, intents  # harness: the reset landed on the gap tick, which liquidated it
+    allo = store.orders(NAME, limit=100_000)  # newest first
+    new = allo[: len(allo) - n]
+    assert not new, ([(o["intent"], o["side"]) for o in new], before, refused, events)
+    assert s.status == "halted" and s.status_reason.startswith("Position margin lost (liquidated): "), \
+        (s.status, s.status_reason, before, refused, events)
 
 
 # ---- ADV-10 (U34's "commands wait": a liquidation order that never fills) -------------------------------------------

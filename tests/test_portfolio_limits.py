@@ -144,3 +144,11 @@ def test_cr208_3_a_request_under_the_venue_minimum_is_rejected_below_min_even_wh
     assert (d.outcome, d.approved_qty, d.limit_hit) == ("rejected", D("0"), "below_min")
     assert "below the venue minimum of 0.001" in d.reason
     assert decide(Book(BOOK), _buy("0.001"), PORTFOLIO).outcome == "approved"  # exactly the minimum passes
+
+
+def test_qa_f211_3_an_unbound_order_is_floored_to_the_step_too():
+    """Before: with nothing binding, an off-step 0.1005 was approved as asked; only the trimmed path floored."""
+    d = decide(Book(BOOK), _buy("0.1005"), PORTFOLIO)
+    assert (d.outcome, d.approved_qty, d.requested_qty, d.limit_hit) == ("approved", D("0.100"), D("0.1005"), None)
+    d = decide(Book(BOOK), _buy("0.0004", step="0.001", min_qty="0"), PORTFOLIO)  # floors to nothing
+    assert (d.outcome, d.approved_qty, d.limit_hit) == ("rejected", D("0"), "below_min")
