@@ -524,9 +524,7 @@ PORTFOLIO_PROFILE_V1 = {
 event.listen(portfolio_profile_t, "after_create",
              lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
 # The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
-PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity", "marked_at")
-PORTFOLIO_STATE_MARKED = ("(" + " AND ".join(f"{c} IS NULL" for c in PORTFOLIO_STATE_FIGURES) + " AND status = 'ok') OR ("
-                          + " AND ".join(f"{c} IS NOT NULL" for c in PORTFOLIO_STATE_FIGURES) + ")")
+PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity")
 portfolio_state_t = Table(
     "portfolio_state",
     metadata,
@@ -549,7 +547,11 @@ portfolio_state_t = Table(
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
     CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name="portfolio_state_paused_until"),
     CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name="portfolio_state_halt_reason"),
-    CheckConstraint(PORTFOLIO_STATE_MARKED, name="portfolio_state_marked"),
+    CheckConstraint("status <> 'paused' OR pause_reason IS NOT NULL", name="portfolio_state_pause_reason"),
+    CheckConstraint("marked_at IS NOT NULL OR status = 'ok'", name="portfolio_state_marked"),
+    # all of the book's figures set, or none (before the first mark): one CHECK per figure (DA, 0011)
+    *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"portfolio_state_{c}_marked")
+      for c in PORTFOLIO_STATE_FIGURES),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.
@@ -615,7 +617,9 @@ gate_decisions_t = Table(
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
     CheckConstraint("approved_qty >= 0 AND approved_qty <= requested_qty", name="gate_decisions_approved_qty"),
     CheckConstraint("outcome <> 'rejected' OR approved_qty = 0", name="gate_decisions_rejected_none"),
-    UniqueConstraint("sleeve_id", "bar_ts", "intent_id", "stage", name="gate_decisions_sleeve_bar_intent_stage"),
+    # One real decision per strategy, bar, intent and stage; an 'error' row is audit and never blocks the retry (0011).
+    Index("gate_decisions_sleeve_bar_intent_stage", "sleeve_id", "bar_ts", "intent_id", "stage", unique=True,
+          sqlite_where=text("outcome <> 'error'"), postgresql_where=text("outcome <> 'error'")),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
 )
 # Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the

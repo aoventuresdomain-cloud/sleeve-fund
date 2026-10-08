@@ -3,10 +3,10 @@ processes share, where sleeve_fund.portfolio.gate.MemoryLedger is the in-memory 
 only keeps its state, reservations and decisions.
 
 - lock(): one transaction. On Postgres it starts with pg_advisory_xact_lock, held until commit or rollback, so a dead
-  process can't keep it; on SQLite a process lock (tests, local). Every ledger call made inside it uses that
+  process can't keep it. On SQLite it is a lock within one process: for the lab and tests only, never two processes. Every ledger call made inside it uses that
   transaction, so check_order's read, decision, reservation and record commit together or not at all.
 - seq: the decision's place in the first-come order, taken inside the lock (gate_decision_seq on Postgres, max + 1 on
-  SQLite), so seq order is decision order.
+  SQLite), so seq order is decision order. A rollback leaves a gap in the sequence; only the order matters (P2-7).
 - A reservation's id is its decision's id (gate_reservations.decision_id). reserve() runs before record() in
   check_order, so it allocates that id and record() writes the decision, then the reservation under it.
 - using(conn): a fill, reject or cancel is written by its own transaction; the release (or reduce) joins it, so the
@@ -28,7 +28,7 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.engine import Connection
 
 from sleeve_fund.money import money, stored
-from sleeve_fund.portfolio.gate import RELEASE_REASONS, RESERVATION_TTL, PortfolioState, Reservation
+from sleeve_fund.portfolio.gate import NEVER, RELEASE_REASONS, RESERVATION_TTL, PortfolioState, Reservation
 from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent
 from sleeve_fund.store import (
     GATE_STAGES,
@@ -278,7 +278,9 @@ class DbLedger:
         row = {"status": status, "paused_until": state.paused_until, "halt_reason": state.halted,
                "pause_reason": state.paused, "reference_equity": _dec(state.reference()), "hwm": _dec(state.hwm),
                "day_start_equity": _dec(state.day_start_equity), "day_start": state.day,
-               "book_equity": _dec(state.equity), "marked_at": state.mark_ts, "stale_told_at": state.stale_told,
+               "book_equity": _dec(state.equity), "marked_at": state.mark_ts,
+               # the stale alert's marker belongs to the spell of this mark; the first fresh mark after it clears it
+               "stale_told_at": state.stale_told if state.stale_told == (state.mark_ts or NEVER) else None,
                "updated_at": utcnow()}
         t = portfolio_state_t
         with self._tx() as conn:

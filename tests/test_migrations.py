@@ -324,3 +324,53 @@ def test_qa_f211_1_a_limit_finer_than_four_places_is_refused_never_rounded(engin
     assert store.portfolio_profile().version == 1
     assert store.portfolio_profile(store.add_portfolio_profile(PortfolioProfile(open_risk=0.0125),
                                                                created_by="pm")).open_risk == 0.0125
+
+
+def _gate_shape(eng):
+    i = inspect(eng)
+    out = {}
+    for t in ("portfolio_profile", "portfolio_state", "book_marks", "gate_decisions", "gate_reservations"):
+        out[t] = (sorted((c["name"], c["nullable"]) for c in i.get_columns(t)),
+                  sorted(c["name"] for c in i.get_check_constraints(t)),
+                  sorted((x["name"], tuple(x["column_names"]), bool(x["unique"])) for x in i.get_indexes(t)),
+                  sorted(u["name"] for u in i.get_unique_constraints(t)),
+                  sorted((tuple(f["constrained_columns"]), f["referred_table"]) for f in i.get_foreign_keys(t)))
+    return out
+
+
+def test_0011_migrated_gate_tables_equal_create_alls_check_for_check(engine, tmp_path):
+    """The migrations (0010 then 0011's batch rebuilds) give the gate's tables exactly what store.py's create_all
+    does: columns and nullability, every named CHECK, the partial unique index in place of the old UNIQUE, and FKs."""
+    schema.migrate(engine)
+    migrated = _gate_shape(engine)
+    fresh = make_engine(f"sqlite:///{tmp_path}/fresh.db") if engine.dialect.name == "sqlite" else engine
+    if fresh is engine:
+        _clean(engine)
+    Store(engine=fresh)
+    built = _gate_shape(fresh)
+    assert migrated == built
+    assert "portfolio_state_pause_reason" in built["portfolio_state"][1]
+    assert ("gate_decisions_sleeve_bar_intent_stage", ("sleeve_id", "bar_ts", "intent_id", "stage"), True) in \
+        built["gate_decisions"][2] and "gate_decisions_sleeve_bar_intent_stage" not in built["gate_decisions"][3]
+
+
+def test_0011_an_error_row_never_blocks_the_retry_but_a_second_real_decision_is_refused(engine):
+    from datetime import datetime, timezone
+
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import gate_decisions_t
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    sid = store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USD",
+                              bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
+    bar = datetime(2026, 10, 7, tzinfo=timezone.utc)
+    with engine.begin() as c:  # two transient failures on the bar, then the retry decides
+        c.execute(insert(gate_decisions_t), [_gate_row(sid, seq=1, bar_ts=bar, outcome="error", limit_hit="lock_error",
+                                                       approved_qty=0),
+                                             _gate_row(sid, seq=2, bar_ts=bar, outcome="error", approved_qty=0),
+                                             _gate_row(sid, seq=3, bar_ts=bar)])
+    with pytest.raises(IntegrityError), engine.begin() as c:  # a replay of the real one fails closed
+        c.execute(insert(gate_decisions_t), [_gate_row(sid, seq=4, bar_ts=bar, outcome="rejected", approved_qty=0)])

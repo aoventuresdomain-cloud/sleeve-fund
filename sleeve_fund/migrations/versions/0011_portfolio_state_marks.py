@@ -1,7 +1,14 @@
-"""P2-2 DB ledger: portfolio_state holds what the gate keeps in it. pause_reason (the pause's why, beside halt_reason),
-stale_told_at (a stale book is alerted once per spell, across processes) and a row before the first mark: the book's
-figures are null until then, all set or all null (portfolio_state_marked). Nothing has written the table yet (the
-ledger lands with this), so it is rebuilt; a row in it stops the migration rather than be lost.
+"""P2-2 DB ledger (the DA's 0011): portfolio_state holds what the gate keeps in it, and an 'error' row never blocks a
+retry.
+
+- portfolio_state: pause_reason (with paused, as halt_reason with halted), stale_told_at (a stale book is alerted once
+  per spell, across processes) and a row before the first mark: the book's figures are null until then, one CHECK
+  per figure tying it to marked_at, and an unmarked book is 'ok' (the gate still treats it as stale).
+- gate_decisions: the UNIQUE (sleeve_id, bar_ts, intent_id, stage) becomes a partial unique index WHERE outcome <>
+  'error', same name: a transient lock or read failure is kept as audit and the retry on the same bar can decide.
+
+Each step is skipped when a newer Store's create_all built that shape first (as 0010 allows). SQLite rebuilds the
+tables (batch); nothing has written portfolio_state yet.
 
 Revision ID: 0011
 Revises: 0010
@@ -19,44 +26,33 @@ depends_on = None
 
 EXACT = sa.Numeric(38, 18)
 TS = sa.DateTime(timezone=True)
-FIGURES = ('reference_equity', 'hwm', 'day_start_equity', 'day_start', 'book_equity', 'marked_at')
-MARKED = ("(" + " AND ".join(f"{c} IS NULL" for c in FIGURES) + " AND status = 'ok') OR ("
-          + " AND ".join(f"{c} IS NOT NULL" for c in FIGURES) + ")")
+FIGURES = ('reference_equity', 'hwm', 'day_start_equity', 'day_start', 'book_equity')
+UNIQUE = 'gate_decisions_sleeve_bar_intent_stage'
+NOT_ERROR = "outcome <> 'error'"
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     have = sa.inspect(bind)
-    if 'stale_told_at' in {c['name'] for c in have.get_columns('portfolio_state')}:
-        return  # built by a newer Store's create_all first (as 0010 allows): already this shape
-    if bind.execute(sa.text('SELECT count(*) FROM portfolio_state')).scalar():
-        raise RuntimeError('portfolio_state has a row: 0011 rebuilds it, so it stops here rather than lose it')
-    op.drop_table('portfolio_state')
-    op.create_table(
-        'portfolio_state',
-        sa.Column('id', sa.Integer(), autoincrement=False, nullable=False),
-        sa.Column('status', sa.String(length=16), nullable=False),
-        sa.Column('paused_until', TS, nullable=True),
-        sa.Column('halt_reason', sa.Text(), nullable=True),
-        sa.Column('pause_reason', sa.Text(), nullable=True),
-        sa.Column('reference_equity', EXACT, nullable=True),
-        sa.Column('hwm', EXACT, nullable=True),
-        sa.Column('day_start_equity', EXACT, nullable=True),
-        sa.Column('day_start', sa.Date(), nullable=True),
-        sa.Column('book_equity', EXACT, nullable=True),
-        sa.Column('marked_at', TS, nullable=True),
-        sa.Column('stale_told_at', TS, nullable=True),
-        sa.Column('profile_version', sa.Integer(), nullable=False),
-        sa.Column('updated_at', TS, nullable=False),
-        sa.CheckConstraint('id = 1', name='portfolio_state_one_row'),
-        sa.CheckConstraint("status IN ('ok', 'paused', 'halted')", name='portfolio_state_status'),
-        sa.CheckConstraint("status <> 'paused' OR paused_until IS NOT NULL", name='portfolio_state_paused_until'),
-        sa.CheckConstraint("status <> 'halted' OR halt_reason IS NOT NULL", name='portfolio_state_halt_reason'),
-        sa.CheckConstraint(MARKED, name='portfolio_state_marked'),
-        sa.ForeignKeyConstraint(['profile_version'], ['portfolio_profile.version']),
-        sa.PrimaryKeyConstraint('id'),
-    )
+    cols = {c['name'] for c in have.get_columns('portfolio_state')}
+    if 'stale_told_at' not in cols:
+        with op.batch_alter_table('portfolio_state') as t:
+            if 'pause_reason' not in cols:
+                t.add_column(sa.Column('pause_reason', sa.Text(), nullable=True))
+            t.add_column(sa.Column('stale_told_at', TS, nullable=True))
+            for c in (*FIGURES, 'marked_at'):
+                t.alter_column(c, existing_type=sa.Date() if c == 'day_start' else TS if c == 'marked_at' else EXACT,
+                               nullable=True)
+            t.create_check_constraint('portfolio_state_pause_reason', "status <> 'paused' OR pause_reason IS NOT NULL")
+            t.create_check_constraint('portfolio_state_marked', "marked_at IS NOT NULL OR status = 'ok'")
+            for c in FIGURES:
+                t.create_check_constraint(f'portfolio_state_{c}_marked', f'({c} IS NULL) = (marked_at IS NULL)')
+    if UNIQUE in {u['name'] for u in have.get_unique_constraints('gate_decisions')}:  # still the old UNIQUE
+        with op.batch_alter_table('gate_decisions') as t:
+            t.drop_constraint(UNIQUE, type_='unique')
+        op.create_index(UNIQUE, 'gate_decisions', ['sleeve_id', 'bar_ts', 'intent_id', 'stage'], unique=True,
+                        sqlite_where=sa.text(NOT_ERROR), postgresql_where=sa.text(NOT_ERROR))
 
 
 def downgrade() -> None:
-    raise NotImplementedError('the portfolio state is kept: never dropped')
+    raise NotImplementedError('the portfolio state and the gate journal are kept: never dropped')

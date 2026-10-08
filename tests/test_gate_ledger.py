@@ -34,16 +34,18 @@ from sleeve_fund.portfolio.gate import (
     check_order,
     entry_block,
     mark_book,
+    resume_after_halt,
 )
 from sleeve_fund.portfolio.limits import Decision, Holding, Intent
 from sleeve_fund.risk import PORTFOLIO
-from sleeve_fund.store import Store, events_t, gate_decisions_t, gate_reservations_t, portfolio_state_t
+from sleeve_fund.store import Store, _aware, events_t, gate_decisions_t, gate_reservations_t, portfolio_state_t
 from test_portfolio_gate import *  # noqa: F401,F403 - the cells, collected here against the DB ledger
 from test_portfolio_gate import PX, T0, _buy
 
 PG = os.environ.get("TEST_DATABASE_URL")
 ROOT = Path(__file__).resolve().parents[1]
 _SCHEMAS: list[str] = []
+_ENGINES: list = []
 STRATEGIES = ("a", "b", "c", "p1", "p2")
 
 
@@ -61,16 +63,22 @@ def _store() -> Store:
     with _engine().begin() as c:
         c.execute(text(f"CREATE SCHEMA {name}"))
     _SCHEMAS.append(name)
-    return Store(engine=_engine(name))
+    eng = _engine(name)
+    _ENGINES.append(eng)
+    return Store(engine=eng)
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _drop_schemas():
     yield
+    for eng in _ENGINES:
+        eng.dispose()
     if PG and _SCHEMAS:
-        with _engine().begin() as c:
-            for s in _SCHEMAS:
+        admin = _engine()
+        for s in _SCHEMAS:  # one schema per transaction: dropping them all at once runs out of lock slots
+            with admin.begin() as c:
                 c.execute(text(f"DROP SCHEMA IF EXISTS {s} CASCADE"))
+        admin.dispose()
 
 
 def _strategies(store: Store) -> None:
@@ -325,3 +333,33 @@ def test_two_processes_take_seq_first_come_and_never_double_book_headroom(tmp_pa
         before += qty * PX
     assert held <= D(10_000) and sum(r.decision.approved_qty for r in rows) * PX == held
 
+
+
+def test_the_stale_marker_is_cleared_by_the_first_fresh_mark_and_an_unmarked_book_is_stale():
+    """DA 0011: stale_told_at belongs to its spell, and a book with no mark is stale (fail closed)."""
+    ledger = CellLedger(D(20_000))
+    assert entry_block(ledger, T0)[0] == "portfolio_state_stale"  # marked_at NULL: blocked, alerted once
+
+    def told():
+        with ledger.engine.connect() as c:
+            return c.execute(select(portfolio_state_t.c.stale_told_at)).scalar()
+
+    assert told() is not None
+    mark_book(ledger, D(20_000), T0, PORTFOLIO)
+    assert told() is None  # the fresh mark ended the spell
+    late = T0 + timedelta(seconds=61)
+    assert entry_block(ledger, late)[0] == "portfolio_state_stale" and _aware(told()) == T0
+    mark_book(ledger, D(20_000), late, PORTFOLIO)
+    assert told() is None and [k for k, *_ in ledger.alerts] == ["portfolio_state_stale"] * 2
+
+
+def test_a_resume_rebases_below_the_hwm_and_round_trips_and_a_flow_moves_both():
+    """DA 0011 (c): halt_reference lives in reference_equity; after a PM Resume it is a value of its own."""
+    ledger = _marked()
+    mark_book(ledger, D(16_000), T0 + timedelta(seconds=5), PORTFOLIO)  # 20% down: halted
+    resume_after_halt(ledger)
+    st = ledger.state()
+    assert (st.halted, st.halt_reference, st.hwm) == (None, D(16_000), D(20_000))
+    apply_flow(ledger, D(1_000))
+    st = ledger.state()
+    assert (st.halt_reference, st.hwm, st.equity) == (D(17_000), D(21_000), D(17_000))
