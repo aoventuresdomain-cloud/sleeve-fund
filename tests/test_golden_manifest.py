@@ -218,7 +218,9 @@ def test_each_candle_fixture_is_the_whole_window_every_minute_whole():
 def test_nothing_reads_the_golden_fixtures_except_through_golden_lib():
     root = Path(__file__).parent.parent
     allowed = {Path(golden_lib.__file__).resolve(), Path(__file__).resolve()}
-    pattern = re.compile(r"""data["'/ ,]+golden|binance-[a-z]+-usdt-\d{4}.*\.csv""")
+    pattern = re.compile(r"""data["'/ ,]+golden|GOLDEN_DIR|[a-z0-9]+-[a-z0-9]+-usdt-\d{4}-\d\d-\d\dT\d{4}""")
+    for bypass in ("pd.read_csv(golden_lib.GOLDEN_DIR / name)", "venue2-btc-usdt-2026-10-06T0000-2026-10-07T2224.csv.gz"):
+        assert pattern.search(bypass), bypass
     offenders = [str(p.relative_to(root)) for d in ("sleeve_fund", "tests", "scripts") for p in (root / d).rglob("*.py")
                  if p.resolve() not in allowed and pattern.search(p.read_text(errors="ignore"))]
     assert offenders == [], f"read golden fixtures through golden_lib.load(), not directly: {offenders}"
@@ -243,6 +245,7 @@ def test_decode_log_rebuilds_the_files_and_fails_closed(tmp_path):
     no_begin = "\n".join(line for line in log.splitlines() if "BEGIN b-canon" not in line)
     with pytest.raises(ValueError, match="b-canon.csv: listed in SHA256SUMS but not in the log"):
         golden_lib.decode_log(no_begin, tmp_path / "x1")
+    assert not (tmp_path / "x1").exists()  # a.csv.gz decoded fine, but nothing is written when the log fails
     lines = log.splitlines()
     cut = "\n".join(lines[:3] + lines[4:])  # one base64 line of a.csv.gz lost
     with pytest.raises(ValueError, match="a.csv.gz: does not match its BEGIN line"):

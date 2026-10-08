@@ -81,13 +81,13 @@ def decode_log(text: str, out: Path) -> list[str]:
     """The .csv.gz files printed by golden-export's print job, written to out from the job's log text. Each file sits
     between "BEGIN <name> <sha256 of the .gz> <bytes>" and "END <name>"; Actions' timestamp prefixes are stripped.
     Raises unless each file matches its BEGIN line and every SHA256SUMS entry (sha256 of the uncompressed CSV) has a
-    rebuilt file that matches it, with none left over. Returns the names written."""
+    rebuilt file that matches it, with none left over; nothing is written to out until every check passes. Returns
+    the names written."""
     lines = [re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", line) for line in text.splitlines()]
     sums = {m[2]: m[1] for line in lines if (m := re.fullmatch(r"([0-9a-f]{64})  (\S+\.csv)", line))}
     if not sums:
         raise ValueError("no SHA256SUMS lines in the log")
-    out.mkdir(parents=True, exist_ok=True)
-    written, name, chunks, want = [], None, [], None
+    rebuilt, name, chunks, want = {}, None, [], None
     for line in lines:
         if m := re.fullmatch(r"BEGIN (\S+\.csv\.gz) ([0-9a-f]{64}) (\d+)", line):
             name, chunks, want = m[1], [], (m[2], int(m[3]))
@@ -95,18 +95,20 @@ def decode_log(text: str, out: Path) -> list[str]:
             data = base64.b64decode("".join(chunks), validate=True)
             if digest(data) != want[0] or len(data) != want[1]:
                 raise ValueError(f"{name}: does not match its BEGIN line; the log is cut or garbled")
-            (out / name).write_bytes(data)
-            written.append(name)
+            rebuilt[name] = data
             name = None
         elif name:
             chunks.append(line)
     if name:
         raise ValueError(f"{name}: no END line; the log is cut")
     for csv, sha in sums.items():
-        if f"{csv}.gz" not in written:
+        if f"{csv}.gz" not in rebuilt:
             raise ValueError(f"{csv}: listed in SHA256SUMS but not in the log")
-        if digest(gzip.decompress((out / f"{csv}.gz").read_bytes())) != sha:
+        if digest(gzip.decompress(rebuilt[f"{csv}.gz"])) != sha:
             raise ValueError(f"{csv}: does not match SHA256SUMS")
-    if extra := sorted(set(written) - {f"{c}.gz" for c in sums}):
+    if extra := sorted(set(rebuilt) - {f"{c}.gz" for c in sums}):
         raise ValueError(f"not in SHA256SUMS: {extra}")
-    return written
+    out.mkdir(parents=True, exist_ok=True)
+    for gz_name, data in rebuilt.items():
+        (out / gz_name).write_bytes(data)
+    return list(rebuilt)
