@@ -76,3 +76,31 @@ def test_the_dashboard_opens_the_servers_journal_with_the_portfolio_gate(monkeyp
     monkeypatch.setattr(dash, "Store", lambda **k: opened.append(k) or Store.in_memory(**k))
     dash.create_app()
     assert opened == [{"portfolio_gate": True}]
+
+
+# Entry points that open the sleeve journal but never decide an entry: research and tooling, the portfolio gate's
+# opt-out (Advisor 06:10 UK). Anything else that opens a journal must run under the gate (HoE 8 Oct).
+RESEARCH_ALLOWLIST = {
+    "sleeve_fund/__main__.py": "the research CLI: reads fees and spreads from the journal, never trades",
+    "sleeve_fund/history.py": "the candle store: writes only alerts to the journal's inbox",
+    "sleeve_fund/mirror.py": "the demo mirror: copies paper fills to a demo account, never decides an entry",
+}
+GATED = ("assert_portfolio_gate(", "Store(portfolio_gate=True)")
+
+
+def test_every_entry_point_that_opens_a_journal_runs_under_the_gate_or_is_allowlisted_research():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    opens = re.compile(r"(?<![A-Za-z_])Store\(")
+    entry = re.compile(r"if __name__ == .__main__.|^def create_app\(", re.M)
+    found = {}
+    for path in sorted((root / "sleeve_fund").rglob("*.py")):
+        src = path.read_text()
+        if entry.search(src) and opens.search(src):
+            found[path.relative_to(root).as_posix()] = any(g in src for g in GATED)
+    assert {"sleeve_fund/supervisor.py", "sleeve_fund/paper/node.py", "sleeve_fund/dashboard/app.py"} <= set(found)
+    ungated = sorted(p for p, gated in found.items() if not gated and p not in RESEARCH_ALLOWLIST)
+    assert not ungated, f"opens the sleeve journal without the portfolio gate and isn't allowlisted research: {ungated}"
+    assert not [p for p in RESEARCH_ALLOWLIST if found.get(p)], "an allowlisted entry point now runs the gate: drop it"
