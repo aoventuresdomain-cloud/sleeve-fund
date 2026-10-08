@@ -7,19 +7,24 @@ The P2-7a spike (qd/p2-7a-spike-note.md) showed one engine does it:
 - an alert at bar close + 1 ns sees every strategy's intents for that close and handles them in one gate pass;
 - a strategy may hold two clones (cash + margin) for two legs.
 
-This module holds the pieces that don't depend on the gate's core (P2-2), which plugs in through `GateFn` once it is on
-main: the venue clones, the per-close batch and the one fill-cost hook."""
+This module holds the venue clones, the per-close batch, the one fill-cost hook and the run's gate (PortfolioGate):
+P2-2's check_order over a MemoryLedger, with each approved order's reservation held until its fill, reject or cancel."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.model import CryptoPerpetual, CurrencyPair, InstrumentId, Venue
 
 from sleeve_fund.money import money, scale
+from sleeve_fund.portfolio.gate import Checked, MemoryLedger, check_order, mark_book
+from sleeve_fund.portfolio.holding import Position, holding_for, underlying
+from sleeve_fund.portfolio.limits import Holding, Intent, rejected
+from sleeve_fund.risk import PortfolioProfile
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
 # ACT-DRIFT (Independent Quant Advisor, 7 Oct 20:05 UK): paper acts at the bar boundary + 2 s, the backtest at the
@@ -111,6 +116,88 @@ class CloseBatch:
                 p.refused(p.intent, decision)
             out.append((p, decision))
         return out
+
+
+def gate_intent(d: dict) -> Intent:
+    """P2-2's Intent for a strategy's opening order, from the hook's intent (LongFlatStrategy._send_entry): its side,
+    qty, expected fill (`price`, from fill_price), instrument, venue step and minimum, and what one unit posts and
+    risks. Those come from holding_for on one unit at the expected fill, so the gate counts the order exactly as it
+    counts the position once held: margin = price / leverage on a perp (leverage None: spot, the full price); risk to
+    the stop (stop_frac from the expected fill) or, with none, the stopless measure from the daily ATR (atr_pct).
+    Raises when a figure can't be used (a float price, a stopless order with no ATR), and the gate fails closed."""
+    side, price = d["side"], money(d["price"], "price")
+    frac = d.get("stop_frac")
+    stop = price - scale(price, side * frac) if frac else None
+    name = underlying(d["instrument"])
+    unit = holding_for(Position("", name, Decimal(side), stop, d.get("leverage")), price, d.get("atr_pct"))
+    return Intent(name, side, money(d["qty"], "qty"), price, unit.margin, unit.risk, d["step"], d["min_qty"])
+
+
+def _utc(ts_ns: int) -> datetime:
+    return datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=timezone.utc).replace(
+        microsecond=ts_ns % 1_000_000_000 // 1000)
+
+
+@dataclass(frozen=True)
+class Gated:
+    """One gate answer and its reservation's lifecycle: attach it to the order sent, reduce it as the order fills,
+    release it when the order closes (fill, reject or cancel) or is never sent."""
+
+    checked: Checked
+    gate: "PortfolioGate"
+
+    @property
+    def decision(self):
+        return self.checked.decision
+
+    @property
+    def approved_qty(self) -> Decimal:
+        return self.checked.decision.approved_qty
+
+    def attach(self, order_id: str) -> None:
+        if self.checked.reservation is not None:
+            self.gate.ledger.attach_order(self.checked.reservation, order_id)
+
+    def filled(self, qty: Decimal) -> None:
+        if self.checked.reservation is not None:
+            self.gate.ledger.reduce(self.checked.reservation, money(qty, "qty"))
+
+    def release(self, reason: str) -> None:
+        if self.checked.reservation is not None:
+            self.gate.ledger.release(self.checked.reservation, reason)
+
+
+@dataclass
+class PortfolioGate:
+    """The GateFn of a portfolio run: P2-2's check_order over a MemoryLedger (the one in-memory Ledger; Advisor
+    condition 2). book(ts_ns) gives the fund's marked equity and every strategy's held positions as Holdings
+    (holding_for); it is read at every check, so an order that filled since the last one counts as held and its
+    reservation has gone. Each check marks the book first (mark_book): the mark is never stale, and a drawdown halt or
+    daily pause it sets blocks the entry. The runner also calls mark() at every close, so the high-water mark sees
+    every close and not only those with an entry, and acts on its "halt" (flatten and halt every strategy)."""
+
+    book: Callable[[int], tuple[Decimal, tuple[Holding, ...]]]
+    profile: PortfolioProfile = field(default_factory=PortfolioProfile)
+    ledger: MemoryLedger = field(default_factory=MemoryLedger)
+
+    def mark(self, ts_ns: int) -> str | None:
+        """Mark the fund at ts_ns: "halt" or "pause" when that mark has just set one, else None."""
+        equity, held = self.book(ts_ns)
+        self.ledger.equity, self.ledger.held = money(equity, "equity"), list(held)
+        return mark_book(self.ledger, self.ledger.equity, _utc(ts_ns), self.profile)
+
+    def __call__(self, strategy: str, intent: dict, ts_ns: int) -> Gated:
+        now = _utc(ts_ns)
+        try:
+            self.mark(ts_ns)
+            order = gate_intent(intent)
+        except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
+            why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
+            self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
+            qty = intent.get("qty") if isinstance(intent, dict) else None
+            qty = qty if isinstance(qty, Decimal) else Decimal(0)
+            return Gated(Checked(rejected(qty, None, why), None, None), self)
+        return Gated(check_order(self.ledger, strategy, order, self.profile, now), self)
 
 
 def strategy_order(names: Iterable[str]) -> tuple[str, ...]:
