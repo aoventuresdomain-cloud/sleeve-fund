@@ -153,14 +153,14 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
                 else _room(used[k], caps[k], per_unit[k])) for k in LIMITS}
     bound = [k for k in LIMITS if room[k] is not None and room[k] < intent.qty]
     limit = min(bound, key=lambda k: room[k]) if bound else None  # min() keeps the first of LIMITS on a tie
-    qty = intent.qty if limit is None else floor_to(room[limit], intent.step)
+    qty = floor_to(intent.qty if limit is None else room[limit], intent.step)  # both paths on the step (QA F211)
 
     def figures(at: Decimal) -> dict:
         after = {k: used[k] + at * per_unit[k] for k in LIMITS}
         return {k: {"before": float(used[k] / e), "after": float(after[k] / e), "cap": float(caps[k] / e)}
                 for k in LIMITS}
 
-    if limit is None and qty < intent.min_qty:  # nothing binds, but the request itself is under the minimum
+    if limit is None and (qty <= 0 or qty < intent.min_qty):  # nothing binds, but the request is under the minimum
         return rejected(intent.qty, "below_min", f"Entry rejected: {qty.normalize():f} is below the venue minimum "
                                                  f"of {intent.min_qty.normalize():f}", figures(ZERO))
     if limit is None:

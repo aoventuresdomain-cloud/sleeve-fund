@@ -311,3 +311,16 @@ def test_0010_on_a_database_a_newer_store_already_opened_keeps_its_tables_and_on
     with engine.connect() as c:
         assert c.execute(select(func.count()).select_from(portfolio_profile_t)).scalar() == 1
     assert schema.report(engine)[1] == []
+
+
+def test_qa_f211_1_a_limit_finer_than_four_places_is_refused_never_rounded(engine):
+    """Before: open_risk 0.00125 was stored as 0.0013, a looser limit than asked. Now it is refused, nothing written."""
+    from sleeve_fund.risk import PortfolioProfile
+
+    schema.migrate(engine)
+    store = Store(engine=engine)
+    with pytest.raises(ValueError, match="at most 4 decimal places: open_risk is 0.00125"):
+        store.add_portfolio_profile(PortfolioProfile(open_risk=0.00125), created_by="pm")
+    assert store.portfolio_profile().version == 1
+    assert store.portfolio_profile(store.add_portfolio_profile(PortfolioProfile(open_risk=0.0125),
+                                                               created_by="pm")).open_risk == 0.0125

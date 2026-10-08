@@ -493,6 +493,7 @@ HOLDOUT_SOURCES = ("study", "ledger_import")
 # The portfolio limits gate's tables (v2 P2-2; Data Architect's shapes, v2/p2-2-tables.md). Money and quantities are
 # EXACT; limits and ratios keep their own scales. Paper only: a backtest keeps its decisions in its result.
 LIMIT = Numeric(10, 4)
+LIMIT_PLACES = Decimal("0.0001")
 # A BIGINT key that still autoincrements on SQLite (which only does so for INTEGER PRIMARY KEY).
 BIG_ID = BigInteger().with_variant(Integer, "sqlite")
 # The PM's limits, one row per version, never updated: a change is a new version, the current one the highest.
@@ -2136,8 +2137,13 @@ class Store:
 
     def add_portfolio_profile(self, limits, created_by: str, note: str | None = None) -> int:
         """Record new portfolio limits as the next version and return it. Append-only: there is no update, because
-        every gate decision names the version it was taken under. limits.version is ignored."""
+        every gate decision names the version it was taken under. limits.version is ignored. A limit finer than the
+        column's 4 places is refused, never rounded (QA F211-1: 0.00125 would be kept as a looser 0.0013)."""
         t = portfolio_profile_t
+        for name in ("gross", "net_instrument", "margin", "open_risk", "drawdown", "daily_loss"):
+            d = to_decimal(getattr(limits, name), name)
+            if d != d.quantize(LIMIT_PLACES):
+                raise ValueError(f"a portfolio limit has at most 4 decimal places: {name} is {d}")
         with self.engine.begin() as c:
             version = (c.execute(select(func.max(t.c.version))).scalar() or 0) + 1
             c.execute(insert(t), [{
