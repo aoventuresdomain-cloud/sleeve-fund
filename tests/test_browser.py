@@ -255,6 +255,25 @@ def test_development_columns_end_on_the_same_line(site, browser):
     assert abs((col["y"] + col["height"]) - (study["y"] + study["height"])) <= 2
 
 
+def test_the_strategy_page_puts_signals_beside_the_chart_and_the_position_below_at_1440(site, browser):
+    """UI polish UP-5 (UI v2, item 7): at 1440 x 900 the price chart and the Signals panel sit side by side, level at
+    the top, and the Position / Trades / Orders panel starts below both."""
+    ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                              viewport={"width": 1440, "height": 900})
+    page = ctx.new_page()
+    page.goto(f"{site}/sleeves/eth-trend")
+    page.wait_for_load_state("networkidle")
+    chart, signals = page.locator(".ov-price").bounding_box(), page.locator(".ov-signals").bounding_box()
+    lower = page.locator(".ov-lower").bounding_box()
+    if os.environ.get("SCREENSHOT_DIR"):
+        page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "strategy-1440.png"), full_page=True)
+    ctx.close()
+    assert chart and signals and lower, "the trend model has signals: the panel must be there"
+    assert signals["x"] >= chart["x"] + chart["width"]  # beside the chart, not under it
+    assert abs(signals["y"] - chart["y"]) <= 2
+    assert lower["y"] >= max(chart["y"] + chart["height"], signals["y"] + signals["height"]) - 1
+
+
 def test_records_and_risk_charts_are_lightweight_charts(site, browser):
     # QA U10: no hand-drawn SVG line charts left; Records' return curve is drawn by Lightweight Charts.
     page, errors = _open(browser, site + "/records")
