@@ -1611,7 +1611,7 @@ class Store:
         # or above (Advisor 8 Oct 04:10, ruling 3)
         amount = amount.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         ts = ts or utcnow()
-        key =((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
+        key = ((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
                & (insurance_t.c.trade_id == trade_id))
         booked = self._book_once(insurance_t, key, dict(sleeve=sleeve, ts=ts, price=price, amount=amount,
                                                         order_id=order_id, trade_id=trade_id),

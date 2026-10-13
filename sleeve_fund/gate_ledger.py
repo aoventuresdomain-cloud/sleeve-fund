@@ -64,6 +64,23 @@ class TaggedIntent(Intent):
     regime_state: str | None = None
 
 
+@dataclass(frozen=True)
+class Journaled:
+    """One decision as the journal holds it, for a replay in first-come order (P2-7 Done-when 1)."""
+
+    seq: int
+    strategy: str
+    intent_id: str
+    kind: str
+    bar_ts: datetime
+    stage: str
+    decided_at: datetime
+    underlying: str
+    price: Decimal
+    decision: Decision  # its reason is not journaled: ""
+    profile_version: int
+
+
 def _dec(x) -> Decimal | None:
     return None if x is None else stored(x)
 
@@ -113,9 +130,14 @@ class DbLedger:
             loc.conn = None
 
     @contextmanager
-    def _tx(self) -> Iterator[Connection]:
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
+    def _tx(self, audit: bool = False) -> Iterator[Connection]:
+        """The lock's or the fill's transaction when inside one, else a transaction of its own. audit: a failed entry
+        check's error row or alert. Inside a fill's transaction (using(), never the lock) only a failed check writes
+        those, so on Postgres they take their own transaction and outlive a fill that rolls back (CR F219-5). SQLite
+        shares one connection, so there they join it."""
+        loc = self._local
+        conn = getattr(loc, "conn", None)
+        if conn is not None and not (audit and self._pg and not getattr(loc, "locked", None)):
             yield conn
             return
         with nullcontext() if self._pg else self._process_lock, self.engine.begin() as conn:
@@ -167,7 +189,7 @@ class DbLedger:
         tags = self._tags(strategy, at, intent)
         loc = self._local
         pending = getattr(loc, "pending", None)
-        with self._tx() as conn:
+        with self._tx(audit=decision.outcome == "error") as conn:
             if self._pg:
                 seq = conn.execute(text("SELECT nextval('gate_decision_seq')")).scalar()
             else:
@@ -210,6 +232,17 @@ class DbLedger:
         b = Book(book[0], (*book[1], *(r.holding for r in reserved)))
         return {"book_equity": stored(b.equity), "gross": stored(b.gross()), "net_underlying": stored(b.net(underlying)),
                 "margin_used": stored(b.margin()), "open_risk": stored(b.open_risk())}
+
+    def replayable(self) -> list[Journaled]:
+        """Every decision a replay follows, in seq order. 'error' rows are left out: they take their seq outside the
+        lock, so they hold no place in the first-come order and decided nothing (CR F219-2)."""
+        d, s = gate_decisions_t, sleeves_t
+        q = (select(d, s.c.name).join(s, s.c.id == d.c.sleeve_id).where(d.c.outcome != "error").order_by(d.c.seq))
+        with self._tx() as conn:
+            return [Journaled(row.seq, row.name, row.intent_id, row.intent, _aware(row.bar_ts), row.stage,
+                              _aware(row.decided_at), row.underlying, money(row.price),
+                              Decision(row.outcome, money(row.approved_qty), money(row.requested_qty), row.limit_hit,
+                                       ""), row.profile_version) for row in conn.execute(q)]
 
     # --- a reservation's life ------------------------------------------------------------------------------------------
 
@@ -298,7 +331,7 @@ class DbLedger:
                 conn.execute(insert(t), [{"id": 1, **row}])
 
     def alert(self, kind: str, message: str, at: datetime) -> None:
-        with self._tx() as conn:
+        with self._tx(audit=True) as conn:
             conn.execute(insert(events_t).values(sleeve=None, ts=at, level="error", kind=kind, message=message))
 
     def write_book_mark(self, ts: datetime, book: Book, state: PortfolioState, profile_version: int) -> None:

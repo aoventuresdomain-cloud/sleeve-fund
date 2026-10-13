@@ -23,12 +23,14 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, func, insert, select, text
+from sqlalchemy.exc import IntegrityError
 
 import test_portfolio_gate as cells
 from sleeve_fund.gate_ledger import DbLedger, TaggedIntent
 from sleeve_fund.money import money
 from sleeve_fund.portfolio.gate import (
     MemoryLedger,
+    PortfolioState,
     Record,
     apply_flow,
     check_order,
@@ -319,6 +321,59 @@ def test_cr_f219_4_an_entry_check_inside_a_fills_transaction_fails_closed_as_loc
         c = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
     assert c.decision.outcome == "rejected" and not ledger.reserved
     assert [(r.decision.outcome, r.decision.limit_hit) for r in ledger.records] == [("error", "lock_error")]
+
+
+def test_cr_f219_5_a_failed_checks_error_row_and_alert_outlive_the_fill_that_rolls_back():
+    """Postgres: an entry check inside a fill's transaction fails closed (F219-4); its error row and alert are audit,
+    written in their own transaction, so they stay when the fill rolls back. SQLite shares one connection: they join."""
+    if not PG:
+        pytest.skip("SQLite's store shares one connection, so the audit row joins the fill's transaction there")
+    ledger = _marked()
+    fill = {"sleeve": "a", "ts": T0, "level": "info", "kind": "fill", "message": "BUY 0.1"}
+    with pytest.raises(RuntimeError, match="venue said no"), ledger.engine.begin() as conn, ledger.using(conn):
+        conn.execute(insert(events_t), [fill])
+        c = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+        raise RuntimeError("venue said no")
+    assert c.decision.outcome == "rejected" and not ledger.reserved
+    assert [(r.decision.outcome, r.decision.limit_hit) for r in ledger.records] == [("error", "lock_error")]
+    assert [k for k, *_ in ledger.alerts] == ["portfolio_check_failed"]
+    with ledger.engine.connect() as conn:  # the fill itself rolled back
+        assert conn.execute(select(func.count()).select_from(events_t).where(events_t.c.kind == "fill")).scalar() == 0
+
+
+def test_cr_f219_3_a_halt_before_the_first_mark_is_written_and_blocks_entries():
+    """DA 0012: a halt, the PM's included, is never refused for coming before the supervisor's first mark (refusing it
+    would fail open). A daily pause always follows a mark, so one without a mark is still refused."""
+    ledger = CellLedger(D(20_000))
+    ledger.set_state(PortfolioState(halted="the PM halted the portfolio"))
+    with ledger.engine.connect() as c:
+        row = c.execute(select(portfolio_state_t)).one()
+    assert (row.status, row.marked_at, row.book_equity, row.halt_reason) == ("halted", None, None,
+                                                                             "the PM halted the portfolio")
+    assert ledger.state().halted == "the PM halted the portfolio" and entry_block(ledger, T0)[0] == "halt"
+    c = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    assert (c.decision.outcome, c.decision.limit_hit) == ("rejected", "halt") and not ledger.reserved
+    with pytest.raises(IntegrityError):
+        CellLedger(D(20_000)).set_state(PortfolioState(paused_until=T0 + timedelta(hours=1), paused="3% down"))
+
+
+def test_cr_f219_2_a_replay_follows_seq_and_skips_error_rows():
+    """An 'error' row takes its seq outside the lock and decided nothing: the replay reader leaves it out and keeps
+    the first-come order of the rest."""
+    ledger = _marked()
+    a = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+
+    class NoLock(CellLedger):
+        def lock(self):
+            raise TimeoutError("lock wait timed out")
+
+    check_order(NoLock(D(20_000), store=ledger.store), "c", _buy("0.1"), PORTFOLIO, T0)
+    b = check_order(ledger, "b", _buy("0.1"), PORTFOLIO, T0)
+    assert [r.decision.outcome for r in ledger.records] == ["approved", "error", "trimmed"]
+    rows = ledger.replayable()
+    assert [(r.seq, r.strategy, r.decision.outcome, r.decision.approved_qty, r.decision.limit_hit) for r in rows] == [
+        (a.seq, "a", "approved", D("0.1"), None), (b.seq, "b", "trimmed", D("0.066"), "net_instrument")]
+    assert a.seq < b.seq and all(r.underlying == "BTC" and r.price == PX and r.stage == "submit" for r in rows)
 
 
 def test_the_state_row_round_trips_and_exists_before_the_first_mark():
