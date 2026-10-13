@@ -1177,14 +1177,21 @@ def _one_way(result: StudyResult, ledger: IdeaLedger, fold_runs: list, bt, minut
 
 
 def idea_of(params: dict | None, idea_hash: str | None) -> str | None:
-    """The idea family a study counts under when its caller named none: a rule-builder definition's own structural idea
+    """The idea family a study counts under. A rule-builder definition counts under its own structural idea
     (candidates.idea_hash), so unrelated definitions never share the "rules" family's trial count, holdout lock and
-    PBO family, and a parent and its candidates share one (CR F236-3). None for a hand-coded model: its name."""
-    if idea_hash is not None or not isinstance((params or {}).get("definition"), dict):
+    PBO family, and a parent and its retunes share one (CR F236-3). A caller's idea_hash must be that idea: any other
+    would file the runs where they don't count, so it is refused (HoQA F236-4). The parent's idea is covered by the
+    same check, since a retune shares it and a restructure is its own idea (candidates.validate_candidate). None for
+    a hand-coded model, which counts under its name, or the caller's idea_hash as given."""
+    if not isinstance((params or {}).get("definition"), dict):
         return idea_hash
     from sleeve_fund.research.candidates import idea_hash as structural
 
-    return structural(params["definition"])
+    own = structural(params["definition"])
+    if idea_hash is not None and idea_hash != own:
+        raise ValueError(f"idea_hash {idea_hash} isn't this definition's own idea {own}; its runs would count under "
+                         "another idea's budget and holdout lock")
+    return own
 
 
 def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: IdeaSpec, research: pd.DataFrame, bt,
