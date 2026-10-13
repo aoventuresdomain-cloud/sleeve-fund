@@ -311,6 +311,15 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.fees import resolve
 
         store = Store(portfolio_gate=True)
+        from sleeve_fund.paper.single_lock import INSTANCE_LOCK, duplicate_refused, instance_lock
+
+        # One process per strategy (SINGLE-LOCK, Advisor 13 Oct 18:10 UK): a second one would double its orders and
+        # positions, so it stops here, before it connects to market data or the venue. Held for the process's life.
+        lock = instance_lock(args.db_sleeve)
+        if lock is None:
+            return duplicate_refused(store, args.db_sleeve)
+        store.event(args.db_sleeve, "info", INSTANCE_LOCK, f"this process (pid {os.getpid()}) runs the strategy: it "
+                    "holds its single-instance lock")
         assert_portfolio_gate(store)
         row = store.sleeve(args.db_sleeve)
         quote = resolve(getattr(row, "venue", None), store)

@@ -18,3 +18,4 @@ data/*.db-*
 data/minute/
 research/results/
 data/history/
+data/locks/
