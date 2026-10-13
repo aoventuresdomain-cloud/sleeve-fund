@@ -18,6 +18,7 @@ The Independent Quant Advisor's rulings (8 Oct 03:05 UK) on the run's risk choic
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -78,7 +79,8 @@ class LegSpec:
 class PortfolioResult:
     legs: dict[str, BacktestResult]  # each Strategy's own record, as run_backtest gives it, over the whole window
     book: pd.Series  # the fund's equity at every mark (each hour's close), the whole window
-    decisions: list[dict]  # every gate decision, in order: strategy, ts, outcome, approved, requested, limit, reason
+    decisions: list[dict]  # every gate decision, in order: strategy, ts, bar_ts, outcome, approved, requested, limit,
+    # reason, side, price (the expected fill the gate priced it at); bar_ts keys it against the paper journal (parity)
     halt: dict | None  # {"ts", "drawdown", "reason"} when the drawdown halt fired
     halt_flatten_cost: float  # the fees and half spread the halt's flatten paid (R2)
     # {"ts", "reason", "until"} for each daily pause. By design (Advisor 03:25 UK) a pause lifts at 00:00 UTC, when a
@@ -318,9 +320,12 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
               for t, w, why, until in actions
               if w == "pause" and until is not None and until > pd.Timestamp(t, tz="UTC")]
     worst, risk = _intrabar(book, marks, hours, profile, halt_info, pauses)
-    decisions = [{"strategy": r.strategy, "ts": r.at, "outcome": r.decision.outcome,
-                  "approved": r.decision.approved_qty, "requested": r.decision.requested_qty,
-                  "limit": r.decision.limit_hit, "reason": r.decision.reason} for r in gate.ledger.records]
+    # bar_ts: the deciding bar's close, as the journal keys a paper decision. The pass ran at close + BATCH_DELAY_NS,
+    # which _utc rounded up to the next microsecond; closes fall on whole minutes, so the close is 1 µs earlier.
+    decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.at - timedelta(microseconds=1),
+                  "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
+                  "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
+                  "side": r.intent.side, "price": r.intent.price} for r in gate.ledger.records]
     gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
              "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
             for kind, msg, at in gate.ledger.alerts
