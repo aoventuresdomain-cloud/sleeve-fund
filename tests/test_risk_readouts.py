@@ -71,10 +71,13 @@ def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
     assert row["risk"] is None and row["atr_pct"] is None  # never raises (PE2 review)
 
 
-def test_the_helper_leaves_out_archived_strategies_and_filters_by_account(store):
+def test_the_helper_leaves_out_archived_flat_strategies_and_filters_by_account(store):
     _hold(store, "a", 0.1)
     _hold(store, "b", 0.1)
     store.archived = lambda: {"b": None}  # archived while still holding (Store.archive refuses a holder)
+    # F229-6 (Advisor 14 Oct 00:15 UK; HoE OK): one still holding counts; once flat it is left out.
+    assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a", "b"]
+    store.record_fill("b", side="SELL", qty=0.1, price=60_000.0, fee=0.0, order_id="X-b", trade_id="x-b")
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a"]
     account = store.account_of("a")
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02, account)] == ["a"]
