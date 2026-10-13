@@ -189,6 +189,17 @@ def test_not_found_with_no_fill_releases_nothing_until_the_quiet_window_has_pass
     assert store.confirm_cancels(_aware(first) + 2 * CANCEL_CONFIRM) == []  # once
 
 
+def test_the_answer_and_the_window_share_the_supervisors_clock(store):
+    """PE2 (og2b): the not-found time is the supervisor's, as given, so the window is measured on one clock."""
+    did = _resting(store)
+    cid = store.request_cancel("s", "E-1", "owner process down")
+    assert store.apply_cancel(cid, "not_found", at=T) == "unconfirmed"
+    assert _aware(store.open_cancels()[0]["not_found_at"]) == T
+    assert store.confirm_cancels(T + CANCEL_CONFIRM) == [cid]
+    r = _reservation(store, did)
+    assert _aware(r.released_at) == T + CANCEL_CONFIRM and r.release_reason == "cancel"
+
+
 def test_a_fill_landing_inside_the_window_is_never_released_as_cancel_and_closes_as_filled(store):
     """og2c, fill second: cancel -> not found -> the venue's fill. The sweep leaves it; once the fills are booked
     the caller answers "filled": applied, nothing released as 'cancel' (the fills reduce the reservation, W2)."""
