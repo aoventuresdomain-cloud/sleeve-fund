@@ -78,3 +78,13 @@ def test_retiring_a_strategy_leaves_the_fund_unchanged(store):
     store.archive("spot")
     assert "spot" not in store.reset_runs()
     assert fund_equity(store) == before
+
+
+def test_dust_with_no_mark_is_held_at_its_entry_price_and_a_real_position_still_fails_closed(store):
+    """HoQA F229-7: a position under DUST_NOTIONAL, never marked, doesn't fail the fund closed (it would block every
+    entry over dust no order can close); it counts at its entry price. A real one with no mark still raises."""
+    _trade(store, "spot", "BUY", 0.00001, 60_000.0, 0.0, 1, T0)  # 0.6 of notional: dust
+    assert fund_equity(store) == D(30000)  # 10,000 - 0.6 + 0.00001 x 60,000, plus the two flat strategies
+    _trade(store, "perp", "SELL", 0.2, 60_000.0, 4.8, 1, T0)
+    with pytest.raises(RuntimeError, match="perp holds .* no mark"):
+        fund_equity(store)
