@@ -237,7 +237,6 @@ def test_og2b_a_confirmed_not_found_releases_and_an_unanswered_cancel_never_rele
     )  # ten minutes unanswered: still held
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
 @pytest.mark.parametrize("fill_first", [True, False])
 def test_og2c_not_found_with_a_journalled_fill_converts_once_and_closes_the_orphan_never_releases(
     store, fill_first
