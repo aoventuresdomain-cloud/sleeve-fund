@@ -693,7 +693,15 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
-                    slower = (REGISTRY[s.strategy][0].slower_needs({**_defaults(s.strategy), **s.params})
+                    try:
+                        defaults = _defaults(s.strategy)
+                    except ModuleNotFoundError as exc:
+                        if exc.name != f"sleeve_fund.strategies.{s.strategy}":  # a shipped model that won't load
+                            raise ValueError(f"the {s.strategy} model can't be loaded: {exc}") from exc
+                        defaults = {}  # only in REGISTRY (a test harness's model): its own settings are all it has
+                    except (ImportError, AttributeError) as exc:
+                        raise ValueError(f"the {s.strategy} model can't be loaded: {exc}") from exc
+                    slower = (REGISTRY[s.strategy][0].slower_needs({**defaults, **s.params})
                               if s.strategy in REGISTRY else {})
                     if why := _warmup_gaps(_venue_name(s.venue), s.instrument, s.bar_spec, s.warmup_bars, slower):
                         st().event(name, "warning", "start_refused", why)  # on the strategy's record (Advisor)

@@ -102,3 +102,49 @@ def test_a_store_too_stale_to_warm_up_from_holds_nothing_back(client, tmp_path, 
     _hole(hs, VENUE, PAIR, start.strftime("%Y-%m"), start, 30)
     assert hs.gaps(VENUE, PAIR)
     assert _new(c).headers["location"] == "/sleeves/btc-test"
+
+
+def test_a_model_registered_without_a_module_of_its_own_starts_on_its_own_settings(client, stored, monkeypatch):  # noqa: F811
+    """A model only in REGISTRY (as the QA harnesses register theirs) has no defaults module to read: its own
+    settings are its warm-up's, so it starts on clean history and is refused over a gap (#245 CI, shard 1)."""
+    from sleeve_fund.strategies import REGISTRY
+
+    c, store = client
+    _, _, hole = stored
+    monkeypatch.setitem(REGISTRY, "regonly", REGISTRY["trend_filter"])
+    store.create_sleeve(name="reg-only", strategy="regonly", instrument=PAIR, bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5000, params={"fast": 10, "slow": 30}, warmup_bars=40,
+                        desired_state="stopped", venue=VENUE)
+
+    def command(what):
+        return c.post("/sleeves/reg-only/command", data={"command": what, "reason": "go"}, auth=AUTH, headers=SAME,
+                      follow_redirects=False).headers["location"]
+
+    assert "command_error" not in command("start") and store.sleeve("reg-only").desired_state == "running"
+    command("stop")
+    gap = hole(pd.Timedelta(hours=3))
+    assert "command_error=history" in command("start") and store.sleeve("reg-only").desired_state == "stopped"
+    (ev,) = [e for e in store.events("reg-only") if e["kind"] == "start_refused"]
+    assert ev["message"].startswith(f"history gaps in warm-up window: BTC/USD {gap:%d %b %H:%M}-")
+
+
+def test_a_shipped_model_that_wont_load_is_refused_with_the_reason(client, stored, monkeypatch):  # noqa: F811
+    """The fallback above is for a model with no module at all. A shipped model whose module fails to load (a
+    missing dependency, no SPEC) doesn't start on guessed settings: the start is refused and says why."""
+    from urllib.parse import parse_qs, urlparse
+
+    from sleeve_fund.dashboard import app as app_module
+
+    c, store = client
+    assert _new(c).headers["location"] == "/sleeves/btc-test"
+    c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "x"}, auth=AUTH, headers=SAME)
+
+    def broken(strategy):
+        raise ModuleNotFoundError("No module named 'talib'", name="talib")
+
+    monkeypatch.setattr(app_module, "_defaults", broken)
+    where = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
+                   follow_redirects=False).headers["location"]
+    error = parse_qs(urlparse(where).query)["command_error"][0]
+    assert error == "the trend_filter model can't be loaded: No module named 'talib'"
+    assert store.sleeve("btc-test").desired_state == "stopped"
