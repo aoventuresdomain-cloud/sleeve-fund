@@ -332,7 +332,7 @@ def apply_flow(ledger: Ledger, amount) -> None:
                                  halt_reference=moved(st.halt_reference), day_start_equity=moved(st.day_start_equity)))
 
 
-def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None],
+def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None] | None,
           ttl: timedelta = RESERVATION_TTL, is_acked: Callable[[str], bool] | None = None) -> list[Reservation]:
     """Orphans only (Advisor MUST FIX, 17:20 UK; refined 20:25 UK): a reservation lives as long as its order. Past
     `ttl`, one whose order is still live has that order cancelled and keeps its reservation until the cancel is
@@ -341,13 +341,22 @@ def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel:
     blind: every CANCEL_CONFIRM it is sent again with an alert, the reservation kept. A reservation with no order, or
     whose order is gone, is released as "ttl" with an alert: its process died before releasing it. Returns those. is_acked (paper): the TTL covers send to venue ack only, so a reservation whose order the venue has
     acked is skipped whatever its age; it lives with its order, released on a confirmed cancel or converted on a fill
-    (Advisor 8 Oct 06:10 UK)."""
+    (Advisor 8 Oct 06:10 UK). cancel None (paper until ORPHAN-GUARD og2): the sweep can't cancel, so it sends nothing
+    and says so; the order's own process cancels it at its next bar close, and the reservation is kept (CR W2-2)."""
     gone = []
     with ledger.lock():
         for r in ledger.reservations():
             if now - r.at <= ttl or (is_acked is not None and r.order_id is not None and is_acked(r.order_id)):
                 continue
             if r.order_id is not None and is_live(r.order_id):
+                if cancel is None:  # nothing to send: told once, kept until its process's cancel or a fill lands
+                    if r.cancel_sent is None:
+                        ledger.cancel_sent(r.id, now)
+                        ledger.alert("reservation_unacked", f"{r.strategy}: order {r.order_id} rested past its "
+                                     "reservation's TTL unacked. The supervisor can't cancel it yet (ORPHAN-GUARD), so "
+                                     "its own process cancels it at its next bar close; nothing was sent, and the "
+                                     "reservation holds until that cancel or a fill lands", now)
+                    continue
                 if r.cancel_sent is not None and now - r.cancel_sent <= CANCEL_CONFIRM:
                     continue  # asked; waiting for the venue's answer
                 kind = "reservation_order_cancelled" if r.cancel_sent is None else "reservation_cancel_unconfirmed"

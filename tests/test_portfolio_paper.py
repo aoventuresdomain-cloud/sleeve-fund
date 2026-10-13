@@ -149,6 +149,30 @@ def test_every_entry_point_that_opens_a_journal_runs_under_the_gate_or_is_allowl
     assert not [p for p in RESEARCH_ALLOWLIST if found.get(p)], "an allowlisted entry point now runs the gate: drop it"
 
 
+def test_past_the_ttl_an_unacked_order_is_told_once_as_not_cancelled_and_nothing_is_sent():
+    """CR W2-2 / F229-4: until ORPHAN-GUARD the supervisor has no cancel to send. An unacked order past its TTL is
+    alerted once, saying nothing was sent and that its process cancels it at its next bar close; no error on later
+    polls, and the reservation is kept."""
+    from test_p21b_wiring_qa import _alerts, _res
+
+    from sleeve_fund.portfolio import gate as gate_mod
+
+    store = _store()
+    _strategies(store)
+    portfolio_pass(store, T0, EQ)
+    led = CellLedger(equity=EQ, store=store)
+    rid = check_order(led, "a", _buy("0.05"), PORTFOLIO, T0 + timedelta(seconds=1)).reservation
+    led.attach_order(rid, "o-sent")
+    later = T0 + gate_mod.RESERVATION_TTL + timedelta(minutes=1)
+    for s in range(0, 600, 5):
+        portfolio_pass(store, later + timedelta(seconds=s), EQ)
+    (told,) = _alerts(store, "reservation_unacked")
+    assert "nothing was sent" in told.message and "next bar close" in told.message
+    assert not _alerts(store, "reservation_cancel_failed") and not _alerts(store, "reservation_cancel_unconfirmed")
+    assert not [e for e in _alerts(store, "supervisor_error")]
+    assert _res(store, rid).released_at is None
+
+
 def test_a_halt_tells_a_holder_it_cant_close_at_most_system_flattens_times_then_says_so_once(monkeypatch):
     """HoQA F229-5: a holder whose flatten never closes it (less than the venue's smallest order, say) is told at most
     SYSTEM_FLATTENS times this halt, then one alert says the PM must close it; the halt still blocks its entries."""

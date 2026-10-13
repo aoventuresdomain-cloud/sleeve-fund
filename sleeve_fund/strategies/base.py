@@ -544,6 +544,10 @@ class LongFlatStrategy(Strategy):
         # LIQ-FUND-1 (Advisor 17:20 UK, 13 Oct): funding taken from, or credited to, that margin since _liq_px was fixed,
         # and the instant (ns) after which a settlement is the position's. _liq_now moves the price by it.
         self._liq_funded, self._liq_from = 0.0, None
+        # STOP-LOOSEN-1 (Advisor 17:10 UK, 13 Oct): whether the open position's stop has been held inside the
+        # half-liquidation cap yet (it alerts once per position), and how many positions were (the tear sheet's count).
+        self._stop_capped = False
+        self.stops_clamped = 0
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         # Perp: the position and the last trade price held at each hour's start, as the first event past it
@@ -754,6 +758,7 @@ class LongFlatStrategy(Strategy):
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
+        self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -1397,7 +1402,8 @@ class LongFlatStrategy(Strategy):
           more bars than there are yet), or
         - when the strategy was started for its exits only (a refused start still holding: EXITS_ONLY),
         no new entry or add opens, and a safety stop is set at the first price: half the REMAINING distance from that
-        mark to the isolated liquidation price (half way to zero where there is none: a long at 1x, or spot), so it
+        mark to the isolated liquidation price, or the profile's share of it if tighter (a third, conservative; Advisor
+        19:15 UK, 13 Oct), or half way to zero where there is none (a long at 1x, or spot), so it
         always sits strictly between the mark and liquidation. A stop already restored stays if it is tighter. The
         model's own stop, once set again (_replan), replaces it only if tighter, and entries open again (never for
         an exits-only start). It raises an incident, and never closes the position itself."""
@@ -1441,7 +1447,13 @@ class LongFlatStrategy(Strategy):
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
-        level = mark - SAFETY_STOP_SHARE * (mark - target)
+        # The tighter of half the remaining way and the profile's own share of it (Advisor 19:15 UK, 13 Oct): a
+        # conservative profile's safety stop sits a third of the way, as its stops do (STOP-LOOSEN-1).
+        share = SAFETY_STOP_SHARE
+        if liq is not None and self.runtime is not None:
+            share = min(share, self.runtime.profile.stop_to_liquidation)
+        way = "half way" if share == SAFETY_STOP_SHARE else f"{share:.0%} of the way"
+        level = mark - share * (mark - target)
         # A stop never loosens (QA SG4): a safety stop an earlier restart set for this same position (no fill since)
         # stays when it is tighter than one measured from today's mark, even if the price is already through it.
         before = self.runtime.last_watched_stop() if not self._backtest else None
@@ -1453,12 +1465,12 @@ class LongFlatStrategy(Strategy):
         if not kept:
             self._stop_frac = side * (1 - level / entry)
             self._stop_basis = (f"safety stop at {level:,.6g}, set before the last restart" if held else
-                                f"safety stop, half way from the {mark:,.6g} mark to "
+                                f"safety stop, {way} from the {mark:,.6g} mark to "
                                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         why = (f"started for its exits only ({self._exits_reason()})" if self._exits_only else self._safety_why)
         work = (f"it keeps its restored stop at {restored:,.6g}, tighter than a safety stop at {level:,.6g}" if kept
                 else f"it keeps the safety stop at {level:,.6g} set before this restart (a stop never loosens)"
-                if held else f"it works to a safety stop at {level:,.6g}, half way from the {mark:,.6g} mark to "
+                if held else f"it works to a safety stop at {level:,.6g}, {way} from the {mark:,.6g} mark to "
                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         head = f"Incident, {self.runtime.name}: the open {_side_word(side)} position of {abs(qty):.12g} (entry "
         self.runtime.incident_once(
@@ -1567,13 +1579,29 @@ class LongFlatStrategy(Strategy):
             self._noted.discard("stop_gapped_open")
         return open_risk.check_entry(book, others, mine)
 
+    def _entry_atr_pct(self) -> float | None:
+        """The daily ATR share a stopless entry is measured with: a backtest's lookup for the day (set_daily_atr), paper's
+        from the history store, as the interim open-risk check reads it (_open_risk_refusal). None when it isn't known."""
+        if self._backtest or self.runtime is None:
+            return self._daily_atr.get((self.clock.timestamp_ns() - 1) // DAY_NS * DAY_NS)
+        from sleeve_fund.venues import venue as venue_profile
+
+        s = self.runtime.store.sleeve(self.runtime.name)
+        return open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, self.runtime.now())
+
     def set_daily_atr(self, lookup: dict[int, float]) -> "LongFlatStrategy":
         """Backtest: the daily ATR share known at each UTC day's start (open_risk.daily_atr_lookup)."""
         self._daily_atr = dict(lookup)
         return self
 
     def _set_plan(self, stop: float | None, tp: float | None, basis: str, kind: str, event_id: int) -> None:
-        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so."""
+        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so. On margin the stop
+        is held inside the half-liquidation cap (STOP-LOOSEN-1): an edit that loosens it, or a stop set again from the
+        market, is clamped like any other."""
+        asked = stop
+        stop, liq = self._capped_stop(asked)
+        if liq is not None:
+            self._stop_clamped(asked, stop, liq)
         self._stop_frac, self._tp_frac, self._stop_basis = stop, tp, basis
         if self.runtime is None or self._plan_entry is None:
             return
@@ -2498,6 +2526,11 @@ class LongFlatStrategy(Strategy):
             self._opened_in_bar = [o for o in self._opened_in_bar if o[0][1] > bar.ts_event]
             for window, qty in due:
                 self._fund_opened_in_bar(window, qty, bar.low.as_double(), bar.high.as_double())
+        if str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
+            # Before any hold, gap or stale check returns (CR W2-1): a bar held for missing minutes still closes the
+            # bar an entry may rest into, so a gated entry decided before it is cancelled now, never left resting on
+            # old prices.
+            self._cancel_gated_at_close(int(bar.ts_event))
         bar = self._first_bar_from_store(bar)
         if self._count_minutes(bar):
             return
@@ -2573,6 +2606,9 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             if self._restore is None:
                 self._apply_funding(self._last_close)
+                # Funding moves the liquidation price: a stop that never moves is held inside its cap again here.
+                if self._stop_frac is not None and self._hold_stop_capped(self._stop_frac) and self._backtest:
+                    self._rest_exits()
                 self._on_bar_sided(bar)
             return
         raw = self.target_weight(bar)
@@ -3031,13 +3067,15 @@ class LongFlatStrategy(Strategy):
     def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
         """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
-        than was sized here, then call sent(trimmed). Exits and reductions never wait for it."""
-        if self._portfolio is None:
+        than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
+        portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
+        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation)."""
+        paper = self._paper_gated()
+        if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
             return
         from sleeve_fund.research.portfolio import Pending, fill_price
 
-        batch, name = self._portfolio
         if self._deciding_bar is not None:
             signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
         s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
@@ -3048,8 +3086,7 @@ class LongFlatStrategy(Strategy):
                   "instrument": self._base_code(),
                   "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
                   if self._margin else None,
-                  "atr_pct": None if self._stop_frac else
-                  self._daily_atr.get((self.clock.timestamp_ns() - 1) // DAY_NS * DAY_NS)}
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
 
         def count(outcome: str) -> None:
             key = f"{what}_{outcome}"
@@ -3067,16 +3104,85 @@ class LongFlatStrategy(Strategy):
             self._noted.discard(f"{what}_trimmed_below_minimum")
             trimmed = approved != qty
             count("trimmed" if trimmed else "sent")
+            held = getattr(getattr(decision, "checked", None), "reservation", None) if paper is not None else None
             if not self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
-                                                                              if trimmed else {})}):
+                                                                              if trimmed else {})}, reservation=held):
                 if hasattr(decision, "release"):
                     decision.release("reject")
                 return
-            self._hold_reservation(decision, self._last_submitted)
+            if paper is None:
+                self._hold_reservation(decision, self._last_submitted)
             if sent is not None:
                 sent(trimmed)
 
+        if paper is not None and intent["atr_pct"] is None and not self._stop_frac:
+            # No stop and no daily ATR (a pair with under 14 whole days of history): the entry's risk can't be
+            # measured, so it is refused here as the interim open-risk check refuses it (QA P1-S3), a warning while it
+            # lasts, rather than sent to the gate to fail closed with an error alert on every bar.
+            count("refused")
+            self._note(f"{what}_refused_by_portfolio", f"{what.capitalize()} refused: its open risk can't be measured "
+                       "(no stop, and the daily ATR isn't known)")
+            return
+        if paper is not None:
+            # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
+            # decision; a refusal's reason is on that row and in the strategy's events.
+            decision = paper(self.runtime.name, {**intent, "bar": self._deciding[0] if self._deciding else None},
+                             self.clock.timestamp_ns())
+            if decision.approved_qty > 0:
+                self._noted.discard(f"{what}_refused_by_portfolio")
+                send(intent, decision)
+            else:
+                count("refused")
+                self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+            return
+        batch, name = self._portfolio
         batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+
+    def _resting_entry_terms(self):
+        """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
+        the venue's minimum lead on a short bar, or good-till-cancelled with the backstop note on a venue without it."""
+        from sleeve_fund.paper.orphan_guard import resting_entry_order
+        from sleeve_fund.venues import venue
+
+        try:
+            lead = venue(str(self._cfg.instrument_id.venue)).gtd_min_lead
+        except ValueError:  # a venue with no profile (a test's): no good-till-date assumed, the backstops cover it
+            lead = None
+        return resting_entry_order(gtd_supported=lead is not None, decision_close=_utc(self._deciding[0]),
+                                   bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
+                                   now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
+
+    def _paper_gated(self):
+        """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a
+        backtest, a portfolio run's batch, or a journal without the gate)."""
+        rt = self.runtime
+        if self._portfolio is not None or rt is None or rt.backtest or not getattr(rt.store, "portfolio_gate", False):
+            return None
+        if self._paper_gate is None:
+            from sleeve_fund.paper.portfolio_gate import paper_gate
+
+            self._paper_gate = paper_gate(rt.store)
+        return self._paper_gate
+
+    def _cancel_gated_at_close(self, close_ns: int) -> None:
+        """Paper with the portfolio gate: at each bar close, every gated entry or addition still resting that was sent
+        before this close is cancelled (Advisor 8 Oct 06:10 UK: an entry never rests past the bar after the one it
+        was decided on). The venue's confirmed cancel releases what is left of its reservation as 'cancel'; a
+        part-filled one keeps what filled, with its stop. Until then it stays reserved, past the TTL (HoQA w1g)."""
+        if self._paper_gated() is None or not (found := self._resting_openers()):
+            return
+        from sleeve_fund.paper.portfolio_gate import resting_entries
+
+        resting, kept = found
+        rt = self.runtime
+        due = set(resting_entries(rt.store, rt.name, _utc(close_ns)))
+        why = "cancelled at the next bar close: an entry never rests past the bar after it was decided"
+        for order in resting:
+            if str(order.client_order_id) in due:
+                self.cancel_order(order.client_order_id)
+        for coid in kept:
+            if coid in due:
+                self._close_kept(coid, why)
 
     def _base_code(self) -> str:
         """What the portfolio book counts this instrument's net in (portfolio.holding.underlying maps venue codes)."""
@@ -3129,12 +3235,14 @@ class LongFlatStrategy(Strategy):
         gated.release("fill" if status == OrderStatus.FILLED else
                       "reject" if status in (OrderStatus.REJECTED, OrderStatus.DENIED) else "cancel")
 
-    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
+    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False,
+                reservation: int | None = None) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
         it, or not sent (a failed write raises here); paper's queued journal sends an exit or stop whatever
         happens to its row, and an unwritten row is an incident (paper.queued, QA P1-L5). With
         maker_wait_minutes set, signal-driven orders rest as post-only limits first. An order that would open or
-        add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent."""
+        add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent. reservation: the
+        paper portfolio gate's, journaled with the order (_send_entry)."""
         if (why := self._gated(side, intent)) is not None:
             self.runtime.refused(why, f"{intent} {side.name.lower()} {qty} would open or add to the position")
             return False
@@ -3154,8 +3262,17 @@ class LongFlatStrategy(Strategy):
         reduce = self._margin and intent not in OPENING_INTENTS
         if maker:
             px = Price(self._maker_price(side, last, tick), self.instrument.price_precision)
+            tif, expires = TimeInForce.GTC, None
+            if intent in OPENING_INTENTS and not self._backtest and self._deciding is not None:
+                tif, expires, note = self._resting_entry_terms()
+                if expires is not None:
+                    signal["expires"] = expires.isoformat()
+                if note is not None:
+                    signal["resting_note"] = note
+                    self._note("resting_entry_no_gtd", note, level="info")
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
-                                             price=px, time_in_force=TimeInForce.GTC, post_only=True,
+                                             price=px, time_in_force=tif, post_only=True,
+                                             expire_time=None if expires is None else _ns(expires),
                                              reduce_only=reduce)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
         else:
@@ -3185,7 +3302,8 @@ class LongFlatStrategy(Strategy):
             timing = {"bar_close": bar_close, "bar_recv": bar_recv, "decided": decided} if bar_close else None
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
-                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing)
+                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing,
+                                  **({"reservation": reservation} if reservation is not None else {}))
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}
@@ -3429,6 +3547,64 @@ class LongFlatStrategy(Strategy):
         denom = self._cfg.perp.maintenance_margin * abs(qty) - qty
         moved = liq + self._liq_funded / denom if denom else liq
         return moved if moved > 0 else None
+
+    def _capped_stop(self, frac: float | None) -> tuple[float | None, float | None]:
+        """The stop a margin position may hold for `frac` (a share of the entry, as _stop_frac), and the liquidation
+        price it was held against (None when nothing caps it). The half-liquidation rule is a standing cap for the
+        life of the position, not an entry check (Independent Quant Advisor 17:10 UK, 13 Oct, STOP-LOOSEN-1): the stop
+        sits no further than the profile's share (half) of the way from the entry to the CURRENT liquidation price
+        (_liq_now). A tighter stop is returned as it is; a looser one is clamped, never flattened. Once funding has
+        carried the liquidation price past the entry, the way is measured from the last close instead. A restart's
+        safety stop is left as set: it has its own rule, measured over the REMAINING way from the mark at the profile's
+        share or half, whichever is tighter (_place_safety_stop), until the model's own stop is set again."""
+        if frac is None or not self._margin or not self._entry_px or self._safety_stop:
+            return frac, None
+        _, cash, qty, _ = self._mark()
+        liq = self._liq_now(cash, qty) if qty else None
+        if liq is None:
+            return frac, None
+        side = self._entry_side or 1
+        ref = self._entry_px if (self._entry_px - liq) * side > 0 else self._last_close
+        if not ref or (ref - liq) * side <= 0:
+            return frac, None  # the price is through it: the liquidation guard closes the position
+        share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+        cap = side * (1 - (ref - side * share * abs(ref - liq)) / self._entry_px)
+        if frac <= cap or math.isclose(frac, cap, rel_tol=1e-12, abs_tol=1e-15):
+            return frac, None
+        return cap, liq
+
+    def _hold_stop_capped(self, asked: float) -> bool:
+        """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when
+        it changes the stop held, so a stop already at the cap writes nothing more, and alerts once per position. True
+        when the stop held changed."""
+        held, liq = self._capped_stop(asked)
+        if held == self._stop_frac:
+            return False
+        self._stop_frac = held
+        if liq is not None:
+            self._stop_clamped(asked, held, liq)
+        return True
+
+    def _fill_stop(self) -> float | None:
+        """The stop after an opening fill, as a share of the (re-averaged) entry: the plan's share, which follows the
+        average entry by definition. Rules override it to keep their level where it is (STOP-AVG-1)."""
+        return self._stop_frac
+
+    def _stop_clamped(self, asked: float, held: float, liq: float) -> None:
+        side = self._entry_side or 1
+        level, at = (self._entry_px * (1 - side * f) for f in (asked, held))
+        why = (f"Stop held at {at:,.6g}, not {level:,.6g}: no further than half the way to the liquidation price "
+               f"{liq:,.6g} (the {_side_word(side)} position's isolated margin)")
+        first = not self._stop_capped
+        if first:
+            self._stop_capped = True
+            self.stops_clamped += 1
+        if self.runtime is not None:
+            if first:  # once per position: a stop on a slow average would otherwise alert every candle
+                self.runtime.store.event(self.runtime.name, "warning", "stop_clamped_liquidation",
+                                         why + ". Its later clamps are journaled as info.", ts=self.runtime.now())
+            else:
+                self.runtime.store.event(self.runtime.name, "info", "stop_clamped", why, ts=self.runtime.now())
 
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
@@ -5075,6 +5251,8 @@ class LongFlatStrategy(Strategy):
                                              f"the journal keeps its entry of {self._restore['entry']:,.6g}",
                                              ts=self.runtime.now())
                 self._restore = self._restore_id = None
+                if self._stop_frac is not None:  # the restored stop, held inside the cap from the first price on
+                    self._hold_stop_capped(self._stop_frac)
             return
         if self._restored is not None:
             self._restored_rounding(1 if event.is_buy else -1, event.last_qty.as_double(), event.last_px.as_double())
@@ -5131,6 +5309,10 @@ class LongFlatStrategy(Strategy):
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
                 self._set_liq(journal_id, intrabar[0] if intrabar is not None else event.ts_event)
+                # The fill re-averaged the entry and fixed its liquidation price: the stop as a share of that entry,
+                # held inside the cap, in paper as in a backtest (STOP-AVG-1, STOP-LOOSEN-1).
+                if (stop := self._fill_stop()) is not None:
+                    self._hold_stop_capped(stop)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
@@ -5238,7 +5420,7 @@ class LongFlatStrategy(Strategy):
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
             self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = None
-            self._liq_funded = 0.0
+            self._liq_funded, self._stop_capped = 0.0, False
             self._funding_skip = None
             self._replan_pending = self._plan_entry = None
             return False
