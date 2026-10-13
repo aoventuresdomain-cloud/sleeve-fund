@@ -1431,6 +1431,13 @@ class Store:
         """The position the journal's fills add up to (the figure the flatten and archive checks read)."""
         return Decimal(self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)["qty"])
 
+    def lifecycle_flat(self, sleeve: str) -> tuple[Decimal, bool]:
+        """(the position the journal holds, whether the lifecycle counts it flat): none, or dust too small for any
+        venue to take an order for (is_dust, as a reset judges it). The engine reads below its smallest order as flat,
+        so a remainder no flatten can close must never keep a strategy from retiring (HoQA P26-1)."""
+        book = self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)
+        return Decimal(book["qty"]), abs(book["qty"]) <= 1e-12 or is_dust(book)
+
     def lifecycle_holds(self, sleeve: str) -> tuple[list[timedelta], list[timedelta], str]:
         """The holding times a wind-down's deadline is set from, as (backtest, paper, where from). Paper: the
         strategy's own closed round trips in the journal. Backtest: none yet, as no saved backtest is linked to the
@@ -1454,8 +1461,7 @@ class Store:
             raise ValueError("a saved backtest has no lifecycle")
         now = now or utcnow()
         s = self.sleeve(sleeve)
-        held = self.held_qty(sleeve)
-        flat = abs(held) <= Decimal("1e-12")
+        held, flat = self.lifecycle_flat(sleeve)
         started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
         if action == "wind_down":
             to = lifecycle.move(s.lifecycle, lifecycle.WINDING_DOWN, actor, flat=flat)
@@ -1484,12 +1490,12 @@ class Store:
         return self.sleeve(sleeve)
 
     def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
-        """Retire a winding-down strategy once the journal shows it flat: the end of the PM's own wind-down, never a
+        """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
         new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
         deadline or close_now, for the journal's words."""
         now = now or utcnow()
         s = self.sleeve(sleeve)
-        if s.lifecycle != lifecycle.WINDING_DOWN or abs(self.held_qty(sleeve)) > Decimal("1e-12"):
+        if s.lifecycle != lifecycle.WINDING_DOWN or not self.lifecycle_flat(sleeve)[1]:
             return False
         text = lifecycle.retired_words(how)
         with self.engine.begin() as c:

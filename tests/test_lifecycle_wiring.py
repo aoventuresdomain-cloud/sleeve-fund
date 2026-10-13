@@ -116,7 +116,7 @@ def test_close_now_on_a_holder_winds_it_down_with_its_deadline_now(store):
     _hold(store)
     s = store.set_lifecycle("s1", "close_now", "pm", "get out", now=T0)
     assert (s.lifecycle, s.wind_down_started, s.wind_down_deadline) == ("winding_down", T0, T0)
-    assert "flattened at the next bar close" in store.last_event("s1", ("lifecycle",))["message"]
+    assert "flattened at market on the first fresh price" in store.last_event("s1", ("lifecycle",))["message"]
 
 
 def test_close_now_while_winding_down_keeps_the_start_and_moves_the_deadline_to_now(store):
@@ -289,6 +289,89 @@ def test_a_stale_feed_past_the_deadline_is_flattened_by_the_tick(store):
     assert rt.tick(**held) is None  # a bar later, not every tick
     t[0] += timedelta(hours=1, minutes=5)
     assert rt.tick(**held) == "flatten"
+
+
+HELD = {"equity": 10_000, "cash": 7_000, "qty": 0.05, "price": 60_000}
+
+
+@pytest.mark.parametrize("winding", [False, True], ids=["from-active", "from-winding-down"])
+def test_p26_2_close_now_flattens_at_market_on_the_first_fresh_tick_from_either_state(store, winding):
+    """P26-2 (Advisor 13 Oct 20:30 UK, MUST): the first fresh tick after the PM's close now sends the flatten, not
+    the next bar close; from winding down the deadline only moves, so this process must see that move itself."""
+    _sleeve(store)
+    _hold(store)
+    if winding:
+        store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0 - timedelta(days=1))
+    t = [T0 - timedelta(minutes=30)]
+    rt = _runtime(store, t)
+    rt.holds.pop("stale_data", None)  # prices are arriving
+    rt.lifecycle_due(t[0], flat=False, busy=False)  # the last bar close before the PM's move
+    assert rt.tick(**HELD) is None
+    store.set_lifecycle("s1", "close_now", "pm", "out", now=T0)
+    t[0] = T0 + timedelta(seconds=5)
+    assert rt.tick(**HELD) == "flatten" and rt.flatten_why == (WIND_FLATTEN, rt.flatten_why[1])
+    assert "Close now by the PM" in rt.flatten_why[1]
+    t[0] += timedelta(seconds=5)
+    assert rt.tick(**HELD) is None  # once: a bar close resends it while it still holds (the deadline's retry)
+
+
+def test_p26_2_on_stale_data_close_now_waits_for_a_fresh_tick_and_says_so_once_after_a_bar(store):
+    _sleeve(store)
+    _hold(store)
+    t = [T0 - timedelta(minutes=30)]
+    rt = _runtime(store, t)
+    rt.holds["stale_data"] = "last price 600 s old"
+    store.set_lifecycle("s1", "close_now", "pm", "out", now=T0)
+    for minutes in (1, 30, 61):  # within a bar and its grace: waits, quietly
+        t[0] = T0 + timedelta(minutes=minutes)
+        assert rt.tick(**HELD) is None
+    assert "close_now_waiting" not in _kinds(store)
+    for minutes in (63, 64):
+        t[0] = T0 + timedelta(minutes=minutes)
+        assert rt.tick(**HELD) is None
+    assert _kinds(store).count("close_now_waiting") == 1
+    rt.holds.pop("stale_data")  # a fresh price
+    t[0] += timedelta(seconds=5)
+    assert rt.tick(**HELD) == "flatten" and "Close now by the PM" in rt.flatten_why[1]
+
+
+def _dust(store):
+    """Held 0.05, sold 0.04999999: 1e-8 left, worth 0.0006, below every venue's smallest order."""
+    _hold(store)
+    _close(store, qty=0.04999999, at=T0 - timedelta(hours=1))
+
+
+def test_p26_1_dust_counts_as_flat_for_the_pms_retire_and_close_now(store):
+    """P26-1 (HoQA MUST FIX): the engine reads below its smallest order as flat, and so does the lifecycle (is_dust,
+    as a reset): dust no order can close never blocks a retire."""
+    _sleeve(store)
+    _dust(store)
+    assert store.set_lifecycle("s1", "retire", "pm", "done", now=T0).lifecycle == "retired"
+    _sleeve(store, "s2")
+    store.record_fill("s2", side="BUY", qty=0.05, price=60_000, fee=1.0, order_id="o1", trade_id="t1",
+                      ts=T0 - timedelta(days=2))
+    store.record_fill("s2", side="SELL", qty=0.04999999, price=61_000, fee=1.0, order_id="o2", trade_id="t2",
+                      ts=T0 - timedelta(hours=1))
+    assert store.set_lifecycle("s2", "close_now", "pm", "out", now=T0).lifecycle == "retired"
+
+
+def test_p26_1_a_wind_down_whose_flatten_leaves_dust_is_retired_once_and_worth_an_order_is_never_dust(store):
+    _sleeve(store)
+    _hold(store)
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0)
+    _close(store, qty=0.04999999, at=T0 + timedelta(days=3))  # the deadline's flatten, rounded down to the lot
+    t = [T0 + timedelta(days=3, hours=1)]
+    rt = _runtime(store, t)
+    rt.lifecycle_due(t[0], flat=True, busy=False)
+    assert store.sleeve("s1").lifecycle == "retired"
+    assert store.complete_retire("s1", t[0]) is False  # once
+    _sleeve(store, "s2")
+    store.record_fill("s2", side="BUY", qty=0.0001, price=60_000, fee=1.0, order_id="o1", trade_id="t1",
+                      ts=T0 - timedelta(days=2))  # 6.00: above the dust line, still a holding
+    with pytest.raises(lifecycle.LifecycleError):
+        store.set_lifecycle("s2", "retire", "pm", "r", now=T0)
+    store.set_lifecycle("s2", "wind_down", "pm", "r", now=T0)
+    assert store.complete_retire("s2", T0 + timedelta(days=4)) is False
 
 
 def test_a_backtest_has_no_pm_so_its_lifecycle_never_acts():

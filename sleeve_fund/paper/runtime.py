@@ -448,6 +448,10 @@ class SleeveRuntime:
         self._wind_noticed = self._journaled_since(WIND_NOTICE)
         self._wind_flattens = 0  # deadline flattens sent this process, for the retry alert
         self._wind_checked: datetime | None = None  # the last bar close lifecycle_due ran at
+        # P26-2: when this process saw the PM's close now while the strategy held, until its flatten goes (on the
+        # first fresh tick) or it is flat; and whether the stale feed's wait for that tick has been alerted.
+        self._close_now_at: datetime | None = None
+        self._close_now_alerted = False
         self._block = open_block(store, sleeve_name)  # the block episode open in the journal, by its reason
         # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
         # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
@@ -578,10 +582,18 @@ class SleeveRuntime:
             return
         sleeve = self.store.sleeve(self.name)
         moved = (sleeve.lifecycle, sleeve.wind_down_started) != (self.lifecycle, self.wind_started)
+        # The PM's close now, from active or winding down (where only the deadline moves, to the moment it was
+        # pressed): its flatten goes on the first fresh tick, not at the next bar close (Advisor 13 Oct 20:30 UK).
+        closed_now = (sleeve.lifecycle == lifecycle.WINDING_DOWN and sleeve.wind_down_deadline is not None
+                      and sleeve.wind_down_deadline != self.wind_deadline and sleeve.wind_down_deadline <= self.now())
         self.lifecycle, self.wind_started, self.wind_deadline = (sleeve.lifecycle, sleeve.wind_down_started,
                                                                  sleeve.wind_down_deadline)
         if moved:
             self.wind_stop, self.wind_stop_interim, self._wind_noticed, self._wind_flattens = None, False, None, 0
+        if closed_now:
+            self._close_now_at, self._close_now_alerted = self.now(), False
+        elif self.lifecycle != lifecycle.WINDING_DOWN:
+            self._close_now_at = None
 
     def place_wind_stop(self, side: int, price: float, atr: float, *, stop_atr: float | None,
                         liquidation: float | None, note: str = "") -> float:
@@ -633,10 +645,12 @@ class SleeveRuntime:
         side, level = self.wind_stop
         return price <= level if side > 0 else price >= level
 
-    def lifecycle_due(self, now: datetime, *, flat: bool, busy: bool) -> tuple[str, str] | None:
+    def lifecycle_due(self, now: datetime, *, flat: bool, busy: bool,
+                      reason: str | None = None) -> tuple[str, str] | None:
         """P2-6 at a bar close (lifecycle.due): the 75% notice, retire once flat, or the deadline's flatten as
         (intent, reason) for the engine to send through its exit path, on stale data too and again each bar until
-        flat. None when there is nothing to send."""
+        flat. None when there is nothing to send. reason: the flatten's words when it isn't the deadline's (close
+        now's)."""
         if self.lifecycle != lifecycle.WINDING_DOWN:  # a research backtest's is always active: it has no PM
             return None
         self._wind_checked = now
@@ -662,10 +676,32 @@ class SleeveRuntime:
                                  f"({lifecycle.stamp(self.wind_deadline)}); it is sent again at each bar close until "
                                  "the strategy is flat.", ts=now)
             self._wind_flattens += 1
-            reason = f"Wind-down deadline {lifecycle.stamp(self.wind_deadline)} reached: flattened"
+            reason = reason or f"Wind-down deadline {lifecycle.stamp(self.wind_deadline)} reached: flattened"
             self.store.decide("system", "flatten", reason, self.name, ts=now)
             return WIND_FLATTEN, reason
         return None
+
+    def _close_now_tick(self, now: datetime, qty: float, busy: bool) -> bool:
+        """P26-2 (Advisor 13 Oct 20:30 UK): the PM's close now flattens at market on the first fresh tick after it,
+        from active and from winding down alike; the strategy's own stops stay until the flatten fills. On stale data
+        it waits for a fresh tick, and says so once if none has come a bar plus WIND_GRACE after the close now. True
+        when the flatten is to go now (flatten_why set)."""
+        if "stale_data" in self.holds:
+            if not self._close_now_alerted and now - self._close_now_at > self.bar_length + WIND_GRACE:
+                self._close_now_alerted = True
+                self.store.event(self.name, "error", "close_now_waiting",
+                                 f"Close now has not flattened yet: no fresh price since "
+                                 f"{lifecycle.stamp(self._close_now_at)} ({self.holds['stale_data']}). It is sent at "
+                                 "market on the first fresh price; the strategy's own stops stay meanwhile.", ts=now)
+            return False
+        why = self.lifecycle_due(now, flat=abs(qty) < max(self.close_floor, 1e-12), busy=busy,
+                                 reason="Close now by the PM: flattened at market on the first fresh price")
+        if why is not None or self.lifecycle != lifecycle.WINDING_DOWN:
+            self._close_now_at = None  # sent (a bar close resends it while it still holds), or retired once flat
+        if why is None:
+            return False
+        self.flatten_why = why
+        return True
 
     def wind_down_overdue(self, now: datetime) -> bool:
         """Paper: past the deadline with no bar close for over a bar (a stale feed), so the tick flattens instead."""
@@ -1031,7 +1067,9 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "flatten_failed",
                                  f"still holding {qty:.12g} after {FLATTEN_RETRIES} attempts to close it; the PM must "
                                  f"flatten it ({self._owed_flatten[1]})", ts=self.now())
-        if not flatten and self.wind_down_overdue(now):
+        if not flatten and self._close_now_at is not None:
+            flatten = self._close_now_tick(now, qty, busy)
+        if not flatten and self._close_now_at is None and self.wind_down_overdue(now):
             # P2-6: the deadline passed and no bar has closed for over a bar (a stale feed): the flatten that the bar
             # close would have sent goes from the tick, and again a bar later while still holding (Advisor 14:55).
             why = self.lifecycle_due(now, flat=abs(qty) < max(self.close_floor, 1e-12), busy=busy)
