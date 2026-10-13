@@ -31,14 +31,14 @@ MINUTE_NS = 60_000_000_000
 REFRESH_SECONDS = 60  # how often the relay picks up instruments asked for since it started
 VENUE_QUIET_SECONDS = 60  # no trade or quote for this long: the heartbeat says the venue is down
 BAR_GRACE_SECONDS = 2  # a minute's bar is built this long after the minute ends; a trade later than that is late
+HOUR_NS = 3_600_000_000_000
+LATE_KEEP_HOURS = 7 * 24  # hourly late-count buckets kept; the parity report reads the latest 24 h of up-time
 
 
 def late_since_path(late_path):
-    """Beside the late-trade counts: {pair: [ns the hub began counting them, ns of this write, ns counted, grace s]}
-    (HUB-LATE-01, HUB-LATE-PERSIST). The second is when the counts were last brought up to date, so a report read after
-    the hub stopped doesn't count the time since as covered; the third is the time the hub was running while it counted
-    them, summed over its restarts, so the time it was down isn't counted as covered either; the fourth is the grace the
-    counts were taken under."""
+    """Beside the late-trade counts, as #239's hub wrote them: {pair: [ns it began counting, ns of its last write]}.
+    The hub now keeps the window in the counts' own file (HUB-LATE-PERSIST) and removes this one; the parity report
+    still reads it beside counts in the older shape."""
     return late_path.with_name(late_path.stem + "-since.json")
 
 
@@ -173,14 +173,15 @@ class HubRelay(DataActor):
         self._store = ThreadPoolExecutor(1, thread_name_prefix="hub-store")
         self._initial = tuple(config.instrument_ids)
         self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
-        # Per instrument, [trades that arrived after their minute's bar was built, all trades], written to
-        # late_path every REFRESH_SECONDS as {pair: [late, total]} for the parity report (scripts/hub_parity.py).
-        # These are this run's; the file carries on from what earlier runs wrote (HUB-LATE-PERSIST: every deploy
-        # restarts the hub, so counts that started afresh would rarely reach the report's 24 h). Beside them goes
-        # when each began counting and how long the hub ran while it did: the report then says what they cover.
-        self.late: dict[str, list[int]] = {}
+        # Per instrument and hour (its start, by the hub's clock), [trades that arrived after their minute's bar was
+        # built, all trades] this run. Written to late_path every REFRESH_SECONDS, in one file, as {pair: {"grace":
+        # BAR_GRACE_SECONDS, "last": ns of the write, "hours": {hour ns: [late, total, ns the hub ran in it]}}}, for
+        # the parity report (scripts/hub_parity.py), which reads the latest 24 h of up-time per instrument. The file
+        # carries on from what earlier runs wrote (HUB-LATE-PERSIST: every deploy restarts the hub, so counts that
+        # began afresh would rarely reach 24 h); hours the hub was down count no up-time. Kept LATE_KEEP_HOURS.
+        self.late: dict[str, dict[int, list[int]]] = {}
         self.late_path = None
-        self._carried: dict[str, tuple[list[int], list[int]]] | None = None  # earlier runs': read at the first write
+        self._carried: dict[str, dict] | None = None  # what earlier runs wrote: read once, at the first write
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
                last_close: dict[str, int] | None = None, discover=None, late_path=None) -> "HubRelay":
@@ -252,23 +253,21 @@ class HubRelay(DataActor):
             if inst is not None:  # sent to each client on connecting, so paper needs no venue connection of its own
                 self.definitions[iid] = inst.to_dict()
 
-    def _load_late(self) -> dict[str, tuple[list[int], list[int]]]:
-        """Per pair, what earlier runs of the hub counted: ([late, total], [began, last write, ns counted, grace s]).
-        Counts taken under another grace, or written before the hub kept the time it counted (an older file), are
-        left behind: the counts start afresh (HUB-LATE-PERSIST)."""
+    def _load_late(self) -> dict[str, dict]:
+        """Per pair, the hourly late counts earlier runs of the hub wrote ({"last": ns, "hours": {hour ns: [late,
+        total, up ns]}}). Counts taken under another grace, in the older shape (no up-time) or unreadable start afresh
+        (HUB-LATE-PERSIST)."""
         try:
-            counts = json.loads(self.late_path.read_text()) if self.late_path.exists() else {}
-            since_path = late_since_path(self.late_path)
-            windows = json.loads(since_path.read_text()) if since_path.exists() else {}
-        except (OSError, ValueError) as exc:
+            kept = json.loads(self.late_path.read_text()) if self.late_path.exists() else {}
+            out = {}
+            for pair, e in kept.items():
+                if isinstance(e, dict) and e.get("grace") == BAR_GRACE_SECONDS:
+                    out[pair] = {"last": int(e["last"]),
+                                 "hours": {int(h): [int(x) for x in v] for h, v in e["hours"].items()}}
+            return out
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             self.log.warning(f"hub: can't read the late counts kept, counting afresh: {exc}")
             return {}
-        out = {}
-        for pair, n in counts.items():
-            w = windows.get(pair)
-            if isinstance(w, list) and len(w) == 4 and w[3] == BAR_GRACE_SECONDS and len(n) == 2:
-                out[pair] = ([int(n[0]), int(n[1])], [int(x) for x in w])
-        return out
 
     def _write_late(self) -> None:
         if self.late_path is None:
@@ -276,33 +275,43 @@ class HubRelay(DataActor):
         if self._carried is None:  # before the first write replaces them
             self._carried = self._load_late()
         now = time.time_ns()
-        counts = {pair: list(n) for pair, (n, _) in self._carried.items()}
-        since = {pair: list(w) for pair, (_, w) in self._carried.items()}
-        for iid, (late, total) in self.late.items():
+        keep = (now // HOUR_NS - LATE_KEEP_HOURS) * HOUR_NS
+        out = {pair: {"last": e["last"], "hours": {h: list(v) for h, v in e["hours"].items()}}
+               for pair, e in self._carried.items()}
+        for iid, since in self._since.items():
             pair = self.pairs.get(iid, iid)
-            (n0, n1), w = self._carried.get(pair, ([0, 0], None))
-            counts[pair] = [n0 + late, n1 + total]
-            if iid in self._since:
-                began, counted = (self._since[iid], 0) if w is None else (w[0], w[2])
-                since[pair] = [began, now, counted + max(now - self._since[iid], 0), BAR_GRACE_SECONDS]
-        for path, data in ((late_since_path(self.late_path), since), (self.late_path, counts)):
-            try:
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data))
-                tmp.replace(path)
-            except OSError as exc:
-                self.log.warning(f"hub: can't write {path}: {exc}")
+            if iid not in self.late and pair not in out:
+                continue  # nothing counted for it yet, by this run or an earlier one
+            e = out.setdefault(pair, {"last": now, "hours": {}})
+            e["last"] = now
+            for h in range(max(since, keep) // HOUR_NS * HOUR_NS, now, HOUR_NS):  # this run's up-time, by hour
+                e["hours"].setdefault(h, [0, 0, 0])[2] += min(now, h + HOUR_NS) - max(since, h)
+            for h, (late, total) in self.late.get(iid, {}).items():
+                b = e["hours"].setdefault(h, [0, 0, 0])
+                b[0], b[1] = b[0] + late, b[1] + total
+        data = {pair: {"grace": BAR_GRACE_SECONDS, "last": e["last"],
+                       "hours": {str(h): v for h, v in sorted(e["hours"].items()) if h >= keep}}
+                for pair, e in out.items()}
+        try:
+            tmp = self.late_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(self.late_path)  # one file, replaced whole: the counts and their up-time never disagree
+            late_since_path(self.late_path).unlink(missing_ok=True)  # #239's window file: now in the counts' own
+        except OSError as exc:
+            self.log.warning(f"hub: can't write {self.late_path}: {exc}")
 
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
         iid = str(tick.instrument_id)
-        n = self.late.setdefault(iid, [0, 0])
+        now = time.time_ns()
+        self._since.setdefault(iid, now)  # counted from its first trade if its subscription went unrecorded
+        n = self.late.setdefault(iid, {}).setdefault(now // HOUR_NS * HOUR_NS, [0, 0])
         late = tick.ts_event < self.gaps.last.get(iid, 0)  # its minute's bar already built: never put in a later one
         if not late:
             late = not self.minutes.add(iid, tick.ts_event, tick.price, tick.size)
         n[0] += late
         n[1] += 1
-        self.fanout.publish(protocol.trade(tick, time.time_ns()))
+        self.fanout.publish(protocol.trade(tick, now))
 
     def on_quote(self, tick) -> None:
         self._last_tick = time.time()

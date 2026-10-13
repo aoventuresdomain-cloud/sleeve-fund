@@ -3,8 +3,10 @@
     python scripts/hub_parity.py --venue binance --hours 24
     python scripts/hub_parity.py --venue binance --pair BTC/USDT --late late.json --out /path/report.md
 
-Without --pair, every instrument the store holds for the venue. --late is the hub's late-trade counts,
-{"BTC/USDT": [late, total], ...}; by default the file the hub keeps beside the store. Reads the store and the venue's public candles; writes only the report.
+Without --pair, every instrument the store holds for the venue. --late is the hub's late-trade counts, hourly with
+the hub's up-time (relay.HubRelay.late; the report reads the latest 24 h of up-time), or {"BTC/USDT": [late, total],
+...} as older hubs wrote them; by default the file the hub keeps beside the store. Reads the store and the venue's
+public candles; writes only the report.
 --sample N also prints N of the hub bars the CANON backfill replaced, per instrument, with both values and the bar
 stored now (a read-only spot-check of the provenance log); exit 1 if any no longer holds the venue's bar.
 Exit 0 when every instrument matches, 1 when any differs.

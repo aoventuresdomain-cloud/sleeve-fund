@@ -263,7 +263,11 @@ def test_trades_arriving_after_their_minutes_bar_are_counted_for_the_parity_repo
     r.on_trade(trade(T0 - 2))  # in the minute just built: late
     r.on_trade(trade(T0 + 1))
     r._write_late()
-    assert json.loads(r.late_path.read_text()) == {"BTC/USDT": [1, 3]}
+    from types import SimpleNamespace
+
+    from sleeve_fund.parity import late_counts
+
+    assert late_counts(SimpleNamespace(root=tmp_path), "BINANCE") == {"BTC/USDT": (1, 3)}
 
 
 def test_a_refill_is_followed_by_filled_whatever_it_found_so_a_client_holding_the_live_bar_stops_waiting():

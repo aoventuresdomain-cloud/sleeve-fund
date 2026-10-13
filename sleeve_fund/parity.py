@@ -220,38 +220,62 @@ def markdown_sample(pair: str, rows: list[dict], total: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def late_counts(store, venue_name: str, path=None) -> dict | None:
-    """The hub's late-trade counts, {pair: (late, total)}: from `path` if given, else from the file the hub keeps
-    beside the store (<store root>/hub-late-<VENUE>.json), so the report shows the rate without being asked
-    (spec P1-1). None when neither exists."""
+def _late_file(store, venue_name: str, path=None) -> dict | None:
     import json
     from pathlib import Path
 
     path = Path(path) if path is not None else store.root / f"hub-late-{venue_name}.json"
-    if not path.exists():
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _latest_day(entry: dict) -> tuple[int, int, int, int, int]:
+    """From the hub's hourly late counts for one instrument (relay.HubRelay.late), the latest LATE_PROVEN_HOURS of
+    up-time, newest hour first: (late, total, ns counting began, ns of the last write, ns of up-time). One hour more
+    or less than the day, as the hours fall; less than the day when the hub hasn't run that long (HUB-LATE-PERSIST:
+    the Advisor's rule is per instrument over 24 h, so an older stretch never dilutes a recent rise)."""
+    late = total = up = 0
+    began = int(entry["last"])
+    for h, (n_late, n_total, n_up) in sorted(((int(h), v) for h, v in entry["hours"].items()), reverse=True):
+        if up >= LATE_PROVEN_HOURS * 3_600_000_000_000:
+            break
+        late, total, up, began = late + n_late, total + n_total, up + n_up, h
+    return late, total, began, int(entry["last"]), up
+
+
+def late_counts(store, venue_name: str, path=None) -> dict | None:
+    """The hub's late-trade counts, {pair: (late, total)}, over the latest 24 h it ran (_latest_day; a file in the
+    older {pair: [late, total]} shape as it stands): from `path` if given, else from the file the hub keeps beside the
+    store (<store root>/hub-late-<VENUE>.json), so the report shows the rate without being asked (spec P1-1). None
+    when neither exists."""
+    kept = _late_file(store, venue_name, path)
+    if kept is None:
         return None
-    return {k: tuple(v) for k, v in json.loads(path.read_text()).items()}
+    return {k: _latest_day(v)[:2] if isinstance(v, dict) else tuple(v) for k, v in kept.items()}
 
 
 def late_since(store, venue_name: str, path=None) -> dict:
     """When the hub began counting each instrument's late trades, when it last wrote them and how long it ran while it
-    counted them, {pair: (UTC timestamp, UTC timestamp or None, Timedelta or None)}: the file beside the counts
-    (relay.late_since_path; a file with the start alone, as first written, has no last write, and one from before
-    HUB-LATE-PERSIST no time counted). Empty when the hub doesn't write it, so every share reads as not proven."""
+    counted them, {pair: (UTC timestamp, UTC timestamp or None, Timedelta or None)}: from the counts' own file
+    (_latest_day), or for counts in the older shape the file beside them (relay.late_since_path: a start alone, as
+    first written, has no last write, and neither says how long the hub ran). Empty when the hub doesn't say, so
+    every share reads as not proven."""
     import json
     from pathlib import Path
 
     from sleeve_fund.hub.relay import late_since_path
 
+    def ts(ns):
+        return pd.Timestamp(int(ns), unit="ns", tz="UTC")
+
+    kept = _late_file(store, venue_name, path) or {}
+    out = {k: (ts(began), ts(last), pd.Timedelta(int(up), unit="ns"))
+           for k, v in kept.items() if isinstance(v, dict) for _, _, began, last, up in [_latest_day(v)]}
     path = late_since_path(Path(path) if path is not None else store.root / f"hub-late-{venue_name}.json")
-    if not path.exists():
-        return {}
-    out = {}
+    if out or not path.exists():
+        return out
     for k, v in json.loads(path.read_text()).items():
-        since, until, counted = (v, None, None) if isinstance(v, int) else (*v, None, None)[:3]
-        out[k] = (pd.Timestamp(int(since), unit="ns", tz="UTC"),
-                  None if until is None else pd.Timestamp(int(until), unit="ns", tz="UTC"),
-                  None if counted is None else pd.Timedelta(int(counted), unit="ns"))
+        since, until = (v, None) if isinstance(v, int) else v[:2]
+        out[k] = (ts(since), None if until is None else ts(until), None)
     return out
 
 
