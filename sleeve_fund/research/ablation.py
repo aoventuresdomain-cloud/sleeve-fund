@@ -448,6 +448,7 @@ def one_x_runtime(instrument, bar_minutes: int, starting_capital: float, risk_pr
     rt = SleeveRuntime.for_backtest(strategy="rules", instrument=pair_of(instrument), bar_spec=spec,
                                     starting_balance=starting_capital, risk_profile=risk_profile, params=params,
                                     bar_seconds=bar_minutes * 60)
-    rt.profile = dataclasses.replace(rt.profile, max_leverage=1.0, max_drawdown=math.inf, daily_loss=math.inf)
+    rt.profile = dataclasses.replace(rt.profile, max_leverage=1.0)
     rt.cap = risk.position_cap(rt.profile, params)
+    rt.halts = False  # an explicit switch, so no halt or pause level is ever priced (CR F235-5)
     return rt
