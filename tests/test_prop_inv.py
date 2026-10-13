@@ -7,11 +7,11 @@ store, eight hours after the step before and starting ten minutes before a fundi
 UTC), so a perp holding a position pays funding in it. The runtime stops and a new one starts on the same journal, so
 each step after the first is a restart.
 
-Invariants on 1709cd9 (design items 1-5; 6-8 switch on with CASH-ONE-PATH, NIGHTLY-RECON and DA-9):
+Every run trades in QUOTE, the 8-dp currency paper and live accounts settle in (DA 13 Oct). Invariants (design items
+1-6 and 8; 7 switches on with NIGHTLY-RECON):
   I1 equity = journal cash + position at the mark, at the last equity mark, and the mark's cash equals the journal's
-     cash at that time: under 1 cent, or until CASH-ONE-PATH under half a cent a fill (HALF_CENT_A_FILL, HoQA ruling
-     (a)): the engine books each fill's cash to the cent, the journal unrounded. The largest drift a run saw is
-     reported as a warning; test_prop_inv_i1_strict_on_the_soak_examples keeps the strict form (strict xfail)
+     cash at that time: under 1 cent (I1_STRICT). The half-a-cent-a-fill bound (HALF_CENT_A_FILL, HoQA ruling (a)) was
+     the 2-dp USD test account rounding a restart's balance to the cent; it stays only for a run switched back to it
   I2 position = signed sum of fills (exact, in Decimal) = the journal's position = the mark's position
   I3 every fill carries one fee (a number, >= 0) and no fill is booked twice (trade_id unique per strategy)
   I4 each funding settlement is charged at most once per strategy and kind, and its amount is the schedule's: the
@@ -25,16 +25,19 @@ Invariants on 1709cd9 (design items 1-5; 6-8 switch on with CASH-ONE-PATH, NIGHT
      time, with a price within SLIP and a qty to a cent of notional (B may skip an entry while it warms up again;
      after a restart the venue holds the position at the price it was put back at, not the journal's entry, so an
      entry can size a few lots apart); no fill is booked twice. When B skipped no entry, its final cash and position
-     (as notional) equal A's to the cent, cash before fees: each fee after k may be a cent apart until
-     CASH-ONE-PATH (R-I5-3, test_prop_inv_r_i5_3_fee_across_a_restart, strict xfail). Compared on money, quantity
+     (as notional) equal A's to the cent, fees included (FEE_STRICT; R-I5-3, the cent-apart fee, was the USD test
+     account's rounding: test_prop_inv_r_i5_3_fee_across_a_restart is green). Compared on money, quantity
      and status columns only (DA 20:35: no ids, created_at/updated_at, order_timings, heartbeats, feed_seen or event
      timestamps). Findings (HoQA 7 Oct): R-I5-1 MUST FIX, a restart after a stop loses the exit lock (strict xfail,
      ..._while_an_exit_lock_holds; the green property leaves the entries after k unchecked when the lock holds at k);
      R-I5-2 MUST FIX, a kill inside a candle loses that candle's exit (cells in test_r_i5_2_missed_candle.py; not
      drawn here); R-I5-3 FOLLOW-UP, the fee above.
+  I6 the one cash reader (strategy_cash_pnl, CASH-2) is the journal's cash change exactly, at the mark is the rows
+     stamped up to it, and its windows add up (_check_cash_reader)
+  I8 every cash figure the store reads back is a Decimal (journal cash, the cash reader, funding and insurance totals)
 
-Known failures (strict xfail, no shrinking in CI): the liquidation-gap runs (strict I1: cent drift, IR-1), the strict
-I1 on the nightly soak's two shrunk examples, R-I5-3, and R-I5-1 (more models in test_r_i5_1_exit_lock.py).
+Known failures: none. The liquidation-gap runs, the nightly soak's two shrunk examples and R-I5-3 went green when the
+runs moved to QUOTE (DA 13 Oct: all three were the USD test account's cent rounding, not the engine's).
 
 Hypothesis (pinned dev dependency, HoE 7 Oct): profile "ci" is derandomized with a bounded max_examples, so a PR run is
 reproducible; "nightly" draws fresh seeds. Select with HYPOTHESIS_PROFILE. A failure prints the shrunk step list.
