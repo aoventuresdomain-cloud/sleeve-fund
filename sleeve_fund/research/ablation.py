@@ -345,13 +345,25 @@ def section(report: AblationReport) -> list[str]:
     return out
 
 
-def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes: int, risk_profile: str | None = None,
-                       exec_prices: pd.DataFrame | None = None, half_spread=None, starting_capital: float = 10_000.0,
-                       params: dict | None = None) -> Evaluate:
+def _utc(x) -> pd.Timestamp:
+    """A time as UTC; a store's naive timestamps are UTC."""
+    t = pd.Timestamp(x)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
+def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes: int, holdout_start,
+                       risk_profile: str | None = None, exec_prices: pd.DataFrame | None = None, half_spread=None,
+                       starting_capital: float = 10_000.0, params: dict | None = None, locks=None,
+                       idea_hash: str | None = None) -> Evaluate:
     """evaluate(definition, one_x) over the out-of-sample windows [(start, end), ...]: each window runs on the bars
     up to its end, trading from its start (so the blocks warm up on the bars before it), as a study's test windows
     do. one_x runs with no risk profile, where the engine's leverage is 1x, for the stopless variants and the base
-    beside them."""
+    beside them.
+
+    An ablation never reads the held-back period, so it can't spend or stale the holdout the edge test is judged on
+    (CR pre-review, HoE 13 Oct): holdout_start is where the study's holdout begins (None only when the data keeps
+    none back), and no bar from it on is read; a window reaching it is refused. With locks and idea_hash, a window
+    overlapping a period this idea has already opened on the underlying is refused too. Nothing here opens a lock."""
     from sleeve_fund.research.metrics import (
         daily_returns,
         fills_to_rows,
@@ -360,6 +372,29 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
     )
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.strategies.definitions import to_params
+
+    if not windows:
+        raise ValueError("an ablation needs at least one out-of-sample window")
+    held = None if holdout_start is None else _utc(holdout_start)
+    locked = None
+    if locks is not None and idea_hash:
+        from sleeve_fund.research.holdout import underlying_of
+
+        row = locks.lock(idea_hash, underlying_of(str(instrument.id.symbol)))
+        if row is not None and row.get("period_start") is not None and row.get("period_end") is not None:
+            locked = (_utc(row["period_start"]), _utc(row["period_end"]))
+    for start, end in windows:
+        start, end = _utc(start), _utc(end)
+        if held is not None and end >= held:
+            raise ValueError(f"an ablation never reads the held-back period: the window to {end:%d %b %Y} reaches "
+                             f"the holdout from {held:%d %b %Y}")
+        if locked is not None and start <= locked[1] and end >= locked[0]:
+            raise ValueError(f"an ablation never reads the held-back period: the window {start:%d %b %Y} to "
+                             f"{end:%d %b %Y} overlaps this idea's opened holdout, {locked[0]:%d %b %Y} to "
+                             f"{locked[1]:%d %b %Y}")
+    if held is not None:
+        prices = prices[prices.index < held]
+        exec_prices = None if exec_prices is None else exec_prices[exec_prices.index < held]
 
     def evaluate(defn: dict, one_x: bool) -> Score:
         rets, held, bars, n = [], 0, 0, 0

@@ -204,14 +204,54 @@ def test_the_section_is_labelled_not_judged_and_the_results_page_reads_it_back()
 def test_on_real_backtests_the_report_runs_and_is_repeatable(prices, instrument):
     days = prices.index
     windows = [(days[400], days[599]), (days[600], days[799])]
-    evaluate = ablation.backtest_evaluator(prices.iloc[:800], instrument, windows, bar_minutes=1440, half_spread=0)
-    defn = {"version": 1, "reason": REASON, "blocks": {"rsi": {"kind": "rsi"}, "dc": {"kind": "donchian", "period": 20}},
-            "long": {"entry": {"all": [{"left": "rsi", "op": "<", "right": 45}, {"left": "close", "op": ">", "right": 0}]},
-                     "exit": {"left": "rsi", "op": ">=", "right": 55}},
-            "exits": {"stop": {"level": "dc.lower"}}}
+    evaluate = ablation.backtest_evaluator(prices, instrument, windows, bar_minutes=1440, half_spread=0,
+                                           holdout_start=days[800])
+    defn = REAL
     one, two = ablate(defn, evaluate), ablate(defn, evaluate)
     assert section(one) == section(two)
     assert one.base.score.trades > 0 and 0 < one.base.score.time_in_market < 1
     assert one.base.score.data_start == pd.Timestamp(days[400]).to_pydatetime()
     assert [r.path for r in one.rows if r.status == "ran"] == ["long.entry[0]", "long.entry[1]", "long.exit", "exits.stop"]
     assert one.base_1x is not None
+
+
+REAL = {"version": 1, "reason": REASON, "blocks": {"rsi": {"kind": "rsi"}, "dc": {"kind": "donchian", "period": 20}},
+        "long": {"entry": {"all": [{"left": "rsi", "op": "<", "right": 45}, {"left": "close", "op": ">", "right": 0}]},
+                 "exit": {"left": "rsi", "op": ">=", "right": 55}},
+        "exits": {"stop": {"level": "dc.lower"}}}
+
+
+def test_an_ablation_window_reaching_the_holdout_is_refused(prices, instrument):
+    days = prices.index
+    with pytest.raises(ValueError, match="never reads the held-back period"):
+        ablation.backtest_evaluator(prices, instrument, [(days[600], days[800])], bar_minutes=1440,
+                                    holdout_start=days[800])
+
+
+def test_an_ablation_reads_no_bar_of_the_holdout(prices, instrument):
+    """The held-back bars changed beyond recognition change nothing: they are never read."""
+    days = prices.index
+    windows = [(days[600], days[799])]
+    changed = prices.copy()
+    changed.loc[changed.index >= days[800], ["open", "high", "low", "close"]] *= 3
+    one = ablation.backtest_evaluator(prices, instrument, windows, bar_minutes=1440, half_spread=0,
+                                      holdout_start=days[800])(REAL, False)
+    two = ablation.backtest_evaluator(changed, instrument, windows, bar_minutes=1440, half_spread=0,
+                                      holdout_start=days[800])(REAL, False)
+    assert one == two
+
+
+def test_an_ablation_overlapping_an_opened_holdout_is_refused_and_opens_no_lock(prices, instrument, tmp_path):
+    from sleeve_fund.research.holdout import HoldoutLocks
+
+    days = prices.index
+    locks = HoldoutLocks(Store(f"sqlite:///{tmp_path}/t.db"))
+    assert locks.open("idea", "BTC", days[500], days[599])
+    before = locks.store.holdout_locks("idea")
+    with pytest.raises(ValueError, match="overlaps this idea's opened holdout"):
+        ablation.backtest_evaluator(prices, instrument, [(days[550], days[650])], bar_minutes=1440,
+                                    holdout_start=None, locks=locks, idea_hash="idea")
+    ablation.backtest_evaluator(prices, instrument, [(days[600], days[699])], bar_minutes=1440,
+                                holdout_start=None, locks=locks, idea_hash="idea")  # after it: fine
+    assert locks.store.holdout_locks("idea") == before
+    assert locks.store.holdout_locks() == before
