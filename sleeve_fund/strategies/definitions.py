@@ -162,9 +162,9 @@ def definition_hash(defn: dict, venue: str | None = None) -> str:
     running it on a venue whose day (and so its slower candles) starts away from 00:00 UTC (Advisor 6 Oct, 4.4)."""
     body = {k: v for k, v in defn.items() if k not in ("name", "reason")}
     if venue is not None:
-        from sleeve_fund.venues import VENUES
+        from sleeve_fund.venues import VENUES, base_venue
 
-        profile = VENUES.get(str(venue))
+        profile = VENUES.get(base_venue(venue))
         anchor = profile.daily_anchor_minutes if profile is not None else 0
         if anchor:  # a venue anchored at 00:00 UTC leaves the hash as it is without one
             body["daily_anchor_minutes"] = anchor
