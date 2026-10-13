@@ -148,6 +148,20 @@ def _x_y(reason):
     return (float(m.group(1).replace(",", "")), m.group(2) if m.group(3) else None) if m else (None, None)
 
 
+def test_an_over_cap_stop_restored_from_the_journal_is_clamped_at_the_first_price(monkeypatch):
+    """STOP-LOOSEN-1 on the restart path: a 2x long journaled with a 35% stop (past its 24.9% half-liquidation cap, as
+    only a position from before the cap could be) restarts 30% against. The restored stop is clamped to the cap at the
+    first price, which is already through it, so it stops out there (about 42,003) rather than riding to the gap and
+    liquidation; the clamp is journaled and alerted."""
+    run, _, _, _ = _l22_run(monkeypatch, 1, "balanced", 0.30, 0.55, 0.35, replayed=False)
+    closing = [o for o in run.orders if o["order_id"] != "O-held" and o["filled_qty"] > 0]
+    assert closing and closing[0]["intent"] == "stop_loss", [(o["intent"], o["reason"][:80]) for o in closing]
+    assert float(closing[0]["avg_px"]) == pytest.approx(42_003.0, abs=5.0)
+    assert not run.kinds("liquidation")
+    (alert,) = run.kinds("stop_clamped_liquidation")
+    assert alert["level"] == "warning"
+
+
 # PE2 (stop-safety, master a476a042): passes (mark removed)
 @pytest.mark.parametrize("side,profile", [("short", "balanced"), ("long", "aggressive")])
 def test_gap_liq_a_stop_gapped_through_liquidation_gives_x_and_y(tmp_path, side, profile):
@@ -231,8 +245,11 @@ L22_REPLAY = pytest.mark.xfail(strict=True, raises=AssertionError,
                                reason="L22: needs #146's NA-3 outage replay with the journal-entry liquidation basis")
 # (label, side, profile, price against the position on return, the gap, a stop restorable after the restart that the
 # return does not trip: beyond the return, inside the gap)
+# The 2x long's stop sits inside its half-liquidation cap (24.9%), as Q199-1 and STOP-LOOSEN-1 now require: back
+# 20% against at the restart, so the stop at 24% still stands and the live gap goes through it and liquidation
+# (HoE-approved set-up change, 13 Oct). The over-cap stop it had is pinned below as clamped at the restart.
 L22_CASES = [pytest.param(-1, "aggressive", 0.10, 0.40, 0.15, id="3x-short"),
-             pytest.param(1, "balanced", 0.30, 0.55, 0.35, id="2x-long")]
+             pytest.param(1, "balanced", 0.20, 0.55, 0.24, id="2x-long")]
 
 
 def _l22_harness(monkeypatch):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.execution import FeeModel
@@ -270,6 +270,10 @@ class ScheduleFeeModel(FeeModel):
         self.intrabar: set[str] = set()  # "fill" / "liq": a booking relied on the order inside a bar (labels)
 
     def _charge(self, exact: Decimal, currency) -> Money:
+        # A currency the account keeps to 8 places (USDT): each fee on its own, 8 dp, half up, no carry, so a restart
+        # can't move one (Advisor 8 Oct 04:10 UK, ruling 1, CASH-3). The journal counts it the same way (per_fill).
+        if currency.precision >= 8:
+            return Money(exact.quantize(Decimal("1e-8"), rounding=ROUND_HALF_UP), currency)
         total = exact + self._carry
         charged = total.quantize(Decimal(10) ** -currency.precision, rounding=ROUND_HALF_EVEN)
         self._carry = total - charged
