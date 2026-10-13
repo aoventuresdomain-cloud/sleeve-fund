@@ -65,6 +65,15 @@ class TrialsRegister:
         return [t for t in self.store.trials(idea_hash) if t["family"] != "benchmark" and t["source"] != "engineering"
                 and t.get("kind", "single") == "single"]
 
+    def counted_ids(self) -> set[str]:
+        """The ids of every row that counts (_counted)."""
+        return {t["id"] for t in self._counted()}
+
+    def portfolio_runs(self) -> int:
+        """How many portfolio runs the project has tried: none counts in N, but choosing members is itself
+        selection, so each portfolio result shows this (Advisor, 8 Oct 2026)."""
+        return sum(1 for t in self.store.trials() if t.get("kind") == "portfolio_run")
+
     def counts(self, idea_hash: str | None = None) -> dict:
         """ideas: distinct ideas; variants: distinct (definition, indicator code, dataset); evaluations: rows.
         With idea_hash, one idea family's: everything tried under that core idea, across settings, instruments,
