@@ -302,7 +302,16 @@ class Supervisor:
                                  "run put away")
             self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
             self.store.drop_pending(name, "lapsed: the strategy was reset")
-            run = self.store.split_run(req, dust_ok=dust)
+            try:
+                run = self.store.split_run(req, dust_ok=dust)
+            except ValueError:
+                if not self.store.open_cancels(name):
+                    raise
+                # F241-4: its process asked for a cancel after the check above and before it was stopped. split_run
+                # changed nothing: refused as above, and the process starts again if it was running.
+                self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
+                self._undo_reset_start(req)
+                continue
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)

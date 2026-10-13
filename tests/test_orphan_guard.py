@@ -324,6 +324,28 @@ def test_f241_3_a_strategy_reset_is_refused_while_a_cancel_is_open_and_runs_once
     assert store.pending_reset("s1") is None and len(store.reset_runs()) == 1
 
 
+def test_f241_4_a_cancel_asked_between_the_check_and_split_run_refuses_the_reset_and_restarts_the_strategy(
+        tmp_path, monkeypatch):
+    """DA F241-4: its process may ask for a cancel after reset_pending's check and before it is stopped. split_run
+    then refuses and changes nothing; the supervisor refuses the reset as F241-3 does, and a running strategy runs
+    again, rather than the supervisor's loop raising."""
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
+    store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.set_desired_state("s1", "running")
+    store.request_reset("s1", "Test finished")
+    assert store.pending_reset("s1")["restart"], "set-up: a reset of a running strategy restarts it"
+    sv = sup.Supervisor(store, python="true")
+    monkeypatch.setattr(sv, "_stop", lambda name, proc, why: _open_cancel(store, name))  # the race, at the stop
+    sv.reset_pending()
+    assert store.pending_reset("s1") is None and not store.reset_runs() and store.open_cancels("s1")
+    assert store.last_event("s1", ("reset_refused",))["message"].endswith(sup.OPEN_CANCEL_REFUSAL)
+    assert store.sleeve("s1").desired_state == "running"
+
+
 def test_f241_3_a_book_reset_or_a_reset_after_liquidation_never_lifts_an_open_cancels_block(tmp_path):
     """The other resets don't move the cancel (no split_run): the book reset is refused while the entry rests, and a
     reset after liquidation leaves the cancel, and the block, as they were."""
