@@ -259,3 +259,45 @@ def test_guarded_a_drain_inside_the_limits_then_a_gap_liquidates_at_the_moved_pr
     assert (gap - now) * side <= 0 < (gap - fixed) * side, "set-up: the gap is through the moved price only"
     assert [o["intent"] for o in orders] == ["entry", "liquidation"], [(o["intent"], o["reason"]) for o in orders]
     assert orders[1]["signal"]["liquidation_px"] == pytest.approx(now, rel=1e-6)
+
+
+def _ledger(where, prices, side):
+    """After a run that liquidated: (end cash, margin, entry fee, liquidation fee, funding, liquidation fill's P&L)."""
+    from sleeve_fund import markets
+
+    if where == "paper":
+        run = _paper(prices, side)
+        intents = {o["order_id"]: o["intent"] for o in run.orders}
+        fills = [{**f, "intent": intents[f["order_id"]]} for f in run.fills]
+        funding = sum(float(r["amount"]) for r in run.store.funding("q146"))
+        cash = float(run.store.journal_book("q146", 10_000)["cash"])
+    else:
+        res = _backtest(prices, side)
+        fills = [{**f, "intent": res.decisions[f["order_id"]]["intent"]} for f in sorted(res.journal.fills_,
+                                                                                        key=lambda f: f["ts"])]
+        funding = sum(r["amount"] for r in res.funding)
+        cash = float(res.equity.iloc[-1])
+    assert [f["intent"] for f in fills] == ["entry", "liquidation"], [(f["intent"], f["price"]) for f in fills]
+    entry, liq = fills
+    margin = markets.isolated_margin(entry["qty"], entry["price"], 3.0)
+    pnl = side * liq["qty"] * (liq["price"] - entry["price"])
+    return cash, margin, entry["fee"], liq["fee"], funding, pnl
+
+
+# Advisor 17:45 UK (13 Oct), MUST: bankruptcy moves by the same funding, b' = b - f / q, so a liquidation loses exactly
+# the isolated margin plus the entry and liquidation fees, the funding inside that, never on top (#155). The funding
+# lines and the liquidation's line sum to it; a credit is taken with the margin.
+LOSSES = [pytest.param(1, 0.05, 0.2834, id="long-paid"), pytest.param(-1, -0.05, 0.282, id="short-paid"),
+          pytest.param(1, -0.05, 0.40, id="long-credited"), pytest.param(-1, 0.05, 0.40, id="short-credited")]
+
+
+@pytest.mark.parametrize("where", ["backtest", "paper"])
+@pytest.mark.parametrize(("side", "rate", "depth"), LOSSES)
+def test_a_liquidation_loses_exactly_the_margin_and_fees_with_the_funding_inside_it(hourly_guarded, monkeypatch,
+                                                                                    where, side, rate, depth):
+    _rate(monkeypatch, rate)
+    cash, margin, entry_fee, liq_fee, funding, pnl = _ledger(where, _prices(side, depth), side)
+    assert abs(funding) > 100, ("set-up: the 08:00 settlement moved the margin", funding)
+    lost = margin + entry_fee + liq_fee
+    assert 10_000 - cash == pytest.approx(lost, abs=0.02)
+    assert funding + pnl - entry_fee - liq_fee == pytest.approx(-lost, abs=0.02)

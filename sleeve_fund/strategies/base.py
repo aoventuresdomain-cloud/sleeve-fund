@@ -4282,6 +4282,12 @@ class LongFlatStrategy(Strategy):
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
         held = -sign
         bankrupt = markets.bankruptcy_price(held * qty, entry, lev)
+        if self._liq_funded:
+            # Funding since the fill was taken from, or credited to, that margin (LIQ-FUND-1; Advisor 17:45 UK, 13 Oct):
+            # bankruptcy moves by it, b' = b - f / q on the whole position, so the funding lines and this one together
+            # lose exactly the margin plus the fees, the funding inside that, never on top (#155: never past bankruptcy).
+            position = held * (self._entry_qty or qty)
+            bankrupt = max(bankrupt - self._liq_funded / position, 0.0)
         trigger = (self.decisions[coid].get("signal") or {}).get("liquidation_px") or px
         rate = self.runtime.taker_fee if self.runtime is not None else self._cfg.assumed_taker_fee
         booked_fee = qty * float(trigger) * rate
