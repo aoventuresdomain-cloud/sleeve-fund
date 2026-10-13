@@ -78,6 +78,7 @@ def test_a_gated_entry_still_resting_at_the_next_bar_close_is_cancelled_and_its_
     order = {o["order_id"]: o for o in _orders(paper)}[held["order"]]
     assert order["status"] == "canceled", order
     assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]
+    assert not paper.open_cancels(NAME)  # og6: its journalled cancel settled by the venue's confirmation
 
 
 def test_a_gated_entry_is_cancelled_at_the_next_close_even_when_that_bar_is_not_decided_on(
@@ -114,12 +115,12 @@ def _qa_intent() -> dict:
             "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": None, "atr_pct": None}
 
 
-def test_a_crashed_strategys_resting_entry_is_cancelled_by_the_supervisor_and_answered_at_its_restart(
+def test_a_crashed_strategys_resting_entry_is_asked_to_cancel_and_its_restart_stays_blocked_until_the_venue_settles_it(
         tmp_path, store, monkeypatch):  # noqa: F811
     """ORPHAN-GUARD og2 + og3 through the paper engine (HoE 13 Oct, the pair): the process dies with a gated entry
-    resting; the supervisor marks it down and asks the cancel; the restart answers it ("not found": a sandbox's orders
-    end with its process) and its entries stay blocked until the quiet window confirms it, which releases the
-    reservation as 'cancel'."""
+    resting; the supervisor marks it down and asks the cancel; the restart answers it "not found" (its sandbox ended
+    with the process), which releases nothing (Advisor 13 Oct 17:00 UK): the reservation is held and the strategy's
+    entries blocked, however long the journal stays silent, until the venue's lookup settles it."""
     from sleeve_fund.paper import orphan_guard as og
 
     paper, held = _gated(store), {}
@@ -144,11 +145,14 @@ def test_a_crashed_strategys_resting_entry_is_cancelled_by_the_supervisor_and_an
 
     run(tmp_path, paper, Plan(t0=STD_T0 + pd.Timedelta(minutes=5), minutes=2, tag="r"), monkeypatch)
     assert og.down_since(paper, NAME) is None  # the restart marked it up
-    assert [c["order_id"] for c in paper.open_cancels(NAME)] == [oid]  # answered "not found", not yet confirmed
+    (c,) = paper.open_cancels(NAME)
+    assert c["order_id"] == oid and c["not_found_at"] is not None  # answered "not found": unconfirmed
     assert not [o for o in _orders(paper) if o["intent"] == "entry" and o["order_id"] != oid]  # blocked meanwhile
 
-    og.supervisor_pass(paper, M(STD_T0, 9).to_pydatetime())  # past the quiet window after the answer
-    assert not paper.open_cancels(NAME)
-    assert og.resting_block(paper, NAME, M(STD_T0, 9).to_pydatetime()) is None
-    assert {o["order_id"]: o for o in _orders(paper)}[oid]["status"] in ("canceled", "expired")
+    for m in (9, 30, 120):  # silence never releases it
+        og.supervisor_pass(paper, M(STD_T0, m).to_pydatetime())
+    assert [c["order_id"] for c in paper.open_cancels(NAME)] == [oid]
+    assert og.resting_block(paper, NAME, M(STD_T0, 120).to_pydatetime())
+    # The restart ends paper's orders that went with its sandbox (runtime.on_start, m8-9), which releases this one's
+    # reservation as 'cancel'; the cancel itself waits for the Advisor's ruling on a dead sandbox's lookup.
     assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]

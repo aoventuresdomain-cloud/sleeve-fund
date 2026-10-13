@@ -3035,11 +3035,11 @@ class LongFlatStrategy(Strategy):
         part-filled one keeps what filled, with its stop. Until then it stays reserved, past the TTL (HoQA w1g)."""
         if self._paper_gated() is None or not (found := self._resting_openers()):
             return
-        from sleeve_fund.paper.portfolio_gate import resting_entries
+        from sleeve_fund.paper.orphan_guard import bar_close_cancel
 
         resting, kept = found
         rt = self.runtime
-        due = set(resting_entries(rt.store, rt.name, _utc(close_ns)))
+        due = set(bar_close_cancel(rt.store, rt.name, _utc(close_ns)))  # journalled: the answer settles it
         why = "cancelled at the next bar close: an entry never rests past the bar after it was decided"
         for order in resting:
             if str(order.client_order_id) in due:
@@ -3354,6 +3354,10 @@ class LongFlatStrategy(Strategy):
     def _kept_closed(self, coid: str, kept: dict) -> None:
         if self.runtime is not None and kept["sent"] < kept["order"].quantity.as_decimal():
             self.runtime.on_order_status(coid, "canceled", kept["why"])
+            if self._paper_gated() is not None:
+                from sleeve_fund.paper.orphan_guard import order_ended
+
+                order_ended(self.runtime.store, coid, "canceled", _utc(self.clock.timestamp_ns()))
 
     def _slice_done(self, pid: str, unfilled: float = 0.0) -> None:
         """Paper: a slice closed. What it didn't fill (a denial, say) is the kept order's to send again."""
@@ -4865,6 +4869,11 @@ class LongFlatStrategy(Strategy):
     def _order_status(self, event, status: str) -> None:
         if self.runtime is not None:
             self.runtime.on_order_status(str(event.client_order_id), status, str(getattr(event, "reason", "") or ""))
+            if status in ("canceled", "expired") and self._paper_gated() is not None:
+                from sleeve_fund.paper.orphan_guard import order_ended
+
+                # og6: the venue ended it, so the cancel journalled for it (if any) is settled, never left blocking
+                order_ended(self.runtime.store, str(event.client_order_id), status, _utc(int(event.ts_event)))
 
     def on_order_accepted(self, event) -> None:
         self._order_status(event, "accepted")

@@ -9,8 +9,8 @@ on SQLite and on PG.
        supports it. Where it doesn't, the order is still sent, and the run journals that only the backstops cover it.
   og2  Backstop. Within 60 s of the owner going down (crash, stop, refused start), something alive (the supervisor's
        'cancel' command) cancels each unfilled resting entry. The cancel is journalled. The reservation is kept until
-       the cancel is confirmed, then released as 'cancel'. A confirmed "not found" also releases it; nothing releases
-       blind.
+       the cancel is confirmed, then released as 'cancel'. A "not found" alone releases nothing (Advisor 17:00 UK
+       13 Oct): only the venue's lookup by client id plus its fill history, showing a zero-fill terminal state, does.
   og2c A "not found" plus a journalled fill for that order, in either order, converts the reservation once (released
        as 'fill', never 'cancel') and triggers og5 (Advisor 06:20 UK).
   og3  Restart reconcile cancels any leftover resting entry before the first new entry. Entries stay blocked until
@@ -18,6 +18,12 @@ on SQLite and on PG.
   og4  An acked entry still resting at its bar close + 2 min raises one alert and blocks that Strategy's entries
        (CHOKE names it) until it is cleared. Before + 2 min there is no alert. Other Strategies are not blocked.
   og4b The + 2 min check runs in the supervisor and fires with the owner dead (Advisor 06:20 UK).
+  og6  Advisor 17:00 UK 13 Oct, the bar-close cancel. A "not found" holds the reservation and blocks that Strategy's
+       new entries (others not) until the venue lookup resolves it; silence never releases, and at bar close + 2 min
+       it alerts once. A fill found by the lookup is booked and treated as a race. In a race the fill wins: filled at
+       or before the bar close is kept; filled after it is an orphan closed at market (og5). The cancel record never
+       stays open or blocks. A partial fill keeps the filled part under the same rule and releases only the confirmed
+       unfilled remainder, as 'cancel'.
   og5  An orphan that fills anyway, long or short, is closed by one reduce-only market order on the opposite side,
        sent by the supervisor through the exit path (never gated). It is journalled as "orphan fill closed" and alerted,
        once.
@@ -87,6 +93,32 @@ def cancel_confirmed(store, order_id: str, *, not_found: bool = False) -> None:
     from sleeve_fund.paper import orphan_guard
 
     orphan_guard.cancel_confirmed(store, order_id, not_found=not_found)
+
+
+def bar_close_cancel(store, name: str, at: datetime) -> list[str]:
+    """The owner (alive) cancels its unfilled resting entries at the resting bar's close. Returns the ids sent."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.bar_close_cancel(store, name, at)
+
+
+def answer_cancel(store, order_id: str, answer: str, at: datetime) -> None:
+    """The venue's answer to a cancel, received at `at`: 'canceled', 'not_found' or 'filled'."""
+    from sleeve_fund.paper import orphan_guard
+
+    orphan_guard.answer_cancel(store, order_id, answer, at)
+
+
+def venue_lookup(
+    store, order_id: str, *, terminal: str | None, fills: list[tuple[float, datetime]], at: datetime
+) -> None:
+    """The venue's answer to the reconcile lookup of `order_id` by client id plus its fill history: the terminal
+    state ('canceled', 'expired', 'filled', or None while the order is unknown) and every fill (qty, fill time). The
+    build books any fill it has not journalled."""
+    from sleeve_fund.paper import orphan_guard
+
+    orphan_guard.venue_lookup(store, order_id, terminal=terminal, at=at,
+                              fills=[(q, t, 60000.0, 0.0) for q, t in fills])  # the cells' price, no fee
 
 
 def restart_reconcile(
@@ -220,7 +252,7 @@ def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancell
     )
 
 
-def test_og2b_a_confirmed_not_found_releases_and_an_unanswered_cancel_never_releases_blind(
+def test_og2b_not_found_releases_only_on_a_zero_fill_lookup_and_an_unanswered_cancel_never_releases_blind(
     store,
 ):
     gone = resting_entry(store, "a", "o-gone", CLOSE)
@@ -231,7 +263,10 @@ def test_og2b_a_confirmed_not_found_releases_and_an_unanswered_cancel_never_rele
         supervisor_pass(store, down + timedelta(seconds=s))
         if s == 30:
             cancel_confirmed(store, "o-gone", not_found=True)
-    assert reservation_reason(store, gone) == "cancel"
+        if s == 300:
+            assert reservation_reason(store, gone) is None  # "not found" alone is no proof (Advisor 17:00 UK 13 Oct)
+            venue_lookup(store, "o-gone", terminal="canceled", fills=[], at=down + timedelta(seconds=s))
+    assert reservation_reason(store, gone) == "cancel"  # released only on the venue's zero-fill terminal state
     assert (
         reservation_reason(store, silent) is None
     )  # ten minutes unanswered: still held
@@ -306,6 +341,89 @@ def test_og4b_the_bar_plus_2_min_check_runs_in_the_supervisor_and_fires_with_the
     assert len(_events(store, "resting_entry_orphaned", "a")) == 1
     blocked, why = entry_blocked(store, "a", due + timedelta(seconds=31))
     assert blocked and "resting" in why.lower()
+
+
+END = CLOSE + BAR  # the resting bar's close, where the owner cancels what is still resting
+
+
+def _closes(store, name="a", entry="o-rest"):
+    return [o for o in store.orders(name) if o["order_id"] != entry]
+
+
+def test_og6a_not_found_holds_blocks_only_its_strategy_and_a_found_fill_before_close_is_booked_and_kept(store):
+    rid = resting_entry(store, "a", "o-rest", CLOSE)
+    assert "o-rest" in bar_close_cancel(store, "a", END)
+    answer_cancel(store, "o-rest", "not_found", END + timedelta(seconds=1))
+    for s in range(5, 600, 5):  # ten minutes of silence: nothing releases, the Strategy stays blocked
+        supervisor_pass(store, END + timedelta(seconds=s))
+    assert reservation_reason(store, rid) is None
+    blocked, why = entry_blocked(store, "a", END + timedelta(seconds=601))
+    assert blocked and "resting" in why.lower()
+    assert not entry_blocked(store, "b", END + timedelta(seconds=601))[0]
+    venue_lookup(store, "o-rest", terminal="filled", fills=[(0.1, END - timedelta(seconds=30))],
+                 at=END + timedelta(seconds=605))
+    supervisor_pass(store, END + timedelta(seconds=610))
+    assert reservation_reason(store, rid) == "fill"
+    assert sum(float(f["qty"]) for f in store.fills("a")) == pytest.approx(0.1)  # booked once
+    assert _closes(store) == []  # filled before the bar close: the Strategy keeps it
+    assert not entry_blocked(store, "a", END + timedelta(seconds=611))[0]
+
+
+def test_og6b_not_found_alerts_once_at_bar_close_plus_2_min_and_releases_only_on_a_zero_fill_lookup(store):
+    rid = resting_entry(store, "a", "o-rest", CLOSE)
+    bar_close_cancel(store, "a", END)
+    answer_cancel(store, "o-rest", "not_found", END + timedelta(seconds=1))
+    supervisor_pass(store, END + timedelta(minutes=2) - timedelta(seconds=5))
+    assert not _events(store, "resting_entry_orphaned")
+    for s in range(0, 60, 5):
+        supervisor_pass(store, END + timedelta(minutes=2, seconds=s))
+    assert len(_events(store, "resting_entry_orphaned", "a")) == 1
+    assert reservation_reason(store, rid) is None
+    at = END + timedelta(minutes=4)
+    venue_lookup(store, "o-rest", terminal="canceled", fills=[], at=at)
+    supervisor_pass(store, at + timedelta(seconds=5))
+    assert reservation_reason(store, rid) == "cancel"
+    assert store.fills("a") == [] and _closes(store) == []
+    assert not entry_blocked(store, "a", at + timedelta(seconds=6))[0]
+
+
+@pytest.mark.parametrize("after_close", [False, True])
+def test_og6c_a_cancel_racing_a_fill_books_it_once_keeps_it_before_close_and_closes_it_at_market_after(
+    store, after_close
+):
+    rid = resting_entry(store, "a", "o-rest", CLOSE)
+    bar_close_cancel(store, "a", END)
+    filled_at = END + timedelta(seconds=2) if after_close else END - timedelta(seconds=2)
+    orphan_fills(store, "a", "o-rest", 0.1, filled_at)
+    answer_cancel(store, "o-rest", "filled", END + timedelta(seconds=3))
+    for s in range(5, 90, 5):
+        supervisor_pass(store, END + timedelta(seconds=s))
+    assert reservation_reason(store, rid) == "fill"  # converted once, never 'cancel'
+    closes = _closes(store)
+    if after_close:  # an orphan: one reduce-only market close through the exit path
+        assert len(closes) == 1
+        c = closes[0]
+        assert (c["side"], c["order_type"], float(c["qty"])) == ("SELL", "MARKET", 0.1)
+        assert is_reduce_only(store, c["order_id"])
+        assert len(_events(store, "orphan_fill_closed", "a")) == 1
+    else:
+        assert closes == [] and not _events(store, "orphan_fill_closed", "a")
+    assert not entry_blocked(store, "a", END + timedelta(seconds=91))[0]  # the cancel record never stays open
+
+
+def test_og6d_a_partial_fill_then_a_confirmed_cancel_keeps_the_filled_part_and_releases_only_the_remainder(store):
+    rid = resting_entry(store, "a", "o-rest", CLOSE)  # reserves 0.1
+    orphan_fills(store, "a", "o-rest", 0.04, END - timedelta(seconds=20))
+    bar_close_cancel(store, "a", END)
+    answer_cancel(store, "o-rest", "canceled", END + timedelta(seconds=1))
+    venue_lookup(store, "o-rest", terminal="canceled", fills=[(0.04, END - timedelta(seconds=20))],
+                 at=END + timedelta(seconds=2))
+    for s in range(5, 60, 5):
+        supervisor_pass(store, END + timedelta(seconds=s))
+    assert sum(float(f["qty"]) for f in store.fills("a")) == pytest.approx(0.04)  # the lookup books nothing twice
+    assert _closes(store) == []  # filled before the close: kept
+    assert reservation_reason(store, rid) == "cancel"  # the unfilled remainder
+    assert not entry_blocked(store, "a", END + timedelta(seconds=61))[0]
 
 
 @pytest.mark.parametrize(

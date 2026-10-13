@@ -8,6 +8,9 @@ unwatched, whatever happens to the process that sent it. The layers, first to la
 - og4 An entry still resting at its bar's close + 2 min alerts once and blocks that strategy's entries (the supervisor's
       check, so a dead owner can't silence it).
 - og5 An orphan that fills anyway is closed by one reduce-only market order through the exit path.
+- og6 A cancel the venue answers "not found" is never released on silence (Advisor 13 Oct 17:00 UK): it holds the
+      reservation and blocks that strategy until the venue's lookup (the order by client id and its fill history)
+      settles it, and a fill found then is booked once, kept if before the bar's close, else closed as og5.
 
 This module holds the pure parts. The journal's half (og2 to og5) builds on 0015's Store.request_cancel and
 apply_cancel (data-architect/0015-orphan-guard-design.md)."""
@@ -84,7 +87,12 @@ def gated_open(store, name: str | None = None) -> list[dict]:
     from sqlalchemy import select
 
     from sleeve_fund.data import spec_minutes
-    from sleeve_fund.store import OPEN_ORDER_STATUSES, gate_decisions_t, gate_reservations_t, orders_t
+    from sleeve_fund.store import (
+        OPEN_ORDER_STATUSES,
+        gate_decisions_t,
+        gate_reservations_t,
+        orders_t,
+    )
 
     o, d, r = orders_t, gate_decisions_t, gate_reservations_t
     q = (select(o.c.order_id, o.c.sleeve, o.c.side, o.c.qty, o.c.filled_qty, d.c.bar_ts)
@@ -169,18 +177,88 @@ def supervisor_pass(store, now: datetime, send=None, close=None) -> list[str]:
 
 
 def settle_cancels(store, now: datetime) -> None:
-    """Close what the venue's answers leave open (DA 0015): a "not found" with no fill in the quiet window after it is a
-    cancel (Store.confirm_cancels releases it as 'cancel'); a cancel whose order filled is applied once its fills are
-    booked and og5 has closed what filled after the owner went down ('filled': nothing more released)."""
-    if hasattr(store, "confirm_cancels"):
-        store.confirm_cancels(now)
+    """Close the cancels whose order the journal shows ended in fills (DA 0015 "filled"), once og5 has closed what
+    filled late. Nothing is released on silence (Advisor 13 Oct 17:00 UK): a cancel answered "not found" stays open,
+    and its strategy blocked, until the venue's lookup settles it (venue_lookup)."""
     filled = {o["order_id"] for o in store.orders(limit=100_000) if float(o.get("filled_qty") or 0) > 0}
     for c in store.open_cancels():
         if c["order_id"] in filled and c["order_id"] not in {r["order_id"] for r in gated_open(store, c["sleeve"])}:
-            try:
-                store.apply_cancel(c["id"], "filled")
-            except ValueError:  # 0015 without the "filled" outcome yet: the cancel stays open, its strategy blocked
-                pass
+            store.apply_cancel(c["id"], "filled", at=now)
+
+
+def bar_close_cancel(store, name: str, at: datetime) -> list[str]:
+    """W2's cancel at the bar close, journalled (og6): every gated entry of `name` still resting that was decided
+    before `at` gets a cancel command (Store.request_cancel, idempotent) before its process sends the cancel, so the
+    venue's answer settles it like any other (answer_cancel, venue_lookup). Returns the ids to send."""
+    from sleeve_fund.paper.portfolio_gate import resting_entries
+
+    due = resting_entries(store, name, at)
+    for oid in due:
+        store.request_cancel(name, oid, "cancelled at the next bar close: an entry never rests past the bar after it "
+                             "was decided", actor="strategy")
+    return due
+
+
+def answer_cancel(store, order_id: str, answer: str, at: datetime, close=None) -> str | None:
+    """The venue's answer to a cancel, received at `at`: 'canceled' (or 'expired'), 'not_found' or 'filled'. A
+    "not found" releases nothing; a "filled" whose fills aren't journalled yet waits for the lookup to book them."""
+    if answer in ("canceled", "expired"):
+        return cancel_confirmed(store, order_id, close=close, at=at)
+    if answer == "not_found":
+        return cancel_confirmed(store, order_id, not_found=True, close=close, at=at)
+    if answer != "filled":
+        raise ValueError(f"a venue's answer to a cancel is canceled, expired, not_found or filled, not {answer!r}")
+    open_ = [c for c in store.open_cancels() if c["order_id"] == order_id]
+    if not open_ or not _journal_filled(store, order_id):
+        return None
+    close_orphans(store, at, close)
+    return store.apply_cancel(open_[0]["id"], "filled", at=at)
+
+
+def venue_lookup(store, order_id: str, *, terminal: str | None, fills: list, at: datetime, close=None) -> str | None:
+    """og6: the venue's lookup of `order_id` by client id plus its fill history settles its open cancel. `fills` are
+    (qty, ts, price, fee[, trade_id]) as the venue reports them. Whatever of them the journal doesn't hold is booked
+    (the journal's own fills counted first, so nothing books twice); then a terminal 'canceled' or 'expired' releases
+    the unfilled remainder as 'cancel', 'filled' applies it, and None (the venue doesn't know it yet) leaves it open
+    and its strategy blocked. A fill after its bar's close, or after its owner went down, is closed (og5)."""
+    o = next((o for o in store.orders(limit=100_000) if o["order_id"] == order_id), None)
+    if o is None:
+        raise ValueError(f"no order {order_id!r}")
+    have = _journal_filled(store, order_id)
+    seen = 0.0
+    for i, f in enumerate(sorted(fills, key=lambda f: f[1])):
+        qty, ts, price, fee = float(f[0]), f[1], float(f[2]), float(f[3])
+        new = min(qty, seen + qty - have) if seen + qty > have else 0.0
+        seen += qty
+        if new > 1e-12:
+            store.book_fill(o["sleeve"], side=o["side"], qty=new, price=price, fee=fee * new / qty, order_id=order_id,
+                            trade_id=f[4] if len(f) > 4 and f[4] else f"{order_id}-lookup-{i}", ts=ts)
+    if terminal is None:
+        return None
+    if terminal in ("canceled", "expired"):
+        got = cancel_confirmed(store, order_id, not_found=False, close=close, at=at)
+        close_orphans(store, at, close)
+        return got
+    if terminal == "filled":
+        return answer_cancel(store, order_id, "filled", at, close)
+    raise ValueError(f"a venue's terminal state is canceled, expired or filled, not {terminal!r}")
+
+
+def order_ended(store, order_id: str, status: str, at: datetime) -> None:
+    """The owner's process saw its venue end an order (canceled or expired): the cancel it journalled, if any, is
+    settled with it (og6), so a confirmed cancel never leaves its strategy blocked."""
+    if any(c["order_id"] == order_id for c in store.open_cancels()):
+        cancel_confirmed(store, order_id, at=at)
+
+
+def _journal_filled(store, order_id: str) -> float:
+    from sqlalchemy import func, select
+
+    from sleeve_fund.store import fills_t
+
+    with store.engine.connect() as c:
+        return float(c.execute(select(func.coalesce(func.sum(fills_t.c.qty), 0)).where(fills_t.c.order_id == order_id))
+                     .scalar())
 
 
 def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=None,
@@ -201,38 +279,53 @@ def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=Non
 
 
 def close_orphans(store, now: datetime, close=None) -> list[str]:
-    """og5: an entry that filled after its strategy's process went down is closed once: one reduce-only market order
-    on the opposite side for what filled, through the exit path (never gated), journaled and alerted as an orphan fill
-    closed. Returns the closing order ids."""
+    """og5: an entry that filled after its strategy's process went down, or a resting one that filled after its bar's
+    close (the bar-close cancel raced it, Advisor 13 Oct 17:00 UK), is closed once: one reduce-only market order on
+    the opposite side for what filled late, through the exit path (never gated), journaled and alerted as an orphan
+    fill closed. What filled before both is the strategy's to keep. Returns the closing order ids."""
     from sqlalchemy import select
 
-    from sleeve_fund.store import fills_t, gate_decisions_t, gate_reservations_t, orders_t
+    from sleeve_fund.data import spec_minutes
+    from sleeve_fund.store import (
+        fills_t,
+        gate_decisions_t,
+        gate_reservations_t,
+        orders_t,
+    )
 
     done = {(o.get("signal") or {}).get("orphan_of") for o in store.orders(limit=100_000) if o["intent"] == "exit"}
     out = []
     d, r = gate_decisions_t, gate_reservations_t
     with store.engine.connect() as c:
-        rows = c.execute(select(orders_t.c.order_id, orders_t.c.sleeve, orders_t.c.side)
+        rows = c.execute(select(orders_t.c.order_id, orders_t.c.sleeve, orders_t.c.side, orders_t.c.order_type,
+                                d.c.bar_ts)
                          .join(d, d.c.order_id == orders_t.c.order_id).join(r, r.c.decision_id == d.c.id)
                          .where(orders_t.c.filled_qty > 0)).all()
-    for oid, name, side in rows:
+    for oid, name, side, kind, bar_ts in rows:
+        if oid in done:
+            continue
         down = down_since(store, name)
-        if down is None or oid in done:
+        end = None
+        if kind != "MARKET" and bar_ts is not None:  # a resting entry: its bar-close cancel races its fills
+            end = _aware(bar_ts) + timedelta(minutes=spec_minutes(store.sleeve(name).bar_spec))
+        if down is None and end is None:
             continue
         with store.engine.connect() as c:
-            late = c.execute(select(fills_t.c.qty).where(fills_t.c.order_id == oid, fills_t.c.ts >= down)).scalars().all()
-        qty = sum(float(q) for q in late)
+            fills = c.execute(select(fills_t.c.qty, fills_t.c.ts).where(fills_t.c.order_id == oid)).all()
+        qty = sum(float(q) for q, ts in fills
+                  if (down is not None and _aware(ts) >= down) or (end is not None and _aware(ts) > end))
         if qty <= 0:
             continue
         exit_side = "SELL" if side == "BUY" else "BUY"
         cid = f"orphan-close-{oid}"
+        why = "after its strategy's process went down" if down is not None else "after its bar's close"
         store.record_order(name, order_id=cid, side=exit_side, qty=qty, intent="exit", order_type="MARKET",
-                           reason=f"Orphan fill closed: {oid} filled {qty:g} after its strategy's process went down",
+                           reason=f"Orphan fill closed: {oid} filled {qty:g} {why}",
                            signal={"reduce_only": True, "orphan_of": oid}, ts=now)
         if close is not None:
             close(name, exit_side, qty, cid)
-        store.event(name, "error", ORPHAN_CLOSED, f"Orphan fill closed: {oid} filled {qty:g} after its strategy's "
-                    f"process went down; closed at market reduce-only ({cid})", ts=now)
+        store.event(name, "error", ORPHAN_CLOSED, f"Orphan fill closed: {oid} filled {qty:g} {why}; closed at market "
+                    f"reduce-only ({cid})", ts=now)
         out.append(cid)
     return out
 
