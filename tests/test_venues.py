@@ -82,6 +82,7 @@ MAY_NAME_A_VENUE = {
     "safety.py": "lists venue credential prefixes so it can refuse every one of them",
     "accounts.py": "recognises the note older versions saved, so it can replace it on read",
     "wording.py": "turns a venue name into what it is (\"the demo account\") in what the PM reads, so it names each one",
+    "0020_orders_venue.py": "freezes the default venue of the day as a literal, so the orders backfill never moves (DA)",
 }
 
 

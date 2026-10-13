@@ -52,6 +52,7 @@ from sqlalchemy.schema import DropConstraint
 
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
+from sleeve_fund.router import venue_for
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
@@ -274,7 +275,9 @@ orders_t = Table(
     Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
+    Column("venue", String(16), nullable=False),  # where it was sent: the strategy's one venue (router, P2-4)
     Index("orders_sleeve_ts", "sleeve", "ts"),
+    CheckConstraint("venue = upper(venue)", name="orders_venue_upper"),
 )
 # When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
 # and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
@@ -1124,10 +1127,12 @@ class Store:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
         with self.engine.begin() as c:
+            # The venue is the router's, never the caller's (P2-4): read with the order, in its transaction.
+            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve)).scalar()
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message=""))
+                                              message="", venue=venue_for(venue)))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))

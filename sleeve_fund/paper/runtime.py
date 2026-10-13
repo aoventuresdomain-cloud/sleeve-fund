@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from sleeve_fund import risk
 from sleeve_fund.exact import EngineJournal
+from sleeve_fund.router import venue_for
 from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
                                replay_book, utcnow)
 
@@ -319,14 +320,16 @@ class SleeveRuntime:
 
     @classmethod
     def for_backtest(cls, *, strategy: str, instrument: str, bar_spec: str, starting_balance: float,
-                     risk_profile: str, params: dict | None = None, bar_seconds: int = 86_400) -> "SleeveRuntime":
+                     risk_profile: str, params: dict | None = None, bar_seconds: int = 86_400,
+                     venue: str | None = None) -> "SleeveRuntime":
         """The paper runtime on an in-memory journal, ticking on the backtest's clock once a bar.
         Store.save_backtest copies the journal into the real one when the run is worth keeping."""
         from sleeve_fund.paper.journal import MemoryJournal
 
         store = MemoryJournal()
         store.create_sleeve(name="backtest", strategy=strategy, instrument=instrument, bar_spec=bar_spec,
-                            starting_balance=starting_balance, risk_profile=risk_profile, params=params or {})
+                            starting_balance=starting_balance, risk_profile=risk_profile, params=params or {},
+                            venue=venue)
         rt = cls(store, "backtest", tick_seconds=bar_seconds)
         rt.backtest = True
         return rt
@@ -345,6 +348,10 @@ class SleeveRuntime:
         self.now = now
         self.name = sleeve_name
         sleeve = self.store.sleeve(sleeve_name)
+        self.venue = venue_for(sleeve.venue)  # the one venue it trades on (router, P2-4): every order is checked against it
+        # A strategy saved before strategies carried a venue has no pin of its own: paper builds it on the default venue
+        # (venue_for), so only a pinned one is held to its pin when it starts and when it sends (strategies/base).
+        self.pinned = sleeve.venue is not None
         self.profile = risk.profile(sleeve.risk_profile)
         self.cap = risk.position_cap(self.profile, sleeve.params)  # on a perp, the margin cap times the leverage cap
         self.starting_balance = sleeve.starting_balance

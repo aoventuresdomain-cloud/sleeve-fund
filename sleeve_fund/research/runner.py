@@ -302,7 +302,8 @@ def plan_run(strategy_name, prices, instrument, params=None, starting_capital=10
         bt = bar_type_for(instrument, bar_minutes)
         runtime = SleeveRuntime.for_backtest(
             strategy=strategy_name, instrument=pair_of(instrument), bar_spec=str(bt).split(f"{instrument.id}-", 1)[1],
-            starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60)
+            starting_balance=starting_capital, risk_profile=risk_profile, params=params, bar_seconds=bar_minutes * 60,
+            venue=str(instrument.id.venue))
         runtime.progress = progress
 
     if runtime is not None:
