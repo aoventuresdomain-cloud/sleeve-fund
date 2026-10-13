@@ -97,6 +97,35 @@ def check_funding_schedule(s: Sleeve) -> None:
         raise ValueError(why)
 
 
+# CCY-8DP (Advisor 13 Oct 16:15 and 16:25 UK): the journal books each fill's fee and cash leg at 8 dp, so a quote
+# currency the engine holds to fewer places (USD: 2) would book what the venue never charged. Only these named test
+# accounts, (account name, venue), may run on one, with a warning; every other account, a future venue included, is
+# refused. Their results are never Strategy evidence.
+SUB_8DP_TEST_ACCOUNTS = {("paper", "KRAKEN"): "the hub-fed USD test Strategies and the full-stack check"}
+FILL_PLACES = 8
+
+
+def check_quote_places(s: Sleeve, account: str) -> str | None:
+    """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account not named in
+    SUB_8DP_TEST_ACCOUNTS; returns the warning to log when it is named there; None when the currency holds 8."""
+    from nautilus_trader.model import Currency
+
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    quote = s.instrument.split("/")[-1].split("-")[0].upper()
+    places = Currency.from_str(quote).precision  # as the engine holds it (one it doesn't list it holds to 8)
+    if places >= FILL_PLACES:
+        return None
+    venue = (getattr(s, "venue", None) or DEFAULT_VENUE).upper()
+    held = f"{places} places"
+    allowed = SUB_8DP_TEST_ACCOUNTS.get((account, venue))
+    if allowed is None:
+        raise ValueError(f"its quote currency {quote} is held to {held}, and fills are booked to {FILL_PLACES}; only "
+                         f"named test accounts may run on it, and account {account} on {venue} is not one")
+    return (f"Test account: its quote currency {quote} is held to {held}, under the {FILL_PLACES} fills are booked "
+            f"to, which only {allowed} may do. Its results are not Strategy evidence")
+
+
 def true_up_stopped(store: Store, s: Sleeve, now: datetime | None = None) -> int:
     """CASH-4: a strategy with no process (stopped, archived, retired, or a reset's earlier run) can't notice the
     venue's rate arriving for a settlement it was charged the baseline for, so this trues it up from the stored rates:
@@ -164,6 +193,7 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
+            warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
@@ -175,6 +205,8 @@ class Supervisor:
             self.store.set_status(name, "stopped", f"not started: {exc}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}")
             return True
+        if warn:
+            self.store.event(name, "warning", "test_currency", warn)
         return False
 
     def _exits_only(self, s: Sleeve, why: str) -> bool:
