@@ -117,8 +117,10 @@ def venue_lookup(
     build books any fill it has not journalled."""
     from sleeve_fund.paper import orphan_guard
 
-    orphan_guard.venue_lookup(store, order_id, terminal=terminal, at=at,
-                              fills=[(q, t, 60000.0, 0.0) for q, t in fills])  # the cells' price, no fee
+    # the real lookup reports price and fee too; the cells only need qty and time (adapter, HoQA 13 Oct)
+    orphan_guard.venue_lookup(
+        store, order_id, terminal=terminal, fills=[(q, t, 60000.0, 0.0) for q, t in fills], at=at
+    )
 
 
 def restart_reconcile(
