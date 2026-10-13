@@ -57,6 +57,17 @@ def resting_entry_order(
     )
 
 
+def resting_entry_order_at(
+    *, decision_close: datetime, bar: timedelta, now: datetime, min_lead: timedelta
+):
+    """As resting_entry_order on a venue with good-till-date whose minimum expiry lead is `min_lead`, sent at `now`."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.resting_entry_order(
+        gtd_supported=True, decision_close=decision_close, bar=bar, now=now, min_lead=min_lead
+    )
+
+
 def owner_down(store, name: str, at: datetime, how: str) -> None:
     """The supervisor sees `name`'s process go down at `at` (how: 'crash', 'stop' or 'refused')."""
     from sleeve_fund.paper import orphan_guard
@@ -166,7 +177,26 @@ def test_og1_a_resting_entry_is_sent_good_till_its_decision_bars_next_close():
     assert note and "backstop" in note.lower()
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
+LEAD = timedelta(seconds=600)  # an assumed venue minimum; the cells hold for any lead
+
+
+def test_og1b_on_a_short_bar_the_expiry_is_clamped_to_now_plus_the_venue_minimum_plus_30_s():
+    """Advisor 13 Oct 15:30 UK: expiry = max(next close, now + venue minimum lead + 30 s); never refused for it."""
+    now = CLOSE + timedelta(seconds=2)
+    tif, expires, note = resting_entry_order_at(
+        decision_close=CLOSE, bar=timedelta(minutes=1), now=now, min_lead=LEAD
+    )
+    assert str(tif).upper().endswith("GTD") and expires == now + LEAD + timedelta(seconds=30)
+
+
+def test_og1b_on_a_4h_bar_early_in_the_bar_the_expiry_is_the_next_close():
+    now = CLOSE + timedelta(seconds=5)
+    tif, expires, note = resting_entry_order_at(
+        decision_close=CLOSE, bar=timedelta(hours=4), now=now, min_lead=LEAD
+    )
+    assert str(tif).upper().endswith("GTD") and expires == CLOSE + timedelta(hours=4) and note is None
+
+
 @pytest.mark.parametrize("how", ["crash", "stop", "refused"])
 def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancelled_by_the_supervisor(
     store, how
@@ -190,7 +220,6 @@ def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancell
     )
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
 def test_og2b_a_confirmed_not_found_releases_and_an_unanswered_cancel_never_releases_blind(
     store,
 ):
@@ -237,7 +266,6 @@ def test_og2c_not_found_with_a_journalled_fill_converts_once_and_closes_the_orph
     assert len(_events(store, "orphan_fill_closed", "a")) == 1
 
 
-@cell("restart reconcile doesn't cancel leftover resting entries first")
 def test_og3_restart_reconcile_cancels_leftovers_before_any_new_entry(store):
     rid = resting_entry(store, "a", "o-left", CLOSE)
     now = CLOSE + timedelta(minutes=20)
@@ -249,7 +277,6 @@ def test_og3_restart_reconcile_cancels_leftovers_before_any_new_entry(store):
     assert not entry_blocked(store, "a", now + timedelta(seconds=1))[0]
 
 
-@cell("nothing alerts on, or blocks for, an entry resting past its bar")
 def test_og4_an_entry_still_resting_at_bar_close_plus_2_min_alerts_once_and_blocks_only_its_strategy(
     store,
 ):
@@ -268,7 +295,6 @@ def test_og4_an_entry_still_resting_at_bar_close_plus_2_min_alerts_once_and_bloc
     assert not entry_blocked(store, "a", due + timedelta(seconds=41))[0]
 
 
-@cell("nothing alerts on, or blocks for, an entry resting past its bar")
 def test_og4b_the_bar_plus_2_min_check_runs_in_the_supervisor_and_fires_with_the_owner_dead(
     store,
 ):
@@ -283,7 +309,6 @@ def test_og4b_the_bar_plus_2_min_check_runs_in_the_supervisor_and_fires_with_the
     assert blocked and "resting" in why.lower()
 
 
-@cell("an orphan fill is left open")
 @pytest.mark.parametrize(
     "entry,close", [("BUY", "SELL"), ("SELL", "BUY")]
 )  # a long's and a short's orphan
