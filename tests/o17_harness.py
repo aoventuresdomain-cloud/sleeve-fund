@@ -199,7 +199,10 @@ def paper(tmp_path, monkeypatch, b, params, start, minutes, published: dict | No
 
     def rates_as_stored(venue_name, pair, root=None):
         s = _REAL_RATES(venue_name, pair, root)
-        return s[[visible(t, stored) for t in s.index]] if len(s) else s
+        if not len(s):
+            return s
+        n = now()  # read the clock once per call, not once per stored rate (CI-TRIM)
+        return s[[stored.get(t, t) <= n for t in s.index]]
 
     monkeypatch.setattr(funding, "rates", rates_as_stored)
     monkeypatch.setattr(b, "funding_loader", lambda pair, since: [(ms(t), r) for t, r in sorted(rates.items())
