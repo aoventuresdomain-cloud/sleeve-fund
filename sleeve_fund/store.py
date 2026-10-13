@@ -21,10 +21,12 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Column,
+    DDL,
     Date,
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -506,6 +508,117 @@ trials_t = Table(
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# P2-5 regime, the data side (DA design data-architect/p2-5-data-design.md; migration 0019). Built nightly by
+# sleeve_fund.regime from daily bars, point in time, and never edited: a row that was wrong is a bug to fix in the code,
+# not in the row, so a backtest and the paper gate always read the series as it was computed.
+# Every contract a venue lists or listed, delisted included (the universe must not be built from survivors only).
+instruments_t = Table(
+    "instruments",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("venue", String(32), nullable=False),
+    Column("symbol", String(32), nullable=False),
+    Column("underlying", String(16), nullable=False),
+    Column("quote", String(16), nullable=False),
+    Column("contract_type", String(8), nullable=False),
+    Column("listed_at", Date, nullable=False),  # its first trading day
+    Column("delisted_at", Date),  # its last; set once, never cleared
+    Column("source", String(8), nullable=False),  # api: the venue's listing; archive: only in its free archive
+    Column("seen_at", TS, nullable=False),  # the loader last saw it, so a stale listing shows
+    UniqueConstraint("venue", "symbol", name="instruments_once"),
+    CheckConstraint("contract_type IN ('perp', 'spot')", name="instruments_contract_type"),
+    CheckConstraint("source IN ('api', 'archive')", name="instruments_source"),
+    CheckConstraint("delisted_at IS NULL OR delisted_at >= listed_at", name="instruments_delisted_after_listed"),
+)
+# The universe on each day: one row per member. config names the settings it was built under (N, lag, hysteresis,
+# minimum age), so a settings change writes new rows beside the old instead of editing them.
+universe_snapshots_t = Table(
+    "universe_snapshots",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("date", Date, nullable=False),
+    Column("venue", String(32), nullable=False),
+    Column("config", String(64), nullable=False),
+    Column("symbol", String(32), nullable=False),
+    Column("underlying", String(16), nullable=False),
+    Column("rank", Integer, nullable=False),
+    Column("notional", EXACT, nullable=False),  # 30-day quote notional through data_through
+    Column("data_through", Date, nullable=False),  # the last daily close it read
+    Column("computed_at", TS, nullable=False),
+    UniqueConstraint("venue", "date", "config", "symbol", name="universe_snapshots_once"),
+    UniqueConstraint("venue", "date", "config", "underlying", name="universe_snapshots_underlying_once"),
+    ForeignKeyConstraint(["venue", "symbol"], ["instruments.venue", "instruments.symbol"],
+                         name="universe_snapshots_instrument"),
+    CheckConstraint("data_through < date", name="universe_snapshots_point_in_time"),
+    CheckConstraint("rank >= 1", name="universe_snapshots_rank"),
+)
+regime_series_t = Table(
+    "regime_series",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("date", Date, nullable=False),
+    Column("reference_venue", String(32), nullable=False),
+    Column("lookback", Integer, nullable=False),
+    Column("config", String(64), nullable=False),
+    Column("universe_date", Date, nullable=False),
+    Column("data_through", Date, nullable=False),
+    Column("er", EXACT),  # the members' median ER; None when no member had a full window
+    Column("state", String(8), nullable=False),
+    Column("lo", EXACT),  # the tercile cuts used; None when the day is unknown
+    Column("hi", EXACT),
+    Column("members", Integer, nullable=False),  # members with every close in the window
+    Column("computed_at", TS, nullable=False),
+    UniqueConstraint("date", "reference_venue", "lookback", "config", name="regime_series_once"),
+    CheckConstraint("lookback IN (20, 30)", name="regime_series_lookback"),
+    CheckConstraint("state IN ('low', 'mid', 'high', 'unknown')", name="regime_series_state"),
+    CheckConstraint("data_through < date", name="regime_series_point_in_time"),
+    CheckConstraint("state = 'unknown' OR (er IS NOT NULL AND lo IS NOT NULL AND hi IS NOT NULL AND lo <= hi)",
+                    name="regime_series_known_has_cuts"),
+    CheckConstraint("members >= 0", name="regime_series_members"),
+)
+
+
+def write_once_ddl(table: str, frozen: tuple[str, ...], why: str, set_once: tuple[str, ...] = ()) -> dict:
+    """The triggers that make `table` write-once in the database itself, by dialect: no row deleted, no `frozen`
+    column changed, and a `set_once` column changed only from NULL. Any column in neither may change (a last-seen
+    stamp). Migrations spell the statements out (frozen at what they ran); create_all builds them from here."""
+    pg_checks = " ".join(
+        [f"IF ({', '.join('NEW.' + c for c in frozen)}) IS DISTINCT FROM ({', '.join('OLD.' + c for c in frozen)}) "
+         f"THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = '{why}: row ' || OLD.id || ' cannot be "
+         "edited'; END IF;"]
+        + [f"IF OLD.{c} IS NOT NULL AND NEW.{c} IS DISTINCT FROM OLD.{c} THEN RAISE EXCEPTION USING ERRCODE = "
+           f"'check_violation', MESSAGE = '{why}: {c} of row ' || OLD.id || ' is set once'; END IF;" for c in set_once])
+    edit = " OR ".join([f"NEW.{c} IS NOT OLD.{c}" for c in frozen]
+                       + [f"(OLD.{c} IS NOT NULL AND NEW.{c} IS NOT OLD.{c})" for c in set_once])
+    return {
+        "postgresql": (
+            f"CREATE OR REPLACE FUNCTION {table}_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            f"IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = '{why}: row ' "
+            f"|| OLD.id || ' cannot be deleted'; END IF; {pg_checks} RETURN NEW; END $$",
+            f"CREATE TRIGGER {table}_write_once BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW "
+            f"EXECUTE FUNCTION {table}_write_once()"),
+        "sqlite": (
+            f"CREATE TRIGGER {table}_no_delete BEFORE DELETE ON {table} BEGIN "
+            f"SELECT RAISE(ABORT, '{why}: a row cannot be deleted'); END",
+            f"CREATE TRIGGER {table}_no_edit BEFORE UPDATE ON {table} WHEN {edit} BEGIN "
+            f"SELECT RAISE(ABORT, '{why}: a row cannot be edited'); END"),
+    }
+
+
+REGIME_WRITE_ONCE = {
+    "instruments": write_once_ddl("instruments", ("id", "venue", "symbol", "underlying", "quote", "contract_type",
+                                                  "listed_at", "source"),
+                                  "instruments are write-once", set_once=("delisted_at",)),
+    "universe_snapshots": write_once_ddl("universe_snapshots", tuple(c.name for c in universe_snapshots_t.columns),
+                                         "universe snapshots are write-once"),
+    "regime_series": write_once_ddl("regime_series", tuple(c.name for c in regime_series_t.columns),
+                                    "the regime series is write-once"),
+}
+for _t in (instruments_t, universe_snapshots_t, regime_series_t):
+    for _dialect, _stmts in REGIME_WRITE_ONCE[_t.name].items():
+        for _sql in _stmts:
+            event.listen(_t, "after_create", DDL(_sql).execute_if(dialect=_dialect))
+
 # The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
 # venue, for ever. Append-only, and no strategy column, so a reset never touches it.
 holdout_locks_t = Table(
@@ -2215,6 +2328,106 @@ class Store:
              .order_by(backtests_t.c.created_at.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
+
+    # --- P2-5 regime data (write-once; sleeve_fund.regime builds the rows) ------------------------------------
+
+    def record_instrument(self, venue: str, symbol: str, *, underlying: str, quote: str, contract_type: str,
+                          listed_at, source: str, delisted_at=None, seen_at: datetime | None = None) -> str:
+        """Note a contract the venue lists or listed: "new"; "same" (only seen_at moves); "delisted" (delisted_at set,
+        once). A listing that differs from the one held in anything else (another underlying or listing day, a
+        delisting moved or cleared) raises ValueError, changing nothing: the loader stops and alerts, and a symbol a
+        venue reuses is never folded into the old contract's history."""
+        seen_at = seen_at or utcnow()
+        want = {"underlying": underlying, "quote": quote, "contract_type": contract_type, "listed_at": listed_at,
+                "source": source}
+        t = instruments_t
+        with self.engine.begin() as c:
+            held = c.execute(select(t).where(t.c.venue == venue, t.c.symbol == symbol)).first()
+            if held is None:
+                try:
+                    with c.begin_nested():
+                        c.execute(insert(t).values(venue=venue, symbol=symbol, delisted_at=delisted_at,
+                                                   seen_at=seen_at, **want))
+                    return "new"
+                except IntegrityError:  # another loader added it meanwhile (compared below), or a CHECK refused it
+                    held = c.execute(select(t).where(t.c.venue == venue, t.c.symbol == symbol)).first()
+                    if held is None:
+                        raise
+            apart = {k: (getattr(held, k), v) for k, v in want.items() if getattr(held, k) != v}
+            if held.delisted_at is not None and delisted_at != held.delisted_at:
+                apart["delisted_at"] = (held.delisted_at, delisted_at)
+            if apart:
+                raise ValueError(f"{venue} {symbol} is listed differently from the contract held: {apart}")
+            fresh = held.delisted_at is None and delisted_at is not None
+            c.execute(update(t).where(t.c.id == held.id).values(
+                seen_at=seen_at, **({"delisted_at": delisted_at} if fresh else {})))
+            return "delisted" if fresh else "same"
+
+    def instruments(self, venue: str) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(instruments_t).where(instruments_t.c.venue == venue)
+                                   .order_by(instruments_t.c.symbol)))
+
+    def record_universe(self, venue: str, day, config: str, members, *, data_through,
+                        computed_at: datetime | None = None) -> str:
+        """The day's universe under `config`, once: "new", or "same" when the rows held are these members with these
+        ranks and notionals. Different members for a day already written raise ValueError, changing nothing (the
+        series is never rewritten: a changed rule is a new config)."""
+        t = universe_snapshots_t
+        want = sorted((m.symbol, m.underlying, m.rank, to_decimal(m.notional)) for m in members)
+        with self.engine.begin() as c:
+            held = sorted((r.symbol, r.underlying, r.rank, to_decimal(r.notional)) for r in c.execute(
+                select(t).where(t.c.venue == venue, t.c.date == day, t.c.config == config)))
+            if held:
+                if held != want:
+                    raise ValueError(f"the {venue} universe for {day} under {config} is already written differently")
+                return "same"
+            stamp = computed_at or utcnow()
+            if want:
+                c.execute(insert(t), [dict(venue=venue, date=day, config=config, symbol=s, underlying=u, rank=r,
+                                           notional=n, data_through=data_through, computed_at=stamp)
+                                      for s, u, r, n in want])
+            return "new"
+
+    def universe_on(self, venue: str, day, config: str) -> list[dict]:
+        t = universe_snapshots_t
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(t).where(t.c.venue == venue, t.c.date == day, t.c.config == config)
+                                   .order_by(t.c.rank)))
+
+    REGIME_FIELDS = ("universe_date", "data_through", "er", "state", "lo", "hi", "members")
+
+    def record_regime(self, row, *, reference_venue: str, config: str, computed_at: datetime | None = None) -> str:
+        """One regime row (sleeve_fund.regime.RegimeRow), once: "new", "same", or ValueError when the day is already
+        written differently (nothing changed)."""
+        t = regime_series_t
+        key = dict(date=row.date, reference_venue=reference_venue, lookback=row.lookback, config=config)
+        want = {f: getattr(row, f) for f in self.REGIME_FIELDS}
+        norm = lambda d: {k: (to_decimal(v) if k in ("er", "lo", "hi") and v is not None else v)  # noqa: E731
+                          for k, v in d.items()}
+        with self.engine.begin() as c:
+            held = c.execute(select(t).where(*(t.c[k] == v for k, v in key.items()))).first()
+            if held is None:
+                try:
+                    with c.begin_nested():
+                        c.execute(insert(t).values(**key, **want, computed_at=computed_at or utcnow()))
+                    return "new"
+                except IntegrityError:  # written meanwhile (compared below), or a CHECK refused it
+                    held = c.execute(select(t).where(*(t.c[k] == v for k, v in key.items()))).first()
+                    if held is None:
+                        raise
+            if norm({f: getattr(held, f) for f in self.REGIME_FIELDS}) != norm(want):
+                raise ValueError(f"the regime for {row.date} ({reference_venue}, {row.lookback}, {config}) is "
+                                 "already written differently")
+            return "same"
+
+    def regime_on(self, day, *, reference_venue: str, lookback: int, config: str) -> dict | None:
+        """The regime row for `day`, or None when none was written (QD's weighting reads None as unknown: 1.0)."""
+        t = regime_series_t
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(t).where(t.c.date == day, t.c.reference_venue == reference_venue,
+                                                   t.c.lookback == lookback, t.c.config == config)))
+        return rows[0] if rows else None
 
     # --- trials register (research guardrails) ----------------------------------------
 

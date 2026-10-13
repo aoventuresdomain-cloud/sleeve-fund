@@ -120,3 +120,122 @@ def test_a_day_with_too_few_full_windows_is_unknown_and_does_not_move_the_state(
     gap = by_day[DAY0 + timedelta(days=55)]
     assert gap.members == 1 and gap.state == "unknown" and gap.lo is None
     assert regime.STATES[-1] == "unknown"
+
+
+# --- the tables (migration 0019): write-once in the database itself, on SQLite and (CI) Postgres ---------------
+
+import os  # noqa: E402
+
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
+
+from sleeve_fund import schema  # noqa: E402
+from sleeve_fund.regime import Member, RegimeRow  # noqa: E402
+from sleeve_fund.store import Store, make_engine, metadata  # noqa: E402
+
+V, CFG = "PERPV", "n20-lag1-k5-age60"
+
+
+def _clean(eng):
+    with eng.begin() as c:
+        c.execute(text("DROP TABLE IF EXISTS alembic_version"))
+    metadata.drop_all(eng)
+
+
+@pytest.fixture(params=["create_all", "0019"])
+def store(request, tmp_path):
+    eng = make_engine(os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/t.db")
+    _clean(eng)
+    if request.param == "0019":
+        from alembic import command
+
+        with eng.begin() as conn:
+            command.upgrade(schema._config(conn), "0014")
+        schema.migrate(eng, log=lambda _: None)
+    yield Store(engine=eng)
+    _clean(eng)
+
+
+def _list(store, symbol="BTCUSDT", **kw):
+    return store.record_instrument(V, symbol, **{**dict(underlying="BTC", quote="USDT", contract_type="perp",
+                                                      listed_at=DAY0, source="api"), **kw})
+
+
+def test_an_instrument_is_noted_once_delisted_once_and_never_rewritten(store):
+    assert _list(store) == "new"
+    assert _list(store) == "same"
+    assert _list(store, delisted_at=DAY0 + timedelta(days=9)) == "delisted"
+    assert _list(store, delisted_at=DAY0 + timedelta(days=9)) == "same"
+    for change in ({"delisted_at": DAY0 + timedelta(days=10)}, {"delisted_at": None}, {"underlying": "XBT"},
+                   {"listed_at": DAY0 + timedelta(days=1)}):
+        with pytest.raises(ValueError, match="listed differently"):
+            _list(store, **change)
+    (row,) = store.instruments(V)
+    assert (row["underlying"], row["listed_at"], row["delisted_at"]) == ("BTC", DAY0, DAY0 + timedelta(days=9))
+
+
+def _bare_edits_refused(store, table, edits):
+    for change in edits:
+        with pytest.raises(IntegrityError, match="write-once"), store.engine.begin() as c:
+            c.execute(text(f"UPDATE {table} SET {change}"))
+    with pytest.raises(IntegrityError, match="write-once"), store.engine.begin() as c:
+        c.execute(text(f"DELETE FROM {table}"))
+
+
+def test_a_bare_update_or_delete_of_any_regime_table_is_refused_by_the_database(store):
+    _list(store)
+    _list(store, symbol="ETHUSDT", underlying="ETH")
+    day = DAY0 + timedelta(days=40)
+    members = [Member("BTCUSDT", "BTC", 1, D("123.45")), Member("ETHUSDT", "ETH", 2, D("67.8"))]
+    assert store.record_universe(V, day, CFG, members, data_through=day - timedelta(days=1)) == "new"
+    row = RegimeRow(day, 20, day, day - timedelta(days=1), D("0.41"), "mid", D("0.3"), D("0.6"), 2)
+    assert store.record_regime(row, reference_venue=V, config=CFG) == "new"
+    _bare_edits_refused(store, "instruments", ["underlying = 'X'", "listed_at = '2023-01-01'"])
+    with store.engine.begin() as c:  # delisted_at from NULL, and seen_at, may move
+        c.execute(text("UPDATE instruments SET delisted_at = '2024-03-01', seen_at = CURRENT_TIMESTAMP "
+                       "WHERE symbol = 'BTCUSDT'"))
+    with pytest.raises(IntegrityError, match="write-once"), store.engine.begin() as c:
+        c.execute(text("UPDATE instruments SET delisted_at = '2024-03-02' WHERE symbol = 'BTCUSDT'"))
+    _bare_edits_refused(store, "universe_snapshots", ["rank = 3", "notional = 1", "computed_at = CURRENT_TIMESTAMP"])
+    _bare_edits_refused(store, "regime_series", ["state = 'high'", "er = 0.9", "lo = 0.1"])
+
+
+def test_a_day_is_written_once_and_a_different_answer_for_it_is_refused(store):
+    for s, u in (("BTCUSDT", "BTC"), ("ETHUSDT", "ETH")):
+        _list(store, symbol=s, underlying=u)
+    day, through = DAY0 + timedelta(days=40), DAY0 + timedelta(days=39)
+    members = [Member("BTCUSDT", "BTC", 1, D("123.45")), Member("ETHUSDT", "ETH", 2, D("67.8"))]
+    assert store.record_universe(V, day, CFG, members, data_through=through) == "new"
+    assert store.record_universe(V, day, CFG, list(reversed(members)), data_through=through) == "same"
+    with pytest.raises(ValueError, match="already written differently"):
+        store.record_universe(V, day, CFG, members[:1], data_through=through)
+    assert store.record_universe(V, day, "another-config", members[:1], data_through=through) == "new"
+    assert [r["symbol"] for r in store.universe_on(V, day, CFG)] == ["BTCUSDT", "ETHUSDT"]
+
+    row = RegimeRow(day, 20, day, through, D("0.41"), "mid", D("0.3"), D("0.6"), 2)
+    assert store.record_regime(row, reference_venue=V, config=CFG) == "new"
+    assert store.record_regime(row, reference_venue=V, config=CFG) == "same"
+    with pytest.raises(ValueError, match="already written differently"):
+        store.record_regime(RegimeRow(day, 20, day, through, D("0.41"), "high", D("0.3"), D("0.6"), 2),
+                            reference_venue=V, config=CFG)
+    got = store.regime_on(day, reference_venue=V, lookback=20, config=CFG)
+    assert (got["state"], got["er"], got["members"]) == ("mid", D("0.41"), 2)
+    assert store.regime_on(day + timedelta(days=1), reference_venue=V, lookback=20, config=CFG) is None
+
+
+def test_the_database_refuses_a_row_that_reads_its_own_day_a_known_state_without_cuts_or_an_unlisted_member(store):
+    _list(store)
+    day = DAY0 + timedelta(days=40)
+    with pytest.raises(IntegrityError):
+        store.record_regime(RegimeRow(day, 20, day, day, D("0.4"), "mid", D("0.3"), D("0.6"), 2),
+                            reference_venue=V, config=CFG)
+    with pytest.raises(IntegrityError):
+        store.record_regime(RegimeRow(day, 20, day, day - timedelta(days=1), D("0.4"), "mid", None, None, 2),
+                            reference_venue=V, config=CFG)
+    with pytest.raises(IntegrityError):
+        store.record_regime(RegimeRow(day, 25, day, day - timedelta(days=1), None, "unknown", None, None, 0),
+                            reference_venue=V, config=CFG)
+    if store.engine.dialect.name == "sqlite":
+        return  # SQLite checks foreign keys only once DA-5 turns them on; Postgres refuses the member below
+    with pytest.raises(IntegrityError):  # not in instruments
+        store.record_universe(V, day, CFG, [Member("DOGEUSDT", "DOGE", 1, D(1))], data_through=day - timedelta(days=1))
