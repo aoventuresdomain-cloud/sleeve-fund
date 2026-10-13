@@ -511,16 +511,22 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")
-        if not self.backtest and self.in_process_venue is not None:
-            # Paper's venue is simulated in the process, so orders still working when it stopped went
-            # with it; without this they would read "Working" for ever (review round 8, m8-9). Only where the
-            # venue's type says it ran in the process (Advisor 13 Oct 17:35 UK): never on testnet or live.
+        if not self.backtest:
+            # A watched stop (P1-U35) is the process's own watch, never a venue order, so it always went with the
+            # process. Paper's other orders went with it only where the venue's type says it ran in the process
+            # (Advisor 13 Oct 17:35 UK): never on testnet or live. Without this they would read "Working" for ever
+            # (review round 8, m8-9).
             down = self.store.last_event(self.name, ("owner_down",))
             seen = f" (owner_down event {down['id']})" if down is not None else ""
             for o in self.store.orders(self.name, statuses=OPEN_ORDER_STATUSES, limit=1000):
-                self.store.update_order(o["order_id"], status="canceled",
-                                        message="cancelled when the strategy restarted: paper's simulated venue "
-                                                f"({self.in_process_venue}) went with the process that sent it{seen}")
+                if (o.get("signal") or {}).get("watched"):
+                    self.store.update_order(o["order_id"], status="canceled", message="cancelled when the strategy "
+                                            "restarted: its stop was watched by the process before this one")
+                elif self.in_process_venue is not None:
+                    self.store.update_order(o["order_id"], status="canceled",
+                                            message="cancelled when the strategy restarted: paper's simulated venue "
+                                                    f"({self.in_process_venue}) went with the process that sent it"
+                                                    f"{seen}")
         self._owed_flatten = self._interrupted_flatten()
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
