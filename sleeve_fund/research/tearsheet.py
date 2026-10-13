@@ -576,6 +576,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                "Break-even fees in this table are interpolated between the cost ladder's rungs; the chosen "
                "settings' is re-run to verify it, as the cost ladder says.")
     out.append("")
+    if getattr(r, "ablation", None) is not None:
+        from sleeve_fund.research.ablation import section
+
+        out.extend(section(r.ablation))
     out.append("## Idea counter")
     out.append("")
     uncertain = f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""

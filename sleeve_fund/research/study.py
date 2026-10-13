@@ -201,6 +201,8 @@ class StudyResult:
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+    # The ablation report (research.ablation), when one was run for this definition: shown, never judged.
+    ablation: object = None
 
     @property
     def compare_returns(self) -> pd.Series:
