@@ -61,3 +61,20 @@ def test_neither_archiving_a_strategy_nor_a_reset_moves_the_fund(store):
     store.set_desired_state("flat", "stopped")
     store.archive("flat")
     assert fund_equity(store) == before  # put away, its 10,000 is the fund's still
+
+
+def test_retiring_a_strategy_leaves_the_fund_unchanged(store):
+    """HoE 13 Oct: a retired strategy's capital stays the fund's (unallocated cash) until the PM reallocates it. Retired
+    today is archived (runtime.RETIRED is the archived cause); lifecycle.move only rules on the move and writes nothing,
+    and neither starts a fresh run, so the strategy counts its start plus everything it made."""
+    from sleeve_fund import lifecycle
+
+    _trade(store, "spot", "BUY", 0.1, 60_000.0, 6.0, 1, T0)
+    _trade(store, "spot", "SELL", 0.1, 59_000.0, 5.9, 2, T0 + timedelta(minutes=5))  # flat, 111.9 down
+    before = fund_equity(store)
+    assert before == D("29888.1")
+    lifecycle.move(lifecycle.ACTIVE, lifecycle.RETIRED, lifecycle.PM, flat=True)
+    store.set_desired_state("spot", "stopped")
+    store.archive("spot")
+    assert "spot" not in store.reset_runs()
+    assert fund_equity(store) == before
