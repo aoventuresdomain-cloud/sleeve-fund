@@ -1638,6 +1638,17 @@ class Store:
                    "strategy's book", ts=arrived_at)
         return "differs", None
 
+    def open_baselines(self, sleeve: str) -> list[dict]:
+        """Settlements charged the baseline and neither trued up nor reversed yet, oldest first: what a strategy
+        with no process of its own is still owed a true-up on (Supervisor.true_up_stopped, CASH-4)."""
+        other = funding_t.alias("other")
+        done = (select(other.c.id).where(other.c.sleeve == funding_t.c.sleeve, other.c.ts == funding_t.c.ts,
+                                         other.c.kind.in_(("true_up", "reversal"))).exists())
+        q = (select(funding_t).where(funding_t.c.sleeve == sleeve, funding_t.c.kind == "baseline", ~done)
+             .order_by(funding_t.c.ts))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
     @staticmethod
     def _cash_moved_at(t):
         """When a row moved cash: a funding true-up at its arrival, everything else at its ts (CASH-4)."""

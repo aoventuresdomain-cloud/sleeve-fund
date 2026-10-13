@@ -138,3 +138,55 @@ def test_0016_migrated_funding_equals_create_alls(engine, tmp_path):
     Store(engine=fresh)
     assert migrated == shape(fresh)
     assert ("arrived_at", True) in migrated[0] and "funding_true_up_arrived" in migrated[1]
+
+
+def test_a_stopped_archived_strategy_still_books_a_true_up_that_arrives_after_it(store):
+    """HoE / PE1 (P2-6): retire stops the process but the journal stays writable; nothing in the writer looks at
+    the strategy's state."""
+    _charge(store)
+    store.set_desired_state("s", "stopped")
+    store.archive("s")
+    assert store.record_true_up("s", S, rate=0.0002, amount=D("-1.20"), arrived_at=ARRIVED) == ("new", D("-0.20"))
+    assert store.funding_total("s") == D("-1.20")
+
+
+def test_open_baselines_are_those_neither_trued_up_nor_reversed(store):
+    for h in (0, 8, 16):
+        _charge(store, ts=S + timedelta(hours=h))
+    _charge(store, kind="settled", ts=S + timedelta(hours=24))
+    store.record_true_up("s", S, rate=0.0002, amount=D("-1.20"), arrived_at=ARRIVED)
+    _charge(store, kind="reversal", amount="1.00", ts=S + timedelta(hours=8))
+    assert [r["ts"].replace(tzinfo=timezone.utc) for r in store.open_baselines("s")] == [S + timedelta(hours=16)]
+
+
+@pytest.fixture
+def stored_rates(monkeypatch):
+    """The collector's stored rates for the strategy's instrument, and terms naming a venue that publishes them."""
+    import pandas as pd
+
+    from sleeve_fund import funding, markets
+
+    kept = {}
+    monkeypatch.setattr(markets, "terms", lambda params, venue: type("T", (), {"funding_venue": "BINANCE"})())
+    monkeypatch.setattr(funding, "rates", lambda venue, pair, root=None: pd.Series(
+        list(kept.values()), index=pd.DatetimeIndex(list(kept), tz="UTC"), dtype=float))
+    return kept
+
+
+def test_with_no_process_the_supervisor_trues_up_once_the_rate_is_stored(store, stored_rates):
+    from sleeve_fund.supervisor import Proc, Supervisor, true_up_stopped
+
+    _charge(store)  # -1.00 at the baseline, on 0.1 at 60,000
+    store.set_desired_state("s", "stopped")
+    (s,) = store.sleeves()
+    assert true_up_stopped(store, s, ARRIVED) == 0  # not published yet: the baseline stays
+    stored_rates[S] = 0.0002
+    sup = Supervisor(store)
+    sup.procs["s"] = type("Alive", (Proc,), {"alive": property(lambda self: True)})()
+    sup.true_up_stopped()
+    assert _rows(store, "true_up") == []  # a running strategy trues up its own
+    sup.procs.clear()
+    sup.true_up_stopped()
+    (up,) = _rows(store, "true_up")
+    assert D(str(up.amount)) == D("-1.20") - D("-1.00") and up.rate == 0.0002
+    assert true_up_stopped(store, s, ARRIVED) == 0 and len(_rows(store, "true_up")) == 1  # once
