@@ -738,6 +738,7 @@ class LongFlatStrategy(Strategy):
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
+        self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -2462,6 +2463,11 @@ class LongFlatStrategy(Strategy):
             self._opened_in_bar = [o for o in self._opened_in_bar if o[0][1] > bar.ts_event]
             for window, qty in due:
                 self._fund_opened_in_bar(window, qty, bar.low.as_double(), bar.high.as_double())
+        if str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
+            # Before any hold, gap or stale check returns (CR W2-1): a bar held for missing minutes still closes the
+            # bar an entry may rest into, so a gated entry decided before it is cancelled now, never left resting on
+            # old prices.
+            self._cancel_gated_at_close(int(bar.ts_event))
         bar = self._first_bar_from_store(bar)
         if self._count_minutes(bar):
             return
@@ -2905,13 +2911,15 @@ class LongFlatStrategy(Strategy):
     def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
         """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
-        than was sized here, then call sent(trimmed). Exits and reductions never wait for it."""
-        if self._portfolio is None:
+        than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
+        portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
+        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation)."""
+        paper = self._paper_gated()
+        if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
             return
         from sleeve_fund.research.portfolio import Pending, fill_price
 
-        batch, name = self._portfolio
         if self._deciding_bar is not None:
             signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
         s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
@@ -2942,16 +2950,77 @@ class LongFlatStrategy(Strategy):
             self._noted.discard(f"{what}_trimmed_below_minimum")
             trimmed = approved != qty
             count("trimmed" if trimmed else "sent")
+            held = getattr(getattr(decision, "checked", None), "reservation", None) if paper is not None else None
             if not self._submit(side, approved, what, reason, {**signal, **({"portfolio_trimmed_from": str(qty)}
-                                                                              if trimmed else {})}):
+                                                                              if trimmed else {})}, reservation=held):
                 if hasattr(decision, "release"):
                     decision.release("reject")
                 return
-            self._hold_reservation(decision, self._last_submitted)
+            if paper is None:
+                self._hold_reservation(decision, self._last_submitted)
             if sent is not None:
                 sent(trimmed)
 
+        if paper is not None:
+            # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
+            # decision; a refusal's reason is on that row and in the strategy's events.
+            decision = paper(self.runtime.name, {**intent, "bar": self._deciding[0] if self._deciding else None},
+                             self.clock.timestamp_ns())
+            if decision.approved_qty > 0:
+                self._noted.discard(f"{what}_refused_by_portfolio")
+                send(intent, decision)
+            else:
+                count("refused")
+                self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+            return
+        batch, name = self._portfolio
         batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+
+    def _resting_entry_terms(self):
+        """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
+        the venue's minimum lead on a short bar, or good-till-cancelled with the backstop note on a venue without it."""
+        from sleeve_fund.paper.orphan_guard import resting_entry_order
+        from sleeve_fund.venues import venue
+
+        try:
+            lead = venue(str(self._cfg.instrument_id.venue)).gtd_min_lead
+        except ValueError:  # a venue with no profile (a test's): no good-till-date assumed, the backstops cover it
+            lead = None
+        return resting_entry_order(gtd_supported=lead is not None, decision_close=_utc(self._deciding[0]),
+                                   bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
+                                   now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
+
+    def _paper_gated(self):
+        """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a
+        backtest, a portfolio run's batch, or a journal without the gate)."""
+        rt = self.runtime
+        if self._portfolio is not None or rt is None or rt.backtest or not getattr(rt.store, "portfolio_gate", False):
+            return None
+        if self._paper_gate is None:
+            from sleeve_fund.paper.portfolio_gate import paper_gate
+
+            self._paper_gate = paper_gate(rt.store)
+        return self._paper_gate
+
+    def _cancel_gated_at_close(self, close_ns: int) -> None:
+        """Paper with the portfolio gate: at each bar close, every gated entry or addition still resting that was sent
+        before this close is cancelled (Advisor 8 Oct 06:10 UK: an entry never rests past the bar after the one it
+        was decided on). The venue's confirmed cancel releases what is left of its reservation as 'cancel'; a
+        part-filled one keeps what filled, with its stop. Until then it stays reserved, past the TTL (HoQA w1g)."""
+        if self._paper_gated() is None or not (found := self._resting_openers()):
+            return
+        from sleeve_fund.paper.portfolio_gate import resting_entries
+
+        resting, kept = found
+        rt = self.runtime
+        due = set(resting_entries(rt.store, rt.name, _utc(close_ns)))
+        why = "cancelled at the next bar close: an entry never rests past the bar after it was decided"
+        for order in resting:
+            if str(order.client_order_id) in due:
+                self.cancel_order(order.client_order_id)
+        for coid in kept:
+            if coid in due:
+                self._close_kept(coid, why)
 
     def _hold_reservation(self, gated, coid: str) -> None:
         """A portfolio run: the gate's reservation for an order now sent lives as long as the order (gate.check_order).
@@ -2977,12 +3046,14 @@ class LongFlatStrategy(Strategy):
         gated.release("fill" if status == OrderStatus.FILLED else
                       "reject" if status in (OrderStatus.REJECTED, OrderStatus.DENIED) else "cancel")
 
-    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False) -> bool:
+    def _submit(self, side, qty: Decimal, intent: str, reason: str, signal: dict, market: bool = False,
+                reservation: int | None = None) -> bool:
         """Send an order with its reason journaled. An order that opens or adds is on record before the venue sees
         it, or not sent (a failed write raises here); paper's queued journal sends an exit or stop whatever
         happens to its row, and an unwritten row is an incident (paper.queued, QA P1-L5). With
         maker_wait_minutes set, signal-driven orders rest as post-only limits first. An order that would open or
-        add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent."""
+        add while nothing may (CHOKE) is not sent, and says why once; returns whether it was sent. reservation: the
+        paper portfolio gate's, journaled with the order (_send_entry)."""
         if (why := self._gated(side, intent)) is not None:
             self.runtime.refused(why, f"{intent} {side.name.lower()} {qty} would open or add to the position")
             return False
@@ -3002,8 +3073,16 @@ class LongFlatStrategy(Strategy):
         reduce = self._margin and intent not in OPENING_INTENTS
         if maker:
             px = Price(self._maker_price(side, last, tick), self.instrument.price_precision)
+            tif, expires = TimeInForce.GTC, None
+            if intent in OPENING_INTENTS and not self._backtest and self._deciding is not None:
+                tif, expires, note = self._resting_entry_terms()
+                if expires is not None:
+                    signal["expires"] = expires.isoformat()
+                if note is not None:
+                    signal["resting_note"] = note
+                    self._note("resting_entry_no_gtd", note, level="info")
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
-                                             price=px, time_in_force=TimeInForce.GTC, post_only=True,
+                                             price=px, time_in_force=tif, expire_time=expires, post_only=True,
                                              reduce_only=reduce)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
         else:
@@ -3033,7 +3112,8 @@ class LongFlatStrategy(Strategy):
             timing = {"bar_close": bar_close, "bar_recv": bar_recv, "decided": decided} if bar_close else None
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
-                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing)
+                                  order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing,
+                                  **({"reservation": reservation} if reservation is not None else {}))
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}

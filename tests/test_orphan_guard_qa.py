@@ -1,0 +1,313 @@
+"""QA Done-when cells for ORPHAN-GUARD (Head of QA, 8 Oct). Source: Advisor 06:15 UK 8 Oct, advisor-rulings.md, a MUST
+before any Strategy that uses resting entries starts on paper. PE2 builds it after W2.
+
+Every cell is a strict xfail on main. The ADAPTERS name what the build must provide, and PE2 renames them to the real
+entry points. The assertions change only through the HoQA. Run from a worktree's tests/ beside test_gate_ledger.py,
+on SQLite and on PG.
+
+  og1  First line. A resting entry is sent good-till-date, expiring at its decision bar's next close, where the venue
+       supports it. Where it doesn't, the order is still sent, and the run journals that only the backstops cover it.
+  og2  Backstop. Within 60 s of the owner going down (crash, stop, refused start), something alive (the supervisor's
+       'cancel' command) cancels each unfilled resting entry. The cancel is journalled. The reservation is kept until
+       the cancel is confirmed, then released as 'cancel'. A confirmed "not found" also releases it; nothing releases
+       blind.
+  og2c A "not found" plus a journalled fill for that order, in either order, converts the reservation once (released
+       as 'fill', never 'cancel') and triggers og5 (Advisor 06:20 UK).
+  og3  Restart reconcile cancels any leftover resting entry before the first new entry. Entries stay blocked until
+       every leftover's cancel is confirmed.
+  og4  An acked entry still resting at its bar close + 2 min raises one alert and blocks that Strategy's entries
+       (CHOKE names it) until it is cleared. Before + 2 min there is no alert. Other Strategies are not blocked.
+  og4b The + 2 min check runs in the supervisor and fires with the owner dead (Advisor 06:20 UK).
+  og5  An orphan that fills anyway, long or short, is closed by one reduce-only market order on the opposite side,
+       sent by the supervisor through the exit path (never gated). It is journalled as "orphan fill closed" and alerted,
+       once.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from test_gate_ledger import _drop_schemas, _store, _strategies  # noqa: F401
+
+from sleeve_fund.paper.runtime import entry_blocked
+
+BAR = timedelta(hours=1)
+CLOSE = datetime(
+    2026, 10, 8, 9, 0, tzinfo=UTC
+)  # the decision bar's close; the order rests into the next bar
+
+
+def cell(why: str):
+    return pytest.mark.xfail(strict=True, reason=f"ORPHAN-GUARD: {why}")
+
+
+# === ADAPTERS (PE2: rename to what you build; nothing below this block changes) =====================================
+
+
+def resting_entry_order(
+    *, gtd_supported: bool, decision_close: datetime, bar: timedelta
+):
+    """The resting (limit / post-only) entry order the engine builds for a decision at `decision_close`, on a venue
+    with or without good-till-date. Returns (time_in_force, expire_time or None, journal note or None)."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.resting_entry_order(
+        gtd_supported=gtd_supported, decision_close=decision_close, bar=bar
+    )
+
+
+def owner_down(store, name: str, at: datetime, how: str) -> None:
+    """The supervisor sees `name`'s process go down at `at` (how: 'crash', 'stop' or 'refused')."""
+    from sleeve_fund.paper import orphan_guard
+
+    orphan_guard.owner_down(store, name, at, how)
+
+
+def supervisor_pass(store, now: datetime) -> list[str]:
+    """One supervisor pass at `now`. Returns the order ids it asked the venue to cancel in this pass."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.supervisor_pass(store, now)
+
+
+def cancel_confirmed(store, order_id: str, *, not_found: bool = False) -> None:
+    """The venue's answer to a cancel: cancelled, or no such order."""
+    from sleeve_fund.paper import orphan_guard
+
+    orphan_guard.cancel_confirmed(store, order_id, not_found=not_found)
+
+
+def restart_reconcile(
+    store, name: str, now: datetime, venue_open: list[str]
+) -> list[str]:
+    """The owner's restart reconciliation, with the venue's open orders for it. Returns the ids it cancelled."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.restart_reconcile(store, name, now, venue_open)
+
+
+def resting_entry(
+    store, name: str, order_id: str, decision_close: datetime, side: str = "BUY"
+) -> int:
+    """An acked resting entry for `name` (a long's BUY or a short's SELL), decided at `decision_close`, holding its
+    reservation. Returns that id."""
+    from sleeve_fund.paper import orphan_guard
+
+    return orphan_guard.qa_resting_entry(
+        store, name, order_id, decision_close, side=side
+    )
+
+
+def orphan_fills(
+    store, name: str, order_id: str, qty: float, at: datetime, side: str = "BUY"
+) -> None:
+    """The venue fills an orphaned resting entry."""
+    store.book_fill(
+        name,
+        side=side,
+        qty=qty,
+        price=60000.0,
+        fee=0.1,
+        order_id=order_id,
+        trade_id="orphan-1",
+        ts=at,
+    )
+
+
+def is_reduce_only(store, order_id: str) -> bool:
+    """Whether the close was sent reduce-only, as journalled (default: the order row's signal)."""
+    o = next(o for o in store.orders() if o["order_id"] == order_id)
+    return bool((o.get("signal") or {}).get("reduce_only"))
+
+
+def reservation_reason(store, rid: int) -> str | None:
+    from sqlalchemy import select
+
+    from sleeve_fund.store import gate_reservations_t
+
+    with store.engine.connect() as c:
+        return c.execute(
+            select(gate_reservations_t.c.release_reason).where(
+                gate_reservations_t.c.decision_id == rid
+            )
+        ).scalar()
+
+
+# =====================================================================================================================
+
+
+@pytest.fixture
+def store():
+    s = _store()
+    _strategies(s)
+    return s
+
+
+def _events(store, kind, name=None):
+    from sqlalchemy import select
+
+    from sleeve_fund.store import events_t
+
+    q = select(events_t).where(events_t.c.kind == kind)
+    with store.engine.connect() as c:
+        return [r for r in c.execute(q) if name is None or r.sleeve == name]
+
+
+def test_og1_a_resting_entry_is_sent_good_till_its_decision_bars_next_close():
+    tif, expires, note = resting_entry_order(
+        gtd_supported=True, decision_close=CLOSE, bar=BAR
+    )
+    assert str(tif).upper().endswith("GTD") and expires == CLOSE + BAR and note is None
+    tif, expires, note = resting_entry_order(
+        gtd_supported=False, decision_close=CLOSE, bar=BAR
+    )
+    assert not str(tif).upper().endswith("GTD") and expires is None
+    assert note and "backstop" in note.lower()
+
+
+@cell("nothing alive cancels a dead owner's resting entries")
+@pytest.mark.parametrize("how", ["crash", "stop", "refused"])
+def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancelled_by_the_supervisor(
+    store, how
+):
+    rid = resting_entry(store, "a", "o-rest", CLOSE)
+    other = resting_entry(
+        store, "b", "o-b", CLOSE
+    )  # another Strategy, alive: untouched
+    down = CLOSE + timedelta(minutes=10)
+    owner_down(store, "a", down, how)
+    asked = []
+    for s in range(0, 61, 5):
+        asked += supervisor_pass(store, down + timedelta(seconds=s))
+    assert asked.count("o-rest") >= 1 and "o-b" not in asked
+    assert reservation_reason(store, rid) is None  # kept until the venue confirms
+    assert _events(store, "orphan_cancel", "a")  # journalled
+    cancel_confirmed(store, "o-rest")
+    assert (
+        reservation_reason(store, rid) == "cancel"
+        and reservation_reason(store, other) is None
+    )
+
+
+@cell("nothing alive cancels a dead owner's resting entries")
+def test_og2b_a_confirmed_not_found_releases_and_an_unanswered_cancel_never_releases_blind(
+    store,
+):
+    gone = resting_entry(store, "a", "o-gone", CLOSE)
+    silent = resting_entry(store, "a", "o-silent", CLOSE)
+    down = CLOSE + timedelta(minutes=10)
+    owner_down(store, "a", down, "crash")
+    for s in range(0, 600, 5):
+        supervisor_pass(store, down + timedelta(seconds=s))
+        if s == 30:
+            cancel_confirmed(store, "o-gone", not_found=True)
+    assert reservation_reason(store, gone) == "cancel"
+    assert (
+        reservation_reason(store, silent) is None
+    )  # ten minutes unanswered: still held
+
+
+@cell("nothing alive cancels a dead owner's resting entries")
+@pytest.mark.parametrize("fill_first", [True, False])
+def test_og2c_not_found_with_a_journalled_fill_converts_once_and_closes_the_orphan_never_releases(
+    store, fill_first
+):
+    """Advisor 06:20 UK: a "not found" for an order that the journal shows filled is a fill. The reservation turns
+    into the holding once (released as 'fill', never 'cancel'), and og5 closes it. This holds whichever arrives first."""
+    rid = resting_entry(store, "a", "o-rest", CLOSE)
+    down = CLOSE + timedelta(minutes=10)
+    owner_down(store, "a", down, "crash")
+    supervisor_pass(store, down + timedelta(seconds=5))
+    steps = [
+        lambda: orphan_fills(store, "a", "o-rest", 0.1, down + timedelta(seconds=10)),
+        lambda: cancel_confirmed(store, "o-rest", not_found=True),
+    ]
+    for step in steps if fill_first else steps[::-1]:
+        step()
+    for s in range(15, 90, 5):
+        supervisor_pass(store, down + timedelta(seconds=s))
+    assert reservation_reason(store, rid) == "fill"
+    closes = [o for o in store.orders("a") if o["order_id"] != "o-rest"]
+    assert (
+        len(closes) == 1
+        and closes[0]["side"] == "SELL"
+        and float(closes[0]["qty"]) == 0.1
+    )
+    assert len(_events(store, "orphan_fill_closed", "a")) == 1
+
+
+@cell("restart reconcile doesn't cancel leftover resting entries first")
+def test_og3_restart_reconcile_cancels_leftovers_before_any_new_entry(store):
+    rid = resting_entry(store, "a", "o-left", CLOSE)
+    now = CLOSE + timedelta(minutes=20)
+    assert restart_reconcile(store, "a", now, venue_open=["o-left"]) == ["o-left"]
+    blocked, why = entry_blocked(store, "a", now)
+    assert blocked and "resting" in why.lower()
+    cancel_confirmed(store, "o-left")
+    assert reservation_reason(store, rid) == "cancel"
+    assert not entry_blocked(store, "a", now + timedelta(seconds=1))[0]
+
+
+@cell("nothing alerts on, or blocks for, an entry resting past its bar")
+def test_og4_an_entry_still_resting_at_bar_close_plus_2_min_alerts_once_and_blocks_only_its_strategy(
+    store,
+):
+    resting_entry(store, "a", "o-rest", CLOSE)
+    due = CLOSE + BAR + timedelta(minutes=2)
+    supervisor_pass(store, due - timedelta(seconds=5))
+    assert not _events(store, "resting_entry_orphaned")
+    for s in range(0, 30, 5):
+        supervisor_pass(store, due + timedelta(seconds=s))
+    assert len(_events(store, "resting_entry_orphaned", "a")) == 1
+    blocked, why = entry_blocked(store, "a", due + timedelta(seconds=31))
+    assert blocked and "resting" in why.lower()
+    assert not entry_blocked(store, "b", due + timedelta(seconds=31))[0]
+    cancel_confirmed(store, "o-rest")
+    supervisor_pass(store, due + timedelta(seconds=40))
+    assert not entry_blocked(store, "a", due + timedelta(seconds=41))[0]
+
+
+@cell("nothing alerts on, or blocks for, an entry resting past its bar")
+def test_og4b_the_bar_plus_2_min_check_runs_in_the_supervisor_and_fires_with_the_owner_dead(
+    store,
+):
+    """Advisor 06:20 UK: the check is the supervisor's, so a dead owner can't silence it."""
+    resting_entry(store, "a", "o-rest", CLOSE)
+    owner_down(store, "a", CLOSE + timedelta(minutes=5), "crash")
+    due = CLOSE + BAR + timedelta(minutes=2)
+    for s in range(0, 30, 5):
+        supervisor_pass(store, due + timedelta(seconds=s))
+    assert len(_events(store, "resting_entry_orphaned", "a")) == 1
+    blocked, why = entry_blocked(store, "a", due + timedelta(seconds=31))
+    assert blocked and "resting" in why.lower()
+
+
+@cell("an orphan fill is left open")
+@pytest.mark.parametrize(
+    "entry,close", [("BUY", "SELL"), ("SELL", "BUY")]
+)  # a long's and a short's orphan
+def test_og5_an_orphan_fill_is_closed_at_market_reduce_only_journalled_and_alerted_once(
+    store, entry, close
+):
+    resting_entry(store, "a", "o-rest", CLOSE, side=entry)
+    down = CLOSE + timedelta(minutes=10)
+    owner_down(store, "a", down, "crash")
+    orphan_fills(store, "a", "o-rest", 0.1, down + timedelta(seconds=20), side=entry)
+    for s in range(25, 90, 5):
+        supervisor_pass(store, down + timedelta(seconds=s))
+    closes = [o for o in store.orders("a") if o["order_id"] != "o-rest"]
+    assert len(closes) == 1, closes
+    c = closes[0]
+    assert (c["side"], c["order_type"], float(c["qty"])) == (close, "MARKET", 0.1)
+    assert c["intent"] in (
+        "exit",
+        "pm_flatten",
+        "risk_halt",
+    )  # the exit path, never an entry
+    assert is_reduce_only(store, c["order_id"])
+    assert len(_events(store, "orphan_fill_closed", "a")) == 1
+    assert any(
+        "orphan fill closed" in e.message.lower()
+        for e in _events(store, "orphan_fill_closed", "a")
+    )

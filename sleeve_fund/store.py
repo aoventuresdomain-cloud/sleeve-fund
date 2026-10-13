@@ -683,6 +683,7 @@ ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "cancel
                   "triggered")
 FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
+GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
 
@@ -1080,9 +1081,11 @@ class Store:
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
                      signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
-                     timing: dict | None = None) -> None:
+                     timing: dict | None = None, reservation: int | None = None) -> None:
         """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
-        order_timings row in the same transaction, so that row never exists without its order (DA-8)."""
+        order_timings row in the same transaction, so that row never exists without its order (DA-8).
+        reservation: the portfolio gate's reservation this entry holds (its gate_decisions id), linked to the order
+        (gate_decisions.order_id) in the same transaction, so the order's fills and end settle it (P2-1b W2)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -1094,6 +1097,9 @@ class Store:
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
+            if reservation is not None:
+                with self._gate_ledger().using(c):
+                    self._gate_ledger().attach_order(reservation, order_id)
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
         """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
@@ -1134,8 +1140,37 @@ class Store:
             self._update_order(c, order_id, status=status, message=message, fill_qty=fill_qty, fill_px=fill_px,
                                fee=fee, qty=qty, intent=intent)
 
-    @staticmethod
-    def _update_order(c, order_id: str, *, status: str | None = None, message: str | None = None,
+    def _gate_ledger(self):
+        """The portfolio gate's journal half, for settling a reservation inside an order's own transaction. One per
+        store: DbLedger.using() is per thread. Imported here: gate_ledger imports this module."""
+        led = self.__dict__.get("_settle_ledger")
+        if led is None:
+            from sleeve_fund.gate_ledger import DbLedger
+
+            def no_book():
+                raise RuntimeError("settling a reservation never reads the book")
+            led = self.__dict__["_settle_ledger"] = DbLedger(self, no_book)
+        return led
+
+    def _settle_reservation(self, c, order_id: str, fill_qty, status: str | None) -> None:
+        """An entry's fills and end settle the reservation it holds, in the order's own transaction (HoQA w2b, w2c):
+        a fill reduces it (filled to nothing, it is released as 'fill'); a filled order releases what is left as
+        'fill', a rejected or denied one as 'reject', a cancelled or expired one as 'cancel' (a part-filled one keeps
+        what filled: its position is in the book). A failed write raises, so the fill or status isn't written either."""
+        d, r = gate_decisions_t, gate_reservations_t  # the decision that reserved (a fill-stage check reserves nothing)
+        rid = c.execute(select(d.c.id).join(r, r.c.decision_id == d.c.id).where(d.c.order_id == order_id)).scalar()
+        if rid is None:
+            return
+        led = self._gate_ledger()
+        with led.using(c):
+            if fill_qty:
+                led.reduce(rid, fill_qty)
+            reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "canceled": "cancel",
+                      "expired": "cancel"}.get(status)
+            if reason is not None:
+                led.release(rid, reason)
+
+    def _update_order(self, c, order_id: str, *, status: str | None = None, message: str | None = None,
                       fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
                       qty: float | None = None, intent: str | None = None) -> None:
         """update_order's change, inside the caller's transaction."""
@@ -1159,6 +1194,8 @@ class Store:
         if intent is not None:
             values["intent"] = intent
         c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
+        if row.intent in GATED_INTENTS and (fill_qty or values.get("status", row.status) != row.status):
+            self._settle_reservation(c, order_id, fill_qty, values.get("status"))
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
