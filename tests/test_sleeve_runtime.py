@@ -750,7 +750,8 @@ def test_orders_by_intent_and_funding_and_insurance_before_a_time_are_read_in_th
     assert {o["order_id"] for o in j.orders("s1", intents=("liquidation",))} == {"o1", "o3"}
     for h, amount in ((0, 1.5), (8, -0.5), (16, 2.0)):
         j.record_funding("s1", qty=1.0, price=100.0, rate=0.0001, amount=amount, ts=t0 + timedelta(hours=h))
-        j.record_insurance("s1", price=100.0, amount=amount * 10, ts=t0 + timedelta(hours=h))
+        j.record_insurance("s1", price=100.0, amount=amount * 10, ts=t0 + timedelta(hours=h), order_id=f"o{h}",
+                           trade_id="t")
     cut = t0 + timedelta(hours=16)
     assert j.funding_total("s1", before=cut) == pytest.approx(1.0) and j.funding_total("s1") == pytest.approx(3.0)
     assert j.insurance_total("s1", before=cut) == pytest.approx(10.0) and j.insurance_total("s1") == pytest.approx(30.0)

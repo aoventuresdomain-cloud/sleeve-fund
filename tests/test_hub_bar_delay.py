@@ -157,3 +157,73 @@ def test_the_parity_report_flags_an_instrument_whose_late_trades_pass_the_widen_
     assert LATE_ALERT_RATE == 0.0005
     assert "**ETH/USDT**: LATE TRADES ABOVE 0.05% (0.060%)" in md
     assert "**BTC/USDT**: LATE" not in md and "**SOL/USDT**: LATE" not in md
+
+
+def test_a_hub_restart_starts_the_late_count_afresh_and_the_report_says_how_long_it_covers(tmp_path):
+    """HUB-LATE-01: the counts start from nothing at each hub start, so the hub writes when it began counting and the
+    parity report shows that window; under 24 h the late share is not proven, however clean it looks."""
+    from sleeve_fund.hub.relay import late_since_path
+    from sleeve_fund.parity import Parity, late_counts, late_since, markdown
+
+    path = tmp_path / "hub-late-BINANCE.json"
+    store = type("S", (), {"root": tmp_path})()
+    first, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 - 30 * 3600 * 10**9)
+    first.late_path = path
+    first.on_trade(_trade(T0 + 1 * MS))
+    first.on_trade(_trade(T0 - 2 * MINUTE_NS))  # its minute already stored: late
+    first._write_late()
+    assert late_counts(store, "BINANCE") == {"BTC/USDT": (1, 2)}
+    (since, until), = late_since(store, "BINANCE").values()
+    assert since == pd.Timestamp(T0 - 30 * 3600 * 10**9, unit="ns", tz="UTC") and until is not None
+
+    restarted, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 + 5 * MINUTE_NS)  # a deploy restarts the hub
+    restarted.late_path = path
+    restarted.on_trade(_trade(T0 + 5 * MINUTE_NS + 1 * MS))
+    restarted._write_late()
+    assert late_counts(store, "BINANCE") == {"BTC/USDT": (0, 1)}
+    since, _ = late_since(store, "BINANCE")["BTC/USDT"]
+    assert since == pd.Timestamp(T0 + 5 * MINUTE_NS, unit="ns", tz="UTC") and late_since_path(path).exists()
+
+    end = pd.Timestamp(T0 + 15 * MINUTE_NS, unit="ns", tz="UTC")
+    md = markdown("the venue", [Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 1),
+                                       late_since=since)])
+    assert "0 of 1 (0.000%) over 0.2 h: not proven" in md
+    assert "**BTC/USDT**: late trades counted for 0.2 h" in md and "the late share is not proven" in md
+
+
+def test_a_late_share_counted_over_24_hours_is_reported_without_the_not_proven_mark():
+    from sleeve_fund.parity import Parity, markdown
+
+    end = pd.Timestamp("2026-10-14 15:00", tz="UTC")
+    day = Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(2, 180_000),
+                 late_since=end - pd.Timedelta("26h"))
+    unknown = Parity("ETH/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 790))  # an older hub: no window
+    md = markdown("the venue", [day, unknown])
+    assert "2 of 180000 (0.001%) over 26.0 h |" in md and "**BTC/USDT**: late trades counted" not in md
+    assert "0 of 790 (0.000%), counting window unknown: not proven" in md
+    assert "**ETH/USDT**: late trades counted for an unknown time" in md
+
+
+def test_counts_last_written_long_before_the_report_cover_only_until_that_write():
+    """PE2 (HUB-LATE-COVER): a hub that stopped 2 h after it started, read 30 h later, covered 2 h, not 30."""
+    from sleeve_fund.parity import Parity, markdown
+
+    end = pd.Timestamp("2026-10-14 15:00", tz="UTC")
+    since = end - pd.Timedelta("30h")
+    stale = Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 200_000), late_since=since,
+                   late_until=since + pd.Timedelta("2h"))
+    md = markdown("the venue", [stale])
+    assert "0 of 200000 (0.000%) over 2.0 h: not proven" in md
+    assert "**BTC/USDT**: late trades counted for 2.0 h" in md and "under 24 h, so the late share is not proven" in md
+
+
+def test_a_day_with_too_few_trades_to_show_the_bar_is_not_proven():
+    """PE2: with none late in n trades the 95% bound is 3/n, under 0.05% only from 6,000 trades."""
+    from sleeve_fund.parity import Parity, markdown
+
+    end = pd.Timestamp("2026-10-14 15:00", tz="UTC")
+    quiet = Parity("SUI/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 5_000),
+                   late_since=end - pd.Timedelta("26h"), late_until=end)
+    md = markdown("the venue", [quiet])
+    assert "0 of 5000 (0.000%) over 26.0 h: not proven" in md
+    assert "over 5,000 trades: under 6,000 trades, so the late share is not proven" in md
