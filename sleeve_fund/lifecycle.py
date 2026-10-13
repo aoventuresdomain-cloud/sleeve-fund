@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sleeve_fund.money import money, scale
 
@@ -99,7 +100,8 @@ class Move:
 
 def close_now(current: str, actor: str, now: datetime, *, flat: bool) -> Move:
     """The PM's "close now", from active or winding down. Flat: retired at once. Holding: winding down with the
-    deadline now, so due() flattens it at the next bar close and retires it once flat."""
+    deadline now: the paper runtime flattens it at market on the first fresh price after (Advisor 13 Oct 20:30 UK, P26-2)
+    and retires it once flat."""
     _utc("now", now)
     if flat:
         return Move(move(current, RETIRED, actor, flat=True), None)
@@ -158,6 +160,41 @@ def due(lifecycle: str, started: datetime | None, deadline_at: datetime | None, 
     if not noticed and now - started >= (deadline_at - started) * NOTICE_AT:
         return NOTICE
     return NONE
+
+
+UK = ZoneInfo("Europe/London")
+
+
+def stamp(t: datetime) -> str:
+    """A time for the journal: UTC, and UK time for the PM."""
+    _utc("t", t)
+    return f"{t:%d %b %Y %H:%M} UTC ({t.astimezone(UK):%H:%M} UK)"
+
+
+def span(d: timedelta) -> str:
+    """A wind-down window in days and hours, e.g. "3 days 6 h"."""
+    days, hours = d.days, round(d.seconds / 3600)
+    out = f"{days} day{'' if days == 1 else 's'}"
+    return out + (f" {hours} h" if hours else "")
+
+
+def moved_words(current: str, to: str, action: str, deadline_at: datetime | None, held) -> str:
+    """The lifecycle event's words for a PM move (Store.set_lifecycle)."""
+    if to == RETIRED:
+        return ("Retired by the PM" + (" with close now" if action == "close_now" else "")
+                + f", flat, from {current.replace('_', ' ')}. It never trades again.")
+    if action == "close_now":
+        return (f"Close now: winding down with its deadline now; holding {held:g}, it is flattened at market on the "
+                f"first fresh price and retired once flat.")
+    return (f"Winding down: it opens nothing new, its exits and stops keep running, and it must be flat by "
+            f"{stamp(deadline_at)}.")
+
+
+def retired_words(how: str) -> str:
+    """The lifecycle event's words when a winding-down strategy is retired once flat (Store.complete_retire)."""
+    return {"flat": "Retired (flat): the wind-down the PM started ended with the position closed.",
+            "deadline": "Retired at the deadline: flattened when the wind-down's time ran out.",
+            "close_now": "Retired by close now: flattened at market on the first fresh price after the PM's close now."}[how]
 
 
 def can_open(lifecycle: str) -> bool:
