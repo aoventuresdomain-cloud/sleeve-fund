@@ -56,13 +56,13 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale")
+         "portfolio_stale", "resting_orphan")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
-          "portfolio_stale": "Portfolio unchecked"}
+          "portfolio_stale": "Portfolio unchecked", "resting_orphan": "Resting entry"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -175,13 +175,15 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
-                  since: datetime | None = None, portfolio: Why | None = None) -> tuple[bool, Why | None]:
+                  since: datetime | None = None, portfolio: Why | None = None,
+                  resting: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
     candle, no funding rate). `portfolio`: the whole fund's block (portfolio_block), which no Start or Resume of one
-    strategy clears. The why lists every cause that applies (Advisor 00:20). The engine checks every order
+    strategy clears. `resting`: ORPHAN-GUARD's block for a resting entry left over or past its bar (resting_block). The
+    why lists every cause that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
     causes = []
@@ -194,6 +196,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(RETIRED)
     if portfolio is not None:
         causes.append(portfolio)
+    if resting is not None:
+        causes.append(resting)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -311,7 +315,21 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     sleeve = store.sleeve(name)
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
-                         portfolio=portfolio_block(store, now))
+                         portfolio=portfolio_block(store, now), resting=resting_block(store, name, now))
+
+
+def resting_block(store, name: str, now: datetime | None = None) -> Why | None:
+    """ORPHAN-GUARD og3/og4 as a CHOKE cause (orphan_guard.resting_block), on a journal under the portfolio gate. One
+    that can't be read blocks, never an error out of CHOKE."""
+    from sleeve_fund.paper import orphan_guard
+
+    if not getattr(store, "portfolio_gate", False):
+        return None
+    try:
+        why = orphan_guard.resting_block(store, name, now or utcnow())
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        why = f"its resting entries couldn't be read ({type(exc).__name__}: {exc})"
+    return None if why is None else _cause("resting_orphan", why)
 
 
 def portfolio_block(store, now: datetime | None = None) -> Why | None:
@@ -404,6 +422,11 @@ class SleeveRuntime:
         # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
         self.book = self.store.journal_book(sleeve_name, sleeve.starting_balance)
         self.last_reconciled = None
+        # The kind of venue that ran inside this process (orphan_guard.in_process_kind: "sandbox", "backtest"), set
+        # from its type by whatever builds the node; None for a venue outside it, whose orders a restart never ends.
+        self.in_process_venue: str | None = None
+        # Whether this process holds the strategy's single-instance lock (single_lock.instance_lock); None: not taken.
+        self.sole_instance: bool | None = None
         self._day = None
         self._day_open = None
         self._last_equity = None
@@ -488,13 +511,16 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")
-        if not self.backtest:
+        if not self.backtest and self.in_process_venue is not None:
             # Paper's venue is simulated in the process, so orders still working when it stopped went
-            # with it; without this they would read "Working" for ever (review round 8, m8-9).
+            # with it; without this they would read "Working" for ever (review round 8, m8-9). Only where the
+            # venue's type says it ran in the process (Advisor 13 Oct 17:35 UK): never on testnet or live.
+            down = self.store.last_event(self.name, ("owner_down",))
+            seen = f" (owner_down event {down['id']})" if down is not None else ""
             for o in self.store.orders(self.name, statuses=OPEN_ORDER_STATUSES, limit=1000):
                 self.store.update_order(o["order_id"], status="canceled",
                                         message="cancelled when the strategy restarted: paper's simulated venue "
-                                                "went with the process that sent it")
+                                                f"({self.in_process_venue}) went with the process that sent it{seen}")
         self._owed_flatten = self._interrupted_flatten()
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
@@ -544,7 +570,9 @@ class SleeveRuntime:
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
                                      holds=self.holds, since=_halted_since(self.store, self.name, state),
-                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()))
+                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()),
+                                     resting=None if self.backtest else resting_block(self.store, self.name,
+                                                                                       self.now()))
         self._episode(why if blocked else None)
         return blocked, why
 

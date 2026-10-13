@@ -110,6 +110,9 @@ def replay(path: Path | str, with_fills: bool = False, store=None,
     runtime = SleeveRuntime(store, s["name"], tick_seconds=s["tick_seconds"])
     engine = BacktestEngine(BacktestEngineConfig(trader_id=TraderId.from_str("REPLAY-001"),
                                                  logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
+    from sleeve_fund.paper.orphan_guard import in_process_kind
+
+    runtime.in_process_venue = in_process_kind(engine)  # its simulated exchange runs in this process
     fee_model = ScheduleFeeModel(fees)
     try:
         perp = markets.is_perp(s["params"])  # on margin, as the paper node ran it

@@ -1950,6 +1950,15 @@ class Store:
             locked = c.execute(select(resets_t.c.restart).where(resets_t.c.id == request["id"]).with_for_update()).first()
             if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
                 request["restart"] = locked.restart
+            # F241-4: an open cancel would move with the run, archived, and the fresh run would trade with nothing
+            # blocking its entries while the venue may still fill that order. Read in this transaction, so a cancel
+            # requested since the supervisor's check (F241-3) is caught too; nothing has been written yet.
+            pending = c.execute(select(commands_t.c.id).where(commands_t.c.sleeve == name,
+                                                              commands_t.c.command == CANCEL,
+                                                              commands_t.c.applied_at.is_(None))).first()
+            if pending is not None:
+                raise ValueError("a strategy with a cancel the venue hasn't answered can't be reset; it is reset once "
+                                 "the venue confirms the order cancelled or filled")
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",

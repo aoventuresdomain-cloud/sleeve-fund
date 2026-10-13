@@ -213,6 +213,11 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             balances = [Money(book["cash"], Currency.from_str(quote_code))]
             if book["qty"] > 0:
                 balances.append(Money(book["qty"], Currency.from_str(base_code)))
+    exec_factory = SandboxExecutionClientFactory()
+    if runtime is not None:  # its type, not a setting, says the venue runs inside this process (orphan_guard)
+        from sleeve_fund.paper.orphan_guard import in_process_kind
+
+        runtime.in_process_venue = in_process_kind(exec_factory)
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -222,7 +227,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         .add_data_client("HUB" if hub is not None else None, data_factory, data_config)
         .add_simulated_exec_client(
             profile.name,
-            SandboxExecutionClientFactory(),
+            exec_factory,
             SandboxExecutionClientConfig(
                 venue=venue,
                 starting_balances=balances,
@@ -314,7 +319,9 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.single_lock import INSTANCE_LOCK, duplicate_refused, instance_lock
 
         # One process per strategy (SINGLE-LOCK, Advisor 13 Oct 18:10 UK): a second one would double its orders and
-        # positions, so it stops here, before it connects to market data or the venue. Held for the process's life.
+        # positions, so it stops here, before it connects to market data or the venue. Held for the process's life: a
+        # restart may also release what the process before it left only once that one is gone (17:55), which a free
+        # lock proves.
         lock = instance_lock(args.db_sleeve)
         if lock is None:
             return duplicate_refused(store, args.db_sleeve)
@@ -327,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.queued import QueuedStore
 
         runtime = SleeveRuntime(QueuedStore(store), sleeve.name)  # journal writes off the decision path
+        runtime.instance_lock, runtime.sole_instance = lock, True
         perp = markets.terms(sleeve.params, sleeve.venue)
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
                     f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "

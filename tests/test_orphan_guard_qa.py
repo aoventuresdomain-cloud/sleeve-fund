@@ -234,7 +234,6 @@ def test_og1b_on_a_4h_bar_early_in_the_bar_the_expiry_is_the_next_close():
     assert str(tif).upper().endswith("GTD") and expires == CLOSE + timedelta(hours=4) and note is None
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
 @pytest.mark.parametrize("how", ["crash", "stop", "refused"])
 def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancelled_by_the_supervisor(
     store, how
@@ -258,7 +257,6 @@ def test_og2_within_60_s_of_the_owner_going_down_its_resting_entries_are_cancell
     )
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
 def test_og2b_not_found_releases_only_on_a_zero_fill_lookup_and_an_unanswered_cancel_never_releases_blind(
     store,
 ):
@@ -279,7 +277,6 @@ def test_og2b_not_found_releases_only_on_a_zero_fill_lookup_and_an_unanswered_ca
     )  # ten minutes unanswered: still held
 
 
-@cell("nothing alive cancels a dead owner's resting entries")
 @pytest.mark.parametrize("fill_first", [True, False])
 def test_og2c_not_found_with_a_journalled_fill_converts_once_and_closes_the_orphan_never_releases(
     store, fill_first
@@ -308,7 +305,6 @@ def test_og2c_not_found_with_a_journalled_fill_converts_once_and_closes_the_orph
     assert len(_events(store, "orphan_fill_closed", "a")) == 1
 
 
-@cell("restart reconcile doesn't cancel leftover resting entries first")
 def test_og3_restart_reconcile_cancels_leftovers_before_any_new_entry(store):
     rid = resting_entry(store, "a", "o-left", CLOSE)
     now = CLOSE + timedelta(minutes=20)
@@ -320,7 +316,6 @@ def test_og3_restart_reconcile_cancels_leftovers_before_any_new_entry(store):
     assert not entry_blocked(store, "a", now + timedelta(seconds=1))[0]
 
 
-@cell("nothing alerts on, or blocks for, an entry resting past its bar")
 def test_og4_an_entry_still_resting_at_bar_close_plus_2_min_alerts_once_and_blocks_only_its_strategy(
     store,
 ):
@@ -339,7 +334,6 @@ def test_og4_an_entry_still_resting_at_bar_close_plus_2_min_alerts_once_and_bloc
     assert not entry_blocked(store, "a", due + timedelta(seconds=41))[0]
 
 
-@cell("nothing alerts on, or blocks for, an entry resting past its bar")
 def test_og4b_the_bar_plus_2_min_check_runs_in_the_supervisor_and_fires_with_the_owner_dead(
     store,
 ):
@@ -361,7 +355,6 @@ def _closes(store, name="a", entry="o-rest"):
     return [o for o in store.orders(name) if o["order_id"] != entry]
 
 
-@cell("a \"not found\" bar-close cancel is not held, blocked and alerted until the venue lookup resolves it")
 def test_og6a_not_found_holds_blocks_only_its_strategy_and_a_found_fill_before_close_is_booked_and_kept(store):
     rid = resting_entry(store, "a", "o-rest", CLOSE)
     assert "o-rest" in bar_close_cancel(store, "a", END)
@@ -381,7 +374,6 @@ def test_og6a_not_found_holds_blocks_only_its_strategy_and_a_found_fill_before_c
     assert not entry_blocked(store, "a", END + timedelta(seconds=611))[0]
 
 
-@cell("a \"not found\" bar-close cancel is not held, blocked and alerted until the venue lookup resolves it")
 def test_og6b_not_found_alerts_once_at_bar_close_plus_2_min_and_releases_only_on_a_zero_fill_lookup(store):
     rid = resting_entry(store, "a", "o-rest", CLOSE)
     bar_close_cancel(store, "a", END)
@@ -400,7 +392,6 @@ def test_og6b_not_found_alerts_once_at_bar_close_plus_2_min_and_releases_only_on
     assert not entry_blocked(store, "a", at + timedelta(seconds=6))[0]
 
 
-@cell("a bar-close cancel that races a fill does not let the fill win under the bar-close time rule")
 @pytest.mark.parametrize("after_close", [False, True])
 def test_og6c_a_cancel_racing_a_fill_books_it_once_keeps_it_before_close_and_closes_it_at_market_after(
     store, after_close
@@ -425,7 +416,6 @@ def test_og6c_a_cancel_racing_a_fill_books_it_once_keeps_it_before_close_and_clo
     assert not entry_blocked(store, "a", END + timedelta(seconds=91))[0]  # the cancel record never stays open
 
 
-@cell("a bar-close cancel that races a fill does not let the fill win under the bar-close time rule")
 def test_og6d_a_partial_fill_then_a_confirmed_cancel_keeps_the_filled_part_and_releases_only_the_remainder(store):
     rid = resting_entry(store, "a", "o-rest", CLOSE)  # reserves 0.1
     orphan_fills(store, "a", "o-rest", 0.04, END - timedelta(seconds=20))
@@ -441,7 +431,6 @@ def test_og6d_a_partial_fill_then_a_confirmed_cancel_keeps_the_filled_part_and_r
     assert not entry_blocked(store, "a", END + timedelta(seconds=61))[0]
 
 
-@cell("an orphan fill is left open")
 @pytest.mark.parametrize(
     "entry,close", [("BUY", "SELL"), ("SELL", "BUY")]
 )  # a long's and a short's orphan

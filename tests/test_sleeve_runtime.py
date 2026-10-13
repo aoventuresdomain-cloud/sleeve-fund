@@ -439,9 +439,24 @@ def test_a_restart_closes_the_orders_the_last_process_left_working(store):
     rt.on_order(order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="Signal to be long", signal={},
                 order_type="POST-ONLY LIMIT")
     rt.on_order_status("O-1", "accepted")
-    SleeveRuntime(store, "s1").on_start(0.008)
+    again = SleeveRuntime(store, "s1")
+    again.in_process_venue = "sandbox"  # as the paper node sets it, from its Sandbox client's type
+    again.on_start(0.008)
     (o,) = store.orders("s1")
     assert o["status"] == "canceled" and "restarted" in o["message"]
+
+
+def test_a_restart_never_ends_orders_on_a_venue_outside_the_process(store):
+    """Advisor 13 Oct 17:35 UK: m8-9 holds only where the venue ran in the process, by its type; on a venue outside
+    it (testnet, live) the order may still be working there, so only that venue's own answer ends it."""
+    _sleeve(store)
+    rt = SleeveRuntime(store, "s1")
+    rt.on_order(order_id="O-1", side="BUY", qty=0.1, intent="entry", reason="Signal to be long", signal={},
+                order_type="POST-ONLY LIMIT")
+    rt.on_order_status("O-1", "accepted")
+    SleeveRuntime(store, "s1").on_start(0.008)
+    (o,) = store.orders("s1")
+    assert o["status"] == "accepted"
 
 
 @pytest.mark.parametrize("command", ["pause", "flatten"])
