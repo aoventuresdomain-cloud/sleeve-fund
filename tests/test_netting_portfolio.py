@@ -36,16 +36,17 @@ def test_every_strategys_sub_ledger_is_its_step_a_pnl(runs):
     assert set(gaps) == {"a", "b"} and all(abs(g) < 1e-6 for g in gaps.values())
 
 
-def test_sub_ledgers_plus_saving_plus_residual_are_the_account_to_the_cent_and_funding_goes_to_the_residual(runs):
-    """Advisor 13 Oct 20:25 UK: no funding saving line; the sub-ledgers' funding reconciles to the account's and the
-    difference is the residual, under the 5 bp rule. This window's funding is the baseline for a missing rate, which
-    both sides pay, so while the two are opposed the one account pays less than its Strategies did: that shows here."""
+def test_sub_ledgers_saving_baseline_and_residual_are_the_account_to_the_cent(runs):
+    """Advisor 13 Oct 20:25 and 20:55 UK: no funding saving line; this window's funding is the baseline for a missing
+    rate, which both sides pay, so while the two are opposed the account pays less than its Strategies did. That is the
+    conservative funding baseline line, by formula; the residual, measured without it, is rounding only."""
     n = runs[1].netting
-    total = n["sub_ledger_total"] + sum(n["saving"].values()) + n["residual"]["amount"]
+    line = n["conservative_funding_baseline"]
+    total = n["sub_ledger_total"] + sum(n["saving"].values()) + line + n["residual"]["amount"]
     assert round(total, 2) == round(n["account"], 2)
-    assert "funding" not in n["saving"]
-    assert round(n["residual"]["amount"], 2) == round(n["funding"]["account"] - n["funding"]["sub_ledgers"], 2)
-    assert n["residual"]["amount"] > 0 and n["residual"]["block"] is (n["residual"]["bp"] > 5)
+    assert "funding" not in n["saving"] and line > 0
+    assert line == pytest.approx(n["funding"]["account"] - n["funding"]["sub_ledgers"], abs=0.01)
+    assert abs(n["residual"]["amount"]) < 0.01 and n["residual"]["block"] is False
 
 
 # --- crossing intents, on legs built by hand: two Strategies deciding opposite ways on one bar ---------------------
@@ -89,6 +90,7 @@ def test_opposite_intents_on_one_bar_go_out_as_one_order_and_save_the_crossed_sp
     # crossed: the spread both sides of that unit would have paid alone (0.1 + 0.1); fee: 0.05 on each side of it
     assert n["saving"]["crossed"] == pytest.approx(0.2) and n["saving"]["fee"] == pytest.approx(0.1)
     assert n["residual"]["amount"] == pytest.approx(0, abs=1e-6) and n["residual"]["block"] is False
+    assert n["conservative_funding_baseline"] == 0  # no baseline settlement
     assert all(abs(g) < 1e-6 for g in n["sub_ledger_vs_step_a"].values())  # the sub-ledgers are step A's
 
 

@@ -12,9 +12,15 @@ saves goes to book-level lines, never to a Strategy:
 
 Funding has no saving line (Advisor 13 Oct 20:25 UK): it is linear in the position, so the net position pays what the
 virtual ones do but for each account's rounding (a baseline settlement for a missing rate, which both sides pay, is
-not linear: there the account pays less than its Strategies when they are opposed, and that shows in the residual). The account pays the net position's funding, the sub-ledgers carry
+not linear: see below). The account pays the net position's funding, the sub-ledgers carry
 their own, and any difference is part of the residual, under the same 5 bp rule. Netting saves fees, spread and margin;
 the margin is shown as information only, never as P&L.
+
+The one exception has its own line, never a plug (Advisor 13 Oct 20:55 UK): a settlement charged at the baseline for
+a missing rate, which every side pays and none receives (Advisor 6 Oct, D9), is not linear, so Strategies opposed
+there pay more than the one account would. "Conservative funding baseline" = each sub-ledger's baseline charge on its
+own position less what the account would pay on its net position at the same baseline, by formula, settlement by
+settlement. It is 0 when every rate is present, and the residual is measured without it.
 
 A bar whose intents all go one way crosses nothing: the account sends what step A sent, at step A's own prices and fees,
 and nothing is saved. Where intents cross, the net order is priced with step A's own fill model for a market order
@@ -108,6 +114,11 @@ class Shadow:
     book: tuple[dict, ...]
     account: Decimal
     account_funding: Decimal = ZERO
+    # The conservative funding baseline line's rows ({instrument, ts, kind, amount}), + where the account pays less
+    baseline: tuple[dict, ...] = ()
+
+    def baseline_total(self) -> Decimal:
+        return sum((r["amount"] for r in self.baseline), ZERO)
 
     def strategy_cash(self) -> dict[str, Decimal]:
         out: dict[str, Decimal] = defaultdict(lambda: ZERO)
@@ -189,22 +200,29 @@ def shadow(fills: Iterable[Fill], funding: Iterable[Funding], mark: Callable[[st
     for r in funding:
         settlements[(r.ts, r.instrument)].append(r)
     positions = _positions(fills)
+    baseline = []
     for (ts, instrument), rows in sorted(settlements.items()):
         rate, m, pos = rows[0].rate, rows[0].mark, positions(instrument, ts)
         owed = -abs(rate * pos * m) if rows[0].both_pay else -rate * pos * m
         net_funding += owed.quantize(funding_quantum)
+        if rows[0].both_pay:
+            alone = sum((abs(rate * positions(instrument, ts, r.strategy) * m) for r in rows), ZERO)
+            if alone != abs(rate * pos * m):
+                baseline.append({"instrument": instrument, "ts": ts, "kind": "conservative_funding_baseline",
+                                 "amount": alone - abs(rate * pos * m)})
     account = sum((o.cash for o in orders), ZERO) + net_funding
-    return Shadow(orders, tuple(sub), tuple(book), account, net_funding)
+    return Shadow(orders, tuple(sub), tuple(book), account, net_funding, tuple(baseline))
 
 
-def _positions(fills: list[Fill]) -> Callable[[str, int], Decimal]:
-    """The account's net position in an instrument just before `ts` (a settlement sees the fills decided before it)."""
+def _positions(fills: list[Fill]) -> Callable[..., Decimal]:
+    """The account's net position in an instrument just before `ts` (a settlement sees the fills decided before it),
+    or one Strategy's virtual position when `strategy` is given."""
     by_inst: dict[str, list[Fill]] = defaultdict(list)
     for f in sorted(fills, key=lambda f: f.ts):
         by_inst[f.instrument].append(f)
 
-    def at(instrument: str, ts: int) -> Decimal:
-        return sum((f.qty for f in by_inst[instrument] if f.ts < ts), ZERO)
+    def at(instrument: str, ts: int, strategy: str | None = None) -> Decimal:
+        return sum((f.qty for f in by_inst[instrument] if f.ts < ts and strategy in (None, f.strategy)), ZERO)
 
     return at
 

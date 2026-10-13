@@ -117,3 +117,22 @@ def test_opposed_exposure_is_the_share_of_the_pairs_gross_that_cancels():
     got = opposed_exposure(fills, mark, [T])
     assert got[("A", "B")] == pytest.approx(2 * 100 / 300)
     assert got[("A", "C")] == 0.0 and got[("B", "C")] == pytest.approx(1.0)
+
+
+def test_the_conservative_funding_baseline_is_its_own_line_by_formula_and_nil_with_every_rate_present():
+    """Advisor 13 Oct 20:55 UK: at a baseline settlement (a missing rate, every side pays) opposed Strategies pay more
+    than the account on its net; that difference is a named line by formula, never a plug, and the residual is
+    measured without it."""
+    fills = [alone("A", 2), alone("B", -1)]
+    rows = [Funding("A", "BTC", T + 1, D("0.0001"), D(100), D("-0.02"), both_pay=True),
+            Funding("B", "BTC", T + 1, D("0.0001"), D(100), D("-0.01"), both_pay=True)]  # B short pays too
+    s = shadow(fills, rows, mark, half, TAKER)
+    (line,) = s.baseline
+    assert line["kind"] == "conservative_funding_baseline" and line["amount"] == D("0.02")  # 0.03 alone, 0.01 net
+    assert s.account_funding == D("-0.01")
+    rec = reconcile(sum(s.strategy_cash().values()), sum(s.saving().values()) + s.baseline_total(), s.account,
+                    D(10_000))
+    assert rec["amount"] == 0 and not rec["block"]
+    signed = [Funding("A", "BTC", T + 1, D("0.0001"), D(100), D("-0.02")),
+              Funding("B", "BTC", T + 1, D("0.0001"), D(100), D("0.01"))]
+    assert shadow(fills, signed, mark, half, TAKER).baseline == ()  # every rate present: nil

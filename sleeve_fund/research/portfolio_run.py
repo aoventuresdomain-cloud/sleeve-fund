@@ -376,16 +376,19 @@ def netting_shadow(results: dict[str, BacktestResult], specs: list[LegSpec], hou
       close) moved by the half spread that bar's market fills paid.
     - Funding: each leg's own payments; the account pays the settlement's rate on the net position. Linear in the
       position, so there is no funding saving line: the difference is rounding, left to the residual (Advisor 13 Oct
-      20:25 UK).
+      20:25 UK), but for the baseline for a missing rate, which has its own line (below).
 
     Returns:
     - saving: the book's lines by kind (crossed, fee), each + where the account saved;
     - account, sub_ledger_total: the account's cash move and the sub-ledgers' summed; funding: the account's funding
-      and the sub-ledgers', which reconcile to within the residual;
+      and the sub-ledgers', which reconcile to within the residual once the next line is taken out;
+    - conservative_funding_baseline: on settlements charged the baseline for a missing rate (every side pays), the
+      sub-ledgers' charges less the account's on its net position, by formula (Advisor 13 Oct 20:55 UK); 0 when every
+      rate is present;
     - crossed_notional: the volume matched inside the account instead of sent, at its mark;
     - orders_sent / orders_alone: net orders with something to send, against step A's fills;
-    - residual: reconcile() of the sub-ledgers and the book's lines against the account, from the fund's starting
-      equity: here the funding's rounding only (the account is built from the same fills); on paper it bites against
+    - residual: reconcile() of the sub-ledgers, the book's lines and the baseline line against the account, from the
+      fund's starting equity: here the funding's rounding only (the account is built from the same fills); on paper it bites against
       the venue's own account;
     - sub_ledger_vs_step_a: per Strategy, its sub-ledger P&L (cash plus the open position at the last close) less its
       step A equity change, which should be nil but for float rounding;
@@ -432,13 +435,16 @@ def netting_shadow(results: dict[str, BacktestResult], specs: list[LegSpec], hou
     saving = sh.saving()
     sub = sh.strategy_cash()
     equity = sum((_exact(s.capital) for s in specs), _exact(unallocated))
-    residual = nt.reconcile(sum(sub.values(), Decimal(0)), sum(saving.values(), Decimal(0)), sh.account, equity)
+    # The residual is measured without the conservative funding baseline line (Advisor 13 Oct 20:55 UK)
+    residual = nt.reconcile(sum(sub.values(), Decimal(0)), sum(saving.values(), Decimal(0)) + sh.baseline_total(),
+                            sh.account, equity)
     # Just after each day's close (1 us), so a flip at the close counts as the position it left
     days = sorted({int(t.value) + 1_000 for h in hours.values() for t in h.index if t.value % DAY_NS == 0})
     price = _closes_at(specs, hours)
     return {
         "saving": {k: float(v) for k, v in saving.items()},
         "account": float(sh.account), "sub_ledger_total": float(sum(sub.values(), Decimal(0))),
+        "conservative_funding_baseline": float(sh.baseline_total()),
         "funding": {"account": float(sh.account_funding),
                     "sub_ledgers": float(sum((r.amount for r in funding), Decimal(0)))},
         "crossed_notional": float(sum((o.crossed * mark(o.instrument, o.ts) for o in sh.orders), Decimal(0))),
