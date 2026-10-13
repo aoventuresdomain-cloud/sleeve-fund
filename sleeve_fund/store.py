@@ -66,6 +66,9 @@ RELOAD = "reload"
 # 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
 # venue has answered.
 CANCEL = "cancel"
+# How long a cancel answered "not found" waits with no fill in the journal before its reservation is released (PE2
+# 13 Oct; the Advisor to confirm): a fill the venue sends late still lands inside it.
+CANCEL_CONFIRM = timedelta(seconds=60)
 # Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0015).
 COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
@@ -221,6 +224,10 @@ commands_t = Table(
     Column("order_id", String(64), ForeignKey("orders.order_id", ondelete="RESTRICT")),
     CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
     CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
+    # When the venue first answered a cancel "not found" with no fill in the journal: no proof of a cancel (Advisor 8 Oct
+    # 06:20 UK), so nothing is released until CANCEL_CONFIRM has passed with still no fill (Store.confirm_cancels).
+    Column("not_found_at", TS),
+    CheckConstraint(f"not_found_at IS NULL OR command = '{CANCEL}'", name="commands_not_found_cancel"),
     # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
     Index("commands_cancel_open", "order_id", unique=True,
           postgresql_where=text(f"command = '{CANCEL}' AND applied_at IS NULL"),
@@ -2548,18 +2555,22 @@ class Store:
             return _rows(c.execute(q.order_by(commands_t.c.id)))
 
     def apply_cancel(self, command_id: int, outcome: str) -> str:
-        """The venue's answer to a cancel, in one transaction. outcome "cancelled" (confirmed) or "not_found".
+        """The venue's answer to a cancel, in one transaction: "cancelled" (confirmed), "not_found" or "filled".
 
-        "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK): the fill journal is read first, and if the order
-        filled at all, nothing is written and "filled" is returned: the caller books the venue's fills (each reduces
-        the reservation as any fill does), holds them as the holding and closes the orphan (og5), and settles the order's
-        final status from the venue; the cancel stays open until then (open question to PE2, 0015 design).
-        Otherwise the order's open reservation (what no fill used) is released as 'cancel', the order is marked
-        canceled (confirmed) or expired (not found: we never claim a cancel we didn't see), and the command applied:
-        "applied", or "partly_filled" for a confirmed cancel of an order with fills, whose filled part the caller
-        closes (og5). "already" when another got there first, and then nothing at all is written."""
-        if outcome not in ("cancelled", "not_found"):
-            raise ValueError(f"a cancel's outcome is 'cancelled' or 'not_found', not {outcome!r}")
+        "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK), so the fill journal is read first:
+        - an order with a fill: nothing is written and "filled" is returned. The caller books the venue's fills (each
+          reduces the reservation as any fill does), closes the orphan (og5) and then answers "filled";
+        - an order with none: only the first such answer's time is kept (not_found_at) and "unconfirmed" is returned.
+          Nothing is released: a fill landing meanwhile reduces the reservation as any fill does, and
+          confirm_cancels releases the rest once CANCEL_CONFIRM has passed with still no fill.
+        "filled", once the journal holds the order's fills: the command is applied and nothing more released (the
+        fills used what they used); refused with no fill in the journal.
+        "cancelled": the order's open reservation (what no fill used) is released as 'cancel', the order marked
+        canceled and the command applied: "applied", or "partly_filled" for an order with fills, whose filled part
+        the caller closes (og5).
+        "already" when another got there first, and then nothing at all is written."""
+        if outcome not in ("cancelled", "not_found", "filled"):
+            raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
         now = utcnow()
         with self.engine.begin() as c:
             cmd = c.execute(select(commands_t).where(commands_t.c.id == command_id,
@@ -2568,24 +2579,63 @@ class Store:
                 raise ValueError(f"command {command_id} is not a cancel")
             if cmd.applied_at is not None:
                 return "already"
-            filled = c.execute(select(fills_t.c.id).where(fills_t.c.sleeve == cmd.sleeve,
-                                                          fills_t.c.order_id == cmd.order_id).limit(1)).first()
-            if filled is not None and outcome == "not_found":
-                return "filled"
-            took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
-                             .values(applied_at=now)).rowcount
-            if not took:
+            filled = self._order_filled(c, cmd)
+            if outcome == "not_found":
+                if filled:
+                    return "filled"
+                c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.not_found_at.is_(None))
+                          .values(not_found_at=now))
+                return "unconfirmed"
+            if outcome == "filled":
+                if not filled:
+                    raise ValueError(f"order {cmd.order_id} has no fill in the journal: book the venue's fills first")
+                took = c.execute(update(commands_t).where(commands_t.c.id == command_id,
+                                                          commands_t.c.applied_at.is_(None))
+                                 .values(applied_at=now)).rowcount
+                return "applied" if took else "already"
+            if not self._close_cancel(c, cmd, "canceled", f"cancelled by the supervisor: {cmd.reason}", now):
                 return "already"
-            decisions = select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == cmd.order_id)
-            c.execute(update(gate_reservations_t).where(gate_reservations_t.c.decision_id.in_(decisions),
-                                                        gate_reservations_t.c.released_at.is_(None))
-                      .values(released_at=now, release_reason="cancel"))
-            c.execute(update(orders_t).where(orders_t.c.order_id == cmd.order_id,
-                                             orders_t.c.status.in_(OPEN_ORDER_STATUSES))
-                      .values(status="canceled" if outcome == "cancelled" else "expired", updated_at=now,
-                              message=f"cancelled by the supervisor: {cmd.reason}" if outcome == "cancelled"
-                              else f"not found at the venue and never filled: {cmd.reason}"))
-        return "applied" if filled is None else "partly_filled"
+        return "partly_filled" if filled else "applied"
+
+    def confirm_cancels(self, now: datetime | None = None, quiet: timedelta | None = None) -> list[int]:
+        """Cancels the venue answered "not found" at least `quiet` (CANCEL_CONFIRM) ago, with still no fill in the
+        journal: each released as 'cancel', its order expired (we never claim a cancel we didn't see) and applied, in
+        one transaction per cancel. Returns their ids. The supervisor calls it."""
+        now, quiet = now or utcnow(), CANCEL_CONFIRM if quiet is None else quiet
+        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None),
+                                     commands_t.c.not_found_at <= now - quiet).order_by(commands_t.c.id)
+        with self.engine.connect() as c:
+            due = c.execute(q).all()
+        done = []
+        for cmd in due:
+            with self.engine.begin() as c:
+                if self._order_filled(c, cmd):
+                    continue  # a fill landed: the caller closes it as "filled"
+                if self._close_cancel(c, cmd, "expired", f"not found at the venue and never filled: {cmd.reason}",
+                                      now):
+                    done.append(cmd.id)
+        return done
+
+    @staticmethod
+    def _order_filled(c, cmd) -> bool:
+        return c.execute(select(fills_t.c.id).where(fills_t.c.sleeve == cmd.sleeve,
+                                                    fills_t.c.order_id == cmd.order_id).limit(1)).first() is not None
+
+    @staticmethod
+    def _close_cancel(c, cmd, status: str, message: str, now: datetime) -> bool:
+        """Apply the cancel, release what of its order's reservation no fill used and end the order, inside the
+        caller's transaction. False when another got there first (nothing written)."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == cmd.id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        decisions = select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == cmd.order_id)
+        c.execute(update(gate_reservations_t).where(gate_reservations_t.c.decision_id.in_(decisions),
+                                                    gate_reservations_t.c.released_at.is_(None))
+                  .values(released_at=now, release_reason="cancel"))
+        c.execute(update(orders_t).where(orders_t.c.order_id == cmd.order_id, orders_t.c.status.in_(OPEN_ORDER_STATUSES))
+                  .values(status=status, updated_at=now, message=message))
+        return True
 
     def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
                ts: datetime | None = None) -> None:

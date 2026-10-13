@@ -5,7 +5,7 @@ releases nothing. CI also runs these against Postgres."""
 
 import ast
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
 from pathlib import Path
 
@@ -17,6 +17,7 @@ import sleeve_fund.store as store_mod
 from sleeve_fund import schema
 from sleeve_fund.store import (
     CANCEL,
+    CANCEL_CONFIRM,
     COMMAND_KINDS,
     Store,
     commands_t,
@@ -27,7 +28,9 @@ from sleeve_fund.store import (
     orders_t,
     portfolio_profile_t,
     sleeves_t,
+    utcnow,
 )
+from sleeve_fund.store import _aware
 
 T = datetime(2026, 10, 13, 9, tzinfo=timezone.utc)
 MIGRATION = Path(store_mod.__file__).parent / "migrations" / "versions" / "0015_orphan_guard_cancel.py"
@@ -100,7 +103,8 @@ def test_the_kinds_the_code_writes_and_the_migrations_check_are_one_list():
 
 def test_the_database_refuses_a_cancel_without_its_order_an_order_on_anything_else_and_an_unknown_kind(store):
     _resting(store)
-    bad = [dict(command=CANCEL), dict(command="pause", order_id="E-1"), dict(command="sell_everything")]
+    bad = [dict(command=CANCEL), dict(command="pause", order_id="E-1"), dict(command="sell_everything"),
+           dict(command="pause", not_found_at=T)]
     for row in bad:
         with pytest.raises(IntegrityError), store.engine.begin() as c:
             c.execute(insert(commands_t).values(sleeve="s", reason="x", created_at=T, **row))
@@ -140,14 +144,19 @@ def test_a_strategys_process_never_sees_a_cancel_and_nothing_lapses_or_marks_it_
 @pytest.mark.parametrize("outcome,status", [("cancelled", "canceled"), ("not_found", "expired")])
 def test_the_venues_answer_releases_the_reservation_and_ends_the_order_with_the_cancel_in_one_go(store, outcome,
                                                                                                  status):
+    """Confirmed: at once. Not found with no fill: only once CANCEL_CONFIRM has passed with still none."""
     did = _resting(store)
     cid = store.request_cancel("s", "E-1", "owner process down")
-    assert store.apply_cancel(cid, outcome) == "applied"
+    if outcome == "cancelled":
+        assert store.apply_cancel(cid, outcome) == "applied"
+    else:
+        assert store.apply_cancel(cid, outcome) == "unconfirmed"
+        assert store.confirm_cancels(utcnow() + CANCEL_CONFIRM + timedelta(seconds=1)) == [cid]
     r = _reservation(store, did)
     assert r.released_at is not None and r.release_reason == "cancel"
     assert _order(store).status == status
     assert store.open_cancels() == []
-    assert store.apply_cancel(cid, outcome) == "already"
+    assert store.apply_cancel(cid, "cancelled") == store.apply_cancel(cid, "not_found") == "already"
     # once applied, a later cancel for the same order may be opened (the index covers open ones only), but the order
     # is no longer resting, so none is
     with pytest.raises(ValueError, match="not resting"):
@@ -162,6 +171,38 @@ def test_not_found_with_a_fill_in_the_journal_releases_nothing_and_leaves_the_ca
     assert store.apply_cancel(cid, "not_found") == "filled"
     assert (_reservation(store, did), _order(store)) == before
     assert [c["id"] for c in store.open_cancels()] == [cid]
+
+
+def test_not_found_with_no_fill_releases_nothing_until_the_quiet_window_has_passed(store):
+    """PE2 / HoQA og2c, Advisor 06:20: "not found" is no proof of a cancel. The first answer's time is kept, a second
+    doesn't move it, and nothing is released or ended before CANCEL_CONFIRM."""
+    did = _resting(store)
+    cid = store.request_cancel("s", "E-1", "owner process down")
+    before = (_reservation(store, did), _order(store))
+    assert store.apply_cancel(cid, "not_found") == "unconfirmed"
+    (first,) = [c["not_found_at"] for c in store.open_cancels()]
+    assert store.apply_cancel(cid, "not_found") == "unconfirmed"
+    assert [c["not_found_at"] for c in store.open_cancels()] == [first]
+    assert store.confirm_cancels(_aware(first) + CANCEL_CONFIRM - timedelta(seconds=1)) == []
+    assert (_reservation(store, did), _order(store)) == before
+    assert store.confirm_cancels(_aware(first) + CANCEL_CONFIRM) == [cid]
+    assert store.confirm_cancels(_aware(first) + 2 * CANCEL_CONFIRM) == []  # once
+
+
+def test_a_fill_landing_inside_the_window_is_never_released_as_cancel_and_closes_as_filled(store):
+    """og2c, fill second: cancel -> not found -> the venue's fill. The sweep leaves it; once the fills are booked
+    the caller answers "filled": applied, nothing released as 'cancel' (the fills reduce the reservation, W2)."""
+    did = _resting(store)
+    cid = store.request_cancel("s", "E-1", "owner process down")
+    with pytest.raises(ValueError, match="no fill"):
+        store.apply_cancel(cid, "filled")
+    assert store.apply_cancel(cid, "not_found") == "unconfirmed"
+    store.record_fill("s", side="BUY", qty=0.01, price=60_000.0, fee=0.1, order_id="E-1", trade_id="T-1", ts=T)
+    assert store.confirm_cancels(utcnow() + 2 * CANCEL_CONFIRM) == []
+    assert _reservation(store, did).release_reason != "cancel"
+    assert store.apply_cancel(cid, "filled") == "applied"
+    assert store.apply_cancel(cid, "filled") == "already" and store.open_cancels() == []
+    assert _reservation(store, did).release_reason != "cancel"
 
 
 def test_a_confirmed_cancel_of_a_partly_filled_order_releases_what_no_fill_used(store):
@@ -247,6 +288,6 @@ def test_0015_migrated_commands_equal_create_alls(engine, tmp_path):
         _clean(engine)
     Store(engine=fresh)
     assert migrated == shape(fresh)
-    assert {"commands_kind", "commands_cancel_order"} <= set(migrated[1])
+    assert {"commands_kind", "commands_cancel_order", "commands_not_found_cancel"} <= set(migrated[1])
     assert ("commands_cancel_open", ("order_id",), True) in migrated[2]
     assert "gate_decisions_order_id" in {i["name"] for i in inspect(engine).get_indexes("gate_decisions")}

@@ -2,7 +2,9 @@
 
 commands: order_id, the resting order a cancel names (FK orders.order_id); a CHECK that a cancel always names one and
 nothing else does (NULL never means "every order"); a partial unique index, one open cancel per order, so a retry, a
-second sweep or a restart never sends two; and a CHECK on the kinds a row may hold (store.COMMAND_KINDS), which until
+second sweep or a restart never sends two; not_found_at, when the venue first answered a cancel "not found" with no
+fill (no proof of a cancel: its reservation waits for CANCEL_CONFIRM, PE2 13 Oct), with a CHECK that only a cancel has
+one; and a CHECK on the kinds a row may hold (store.COMMAND_KINDS), which until
 now only Python checked. gate_decisions: an index on order_id, which every fill and status change of a gated order and
 every cancel reads (PE2 and QA Tester 2, 13 Oct).
 
@@ -50,6 +52,8 @@ def upgrade() -> None:
                                     ondelete='RESTRICT')
         batch_op.create_check_constraint('commands_kind', KIND_IN)
         batch_op.create_check_constraint('commands_cancel_order', "(command = 'cancel') = (order_id IS NOT NULL)")
+        batch_op.add_column(sa.Column('not_found_at', sa.DateTime(timezone=True), nullable=True))
+        batch_op.create_check_constraint('commands_not_found_cancel', "not_found_at IS NULL OR command = 'cancel'")
         batch_op.create_index('commands_cancel_open', ['order_id'], unique=True,
                               postgresql_where=sa.text(OPEN), sqlite_where=sa.text(OPEN))
 
