@@ -406,8 +406,11 @@ def create_app(store: Store | None = None) -> FastAPI:
             check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
-            for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
+            slower = REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params})
+            for minutes, candles in slower.items():
                 _check_slower_history(cfg.venue, cfg.instrument, minutes, candles)
+            if why := _warmup_gaps(cfg.venue, cfg.instrument, cfg.bar_spec, cfg.warmup_bars, slower):
+                raise ValueError(why + GAPS_AFTER)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -690,6 +693,21 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    try:
+                        defaults = _defaults(s.strategy)
+                    except ModuleNotFoundError as exc:
+                        model = REGISTRY.get(s.strategy, (None,))[0]
+                        if (exc.name != f"sleeve_fund.strategies.{s.strategy}"  # a shipped model that won't load,
+                                or getattr(model, "__module__", None) == exc.name):  # or whose own module failed
+                            raise ValueError(f"the {s.strategy} model can't be loaded: {exc}") from exc
+                        defaults = {}  # only in REGISTRY (a test harness's model): its own settings are all it has
+                    except (ImportError, AttributeError) as exc:
+                        raise ValueError(f"the {s.strategy} model can't be loaded: {exc}") from exc
+                    slower = (REGISTRY[s.strategy][0].slower_needs({**defaults, **s.params})
+                              if s.strategy in REGISTRY else {})
+                    if why := _warmup_gaps(_venue_name(s.venue), s.instrument, s.bar_spec, s.warmup_bars, slower):
+                        st().event(name, "warning", "start_refused", why)  # on the strategy's record (Advisor)
+                        raise ValueError(why + GAPS_AFTER)
                     blocked, why = entry_blocked(st(), name, utcnow(), starting=True)  # CHOKE
                     if blocked and not (s.status == "halted" and any(
                             c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
@@ -1755,6 +1773,48 @@ def _check_slower_history(venue: str, pair: str, minutes: int, candles: int) -> 
                          f"history and the store holds {have:,} for {pair}; load more history first")
 
 
+def _warmup_gaps(venue: str, pair: str, bar_spec: str, warmup_bars: int, slower: dict[int, int]) -> str | None:
+    """START-GAPS (HoE 13 Oct, Advisor ADV1940): a start is refused while the stored minutes its warm-up reads
+    have gaps, by the backtest's own rule (HistoryStore.gaps, as _check_gaps reads it) with no tolerance, since
+    the indicators would step across the hole (QA P1-D8). The window is the one ending at the first decision
+    (now): its bars, or its slower candles' look-back, back from now. Only when the store warms it up: bars built
+    from live trades or from the hub, and slower candles. A store too stale to use (paper.node.HISTORY_MAX_LAG)
+    isn't read at all (the venue's own candles warm it up instead), so its gaps aren't what the model reads. A gap
+    the hub has since refilled is no longer a gap, so the PM's next Start goes ahead."""
+    import pandas as pd
+
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.paper.node import HISTORY_MAX_LAG, hub_address
+
+    minutes = spec_minutes(bar_spec)
+    stored = bar_spec.endswith("INTERNAL") or hub_address(venue) is not None
+    span = max([warmup_bars * minutes if stored else 0, *(m * n for m, n in slower.items())])
+    if not span:
+        return None
+    now = pd.Timestamp.now(tz="UTC")
+    try:
+        hs = HistoryStore()
+        cov = hs.coverage(venue, pair)
+        if cov is None or now - cov.last > HISTORY_MAX_LAG:
+            return None
+        since = now - pd.Timedelta(minutes=span)
+        hit = [g for g in hs.gaps(venue, pair) if g[1] >= since]
+    except OSError:  # an unreadable store: the warm-up itself says what failed
+        return None
+    return f"history gaps in warm-up window: {_gap_ranges(pair, hit)}" if hit else None
+
+
+GAPS_AFTER = "; it can start once they are filled"
+
+
+def _gap_ranges(pair: str, gaps: list) -> str:
+    """The missing minutes, as the PM reads them: "BTC/USD 13 Oct 15:31-16:00 UTC, ..." (open times, UTC)."""
+    def one(a, b):
+        end = "" if a == b else f"-{b:%H:%M}" if a.date() == b.date() else f" to {b:%d %b %H:%M}"
+        return f"{a:%d %b %H:%M}{end}"
+    return f"{pair} " + ", ".join(one(a, b) for a, b in gaps) + " UTC"
+
+
 def _venue_name(value) -> str:
     """A venue picked on a form (any case; blank is the default venue), as its profile names it. Raises
     ValueError on a venue with no profile."""
@@ -2067,6 +2127,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "alert_send_failed": "Couldn't send alert", "alerts_sent": "Alerts sent", "alerts_config": "Alerts set up",
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
+              "start_refused": "Start refused",
               "account_move": "Moved account"}
 
 
