@@ -1564,6 +1564,16 @@ class LongFlatStrategy(Strategy):
             self._noted.discard("stop_gapped_open")
         return open_risk.check_entry(book, others, mine)
 
+    def _entry_atr_pct(self) -> float | None:
+        """The daily ATR share a stopless entry is measured with: a backtest's lookup for the day (set_daily_atr), paper's
+        from the history store, as the interim open-risk check reads it (_open_risk_refusal). None when it isn't known."""
+        if self._backtest or self.runtime is None:
+            return self._daily_atr.get((self.clock.timestamp_ns() - 1) // DAY_NS * DAY_NS)
+        from sleeve_fund.venues import venue as venue_profile
+
+        s = self.runtime.store.sleeve(self.runtime.name)
+        return open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, self.runtime.now())
+
     def set_daily_atr(self, lookup: dict[int, float]) -> "LongFlatStrategy":
         """Backtest: the daily ATR share known at each UTC day's start (open_risk.daily_atr_lookup)."""
         self._daily_atr = dict(lookup)
@@ -2948,8 +2958,7 @@ class LongFlatStrategy(Strategy):
                   "instrument": self._base_code(),
                   "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
                   if self._margin else None,
-                  "atr_pct": None if self._stop_frac else
-                  self._daily_atr.get((self.clock.timestamp_ns() - 1) // DAY_NS * DAY_NS)}
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
 
         def count(outcome: str) -> None:
             key = f"{what}_{outcome}"

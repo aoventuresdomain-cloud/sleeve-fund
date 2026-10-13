@@ -112,3 +112,27 @@ def _ns_of(t) -> int:
 def _qa_intent() -> dict:
     return {"side": 1, "qty": D("0.01"), "close": D(60_000), "price": D(60_000), "stop_frac": 0.02, "what": "entry",
             "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": None, "atr_pct": None}
+
+
+def test_a_paper_stopless_entry_is_measured_with_the_history_stores_daily_atr(monkeypatch):
+    """e2e on #247: paper sent the gate a stopless entry's daily ATR from the backtest's lookup, empty in paper, so every
+    stopless entry was refused as unmeasurable. Paper reads it from the history store, as the interim open-risk check
+    does (a backtest keeps its lookup, pinned by the portfolio backtest's stopless cases)."""
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import BarType
+
+    from sleeve_fund import open_risk
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.venues import venue
+
+    asked = []
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda v, pair, now: asked.append((v, pair)) or 0.031)
+    instrument = venue("kraken").instrument("BTC", "USD")
+    cls, cfg = REGISTRY["ping_pong"]
+    s = cls(cfg(instrument_id=instrument.id, bar_type=BarType.from_str("BTC/USD.KRAKEN-1-MINUTE-LAST-INTERNAL"),
+                assumed_taker_fee=0.0005))
+    sleeve = SimpleNamespace(venue="kraken", instrument="BTC/USD")
+    s.runtime = SimpleNamespace(name="s1", backtest=False, now=lambda: END,
+                                store=SimpleNamespace(sleeve=lambda name: sleeve))
+    assert s._entry_atr_pct() == 0.031 and asked == [("KRAKEN", "BTC/USD")]
