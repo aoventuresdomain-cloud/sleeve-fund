@@ -21,6 +21,7 @@ _VARIANTS = re.compile(r"^- (\d+) distinct variants? of this idea tried so far",
 _PROJECT = re.compile(r"^- (\d+) ideas? and (\d+) distinct variants? tested so far", re.M)
 _DSR = re.compile(r"^- Deflated Sharpe: (?:([\d.]+%) probability|(can't be computed here: .*?)(?= N uncertain|$))", re.M)
 _UNCERTAIN = re.compile(r"N uncertain: [^\n]*")
+_ABLATION = re.compile(r"^## Ablation \(not judged\)\n(.*?)(?=^## |\Z)", re.M | re.S)
 UK = ZoneInfo("Europe/London")
 
 
@@ -46,7 +47,18 @@ def facts(path: Path) -> dict:
         nearby=near, trades=trades, min_trades=MIN_OOS_TRADES, trades_met=bar_met,
         trades_check=checks.get(OOS_TRADES),
         not_judged=(s["evidence"] if s.get("g1") == "NOT JUDGED" else None),
+        ablation=ablation_rows(text),
     )
+
+
+def ablation_rows(text: str) -> list[list[str]] | None:
+    """The tear sheet's ablation table (research.ablation.section) as rows of cells, header left out; None when the
+    sheet has no ablation."""
+    m = _ABLATION.search(text)
+    if m is None:
+        return None
+    lines = [ln for ln in m.group(1).splitlines() if ln.startswith("|")]
+    return [[c.strip().replace("`", "") for c in ln.strip("|").split("|")] for ln in lines[2:]]
 
 
 def register(app: FastAPI, *, page, sheet_path, require_pm) -> None:
