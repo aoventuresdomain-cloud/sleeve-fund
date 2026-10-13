@@ -29,3 +29,11 @@ def assert_keyless(environ: dict[str, str] | None = None) -> None:
             + ", ".join(found)
             + ". Unset them; paper needs public data only."
         )
+
+
+def assert_portfolio_gate(store) -> None:
+    """Paper and live run under the portfolio gate (Advisor 06:10, 8 Oct): a journal opened without it, the opt-out
+    kept for single-strategy research backtests, is refused at startup."""
+    if not getattr(store, "portfolio_gate", False):
+        raise PaperSafetyError("paper trading refuses to start on a journal without the portfolio gate: that opt-out is "
+                               "for single-strategy research backtests only")

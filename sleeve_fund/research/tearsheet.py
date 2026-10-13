@@ -8,7 +8,8 @@ import math
 import numpy as np
 import pandas as pd
 
-from sleeve_fund.research.guardrails import G1_RULES, MIN_OOS_TRADES, nearby_scored
+from sleeve_fund import funding
+from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
     daily_returns,
@@ -17,7 +18,7 @@ from sleeve_fund.research.metrics import (
     summary,
     years_covered,
 )
-from sleeve_fund import funding
+from sleeve_fund.research.pbo import PBO_CHECK, g1_row
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -32,6 +33,8 @@ N_UNCERTAIN = ("N uncertain: a run of this idea couldn't be counted in full, so 
                "until it is re-counted.")
 # A check that rests on the out-of-sample a study couldn't produce: shown, but not counted as a fail.
 NOT_APPLICABLE = "N/A"
+# Rows whose NOT JUDGED never passes G1 but never hides another check's fail (R4).
+LAST_TIER = (PBO_CHECK, CANDIDATE_CHECK)
 NEARBY_CHECK = "Holds at nearby settings"
 RANDOM_ENTRY_CHECK = "Beats random entry times"
 RANDOM_SIDE_CHECK = "Beats random long or short"
@@ -51,12 +54,19 @@ def g1_verdict(checks: list[tuple[str, str, str]]) -> tuple[str, list[str]]:
     """G1 passes only when every check that can fail passes: the Sharpe test, robustness, an unused
     holdout and enough trades. A strong Sharpe on three trades, or on a holdout already looked at,
     is not evidence. A study whose runs raised errors, or whose out-of-sample the risk guard left flat,
-    is not judged at all: neither a pass nor a fail. Returns the verdict and the checks that failed."""
-    unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED]
+    is not judged at all: neither a pass nor a fail. A PBO that couldn't be judged (too few variants, a window too
+    short) never counts as a pass, but nor does it hide another check's fail (Advisor 13 Oct 16:50, R4); nor does a
+    benchmark's (18:05: never a G1 candidate). Returns the
+    verdict and the checks that failed, or that weren't judged."""
+    unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED and name not in LAST_TIER]
     if unjudged:
         return NOT_JUDGED, unjudged
-    failed = [name for name, verdict, _ in checks if verdict not in ("PASS", "WARN", "INFO", NOT_APPLICABLE)]
-    return ("FAIL" if failed else "PASS"), failed
+    failed = [name for name, verdict, _ in checks
+              if verdict not in ("PASS", "WARN", "INFO", NOT_APPLICABLE, NOT_JUDGED)]
+    if failed:
+        return "FAIL", failed
+    pbo_unjudged = [name for name, verdict, _ in checks if verdict == NOT_JUDGED]
+    return (NOT_JUDGED, pbo_unjudged) if pbo_unjudged else ("PASS", [])
 
 
 def _pct(x: float) -> str:
@@ -210,6 +220,11 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
         (NEARBY_CHECK, *_nearby(r)),
+        # R4: how often the best in-sample configuration is no better than average out of sample. In-sample grid,
+        # so it counts under NOT JUDGED too.
+        g1_row(getattr(r, "pbo", None)),
+        *([(CANDIDATE_CHECK, NOT_JUDGED, "a benchmark: buy and hold is never a G1 candidate")]
+          if getattr(getattr(r, "spec", None), "family", None) == "benchmark" else []),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
@@ -450,7 +465,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     checks = g1_checks(r, ledger, register, liquidation_ack)
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
-        out.append(f"**G1: {verdict}** ({r.not_judged}; this is neither a pass nor a fail"
+        why = r.not_judged or "; ".join(e for name, v, e in checks if name in failed and v == NOT_JUDGED)
+        out.append(f"**G1: {verdict}** ({why}; this is neither a pass nor a fail"
                    + (", and the holdout stays unspent)" if r.holdout_days else ")"))
     else:
         out.append(f"**G1: {verdict}**" + (f" (failed: {', '.join(failed)})" if failed else " (every check passed)"))
