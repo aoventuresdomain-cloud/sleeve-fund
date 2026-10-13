@@ -54,3 +54,15 @@ def test_an_unknown_venue_or_a_bad_date_fails_closed_before_reading_anything(tmp
     with pytest.raises(ValueError):
         main(["--root", str(tmp_path), "coverage", "--venue", "binance", "--start", "not-a-date", "BTC/USDT"])
     assert not any(tmp_path.iterdir())  # nothing written
+
+
+def test_an_hourly_instrument_is_judged_on_its_own_interval_and_an_empty_window_is_refused(tmp_path):
+    import pytest
+
+    store = HistoryStore(tmp_path)
+    store.append("X", "ABC/USDT", _minutes("2025-12-31 23:00", 3 * 1440), cursor="c")
+    _rates(tmp_path, 1)  # hourly, from 16:00 the day before: 12 rates end at 03:00 on the first day
+    assert "ends before the window closes" in coverage_line(store, "X", "ABC/USDT", W0, W0 + pd.Timedelta(hours=6),
+                                                            perpetual=True)
+    with pytest.raises(ValueError, match="close after it opens"):
+        coverage_line(store, "X", "ABC/USDT", W1, W0, perpetual=True)

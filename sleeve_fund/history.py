@@ -1093,6 +1093,8 @@ def coverage_line(store: HistoryStore, venue: str, pair: str, start: pd.Timestam
     COVERED only when every minute and every settlement in the window is held. Read-only."""
     from sleeve_fund import funding
 
+    if end <= start:
+        raise ValueError(f"the window must close after it opens: {start} .. {end}")
     parts, whole = [f"{venue} {pair} {start:%Y-%m-%d %H:%M}..{end:%Y-%m-%d %H:%M}:"], True
     cov = store.coverage(venue, pair)
     if cov is None:
@@ -1120,7 +1122,11 @@ def coverage_line(store: HistoryStore, venue: str, pair: str, start: pd.Timestam
             holes, maybe = funding.settled_holes(venue, pair, store.root)
             within = lambda spans: [g for g in spans if g[1] > start and g[0] < end]  # noqa: E731
             h, m = within(holes), within(maybe)
-            late, early = t[0] > start + pd.Timedelta(hours=8), t[-1] < end - pd.Timedelta(hours=8)
+            # the instrument's own settlement interval (its shortest recent spacing; 8 hours with one rate), so a 1 or
+            # 4-hour instrument missing its first or last settlements in the window reads as such (CR COV-1)
+            steps = [b - a for a, b in zip(t[-6:], t[-5:])]
+            every = min(steps) if steps else pd.Timedelta(hours=8)
+            late, early = t[0] > start + every, t[-1] < end - every
             whole &= not (h or m or late or early)
             parts.append(f"funding {t[0]:%Y-%m-%d %H:%M}..{t[-1]:%Y-%m-%d %H:%M}, {len(h)} hole(s), "
                          f"{len(m)} possible at an interval change" + (", starts after the window opens" if late else "")
