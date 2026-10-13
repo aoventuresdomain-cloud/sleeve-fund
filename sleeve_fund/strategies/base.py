@@ -1397,7 +1397,8 @@ class LongFlatStrategy(Strategy):
           more bars than there are yet), or
         - when the strategy was started for its exits only (a refused start still holding: EXITS_ONLY),
         no new entry or add opens, and a safety stop is set at the first price: half the REMAINING distance from that
-        mark to the isolated liquidation price (half way to zero where there is none: a long at 1x, or spot), so it
+        mark to the isolated liquidation price, or the profile's share of it if tighter (a third, conservative; Advisor
+        19:15 UK, 13 Oct), or half way to zero where there is none (a long at 1x, or spot), so it
         always sits strictly between the mark and liquidation. A stop already restored stays if it is tighter. The
         model's own stop, once set again (_replan), replaces it only if tighter, and entries open again (never for
         an exits-only start). It raises an incident, and never closes the position itself."""
@@ -1441,7 +1442,13 @@ class LongFlatStrategy(Strategy):
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
-        level = mark - SAFETY_STOP_SHARE * (mark - target)
+        # The tighter of half the remaining way and the profile's own share of it (Advisor 19:15 UK, 13 Oct): a
+        # conservative profile's safety stop sits a third of the way, as its stops do (STOP-LOOSEN-1).
+        share = SAFETY_STOP_SHARE
+        if liq is not None and self.runtime is not None:
+            share = min(share, self.runtime.profile.stop_to_liquidation)
+        way = "half way" if share == SAFETY_STOP_SHARE else f"{share:.0%} of the way"
+        level = mark - share * (mark - target)
         # A stop never loosens (QA SG4): a safety stop an earlier restart set for this same position (no fill since)
         # stays when it is tighter than one measured from today's mark, even if the price is already through it.
         before = self.runtime.last_watched_stop() if not self._backtest else None
@@ -1453,12 +1460,12 @@ class LongFlatStrategy(Strategy):
         if not kept:
             self._stop_frac = side * (1 - level / entry)
             self._stop_basis = (f"safety stop at {level:,.6g}, set before the last restart" if held else
-                                f"safety stop, half way from the {mark:,.6g} mark to "
+                                f"safety stop, {way} from the {mark:,.6g} mark to "
                                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         why = (f"started for its exits only ({self._exits_reason()})" if self._exits_only else self._safety_why)
         work = (f"it keeps its restored stop at {restored:,.6g}, tighter than a safety stop at {level:,.6g}" if kept
                 else f"it keeps the safety stop at {level:,.6g} set before this restart (a stop never loosens)"
-                if held else f"it works to a safety stop at {level:,.6g}, half way from the {mark:,.6g} mark to "
+                if held else f"it works to a safety stop at {level:,.6g}, {way} from the {mark:,.6g} mark to "
                 + (f"the liquidation price {liq:,.6g}" if liq is not None else "zero"))
         head = f"Incident, {self.runtime.name}: the open {_side_word(side)} position of {abs(qty):.12g} (entry "
         self.runtime.incident_once(
@@ -3342,8 +3349,8 @@ class LongFlatStrategy(Strategy):
         sits no further than the profile's share (half) of the way from the entry to the CURRENT liquidation price
         (_liq_now). A tighter stop is returned as it is; a looser one is clamped, never flattened. Once funding has
         carried the liquidation price past the entry, the way is measured from the last close instead. A restart's
-        safety stop is left as set: it has its own rule, half the REMAINING way from the mark (_place_safety_stop),
-        until the model's own stop is set again."""
+        safety stop is left as set: it has its own rule, measured over the REMAINING way from the mark at the profile's
+        share or half, whichever is tighter (_place_safety_stop), until the model's own stop is set again."""
         if frac is None or not self._margin or not self._entry_px or self._safety_stop:
             return frac, None
         _, cash, qty, _ = self._mark()
