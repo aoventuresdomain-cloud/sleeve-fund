@@ -479,6 +479,15 @@ def handler_error_words(handler: str, exc: BaseException | str) -> str:
     return f"handling {where}: {what or 'no message'}" + (f" ({kind})" if kind else "")
 
 
+def fund_margin(owner, ts, amount: float) -> None:
+    """LIQ-FUND-1: a funding movement settled after the liquidation price was fixed is the position's margin's
+    (_liq_now). One settled before the fill (a late publish, a reversal) was the position's before it, so it doesn't
+    count. A plain function, as the funding writers are, so an engine-like holder without the fields moves nothing."""
+    since = getattr(owner, "_liq_from", None)
+    if getattr(owner, "_liq_px", None) is not None and since is not None and int(pd_ts(ts).value) > since:
+        owner._liq_funded += amount
+
+
 def pd_ts(t):
     import pandas as pd
 
@@ -531,6 +540,9 @@ class LongFlatStrategy(Strategy):
         # average entry and posted margin, journaled on that order and read back after a restart: never from the
         # restore's price (Advisor 22:36, QA P1-L22).
         self._liq_px: float | None = None
+        # LIQ-FUND-1 (Advisor 17:20 UK, 13 Oct): funding taken from, or credited to, that margin since _liq_px was fixed,
+        # and the instant (ns) after which a settlement is the position's. _liq_now moves the price by it.
+        self._liq_funded, self._liq_from = 0.0, None
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         # Perp: the position and the last trade price held at each hour's start, as the first event past it
@@ -1291,13 +1303,19 @@ class LongFlatStrategy(Strategy):
         if self._margin:  # the liquidation price set when it was entered or last added to (_set_liq), if journaled
             # Filled entries only: a later entry that never filled (an expired post-only) must not hide the held
             # entry's price (CR #146).
-            recent, filled = store.orders(name, limit=200), {f["order_id"] for f in store.fills(name, limit=500)}
+            recent, fills = store.orders(name, limit=200), store.fills(name, limit=None)  # every fill: F242-3
+            filled = {f["order_id"] for f in fills}
             held = next((o for o in recent if o.get("intent") == "entry" and o.get("side") == opened
                          and o["order_id"] in filled), None)
-            self._liq_px = next((o["signal"]["position_liquidation_px"] for o in recent
-                                 if held is not None and o["ts"] >= held["ts"] and o.get("side") == opened
-                                 and o.get("intent") in OPENING_INTENTS and o["order_id"] in filled
-                                 and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
+            fixed = next((o for o in recent
+                          if held is not None and o["ts"] >= held["ts"] and o.get("side") == opened
+                          and o.get("intent") in OPENING_INTENTS and o["order_id"] in filled
+                          and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
+            self._liq_px = fixed["signal"]["position_liquidation_px"] if fixed is not None else None
+            if fixed is not None:  # and the funding its margin has taken or been credited since it opened (LIQ-FUND-1)
+                self._liq_from = self._position_opened(fills)
+                self._liq_funded = sum(float(r["amount"]) for r in store.funding(name, limit=None)
+                                       if int(pd_ts(r["ts"]).value) > self._liq_from)
         if entry is None:
             if self._has_exits and not (c.stop_atr or c.stop_swing_bars):
                 self._stop_frac, self._tp_frac, self._stop_basis = (self._plan_exits(self._entry_px, self._entry_side or 1)
@@ -2378,7 +2396,7 @@ class LongFlatStrategy(Strategy):
         cash = qty = 0.0
         if self._margin and self.runtime is not None:
             equity, cash, qty, _ = self._mark()
-            liq = self._liq(cash, qty) if qty else None
+            liq = self._liq_now(cash, qty) if qty else None
             if liq is not None:
                 d = self.runtime.profile.min_liquidation_distance
                 venue["liquidation"] = liq
@@ -2766,7 +2784,7 @@ class LongFlatStrategy(Strategy):
         values = {"entry_px": self._entry_px, "move": move, hit: level}
         if hit == "stop_loss" and self._margin:
             _, cash, qty, _ = self._mark()
-            liq = self._liq(cash, qty) if qty else None
+            liq = self._liq_now(cash, qty) if qty else None
             if liq is not None:
                 values["liquidation_px"] = round(liq, 8)  # GAP-LIQ: judged on its fill (_gap_liquidation)
         if hit == "take_profit":  # the level beside the real fill, for fills-against-model (Advisor L12)
@@ -3291,6 +3309,19 @@ class LongFlatStrategy(Strategy):
             return self._liq_px
         return self._liq_from_entry(cash, qty)
 
+    def _liq_now(self, cash: float, qty: float) -> float | None:
+        """The liquidation price now (LIQ-FUND-1): the one fixed at the fill (_liq), moved by the funding booked to the
+        position's isolated margin since. Its equity cash + f + q x p falls to the maintenance margin on its value
+        at p' = p + f / (mm x |q| - q), so a payment brings the price closer for a long and a short alike, and a credit
+        moves it away. The one price every check reads: the liquidation guard and cut, the stop clamp, open risk, the
+        outage replay and a stop's gap-through. None when nothing liquidates it."""
+        liq = self._liq(cash, qty)
+        if liq is None or not qty or self._liq_px is None or not self._liq_funded or self._cfg.perp is None:
+            return liq
+        denom = self._cfg.perp.maintenance_margin * abs(qty) - qty
+        moved = liq + self._liq_funded / denom if denom else liq
+        return moved if moved > 0 else None
+
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
         venue's, which after a restart is the restore's price (QA P1-L22)."""
@@ -3298,11 +3329,29 @@ class LongFlatStrategy(Strategy):
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
 
-    def _set_liq(self, order_id: str) -> None:
+    def _position_opened(self, fills: list[dict]) -> int:
+        """When the position held now opened (ns): its first fill since the journal was last flat or went through
+        flat, so an add keeps the funding taken before it after a restart too (F242-1, CR). Fills newest first."""
+        half, pos, opened = self._lot() / 2, 0.0, None
+        for f in reversed(fills):
+            q = float(f["qty"]) * (1 if f["side"] == "BUY" else -1)
+            if abs(pos) < half or (pos > 0) != (pos + q > 0):
+                opened = f["ts"]  # from flat, or through it: this fill opened the side held after it
+            pos += q
+        return int(pd_ts(opened).value)
+
+    def _set_liq(self, order_id: str, since: int | None = None) -> None:
         """After a perp entry or add fills: the position's liquidation price, journaled on that order beside the
-        decision's own estimate from the close (liquidation_px), which stays as it was decided."""
+        decision's own estimate from the close (liquidation_px), which stays as it was decided. Funding up to the fill
+        is settled before it (on_order_filled), so the margin's funding counts afresh from `since`: the fill, or for a
+        bars-only resting fill the bar's open, as the settlements inside the bar after it are charged (_fund_opened_in_bar).
+        Only a position opened from flat (or through it) starts counting afresh: an add or a later part-fill keeps the
+        funding its margin has taken since it opened, as the venue's isolated margin does, and _liq_now applies it to the
+        whole position (F242-1). _track_entry clears it when the position goes flat or flips."""
         _, cash, qty, _ = self._mark()
         self._liq_px = self._liq_from_entry(cash, qty) if qty else None
+        if self._liq_from is None:
+            self._liq_funded, self._liq_from = 0.0, since
         if self._liq_px is not None and self.runtime is not None and not self._backtest:
             self.runtime.store.merge_order_signal(order_id, {"position_liquidation_px": round(self._liq_px, 8)})
 
@@ -3686,6 +3735,7 @@ class LongFlatStrategy(Strategy):
                 self.runtime.name, qty=qty, price=px, rate=rate, amount=round(amount, 8), ts=ts, kind=kind) != "new":
             return
         self._cash_adj += amount
+        fund_margin(self, ts, amount)
         self.funding_log.append((ts, amount, kind))
         if note:
             self.funding_notes[ts] = note.strip(" ()")  # the snapped record's own stamp, kept for the audit
@@ -3790,6 +3840,7 @@ class LongFlatStrategy(Strategy):
                                     amount=round(-amount, 8), ts=ts, kind="reversal") != "new":
                 continue  # reversed already (CASH-1): one reversal per settlement
             self._cash_adj -= amount
+            fund_margin(self, ts, -amount)
             self.funding_log.append((ts, -amount, "reversal"))
             # Nothing of the strategy's is owed at it now: it leaves the watch, and the hub alone judges the rate (M-1)
             when = pd_ts(ts)
@@ -3953,6 +4004,7 @@ class LongFlatStrategy(Strategy):
                     kind="reversal") != "new":
                 continue  # reversed already (CASH-1)
             self._cash_adj -= amount
+            fund_margin(self, when, -amount)
             self.funding_log.append((when, -amount, "reversal"))
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "info", "funding",
@@ -4082,7 +4134,7 @@ class LongFlatStrategy(Strategy):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
                   ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
-        liq = self._liq(cash, qty)
+        liq = self._liq_now(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
             levels.append((liq / (1 - d) if side > 0 else liq / (1 + d), "liquidation_cut"))
@@ -4116,7 +4168,7 @@ class LongFlatStrategy(Strategy):
         px = Price(level, self.instrument.price_precision)
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         _, cash, net, _ = self._mark()
-        liq = self._liq(cash, net)
+        liq = self._liq_now(cash, net)
         if order is not None:
             if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
                 return  # in flight: re-priced at the next bar
@@ -4198,7 +4250,7 @@ class LongFlatStrategy(Strategy):
         if not self._margin:
             return {}
         _, cash, qty, _ = self._mark()
-        liq = self._liq(cash, qty) if qty else None
+        liq = self._liq_now(cash, qty) if qty else None
         return {"liquidation_px": round(liq, 8)} if liq is not None else {}
 
     def _gap_liquidation(self, coid: str, journal_id: str, price: float) -> bool:
@@ -4250,6 +4302,12 @@ class LongFlatStrategy(Strategy):
         lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
         held = -sign
         bankrupt = markets.bankruptcy_price(held * qty, entry, lev)
+        if self._liq_funded:
+            # Funding since the fill was taken from, or credited to, that margin (LIQ-FUND-1; Advisor 17:45 UK, 13 Oct):
+            # bankruptcy moves by it, b' = b - f / q on the whole position, so the funding lines and this one together
+            # lose exactly the margin plus the fees, the funding inside that, never on top (#155: never past bankruptcy).
+            position = held * (self._entry_qty or qty)
+            bankrupt = max(bankrupt - self._liq_funded / position, 0.0)
         trigger = (self.decisions[coid].get("signal") or {}).get("liquidation_px") or px
         rate = self.runtime.taker_fee if self.runtime is not None else self._cfg.assumed_taker_fee
         booked_fee = qty * float(trigger) * rate
@@ -4392,7 +4450,7 @@ class LongFlatStrategy(Strategy):
         terms = self._cfg.perp
         if terms is None or qty == 0 or price <= 0 or self._pending_exit is not None or self._busy():
             return
-        liq = self._liq(cash, qty)
+        liq = self._liq_now(cash, qty)
         if liq is None:
             return
         side = 1 if qty > 0 else -1
@@ -4435,7 +4493,7 @@ class LongFlatStrategy(Strategy):
         day_open = self.runtime._day_open or equity
         if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
             return True
-        liq = self._liq(cash, qty)
+        liq = self._liq_now(cash, qty)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
 
     def _intrabar_guard(self, bar: Bar) -> None:
@@ -4449,7 +4507,7 @@ class LongFlatStrategy(Strategy):
         worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
         _, cash, _, _ = self._mark()
         self._guard_equity = cash + qty * worst
-        liq = self._liq(cash, qty)
+        liq = self._liq_now(cash, qty)
         if liq is not None and (worst <= liq if qty > 0 else worst >= liq):
             self._guard_price = worst
 
@@ -4600,7 +4658,7 @@ class LongFlatStrategy(Strategy):
                 # Through the liquidation price: the venue takes the position whatever our own risk check says,
                 # so the liquidation goes first and is journaled as one (review round 11, M11-3).
                 probe = price if underwater or worst is None else worst
-                liq = self._liq(cash, qty)
+                liq = self._liq_now(cash, qty)
                 if underwater or through_liquidation(1 if qty > 0 else -1, probe, liq):
                     self._liquidation_guard(cash, qty, probe)
             self.runtime.close_floor = float(max(self._lot(), self._min_qty()))
@@ -4608,7 +4666,7 @@ class LongFlatStrategy(Strategy):
             if underwater and self._liquidated is None:
                 # Its liquidation fee at the taker rate on the liquidation price, where the venue books it
                 # (_book_liquidation), until the fill gives the fee charged.
-                at = self._liq(cash, qty) if self._margin else None
+                at = self._liq_now(cash, qty) if self._margin else None
                 fees, taken, before, _ = self._liquidation_figures(None, abs(qty) * (at or price))
                 self._liquidated = self._margin_lost(abs(qty) + taken, self._entry_px or price, fees, before)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
@@ -4964,7 +5022,7 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
-                self._set_liq(journal_id)
+                self._set_liq(journal_id, intrabar[0] if intrabar is not None else event.ts_event)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
@@ -5071,7 +5129,8 @@ class LongFlatStrategy(Strategy):
         pre = post - sign * filled
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
-            self._stop_frac = self._tp_frac = self._liq_px = None
+            self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = None
+            self._liq_funded = 0.0
             self._funding_skip = None
             self._replan_pending = self._plan_entry = None
             return False
@@ -5083,7 +5142,8 @@ class LongFlatStrategy(Strategy):
         elif opening or self._entry_side != side or self._entry_px is None:
             self._entry_px = px  # opened from flat, or this fill went through flat and opened the other side
         if self._entry_side != side:
-            self._liq_px = None  # went through flat: the old side's price is no longer the position's
+            self._liq_px = self._liq_from = None  # went through flat: the old side's price is no longer the position's
+            self._liq_funded = 0.0
         self._entry_qty, self._entry_side = float(abs(post)), side
         return opening
 
@@ -5201,7 +5261,7 @@ class LongFlatStrategy(Strategy):
                 self.fee_model.intrabar.add("fill")
         if self._margin and self._net_position()[0]:
             _, cash, qty, _ = self._mark()
-            liq = self._liq(cash, qty)
+            liq = self._liq_now(cash, qty)
             if liq is not None and low <= liq <= high:
                 self.fee_model.intrabar.add("liq")
 
