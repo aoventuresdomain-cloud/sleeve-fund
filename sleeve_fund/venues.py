@@ -361,6 +361,51 @@ def binance_instruments(get_json=None) -> list[str]:
                   if i.get("contractType") == "PERPETUAL" and i.get("status") == "TRADING")
 
 
+# deliveryDate on a perpetual still trading: Binance's far-future placeholder (2100-12-25), not a delisting
+_BINANCE_NO_DELIVERY_MS = 4_000_000_000_000
+
+
+def binance_listings(get_json=None) -> list[dict]:
+    """Every USD-M perpetual exchangeInfo still names, trading or not, as `instruments` rows (P2-5): the base asset
+    as the underlying, the onboard day as listed_at, and for a contract no longer trading whose delivery date is
+    real, that day as delisted_at. A contract exchangeInfo has dropped altogether is only in the free archive."""
+    from datetime import datetime, timezone
+
+    day = lambda ms: datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).date()  # noqa: E731
+    out = []
+    for i in _binance_info(get_json).get("symbols", []):
+        if i.get("contractType") != "PERPETUAL" or not i.get("onboardDate"):
+            continue
+        gone = i.get("status") != "TRADING" and 0 < int(i.get("deliveryDate") or 0) < _BINANCE_NO_DELIVERY_MS
+        out.append({"symbol": i["symbol"], "underlying": i["baseAsset"], "quote": i["quoteAsset"],
+                    "contract_type": "perp", "listed_at": day(i["onboardDate"]),
+                    "delisted_at": day(i["deliveryDate"]) if gone else None, "source": "api"})
+    return sorted(out, key=lambda r: r["symbol"])
+
+
+def binance_daily_notional(pair: str, get_json=None) -> pd.Series:
+    """Each closed day's quote notional traded (the kline's quote-asset volume), indexed by the day it covers (UTC
+    open date), since listing. The forming day is dropped."""
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    parts, start = {}, 0
+    while True:
+        q = {"symbol": binance_symbol(pair), "interval": "1d", "limit": 1500, "startTime": start}
+        rows = (get_json or _get_json)(f"{BINANCE_FAPI}/klines?" + urllib.parse.urlencode(q))
+        if isinstance(rows, dict):
+            raise ValueError(f"Binance: {rows.get('msg', rows)}")
+        for r in rows:
+            parts[pd.Timestamp(int(r[0]), unit="ms", tz="UTC").date()] = Decimal(str(r[7]))
+        if len(rows) < 1500:
+            break
+        start = int(rows[-1][0]) + 1
+    if parts:
+        parts.pop(max(parts))  # the newest day is still forming
+    return pd.Series(parts, dtype=object).sort_index()
+
+
 def binance_contract(pair: str, get_json=None) -> dict:
     """The perpetual's price and size steps, smallest order and smallest notional, from exchangeInfo."""
     info = _binance_listing(pair, get_json)

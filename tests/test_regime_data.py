@@ -247,3 +247,40 @@ def test_a_pegged_underlying_never_enters_and_the_settings_are_the_advisors():
     got = universe(DAY0 + timedelta(days=100), listings, notional, n=2, keep_within=2, min_age_days=0, lag_days=1)
     assert [m.symbol for m in got] == ["BTCUSDT"]
     assert regime.SETTINGS == dict(n=20, keep_within=25, min_age_days=60, lag_days=1, min_members=10, min_history=180)
+
+
+# --- loading the venue's listing --------------------------------------------------------------------------------
+
+from sleeve_fund import venues  # noqa: E402
+from sleeve_fund.regime_load import sync_instruments  # noqa: E402
+
+MS = lambda d: int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)  # noqa: E731
+from datetime import datetime, timezone  # noqa: E402
+
+
+def _info(*symbols):
+    return {"symbols": [dict(symbol=s, baseAsset=b, quoteAsset="USDT", contractType=ct, status=st,
+                             onboardDate=MS(on), deliveryDate=dd) for s, b, ct, st, on, dd in symbols]}
+
+
+def test_the_listing_books_live_and_delisted_perps_once_and_refuses_a_reused_symbol(store):
+    gone = DAY0 + timedelta(days=200)
+    info = _info(("BTCUSDT", "BTC", "PERPETUAL", "TRADING", DAY0, 4133404800000),
+                 ("OLDUSDT", "OLD", "PERPETUAL", "SETTLING", DAY0, MS(gone)),
+                 ("BTCUSDT_251226", "BTC", "CURRENT_QUARTER", "TRADING", DAY0, MS(gone)))
+    rows = venues.binance_listings(get_json=lambda url: info)
+    assert [(r["symbol"], r["listed_at"], r["delisted_at"]) for r in rows] == [("BTCUSDT", DAY0, None),
+                                                                               ("OLDUSDT", DAY0, gone)]
+    assert sync_instruments(store, V, rows) == {"new": 2, "same": 0, "delisted": 0, "refused": []}
+    assert sync_instruments(store, V, rows) == {"new": 0, "same": 2, "delisted": 0, "refused": []}
+    reused = _info(("OLDUSDT", "OLD", "PERPETUAL", "TRADING", DAY0 + timedelta(days=300), 4133404800000))
+    got = sync_instruments(store, V, venues.binance_listings(get_json=lambda url: reused))
+    assert got["refused"] and got["refused"][0][0] == "OLDUSDT"
+    assert {r["symbol"]: r["delisted_at"] for r in store.instruments(V)} == {"BTCUSDT": None, "OLDUSDT": gone}
+
+
+def test_daily_notional_is_the_quote_volume_per_closed_day():
+    k = lambda d, qv: [MS(d), "1", "1", "1", "1", "5", MS(d) + 86_399_999, str(qv)]  # noqa: E731
+    pages = [[k(DAY0 + timedelta(days=i), f"{100 + i}.5") for i in range(3)]]
+    got = venues.binance_daily_notional("BTC/USDT", get_json=lambda url: pages.pop(0))
+    assert dict(got) == {DAY0: D("100.5"), DAY0 + timedelta(days=1): D("101.5")}
