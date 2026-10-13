@@ -296,9 +296,13 @@ class HubRelay(DataActor):
             tmp = self.late_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data))
             tmp.replace(self.late_path)  # one file, replaced whole: the counts and their up-time never disagree
-            late_since_path(self.late_path).unlink(missing_ok=True)  # #239's window file: now in the counts' own
         except OSError as exc:
             self.log.warning(f"hub: can't write {self.late_path}: {exc}")
+            return
+        try:
+            late_since_path(self.late_path).unlink(missing_ok=True)  # #239's window file: now in the counts' own
+        except OSError as exc:
+            self.log.warning(f"hub: can't remove the old late window file: {exc}")
 
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
