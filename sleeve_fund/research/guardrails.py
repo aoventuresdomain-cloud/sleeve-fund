@@ -15,7 +15,7 @@ import pandas as pd
 
 # The G1 rules a sheet was judged under, written on it. A pass under any other rules no longer counts: the
 # pipeline reads it as "old bar" until the study is re-run (QA F3). Change it whenever G1 gets stricter.
-G1_RULES = "2026-10-06"
+G1_RULES = "2026-10-13"  # R4: the probability of backtest overfitting fails above 0.5
 MIN_OOS_TRADES = 100  # the spec's "at least about 100 out-of-sample trades"
 # Independent Quant Advisor (5 Oct 2026): every neighbour must keep a positive Sharpe, and the median neighbour
 # at least this share of the chosen settings' Sharpe. A cliff next to the chosen value says it was picked from

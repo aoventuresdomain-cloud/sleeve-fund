@@ -201,6 +201,8 @@ class StudyResult:
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+    # The probability of backtest overfitting over the sensitivity grid (research.pbo, R4), with its variant count.
+    pbo: object = None
 
     @property
     def compare_returns(self) -> pd.Series:
@@ -701,9 +703,11 @@ def run_study(
 
     rows, ladders = [], []
     full_default = None
-    for params in combos:
+    grid_returns = {}  # every configuration's daily net returns, discarded ones too: what PBO is fed (R4)
+    for i, params in enumerate(combos):
         res = bt(spec.name, research, params)
-        m = summary(daily_returns(res.equity))
+        grid_returns[i] = daily_returns(res.equity)
+        m = summary(grid_returns[i])
         log(params, "sensitivity", m["sharpe"], research)
         rungs = cost_ladder(params)
         ladders.append(rungs)
@@ -715,6 +719,9 @@ def run_study(
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
     sensitivity = pd.DataFrame(rows)
+    from sleeve_fund.research.pbo import pbo
+
+    overfit = pbo(pd.DataFrame(grid_returns))
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
     sharpes = [r["sharpe"] if math.isfinite(r["sharpe"]) else -math.inf for r in rows]
     if rows and max(sharpes) > -math.inf:
@@ -858,6 +865,7 @@ def run_study(
         full_period=full_default,
         full_period_benchmark=bench,
         sensitivity=sensitivity,
+        pbo=overfit,
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),

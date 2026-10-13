@@ -8,6 +8,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from sleeve_fund import funding
 from sleeve_fund.research.guardrails import G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -17,7 +18,7 @@ from sleeve_fund.research.metrics import (
     summary,
     years_covered,
 )
-from sleeve_fund import funding
+from sleeve_fund.research.pbo import g1_row
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -210,6 +211,9 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         # v2 P1-6: the whole grid can beat the benchmark while the chosen value sits on a peak; this asks
         # whether the settings right next to it still work. In-sample, so it counts under NOT JUDGED too.
         (NEARBY_CHECK, *_nearby(r)),
+        # R4: how often the best in-sample configuration is no better than average out of sample. In-sample grid,
+        # so it counts under NOT JUDGED too.
+        g1_row(getattr(r, "pbo", None)),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
