@@ -183,6 +183,10 @@ class PortfolioGate:
     profile: PortfolioProfile = field(default_factory=PortfolioProfile)
     ledger: MemoryLedger = field(default_factory=MemoryLedger)
     on_action: Callable[[int, str], None] | None = None  # (ts_ns, "halt" | "pause"), whichever mark sets it
+    # Why the book just read has open risk it couldn't measure (a held stopless position with no daily ATR), else None.
+    # The book is still marked, so the halt and pause act; every entry is refused until the figure exists (Advisor 13
+    # Oct 16:20 UK, MUST).
+    unmeasured: Callable[[], str | None] | None = None
 
     def mark(self, ts_ns: int) -> str | None:
         """Mark the fund at ts_ns, a close + BATCH_DELAY_NS: "halt" or "pause" when that mark has just set one
@@ -207,6 +211,9 @@ class PortfolioGate:
         now = _utc(ts_ns)
         try:
             self.mark(ts_ns)
+            missing = self.unmeasured() if self.unmeasured is not None else None
+            if missing:
+                raise ValueError(f"open risk can't be measured ({missing})")
             order = gate_intent(intent)
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
