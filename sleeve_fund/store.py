@@ -65,6 +65,12 @@ COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
+# The supervisor's cancel of one resting order whose Strategy can no longer manage it (ORPHAN-GUARD, Advisor 8 Oct
+# 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
+# venue has answered.
+CANCEL = "cancel"
+# Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0015).
+COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -231,6 +237,20 @@ commands_t = Table(
     Column("incident", Integer, ForeignKey("events.id", ondelete="RESTRICT")),
     Index("commands_incident", "incident", unique=True, postgresql_where=text("incident IS NOT NULL"),
           sqlite_where=text("incident IS NOT NULL")),
+    # The one resting order a cancel names (migration 0015). Only a cancel has one, and a cancel always does: NULL never
+    # means "every order".
+    Column("order_id", String(64), ForeignKey("orders.order_id", ondelete="RESTRICT")),
+    CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
+    CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
+    # When the venue first answered a cancel "not found" with no fill in the journal: no proof of a cancel (Advisor 8 Oct
+    # 06:20 UK, 13 Oct 17:00 UK), so nothing is released and the Strategy's entries stay blocked until the venue confirms
+    # the order's end state (apply_cancel "cancelled" with zero fills, or "filled").
+    Column("not_found_at", TS),
+    CheckConstraint(f"not_found_at IS NULL OR command = '{CANCEL}'", name="commands_not_found_cancel"),
+    # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
+    Index("commands_cancel_open", "order_id", unique=True,
+          postgresql_where=text(f"command = '{CANCEL}' AND applied_at IS NULL"),
+          sqlite_where=text(f"command = '{CANCEL}' AND applied_at IS NULL")),
 )
 
 decisions_t = Table(
@@ -660,6 +680,8 @@ gate_decisions_t = Table(
     Index("gate_decisions_sleeve_bar_intent_stage", "sleeve_id", "bar_ts", "intent_id", "stage", unique=True,
           sqlite_where=text("outcome <> 'error'"), postgresql_where=text("outcome <> 'error'")),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
+    # An order's decisions, read on every fill and status change of a gated order and by a cancel (migration 0015)
+    Index("gate_decisions_order_id", "order_id"),
 )
 # Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the
 # fill, reject or cancel row. Never released blind while its order may still fill (Advisor 20:25 UK).
@@ -2538,7 +2560,11 @@ class Store:
         return next((c for c in self.pending_commands(sleeve) if c["command"] == RELOAD), None)
 
     def pending_commands(self, sleeve: str) -> list[dict]:
-        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None))
+        """The commands a Strategy's process (and the PM's screens) act on. A cancel is the supervisor's, read with
+        open_cancels: a process never applies one, and drop_pending never lapses one, since the order would be left
+        resting with nobody asking for it to go."""
+        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                                      commands_t.c.command != CANCEL)
              .order_by(commands_t.c.id))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -2555,8 +2581,123 @@ class Store:
         return len(pending)
 
     def mark_applied(self, command_id: int) -> None:
+        """Not for a cancel: apply_cancel applies one, with its order and reservation, when the venue has answered."""
         with self.engine.begin() as c:
-            c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
+            c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.command != CANCEL)
+                      .values(applied_at=utcnow()))
+
+    # --- ORPHAN-GUARD: the supervisor's cancel of a resting order (migration 0015) -----------------------------------
+
+    def request_cancel(self, sleeve: str, order_id: str, reason: str, actor: str = "supervisor") -> int:
+        """Ask for one resting order to be cancelled, journaled before anything is sent. Returns the cancel's id; a
+        cancel already open for this order is returned, never a second one (commands_cancel_open), so a retry, a second
+        sweep or a restart sends nothing new. Refused for an order of another Strategy or one no longer open."""
+        if not reason.strip():
+            raise ValueError("every command needs a reason")
+        with self.engine.begin() as c:
+            order = c.execute(select(orders_t.c.sleeve, orders_t.c.status)
+                              .where(orders_t.c.order_id == order_id)).first()
+            if order is None or order.sleeve != sleeve:
+                raise ValueError(f"no order {order_id!r} for {sleeve}")
+            if (open_id := self._open_cancel(c, order_id)) is not None:
+                return open_id
+            if order.status not in OPEN_ORDER_STATUSES:
+                raise ValueError(f"order {order_id} is {order.status}, not resting: nothing to cancel")
+        now = utcnow()
+        try:
+            with self.engine.begin() as c:  # the cancel and its decision-log line together, or neither (CR F241-2)
+                cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=CANCEL, order_id=order_id,
+                                                          reason=reason.strip(), created_at=now)
+                                ).inserted_primary_key[0]
+                c.execute(insert(decisions_t).values(ts=now, actor=actor, action=CANCEL, sleeve=sleeve,
+                                                     reason=f"{reason.strip()} (order {order_id})"))
+        except IntegrityError:  # another caller opened it between our read and our insert
+            with self.engine.connect() as c:
+                if (open_id := self._open_cancel(c, order_id)) is None:
+                    raise
+                return open_id
+        return cid
+
+    @staticmethod
+    def _open_cancel(c, order_id: str) -> int | None:
+        return c.execute(select(commands_t.c.id).where(commands_t.c.order_id == order_id,
+                                                       commands_t.c.command == CANCEL,
+                                                       commands_t.c.applied_at.is_(None))).scalar()
+
+    def open_cancels(self, sleeve: str | None = None) -> list[dict]:
+        """Cancels sent or to send whose venue answer hasn't come: the supervisor's to work, oldest first."""
+        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None))
+        if sleeve is not None:
+            q = q.where(commands_t.c.sleeve == sleeve)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(commands_t.c.id)))
+
+    def apply_cancel(self, command_id: int, outcome: str, at: datetime | None = None) -> str:
+        """The venue's answer to a cancel, in one transaction: "cancelled" (confirmed), "not_found" or "filled".
+
+        "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK), so the fill journal is read first:
+        - an order with a fill: nothing is written and "filled" is returned. The caller books the venue's fills (each
+          reduces the reservation as any fill does), closes the orphan (og5) and then answers "filled";
+        - an order with none: only the first such answer's time is kept (not_found_at) and "unconfirmed" is returned.
+          Nothing is released, however long our journal stays silent (Advisor 13 Oct 17:00 UK): the cancel stays
+          open, which blocks the Strategy's entries (open_cancels), until the venue's own order query and fill history
+          settle it as "cancelled" (a terminal state with zero fills) or "filled".
+        "filled", once the journal holds the order's fills: the command is applied and nothing more released (the
+        fills used what they used); refused with no fill in the journal.
+        "cancelled": the venue confirmed the order ended (cancelled, or terminal with zero fills after a "not found").
+        The order's open reservation (what no fill used) is released as 'cancel', the order marked canceled and the
+        command applied: "applied", or "partly_filled" for an order with fills, whose filled part the caller closes
+        (og5).
+        "already" when another got there first, and then nothing at all is written. `at`: when the answer came, on
+        the supervisor's clock, else now."""
+        if outcome not in ("cancelled", "not_found", "filled"):
+            raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
+        now = at or utcnow()
+        with self.engine.begin() as c:
+            cmd = c.execute(select(commands_t).where(commands_t.c.id == command_id,
+                                                     commands_t.c.command == CANCEL)).first()
+            if cmd is None:
+                raise ValueError(f"command {command_id} is not a cancel")
+            if cmd.applied_at is not None:
+                return "already"
+            filled = self._order_filled(c, cmd)
+            if outcome == "not_found":
+                if filled:
+                    return "filled"
+                c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.not_found_at.is_(None))
+                          .values(not_found_at=now))
+                return "unconfirmed"
+            if outcome == "filled":
+                if not filled:
+                    raise ValueError(f"order {cmd.order_id} has no fill in the journal: book the venue's fills first")
+                took = c.execute(update(commands_t).where(commands_t.c.id == command_id,
+                                                          commands_t.c.applied_at.is_(None))
+                                 .values(applied_at=now)).rowcount
+                return "applied" if took else "already"
+            if not self._close_cancel(c, cmd, "canceled", f"cancelled by the supervisor: {cmd.reason}", now):
+                return "already"
+        return "partly_filled" if filled else "applied"
+
+    @staticmethod
+    def _order_filled(c, cmd) -> bool:
+        return c.execute(select(fills_t.c.id).where(fills_t.c.sleeve == cmd.sleeve,
+                                                    fills_t.c.order_id == cmd.order_id).limit(1)).first() is not None
+
+    @staticmethod
+    def _close_cancel(c, cmd, status: str, message: str, now: datetime) -> bool:
+        """Apply the cancel, release what of its order's reservation no fill used and end the order, inside the
+        caller's transaction. False when another got there first (nothing written)."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == cmd.id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        decisions = select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == cmd.order_id)
+        c.execute(update(gate_reservations_t).where(gate_reservations_t.c.decision_id.in_(decisions),
+                                                    gate_reservations_t.c.released_at.is_(None))
+                  .values(released_at=now, release_reason="cancel"))
+        c.execute(update(orders_t).where(orders_t.c.order_id == cmd.order_id, orders_t.c.status.in_(OPEN_ORDER_STATUSES))
+                  .values(status=status, updated_at=now, message=message))
+        return True
 
     def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
                ts: datetime | None = None) -> None:
