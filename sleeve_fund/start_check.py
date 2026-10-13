@@ -58,6 +58,16 @@ def read_only_engine(url: str) -> Engine:
     raise ValueError("the journal URL is neither SQLite nor Postgres")
 
 
+def read_only_store(url: str):
+    """The Store's readers on the read-only engine; its constructor would create tables. The caller disposes of
+    store.engine."""
+    from sleeve_fund.store import Store
+
+    store = Store.__new__(Store)
+    store.engine, store.portfolio_gate, store.url = read_only_engine(url), False, None
+    return store
+
+
 def check_keys(environ: dict[str, str], engine: Engine) -> Section:
     from sleeve_fund.mirror import ACCOUNTS as DEMO_ACCOUNTS
     from sleeve_fund.paper.safety import credential_var
@@ -140,12 +150,9 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     """The checks against the journal at url, and the one-page report."""
     from datetime import UTC, datetime
 
-    from sleeve_fund.store import Store
-
     env = dict(os.environ if environ is None else environ)
-    engine = read_only_engine(url)
-    store = Store.__new__(Store)  # the Store's readers on the read-only engine; its constructor would create tables
-    store.engine, store.portfolio_gate, store.url = engine, False, None
+    store = read_only_store(url)
+    engine = store.engine
     sections = [check_keys(env, engine), check_venues(engine), check_books(store)]
     ok = not any(s.failed for s in sections)
     where = make_url(url).render_as_string(hide_password=True)
