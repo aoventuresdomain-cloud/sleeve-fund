@@ -8,7 +8,7 @@ runs. Tables are plain and typed so reports and BI tools can query them directly
 
 from __future__ import annotations
 
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 import json
 import math
@@ -795,9 +795,9 @@ def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     big, legs = 0.0, 0  # the largest fill and the fills since the position was last flat
     for f in fills:
         n += 1
-        price, q, fee = D(f["price"], "price"), D(f["qty"], "qty"), D(f["fee"], "fee")
+        price, q, fee = D(f["price"], "price"), D(f["qty"], "qty"), per_fill(D(f["fee"], "fee"))
         sign = 1 if f["side"] == "BUY" else -1
-        cash -= sign * q * price + fee
+        cash += fill_cash(f["side"], q, price, fee)
         new = qty + sign * q
         big, legs = max(big, abs(float(q))), legs + 1
         # Float residue from the fills' own arithmetic: below DUST, or for fills too large for a float to hold
@@ -822,12 +822,21 @@ def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
             "funding": funding, "insurance": insurance, "entry_fees": fees}
 
 
+# A fill's cash leg and its fee each count at 8 dp, rounded half up, on their own: no carry, so a restart can't move
+# one (Advisor 8 Oct 04:10 UK, ruling 1, CASH-3). Not to the cent: a per-fill cent is systematic on fixed-size fills.
+FILL_DP = Decimal("1e-8")
+
+
+def per_fill(amount: Decimal) -> Decimal:
+    return amount.quantize(FILL_DP, rounding=ROUND_HALF_UP)
+
+
 def fill_cash(side: str, qty, price, fee) -> Decimal:
     """What one fill moved the strategy's cash by, as replay_book books it: a buy pays qty * price and the fee, a sell
-    receives qty * price less the fee."""
+    receives qty * price less the fee, each at 8 dp half up (per_fill)."""
     D = to_decimal
-    leg = D(qty, "qty") * D(price, "price")
-    return (-leg if side == "BUY" else leg) - D(fee, "fee")
+    leg = per_fill(D(qty, "qty") * D(price, "price"))
+    return (-leg if side == "BUY" else leg) - per_fill(D(fee, "fee"))
 
 
 def is_backtest(name: str | None) -> bool:
@@ -1748,7 +1757,9 @@ class Store:
         f = fills_t.c
         with self.engine.connect() as c:
             if self.engine.dialect.name == "postgresql":
-                leg = case((f.side == "BUY", -(f.qty * f.price)), else_=f.qty * f.price) - f.fee
+                # Postgres' round(numeric, 8) is half away from zero: per_fill's ROUND_HALF_UP
+                leg = (case((f.side == "BUY", -func.round(f.qty * f.price, 8)), else_=func.round(f.qty * f.price, 8))
+                       - func.round(f.fee, 8))
                 sums = [select(func.sum(leg)).where(window(fills_t)),
                         select(func.sum(funding_t.c.amount)).where(window(funding_t)),
                         select(func.sum(insurance_t.c.amount)).where(window(insurance_t))]
@@ -1764,11 +1775,11 @@ class Store:
         """Every fill the strategy has and the fees they paid, uncapped (CASH-2), exact as strategy_cash_pnl."""
         with self.engine.connect() as c:
             if self.engine.dialect.name == "postgresql":
-                n, fees = c.execute(select(func.count(), func.sum(fills_t.c.fee))
+                n, fees = c.execute(select(func.count(), func.sum(func.round(fills_t.c.fee, 8)))
                                     .where(fills_t.c.sleeve == sleeve)).one()
                 return n, to_decimal(fees or 0)
             fees = list(c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars())
-            return len(fees), sum((to_decimal(x) for x in fees), Decimal(0))
+            return len(fees), sum((per_fill(to_decimal(x)) for x in fees), Decimal(0))
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""

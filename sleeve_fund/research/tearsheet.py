@@ -539,6 +539,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Fees paid: {r.full_period.fees_paid:,.0f} on {r.full_period.starting_capital:,.0f} starting capital; "
                f"fee drag {fee_drag:.2%} of average equity a year")
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
+    out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
+               "the liquidation price when the level loosened past it or funding moved it nearer")
     out.append("")
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
