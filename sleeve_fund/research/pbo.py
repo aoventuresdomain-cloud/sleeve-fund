@@ -32,12 +32,14 @@ NA = "window too short"
 NO_SELECTION = "not applicable: no selection"  # one pre-registered setting (Advisor 13 Oct 18:05): G1 rests on the rest
 NOT_JUDGED = "NOT JUDGED"  # tearsheet.NOT_JUDGED, which imports this module: G1 reads it as neither pass nor fail
 PARTIAL = "PBO partial"
+PARTIAL_MAX = 0.2  # HoE F238-3: more of the counted family than this couldn't be re-run, so the value isn't the family's
+TOO_PARTIAL = "too many settings couldn't be re-run"
 
 
 @dataclass(frozen=True)
 class PBOResult:
     value: float | None
-    verdict: str  # "PASS", "WARN", "FAIL", TOO_FEW, NA or NO_SELECTION
+    verdict: str  # "PASS", "WARN", "FAIL", TOO_FEW, NA, TOO_PARTIAL or NO_SELECTION
     n_variants: int  # distinct configurations, after exact duplicates are dropped
     n_combos: int = 0
     words: str = ""
@@ -79,6 +81,11 @@ def pbo(returns: pd.DataFrame, blocks: int = BLOCKS, partial: tuple[str, ...] = 
     note = "".join([f", {dropped} identical series dropped" if dropped else "",
                     f"; {len(partial)} counted setting{'s' if len(partial) != 1 else ''} couldn't be "
                     f"re-run ({'; '.join(partial)})" if partial else ""])
+    tried = returns.shape[1] + len(partial)  # every counted setting: re-run, or listed as not
+    if partial and len(partial) > PARTIAL_MAX * tried:
+        return PBOResult(None, TOO_PARTIAL, n, words=f"{len(partial)} of the {tried} counted settings couldn't be "
+                         f"re-run, more than {PARTIAL_MAX:.0%}, so the result wouldn't be the family's{note}",
+                         dropped=dropped, partial=partial)
     if n < MIN_VARIANTS:
         return PBOResult(None, TOO_FEW, n, words=f"{n} distinct configuration{'s' if n != 1 else ''} tried, fewer "
                          f"than the {MIN_VARIANTS} it needs{note}", dropped=dropped, partial=partial)
@@ -130,9 +137,10 @@ def no_selection(why: str) -> PBOResult:
 def g1_row(result: PBOResult | None) -> tuple[str, str, str]:
     """The tear sheet's G1 row. FAIL fails G1; WARN shows amber and doesn't; too few variants or a window too short
     is not judged, which never counts as a pass (Advisor 13 Oct 16:50). One pre-registered setting has no selection
-    to judge: N/A (18:05). A result from before R4 has none: N/A."""
+    to judge: N/A (18:05). No result at all (a study from before R4) is not judged either, so G1 fails closed (CR F238-1).
+    So is a family too much of which couldn't be re-run (F238-3)."""
     if result is None:
-        return PBO_CHECK, "N/A", "not computed for this study"
+        return PBO_CHECK, NOT_JUDGED, "PBO not computed for this study"
     if result.verdict == NO_SELECTION:
         return PBO_CHECK, "N/A", f"{NO_SELECTION}: {result.words}"
     if result.value is None:
