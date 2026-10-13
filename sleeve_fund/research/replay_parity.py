@@ -6,7 +6,8 @@ window, then hands both lists here. Decisions are keyed on (strategy, bar_ts), b
 two decisions on one key pair in the order each side made them. Only 'submit' stage rows are compared: a backtest has
 no fill-stage backstop, and 'error' rows never reach replayable(). A paper entry sent outside a bar decision (a
 rebalance add, a resumed entry) carries the check time as its bar_ts (PE2, W2) and no signal.bar on its order row: the
-caller names those intents (`unbarred`), and they are listed on their own line, never matched or mismatched."""
+caller names those intents (`unbarred`), and they are listed on their own line, never matched or mismatched. The
+backtest's own such orders are marked in its decisions (bar_decided) and listed apart the same way."""
 
 from __future__ import annotations
 
@@ -67,6 +68,7 @@ class ParityReport:
     matched: int
     mismatches: list[Mismatch] = field(default_factory=list)
     unbarred: list[Decided] = field(default_factory=list)  # paper entries not decided on a bar: listed, not compared
+    unbarred_backtest: list[Decided] = field(default_factory=list)  # the backtest's likewise
 
     @property
     def clean(self) -> bool:
@@ -90,8 +92,8 @@ def from_journal(rows: Iterable[Journaled], unbarred: Collection[str] = ()) -> l
 
 def from_backtest(decisions: Iterable[dict]) -> list[Decided]:
     """The backtest's side: PortfolioResult.decisions."""
-    return [Decided(d["strategy"], d["bar_ts"], d["outcome"], d["requested"], d["approved"], d["limit"])
-            for d in decisions]
+    return [Decided(d["strategy"], d["bar_ts"], d["outcome"], d["requested"], d["approved"], d["limit"],
+                    d.get("bar_decided", True)) for d in decisions]
 
 
 def _within(rows: list[Decided], start: datetime | None, end: datetime | None) -> list[Decided]:
@@ -111,6 +113,7 @@ def compare(paper: list[Decided], backtest: list[Decided], start: datetime | Non
     Quantities are compared exactly: both sides size on the same step, so any difference is a real one."""
     p, b = _within(paper, start, end), _within(backtest, start, end)
     unbarred, p = [r for r in p if not r.bar_decided], [r for r in p if r.bar_decided]
+    unbarred_b, b = [r for r in b if not r.bar_decided], [r for r in b if r.bar_decided]
     pk, bk = _keyed(p), _keyed(b)
     matched, out = 0, []
     for key in sorted(pk.keys() | bk.keys()):
@@ -127,7 +130,7 @@ def compare(paper: list[Decided], backtest: list[Decided], start: datetime | Non
                     out.append(Mismatch(*key, what, x, y))
                 else:
                     matched += 1
-    return ParityReport(len(p), len(b), matched, out, unbarred)
+    return ParityReport(len(p), len(b), matched, out, unbarred, unbarred_b)
 
 
 def adverse_bp(side: int, expected: Decimal, fill: Decimal) -> float:

@@ -323,7 +323,8 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
     decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.intent.bar_ts, "kind": r.intent.kind,
                   "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
                   "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
-                  "side": r.intent.side, "price": r.intent.price} for r in gate.ledger.records]
+                  "side": r.intent.side, "price": r.intent.price,
+                  "bar_decided": r.intent.intent_id not in gate.unbarred} for r in gate.ledger.records]
     gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
              "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
             for kind, msg, at in gate.ledger.alerts

@@ -182,3 +182,17 @@ def test_paper_and_the_backtest_hand_the_check_the_same_tagged_order(monkeypatch
     paper_gate.ledger, paper_gate.profile = None, None
     paper_gate("a", intent, BAR_NS + 1)
     assert len(seen) == 2 and seen[0] == seen[1] and seen[0].bar_ts == _day(2)
+
+
+def test_a_backtest_entry_not_decided_on_a_bar_is_listed_on_its_own_never_a_false_backtest_only(monkeypatch):
+    """PE2 FU-1: the backtest marks an order sent outside a bar decision, and the report lists it apart, as paper's."""
+    monkeypatch.setattr(portfolio, "check_order", lambda ledger, s, order, profile, now: None)
+    gate = portfolio.PortfolioGate(book=lambda ts: (D(20000), ()))
+    gate("a", {**_ORDER, "intent_id": "a-1", "bar": BAR_NS}, BAR_NS + 1)
+    gate("a", {**_ORDER, "intent_id": "a-2"}, BAR_NS + 7 * 60 * 10**9)  # a rebalance add: no bar
+    assert gate.unbarred == {"a-2"}
+    off_bar = _day(1) + timedelta(minutes=7)
+    report = compare(from_journal([_j(1, "a", _day(0))]),
+                     from_backtest([_b("a", _day(0)), {**_b("a", off_bar), "bar_decided": False}]))
+    assert report.clean and report.matched == 1 and report.backtest == 1
+    assert [(u.strategy, u.bar_ts) for u in report.unbarred_backtest] == [("a", off_bar)]

@@ -202,6 +202,9 @@ class PortfolioGate:
     # The book is still marked, so the halt and pause act; every entry is refused until the figure exists (Advisor 13
     # Oct 16:20 UK, MUST).
     unmeasured: Callable[[], str | None] | None = None
+    # The intent_ids of orders sent outside a bar decision (no `bar`): their bar_ts is only the check time, so the
+    # parity report lists them on their own, as it does paper's (P2-7, PE2 FU-1).
+    unbarred: set[str] = field(default_factory=set)
 
     def mark(self, ts_ns: int) -> str | None:
         """Mark the fund at ts_ns, a close + BATCH_DELAY_NS: "halt" or "pause" when that mark has just set one
@@ -230,6 +233,8 @@ class PortfolioGate:
             if missing:
                 raise ValueError(f"open risk can't be measured ({missing})")
             order = tagged_intent(intent, now)
+            if not isinstance(intent.get("bar"), int):
+                self.unbarred.add(order.intent_id)
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
