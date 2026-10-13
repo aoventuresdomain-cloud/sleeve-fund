@@ -15,8 +15,10 @@ from sleeve_fund.research.candidates import (
     OPTIMISER_PACKAGE,
     PROTECTED_MODULES,
     Candidate,
+    NewIdea,
     PmOverride,
     idea_hash,
+    log_override,
     validate_candidate,
 )
 from sleeve_fund.research.trials import TrialsRegister, trial_row
@@ -34,9 +36,15 @@ PARENT = {
 }
 
 
+HYPOTHESIS = NewIdea(by="researcher", hypothesis="Dips only pay inside an uptrend, so the entry needs the trend.")
+
+
 class _Rows:
     def __init__(self):
-        self.rows = []
+        self.rows, self.events = [], []
+
+    def event(self, sleeve, level, kind, message):
+        self.events.append((sleeve, level, kind, message))
 
     def add_trials(self, rows):
         self.rows.extend({"status": "ok", "kind": "single", **r} for r in rows)
@@ -118,20 +126,82 @@ def test_r6_4_ablation_rows_use_no_budget(tmp_path):
                               register=reg)
 
 
-def test_r6_7_a_restructured_candidate_is_refused_unless_flagged_a_new_idea():
+def test_r6_7_a_restructured_candidate_is_refused_unless_flagged_a_new_idea_with_a_hypothesis():
     cand = _with(long={"entry": {"left": "rsi", "op": "<", "right": 30}, "exit": PARENT["long"]["exit"]})
     assert idea_hash(cand) != idea_hash(PARENT)
-    with pytest.raises(ValueError, match="flagged as a new idea"):
+    with pytest.raises(ValueError, match="flagged as a new idea, with the Researcher's hypothesis"):
         validate_candidate(PARENT, cand, register=_register())
-    out = validate_candidate(PARENT, cand, register=_register(), new_idea=True)
-    assert out.new_idea and out.idea_hash == idea_hash(cand)
+    out = validate_candidate(PARENT, cand, register=_register(), new_idea=HYPOTHESIS)
+    assert out.new_idea == HYPOTHESIS and out.idea_hash == idea_hash(cand)
+    with pytest.raises(TypeError, match="Researcher's hypothesis"):
+        validate_candidate(PARENT, cand, register=_register(), new_idea=True)
+    for by, why in [("optimiser", "A reason."), ("researcher", " ")]:
+        with pytest.raises(ValueError, match="flagged by the Researcher, with the hypothesis"):
+            NewIdea(by=by, hypothesis=why)
 
 
-def test_r6_7_numbers_alone_never_make_a_new_idea():
-    assert idea_hash(_with(long={**PARENT["long"], "exit": {"left": "rsi", "op": ">=", "right": 61.5}})) == \
-        idea_hash(PARENT)
-    assert idea_hash(_with(long={**PARENT["long"], "exit": {"left": "rsi", "op": ">", "right": 55}})) != \
-        idea_hash(PARENT)
+def test_r6_7_a_retuned_candidate_cant_be_flagged_a_new_idea():
+    cand = _with(long={**PARENT["long"], "exit": {"left": "rsi", "op": ">", "right": 60}})
+    with pytest.raises(ValueError, match="same idea and uses its budget"):
+        validate_candidate(PARENT, cand, register=_register(), new_idea=HYPOTHESIS)
+
+
+def _swap(defn, path, value):
+    d = copy.deepcopy(defn)
+    *head, last = path
+    node = d
+    for k in head:
+        node = node[k]
+    node[last] = value
+    return d
+
+
+ENTRY = ("long", "entry", "all")
+
+
+@pytest.mark.parametrize("why, knob", [
+    ("a number", lambda d: _swap(d, ("long", "exit", "right"), 61.5)),
+    ("> for >=", lambda d: _swap(d, ("long", "exit", "op"), ">")),
+    ("< for <=", lambda d: _swap(d, (*ENTRY, 0), {"left": "rsi", "op": "<=", "right": 30})),
+    ("the high for the close", lambda d: _swap(d, (*ENTRY, 1), {"left": "high", "op": ">", "right": 0})),
+    ("a block's lookback", lambda d: _swap(d, ("blocks", "dc"), {"kind": "donchian", "period": 55})),
+    ("a block's timeframe", lambda d: _swap(d, ("blocks", "rsi"), {"kind": "rsi", "period": 14, "timeframe": "4h"})),
+    ("a block's input series", lambda d: _swap(d, ("blocks", "rsi"), {"kind": "rsi", "period": 14, "input": "high"})),
+    ("a block's name", lambda d: _swap(_swap(d, ("blocks",), {"dc": d["blocks"]["dc"], "osc": d["blocks"]["rsi"]}),
+                                     ("long",), json.loads(json.dumps(d["long"]).replace('"rsi"', '"osc"')))),
+    ("the members' order", lambda d: _swap(d, ENTRY, list(reversed(d["long"]["entry"]["all"])))),
+])
+def test_r6_7_every_tuning_knob_stays_the_same_idea(why, knob):
+    """Advisor 13 Oct 15:40 UK: flipping a knob never resets the budget."""
+    assert idea_hash(knob(PARENT)) == idea_hash(PARENT), why
+
+
+def test_r6_7_the_moving_average_type_and_the_atr_smoothing_stay_the_same_idea():
+    trend = {"version": 1, "reason": REASON, "blocks": {"ma": {"kind": "sma", "period": 50}, "atr": {"kind": "atr"}},
+             "long": {"entry": {"left": "close", "op": ">", "right": "ma"}},
+             "exits": {"stop": {"level": {"sub": ["close", {"mul": ["atr", 2]}]}}}}
+    for kind in ("ema", "wma"):
+        assert idea_hash(_swap(trend, ("blocks", "ma", "kind"), kind)) == idea_hash(trend)
+    assert idea_hash(_swap(trend, ("blocks", "atr", "kind"), "atr_sma")) == idea_hash(trend)
+    assert idea_hash(_swap(trend, ("blocks", "ma", "kind"), "vwap")) != idea_hash(trend)  # another indicator
+
+
+@pytest.mark.parametrize("why, change", [
+    ("a condition added", lambda d: _swap(d, ENTRY, [*d["long"]["entry"]["all"],
+                                                     {"left": "close", "op": ">", "right": "dc.upper"}])),
+    ("a condition removed", lambda d: _swap(d, ("long", "entry"), d["long"]["entry"]["all"][0])),
+    ("an exit added", lambda d: _swap(d, ("exits", "trail"), {"level": "dc.mid"})),
+    ("an exit removed", lambda d: _swap(d, ("exits",), {"stop": {"level": "dc.lower"}})),
+    ("a block added", lambda d: _swap(d, ("blocks", "vol"), {"kind": "relative_volume"})),
+    ("and made or", lambda d: _swap(d, ("long", "entry"), {"any": d["long"]["entry"]["all"]})),
+    ("RSI measured as volume", lambda d: _swap(_swap(d, ("blocks", "rsi"), {"kind": "relative_volume"}),
+                                               (*ENTRY, 0), {"left": "rsi", "op": "<", "right": 30})),
+    ("close read as volume", lambda d: _swap(d, (*ENTRY, 1), {"left": "volume", "op": ">", "right": 0})),
+    ("the short side traded", lambda d: _swap(d, ("short",), {"entry": {"left": "rsi", "op": ">", "right": 70}})),
+    ("a comparison turned round", lambda d: _swap(d, ("long", "exit", "op"), "<=")),
+])
+def test_r6_7_a_change_of_structure_or_of_what_is_measured_is_a_new_idea(why, change):
+    assert idea_hash(change(PARENT)) != idea_hash(PARENT), why
 
 
 @pytest.mark.parametrize("real", [False, True])
@@ -152,16 +222,55 @@ def test_r6_8_an_ablation_variant_or_one_built_from_it_is_refused(real, tmp_path
         validate_candidate(variant, tweaked, register=reg)
     stopless = remove(PARENT, "exits.stop")[1]  # a removed exit: a different idea, refused all the same
     with pytest.raises(ValueError, match="is an ablation variant"):
-        validate_candidate(PARENT, stopless, register=reg, new_idea=True)
+        validate_candidate(PARENT, stopless, register=reg, new_idea=HYPOTHESIS)
 
 
-def test_r6_8_an_ablation_row_without_its_lineage_refuses_every_candidate():
+def _lost(idea):
+    return {**trial_row(definition_hash="x" * 16, idea_hash=idea, name="dip", family="rule-builder",
+                        settings={"one_x": False}, dataset="d", stage="out_of_sample", source="study", sharpe=None),
+            "kind": "ablation"}
+
+
+def test_r6_8_an_ablation_row_without_its_lineage_refuses_its_ideas_candidates_and_raises_an_alert():
+    """Advisor 13 Oct 15:40 UK: only in that row's idea, with an alert."""
     reg = _register()
-    reg.store.add_trials([{**trial_row(definition_hash="x" * 16, idea_hash="i", name="dip", family="rule-builder",
-                                       settings={"one_x": False}, dataset="d", stage="out_of_sample", source="study",
-                                       sharpe=None), "kind": "ablation"}])
-    with pytest.raises(ValueError, match="lineage can't be checked"):
+    reg.store.add_trials([_lost(idea_hash(PARENT))])
+    with pytest.raises(ValueError, match="lineage can't be checked; candidates of idea"):
         validate_candidate(PARENT, PARENT, register=reg)
+    assert [(e[0], e[1], e[2]) for e in reg.store.events] == [(None, "warning", "ablation_lineage")]
+    assert idea_hash(PARENT)[:12] in reg.store.events[0][3]
+    other = _register()
+    other.store.add_trials([_lost("another-idea")])
+    assert validate_candidate(PARENT, PARENT, register=other)  # another idea's row refuses nothing here
+    assert other.store.events == []
+
+
+def test_r6_8_an_ablation_row_without_lineage_or_idea_refuses_every_candidate():
+    reg = _register()
+    reg.store.add_trials([_lost("")])
+    with pytest.raises(ValueError, match="no lineage and no idea"):
+        validate_candidate(PARENT, PARENT, register=reg)
+
+
+def test_r6_4_the_pms_override_goes_in_the_decision_log_after_the_trial_row(tmp_path):
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    reg = _register(store)
+    for bars in range(1, BUDGET_PER_IDEA + 1):
+        _tried(reg, _with(exits={"time_stop": {"bars": bars}, "stop": {"level": "dc.lower"}}))
+    ok = PmOverride(by="pm", reason="Wider stop range asked for.", at=datetime(2026, 10, 13, tzinfo=UTC))
+    within = validate_candidate(PARENT, _with(exits={"time_stop": {"bars": 5}, "stop": {"level": "dc.lower"}}),
+                                register=reg, override=ok)
+    assert within.override is None and within.configuration == BUDGET_PER_IDEA  # already tried: no new one
+    log_override(store, within, "t-5")
+    assert store.decisions(action="budget_override") == []
+    past = validate_candidate(PARENT, _with(exits={"time_stop": {"bars": 99}, "stop": {"level": "dc.lower"}}),
+                              register=reg, override=ok)
+    assert past.configuration == BUDGET_PER_IDEA + 1
+    log_override(store, past, "t-21")
+    (row,) = store.decisions(action="budget_override")
+    assert row["actor"] == "PM" and row["sleeve"] is None
+    assert row["reason"] == (f"Wider stop range asked for. (idea {idea_hash(PARENT)[:12]}, trial t-21, "
+                             f"configuration 21 of {BUDGET_PER_IDEA})")
 
 
 # --- R6-5: the optimiser package never reaches what it must not touch ----------------------------------------------
@@ -184,7 +293,7 @@ def protected_uses(source: str) -> list[str]:
         if isinstance(node, ast.Call):
             fn = node.func
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
-            if name in ("add_trials", "add_holdout_lock", "execute", "write_text", "write_bytes"):
+            if name in ("add_trials", "add_holdout_lock", "decide", "event", "execute", "write_text", "write_bytes"):
                 out.append(f"calls {name}")
             if name == "open":
                 modes = [a.value for a in node.args[1:2] if isinstance(a, ast.Constant)]
@@ -203,8 +312,9 @@ def test_r6_5_the_optimiser_package_touches_nothing_protected():
 
 def test_r6_5_the_scan_catches_a_module_that_reaches_a_protected_one():
     bad = ("import sleeve_fund.risk\nfrom sleeve_fund.research import trials\nfrom sleeve_fund.paper.runtime import x\n"
-           "def go(store, p):\n    store.add_trials([])\n    open(p, 'w')\n    open(p, mode='a')\n")
-    assert protected_uses(bad) == ["calls add_trials", "imports sleeve_fund.paper.runtime",
+           "def go(store, p):\n    store.add_trials([])\n    store.decide('PM', 'budget_override', 'x')\n"
+           "    open(p, 'w')\n    open(p, mode='a')\n")
+    assert protected_uses(bad) == ["calls add_trials", "calls decide", "imports sleeve_fund.paper.runtime",
                                    "imports sleeve_fund.research.trials", "imports sleeve_fund.risk",
                                    "opens a file for writing"]
     ok = "from sleeve_fund.research.candidates import validate_candidate\nopen('x').read()\n"
@@ -223,5 +333,7 @@ def test_r6_6_no_code_path_from_a_candidate_to_paper():
     users = [str(p.relative_to(ROOT)) for p in (ROOT / "sleeve_fund").rglob("*.py")
              if "Candidate" in p.read_text(encoding="utf-8") and p.name != "candidates.py"]
     assert users == []
-    assert protected_uses((ROOT / "sleeve_fund/research/candidates.py").read_text(encoding="utf-8")) == []
+    guard = protected_uses((ROOT / "sleeve_fund/research/candidates.py").read_text(encoding="utf-8"))
+    assert [u for u in guard if not u.startswith("calls ")] == []  # it logs the PM's override and alerts; nothing more
+    assert guard == ["calls decide", "calls event"]
     assert json.dumps(PARENT)  # a candidate is plain data
