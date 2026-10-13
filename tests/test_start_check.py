@@ -132,7 +132,7 @@ def test_a_wiped_out_isolated_margin_mark_floored_at_zero_is_a_note(tmp_path):
                         ts=T0 + timedelta(minutes=2))
     store.engine.dispose()
     ok, page = start_check.run(url, environ={})
-    assert ok and "equity 0.00, floored from -1,003.00" in page
+    assert ok and "  NOTE  s1: position 0.1" in page and "equity 0.00, floored from -1,003.00" in page
 
 
 def test_nothing_compared_is_a_fail_not_a_vacuous_pass(tmp_path):
@@ -153,3 +153,14 @@ def test_postgres_read_only_engine_refuses_a_write():
     with pytest.raises(Exception, match="read-only|ReadOnlySqlTransaction"), engine.begin() as c:
         c.execute(text("CREATE TABLE start_check_probe (x int)"))
     engine.dispose()
+
+
+def test_a_zero_mark_when_the_journal_is_not_underwater_fails(tmp_path):
+    """HoE: the floor is a NOTE only when the journal side really is underwater; at journal equity >= 0 a mark of 0
+    is wrong."""
+    url, store = _journal(tmp_path)
+    store.record_equity("s1", equity=0.0, cash=3_997.0, qty=0.1, price=60_000.0, benchmark=10_000.0,
+                        ts=T0 + timedelta(minutes=2))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "but equity 0.00 vs journal 9,997.00" in page
