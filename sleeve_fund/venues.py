@@ -9,6 +9,7 @@ means registering a profile here, not changing the engine.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
@@ -141,8 +142,14 @@ def register(profile: VenueProfile) -> VenueProfile:
     return profile
 
 
+def base_venue(name: str) -> str:
+    """The venue a portfolio run's venue clone stands for (research.portfolio.clone_venue: VENUE -> VENUE_P1): a
+    clone trades with its venue's fees, spread, perpetual terms and day start. Any other name comes back as given."""
+    return re.sub(r"_P\d+$", "", str(name))
+
+
 def venue(name: str | None = None) -> VenueProfile:
-    name = (name or DEFAULT_VENUE).upper()
+    name = base_venue(name or DEFAULT_VENUE).upper()
     if name not in VENUES:
         raise ValueError(f"unknown venue {name!r}; known: {sorted(VENUES)}")
     return VENUES[name]

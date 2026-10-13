@@ -122,16 +122,26 @@ def test_cli_reads_the_history_store(tmp_path, monkeypatch):
     from sleeve_fund import history
     from sleeve_fund.__main__ import main
 
-    idx = pd.date_range("2020-01-01", periods=1700 * 1440 // 60, freq="60min", tz="UTC")
+    idx = pd.date_range("2020-01-01", periods=191 * 1440 // 60, freq="60min", tz="UTC")
     c = 100 * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.004, len(idx))))
     hourly = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx)
     minutes = hourly.resample("1min").ffill()
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
     history.HistoryStore(tmp_path / "hist").append("KRAKEN", "BTC/USD", minutes, cursor="x")
     out = tmp_path / "sheet.md"
+    # Short windows keep the run small (CI-TRIM); the CLI's default windows are pinned on their own below.
     assert main(["--ledger", str(tmp_path / "l.jsonl"), "study", "buy_and_hold", "--store", "--holdout-days", "100",
-                 "--out", str(out)]) == 0
+                 "--train-days", "60", "--test-days", "30", "--out", str(out)]) == 0
     assert "capped at 33%" in out.read_text()
+
+
+def test_the_cli_study_defaults_to_three_years_of_training_one_of_testing_and_a_one_year_holdout(tmp_path, monkeypatch):
+    import sleeve_fund.__main__ as cli
+
+    seen = []
+    monkeypatch.setattr(cli, "run_store_study", lambda req, **kw: seen.append(req) or tmp_path / "sheet.md")
+    assert cli.main(["--ledger", str(tmp_path / "l.jsonl"), "study", "buy_and_hold", "--store"]) == 0
+    assert (seen[0].train_days, seen[0].test_days, seen[0].holdout_days) == (1095, 365, 365)
 
 
 def test_an_hourly_study_is_judged_on_daily_returns(tmp_path, instrument):
@@ -178,7 +188,11 @@ def test_a_study_on_bars_that_start_mid_day_counts_each_whole_day_once(tmp_path,
     bars = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 1e6},
                         index=idx)
     ledger = IdeaLedger(tmp_path / "l.jsonl")
-    r = run_study(SPEC, bars, instrument, dataset=f"syn-{minutes}m", ledger=ledger, synthetic=True, holdout_days=30,
+    from dataclasses import replace
+
+    # One setting is enough: the cell is about the folds' day windows, not the grid (CI-TRIM).
+    one = replace(SPEC, param_grid={"fast": [20], "slow": [100]})
+    r = run_study(one, bars, instrument, dataset=f"syn-{minutes}m", ledger=ledger, synthetic=True, holdout_days=30,
                   train_days=60, test_days=30, default_params={"fast": 20, "slow": 100}, use_holdout=True)
     assert len(r.folds) == 2
     days = pd.Series(r.oos_returns.index)
@@ -217,7 +231,7 @@ def test_cli_studies_hourly_bars_from_the_store(tmp_path, monkeypatch):
     from sleeve_fund import history
     from sleeve_fund.__main__ import main
 
-    idx = pd.date_range("2024-01-01", periods=500 * 24, freq="60min", tz="UTC")
+    idx = pd.date_range("2024-01-01", periods=331 * 24, freq="60min", tz="UTC")
     c = 100 * np.exp(np.cumsum(np.random.default_rng(2).normal(0, 0.004, len(idx))))
     minutes = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx).resample("1min").ffill()
     monkeypatch.setattr(history, "DEFAULT_ROOT", tmp_path / "hist")
@@ -674,8 +688,9 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
     import sleeve_fund.research.study as study
     from dataclasses import replace
 
-    # A perpetual on a venue that lists spot: every setting trades the simulated low-fee perp market.
-    perp = replace(SPEC, param_grid={k: v[:2] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
+    # A perpetual on a venue that lists spot: every setting trades the simulated low-fee perp market. Two settings, so
+    # the suite keeps one perp study whose folds pick a best setting with funding charged (HoQA, CI-TRIM).
+    perp = replace(SPEC, param_grid={"fast": [20], "slow": [100, 150], "market": ["perp"]},
                    default_params={**SPEC.default_params, "market": "perp"})
 
     costs, runs = [], []
@@ -704,7 +719,7 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
 def _perp_study(tmp_path, instrument, prices, **kw):
     from dataclasses import replace
 
-    perp = replace(SPEC, param_grid={k: v[:2] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
+    perp = replace(SPEC, param_grid={k: v[:1] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
                    default_params={**SPEC.default_params, "market": "perp"})
     return run_study(perp, prices, instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"), synthetic=True,
                      holdout_days=0, train_days=365, test_days=365, **kw)

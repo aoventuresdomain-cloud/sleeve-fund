@@ -44,7 +44,7 @@ def _need(obj, name, what):
 def _spec(market):
     if market == "spot":
         return SPEC
-    return replace(SPEC, param_grid={k: v[:2] for k, v in SPEC.param_grid.items()} | {"market": [market]},
+    return replace(SPEC, param_grid={k: v[:1] for k, v in SPEC.param_grid.items()} | {"market": [market]},
                    default_params={**SPEC.default_params, "market": market})
 
 
