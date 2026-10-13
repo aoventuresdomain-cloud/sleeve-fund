@@ -641,6 +641,7 @@ class LongFlatStrategy(Strategy):
         self._daily_atr: dict[int, float] = {}
         # P2-6: the decision bars' (high, low, close), for the wind-down stop's Wilder ATR(14) (lifecycle.wind_down_stop)
         self._wind_bars: deque = deque(maxlen=open_risk.ATR_WINDOW)
+        self._wind_missing_told = False
         self.open_risk_binds = 0
         self.open_risk_max = 0.0
         # After a restart, a position whose stop couldn't be restored, or one started for its exits only, works to a
@@ -2284,10 +2285,21 @@ class LongFlatStrategy(Strategy):
             return fill if fill is not None else _ns(self._last_alive)
         return max(latest, fill) if fill is not None else latest
 
+    def _replayed_stop(self, side: int, own: float | None) -> float | None:
+        """The stop a replay rests for the position: its own, or the wind-down stop (P2-6), which the replay treats as
+        the strategy's own resting stop (Advisor 13 Oct 16:40, MUST), whichever the price reaches first."""
+        wind = self.runtime.wind_stop if self.runtime is not None else None
+        if wind is None or wind[0] != side:
+            return own
+        if own is None:
+            return wind[1]
+        return max(own, wind[1]) if side > 0 else min(own, wind[1])
+
     def _replay_watches(self) -> bool:
         """The open position has something a replay can act on: a stop or target, or on a perp its liquidation
         price and the risk guard."""
-        return self._margin or self._stop_frac is not None or bool(self._tp_frac)
+        return (self._margin or self._stop_frac is not None or bool(self._tp_frac)
+                or (self.runtime is not None and self.runtime.wind_stop is not None))
 
     def _note_trade(self, ts: int) -> None:
         """Paper: a trade at venue time ts. A stretch over UNSEEN_GAP_NS with no trade while in a position is
@@ -2325,7 +2337,7 @@ class LongFlatStrategy(Strategy):
         """The live check at the price now, its exit flagged as the market-on-return fallback (Advisor NA-1)."""
         self._outage_book = {"outage_fallback": f"market on return: {why}"}
         try:
-            return self._check_exits(self._last_close)
+            return self._check_exits(self._last_close) or self._check_wind_stop(self._last_close)
         finally:
             if self._pending_exit is None:
                 self._outage_book = None
@@ -2374,6 +2386,9 @@ class LongFlatStrategy(Strategy):
         venue, guards = {}, {}
         if self._stop_frac is not None:
             venue["stop_loss"] = entry * (1 - side * self._stop_frac)
+        stop = self._replayed_stop(side, venue.get("stop_loss"))
+        if stop is not None:
+            venue["stop_loss"] = stop
         target = entry * (1 + side * self._tp_frac) if self._tp_frac else None
         cash = qty = 0.0
         if self._margin and self.runtime is not None:
@@ -2790,7 +2805,7 @@ class LongFlatStrategy(Strategy):
             return False
         now = rt.now()
         side = self._pos_side()
-        if side and rt.wind_stop is None and self._restore is None and rt.wind_deadline > now:
+        if side and (rt.wind_stop is None or rt.wind_stop_interim) and self._restore is None and rt.wind_deadline > now:
             self._place_wind_stop(side, self._last_close)
         busy = self._pending_exit is not None or bool(self._working())
         why = rt.lifecycle_due(now, flat=side == 0, busy=busy)
@@ -2800,43 +2815,57 @@ class LongFlatStrategy(Strategy):
         return True
 
     def _wind_atr(self, price: float) -> tuple[float, float | None, str]:
-        """The ATR the wind-down stop is set from, as (ATR in price, the strategy's own stop_atr or None, its
-        words): the strategy's own ATR with its own stop_atr, else Wilder ATR(14) on the decision bars, else (under
-        14 bars since a restart) the daily Wilder ATR(14). Advisor 6 Oct 14:55; which ATR goes with stop_atr is
-        asked of the Advisor (p2-6-wiring.md, Q3)."""
+        """The ATR the wind-down stop is set from, as (ATR in price, the strategy's own stop_atr or None, a note for
+        the journal): a strategy with its own stop_atr uses its own ATR (its own series and atr_bars); else 3 x Wilder
+        ATR(14) on the decision candles (warm-up candles count, so a restart's preloaded history does); only when
+        that is still short, 3 x the open-risk daily Wilder ATR(14), journaled "own ATR unavailable" (Advisor 13 Oct
+        16:40). Raises ValueError when there is none at all."""
         c = self._cfg
         if c.stop_atr and self._atr is not None and self._atr.initialized and self._atr.value > 0:
-            return self._atr.value, c.stop_atr, f"its own {c.atr_bars}-bar average true range"
+            return self._atr.value, c.stop_atr, ""
         if len(self._wind_bars) >= open_risk.ATR_DAYS:
             from sleeve_fund.strategies.indicators.averages import Atr
 
             atr = Atr(open_risk.ATR_DAYS)
             for h, lo, cl in self._wind_bars:
                 atr.update_raw(h, lo, cl)
-            return atr._outputs()["value"], None, "Wilder ATR(14) on the decision candles"
+            own = " (own ATR unavailable: its own average true range isn't ready)" if c.stop_atr else ""
+            return atr._outputs()["value"], None, own
         from sleeve_fund.venues import venue as venue_profile
 
         s = self.runtime.store.sleeve(self.runtime.name)
         share = open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, self.runtime.now())
         if not share:
-            raise ValueError("no ATR for the wind-down stop: too few candles and no daily history")
-        return share * price, None, "the daily Wilder ATR(14)"
+            raise ValueError("no ATR yet: too few candles and no daily history")
+        return share * price, None, (f" (own ATR unavailable: {len(self._wind_bars)} of {open_risk.ATR_DAYS} candles "
+                                     "loaded, so the daily Wilder ATR(14) is used)")
 
     def _place_wind_stop(self, side: int, price: float) -> None:
-        """The one wind-down stop, journaled by the runtime (place_wind_stop) and read back after a restart."""
+        """The one wind-down stop, journaled by the runtime (place_wind_stop) and read back after a restart. With no
+        ATR at all yet it is tried again at every bar close, with one alert, never given up on (Advisor 16:40 MUST:
+        a winding-down holder is never left without a stop)."""
         rt = self.runtime
+        liq = None
+        if self._margin:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq(cash, qty) if qty else None
         try:
-            atr, own, _ = self._wind_atr(price)
-            liq = None
-            if self._margin:
-                _, cash, qty, _ = self._mark()
-                liq = self._liq(cash, qty) if qty else None
-            rt.place_wind_stop(side, price, atr, stop_atr=own, liquidation=liq)
+            atr, own, note = self._wind_atr(price)
+            if rt.wind_stop_interim:  # the interim stop gives way once, to an ATR stop only if tighter
+                level = float(lifecycle.wind_down_stop(side, repr(price), repr(atr), stop_atr=own,
+                                                       liquidation=None if liq is None else repr(liq)).level)
+                if side * (level - rt.wind_stop[1]) <= 0:
+                    rt.keep_wind_stop(f"the ATR stop at {level:,.6g} would be further from the price")
+                    return
+            rt.place_wind_stop(side, price, atr, stop_atr=own, liquidation=liq, note=note)
         except ValueError as e:
-            rt.store.event(rt.name, "error", "wind_down_stop_missing",
-                           f"Winding down with no wind-down stop: {e}. Its own exits and the deadline still close it.",
-                           ts=rt.now())
-            rt.wind_stop = (side, 0.0 if side > 0 else math.inf)  # tried once: never placed again this wind-down
+            if rt.wind_stop is None:  # Advisor 13 Oct 17:05, MUST: never unprotected while the ATR loads
+                rt.place_interim_wind_stop(side, price, liq)
+            if not self._wind_missing_told:
+                rt.store.event(rt.name, "error", "wind_down_stop_missing",
+                               f"Winding down with no ATR for its wind-down stop yet: {e}. An interim safety stop "
+                               "holds meanwhile, and the ATR stop is tried again at each candle close.", ts=rt.now())
+            self._wind_missing_told = True
 
     def _check_wind_stop(self, price: float) -> bool:
         """Paper, every trade: the wind-down stop, judged as the strategy's own stop is. True if an exit was sent."""

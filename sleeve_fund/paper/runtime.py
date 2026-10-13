@@ -25,6 +25,7 @@ from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSE
 # P2-6 journal kinds and order intents (orders.intent is String(16)).
 WIND_STOP, WIND_NOTICE, WIND_RETRY, WIND_FLATTEN = "wind_down_stop", "wind_down_notice", "wind_down_retry", "wind_down"
 WIND_STOP_RE = r"Wind-down stop at (?P<level>[0-9.e+-]+) for the (?P<side>long|short):"
+INTERIM = "interim safety stop"
 WIND_GRACE = timedelta(minutes=2)  # past a bar's length with no bar close: the feed is stale, so the tick flattens
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
@@ -398,7 +399,7 @@ class SleeveRuntime:
         from sleeve_fund.data import spec_minutes
 
         self.bar_length = timedelta(minutes=spec_minutes(sleeve.bar_spec))
-        self.wind_stop = self._journaled_wind_stop()
+        self.wind_stop, self.wind_stop_interim = self._journaled_wind_stop()
         self._wind_noticed = self._journaled_since(WIND_NOTICE)
         self._wind_flattens = 0  # deadline flattens sent this process, for the retry alert
         self._wind_checked: datetime | None = None  # the last bar close lifecycle_due ran at
@@ -516,12 +517,15 @@ class SleeveRuntime:
         last = self.store.last_event(self.name, (kind,))
         return last if last is not None and last["ts"] >= self.wind_started else None
 
-    def _journaled_wind_stop(self) -> tuple[int, float] | None:
-        """This wind-down's stop as journaled when it was placed, (side, level), else None: placed once, never
-        recomputed or trailed, so a restart reads it back (Advisor 6 Oct 14:55)."""
+    def _journaled_wind_stop(self) -> tuple[tuple[int, float] | None, bool]:
+        """This wind-down's stop as last journaled, ((side, level) or None, whether it is the interim safety stop):
+        placed once, never recomputed or trailed, so a restart reads it back (Advisor 6 Oct 14:55). The interim one
+        gives way once to an ATR stop that is tighter (Advisor 13 Oct 17:05)."""
         last = self._journaled_since(WIND_STOP)
         m = re.match(WIND_STOP_RE, last["message"]) if last else None
-        return (1 if m["side"] == "long" else -1, float(m["level"])) if m else None
+        if not m:
+            return None, False
+        return (1 if m["side"] == "long" else -1, float(m["level"])), INTERIM in last["message"]
 
     def refresh_lifecycle(self) -> None:
         """Paper: the lifecycle as the PM last set it (Store.set_lifecycle), read every tick."""
@@ -532,23 +536,49 @@ class SleeveRuntime:
         self.lifecycle, self.wind_started, self.wind_deadline = (sleeve.lifecycle, sleeve.wind_down_started,
                                                                  sleeve.wind_down_deadline)
         if moved:
-            self.wind_stop, self._wind_noticed, self._wind_flattens = None, None, 0
+            self.wind_stop, self.wind_stop_interim, self._wind_noticed, self._wind_flattens = None, False, None, 0
 
     def place_wind_stop(self, side: int, price: float, atr: float, *, stop_atr: float | None,
-                        liquidation: float | None) -> float:
+                        liquidation: float | None, note: str = "") -> float:
         """The one reduce-only stop a strategy holding a position gets when its wind-down starts (lifecycle.
         wind_down_stop), journaled with its figures; returns its level."""
         stop = lifecycle.wind_down_stop(side, repr(price), repr(atr), stop_atr=stop_atr,
                                         liquidation=None if liquidation is None else repr(liquidation))
         level = float(stop.level)
-        self.wind_stop = (side, level)
+        self.wind_stop, self.wind_stop_interim = (side, level), False
         self.store.event(self.name, "info", WIND_STOP,
                          f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: {stop.reason} "
                          f"Price {price:,.6g}, ATR {atr:,.6g} x {stop.atrs:g} = {float(stop.distance):,.6g}"
-                         + (" (held at half the distance to liquidation)" if stop.clamped else "") + ".",
+                         + (" (held at half the distance to liquidation)" if stop.clamped else "") + note + ".",
                          ts=self.now())
         self.store.decide("system", WIND_STOP, f"{stop.reason} Level {level:,.6g}.", self.name, ts=self.now())
         return level
+
+    def place_interim_wind_stop(self, side: int, price: float, liquidation: float | None) -> float | None:
+        """With no ATR at all yet, the restart safety stop's rule at once (S3 to S5): half the remaining distance from
+        the price to liquidation, or to zero where nothing liquidates it (1x, spot). Journaled as interim: an ATR stop
+        replaces it once if tighter (Advisor 13 Oct 17:05). None when the price is already through liquidation."""
+        target = liquidation if liquidation is not None else 0.0
+        if side * (price - target) <= 0:
+            return None
+        level = price - 0.5 * (price - target)
+        self.wind_stop, self.wind_stop_interim = (side, level), True
+        to = f"the liquidation price {liquidation:,.6g}" if liquidation is not None else "zero"
+        self.store.event(self.name, "info", WIND_STOP,
+                         f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: {INTERIM}, half way "
+                         f"from the {price:,.6g} price to {to}, while no ATR is ready; an ATR stop replaces it if "
+                         "tighter.", ts=self.now())
+        self.store.decide("system", WIND_STOP, f"Interim wind-down stop at {level:,.6g}, no ATR yet.", self.name,
+                          ts=self.now())
+        return level
+
+    def keep_wind_stop(self, why: str) -> None:
+        """The interim stop stays as the wind-down's fixed stop: the ATR one would be further away."""
+        side, level = self.wind_stop
+        self.wind_stop_interim = False
+        self.store.event(self.name, "info", WIND_STOP,
+                         f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: the interim stop is "
+                         f"kept and now fixed; {why}.", ts=self.now())
 
     def wind_stop_hit(self, price: float) -> bool:
         """Paper: whether the wind-down stop is hit by this trade's price (judged on every trade, as the strategy's

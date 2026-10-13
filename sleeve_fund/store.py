@@ -97,7 +97,7 @@ sleeves_t = Table(
     Column("wind_down_deadline", TS),
     CheckConstraint("lifecycle IN ('active', 'winding_down', 'retired')", name="sleeves_lifecycle"),
     CheckConstraint("lifecycle <> 'winding_down' OR (wind_down_started IS NOT NULL AND wind_down_deadline IS NOT NULL "
-                    "AND wind_down_deadline >= wind_down_started)", name="sleeves_wind_down"),
+                    "AND wind_down_deadline >= wind_down_started)", name="sleeves_winding_down"),
 )
 
 equity_t = Table(
@@ -1466,8 +1466,11 @@ class Store:
                 return False
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
             c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            # The PM's wind-down, ended by the system once flat: the row names both, so it never reads as the PM
+            # pressing retire (Advisor 13 Oct 16:40)
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=sleeve,
-                                                 reason=text))
+                                                 reason="Triggered by the system once flat, ending the PM's "
+                                                        f"wind-down. {text}"))
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
         return True
 

@@ -12,7 +12,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from sleeve_fund import lifecycle
-from sleeve_fund.paper.runtime import WIND_FLATTEN, WIND_NOTICE, WIND_RETRY, WIND_STOP, SleeveRuntime, entry_blocked
+from sleeve_fund.paper.runtime import (
+    WIND_FLATTEN,
+    WIND_NOTICE,
+    WIND_RETRY,
+    WIND_STOP,
+    SleeveRuntime,
+    entry_blocked,
+)
 from sleeve_fund.store import Store
 from sleeve_fund.supervisor import Proc, decide
 
@@ -153,15 +160,15 @@ def test_set_lifecycle_has_one_caller_the_pm_route():
     assert callers == ["dashboard/app.py"]
 
 
-# --- the database's own checks (0016) -------------------------------------------------------------------------
+# --- the database's own checks (0017) -------------------------------------------------------------------------
 
 
 def test_the_database_refuses_an_unknown_lifecycle_and_a_wind_down_without_its_times(store):
     _sleeve(store)
     for sql in ("UPDATE sleeves SET lifecycle = 'paused' WHERE name = 's1'",
                 "UPDATE sleeves SET lifecycle = 'winding_down' WHERE name = 's1'",
-                "UPDATE sleeves SET lifecycle = 'winding_down', wind_down_started = :t, "
-                "wind_down_deadline = :before WHERE name = 's1'"):
+                ("UPDATE sleeves SET lifecycle = 'winding_down', wind_down_started = :t, "
+                 "wind_down_deadline = :before WHERE name = 's1'")):
         with pytest.raises(IntegrityError), store.engine.begin() as c:
             c.execute(text(sql), {"t": T0, "before": T0 - timedelta(seconds=1)})
     assert store.sleeve("s1").lifecycle == "active"
@@ -404,3 +411,201 @@ def test_the_engine_places_the_stop_flattens_at_the_deadline_through_the_exit_pa
     assert (s.lifecycle, s.desired_state) == ("retired", "stopped") and "s1" in store.archived()
     assert store.last_event("s1", ("lifecycle",))["message"].startswith("Retired at the deadline")
     assert [f["side"] for f in reversed(store.fills("s1"))] == ["BUY", "SELL"]  # nothing opened while winding down
+
+
+# --- Advisor 13 Oct 16:40 ---------------------------------------------------------------------------------------
+
+
+def test_retire_once_flat_names_the_pm_and_the_system_in_its_decision(store):
+    _sleeve(store)
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0)
+    store.complete_retire("s1", T0 + timedelta(hours=1))
+    d = store.decisions("s1", limit=1)[0]
+    assert d["actor"] == "PM" and d["reason"].startswith("Triggered by the system once flat, ending the PM's wind-down")
+
+
+def _engine(stop_atr=None, own_ready=False, bars=0, daily=0.02, wind=None):
+    """Just what the wind-down ATR and the replay's stop read of the engine."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    store = SimpleNamespace(sleeve=lambda n: SimpleNamespace(venue=None, instrument="BTC/USD"))
+    rt = SimpleNamespace(store=store, name="s1", now=lambda: T0, wind_stop=wind)
+    eng = SimpleNamespace(_cfg=SimpleNamespace(stop_atr=stop_atr, atr_bars=20), runtime=rt,
+                          _atr=SimpleNamespace(initialized=own_ready, value=900.0),
+                          _wind_bars=[(101.0 + i % 3, 99.0 - i % 2, 100.0) for i in range(bars)])
+    eng._wind_atr = LongFlatStrategy._wind_atr.__get__(eng)
+    eng._replayed_stop = LongFlatStrategy._replayed_stop.__get__(eng)
+    return eng
+
+
+def test_the_wind_down_atr_is_its_own_then_wilder_on_its_candles_then_the_daily_one_said_so(monkeypatch):
+    from sleeve_fund import open_risk
+
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda *a, **k: 0.02)
+    assert _engine(stop_atr=2.0, own_ready=True)._wind_atr(60_000.0) == (900.0, 2.0, "")
+    atr, own, note = _engine(stop_atr=2.0, own_ready=False, bars=20)._wind_atr(60_000.0)
+    assert own is None and 2.0 < atr < 4.0 and "own ATR unavailable" in note  # 3 x Wilder on its candles
+    atr, own, note = _engine(bars=20)._wind_atr(60_000.0)
+    assert own is None and note == ""
+    atr, own, note = _engine(bars=5)._wind_atr(60_000.0)
+    assert (atr, own) == (1_200.0, None) and "5 of 14 candles" in note and "own ATR unavailable" in note
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda *a, **k: None)
+    with pytest.raises(ValueError, match="no ATR yet"):
+        _engine(bars=5)._wind_atr(60_000.0)
+
+
+@pytest.mark.parametrize("side,own,wind,want", [
+    (1, None, (1, 57_000.0), 57_000.0),
+    (1, 58_000.0, (1, 57_000.0), 58_000.0),  # a long's higher stop is reached first
+    (1, 56_000.0, (1, 57_000.0), 57_000.0),
+    (-1, 62_000.0, (-1, 63_000.0), 62_000.0),  # a short's lower stop is reached first
+    (1, 58_000.0, None, 58_000.0),
+    (1, 58_000.0, (-1, 63_000.0), 58_000.0),  # a stop for the other side is not this position's
+])
+def test_the_outage_replay_rests_the_wind_down_stop_as_the_strategys_own(side, own, wind, want):
+    assert _engine(wind=wind)._replayed_stop(side, own) == want
+
+
+@pytest.mark.xfail(strict=True, reason="CASH-4 (DA): a true-up arriving after retire must still book (Advisor MUST)")
+def test_l15_a_true_up_arriving_after_retire_is_still_booked(store):
+    _sleeve(store)
+    _hold(store)
+    store.set_lifecycle("s1", "close_now", "pm", "r", now=T0)
+    _close(store, at=T0 + timedelta(hours=1))
+    store.complete_retire("s1", T0 + timedelta(hours=2), "close_now")
+    store.record_true_up("s1", ts=T0 - timedelta(hours=4), amount=-1.25, arrived=T0 + timedelta(hours=3))
+    assert any(r["kind"] == "true_up" for r in store.funding("s1"))
+
+
+@pytest.mark.parametrize("side,price,liq,level", [
+    (1, 60_000.0, None, 30_000.0),  # spot or a 1x long: half way to zero
+    (1, 60_000.0, 40_000.0, 50_000.0),  # half the remaining distance to liquidation
+    (-1, 60_000.0, 90_000.0, 75_000.0),
+])
+def test_with_no_atr_an_interim_safety_stop_goes_on_at_once_and_a_tighter_atr_stop_replaces_it_once(
+        store, side, price, liq, level):
+    """Advisor 13 Oct 17:05, MUST: no ATR means the safety stop (S3 to S5) is placed on the first close; the ATR stop
+    replaces it later only if tighter, and from then the level is fixed."""
+    _sleeve(store)
+    _hold(store)
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0)
+    t = [T0 + timedelta(hours=1)]
+    rt = _runtime(store, t)
+    assert rt.place_interim_wind_stop(side, price, liq) == level
+    assert rt.wind_stop == (side, level) and rt.wind_stop_interim
+    again = _runtime(store, t)
+    assert again.wind_stop == (side, level) and again.wind_stop_interim  # a restart keeps it, still interim
+    tighter = again.place_wind_stop(side, price, 1_000.0, stop_atr=None, liquidation=liq)
+    assert side * (tighter - level) > 0 and not again.wind_stop_interim
+    assert _runtime(store, t).wind_stop == (side, tighter) and not _runtime(store, t).wind_stop_interim
+
+
+def test_an_interim_stop_tighter_than_the_atr_one_is_kept_and_fixed(store):
+    _sleeve(store)
+    _hold(store)
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0)
+    t = [T0 + timedelta(hours=1)]
+    rt = _runtime(store, t)
+    rt.place_interim_wind_stop(1, 60_000.0, 50_000.0)  # 55,000
+    rt.keep_wind_stop("the ATR stop at 45,000 would be further from the price")
+    back = _runtime(store, t)
+    assert back.wind_stop == (1, 55_000.0) and not back.wind_stop_interim
+
+
+def test_the_engine_places_the_interim_stop_on_the_first_close_when_there_is_no_atr(store, instrument, monkeypatch):
+    from sleeve_fund import open_risk
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.runner import run_backtest
+
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda *a, **k: None)
+    _sleeve(store, bar_spec="1-DAY-LAST-EXTERNAL")
+    prices = synthetic_ohlcv(days=40, seed=3)
+    run_backtest("buy_and_hold", prices.iloc[:20], instrument, runtime=SleeveRuntime(store, "s1", tick_seconds=21_600))
+    start = prices.index[19].to_pydatetime()
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=start)
+    run_backtest("buy_and_hold", prices.iloc[20:], instrument, runtime=SleeveRuntime(store, "s1", tick_seconds=21_600))
+    stops = [e for e in reversed(store.events("s1", limit=1000)) if e["kind"] == WIND_STOP]
+    assert stops and "interim safety stop" in stops[0]["message"] and stops[0]["ts"] == prices.index[20]
+    assert _kinds(store).count("wind_down_stop_missing") == 1
+
+
+# --- the migration (DA 13 Oct: 0017, named CHECKs, the batch rebuild keeps every child row) -----------------------
+
+
+@pytest.fixture
+def engine(tmp_path):
+    from sleeve_fund.store import make_engine, metadata
+
+    eng = make_engine(os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/m.db")
+
+    def clean():
+        with eng.begin() as c:
+            c.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        metadata.drop_all(eng)
+
+    clean()
+    yield eng
+    clean()
+
+
+def _sleeves_shape(eng):
+    from sqlalchemy import inspect
+
+    i = inspect(eng)
+    cols = {c["name"]: (str(c["type"]).split("(")[0], c["nullable"]) for c in i.get_columns("sleeves")}
+    return cols, {c["name"] for c in i.get_check_constraints("sleeves")}
+
+
+def test_0017_gives_sleeves_exactly_what_create_all_does(engine, tmp_path):
+    from sleeve_fund import schema
+    from sleeve_fund.store import make_engine
+
+    schema.migrate(engine, log=lambda _: None)
+    migrated = _sleeves_shape(engine)
+    assert {"sleeves_lifecycle", "sleeves_winding_down"} <= migrated[1]
+    if engine.dialect.name == "sqlite":
+        fresh = make_engine(f"sqlite:///{tmp_path}/fresh.db")
+    else:
+        from sleeve_fund.store import metadata
+
+        with engine.begin() as c:
+            c.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        metadata.drop_all(engine)
+        fresh = engine
+    Store(engine=fresh)
+    assert _sleeves_shape(fresh) == migrated
+
+
+def test_0017_upgrades_an_existing_book_keeping_every_child_row_and_reads_it_active(engine):
+    from alembic import command
+
+    from sleeve_fund import schema
+
+    with engine.connect() as conn, conn.begin():
+        command.upgrade(schema._config(conn), "0013")
+    now = T0.isoformat()
+    rows = {
+        "sleeves": "INSERT INTO sleeves (name, strategy, instrument, bar_spec, params, starting_balance, risk_profile, "
+                   "warmup_bars, desired_state, status, status_reason, created_at, updated_at) VALUES ('s1', "
+                   "'buy_and_hold', 'BTC/USD', '1-HOUR-LAST-EXTERNAL', '{}', 10000, 'balanced', 0, 'running', "
+                   "'running', '', :t, :t)",
+        "fills": "INSERT INTO fills (sleeve, ts, side, qty, price, fee, order_id, trade_id) VALUES "
+                 "('s1', :t, 'BUY', 0.05, 60000, 1, 'o1', 't1')",
+        "equity": "INSERT INTO equity (sleeve, ts, equity, cash, qty, price, benchmark) VALUES "
+                  "('s1', :t, 10000, 7000, 0.05, 60000, 10000)",
+        "orders": "INSERT INTO orders (sleeve, order_id, ts, updated_at, side, order_type, qty, status, filled_qty, fee, "
+                  "intent, reason, signal, message) VALUES ('s1', 'o1', :t, :t, 'BUY', 'MARKET', 0.05, 'filled', "
+                  "0.05, 1, 'entry', 'r', '{}', '')",
+        "sleeve_archive": "INSERT INTO sleeve_archive (sleeve, archived_at) VALUES ('s1', :t)",
+        "events": "INSERT INTO events (sleeve, ts, level, kind, message) VALUES ('s1', :t, 'info', 'start', 'm')",
+    }
+    with engine.begin() as c:
+        for sql in rows.values():
+            c.execute(text(sql), {"t": now})
+    schema.migrate(engine, log=lambda _: None)
+    with engine.connect() as c:
+        assert {t: c.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() for t in rows} == {t: 1 for t in rows}
+    s = Store(engine=engine).sleeve("s1")
+    assert (s.lifecycle, s.wind_down_started, s.wind_down_deadline) == ("active", None, None)

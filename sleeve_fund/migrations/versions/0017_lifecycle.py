@@ -6,10 +6,12 @@ flat; both set while winding down (CHECK), and kept on a retired row as its reco
 only: each move is journaled in events and decisions (Store.set_lifecycle, the one writer).
 
 Additive only. Each step is skipped when a Store on the same code built that shape first (create_all), as 0012 does.
-The chain is renumbered onto the register's head when the reserved 0014 and 0015 merge (DA register rule).
+0017 in the DA's register (13 Oct). It chains onto main's head now and onto 0016 when the reserved 0014 to 0016 merge
+(the PR that merges second renumbers: DA register rule). On SQLite the CHECKs rebuild sleeves in batch mode, which
+every child table's rows survive (pinned in test_migrations).
 
-Revision ID: 0016
-Revises: 0013
+Revision ID: 0017
+Revises: 0013 (0016 once CASH-4's 0016 and the reserved 0014/0015 are on main)
 Create Date: 2026-10-13 16:00:00.000000
 """
 
@@ -17,7 +19,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '0016'
+revision = '0017'
 down_revision = '0013'
 branch_labels = None
 depends_on = None
@@ -36,7 +38,7 @@ def upgrade() -> None:
             batch_op.add_column(sa.Column('wind_down_started', sa.DateTime(timezone=True), nullable=True))
             batch_op.add_column(sa.Column('wind_down_deadline', sa.DateTime(timezone=True), nullable=True))
             batch_op.create_check_constraint('sleeves_lifecycle', STATES)
-            batch_op.create_check_constraint('sleeves_wind_down', WINDING)
+            batch_op.create_check_constraint('sleeves_winding_down', WINDING)
 
 
 def downgrade() -> None:
