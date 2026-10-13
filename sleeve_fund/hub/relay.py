@@ -34,7 +34,9 @@ BAR_GRACE_SECONDS = 2  # a minute's bar is built this long after the minute ends
 
 
 def late_since_path(late_path):
-    """Beside the late-trade counts: {pair: ns since epoch the hub began counting them} (HUB-LATE-01)."""
+    """Beside the late-trade counts: {pair: [ns the hub began counting them, ns of this write]} (HUB-LATE-01). The
+    second is when the counts were last brought up to date, so a report read after the hub stopped doesn't count the
+    time since as covered."""
     return late_path.with_name(late_path.stem + "-since.json")
 
 
@@ -250,7 +252,8 @@ class HubRelay(DataActor):
         if self.late_path is None:
             return
         counts = {self.pairs.get(iid, iid): n for iid, n in self.late.items()}
-        since = {self.pairs.get(iid, iid): self._since[iid] for iid in self.late if iid in self._since}
+        now = time.time_ns()
+        since = {self.pairs.get(iid, iid): [self._since[iid], now] for iid in self.late if iid in self._since}
         for path, data in ((late_since_path(self.late_path), since), (self.late_path, counts)):
             try:
                 tmp = path.with_suffix(".tmp")
