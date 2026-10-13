@@ -4,6 +4,7 @@
 import copy
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -254,6 +255,25 @@ def test_the_1x_pair_keeps_the_profiles_caps_and_drops_only_its_halts(prices, in
     assert 0 < one_x.exposure.max() < 0.4  # sized at the 33% cap (the marks drift with the price after entry)
     assert run(True, None).exposure.max() > 0.5  # without a profile it would not
 
+    # CR F235-5: a 1x short on a perp. The switch is explicit, so no halt or pause level is priced at all: the run
+    # never halts, every fill is at a finite price, and the short stays within the cap.
+    short = {"version": 1, "reason": REASON, "blocks": {"rsi": {"kind": "rsi"}},
+             "short": {"entry": {"left": "rsi", "op": ">", "right": 55}, "exit": {"left": "rsi", "op": "<=", "right": 45}}}
+
+    def run_short(one_x):
+        seen.clear()
+        ablation.backtest_evaluator(prices, instrument, [(days[400], days[799])], bar_minutes=1440, half_spread=0,
+                                    holdout_start=days[800], risk_profile="tight",
+                                    params={"market": "perp", "allow_short": True})(short, one_x)
+        return seen[0]
+
+    assert any(e["kind"] in halts for e in run_short(False).risk_events)
+    one_x_short = run_short(True)
+    assert not any(e["kind"] in halts for e in one_x_short.risk_events)
+    assert len(one_x_short.fills) and np.isfinite(one_x_short.fills["avg_px"].astype(float)).all()
+    opened = one_x_short.exposure[one_x_short.exposure != 0].iloc[0]
+    assert -0.331 < opened < 0  # it went short, sized at the 33% cap, at 1x
+
 
 def test_an_ablation_window_reaching_the_holdout_is_refused(prices, instrument):
     days = prices.index
@@ -289,3 +309,12 @@ def test_an_ablation_overlapping_an_opened_holdout_is_refused_and_opens_no_lock(
                                 holdout_start=None, locks=locks, idea_hash="idea")  # after it: fine
     assert locks.store.holdout_locks("idea") == before
     assert locks.store.holdout_locks() == before
+
+
+def test_f235_5_halts_off_drops_only_the_drawdown_halt_and_the_daily_pause():
+    from sleeve_fund import risk
+
+    p = risk.profile("balanced")
+    assert risk.check(p, 50.0, 100.0, 100.0).action == "halt"  # 50% down: the halt
+    assert risk.check(p, 50.0, 100.0, 100.0, halts=False) is None
+    assert risk.check(p, 0.0, 100.0, 100.0, halts=False).action == "halt"  # a book that can't be valued still halts
