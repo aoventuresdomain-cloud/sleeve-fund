@@ -27,6 +27,7 @@ from decimal import Decimal
 from sleeve_fund import accounts, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
+from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
@@ -56,10 +57,31 @@ STOPPED_HOLDING = "it was stopped while it still holds a position"
 
 
 def fund_equity(store: Store) -> Decimal:
-    """The whole fund's marked equity: every strategy's, running or not, plus the cash no strategy holds (Advisor 3).
-    It reads CASH-2's strategy_cash_pnl, the one cash reader; until that is on main it raises, so the portfolio's mark
-    fails, its book goes stale after 60 s and no strategy opens anything (fail closed)."""
-    raise NotImplementedError("the fund's equity reads CASH-2's strategy_cash_pnl, which isn't on main yet")
+    """The whole fund's marked equity (Advisor 3): every strategy's, running or not, plus the cash no strategy holds.
+    A strategy's is its starting capital, what the journal moved its cash by (CASH-2's strategy_cash_pnl, the one cash
+    reader) and its journal position at its last mark. One the PM put away (archived, a clean slate) still counts in
+    full: its cash is the fund's, unallocated, so archiving never moves the book. A run a reset put away counts only
+    its cash movement: the strategy it came from starts again at the same capital, which it still counts (HoE 13 Oct).
+    Raises when a position has no mark, so the portfolio isn't marked and entries stop once its mark is stale."""
+    from sleeve_fund.store import is_backtest
+
+    runs = store.reset_runs()
+    total = Decimal(0)
+    for s in store.sleeves():
+        if is_backtest(s.name):
+            continue
+        cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
+        if s.name in runs:
+            total += cash  # flat when put away (split_run): its capital is its successor's
+            continue
+        total += to_decimal(s.starting_balance, "starting balance") + cash
+        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+        if qty != 0:
+            last = store.last_equity(s.name)
+            if last is None or not last["price"]:
+                raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
+            total += qty * to_decimal(last["price"], "mark")
+    return total
 
 
 def fund_holdings(store: Store) -> tuple[Holding, ...]:
@@ -138,6 +160,7 @@ class Supervisor:
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
+        self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
 
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
@@ -384,11 +407,13 @@ class Supervisor:
                     pass  # no holdings yet (P2-1b W2): the cache row waits; the state row above is the gate's
             if acted == "halt":
                 self._flatten_told.clear()  # a new halt tells every holder at once
+                self._halt_tells.clear()
         st = led.state()
         if st.halted:
             self._halt_every_strategy(st.halted, now)
         else:
             self._flatten_told.clear()
+            self._halt_tells.clear()
         sweep(led, now, self._order_live, self._cancel_order, is_acked=self._order_acked)
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
@@ -402,14 +427,26 @@ class Supervisor:
             told = self._flatten_told.get(s.name)
             if not _holding(self.store, s):
                 self._flatten_told.pop(s.name, None)
+                self._halt_tells.pop(s.name, None)
                 continue
             if told is not None and now - told < HALT_RETELL:
+                continue
+            if self._halt_tells.get(s.name, 0) >= SYSTEM_FLATTENS:
+                # F229-5: still holding after that many flattens, perhaps less than the venue's smallest order. Said
+                # once; the PM closes it. Its entries stay blocked by the halt meanwhile.
+                if self._halt_tells[s.name] == SYSTEM_FLATTENS:
+                    qty = self.store.journal_book(s.name, s.starting_balance)["qty"]
+                    self.store.event(s.name, "error", "flatten_gave_up",
+                                     f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the "
+                                     f"venue's smallest order; the PM must close it: {reason}")
+                    self._halt_tells[s.name] += 1
                 continue
             try:
                 if any(c["command"] == "flatten" for c in self.store.pending_commands(s.name)):
                     continue
                 self.store.command(s.name, "flatten", reason, actor="supervisor")
                 self._flatten_told[s.name] = now
+                self._halt_tells[s.name] = self._halt_tells.get(s.name, 0) + 1
             except Exception as exc:  # noqa: BLE001 - asked again in a minute
                 self._flatten_told[s.name] = now
                 self.store.event(s.name, "error", "supervisor_error", "couldn't tell it to flatten for the portfolio "
