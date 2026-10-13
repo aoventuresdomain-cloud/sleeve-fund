@@ -42,3 +42,15 @@ def test_nothing_stored_is_said_plainly_and_spot_has_no_funding_part(tmp_path):
         "GAPS X NEW/USDT 2026-01-01 00:00..2026-01-03 00:00: 1m none stored funding none stored"
     store.append("X", "ABC/USD", _minutes("2025-12-31 23:00", 3 * 1440), cursor="c")
     assert "funding" not in coverage_line(store, "X", "ABC/USD", W0, W1, perpetual=False)
+
+
+def test_an_unknown_venue_or_a_bad_date_fails_closed_before_reading_anything(tmp_path):
+    import pytest
+
+    from sleeve_fund.history import main
+
+    with pytest.raises(ValueError, match="unknown venue"):
+        main(["--root", str(tmp_path), "coverage", "--venue", "nosuch", "--start", "2026-01-01"])
+    with pytest.raises(ValueError):
+        main(["--root", str(tmp_path), "coverage", "--venue", "binance", "--start", "not-a-date", "BTC/USDT"])
+    assert not any(tmp_path.iterdir())  # nothing written
