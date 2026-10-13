@@ -41,8 +41,9 @@ def weight(family: str, state: str | None) -> Decimal:
 class Weighting:
     """The regime weight per gated order of a run. state_on(day) is the regime state of the row dated `day` (None for no
     row); families maps each Strategy to its family. The weight is fixed when a position is opened (`opens`: the
-    Strategy was flat when it sent the order): an add or a rebalance that adds reuses it, and one whose opening entry
-    wasn't seen here is weighed 1.0 (opened before weighting began)."""
+    Strategy was flat when it sent the order): an add or a rebalance that adds carries its entry's weight, never 1.0
+    and never a fresh regime read (Advisor 13 Oct 19:45 UK). One whose entry wasn't weighed here is refused: the gate
+    fails closed. A run starts flat, so in a backtest that can't happen."""
 
     state_on: Callable[[date], str | None]
     families: Mapping[str, str]
@@ -50,7 +51,9 @@ class Weighting:
 
     def for_order(self, strategy: str, opens: bool, bar_ts: datetime) -> tuple[Decimal, str]:
         if not opens:
-            return self._held.get(strategy, (FULL, UNKNOWN))
+            if strategy not in self._held:
+                raise ValueError(f"{strategy} adds to a position whose entry wasn't weighed: no weight to carry")
+            return self._held[strategy]
         state = self.state_on(bar_ts.date()) or UNKNOWN
         state = state if state in STATES else UNKNOWN
         out = (weight(self.families.get(strategy, ""), state), state)

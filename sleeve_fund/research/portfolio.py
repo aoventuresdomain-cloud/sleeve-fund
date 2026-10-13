@@ -137,16 +137,19 @@ def gate_intent(d: dict) -> Intent:
 
 def tagged_intent(d: dict, now: datetime):
     """gate_intent's Intent with what the journal keys it on (gate_ledger.TaggedIntent): the strategy's id for it (a
-    fresh one when it has none), its kind (`what`) and the bar it was decided on (`bar`, that bar's close in ns, as
-    paper's journal and the parity report read it; the check time for an order sent outside a bar decision). Paper's
-    gate and the portfolio backtest's both build it here, so they gate the same order the same way (P2-7)."""
+    fresh one when it has none), its kind (`what`; an entry sent while a position is held is an "add") and the bar it
+    was decided on (`bar`, that bar's close in ns, as paper's journal and the parity report read it; the check time
+    for an order sent outside a bar decision). Paper's gate and the portfolio backtest's both build it here, so they
+    gate the same order the same way (P2-7)."""
     import uuid
 
     from sleeve_fund.gate_ledger import TaggedIntent
 
     order, bar = gate_intent(d), d.get("bar")
+    kind = str(d.get("what") or "entry")
+    kind = "add" if kind == "entry" and d.get("opens", True) is False else kind  # held when sent: an add (P2-5)
     return TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
-                        intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=str(d.get("what") or "entry"),
+                        intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=kind,
                         bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
 
 
