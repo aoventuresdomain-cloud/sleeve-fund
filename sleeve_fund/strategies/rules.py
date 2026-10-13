@@ -501,8 +501,14 @@ class Rules(LongFlatStrategy):
             self._rest_exits()  # moves the resting stop
         return None
 
+    def _fill_stop(self) -> float | None:
+        """A level is a price: after a fill that re-averaged the entry, the stop is the same level as a share of the
+        new entry, in paper as in a backtest (STOP-AVG-1). Until the levels exist, the plan's share."""
+        if self._levels is None or not self._entry_px:
+            return self._stop_frac
+        return (self._entry_side or 1) * (1 - self._tightest(self._levels, self._entry_side or 1) / self._entry_px)
+
     def _rest_exits(self) -> None:
         if self._levels is not None and self._entry_px:  # the levels, not the decision close's share of them
-            self._hold_stop_capped((self._entry_side or 1) * (1 - self._tightest(self._levels, self._entry_side or 1)
-                                                              / self._entry_px))
+            self._hold_stop_capped(self._fill_stop())
         super()._rest_exits()

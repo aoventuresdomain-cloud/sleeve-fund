@@ -194,3 +194,35 @@ def test_after_a_restart_the_funding_paid_since_the_entry_still_pulls_the_stop_i
         assert [e for e in run.events if e["kind"] == "stop_clamped_liquidation"]
     else:  # the daily-loss pause may close it, but no stop fires
         assert not [r for r in exits if r[0] == "stop_loss"], seq
+
+
+def test_after_an_opening_fill_that_re_averages_the_entry_a_rules_stop_stays_at_its_level(instrument, monkeypatch):
+    """STOP-AVG-1 (QD, HoE): a fill that re-averages the entry (a second slice, or an add, at another price) keeps a
+    rules stop at its level, as a share of the new entry, on the fill itself, not from the next close. Paper rests no
+    exits, so the backtest's _rest_exits is switched off here, as paper runs; the fill's re-averaging is made by moving
+    the entry the way a second fill at 130 would, before the fill fixes its liquidation price."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    closes, legs = PATHS[1]
+    defn = _defn(legs, {"ma": {"kind": "sma", "period": 3}}, {"exit_at_level": {"level": "ma"}})
+    monkeypatch.setattr(Rules, "_rest_exits", lambda self: None)  # as paper: nothing rests at the venue
+    set_liq, filled, after = LongFlatStrategy._set_liq, LongFlatStrategy.on_order_filled, []
+
+    def averaged(self, order_id, since=None):
+        if isinstance(self, Rules) and self._entry_px:
+            self._entry_px = (self._entry_px + 130.0) / 2  # half the position again at 130
+        return set_liq(self, order_id, since)
+
+    def watched(self, event):
+        filled(self, event)
+        if isinstance(self, Rules) and self._entry_px and self._levels:
+            after.append((self._entry_px, self._stop_frac, self._tightest(self._levels, 1)))
+
+    monkeypatch.setattr(LongFlatStrategy, "_set_liq", averaged)
+    monkeypatch.setattr(LongFlatStrategy, "on_order_filled", watched)
+    res = run_backtest("rules", _bars(closes), instrument, params={**to_params(defn), **PERP}, bar_minutes=1,
+                       half_spread=0, risk_profile="balanced")
+    assert not res.handler_errors, res.handler_errors
+    (entry, frac, level), *_ = after
+    assert entry == pytest.approx(140.0)  # re-averaged
+    assert entry * (1 - frac) == pytest.approx(level, rel=1e-9)  # the stop watched is the rules level, not 140 x (1 - its old share)

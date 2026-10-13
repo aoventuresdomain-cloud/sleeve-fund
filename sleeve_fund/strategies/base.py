@@ -3370,6 +3370,11 @@ class LongFlatStrategy(Strategy):
             self._stop_clamped(asked, held, liq)
         return True
 
+    def _fill_stop(self) -> float | None:
+        """The stop after an opening fill, as a share of the (re-averaged) entry: the plan's share, which follows the
+        average entry by definition. Rules override it to keep their level where it is (STOP-AVG-1)."""
+        return self._stop_frac
+
     def _stop_clamped(self, asked: float, held: float, liq: float) -> None:
         side = self._entry_side or 1
         level, at = (self._entry_px * (1 - side * f) for f in (asked, held))
@@ -5089,8 +5094,10 @@ class LongFlatStrategy(Strategy):
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
                 self._set_liq(journal_id, intrabar[0] if intrabar is not None else event.ts_event)
-                if self._stop_frac is not None:  # the fill's own liquidation price can sit nearer than the decision's
-                    self._hold_stop_capped(self._stop_frac)
+                # The fill re-averaged the entry and fixed its liquidation price: the stop as a share of that entry,
+                # held inside the cap, in paper as in a backtest (STOP-AVG-1, STOP-LOOSEN-1).
+                if (stop := self._fill_stop()) is not None:
+                    self._hold_stop_capped(stop)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
