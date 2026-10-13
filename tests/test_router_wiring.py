@@ -343,3 +343,34 @@ def test_0020_frozen_default_is_todays_default_venue():
     assert mod.DEFAULT_VENUE_THEN == DEFAULT_VENUE
     with pytest.raises(NotImplementedError):
         mod.downgrade()
+
+
+def test_an_unpinned_strategy_is_held_to_the_venue_its_market_was_built_on_a_pinned_one_to_its_pin():
+    """HoE 13 Oct: a strategy saved before strategies carried a venue (no pin) is checked against the venue its market
+    was built on, so test harnesses that build one on another venue's market run as before; production paper builds
+    every unpinned strategy on the default venue (F-P24-1 makes every new one pinned). A pinned one is held to its
+    pin."""
+    from nautilus_trader.trading import Strategy
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    sent = []
+
+    class Sink(Strategy):
+        def submit_order(self, order, *a, **k):
+            sent.append(order.client_order_id)
+
+    class Bare(LongFlatStrategy, Sink):  # Sink takes the parent's submit_order: what reaches the engine is recorded
+        clock = SimpleNamespace(timestamp_ns=lambda: 0)
+        log = SimpleNamespace(error=lambda _: None)
+
+    for pinned in (False, True):
+        s = Bare.__new__(Bare)
+        s._cfg = SimpleNamespace(trade_from=None, instrument_id=SimpleNamespace(venue=SimpleNamespace(value="BINANCE")))
+        statuses = []
+        s.runtime = SimpleNamespace(name="u", venue=DEFAULT_VENUE, pinned=pinned, backtest=False, now=lambda: None,
+                                    on_order_status=lambda oid, st, msg="": statuses.append(st),
+                                    store=SimpleNamespace(event=lambda *a, **k: None))
+        s.decisions = {}
+        s.submit_order(SimpleNamespace(client_order_id=f"O-{pinned}", instrument_id="BTCUSDT-PERP.BINANCE"))
+    assert sent == ["O-False"] and statuses == ["denied"]
