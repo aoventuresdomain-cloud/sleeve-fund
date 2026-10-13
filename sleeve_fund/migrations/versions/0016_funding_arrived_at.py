@@ -9,7 +9,7 @@ has no arrival to give it, so the migration stops and lists it (never edits or d
 Architect and the HoE. Skipped when a Store on the same code built the column first (create_all).
 
 Revision ID: 0016
-Revises: 0013
+Revises: 0014
 Create Date: 2026-10-13 16:40:00.000000
 """
 
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 
 
 revision = '0016'
-down_revision = '0013'
+down_revision = '0014'
 branch_labels = None
 depends_on = None
 

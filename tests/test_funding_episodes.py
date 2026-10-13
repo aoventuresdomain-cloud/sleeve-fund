@@ -517,7 +517,7 @@ def test_paper_reverses_the_baseline_for_a_foreseen_settlement_the_venue_never_m
     rates = {**{f"2025-10-03 {h}": 0.0001 for h in ("00:00", "04:00", "08:00", "16:00")}, "2025-10-04 00:00": 0.0001}
     store = journal()
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-04 00:40", 1)), "2025-10-03 07:50",
-                1010, step=5, rates=rates, store=store, name="w", published={"2025-10-03 12:00": NEVER},
+                1010, step=10, rates=rates, store=store, name="w", published={"2025-10-03 12:00": NEVER},
                 stored={"2025-10-03 00:00": "2025-10-03 00:00", "2025-10-03 04:00": "2025-10-03 04:00",
                         "2025-10-03 08:00": "2025-10-03 08:00", "2025-10-03 16:00": "2025-10-03 16:01",
                         "2025-10-04 00:00": "2025-10-04 00:01"})

@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 
 from sleeve_fund import markets
-from sleeve_fund.research.guardrails import G1_RULES
+from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES
+from sleeve_fund.research.pbo import PBO_CHECK
 from sleeve_fund.strategies import REGISTRY
 
 STAGES = ["Idea", "Tested", "Passed G1", "Paper", "Passed G2", "Live"]
@@ -28,10 +29,17 @@ def _g1(text: str) -> tuple[str | None, str, list[str]]:
     sharpe = next((r for r in rows if r[0].startswith("G1 test")), None)
     if sharpe is None:
         return None, "", []
-    unjudged = [(label, ev.strip()) for label, verdict, ev in rows if verdict == "NOT JUDGED"]
+    # The same order as tearsheet.g1_verdict: a check that couldn't be judged, then a fail, then a PBO that couldn't be
+    # judged or a benchmark (R4: never a pass, but it doesn't hide a fail); a PBO warning is amber, not a fail.
+    unjudged = [(label, ev.strip()) for label, verdict, ev in rows if verdict == "NOT JUDGED"
+                and label not in (PBO_CHECK, CANDIDATE_CHECK)]
     if unjudged:  # neither a pass nor a fail: the study's runs can't be judged (tearsheet.g1_verdict)
         return "NOT JUDGED", "; ".join(ev or label for label, ev in unjudged), [label for label, _ in unjudged]
-    failed = [(label, ev.strip()) for label, verdict, ev in rows if verdict not in ("PASS", "INFO", "N/A")]
+    failed = [(label, ev.strip()) for label, verdict, ev in rows
+              if verdict not in ("PASS", "INFO", "N/A", "NOT JUDGED") and not (label == PBO_CHECK and verdict == "WARN")]
+    last = [(label, ev.strip()) for label, verdict, ev in rows if verdict == "NOT JUDGED"]
+    if last and not failed:
+        return "NOT JUDGED", "; ".join(ev or label for label, ev in last), [label for label, _ in last]
     rules = _RULES.search(text)
     if not failed and (rules is None or rules.group(1) != G1_RULES):
         # Passed under older, looser rules (a 10-trade bar, no nearby-settings check, or one centred on the
