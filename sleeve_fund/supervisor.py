@@ -149,6 +149,18 @@ def check_funding_schedule(s: Sleeve) -> None:
         raise ValueError(why)
 
 
+RESTING_OFF = ("its entries would rest at the venue as post-only limits (maker-first execution), and paper sends no "
+               "resting entry until the orphan guard is in, which cancels one its process can no longer watch: set "
+               "its execution to market to run it")
+
+
+def check_resting_entries(s: Sleeve) -> None:
+    """RESTING-OFF (HoE, Advisor 13 Oct): raises ValueError for a Strategy whose entries would rest at the venue
+    (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here."""
+    if (s.params or {}).get("maker_wait_minutes"):
+        raise ValueError(RESTING_OFF)
+
+
 class Supervisor:
     def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
         self.store = float_view(store)  # its figures are floats: the journal's exact ones (DA-9) read as floats
@@ -184,6 +196,7 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
+            check_resting_entries(s)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
