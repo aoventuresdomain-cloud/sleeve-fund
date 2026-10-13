@@ -123,6 +123,8 @@ def check_books(store) -> Section:
     Strategy still holding stays in the book and is checked). Position and cash come from the latest equity mark
     (book.sleeve_extras); Book, P&L and Return from that mark's own equity column (metrics.sleeve_summary), which must
     be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes)."""
+    from sleeve_fund import markets
+
     sec = Section("Dashboard against the journal")
     earlier = store.previous_book()
     checked = compared = 0
@@ -160,8 +162,9 @@ def check_books(store) -> Section:
                 f"journal {book['cash']:,.2f} ({book['fills']} fills)")
         if abs(d_qty) > qty_tol or abs(d_cash) > cash_tol:
             sec.add(FAIL, what)
-        elif equity == 0.0 and want < 0:
-            # Isolated margin: a Strategy wiped out can't lose more than it had, so its mark is floored at zero.
+        elif equity == 0.0 and want < 0 and markets.is_perp(s.params):
+            # Isolated margin: a Strategy wiped out can't lose more than it had, so its mark is floored at zero. A
+            # spot mark is never floored, so there a zero against a negative journal figure fails below.
             sec.add(NOTE, f"{what}; equity 0.00, floored from {want:,.2f}: its isolated margin is wiped out")
         elif abs(equity - want) > equity_tol:
             sec.add(FAIL, f"{what}; but equity {equity:,.2f} vs journal {want:,.2f} (its cash plus its position at "

@@ -15,12 +15,12 @@ from sleeve_fund.store import Store, account_keys_t
 T0 = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
 
-def _journal(tmp_path, *, mark_qty=0.1, mark_cash=4_000.0 - 3.0):
+def _journal(tmp_path, *, mark_qty=0.1, mark_cash=4_000.0 - 3.0, params=None):
     """One Strategy that bought 0.1 at 60,000 (fee 3), marked after the fill at mark_qty / mark_cash."""
     url = f"sqlite:///{tmp_path}/j.db"
     store = Store(url)
     store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
-                        starting_balance=10_000, venue="BINANCE")
+                        starting_balance=10_000, venue="BINANCE", **({"params": params} if params else {}))
     store.record_fill("s1", side="BUY", qty=0.1, price=60_000.0, fee=3.0, order_id="o1", trade_id="t1", ts=T0)
     store.record_equity("s1", equity=mark_cash + mark_qty * 60_000.0, cash=mark_cash, qty=mark_qty, price=60_000.0,
                         benchmark=10_000.0, ts=T0 + timedelta(minutes=1))
@@ -137,13 +137,18 @@ def test_a_mark_whose_equity_disagrees_fails_though_position_and_cash_match(tmp_
     assert not ok and "but equity 9,998.00 vs journal 9,997.00" in page
 
 
-def test_a_wiped_out_isolated_margin_mark_floored_at_zero_is_a_note(tmp_path):
-    url, store = _journal(tmp_path)
+@pytest.mark.parametrize("market", ["perp", "spot"])
+def test_a_wiped_out_isolated_margin_mark_floored_at_zero_is_a_note_on_a_perp_only(tmp_path, market):
+    """The floor is the perp's isolated margin (Strategy._mark); a spot mark is never floored (FE), so there it fails."""
+    url, store = _journal(tmp_path, params={"market": market})
     store.record_equity("s1", equity=0.0, cash=3_997.0, qty=0.1, price=-50_000.0, benchmark=10_000.0,
                         ts=T0 + timedelta(minutes=2))
     store.engine.dispose()
     ok, page = start_check.run(url, environ={})
-    assert ok and "  NOTE  s1: position 0.1" in page and "equity 0.00, floored from -1,003.00" in page
+    if market == "perp":
+        assert ok and "  NOTE  s1: position 0.1" in page and "equity 0.00, floored from -1,003.00" in page
+    else:
+        assert not ok and "but equity 0.00 vs journal -1,003.00" in page
 
 
 def test_nothing_compared_is_a_fail_not_a_vacuous_pass(tmp_path):
