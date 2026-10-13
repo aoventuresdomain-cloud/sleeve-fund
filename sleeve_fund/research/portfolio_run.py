@@ -31,6 +31,7 @@ from sleeve_fund.research.portfolio import (
     BATCH_DELAY_NS,
     CloseBatch,
     PortfolioGate,
+    _utc,
     clone_instrument,
     clone_venue,
     strategy_order,
@@ -85,13 +86,18 @@ class PortfolioResult:
     pauses: list[dict]
     worst_intrabar_drawdown: float  # the deepest the book went inside an hour, from its high-water mark (R1)
     intrabar_halt_risk: dict  # {"halt": days, "pause": days}: crossed inside an hour, never on a mark (R1)
-    data_gaps: list[dict]  # orders refused inside the window because a figure couldn't be measured (R5)
+    # Inside the window, what couldn't be measured (R5, CR F227-1): {ts, strategy, why, what}, what "entry" for an order
+    # refused, "open_risk" for an hour whose open risk wasn't marked (a held stopless position's daily ATR missing).
+    data_gaps: list[dict]
     unallocated: float = 0.0
     # Every refusal, by Strategy and why: a limit, "halt", "pause", "portfolio_state_stale", or "unmeasurable" (the
     # gate couldn't measure the order, e.g. a stopless entry with no daily ATR yet: CR F220-1, R5).
     refusals: dict = field(default_factory=dict)
     profile: PortfolioProfile = PORTFOLIO
     portfolio_runs_tried: int | None = None  # set by record(): every portfolio run in the project, this one included
+    # Hourly marks whose open risk couldn't be measured (Advisor 13 Oct 16:20 UK, MUST): their equity, drawdown halt
+    # and daily pause were still marked; only open risk wasn't, and every entry was refused meanwhile.
+    open_risk_unmarked_hours: int = 0
 
     def summary(self) -> dict:
         """The fund's headline metrics from the book's daily closes, over the whole window: after a halt the flat
@@ -204,10 +210,15 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
     marks: dict[int, tuple[float, list[tuple[str, float, float]]]] = {}  # hour -> (book, [(name, qty, close)])
     actions: list[tuple[int, str, str, object]] = []  # (ts, "halt" | "pause", why, paused until)
     last: dict = {}
+    unmarked: set[int] = set()  # hours whose open risk wasn't marked
     running = {"on": True}  # the engine can still take orders
 
     def book(ts_ns: int):
-        total, held, seen = Decimal(repr(float(unallocated))), [], []
+        """The fund at ts_ns: equity and every held position. A held stopless position whose daily ATR is missing still
+        counts its equity, so the drawdown halt and the daily pause are marked every hour; only its open risk can't be
+        measured, so it is left out of the holdings and named in last["missing"], and every entry is refused until the
+        figure exists (Advisor 13 Oct 16:20 UK, MUST; CR F227-1, F237-1)."""
+        total, held, seen, missing = Decimal(repr(float(unallocated))), [], [], []
         for leg, spec in zip(legs, specs):
             h = hours[spec.name]
             at = h.index.searchsorted(pd.Timestamp(ts_ns, tz="UTC"), side="right") - 1
@@ -215,18 +226,33 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
                 continue
             close = float(h["close"].iloc[at])
             atr = leg.strategy._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
-            equity, holding = leg.strategy.portfolio_book(spec.name, close, atr)
+            try:
+                equity, holding = leg.strategy.portfolio_book(spec.name, close, atr)
+                qty = float(holding.notional) / close if holding is not None else 0.0
+            except ValueError as e:  # its open risk can't be measured; its equity still can
+                eq, _, qty, _ = leg.strategy._mark(close)
+                equity, holding = Decimal(repr(float(eq))), None
+                missing.append(f"{spec.name}: {e}")
             total += equity
             if holding is not None:
                 held.append(holding)
-            seen.append((spec.name, float(holding.notional) / close if holding is not None else 0.0, close))
-        last["book"] = (float(total), seen)
+            seen.append((spec.name, qty, close))
+        last["book"], last["missing"] = (float(total), seen), missing
         return total, tuple(held)
 
+    def unmeasured() -> str | None:
+        """Why the book just read has open risk it couldn't measure, for the gate to refuse an entry on."""
+        return "; ".join(last.get("missing") or []) or None
+
     def mark(hour_ns: int) -> None:
-        """The hourly mark (R1): the gate marks the book, and the run keeps it for the result."""
+        """The hourly mark (R1): the gate marks the book, and the run keeps it for the result. An hour whose open risk
+        can't be measured is still marked, so its drawdown halt and daily pause act (Advisor 13 Oct 16:20 UK, MUST);
+        it is counted as open risk unmarked and each Strategy short of its figure is reported as a data gap."""
         gate.mark(hour_ns + BATCH_DELAY_NS)
         marks[hour_ns] = last["book"]
+        for why in last["missing"]:
+            unmarked.add(hour_ns)
+            gate.ledger.alert("portfolio_open_risk_unmarked", why, _utc(hour_ns + BATCH_DELAY_NS))
 
     def act(ts_ns: int, what: str) -> None:
         st = gate.ledger.state()
@@ -236,7 +262,7 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             for leg in legs:  # every Strategy, in the run's order, in this one pass (Done-when 3)
                 leg.strategy.portfolio_halt(why)
 
-    gate = PortfolioGate(book, profile, on_action=act)
+    gate = PortfolioGate(book, profile, on_action=act, unmeasured=unmeasured)
     batch = CloseBatch(order, gate)
     engine = new_engine(log_level)
     try:
@@ -258,7 +284,9 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
         for leg in legs:
             release_leg(leg)
         engine.dispose()
-    return _result(results, spread, marks, actions, gate, hours, window, profile, unallocated)
+    out = _result(results, spread, marks, actions, gate, hours, window, profile, unallocated)
+    out.open_risk_unmarked_hours = sum(1 for t in unmarked if t >= window)
+    return out
 
 
 def _flatten_cost(results: dict[str, BacktestResult], legs_spread: dict[str, dict]) -> float:
@@ -293,9 +321,11 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
     decisions = [{"strategy": r.strategy, "ts": r.at, "outcome": r.decision.outcome,
                   "approved": r.decision.approved_qty, "requested": r.decision.requested_qty,
                   "limit": r.decision.limit_hit, "reason": r.decision.reason} for r in gate.ledger.records]
-    gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip()}
+    gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
+             "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
             for kind, msg, at in gate.ledger.alerts
-            if kind == "portfolio_check_failed" and int(pd.Timestamp(at).value) >= window]
+            if kind in ("portfolio_check_failed", "portfolio_open_risk_unmarked")
+            and int(pd.Timestamp(at).value) >= window]
     refusals: dict[str, dict[str, int]] = {}
     for d in decisions:
         if d["outcome"] == "rejected":

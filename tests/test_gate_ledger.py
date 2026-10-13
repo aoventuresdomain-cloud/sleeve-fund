@@ -323,6 +323,19 @@ def test_cr_f219_4_an_entry_check_inside_a_fills_transaction_fails_closed_as_loc
     assert [(r.decision.outcome, r.decision.limit_hit) for r in ledger.records] == [("error", "lock_error")]
 
 
+def test_cr_f228_1_an_entry_check_inside_a_fills_transaction_is_refused_alerted_by_name_and_books_nothing():
+    """FE note 13 Oct (F228-1): the one way to an audit write inside using() is an entry check there, a mistake. It
+    fails closed, the alert lands in the journal naming the strategy, and nothing is reserved; both engines."""
+    ledger = _marked()
+    with ledger.engine.begin() as conn, ledger.using(conn):
+        c = check_order(ledger, "a", _buy("0.1"), PORTFOLIO, T0)
+    assert c.decision.outcome == "rejected" and c.reservation is None
+    with ledger.engine.connect() as conn:
+        told = conn.execute(select(events_t.c.message).where(events_t.c.kind == "portfolio_check_failed")).scalars().all()
+        held = conn.execute(select(func.count()).select_from(gate_reservations_t)).scalar()
+    assert len(told) == 1 and told[0].startswith("a: ") and held == 0, (told, held)
+
+
 def test_cr_f219_5_a_failed_checks_error_row_and_alert_outlive_the_fill_that_rolls_back():
     """Postgres: an entry check inside a fill's transaction fails closed (F219-4); its error row and alert are audit,
     written in their own transaction, so they stay when the fill rolls back. SQLite shares one connection: they join."""

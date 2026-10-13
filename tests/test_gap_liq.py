@@ -58,8 +58,11 @@ def test_a_backtest_stop_gapped_through_liquidation_books_a_liquidation_at_the_d
     # isolated margin, to the cent, with no insurance-fund row; the fees are charged as filled, so the trade loses the
     # margin and both fees, never more.
     assert not res.insurance
-    assert close["price"] == pytest.approx(entry["price"] * (1 + 1 / 3), rel=1e-9)  # the 3x short's bankruptcy price
-    assert (close["price"] - entry["price"]) * entry["qty"] == pytest.approx(margin, abs=0.01)
+    # LIQ-FUND-1 (Advisor 17:45 UK, 13 Oct; HoE-approved expectation change): funding paid since the fill counts inside
+    # the margin, so bankruptcy moves by it (b' = b - f / q, q = -qty) and the price loss less the funding is the margin.
+    funded = sum(r["amount"] for r in res.funding if r["ts"] > entry["ts"])
+    assert close["price"] == pytest.approx(entry["price"] * (1 + 1 / 3) + funded / entry["qty"], rel=1e-9)
+    assert (close["price"] - entry["price"]) * entry["qty"] - funded == pytest.approx(margin, abs=0.01)
     assert res.exposure.iloc[-1] == pytest.approx(0, abs=1e-9)  # halted: nothing reopened
 
 
