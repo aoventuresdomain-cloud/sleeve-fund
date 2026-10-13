@@ -38,6 +38,7 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    inspect,
     insert,
     or_,
     select,
@@ -46,6 +47,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import DropConstraint
 
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
@@ -66,9 +68,6 @@ RELOAD = "reload"
 # 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
 # venue has answered.
 CANCEL = "cancel"
-# How long a cancel answered "not found" waits with no fill in the journal before its reservation is released (PE2
-# 13 Oct; the Advisor to confirm): a fill the venue sends late still lands inside it.
-CANCEL_CONFIRM = timedelta(seconds=60)
 # Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0015).
 COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
@@ -203,8 +202,26 @@ events_t = Table(
     Column("level", String(8), nullable=False),
     Column("kind", String(32), nullable=False),
     Column("message", Text, nullable=False),
+    # The command a liquidation_reset carries out (F217-3): one reset per command, so a retry after a crash reads
+    # whether its own reset was journaled from this key, never from the message's wording. NULL on every other row.
+    Column("command_id", Integer, ForeignKey("commands.id", ondelete="RESTRICT", use_alter=True,
+                                             name="events_command_id_fkey")),
     Index("events_ts", "ts"),
+    Index("events_command_once", "command_id", unique=True, postgresql_where=text("command_id IS NOT NULL"),
+          sqlite_where=text("command_id IS NOT NULL")),
 )
+
+
+def _unless_dropping_an_absent_fk(ddl, target, bind, **_kw) -> bool:
+    """drop_all drops a use_alter FK by name before its table, and Postgres refuses a name that isn't there: a
+    database built to a revision before 0014 has events without it. Skip that one drop then; adding it always runs."""
+    if not isinstance(ddl, DropConstraint):
+        return True
+    return any(fk["name"] == target.name for fk in inspect(bind).get_foreign_keys(target.table.name))
+
+
+next(c for c in events_t.foreign_key_constraints if c.name == "events_command_id_fkey").ddl_if(
+    callable_=_unless_dropping_an_absent_fk)
 
 commands_t = Table(
     "commands",
@@ -225,7 +242,8 @@ commands_t = Table(
     CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
     CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
     # When the venue first answered a cancel "not found" with no fill in the journal: no proof of a cancel (Advisor 8 Oct
-    # 06:20 UK), so nothing is released until CANCEL_CONFIRM has passed with still no fill (Store.confirm_cancels).
+    # 06:20 UK, 13 Oct 17:00 UK), so nothing is released and the Strategy's entries stay blocked until the venue confirms
+    # the order's end state (apply_cancel "cancelled" with zero fills, or "filled").
     Column("not_found_at", TS),
     CheckConstraint(f"not_found_at IS NULL OR command = '{CANCEL}'", name="commands_not_found_cancel"),
     # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
@@ -1522,11 +1540,23 @@ class Store:
                             .where(signal_state_t.c.sleeve == sleeve)).first()
         return None if row is None else {"ts": _aware(row[0]), "payload": json.loads(row[1])}
 
-    def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None) -> None:
+    def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None,
+              command_id: int | None = None) -> None:
+        """`command_id`: only on a liquidation_reset, the command it carries out (unique: a second raises)."""
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
+        if command_id is not None and kind != LIQUIDATION_RESET:
+            raise ValueError("only a liquidation_reset names the command it carries out")
         with self.engine.begin() as c:
-            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message,
+                                              command_id=command_id))
+
+    def reset_for_command(self, command_id: int) -> dict | None:
+        """The liquidation_reset journaled for this command (F217-3), else None."""
+        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == LIQUIDATION_RESET)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def equity_series(self, sleeve: str, limit: int = 5000) -> list[dict]:
         q = select(equity_t).where(equity_t.c.sleeve == sleeve).order_by(equity_t.c.ts.desc(), equity_t.c.id.desc())
@@ -2388,7 +2418,7 @@ class Store:
         if not took:
             return False
         c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIQUIDATION_RESET,
-                                          message=here["words"]))
+                                          message=here["words"], command_id=command_id))
         if here["mark"] is not None:
             c.execute(insert(equity_t).values(sleeve=sleeve, ts=now, **here["mark"]))
         c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
@@ -2561,15 +2591,17 @@ class Store:
         - an order with a fill: nothing is written and "filled" is returned. The caller books the venue's fills (each
           reduces the reservation as any fill does), closes the orphan (og5) and then answers "filled";
         - an order with none: only the first such answer's time is kept (not_found_at) and "unconfirmed" is returned.
-          Nothing is released: a fill landing meanwhile reduces the reservation as any fill does, and
-          confirm_cancels releases the rest once CANCEL_CONFIRM has passed with still no fill.
+          Nothing is released, however long our journal stays silent (Advisor 13 Oct 17:00 UK): the cancel stays
+          open, which blocks the Strategy's entries (open_cancels), until the venue's own order query and fill history
+          settle it as "cancelled" (a terminal state with zero fills) or "filled".
         "filled", once the journal holds the order's fills: the command is applied and nothing more released (the
         fills used what they used); refused with no fill in the journal.
-        "cancelled": the order's open reservation (what no fill used) is released as 'cancel', the order marked
-        canceled and the command applied: "applied", or "partly_filled" for an order with fills, whose filled part
-        the caller closes (og5).
+        "cancelled": the venue confirmed the order ended (cancelled, or terminal with zero fills after a "not found").
+        The order's open reservation (what no fill used) is released as 'cancel', the order marked canceled and the
+        command applied: "applied", or "partly_filled" for an order with fills, whose filled part the caller closes
+        (og5).
         "already" when another got there first, and then nothing at all is written. `at`: when the answer came, on
-        the clock confirm_cancels is given (the supervisor's), else now."""
+        the supervisor's clock, else now."""
         if outcome not in ("cancelled", "not_found", "filled"):
             raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
         now = at or utcnow()
@@ -2597,25 +2629,6 @@ class Store:
             if not self._close_cancel(c, cmd, "canceled", f"cancelled by the supervisor: {cmd.reason}", now):
                 return "already"
         return "partly_filled" if filled else "applied"
-
-    def confirm_cancels(self, now: datetime | None = None, quiet: timedelta | None = None) -> list[int]:
-        """Cancels the venue answered "not found" at least `quiet` (CANCEL_CONFIRM) ago, with still no fill in the
-        journal: each released as 'cancel', its order expired (we never claim a cancel we didn't see) and applied, in
-        one transaction per cancel. Returns their ids. The supervisor calls it."""
-        now, quiet = now or utcnow(), CANCEL_CONFIRM if quiet is None else quiet
-        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None),
-                                     commands_t.c.not_found_at <= now - quiet).order_by(commands_t.c.id)
-        with self.engine.connect() as c:
-            due = c.execute(q).all()
-        done = []
-        for cmd in due:
-            with self.engine.begin() as c:
-                if self._order_filled(c, cmd):
-                    continue  # a fill landed: the caller closes it as "filled"
-                if self._close_cancel(c, cmd, "expired", f"not found at the venue and never filled: {cmd.reason}",
-                                      now):
-                    done.append(cmd.id)
-        return done
 
     @staticmethod
     def _order_filled(c, cmd) -> bool:

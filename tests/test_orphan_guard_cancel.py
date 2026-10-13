@@ -17,7 +17,6 @@ import sleeve_fund.store as store_mod
 from sleeve_fund import schema
 from sleeve_fund.store import (
     CANCEL,
-    CANCEL_CONFIRM,
     COMMAND_KINDS,
     Store,
     commands_t,
@@ -28,11 +27,11 @@ from sleeve_fund.store import (
     orders_t,
     portfolio_profile_t,
     sleeves_t,
-    utcnow,
 )
 from sleeve_fund.store import _aware
 
 T = datetime(2026, 10, 13, 9, tzinfo=timezone.utc)
+RAL_KIND = "reset_after_liquidation"
 MIGRATION = Path(store_mod.__file__).parent / "migrations" / "versions" / "0015_orphan_guard_cancel.py"
 
 
@@ -141,20 +140,18 @@ def test_a_strategys_process_never_sees_a_cancel_and_nothing_lapses_or_marks_it_
     assert [c["id"] for c in store.open_cancels("s")] == [cid]
 
 
-@pytest.mark.parametrize("outcome,status", [("cancelled", "canceled"), ("not_found", "expired")])
-def test_the_venues_answer_releases_the_reservation_and_ends_the_order_with_the_cancel_in_one_go(store, outcome,
-                                                                                                 status):
-    """Confirmed: at once. Not found with no fill: only once CANCEL_CONFIRM has passed with still none."""
+@pytest.mark.parametrize("not_found_first", [False, True], ids=["confirmed", "not-found-then-confirmed"])
+def test_the_venues_answer_releases_the_reservation_and_ends_the_order_with_the_cancel_in_one_go(store, not_found_first):
+    """Released only on the venue's confirmed end: a confirmed cancel, or after "not found" its own order query and fill
+    history showing a terminal state with zero fills (Advisor 13 Oct 17:00 UK)."""
     did = _resting(store)
     cid = store.request_cancel("s", "E-1", "owner process down")
-    if outcome == "cancelled":
-        assert store.apply_cancel(cid, outcome) == "applied"
-    else:
-        assert store.apply_cancel(cid, outcome) == "unconfirmed"
-        assert store.confirm_cancels(utcnow() + CANCEL_CONFIRM + timedelta(seconds=1)) == [cid]
+    if not_found_first:
+        assert store.apply_cancel(cid, "not_found") == "unconfirmed"
+    assert store.apply_cancel(cid, "cancelled") == "applied"
     r = _reservation(store, did)
     assert r.released_at is not None and r.release_reason == "cancel"
-    assert _order(store).status == status
+    assert _order(store).status == "canceled"
     assert store.open_cancels() == []
     assert store.apply_cancel(cid, "cancelled") == store.apply_cancel(cid, "not_found") == "already"
     # once applied, a later cancel for the same order may be opened (the index covers open ones only), but the order
@@ -173,45 +170,32 @@ def test_not_found_with_a_fill_in_the_journal_releases_nothing_and_leaves_the_ca
     assert [c["id"] for c in store.open_cancels()] == [cid]
 
 
-def test_not_found_with_no_fill_releases_nothing_until_the_quiet_window_has_passed(store):
-    """PE2 / HoQA og2c, Advisor 06:20: "not found" is no proof of a cancel. The first answer's time is kept, a second
-    doesn't move it, and nothing is released or ended before CANCEL_CONFIRM."""
+def test_not_found_with_no_fill_releases_nothing_however_long_the_journal_stays_silent(store):
+    """Advisor 13 Oct 17:00 UK (HoQA og2c): silence in our own journal is no confirmation. The first answer's time is
+    kept on the supervisor's clock (a second doesn't move it), and the cancel stays open, which is what blocks the
+    Strategy's entries and what the bar close + 2 min alert reads, until the venue settles the order's end."""
     did = _resting(store)
     cid = store.request_cancel("s", "E-1", "owner process down")
     before = (_reservation(store, did), _order(store))
-    assert store.apply_cancel(cid, "not_found") == "unconfirmed"
-    (first,) = [c["not_found_at"] for c in store.open_cancels()]
-    assert store.apply_cancel(cid, "not_found") == "unconfirmed"
-    assert [c["not_found_at"] for c in store.open_cancels()] == [first]
-    assert store.confirm_cancels(_aware(first) + CANCEL_CONFIRM - timedelta(seconds=1)) == []
-    assert (_reservation(store, did), _order(store)) == before
-    assert store.confirm_cancels(_aware(first) + CANCEL_CONFIRM) == [cid]
-    assert store.confirm_cancels(_aware(first) + 2 * CANCEL_CONFIRM) == []  # once
-
-
-def test_the_answer_and_the_window_share_the_supervisors_clock(store):
-    """PE2 (og2b): the not-found time is the supervisor's, as given, so the window is measured on one clock."""
-    did = _resting(store)
-    cid = store.request_cancel("s", "E-1", "owner process down")
     assert store.apply_cancel(cid, "not_found", at=T) == "unconfirmed"
-    assert _aware(store.open_cancels()[0]["not_found_at"]) == T
-    assert store.confirm_cancels(T + CANCEL_CONFIRM) == [cid]
-    r = _reservation(store, did)
-    assert _aware(r.released_at) == T + CANCEL_CONFIRM and r.release_reason == "cancel"
+    assert store.apply_cancel(cid, "not_found", at=T + timedelta(hours=6)) == "unconfirmed"
+    assert [(c["id"], _aware(c["not_found_at"])) for c in store.open_cancels("s")] == [(cid, T)]
+    assert (_reservation(store, did), _order(store)) == before
+    assert not hasattr(store, "confirm_cancels")  # no timer releases it
 
 
-def test_a_fill_landing_inside_the_window_is_never_released_as_cancel_and_closes_as_filled(store):
-    """og2c, fill second: cancel -> not found -> the venue's fill. The sweep leaves it; once the fills are booked
-    the caller answers "filled": applied, nothing released as 'cancel' (the fills reduce the reservation, W2)."""
+def test_a_fill_found_after_not_found_is_never_released_as_cancel_and_closes_as_filled(store):
+    """og2c, fill second: cancel -> not found -> the venue's fill. Once the fills are booked (each reduces the
+    reservation, W2) the caller answers "filled": applied, nothing released as 'cancel'."""
     did = _resting(store)
     cid = store.request_cancel("s", "E-1", "owner process down")
     with pytest.raises(ValueError, match="no fill"):
         store.apply_cancel(cid, "filled")
     assert store.apply_cancel(cid, "not_found") == "unconfirmed"
     store.record_fill("s", side="BUY", qty=0.01, price=60_000.0, fee=0.1, order_id="E-1", trade_id="T-1", ts=T)
-    assert store.confirm_cancels(utcnow() + 2 * CANCEL_CONFIRM) == []
+    assert store.apply_cancel(cid, "not_found") == "filled"
     assert _reservation(store, did).release_reason != "cancel"
-    assert store.apply_cancel(cid, "filled") == "applied"
+    assert store.apply_cancel(cid, "filled", at=T) == "applied"
     assert store.apply_cancel(cid, "filled") == "already" and store.open_cancels() == []
     assert _reservation(store, did).release_reason != "cancel"
 
@@ -267,7 +251,7 @@ def test_0015_stops_on_a_command_of_unknown_kind_and_changes_nothing(engine):
     from alembic import command
 
     with engine.begin() as conn:
-        command.upgrade(schema._config(conn), "0013")
+        command.upgrade(schema._config(conn), "0014")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, starting_balance, created_at, "
                           "updated_at, desired_state, status, status_reason, risk_profile, params, warmup_bars) "
@@ -278,8 +262,11 @@ def test_0015_stops_on_a_command_of_unknown_kind_and_changes_nothing(engine):
     with pytest.raises(Exception, match="legacy_thing"):
         schema.migrate(engine, log=lambda _: None)
     with engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0013"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0014"
     assert "order_id" not in {c["name"] for c in inspect(engine).get_columns("commands")}
+    with engine.begin() as conn:  # to head, so teardown's drop_all finds every constraint the code names
+        conn.execute(text("DELETE FROM commands WHERE command = 'legacy_thing'"))
+    schema.migrate(engine, log=lambda _: None)
 
 
 def test_0015_migrated_commands_equal_create_alls(engine, tmp_path):
@@ -302,3 +289,27 @@ def test_0015_migrated_commands_equal_create_alls(engine, tmp_path):
     assert {"commands_kind", "commands_cancel_order", "commands_not_found_cancel"} <= set(migrated[1])
     assert ("commands_cancel_open", ("order_id",), True) in migrated[2]
     assert "gate_decisions_order_id" in {i["name"] for i in inspect(engine).get_indexes("gate_decisions")}
+
+
+def test_0015_keeps_a_reset_keyed_to_its_command_when_it_rebuilds_commands(engine):
+    """0014's events.command_id references commands; 0015's batch rebuild of commands (SQLite) must keep that row
+    and its key valid."""
+    from alembic import command
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0014")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, starting_balance, created_at, "
+                          "updated_at, desired_state, status, status_reason, risk_profile, params, warmup_bars) "
+                          "SELECT 's', 'buy_and_hold', 'BTC/USDT-PERP', 'b', 1000, :t, :t, 'stopped', 'stopped', '', "
+                          "'balanced', '{}', 0"), {"t": T})
+        cid = conn.execute(text("INSERT INTO commands (sleeve, command, reason, created_at, applied_at) VALUES "
+                                "('s', 'reset_after_liquidation', 'x', :t, :t) RETURNING id"), {"t": T}).scalar()
+        conn.execute(text("INSERT INTO events (sleeve, ts, level, kind, message, command_id) VALUES "
+                          "('s', :t, 'info', 'liquidation_reset', 'reset', :c)"), {"t": T, "c": cid})
+    schema.migrate(engine, log=lambda _: None)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT command_id FROM events WHERE kind = 'liquidation_reset'")).scalar() == cid
+        assert conn.execute(text("SELECT command FROM commands WHERE id = :c"), {"c": cid}).scalar() == RAL_KIND
+        if engine.dialect.name == "sqlite":
+            assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
