@@ -241,6 +241,41 @@ def test_a_reason_dialog_is_searchable_and_needs_no_typing(site, browser):
     page.context.close()
 
 
+def test_a_reason_is_picked_by_keyboard_alone_in_the_combo_box(site, browser):
+    """UP-4 (UI v2, item 9): the reasons are a combo-box like the instrument field. The list shows until a reason is
+    picked, then folds into the search box; the arrow keys move, Enter picks (it never submits the dialog), Escape
+    closes the list and leaves the dialog open. The pick is the reason's own radio, so the form posts the same
+    reason_pick."""
+    page, errors = _open(browser, f"{site}/sleeves/eth-trend")
+    opener = page.locator("[data-open=dlg-start], [data-open=dlg-pause]").first
+    which = opener.get_attribute("data-open")
+    opener.click()
+    dlg = page.locator(f"#{which}")
+    search, listing = dlg.locator("[data-reason-search]"), dlg.locator(".reason-list")
+    search.focus()  # the box opens the list on focus
+    assert listing.is_visible() and search.get_attribute("aria-expanded") == "true"
+    page.keyboard.press("Escape")
+    assert not listing.is_visible() and dlg.is_visible()  # Escape closes the list, not the dialog
+    page.keyboard.press("ArrowDown")  # and the keyboard opens it again
+    assert listing.is_visible()
+    labels = dlg.locator("label.opt")
+    first, second = labels.nth(0).inner_text().split("\n")[0], labels.nth(1).inner_text().split("\n")[0]
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    assert not listing.is_visible() and dlg.is_visible()  # picked, list closed, dialog still open
+    assert dlg.locator("input[name=reason_pick]:checked").get_attribute("value") == second != first
+    assert search.input_value() == second and f"Logged as: {second}" in dlg.inner_text()
+    assert dlg.locator("[data-needs-reason]").first.is_enabled()
+    page.keyboard.press("ArrowDown")  # reopens on the whole list, the pick marked
+    assert listing.is_visible() and "act" in (labels.nth(1).get_attribute("class") or "")
+    page.keyboard.type("zzzz")
+    assert [t.split("\n")[0] for t in dlg.locator("label.opt:visible").all_inner_texts()] == ["+ Write your own reason"]
+    page.keyboard.press("Escape")
+    assert not listing.is_visible() and dlg.is_visible()
+    assert errors == []
+    page.context.close()
+
+
 def test_development_columns_end_on_the_same_line(site, browser):
     """UI v2, item 8: at 1440 x 900 the model list and the study are the same height; the list scrolls."""
     ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},

@@ -1113,6 +1113,9 @@ fieldset.reasons .reason-list .grp { margin: 4px 0 0; font-size: 11px; text-tran
 fieldset.reasons .reason-list .none { margin: 0; font-size: 12px; color: var(--muted); }
 fieldset.reasons label.opt.write span { color: var(--accent); }
 fieldset.reasons label[hidden], fieldset.reasons .grp[hidden] { display: none; }
+/* UP-4: with JavaScript the list is a combo-box, folded into the search box once a reason is picked; the active row is outlined. */
+fieldset.reasons.rp-closed .reason-list { display: none; }
+fieldset.reasons label.opt.act { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 dialog:has(fieldset.reasons) { max-height: calc(100vh - 24px); overflow-y: auto; }
 .warnbox { background: var(--warn-bg); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); border-radius: var(--r-sm); padding: 9px 11px; font-size: 13px; margin: 0 0 12px; }
 .warnbox b { color: var(--warn); font-weight: 600; }
