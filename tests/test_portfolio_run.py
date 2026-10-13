@@ -376,20 +376,71 @@ def test_f223_1_on_the_real_store_a_recorded_run_is_kind_portfolio_run_and_outsi
     assert halted.portfolio_runs_tried == register.portfolio_runs() == 1
 
 
-def test_f227_1_a_mid_window_atr_gap_under_a_held_stopless_position_fails_closed_and_is_a_data_gap(monkeypatch):
-    s = _spec("a", 2)
-    entry = pd.Timestamp(run_portfolio([s], LOOSE).legs["a"].fills["ts_last"].iloc[0])
+def _atr_gap(monkeypatch, profile=LOOSE):
+    """A held stopless position whose daily ATR goes missing from the day after its entry (it is held to the end of
+    the gap). Returns the run under `profile`, the same run with room to spare, and the cut."""
+    entry = pd.Timestamp(run_portfolio([_spec("a", 2)], LOOSE).legs["a"].fills["ts_last"].iloc[0])
     cut = int((entry.floor("D") + pd.Timedelta("1D")).value)  # no ATR from the day after the first entry
     real = open_risk.daily_atr_lookup
     monkeypatch.setattr(open_risk, "daily_atr_lookup", lambda prices: {k: v for k, v in real(prices).items() if k < cut})
-    run = run_portfolio([_spec("a", 2)], LOOSE)  # finishes: nothing raises inside the hourly mark
-    marks = [g for g in run.data_gaps if g["what"] == "mark"]
-    assert marks and all(g["strategy"] == "a" and "daily ATR" in g["why"] for g in marks)
-    assert all(int(pd.Timestamp(g["ts"]).value) > cut for g in marks)
-    skipped = {pd.Timestamp(g["ts"]).floor("h") for g in marks}
-    assert not skipped & set(run.book.index)  # no mark is made up for an hour that couldn't be measured
-    after = [d for d in run.decisions if int(pd.Timestamp(d["ts"]).value) > cut]
+    return run_portfolio([_spec("a", 2)], profile), run_portfolio([_spec("a", 2)], LOOSE), pd.Timestamp(cut, tz="UTC")
+
+
+def test_f227_1_a_mid_window_atr_gap_under_a_held_stopless_position_fails_closed_and_is_a_data_gap(monkeypatch):
+    run, _, cut = _atr_gap(monkeypatch)  # finishes: nothing raises inside the hourly mark
+    gaps = [g for g in run.data_gaps if g["what"] == "open_risk"]
+    assert gaps and all(g["strategy"] == "a" and "daily ATR" in g["why"] for g in gaps)
+    assert all(pd.Timestamp(g["ts"]) > cut for g in gaps)
+    hours = {pd.Timestamp(g["ts"]).floor("h") for g in gaps}
+    assert hours <= set(run.book.index)  # every hour is still marked: only its open risk isn't (Advisor 16:20 UK)
+    assert run.open_risk_unmarked_hours == len(hours) > 0  # MUST 3: the result says how many
+    after = [d for d in run.decisions if pd.Timestamp(d["ts"]) > cut]
     assert not [d for d in after if d["outcome"] == "approved"]  # no new entry until the figure exists
-    assert [g for g in run.data_gaps if g["what"] == "entry"]  # each refused entry is a gap too (R5)
     sells = run.legs["a"].fills[run.legs["a"].fills["side"] == "SELL"]
-    assert (pd.to_datetime(sells["ts_last"]) > pd.Timestamp(cut, tz="UTC")).any()  # the exit still went through
+    assert (pd.to_datetime(sells["ts_last"]) > cut).any()  # the exit still went through
+
+
+def _first(series: pd.Series, level: float, after: pd.Timestamp) -> pd.Timestamp:
+    crossed = series[(series >= level) & (series.index > after)]
+    assert len(crossed) and not (series[series.index <= after] >= level).any()  # it crosses inside the gap only
+    return crossed.index[0]
+
+
+def test_f237_1_the_drawdown_halt_fires_at_its_hour_inside_an_atr_gap(monkeypatch):
+    """Advisor 13 Oct 16:20 UK, MUST 1: equity is marked every hour, so the 15% halt fires at the hour it is crossed,
+    though that hour's open risk can't be measured."""
+    run, loose, cut = _atr_gap(monkeypatch, PortfolioProfile(drawdown=0.15, daily_loss=0.99, gross=100,
+                                                             net_instrument=100, margin=100, open_risk=100))
+    drawdown = 1 - loose.book / loose.book.cummax()
+    assert run.halt is not None and run.halt["ts"] == _first(drawdown, 0.15, cut)
+    assert run.halt["ts"] in {pd.Timestamp(g["ts"]).floor("h") for g in run.data_gaps if g["what"] == "open_risk"}
+
+
+def test_f237_1_the_daily_pause_fires_at_its_hour_inside_an_atr_gap(monkeypatch):
+    """Advisor 13 Oct 16:20 UK, MUST 2: likewise the 3% daily pause."""
+    run, loose, cut = _atr_gap(monkeypatch, PortfolioProfile(drawdown=0.99, daily_loss=0.03, gross=100,
+                                                             net_instrument=100, margin=100, open_risk=100))
+    b = loose.book
+    day_start = b.groupby((b.index - pd.Timedelta(1, "ns")).floor("D")).transform("first")  # the 00:00 mark
+    assert run.pauses and run.pauses[0]["ts"] == _first(1 - b / day_start, 0.03, cut)
+    assert run.pauses[0]["ts"] in {pd.Timestamp(g["ts"]).floor("h") for g in run.data_gaps if g["what"] == "open_risk"}
+
+
+def test_f237_1_while_open_risk_is_unmarked_the_gate_refuses_every_entry_and_still_marks_the_halt():
+    """The gate side of MUST 1 and the entry block: with a held position's open risk unmeasured, an entry it would
+    otherwise approve (a stop, so no ATR needed) is refused and reported, and the book's halt still fires."""
+    from sleeve_fund.research.portfolio import PortfolioGate
+
+    order = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
+                 min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+    t0 = int(pd.Timestamp("2026-10-08 12:00", tz="UTC").value)
+
+    equity, missing = {"now": D(1000)}, {"why": None}
+    gate = PortfolioGate(lambda ts: (equity["now"], ()), unmeasured=lambda: missing["why"])
+    assert gate("a", order, t0).decision.outcome == "approved"
+    missing["why"] = "b: the daily ATR isn't known"
+    refused = gate("a", order, t0 + 10**9)
+    assert refused.approved_qty == 0 and "open risk can't be measured (b: the daily ATR" in refused.decision.reason
+    assert gate.ledger.alerts[-1][0] == "portfolio_check_failed"
+    equity["now"] = D(800)
+    assert gate.mark(t0 + 2 * 10**9) == "halt"  # 20% down: the halt fires though open risk is unmarked
