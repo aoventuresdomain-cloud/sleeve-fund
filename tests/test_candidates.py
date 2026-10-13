@@ -176,6 +176,15 @@ def test_r6_7_every_tuning_knob_stays_the_same_idea(why, knob):
     assert idea_hash(knob(PARENT)) == idea_hash(PARENT), why
 
 
+def test_r6_7_a_strict_or_inclusive_comparison_is_one_idea_and_a_reversed_one_is_another():
+    """Advisor 13 Oct 16:00 UK (MUST): > and >= share an idea; > and <= don't, since <= reverses the hypothesis."""
+    gt, ge, le = (_swap(PARENT, ("long", "exit", "op"), op) for op in (">", ">=", "<="))
+    assert idea_hash(gt) == idea_hash(ge) != idea_hash(le)
+    lt, le_entry = (_swap(PARENT, (*ENTRY, 0), {"left": "rsi", "op": op, "right": 30}) for op in ("<", "<="))
+    gt_entry = _swap(PARENT, (*ENTRY, 0), {"left": "rsi", "op": ">=", "right": 30})
+    assert idea_hash(lt) == idea_hash(le_entry) != idea_hash(gt_entry)
+
+
 def test_r6_7_the_moving_average_type_and_the_atr_smoothing_stay_the_same_idea():
     trend = {"version": 1, "reason": REASON, "blocks": {"ma": {"kind": "sma", "period": 50}, "atr": {"kind": "atr"}},
              "long": {"entry": {"left": "close", "op": ">", "right": "ma"}},
