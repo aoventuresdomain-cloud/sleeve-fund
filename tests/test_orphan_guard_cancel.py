@@ -118,6 +118,27 @@ def test_one_open_cancel_per_order_and_asking_again_returns_the_first(store):
         c.execute(insert(commands_t).values(sleeve="s", command=CANCEL, order_id="E-1", reason="x", created_at=T))
     assert [r.id for r in _cancel_rows(store)] == [first]
     assert [c["id"] for c in store.open_cancels("s")] == [first]
+    # one decision-log line, written with the cancel itself (CR F241-2)
+    assert [d["reason"] for d in store.decisions("s", action=CANCEL)] == ["owner process down (order E-1)"]
+
+
+def test_a_cancel_whose_decision_line_fails_is_not_written_either(store, monkeypatch):
+    """CR F241-2: the cancel and its decision-log line commit together, so a crash between them can't leave one."""
+    import sleeve_fund.store as store_mod
+
+    _resting(store)
+    real = store_mod.insert
+
+    def failing(table):
+        if table is store_mod.decisions_t:
+            raise RuntimeError("crash before the log line")
+        return real(table)
+
+    monkeypatch.setattr(store_mod, "insert", failing)
+    with pytest.raises(RuntimeError, match="log line"):
+        store.request_cancel("s", "E-1", "owner process down")
+    monkeypatch.undo()
+    assert _cancel_rows(store) == [] and store.decisions("s", action=CANCEL) == []
 
 
 def test_a_cancel_for_another_strategys_order_an_unknown_one_or_a_finished_one_is_refused(store):

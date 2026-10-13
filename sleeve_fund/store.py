@@ -2515,17 +2515,19 @@ class Store:
                 return open_id
             if order.status not in OPEN_ORDER_STATUSES:
                 raise ValueError(f"order {order_id} is {order.status}, not resting: nothing to cancel")
+        now = utcnow()
         try:
-            with self.engine.begin() as c:
+            with self.engine.begin() as c:  # the cancel and its decision-log line together, or neither (CR F241-2)
                 cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=CANCEL, order_id=order_id,
-                                                          reason=reason.strip(), created_at=utcnow())
+                                                          reason=reason.strip(), created_at=now)
                                 ).inserted_primary_key[0]
+                c.execute(insert(decisions_t).values(ts=now, actor=actor, action=CANCEL, sleeve=sleeve,
+                                                     reason=f"{reason.strip()} (order {order_id})"))
         except IntegrityError:  # another caller opened it between our read and our insert
             with self.engine.connect() as c:
                 if (open_id := self._open_cancel(c, order_id)) is None:
                     raise
                 return open_id
-        self.decide(actor, CANCEL, f"{reason.strip()} (order {order_id})", sleeve)
         return cid
 
     @staticmethod
