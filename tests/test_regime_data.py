@@ -279,8 +279,162 @@ def test_the_listing_books_live_and_delisted_perps_once_and_refuses_a_reused_sym
     assert {r["symbol"]: r["delisted_at"] for r in store.instruments(V)} == {"BTCUSDT": None, "OLDUSDT": gone}
 
 
-def test_daily_notional_is_the_quote_volume_per_closed_day():
-    k = lambda d, qv: [MS(d), "1", "1", "1", "1", "5", MS(d) + 86_399_999, str(qv)]  # noqa: E731
-    pages = [[k(DAY0 + timedelta(days=i), f"{100 + i}.5") for i in range(3)]]
-    got = venues.binance_daily_notional("BTC/USDT", get_json=lambda url: pages.pop(0))
-    assert dict(got) == {DAY0: D("100.5"), DAY0 + timedelta(days=1): D("101.5")}
+def _kline(d, close, qv):
+    return [MS(d), "1", "1", "1", str(close), "5", MS(d) + 86_399_999, str(qv)]
+
+
+def test_daily_bars_are_the_close_and_quote_volume_per_closed_day_from_a_start():
+    pages, urls = [[_kline(DAY0 + timedelta(days=i), f"{10 + i}.25", f"{100 + i}.5") for i in range(3)]], []
+    got = venues.binance_daily_bars("BTCUSDT", get_json=lambda url: urls.append(url) or pages.pop(0),
+                                    start=DAY0)
+    assert got == {DAY0: (D("10.25"), D("100.5")), DAY0 + timedelta(days=1): (D("11.25"), D("101.5"))}
+    assert f"startTime={MS(DAY0)}" in urls[0] and "symbol=BTCUSDT" in urls[0]
+
+
+S3 = "http://s3.amazonaws.com/doc/2006-03-01/"
+
+
+def _index(items, tag, truncated=False):
+    body = "".join(f"<CommonPrefixes><Prefix>{x}</Prefix></CommonPrefixes>" if tag == "Prefix"
+                   else f"<Contents><Key>{x}</Key></Contents>" for x in items)
+    return (f'<ListBucketResult xmlns="{S3}"><IsTruncated>{"true" if truncated else "false"}</IsTruncated>'
+            f"{body}</ListBucketResult>").encode()
+
+
+def _zip(rows, header):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        lines = (["open_time,open,high,low,close,volume,close_time,quote_volume"] if header else [])
+        z.writestr("k.csv", "\n".join(lines + [",".join(map(str, r)) for r in rows]) + "\n")
+    return buf.getvalue()
+
+
+def test_the_archive_lists_every_perpetual_across_pages_and_reads_its_monthly_zips_with_or_without_a_header():
+    base = "data/futures/um/monthly/klines/"
+    pages = [_index([f"{base}AAAUSDT/", f"{base}BTCUSDT_240329/"], "Prefix", truncated=True),
+             _index([f"{base}GONEUSDT/", f"{base}ODDEUR/"], "Prefix")]
+    urls = []
+    syms = venues.binance_archive_symbols(get_bytes=lambda url: urls.append(url) or pages.pop(0))
+    assert syms == ["AAAUSDT", "GONEUSDT"]  # no quarterly contract, no unknown quote
+    assert "marker=" + "data%2Ffutures%2Fum%2Fmonthly%2Fklines%2FBTCUSDT_240329%2F" in urls[1]
+
+    jan, feb = DAY0, DAY0 + timedelta(days=31)
+    files = {"index": _index([f"{base}GONEUSDT/1d/a-2024-01.zip", f"{base}GONEUSDT/1d/a-2024-01.zip.CHECKSUM",
+                              f"{base}GONEUSDT/1d/a-2024-02.zip"], "Key"),
+             "a-2024-01.zip": _zip([_kline(jan, "2.5", "7")], header=False),
+             "a-2024-02.zip": _zip([_kline(feb, "3", "8.125")], header=True)}
+    got = venues.binance_archive_daily_bars(
+        "GONEUSDT", get_bytes=lambda url: files["index" if "?" in url else url.rsplit("/", 1)[1]])
+    assert got == {jan: (D("2.5"), D("7")), feb: (D("3"), D("8.125"))}
+    assert venues.binance_archive_listing("GONEUSDT", got) == {
+        "symbol": "GONEUSDT", "underlying": "GONE", "quote": "USDT", "contract_type": "perp", "listed_at": jan,
+        "delisted_at": feb, "source": "archive"}
+    assert venues.binance_archive_listing("GONEUSDT", {}) is None
+
+
+def test_a_daily_bar_is_booked_once_and_a_revised_one_is_refused(store):
+    _list(store)
+    bars = {DAY0: (D("10"), D("100")), DAY0 + timedelta(days=1): (D("11.5"), D("0"))}
+    assert store.record_daily_bars(V, "BTCUSDT", bars, source="api") == {"new": 2, "same": 0}
+    more = {**bars, DAY0 + timedelta(days=2): (D("12"), D("5"))}
+    assert store.record_daily_bars(V, "BTCUSDT", more, source="api") == {"new": 1, "same": 2}
+    with pytest.raises(ValueError, match="already held with another close"):
+        store.record_daily_bars(V, "BTCUSDT", {DAY0: (D("10.01"), D("100")), DAY0 + timedelta(days=3): (D(1), D(1))},
+                                source="api")
+    assert store.last_daily_bar(V, "BTCUSDT") == DAY0 + timedelta(days=2)  # the refused call wrote nothing
+    closes, notionals = store.daily_bars(V)
+    assert closes["BTCUSDT"][DAY0 + timedelta(days=1)] == D("11.5") and notionals["BTCUSDT"][DAY0] == D("100")
+    _bare_edits_refused(store, "daily_bars", ["close = 1", "notional = 2", "source = 'archive'"])
+    with pytest.raises(IntegrityError):
+        store.record_daily_bars(V, "BTCUSDT", {DAY0 + timedelta(days=9): (D(0), D(1))}, source="api")
+
+
+# --- the backfill: listing, bars, then every day's universe and regime, written once ----------------------------
+
+from sleeve_fund import regime_load  # noqa: E402
+
+DAYS = 330
+
+
+def _source(n_live=24, gone_day=200, days=DAYS):
+    """A venue of n_live listed contracts plus one delisted (still in the listing) and one only in the archive, with
+    a seeded random walk each, so the ER moves."""
+    import random
+
+    rnd = random.Random(7)
+    def walk(seed_days, start=0):
+        out, px = {}, D(100)
+        for i in range(start, seed_days):
+            px = max(D("0.01"), px * (1 + D(rnd.randint(-40, 45)) / 1000)).quantize(D("0.0001"))
+            out[DAY0 + timedelta(days=i)] = (px, D(1000 + rnd.randint(0, 9000)))
+        return out
+
+    live = {f"C{i:02d}USDT": walk(days) for i in range(n_live)}
+    gone = walk(gone_day + 1)
+    old = walk(150)
+    listings = [dict(symbol=s, underlying=s[:-4], quote="USDT", contract_type="perp", listed_at=DAY0,
+                     delisted_at=None, source="api") for s in live]
+    listings.append(dict(symbol="GONEUSDT", underlying="GONE", quote="USDT", contract_type="perp", listed_at=DAY0,
+                         delisted_at=DAY0 + timedelta(days=gone_day), source="api"))
+    api = {**live, "GONEUSDT": gone}
+    calls = []
+
+    def api_bars(sym, start=None):
+        calls.append((sym, start))
+        return {d: v for d, v in api[sym].items() if start is None or d >= start}
+
+    src = {"listings": lambda: listings, "archive_symbols": lambda: ["C00USDT", "OLDUSDT"],
+           "api_bars": api_bars, "archive_bars": lambda sym: {"OLDUSDT": old}[sym],
+           "archive_listing": venues.binance_archive_listing}
+    return src, api, calls
+
+
+def test_the_backfill_loads_listed_delisted_and_archive_only_contracts_and_a_rerun_fetches_only_new_days(store):
+    src, api, calls = _source()
+    now = datetime(2024, 12, 1, tzinfo=timezone.utc)
+    got = regime_load.load_bars(store, V, src, now, log=lambda _: None)
+    assert got["refused"] == [] and got["archive_only"] == 1
+    held = {r["symbol"]: r for r in store.instruments(V)}
+    assert held["OLDUSDT"]["source"] == "archive" and held["OLDUSDT"]["delisted_at"] == DAY0 + timedelta(days=149)
+    assert store.last_daily_bar(V, "GONEUSDT") == DAY0 + timedelta(days=200)
+    calls.clear()
+    assert regime_load.load_bars(store, V, src, now, log=lambda _: None)["bars_new"] == 0
+    assert ("GONEUSDT", DAY0 + timedelta(days=201)) not in calls and all(s != "GONEUSDT" for s, _ in calls)
+    assert ("C00USDT", DAY0 + timedelta(days=DAYS)) in calls  # from the day after the newest held
+
+
+def test_the_build_writes_every_day_once_is_reproducible_and_a_later_night_only_adds_rows(store):
+    src, _, _ = _source()
+    regime_load.load_bars(store, V, src, log=lambda _: None)
+    cfg = regime_load.config_name()
+    assert cfg == "n20-k25-age60-lag1-min10-h180"
+    end = DAY0 + timedelta(days=300)
+    first = regime_load.build(store, V, end, lookbacks=(20,), log=lambda _: None)
+    assert first["regime"]["new"] == 301 and "same" not in first["regime"]
+    again = regime_load.build(store, V, end + timedelta(days=5), lookbacks=(20,), log=lambda _: None)
+    assert again["regime"] == {"same": 301, "new": 5}  # the earlier days come out identical with more bars held
+    late = store.regime_on(end, reference_venue=V, lookback=20, config=cfg)
+    assert late["data_through"] == end - timedelta(days=1) and late["members"] >= 10
+    assert late["state"] in ("low", "mid", "high")  # 180 valid days of history by then
+    day = DAY0 + timedelta(days=100)
+    members = store.universe_on(V, day, cfg)
+    assert len(members) == 20 and "OLDUSDT" in {m["symbol"] for m in members}  # the archive-only one, in its time
+    assert "OLDUSDT" not in {m["symbol"] for m in store.universe_on(V, DAY0 + timedelta(days=200), cfg)}
+
+
+def test_the_cli_loads_then_builds_and_fails_on_a_refusal(store, monkeypatch, capfd):
+    with pytest.raises(ValueError, match="no regime data loaders"):
+        venues.regime_source("elsewhere")
+    src, api, _ = _source(days=120)
+    monkeypatch.setattr("sleeve_fund.store.Store", lambda: store)
+    monkeypatch.setattr("sleeve_fund.venues.regime_source", lambda name: src)
+    assert regime_load.main(["backfill", "--venue", V, "--end", str(DAY0 + timedelta(days=100))]) == 0
+    assert store.regime_on(DAY0 + timedelta(days=100), reference_venue=V, lookback=30,
+                           config=regime_load.config_name()) is not None
+    api["C01USDT"] = {**api["C01USDT"], DAY0: (D("1"), D("1"))}  # the venue revised a printed day
+    src["api_bars"] = lambda sym, start=None: api[sym]
+    assert regime_load.main(["backfill", "--venue", V, "--end", str(DAY0 + timedelta(days=100))]) == 1
+    assert "refused C01USDT" in capfd.readouterr().out

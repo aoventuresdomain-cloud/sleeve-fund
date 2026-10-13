@@ -530,6 +530,25 @@ instruments_t = Table(
     CheckConstraint("source IN ('api', 'archive')", name="instruments_source"),
     CheckConstraint("delisted_at IS NULL OR delisted_at >= listed_at", name="instruments_delisted_after_listed"),
 )
+# Each closed day's close and quote notional per contract, as the venue (or its archive) printed them: the only input
+# the universe and the ER read, so the series can be rebuilt from the database alone.
+daily_bars_t = Table(
+    "daily_bars",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("venue", String(32), nullable=False),
+    Column("symbol", String(32), nullable=False),
+    Column("day", Date, nullable=False),  # the UTC day it covers (its open date)
+    Column("close", EXACT, nullable=False),
+    Column("notional", EXACT, nullable=False),  # quote notional traded that day
+    Column("source", String(8), nullable=False),  # api or archive
+    Column("fetched_at", TS, nullable=False),
+    UniqueConstraint("venue", "symbol", "day", name="daily_bars_once"),
+    ForeignKeyConstraint(["venue", "symbol"], ["instruments.venue", "instruments.symbol"], name="daily_bars_instrument"),
+    CheckConstraint("close > 0", name="daily_bars_close"),
+    CheckConstraint("notional >= 0", name="daily_bars_notional"),
+    CheckConstraint("source IN ('api', 'archive')", name="daily_bars_source"),
+)
 # The universe on each day: one row per member. config names the settings it was built under (N, lag, hysteresis,
 # minimum age), so a settings change writes new rows beside the old instead of editing them.
 universe_snapshots_t = Table(
@@ -609,12 +628,14 @@ REGIME_WRITE_ONCE = {
     "instruments": write_once_ddl("instruments", ("id", "venue", "symbol", "underlying", "quote", "contract_type",
                                                   "listed_at", "source"),
                                   "instruments are write-once", set_once=("delisted_at",)),
+    "daily_bars": write_once_ddl("daily_bars", tuple(c.name for c in daily_bars_t.columns),
+                                 "daily bars are write-once"),
     "universe_snapshots": write_once_ddl("universe_snapshots", tuple(c.name for c in universe_snapshots_t.columns),
                                          "universe snapshots are write-once"),
     "regime_series": write_once_ddl("regime_series", tuple(c.name for c in regime_series_t.columns),
                                     "the regime series is write-once"),
 }
-for _t in (instruments_t, universe_snapshots_t, regime_series_t):
+for _t in (instruments_t, daily_bars_t, universe_snapshots_t, regime_series_t):
     for _dialect, _stmts in REGIME_WRITE_ONCE[_t.name].items():
         for _sql in _stmts:
             event.listen(_t, "after_create", DDL(_sql).execute_if(dialect=_dialect))
@@ -2368,15 +2389,63 @@ class Store:
             return _rows(c.execute(select(instruments_t).where(instruments_t.c.venue == venue)
                                    .order_by(instruments_t.c.symbol)))
 
+    def _as_held(self, v):
+        """An exact value as an EXACT column gives it back: 18 places, and on SQLite (a REAL) the decimal that float
+        prints as. Written-once rows compare in this form, so a rebuild matches the row it wrote."""
+        if v is None:
+            return None
+        d = stored(v)
+        return to_decimal(float(d)) if self.engine.dialect.name == "sqlite" else d
+
+    def record_daily_bars(self, venue: str, symbol: str, bars: dict, *, source: str,
+                          fetched_at: datetime | None = None) -> dict:
+        """Book a contract's closed days, {day: (close, notional)}, once: counts of "new" and "same". A day already
+        held with another close or notional raises ValueError naming the days, writing nothing (a venue that revised
+        a printed day is an alert, never a silent rewrite)."""
+        if not bars:
+            return {"new": 0, "same": 0}
+        t = daily_bars_t
+        want = {d: (self._as_held(c), self._as_held(n)) for d, (c, n) in bars.items()}
+        with self.engine.begin() as c:
+            held = {r.day: (self._as_held(r.close), self._as_held(r.notional)) for r in c.execute(
+                select(t.c.day, t.c.close, t.c.notional).where(t.c.venue == venue, t.c.symbol == symbol,
+                                                              t.c.day >= min(want), t.c.day <= max(want)))}
+            apart = sorted(d for d in want if d in held and held[d] != want[d])
+            if apart:
+                raise ValueError(f"{venue} {symbol}: {len(apart)} day(s) already held with another close or "
+                                 f"notional, first {apart[0]}: held {held[apart[0]]}, now {want[apart[0]]}")
+            fresh = [dict(venue=venue, symbol=symbol, day=d, close=cl, notional=n, source=source,
+                          fetched_at=fetched_at or utcnow()) for d, (cl, n) in sorted(want.items()) if d not in held]
+            if fresh:
+                c.execute(insert(t), fresh)
+        return {"new": len(fresh), "same": len(want) - len(fresh)}
+
+    def last_daily_bar(self, venue: str, symbol: str):
+        """The newest day held for a contract, or None."""
+        t = daily_bars_t
+        with self.engine.connect() as c:
+            return c.execute(select(func.max(t.c.day)).where(t.c.venue == venue, t.c.symbol == symbol)).scalar()
+
+    def daily_bars(self, venue: str) -> tuple[dict, dict]:
+        """Every held day for the venue as ({symbol: {day: close}}, {symbol: {day: notional}}), exact."""
+        t = daily_bars_t
+        closes: dict = {}
+        notionals: dict = {}
+        with self.engine.connect() as c:
+            for r in c.execute(select(t.c.symbol, t.c.day, t.c.close, t.c.notional).where(t.c.venue == venue)):
+                closes.setdefault(r.symbol, {})[r.day] = to_decimal(r.close)
+                notionals.setdefault(r.symbol, {})[r.day] = to_decimal(r.notional)
+        return closes, notionals
+
     def record_universe(self, venue: str, day, config: str, members, *, data_through,
                         computed_at: datetime | None = None) -> str:
         """The day's universe under `config`, once: "new", or "same" when the rows held are these members with these
         ranks and notionals. Different members for a day already written raise ValueError, changing nothing (the
         series is never rewritten: a changed rule is a new config)."""
         t = universe_snapshots_t
-        want = sorted((m.symbol, m.underlying, m.rank, to_decimal(m.notional)) for m in members)
+        want = sorted((m.symbol, m.underlying, m.rank, self._as_held(m.notional)) for m in members)
         with self.engine.begin() as c:
-            held = sorted((r.symbol, r.underlying, r.rank, to_decimal(r.notional)) for r in c.execute(
+            held = sorted((r.symbol, r.underlying, r.rank, self._as_held(r.notional)) for r in c.execute(
                 select(t).where(t.c.venue == venue, t.c.date == day, t.c.config == config)))
             if held:
                 if held != want:
@@ -2402,9 +2471,9 @@ class Store:
         written differently (nothing changed)."""
         t = regime_series_t
         key = dict(date=row.date, reference_venue=reference_venue, lookback=row.lookback, config=config)
-        want = {f: getattr(row, f) for f in self.REGIME_FIELDS}
-        norm = lambda d: {k: (to_decimal(v) if k in ("er", "lo", "hi") and v is not None else v)  # noqa: E731
+        norm = lambda d: {k: (self._as_held(v) if k in ("er", "lo", "hi") else v)  # noqa: E731
                           for k, v in d.items()}
+        want = norm({f: getattr(row, f) for f in self.REGIME_FIELDS})
         with self.engine.begin() as c:
             held = c.execute(select(t).where(*(t.c[k] == v for k, v in key.items()))).first()
             if held is None:

@@ -383,27 +383,111 @@ def binance_listings(get_json=None) -> list[dict]:
     return sorted(out, key=lambda r: r["symbol"])
 
 
-def binance_daily_notional(pair: str, get_json=None) -> pd.Series:
-    """Each closed day's quote notional traded (the kline's quote-asset volume), indexed by the day it covers (UTC
-    open date), since listing. The forming day is dropped."""
+def binance_daily_bars(symbol: str, get_json=None, start=None) -> dict:
+    """Each closed day's (close, quote notional traded) for one USD-M perpetual by its own symbol, keyed by the day it
+    covers (UTC open date), from `start` (a date; None: since listing). The forming day is dropped. Exact Decimals,
+    as the venue printed them."""
     import urllib.parse
+    from datetime import datetime, time, timezone
 
     from sleeve_fund.data import _get_json
 
-    parts, start = {}, 0
+    parts = {}
+    at = 0 if start is None else int(datetime.combine(start, time(), timezone.utc).timestamp() * 1000)
     while True:
-        q = {"symbol": binance_symbol(pair), "interval": "1d", "limit": 1500, "startTime": start}
+        q = {"symbol": symbol, "interval": "1d", "limit": 1500, "startTime": at}
         rows = (get_json or _get_json)(f"{BINANCE_FAPI}/klines?" + urllib.parse.urlencode(q))
         if isinstance(rows, dict):
             raise ValueError(f"Binance: {rows.get('msg', rows)}")
         for r in rows:
-            parts[pd.Timestamp(int(r[0]), unit="ms", tz="UTC").date()] = Decimal(str(r[7]))
+            parts[pd.Timestamp(int(r[0]), unit="ms", tz="UTC").date()] = (Decimal(str(r[4])), Decimal(str(r[7])))
         if len(rows) < 1500:
             break
-        start = int(rows[-1][0]) + 1
+        at = int(rows[-1][0]) + 1
     if parts:
         parts.pop(max(parts))  # the newest day is still forming
-    return pd.Series(parts, dtype=object).sort_index()
+    return dict(sorted(parts.items()))
+
+
+# The venue's free public archive: monthly zips of daily klines per symbol, delisted contracts included, listed
+# through the bucket's own index (S3 ListObjects v1 XML).
+BINANCE_ARCHIVE = "https://data.binance.vision"
+BINANCE_ARCHIVE_INDEX = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+_BINANCE_KLINES = "data/futures/um/monthly/klines/"
+_ARCHIVE_QUOTES = ("USDT", "USDC", "BUSD")  # a perpetual's symbol is its underlying then one of these
+
+
+def _get_bytes(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=60) as r:  # public archive, no key
+        return r.read()
+
+
+def _archive_index(prefix: str, get_bytes, delimiter: bool) -> list[str]:
+    """Every key (or, with delimiter, every sub-prefix) under `prefix` in the archive bucket, all pages."""
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+    out, marker = [], ""
+    while True:
+        q = {"prefix": prefix, "marker": marker, **({"delimiter": "/"} if delimiter else {})}
+        root = ET.fromstring((get_bytes or _get_bytes)(f"{BINANCE_ARCHIVE_INDEX}?" + urllib.parse.urlencode(q)))
+        page = ([e.findtext(f"{ns}Prefix") for e in root.iter(f"{ns}CommonPrefixes")] if delimiter
+                else [e.findtext(f"{ns}Key") for e in root.iter(f"{ns}Contents")])
+        out += [x for x in page if x]
+        if root.findtext(f"{ns}IsTruncated") != "true" or not page:
+            break
+        marker = root.findtext(f"{ns}NextMarker") or page[-1]
+    return out
+
+
+def binance_archive_symbols(get_bytes=None) -> list[str]:
+    """Every USD-M perpetual symbol the archive holds daily klines for, delisted included (quarterly contracts,
+    named with a delivery date after an underscore, left out)."""
+    prefixes = _archive_index(_BINANCE_KLINES, get_bytes, delimiter=True)
+    syms = (p[len(_BINANCE_KLINES):].strip("/") for p in prefixes)
+    return sorted(s for s in syms if s and "_" not in s and s.endswith(_ARCHIVE_QUOTES))
+
+
+def binance_archive_daily_bars(symbol: str, get_bytes=None) -> dict:
+    """Each day's (close, quote notional) the archive holds for `symbol`, from its monthly daily-kline zips (the
+    current month is not archived yet). A zip may or may not start with a header row."""
+    import csv
+    import io
+    import zipfile
+
+    keys = [k for k in _archive_index(f"{_BINANCE_KLINES}{symbol}/1d/", get_bytes, delimiter=False)
+            if k.endswith(".zip")]
+    parts = {}
+    for key in sorted(keys):
+        with zipfile.ZipFile(io.BytesIO((get_bytes or _get_bytes)(f"{BINANCE_ARCHIVE}/{key}"))) as z:
+            for name in z.namelist():
+                for r in csv.reader(io.TextIOWrapper(z.open(name), encoding="utf-8")):
+                    if not r or not r[0].strip().isdigit():
+                        continue  # the header row
+                    day = pd.Timestamp(int(r[0]), unit="ms", tz="UTC").date()
+                    parts[day] = (Decimal(r[4]), Decimal(r[7]))
+    return dict(sorted(parts.items()))
+
+
+def binance_archive_listing(symbol: str, bars: dict) -> dict | None:
+    """An `instruments` row for a contract only the archive holds: its first and last archived days as listed and
+    delisted, the underlying its symbol before the quote. None when it has no bars or an unknown quote."""
+    quote = next((q for q in _ARCHIVE_QUOTES if symbol.endswith(q) and len(symbol) > len(q)), None)
+    if not bars or quote is None:
+        return None
+    return {"symbol": symbol, "underlying": symbol[:-len(quote)], "quote": quote, "contract_type": "perp",
+            "listed_at": min(bars), "delisted_at": max(bars), "source": "archive"}
+
+
+def regime_source(venue_name: str) -> dict:
+    """The P2-5 regime loaders for a venue (sleeve_fund.regime_load names none itself): listings, archive symbols,
+    API daily bars, archive daily bars and the archive-only listing row. ValueError for a venue without them."""
+    if venue_name.lower() == "binance":
+        return {"listings": binance_listings, "archive_symbols": binance_archive_symbols,
+                "api_bars": binance_daily_bars, "archive_bars": binance_archive_daily_bars,
+                "archive_listing": binance_archive_listing}
+    raise ValueError(f"no regime data loaders for {venue_name!r}: the reference is the paper perpetual venue")
 
 
 def binance_contract(pair: str, get_json=None) -> dict:

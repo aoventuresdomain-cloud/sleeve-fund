@@ -1,15 +1,17 @@
 """P2-5 regime, the data side (DA design data-architect/p2-5-data-design.md): instruments, universe_snapshots and
-regime_series, each write-once in the database itself.
+regime_series, with daily_bars beside them, each write-once in the database itself.
 
 - instruments: every contract a venue lists or listed, delisted included, unique (venue, symbol). Only delisted_at
   (set once, from NULL) and seen_at may change; no row is deleted.
+- daily_bars: each closed day's close and quote notional per contract (api or archive), unique (venue, symbol, day),
+  FK to instruments: the only input the universe and the ER read.
 - universe_snapshots: the members on each day under one config, unique per (venue, date, config) by symbol and by
   underlying (one contract per underlying), FK (venue, symbol) to instruments, data_through before date.
 - regime_series: one row per (date, reference_venue, lookback, config): the median ER, its state and the cuts used;
   data_through before date; a known state carries its ER and cuts.
 universe_snapshots and regime_series rows are never edited or deleted.
 
-Additive only: three new tables, no row read or changed. Each table and its triggers are skipped when a Store on the
+Additive only: four new tables, no row read or changed. Each table and its triggers are skipped when a Store on the
 same code built them first (create_all).
 
 Revision ID: 0019
@@ -40,6 +42,16 @@ TRIGGERS = {
         'sqlite': (
             "CREATE TRIGGER instruments_no_delete BEFORE DELETE ON instruments BEGIN SELECT RAISE(ABORT, 'instruments are write-once: a row cannot be deleted'); END",
             "CREATE TRIGGER instruments_no_edit BEFORE UPDATE ON instruments WHEN NEW.id IS NOT OLD.id OR NEW.venue IS NOT OLD.venue OR NEW.symbol IS NOT OLD.symbol OR NEW.underlying IS NOT OLD.underlying OR NEW.quote IS NOT OLD.quote OR NEW.contract_type IS NOT OLD.contract_type OR NEW.listed_at IS NOT OLD.listed_at OR NEW.source IS NOT OLD.source OR (OLD.delisted_at IS NOT NULL AND NEW.delisted_at IS NOT OLD.delisted_at) BEGIN SELECT RAISE(ABORT, 'instruments are write-once: a row cannot be edited'); END",
+        ),
+    },
+    'daily_bars': {
+        'postgresql': (
+            "CREATE OR REPLACE FUNCTION daily_bars_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'daily bars are write-once: row ' || OLD.id || ' cannot be deleted'; END IF; IF (NEW.id, NEW.venue, NEW.symbol, NEW.day, NEW.close, NEW.notional, NEW.source, NEW.fetched_at) IS DISTINCT FROM (OLD.id, OLD.venue, OLD.symbol, OLD.day, OLD.close, OLD.notional, OLD.source, OLD.fetched_at) THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'daily bars are write-once: row ' || OLD.id || ' cannot be edited'; END IF; RETURN NEW; END $$",
+            'CREATE TRIGGER daily_bars_write_once BEFORE UPDATE OR DELETE ON daily_bars FOR EACH ROW EXECUTE FUNCTION daily_bars_write_once()',
+        ),
+        'sqlite': (
+            "CREATE TRIGGER daily_bars_no_delete BEFORE DELETE ON daily_bars BEGIN SELECT RAISE(ABORT, 'daily bars are write-once: a row cannot be deleted'); END",
+            "CREATE TRIGGER daily_bars_no_edit BEFORE UPDATE ON daily_bars WHEN NEW.id IS NOT OLD.id OR NEW.venue IS NOT OLD.venue OR NEW.symbol IS NOT OLD.symbol OR NEW.day IS NOT OLD.day OR NEW.close IS NOT OLD.close OR NEW.notional IS NOT OLD.notional OR NEW.source IS NOT OLD.source OR NEW.fetched_at IS NOT OLD.fetched_at BEGIN SELECT RAISE(ABORT, 'daily bars are write-once: a row cannot be edited'); END",
         ),
     },
     'universe_snapshots': {
@@ -84,6 +96,23 @@ def _tables():
             sa.CheckConstraint("source IN ('api', 'archive')", name='instruments_source'),
             sa.CheckConstraint('delisted_at IS NULL OR delisted_at >= listed_at',
                                name='instruments_delisted_after_listed'),
+        ],
+        'daily_bars': [
+            sa.Column('id', sa.Integer(), nullable=False),
+            sa.Column('venue', sa.String(length=32), nullable=False),
+            sa.Column('symbol', sa.String(length=32), nullable=False),
+            sa.Column('day', sa.Date(), nullable=False),
+            sa.Column('close', EXACT, nullable=False),
+            sa.Column('notional', EXACT, nullable=False),
+            sa.Column('source', sa.String(length=8), nullable=False),
+            sa.Column('fetched_at', TS, nullable=False),
+            sa.PrimaryKeyConstraint('id'),
+            sa.UniqueConstraint('venue', 'symbol', 'day', name='daily_bars_once'),
+            sa.ForeignKeyConstraint(['venue', 'symbol'], ['instruments.venue', 'instruments.symbol'],
+                                    name='daily_bars_instrument'),
+            sa.CheckConstraint('close > 0', name='daily_bars_close'),
+            sa.CheckConstraint('notional >= 0', name='daily_bars_notional'),
+            sa.CheckConstraint("source IN ('api', 'archive')", name='daily_bars_source'),
         ],
         'universe_snapshots': [
             sa.Column('id', sa.Integer(), nullable=False),
