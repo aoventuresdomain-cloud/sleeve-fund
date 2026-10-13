@@ -27,7 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import liquidation, markets, open_risk
+from sleeve_fund import lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
@@ -960,6 +960,21 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
+
+    @app.post("/sleeves/{name}/lifecycle")
+    def sleeve_lifecycle(name: str, action: str = Form(...), reason: str = Form(""),
+                         actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """P2-6: the PM's lifecycle move (wind_down, retire, close_now), and the one caller of Store.set_lifecycle.
+        The buttons come with the phase 2 UI; the rules are sleeve_fund.lifecycle's."""
+        try:
+            if not reason.strip():
+                raise ValueError("a reason is required")
+            st().set_lifecycle(name, action, lifecycle.PM if actor == "PM" else actor, reason)
+        except KeyError:
+            raise HTTPException(404, "no such strategy") from None
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(400, getattr(exc, "reason", None) or str(exc)) from None
+        return RedirectResponse(f"/sleeves/{name}", status_code=303)
 
     def research_page(request: Request, job=None, error: str = "", pre: dict | None = None,
                       notice: str = "", tab: str | None = None):

@@ -31,11 +31,12 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, Mo
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets, open_risk, risk
+from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
+from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
 from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
@@ -638,6 +639,8 @@ class LongFlatStrategy(Strategy):
         # how many of its entries the limit would have refused, and the largest share of equity one of them put at
         # risk; a backtest doesn't gate on it.
         self._daily_atr: dict[int, float] = {}
+        # P2-6: the decision bars' (high, low, close), for the wind-down stop's Wilder ATR(14) (lifecycle.wind_down_stop)
+        self._wind_bars: deque = deque(maxlen=open_risk.ATR_WINDOW)
         self.open_risk_binds = 0
         self.open_risk_max = 0.0
         # After a restart, a position whose stop couldn't be restored, or one started for its exits only, works to a
@@ -1055,7 +1058,7 @@ class LongFlatStrategy(Strategy):
             self._publish_signals()
             return
         try:
-            if self._check_exits(self._last_close):
+            if self._check_exits(self._last_close) or self._check_wind_stop(self._last_close):
                 return
         finally:
             if self._pending_exit is None:
@@ -2516,6 +2519,8 @@ class LongFlatStrategy(Strategy):
                 self._funding_skip = None
         if self._exec_type is None:
             self._rest_risk_stop()
+        if self._wind_down_bar(bar):
+            return
         if self._pending_exit is not None:
             return
         if self._replan_pending is not None and self._entry_px is not None:
@@ -2771,6 +2776,80 @@ class LongFlatStrategy(Strategy):
         self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None  # don't fire again while the sell is in flight
         self._exit_at_market(hit, reason, values, price)
+        return True
+
+    # --- P2-6 lifecycle: winding down ------------------------------------------------
+
+    def _wind_down_bar(self, bar: Bar) -> bool:
+        """Paper, at each decision bar's close while the PM winds the strategy down (sleeve_fund.lifecycle): place
+        its one wind-down stop if it holds and has none, then lifecycle_due: the 75% notice, retire once flat, or
+        the deadline's flatten through the exit path, sent again each bar until flat. True if an exit was sent."""
+        self._wind_bars.append((bar.high.as_double(), bar.low.as_double(), bar.close.as_double()))
+        rt = self.runtime
+        if rt is None or rt.backtest or rt.lifecycle != lifecycle.WINDING_DOWN:
+            return False
+        now = rt.now()
+        side = self._pos_side()
+        if side and rt.wind_stop is None and self._restore is None and rt.wind_deadline > now:
+            self._place_wind_stop(side, self._last_close)
+        busy = self._pending_exit is not None or bool(self._working())
+        why = rt.lifecycle_due(now, flat=side == 0, busy=busy)
+        if why is None:
+            return False
+        self._sell_all(*why, {"deadline": rt.wind_deadline.isoformat()})
+        return True
+
+    def _wind_atr(self, price: float) -> tuple[float, float | None, str]:
+        """The ATR the wind-down stop is set from, as (ATR in price, the strategy's own stop_atr or None, its
+        words): the strategy's own ATR with its own stop_atr, else Wilder ATR(14) on the decision bars, else (under
+        14 bars since a restart) the daily Wilder ATR(14). Advisor 6 Oct 14:55; which ATR goes with stop_atr is
+        asked of the Advisor (p2-6-wiring.md, Q3)."""
+        c = self._cfg
+        if c.stop_atr and self._atr is not None and self._atr.initialized and self._atr.value > 0:
+            return self._atr.value, c.stop_atr, f"its own {c.atr_bars}-bar average true range"
+        if len(self._wind_bars) >= open_risk.ATR_DAYS:
+            from sleeve_fund.strategies.indicators.averages import Atr
+
+            atr = Atr(open_risk.ATR_DAYS)
+            for h, lo, cl in self._wind_bars:
+                atr.update_raw(h, lo, cl)
+            return atr._outputs()["value"], None, "Wilder ATR(14) on the decision candles"
+        from sleeve_fund.venues import venue as venue_profile
+
+        s = self.runtime.store.sleeve(self.runtime.name)
+        share = open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, self.runtime.now())
+        if not share:
+            raise ValueError("no ATR for the wind-down stop: too few candles and no daily history")
+        return share * price, None, "the daily Wilder ATR(14)"
+
+    def _place_wind_stop(self, side: int, price: float) -> None:
+        """The one wind-down stop, journaled by the runtime (place_wind_stop) and read back after a restart."""
+        rt = self.runtime
+        try:
+            atr, own, _ = self._wind_atr(price)
+            liq = None
+            if self._margin:
+                _, cash, qty, _ = self._mark()
+                liq = self._liq(cash, qty) if qty else None
+            rt.place_wind_stop(side, price, atr, stop_atr=own, liquidation=liq)
+        except ValueError as e:
+            rt.store.event(rt.name, "error", "wind_down_stop_missing",
+                           f"Winding down with no wind-down stop: {e}. Its own exits and the deadline still close it.",
+                           ts=rt.now())
+            rt.wind_stop = (side, 0.0 if side > 0 else math.inf)  # tried once: never placed again this wind-down
+
+    def _check_wind_stop(self, price: float) -> bool:
+        """Paper, every trade: the wind-down stop, judged as the strategy's own stop is. True if an exit was sent."""
+        rt = self.runtime
+        if rt is None or rt.backtest or self._pending_exit is not None or self._busy() or not self._pos_side():
+            return False
+        if not rt.wind_stop_hit(price):
+            return False
+        side, level = rt.wind_stop
+        reason = f"Wind-down stop: price {price:,.6g} went past the {level:,.6g} stop placed when the wind-down began"
+        rt.store.event(rt.name, "info", "wind_down_stop_hit", f"exit at {price:,.4f}; {reason}", ts=rt.now())
+        self._lock_exit_leg(side if self._margin else True)
+        self._exit_at_market(WIND_STOP_INTENT, reason, {"wind_down_stop": level}, price)
         return True
 
     def _exit_at_market(self, intent: str, reason: str, values: dict, price: float) -> None:

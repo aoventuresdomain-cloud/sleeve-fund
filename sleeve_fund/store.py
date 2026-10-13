@@ -47,6 +47,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
 
@@ -62,6 +63,8 @@ COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
+LIFECYCLE_ACTIONS = ("wind_down", "retire", "close_now")  # the PM's lifecycle moves (Store.set_lifecycle)
+LIFECYCLE_EVENT = "lifecycle"  # one event per lifecycle move, with what moved and why
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -87,6 +90,14 @@ sleeves_t = Table(
     Column("heartbeat_at", TS),
     Column("created_at", TS, nullable=False),
     Column("updated_at", TS, nullable=False),
+    # P2-6: the PM's lifecycle, kept apart from running/stopped/paused (DA). The row holds the current state only;
+    # each move is journaled in events and decisions (Store.set_lifecycle, the one writer).
+    Column("lifecycle", String(16), nullable=False, default="active", server_default="active"),
+    Column("wind_down_started", TS),
+    Column("wind_down_deadline", TS),
+    CheckConstraint("lifecycle IN ('active', 'winding_down', 'retired')", name="sleeves_lifecycle"),
+    CheckConstraint("lifecycle <> 'winding_down' OR (wind_down_started IS NOT NULL AND wind_down_deadline IS NOT NULL "
+                    "AND wind_down_deadline >= wind_down_started)", name="sleeves_wind_down"),
 )
 
 equity_t = Table(
@@ -697,7 +708,7 @@ ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "cancel
 FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
-           "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
+           "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
 
 
 def _check_rebook(order_id: str, row) -> None:
@@ -824,12 +835,16 @@ class Sleeve:
     heartbeat_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    lifecycle: str = "active"  # P2-6: active, winding_down or retired (sleeve_fund.lifecycle)
+    wind_down_started: datetime | None = None
+    wind_down_deadline: datetime | None = None
     venue: str | None = None  # None: the default venue (sleeve_fund.venues.DEFAULT_VENUE)
 
     @classmethod
     def from_row(cls, row, venue: str | None = None) -> "Sleeve":
         d = dict(row._mapping)
-        for k in ("paused_until", "heartbeat_at", "created_at", "updated_at"):
+        for k in ("paused_until", "heartbeat_at", "created_at", "updated_at", "wind_down_started",
+                  "wind_down_deadline"):
             d[k] = _aware(d[k])
         d["params"] = dict(d["params"] or {})
         # A configured balance, read by the engine's float figures: the journal (journal_book) takes it exactly.
@@ -1371,9 +1386,90 @@ class Store:
             c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
 
     def unarchive(self, sleeve: str) -> None:
-        self.sleeve(sleeve)
+        if self.sleeve(sleeve).lifecycle == lifecycle.RETIRED:
+            raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
         with self.engine.begin() as c:
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+
+    # --- lifecycle (P2-6) ------------------------------------------------------------
+
+    def held_qty(self, sleeve: str) -> Decimal:
+        """The position the journal's fills add up to (the figure the flatten and archive checks read)."""
+        return Decimal(self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)["qty"])
+
+    def lifecycle_holds(self, sleeve: str) -> tuple[list[timedelta], list[timedelta], str]:
+        """The holding times a wind-down's deadline is set from, as (backtest, paper, where from). Paper: the
+        strategy's own closed round trips in the journal. Backtest: none yet, as no saved backtest is linked to the
+        strategy it came from, so lifecycle.window falls back to the longest hold (fewer than 20 backtest trades)."""
+        from sleeve_fund import markets
+        from sleeve_fund.research.metrics import trades
+
+        rows = list(reversed(self.fills(sleeve, limit=10_000_000)))
+        paper = [t["closed"] - t["opened"] for t in trades(rows, shorts=markets.is_perp(self.sleeve(sleeve).params))
+                 if t["opened"] and t["closed"]]
+        return [], paper, f"no linked backtest; {len(paper)} closed paper trade{'' if len(paper) == 1 else 's'}"
+
+    def set_lifecycle(self, sleeve: str, action: str, actor: str, reason: str, now: datetime | None = None) -> Sleeve:
+        """The PM's lifecycle move, and the one writer of it (the dashboard's lifecycle route is its one caller).
+        action: wind_down, retire or close_now; the rules are lifecycle.move and lifecycle.close_now, which refuse
+        anyone but the PM. Writes the row, a decision and a lifecycle event in one transaction; a strategy retired
+        here is also stopped and archived, so every reader of the archive sees it put away."""
+        if action not in LIFECYCLE_ACTIONS:
+            raise ValueError(f"bad lifecycle action {action!r}")
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest has no lifecycle")
+        now = now or utcnow()
+        s = self.sleeve(sleeve)
+        held = self.held_qty(sleeve)
+        flat = abs(held) <= Decimal("1e-12")
+        started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
+        if action == "wind_down":
+            to = lifecycle.move(s.lifecycle, lifecycle.WINDING_DOWN, actor, flat=flat)
+            backtest, paper, basis = self.lifecycle_holds(sleeve)
+            started, deadline_at = now, lifecycle.deadline(now, backtest, paper)
+            basis = f" Window {lifecycle.span(lifecycle.window(backtest, paper))}, from the holds: {basis}."
+        elif action == "retire":
+            to = lifecycle.move(s.lifecycle, lifecycle.RETIRED, actor, flat=flat)
+        else:
+            m = lifecycle.close_now(s.lifecycle, actor, now, flat=flat)
+            to = m.lifecycle
+            if to == lifecycle.WINDING_DOWN:
+                started, deadline_at = started or now, now
+        text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
+        with self.engine.begin() as c:
+            values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
+                      "updated_at": now}
+            if to == lifecycle.RETIRED:
+                values["desired_state"] = "stopped"
+                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(**values))
+            c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=sleeve,
+                                                 reason=reason.strip()))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
+        return self.sleeve(sleeve)
+
+    def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
+        """Retire a winding-down strategy once the journal shows it flat: the end of the PM's own wind-down, never a
+        new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
+        deadline or close_now, for the journal's words."""
+        now = now or utcnow()
+        s = self.sleeve(sleeve)
+        if s.lifecycle != lifecycle.WINDING_DOWN or abs(self.held_qty(sleeve)) > Decimal("1e-12"):
+            return False
+        text = lifecycle.retired_words(how)
+        with self.engine.begin() as c:
+            done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
+                                                     sleeves_t.c.lifecycle == lifecycle.WINDING_DOWN)
+                             .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now)).rowcount
+            if not done:  # another process retired it first
+                return False
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=sleeve,
+                                                 reason=text))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
+        return True
 
     def report_keys(self, present: dict[str, bool]) -> None:
         """Supervisor only: whether each live account's key is on the server. Never the key itself."""

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sleeve_fund import accounts, liquidation
+from sleeve_fund import accounts, lifecycle, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.paper.safety import credential_var
@@ -66,7 +66,7 @@ class Proc:
 def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> str:
     """One of: start, stop, restart_stale, crashed, wait, none. A stopped strategy that still `holds` a position is
     wanted running too, for its exits only (P1-U35)."""
-    want = sleeve.desired_state == "running" or holds
+    want = (sleeve.desired_state == "running" or holds) and sleeve.lifecycle != lifecycle.RETIRED  # P2-6: never again
     if want and not proc.alive:
         if proc.popen is not None:
             return "crashed"
