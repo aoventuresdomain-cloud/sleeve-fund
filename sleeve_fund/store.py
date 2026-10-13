@@ -68,9 +68,6 @@ RELOAD = "reload"
 # 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
 # venue has answered.
 CANCEL = "cancel"
-# How long a cancel answered "not found" waits with no fill in the journal before its reservation is released (PE2
-# 13 Oct; the Advisor to confirm): a fill the venue sends late still lands inside it.
-CANCEL_CONFIRM = timedelta(seconds=60)
 # Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0015).
 COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
@@ -245,7 +242,8 @@ commands_t = Table(
     CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
     CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
     # When the venue first answered a cancel "not found" with no fill in the journal: no proof of a cancel (Advisor 8 Oct
-    # 06:20 UK), so nothing is released until CANCEL_CONFIRM has passed with still no fill (Store.confirm_cancels).
+    # 06:20 UK, 13 Oct 17:00 UK), so nothing is released and the Strategy's entries stay blocked until the venue confirms
+    # the order's end state (apply_cancel "cancelled" with zero fills, or "filled").
     Column("not_found_at", TS),
     CheckConstraint(f"not_found_at IS NULL OR command = '{CANCEL}'", name="commands_not_found_cancel"),
     # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
@@ -2551,15 +2549,17 @@ class Store:
         - an order with a fill: nothing is written and "filled" is returned. The caller books the venue's fills (each
           reduces the reservation as any fill does), closes the orphan (og5) and then answers "filled";
         - an order with none: only the first such answer's time is kept (not_found_at) and "unconfirmed" is returned.
-          Nothing is released: a fill landing meanwhile reduces the reservation as any fill does, and
-          confirm_cancels releases the rest once CANCEL_CONFIRM has passed with still no fill.
+          Nothing is released, however long our journal stays silent (Advisor 13 Oct 17:00 UK): the cancel stays
+          open, which blocks the Strategy's entries (open_cancels), until the venue's own order query and fill history
+          settle it as "cancelled" (a terminal state with zero fills) or "filled".
         "filled", once the journal holds the order's fills: the command is applied and nothing more released (the
         fills used what they used); refused with no fill in the journal.
-        "cancelled": the order's open reservation (what no fill used) is released as 'cancel', the order marked
-        canceled and the command applied: "applied", or "partly_filled" for an order with fills, whose filled part
-        the caller closes (og5).
+        "cancelled": the venue confirmed the order ended (cancelled, or terminal with zero fills after a "not found").
+        The order's open reservation (what no fill used) is released as 'cancel', the order marked canceled and the
+        command applied: "applied", or "partly_filled" for an order with fills, whose filled part the caller closes
+        (og5).
         "already" when another got there first, and then nothing at all is written. `at`: when the answer came, on
-        the clock confirm_cancels is given (the supervisor's), else now."""
+        the supervisor's clock, else now."""
         if outcome not in ("cancelled", "not_found", "filled"):
             raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
         now = at or utcnow()
@@ -2587,25 +2587,6 @@ class Store:
             if not self._close_cancel(c, cmd, "canceled", f"cancelled by the supervisor: {cmd.reason}", now):
                 return "already"
         return "partly_filled" if filled else "applied"
-
-    def confirm_cancels(self, now: datetime | None = None, quiet: timedelta | None = None) -> list[int]:
-        """Cancels the venue answered "not found" at least `quiet` (CANCEL_CONFIRM) ago, with still no fill in the
-        journal: each released as 'cancel', its order expired (we never claim a cancel we didn't see) and applied, in
-        one transaction per cancel. Returns their ids. The supervisor calls it."""
-        now, quiet = now or utcnow(), CANCEL_CONFIRM if quiet is None else quiet
-        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None),
-                                     commands_t.c.not_found_at <= now - quiet).order_by(commands_t.c.id)
-        with self.engine.connect() as c:
-            due = c.execute(q).all()
-        done = []
-        for cmd in due:
-            with self.engine.begin() as c:
-                if self._order_filled(c, cmd):
-                    continue  # a fill landed: the caller closes it as "filled"
-                if self._close_cancel(c, cmd, "expired", f"not found at the venue and never filled: {cmd.reason}",
-                                      now):
-                    done.append(cmd.id)
-        return done
 
     @staticmethod
     def _order_filled(c, cmd) -> bool:

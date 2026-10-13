@@ -3,7 +3,8 @@
 commands: order_id, the resting order a cancel names (FK orders.order_id); a CHECK that a cancel always names one and
 nothing else does (NULL never means "every order"); a partial unique index, one open cancel per order, so a retry, a
 second sweep or a restart never sends two; not_found_at, when the venue first answered a cancel "not found" with no
-fill (no proof of a cancel: its reservation waits for CANCEL_CONFIRM, PE2 13 Oct), with a CHECK that only a cancel has
+fill (no proof of a cancel: nothing is released until the venue confirms the order's end state, Advisor 13 Oct 17:00
+UK), with a CHECK that only a cancel has
 one; and a CHECK on the kinds a row may hold (store.COMMAND_KINDS), which until
 now only Python checked. gate_decisions: an index on order_id, which every fill and status change of a gated order and
 every cancel reads (PE2 and QA Tester 2, 13 Oct).
