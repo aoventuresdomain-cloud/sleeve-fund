@@ -1573,7 +1573,13 @@ class LongFlatStrategy(Strategy):
         return self
 
     def _set_plan(self, stop: float | None, tp: float | None, basis: str, kind: str, event_id: int) -> None:
-        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so."""
+        """Put a plan set after entry in force, journal it with the trade's R from now on, and say so. On margin the stop
+        is held inside the half-liquidation cap (STOP-LOOSEN-1): an edit that loosens it, or a stop set again from the
+        market, is clamped like any other."""
+        asked = stop
+        stop, liq = self._capped_stop(asked)
+        if liq is not None:
+            self._stop_clamped(asked, stop, liq)
         self._stop_frac, self._tp_frac, self._stop_basis = stop, tp, basis
         if self.runtime is None or self._plan_entry is None:
             return

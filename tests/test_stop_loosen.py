@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import test_hub_146_qa as qa
-from test_hub_146_qa import _probe  # noqa: F401 - the autouse fixture that registers the probe strategy
+from test_hub_146_qa import (
+    _probe,  # noqa: F401 - the autouse fixture that registers the probe strategy
+)
 
 from sleeve_fund import markets
 from sleeve_fund.research.runner import run_backtest
@@ -134,6 +136,28 @@ def test_funding_paid_moves_the_liquidation_price_and_a_fixed_stop_is_pulled_in(
     assert moved > liq + 1.0  # the price it was held against is the moved one, not the entry's
     assert held[-1] == pytest.approx(entry - 0.5 * (entry - moved), rel=1e-5)
     assert res.stops_clamped == 1
+
+
+def test_once_funding_carries_the_liquidation_price_past_the_entry_half_way_is_measured_from_the_close(
+        instrument, monkeypatch):
+    """QD: the one branch where the cap reads the market. A 3x long from 150 that has run to 220 pays 25% funding at
+    08:00, which lifts its liquidation price past the entry (to about 156): half way from the entry would sit below
+    the liquidation price, so the stop is held half way from the close instead, in profit."""
+    monkeypatch.setattr(markets, "LOW_FEE_PERP", dataclasses.replace(markets.LOW_FEE_PERP, funding_rate=0.25))
+    seen = _spy_stops(monkeypatch)
+    legs = {"long": {"entry": {"left": "close", "op": ">", "right": 140}}}
+    defn = _defn(legs, {"dc": {"kind": "donchian", "period": 3}}, {"stop": {"level": "dc.lower"}})
+    closes = [200, 125.5, 150, 150, 180, 220, 220, 220, 220]  # hourly, from 03:00 UTC: held across 08:00
+    res = run_backtest("rules", _bars(closes, "2025-10-03 03:00", 60), instrument,
+                       params={**to_params(defn), **PERP}, bar_minutes=60, half_spread=0, risk_profile="aggressive")
+    assert not res.handler_errors, res.handler_errors
+    entry = _entry(res)
+    (alert,) = _events(res, "stop_clamped_liquidation")
+    moved = float(alert["message"].split("liquidation price ")[1].split(" ")[0].replace(",", ""))
+    assert moved > entry  # past the entry: half way from it would be beyond the liquidation price
+    held = _held(seen, entry)
+    assert held[-1] == pytest.approx(220 - 0.5 * (220 - moved), rel=1e-5) and held[-1] > entry
+    assert not [o for o in res.fills.index if res.decisions[o]["intent"] in ("liquidation", "risk_halt")]
 
 
 @pytest.mark.parametrize("paid", [0.0, -500.0], ids=["no-funding", "funding-paid"])
