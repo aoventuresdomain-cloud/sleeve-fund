@@ -147,14 +147,14 @@ def test_a7_removing_the_stop_runs_stopless_at_1x_beside_the_base_at_1x():
 
     report = ablate(RICH, score)
     stop = next(r for r in report.rows if r.path == "exits.stop")
-    assert stop.one_x and "stopless, at 1x" in stop.note
+    assert stop.one_x and "stopless, at 1x, no halts" in stop.note
     assert report.base_1x is not None and report.base_1x.one_x and (report.parent_hash, True) in calls
     assert stop.delta["net_return"] == pytest.approx(stop.score.net_return - report.base_1x.score.net_return)
     others = [r for r in report.rows if r.status == "ran" and r.path != "exits.stop"]
     assert not any(r.one_x for r in others)  # each still rests the stop, so sized as the base is
     assert all(r.delta["sharpe"] == pytest.approx(r.score.sharpe - report.base.score.sharpe) for r in others)
     text = "\n".join(section(report))
-    assert "| base at 1x |" in text and "stopless, at 1x; compared with the base at 1x" in text
+    assert "| base at 1x, no halts |" in text and "stopless, at 1x, no halts; compared with the base at 1x, no halts" in text
 
 
 def test_a7_no_stop_removed_means_no_base_at_1x():
@@ -210,7 +210,7 @@ def test_on_real_backtests_the_report_runs_and_is_repeatable(prices, instrument)
     one, two = ablate(defn, evaluate), ablate(defn, evaluate)
     assert section(one) == section(two)
     assert one.base.score.trades > 0 and 0 < one.base.score.time_in_market < 1
-    assert one.base.score.data_start == pd.Timestamp(days[400]).to_pydatetime()
+    assert one.base.score.data_start == pd.Timestamp(days[0]).to_pydatetime()  # the first bar read, warm-up included
     assert [r.path for r in one.rows if r.status == "ran"] == ["long.entry[0]", "long.entry[1]", "long.exit", "exits.stop"]
     assert one.base_1x is not None
 
@@ -219,6 +219,40 @@ REAL = {"version": 1, "reason": REASON, "blocks": {"rsi": {"kind": "rsi"}, "dc":
         "long": {"entry": {"all": [{"left": "rsi", "op": "<", "right": 45}, {"left": "close", "op": ">", "right": 0}]},
                  "exit": {"left": "rsi", "op": ">=", "right": 55}},
         "exits": {"stop": {"level": "dc.lower"}}}
+
+
+def test_the_1x_pair_keeps_the_profiles_caps_and_drops_only_its_halts(prices, instrument, monkeypatch):
+    """F235-1 (HoE and Advisor, 13 Oct): one_x runs under the same profile at 1x with no halts. A profile tight enough
+    to halt the normal base still caps the 1x run's position, and that run never halts or pauses."""
+    from sleeve_fund import risk
+    from sleeve_fund.research import runner
+
+    monkeypatch.setitem(risk.PROFILES, "tight", risk.RiskProfile("tight", max_drawdown=0.01, daily_loss=0.005,
+                                                                 max_position_pct=0.33, max_open_positions=3,
+                                                                 max_leverage=2.0))
+    seen, real_run = [], runner.run_backtest
+
+    def spy(*a, **k):
+        res = real_run(*a, **k)
+        seen.append(res)
+        return res
+
+    monkeypatch.setattr(runner, "run_backtest", spy)
+    days = prices.index
+    stopless = {k: v for k, v in REAL.items() if k != "exits"}
+
+    def run(one_x, profile):
+        seen.clear()
+        ablation.backtest_evaluator(prices, instrument, [(days[400], days[799])], bar_minutes=1440, half_spread=0,
+                                    holdout_start=days[800], risk_profile=profile)(stopless, one_x)
+        return seen[0]
+
+    halts = ("risk_halt", "risk_pause")
+    assert any(e["kind"] in halts for e in run(False, "tight").risk_events)  # the normal base halts
+    one_x = run(True, "tight")
+    assert not any(e["kind"] in halts for e in one_x.risk_events)
+    assert 0 < one_x.exposure.max() < 0.4  # sized at the 33% cap (the marks drift with the price after entry)
+    assert run(True, None).exposure.max() > 0.5  # without a profile it would not
 
 
 def test_an_ablation_window_reaching_the_holdout_is_refused(prices, instrument):

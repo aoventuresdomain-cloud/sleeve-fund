@@ -16,7 +16,9 @@ never enters: reported, not run, no trials row.
 
 A variant with no level exit left (stop, trail or exit_at_level, which rest at the venue in a backtest) is stopless,
 so it runs at 1x, and the base also runs at 1x beside it so the difference reflects the exit, not the leverage
-(Advisor 18:20 Q3, 13 Oct Q2).
+(Advisor 18:20 Q3, 13 Oct Q2). That pair runs with no halts: the profile's position cap and liquidation guards act,
+its drawdown halt and daily-loss pause don't, so no change is ever taken between a halted run and one that can't
+halt (HoE and Advisor, 13 Oct).
 
 Each variant that runs is one trials row, kind 'ablation', under the parent's idea and family, its own definition
 hash, and the parent's hash and the removed path in its settings. Ablation rows are not in N, the 20-per-idea budget
@@ -26,6 +28,7 @@ built here can be promoted (R6)."""
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 from collections.abc import Callable
@@ -68,7 +71,7 @@ class Row:
     words: str
     status: str  # "ran", "not ablatable", "no trades"
     note: str = ""
-    one_x: bool = False  # run stopless at 1x, compared with the base at 1x
+    one_x: bool = False  # run stopless at 1x with no halts, compared with the base run the same way
     definition_hash: str = ""
     score: Score | None = None
     delta: dict = field(default_factory=dict)
@@ -262,7 +265,7 @@ def ablate(defn: dict, evaluate: Evaluate, *, register=None, dataset: str = "", 
     base = Row("", "base (every block on)", "ran", definition_hash=parent, score=evaluate(defn, False))
     base_1x = None
     if any(status == "ran" and stopless(v) for _, status, v, _ in plan):
-        base_1x = Row("", "base at 1x", "ran", note="beside the stopless variants", one_x=True,
+        base_1x = Row("", "base at 1x, no halts", "ran", note="beside the stopless variants", one_x=True,
                       definition_hash=parent, score=evaluate(defn, True))
     rows = []
     for path, status, variant, note in plan:
@@ -273,7 +276,7 @@ def ablate(defn: dict, evaluate: Evaluate, *, register=None, dataset: str = "", 
             row.score = evaluate(variant, row.one_x)
             row.delta = _delta(row.score, (base_1x if row.one_x else base).score)
             if row.one_x:
-                row.note = "stopless, at 1x; compared with the base at 1x"
+                row.note = "stopless, at 1x, no halts; compared with the base at 1x, no halts"
         rows.append(row)
     report = AblationReport(name, parent, base, base_1x, rows)
     if register is not None:
@@ -327,7 +330,7 @@ def _cells(s: Score | None, d: dict | None) -> list[str]:
 
 def section(report: AblationReport) -> list[str]:
     """The tear sheet's ablation section, as markdown lines. Each figure carries its change against the base (or
-    the base at 1x) in brackets. Nothing in it is a verdict."""
+    the base at 1x, no halts) in brackets. Nothing in it is a verdict."""
     out = ["## Ablation (not judged)", "",
            ("Each block switched off in turn, settings otherwise unchanged, out of sample. This shows what each "
             "piece contributes; it is not a test, and no variant here can be promoted."), ""]
@@ -357,8 +360,10 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
                        idea_hash: str | None = None) -> Evaluate:
     """evaluate(definition, one_x) over the out-of-sample windows [(start, end), ...]: each window runs on the bars
     up to its end, trading from its start (so the blocks warm up on the bars before it), as a study's test windows
-    do. one_x runs with no risk profile, where the engine's leverage is 1x, for the stopless variants and the base
-    beside them.
+    do. one_x, for the stopless variants and the base beside them, runs at 1x with no halts: under the same risk
+    profile with its leverage capped at 1x, so the position cap and the liquidation guards still act, and its drawdown
+    halt and daily-loss pause off (HoE and Advisor, 13 Oct), so the pair are compared like with like and never with a
+    halted run.
 
     An ablation never reads the held-back period, so it can't spend or stale the holdout the edge test is judged on
     (CR pre-review, HoE 13 Oct): holdout_start is where the study's holdout begins (None only when the data keeps
@@ -397,25 +402,52 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
         exec_prices = None if exec_prices is None else exec_prices[exec_prices.index < held]
 
     def evaluate(defn: dict, one_x: bool) -> Score:
-        rets, held, bars, n = [], 0, 0, 0
+        rets, in_market, bars, n, first = [], 0, 0, 0, None
         for start, end in windows:
             start, end = pd.Timestamp(start), pd.Timestamp(end)
             df = prices[prices.index <= end]
             fine = None if exec_prices is None else exec_prices[exec_prices.index <= end]
+            read = [f.index[0] for f in (df, fine) if f is not None and len(f)]
+            first = min([first, *read]) if first is not None else min(read, default=None)
             p = {**(params or {}), **to_params(defn, str(instrument.id.venue)), "trade_from": start.value}
+            if one_x and risk_profile is not None:
+                run = {"runtime": one_x_runtime(instrument, bar_minutes, starting_capital, risk_profile, p)}
+            else:
+                run = {"risk_profile": None if one_x else risk_profile}
             res = run_backtest("rules", df, instrument, p, starting_capital=starting_capital, bar_minutes=bar_minutes,
-                               risk_profile=None if one_x else risk_profile, exec_prices=fine,
-                               half_spread=half_spread)
+                               exec_prices=fine, half_spread=half_spread, **run)
             eq = res.equity[res.equity.index >= start]
             rets.append(daily_returns(eq))
             ex = res.exposure[res.exposure.index >= start]
-            held, bars = held + int((ex.abs() > 0).sum()), bars + len(ex)
+            in_market, bars = in_market + int((ex.abs() > 0).sum()), bars + len(ex)
             n += sum(1 for t in trades(fills_to_rows(res.fills), res.shorts) if pd.Timestamp(t["opened"]) >= start)
         r = pd.concat(rets).sort_index()
         s = summary(r) if len(r.dropna()) >= 2 else {"total_return": 0.0, "sharpe": None, "max_drawdown": 0.0}
         return Score(net_return=float((1 + r.fillna(0)).prod() - 1), sharpe=s["sharpe"],
-                     max_drawdown=float(s["max_drawdown"]), trades=n, time_in_market=held / bars if bars else 0.0,
-                     data_start=pd.Timestamp(windows[0][0]).to_pydatetime(),
+                     max_drawdown=float(s["max_drawdown"]), trades=n,
+                     time_in_market=in_market / bars if bars else 0.0,
+                     # the first bar read, warm-up included: what the run saw, not where it began trading (CR F235-3)
+                     data_start=pd.Timestamp(first if first is not None else windows[0][0]).to_pydatetime(),
                      data_end=pd.Timestamp(windows[-1][1]).to_pydatetime())
 
     return evaluate
+
+
+def one_x_runtime(instrument, bar_minutes: int, starting_capital: float, risk_profile: str, params: dict):
+    """The paper runtime for a 1x run with no halts (HoE and Advisor, 13 Oct): the profile with its leverage capped at
+    1x, so the position cap and the liquidation guards act as in every other row, and its drawdown halt and
+    daily-loss pause off, so a stopless variant and the base beside it are never compared with a halted run. The
+    runtime sets the cap from the profile, so position_cap_pct goes, as run_backtest does with a profile."""
+    from sleeve_fund import risk
+    from sleeve_fund.data import bar_type_for
+    from sleeve_fund.instruments import pair_of
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    params.pop("position_cap_pct", None)
+    spec = str(bar_type_for(instrument, bar_minutes)).split(f"{instrument.id}-", 1)[1]
+    rt = SleeveRuntime.for_backtest(strategy="rules", instrument=pair_of(instrument), bar_spec=spec,
+                                    starting_balance=starting_capital, risk_profile=risk_profile, params=params,
+                                    bar_seconds=bar_minutes * 60)
+    rt.profile = dataclasses.replace(rt.profile, max_leverage=1.0, max_drawdown=math.inf, daily_loss=math.inf)
+    rt.cap = risk.position_cap(rt.profile, params)
+    return rt
