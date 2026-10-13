@@ -33,6 +33,7 @@ from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
+from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
@@ -357,6 +358,11 @@ class Supervisor:
                 proc.crashes += 1
                 delay = min(MAX_BACKOFF, 10 * 2 ** (proc.crashes - 1))
                 proc.next_start = now + timedelta(seconds=delay)
+                if code == EXIT_DUPLICATE:
+                    # SINGLE-LOCK: another live process holds the strategy's lock, so the strategy is still running there;
+                    # not a crash of it. Its refusal is journalled (duplicate_refused); tried again after the backoff,
+                    # and it takes over once that process is gone.
+                    continue
                 if sleeve.status in ("paused", "halted"):
                     # A crash must not lift a pause or a halt: the status (and a pause's end time) stays, and
                     # the restarted process keeps it (review round 10, B10-3). The crash is in the events.
