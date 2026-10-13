@@ -374,6 +374,29 @@ def test_p26_1_a_wind_down_whose_flatten_leaves_dust_is_retired_once_and_worth_a
     assert store.complete_retire("s2", T0 + timedelta(days=4)) is False
 
 
+def test_f26_a_a_pm_move_never_writes_over_a_retire_the_runtime_completed_meanwhile(store, monkeypatch):
+    """CR F26-A: close now judged on winding down, while the runtime's complete_retire lands first: refused, and the
+    strategy stays retired and archived."""
+    _sleeve(store)
+    _hold(store)
+    store.set_lifecycle("s1", "wind_down", "pm", "r", now=T0)
+    _close(store, at=T0 + timedelta(hours=1))
+    read, raced = store.sleeve, []
+
+    def racing(name):  # the PM's read sees winding down; the runtime retires it before the write
+        row = read(name)
+        if row.lifecycle == "winding_down" and not raced:
+            raced.append(True)
+            assert store.complete_retire(name, T0 + timedelta(hours=2))
+        return row
+
+    monkeypatch.setattr(store, "sleeve", racing)
+    with pytest.raises(lifecycle.LifecycleError, match="changed meanwhile"):
+        store.set_lifecycle("s1", "close_now", "pm", "out", now=T0 + timedelta(hours=2))
+    monkeypatch.undo()
+    assert store.sleeve("s1").lifecycle == "retired" and "s1" in store.archived()
+
+
 def test_a_backtest_has_no_pm_so_its_lifecycle_never_acts():
     rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
                                     starting_balance=10_000, risk_profile="balanced")

@@ -1429,14 +1429,14 @@ class Store:
 
     def held_qty(self, sleeve: str) -> Decimal:
         """The position the journal's fills add up to (the figure the flatten and archive checks read)."""
-        return Decimal(self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)["qty"])
+        return to_decimal(self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)["qty"])
 
     def lifecycle_flat(self, sleeve: str) -> tuple[Decimal, bool]:
         """(the position the journal holds, whether the lifecycle counts it flat): none, or dust too small for any
         venue to take an order for (is_dust, as a reset judges it). The engine reads below its smallest order as flat,
         so a remainder no flatten can close must never keep a strategy from retiring (HoQA P26-1)."""
         book = self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)
-        return Decimal(book["qty"]), abs(book["qty"]) <= 1e-12 or is_dust(book)
+        return to_decimal(book["qty"]), abs(book["qty"]) <= 1e-12 or is_dust(book)
 
     def lifecycle_holds(self, sleeve: str) -> tuple[list[timedelta], list[timedelta], str]:
         """The holding times a wind-down's deadline is set from, as (backtest, paper, where from). Paper: the
@@ -1481,9 +1481,15 @@ class Store:
                       "updated_at": now}
             if to == lifecycle.RETIRED:
                 values["desired_state"] = "stopped"
+            # Only over the lifecycle this move was judged on: a retire the runtime completed meanwhile is never
+            # written back to winding down (CR F26-A); the PM sees the refusal and the row as it now stands.
+            done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
+                                                     sleeves_t.c.lifecycle == s.lifecycle).values(**values)).rowcount
+            if not done:
+                raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
+            if to == lifecycle.RETIRED:
                 c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
                 c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
-            c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(**values))
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
