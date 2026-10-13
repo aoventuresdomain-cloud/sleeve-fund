@@ -160,7 +160,23 @@ def supervisor_pass(store, now: datetime, send=None, close=None) -> list[str]:
                 send(oid)
             asked.append(oid)
     close_orphans(store, now, close)
+    settle_cancels(store, now)
     return asked
+
+
+def settle_cancels(store, now: datetime) -> None:
+    """Close what the venue's answers leave open (DA 0015): a "not found" with no fill in the quiet window after it is a
+    cancel (Store.confirm_cancels releases it as 'cancel'); a cancel whose order filled is applied once its fills are
+    booked and og5 has closed what filled after the owner went down ('filled': nothing more released)."""
+    if hasattr(store, "confirm_cancels"):
+        store.confirm_cancels(now)
+    filled = {o["order_id"] for o in store.orders(limit=100_000) if float(o.get("filled_qty") or 0) > 0}
+    for c in store.open_cancels():
+        if c["order_id"] in filled and c["order_id"] not in {r["order_id"] for r in gated_open(store, c["sleeve"])}:
+            try:
+                store.apply_cancel(c["id"], "filled")
+            except ValueError:  # 0015 without the "filled" outcome yet: the cancel stays open, its strategy blocked
+                pass
 
 
 def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=None) -> str | None:
@@ -170,7 +186,10 @@ def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=Non
     if not open_:  # its own process's cancel (the bar-close cancel): the order's end settles its reservation (W2)
         store.update_order(order_id, status="expired" if not_found else "canceled")
         return "applied"
-    return store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled")
+    got = store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled")
+    if got in ("filled", "partly_filled"):  # a fill, not a cancel: og5 closes what filled while its owner was down
+        close_orphans(store, utcnow_(), close)
+    return got
 
 
 def close_orphans(store, now: datetime, close=None) -> list[str]:
@@ -246,6 +265,12 @@ def _events_of(store, kind: str) -> list[dict]:
 
     with store.engine.connect() as c:
         return [dict(r._mapping) for r in c.execute(select(events_t).where(events_t.c.kind == kind))]
+
+
+def utcnow_() -> datetime:
+    from sleeve_fund.store import utcnow
+
+    return utcnow()
 
 
 def _aware(ts: datetime) -> datetime:
