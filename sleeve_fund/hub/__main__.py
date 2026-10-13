@@ -29,15 +29,25 @@ def instruments(profile, store=None) -> dict[str, str]:
     return {f"{profile.symbol_of(pair)}.{profile.name}": pair for pair, _ in _pairs_in_use(profile.name, store)}
 
 
-def last_closes(profile, pairs: dict[str, str], history=None) -> dict[str, int]:
+def last_closes(profile, pairs: dict[str, str], history=None, alert=None) -> dict[str, int]:
     """Per instrument, the close of the last minute the history store holds, so the hub refills what it missed
-    while it was down. Read only: the store's writer is the storage side's."""
+    while it was down. Read only: the store's writer is the storage side's. An instrument whose coverage can't be read
+    (a torn coverage.json after a crash) is left out and alerted, `alert(key, message)`: the hub starts anyway, and its
+    first live bar is relayed unseeded (F-HRF-1: no hub would cost every Strategy on the venue its data)."""
     from sleeve_fund.history import HistoryStore
 
     hs = history or HistoryStore()
     out = {}
     for iid, pair in pairs.items():
-        cov = hs.coverage(profile.name, pair)
+        try:
+            cov = hs.coverage(profile.name, pair)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store never stops the hub; the alert says which
+            message = (f"hub {profile.name} {pair}: can't read the stored history's coverage ({exc!r}); the hub "
+                       f"started without it, so minutes missed while it was down are not refilled at start")
+            print(message)
+            if alert is not None:
+                alert(f"hub-coverage-unreadable:{profile.name}:{pair}", message)
+            continue
         if cov is not None:  # the last stored minute may still have been forming: count from the one before
             out[iid] = int(pd.Timestamp(cov.last).value)
     return out
@@ -99,7 +109,9 @@ def build(profile, port: int, sink=None):
     if sink is None:
         sink = store_sink(store, profile.name, pairs)  # the same dict the relay keeps up to date
     relay.attach(fanout, sink=sink, pairs=pairs, recent=profile.ohlc_history,
-                 last_close=last_closes(profile, pairs, store), holes=start_holes(profile, pairs, store),
+                 last_close=last_closes(profile, pairs, store, alert=lambda key, message: _alert(
+                     key, "warning", "hub_history_unreadable", message)),
+                 holes=start_holes(profile, pairs, store),
                  alert=lambda key, message: _alert(key, "warning", "hub_refill_failed", message),
                  seed=seeder(profile, pairs, store),
                  discover=lambda: instruments(profile), late_path=store.root / f"hub-late-{profile.name}.json")

@@ -140,6 +140,20 @@ def test_start_holes_reads_the_last_day_only_and_a_store_it_cant_read_is_skipped
     assert "can't read the history's gaps" in capfd.readouterr().out
 
 
+def test_f_hrf_1_a_coverage_it_cant_read_never_stops_the_hubs_start_and_is_alerted(tmp_path, capfd):
+    """F-HRF-1 (QT2, HoQA MUST FIX): build reads last_closes before the relay starts, so a torn coverage.json must
+    leave that instrument out, alerted, never raise: no hub would cost every Strategy on the venue its data."""
+    store = HistoryStore(tmp_path)
+    _live(store, T0 - 30 * MINUTE_NS, T0 - MINUTE_NS)
+    assert last_closes(PROFILE, {BTC: P}, store) == {BTC: T0 - 2 * MINUTE_NS}  # the last stored minute is re-fetched
+    next(tmp_path.rglob("coverage.json")).write_text("{not json")
+    alerts = []
+    assert last_closes(PROFILE, {BTC: P}, store, alert=lambda key, message: alerts.append((key, message))) == {}
+    ((key, message),) = alerts
+    assert P in key and "can't read the stored history's coverage" in message
+    assert "can't read the stored history's coverage" in capfd.readouterr().out
+
+
 @pytest.mark.parametrize("pair", [None, P], ids=["no-pair", "no-venue-candles"])
 def test_a_refill_with_nothing_to_refill_from_says_so(pair):
     r = HubRelay(HubRelayConfig(instrument_ids=(BTC,)))
