@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 def sync_instruments(store, venue: str, listings: list[dict], now: datetime | None = None) -> dict:
-    """Book each listing (venues.binance_listings rows) into `instruments`: counts of "new", "same" and "delisted",
+    """Book each listing (the venue loader's listing rows) into `instruments`: counts of "new", "same" and "delisted",
     and "refused": the listings that differ from the contract held (a reused symbol, a listing day or delisting
     that moved), each with the store's reason. A refusal changes nothing and stops nothing else: the caller raises
     it as an alert."""
