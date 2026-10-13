@@ -214,9 +214,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         return sleeves, frames, summaries
 
     def shown_book():
-        """The book as the PM's figures show it (CCY-8DP-UI, HoE 13 Oct): strategies on a named test account are left
-        out of the totals and listed apart, as their results are never Strategy evidence. Display only: the engine's
-        and the supervisor's limits and halts count what they count. Returns book_data's three plus the test ones."""
+        """The book as the PM's equity and P&L show it (CCY-8DP-UI, HoE 13 Oct): strategies on a named test account are
+        left out of those totals and listed apart, as their results are never Strategy evidence. Display only, and
+        never risk: open risk, margin and the Risk page read every strategy, as the limits do, so the screen never
+        shows less risk than the engine enforces. Returns book_data's three plus the test ones."""
         sleeves, frames, summaries = book_data()
         tests = [x for x in summaries if x["test_account"]]
         out = {x["sleeve"].name for x in tests}
@@ -232,13 +233,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         sleeves, frames, summaries, tests = shown_book()
         put_away = st().archived()
         earlier = st().previous_book()
-        names = [s.name for s in sleeves]
+        names = [s.name for s in sleeves] + [x["sleeve"].name for x in tests]
         # The bottom tabs: the book's positions, working orders, latest fills and funding, from the same
         # journal the strategy pages read. Every strategy in the book counts, archived ones still holding too.
         working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
-        positions = trading.book_positions(st(), summaries)
+        positions = trading.book_positions(st(), summaries + tests)  # risk counts every strategy, as the gate does
         funding = trading.book_funding(st(), summaries)
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
@@ -254,7 +255,14 @@ def create_app(store: Store | None = None) -> FastAPI:
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
                     fill_count=sum(x["fills"] for x in summaries), tests=tests,
-                    test_positions=trading.book_positions(st(), tests) if tests else None)
+                    test_risk=_test_risk(positions, tests))
+
+    def _test_risk(positions: dict, tests: list[dict]) -> dict:
+        """Per test-account strategy, the open risk its position row counts in the tile (None: not measured), and
+        their total, for the tile's "incl. test accounts" line."""
+        names = {x["sleeve"].name for x in tests}
+        per = {r["sleeve"]: r["risk"]["amount"] for r in positions["rows"] if r["sleeve"] in names}
+        return {"per": per, "total": sum(v for v in per.values() if v is not None)}
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -290,10 +298,9 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/risk", response_class=HTMLResponse)
     def risk_page(request: Request, _: str = Depends(require_pm)):
-        _, _, everyone = book_data()
-        kill = _kill_targets(everyone)  # the kill switch acts on every strategy, test accounts included
-        sleeves, frames, summaries, tests = shown_book()
+        sleeves, frames, summaries = book_data()  # every strategy: risk is never filtered (CCY-8DP-UI)
         book = bookm.book_view(st(), summaries, frames)
+        kill = _kill_targets(summaries)
         risk = riskops.risk_view(st(), summaries, book)
         health = riskops.health_view(st(), summaries)
         running = sum(1 for x in summaries if x["sleeve"].status == "running")
@@ -304,7 +311,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
-                    ops=riskops.ops_view(st(), summaries), shell=shell(), kill=kill, tests=tests,
+                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:

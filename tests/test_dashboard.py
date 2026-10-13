@@ -7,6 +7,17 @@ from fastapi.testclient import TestClient
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import KRAKEN
 
+
+@pytest.fixture(autouse=True)
+def _strategy_accounts(monkeypatch):
+    """CCY-8DP-UI (HoE-approved set-up, 13 Oct): these fixtures' Strategies sit at the default venue on the paper
+    account, the named test account, so they are read as Strategy accounts here; tests/test_ccy_8dp_ui.py pins the
+    test-account views."""
+    from sleeve_fund.dashboard import book
+
+    monkeypatch.setattr(book, "is_test_account", lambda store, sleeve: False)
+
+
 AUTH = ("pm", "test-pw")
 SAME = {"origin": "http://testserver"}
 

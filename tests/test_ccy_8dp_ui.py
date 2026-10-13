@@ -41,8 +41,23 @@ def test_the_books_figures_leave_a_test_account_strategy_out(tmp_path, monkeypat
     c, _ = _client(tmp_path, monkeypatch)
     curve = c.get("/api/book/equity", auth=AUTH).json()
     assert curve["start"] == 5000 and curve["equity"][-1] == 5100.0  # the real Strategy's alone, not 8,000 / 7,600
-    risk = c.get("/risk", auth=AUTH).text
-    assert "tst runs on a test account: left out of the figures on this page" in risk
+
+
+
+def test_open_risk_is_never_filtered_and_says_what_the_test_accounts_add(tmp_path, monkeypatch):
+    """HoE: the screen never shows less risk than the engine enforces. The tile keeps the gate's figure, test accounts
+    included, with their part on a line under it; only equity and P&L leave them out."""
+    from sleeve_fund.dashboard import trading
+
+    c, _ = _client(tmp_path, monkeypatch)
+    seen = []
+    real = trading.book_positions
+    monkeypatch.setattr(trading, "book_positions", lambda st, summaries: seen.append(
+        sorted(x["sleeve"].name for x in summaries)) or real(st, summaries))
+    home = c.get("/", auth=AUTH).text
+    assert seen == [["real", "tst"]]  # the tile's positions: every strategy
+    assert "incl. test accounts:" in home
+    assert "left out of the figures on this page" not in c.get("/risk", auth=AUTH).text  # it reads every strategy
 
 
 def test_its_path_to_live_says_it_is_not_strategy_evidence(tmp_path, monkeypatch):

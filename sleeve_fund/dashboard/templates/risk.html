@@ -13,7 +13,6 @@
   <h1>Risk &amp; health</h1>
   <div class="actions"><span class="rh-live" id="rh-live" aria-live="off">Live</span>{{ flatten_button('rh-kill-top') }}</div>
 </div>
-{% if tests %}<p class="banner" role="note">{{ tests|map(attribute='sleeve.name')|join(', ') }} {{ 'runs' if tests|length == 1 else 'run' }} on a test account: left out of the figures on this page, which the open-risk and drawdown limits still count. <a href="/#test-accounts">See {{ 'it' if tests|length == 1 else 'them' }} on Home</a>. The kill switch acts on {{ 'it' if tests|length == 1 else 'them' }} too.</p>{% endif %}
 {% if kill_error %}<p class="banner warn" data-once>Nothing was sold: the kill switch needs a reason for the decision log.</p>{% endif %}
 {# The count and the names are the same list: every strategy waiting to sell now (review round 9, N1). #}
 {% set selling = kill.flattening|length if kill.flattening else (killed|int) %}
