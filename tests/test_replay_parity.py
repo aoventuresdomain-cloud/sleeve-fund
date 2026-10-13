@@ -143,3 +143,13 @@ def test_a_side_or_expected_fill_that_cant_be_measured_is_refused(side, expected
 
 def test_decided_compares_by_value():
     assert Decided("a", T0, "approved", D("1"), D("1"), None) == Decided("a", T0, "approved", D("1.0"), D("1"), None)
+
+
+def test_a_paper_entry_not_decided_on_a_bar_is_listed_on_its_own_never_a_false_paper_only():
+    off_bar = _day(1) + timedelta(minutes=7)  # the check time: no bar closed then
+    rows = [_j(1, "a", _day(0)), _j(2, "a", off_bar)]
+    report = compare(from_journal(rows, unbarred={"a-2"}), from_backtest([_b("a", _day(0))]))
+    assert report.clean and report.matched == 1 and report.paper == 1
+    assert [(u.strategy, u.bar_ts) for u in report.unbarred] == [("a", off_bar)]
+    assert [m.what for m in compare(from_journal(rows), from_backtest([_b("a", _day(0))])).mismatches] == [
+        ("paper only",)]  # without the order rows' word it would be one

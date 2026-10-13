@@ -4,11 +4,13 @@ backtest's over the same bars, and the fill-cost line that tells the ACT-DRIFT t
 Pure: no store, no engine. The caller reads the journal (DbLedger.replayable()) and runs run_portfolio over the paper
 window, then hands both lists here. Decisions are keyed on (strategy, bar_ts), bar_ts being the deciding bar's close;
 two decisions on one key pair in the order each side made them. Only 'submit' stage rows are compared: a backtest has
-no fill-stage backstop, and 'error' rows never reach replayable()."""
+no fill-stage backstop, and 'error' rows never reach replayable(). A paper entry sent outside a bar decision (a
+rebalance add, a resumed entry) carries the check time as its bar_ts (PE2, W2) and no signal.bar on its order row: the
+caller names those intents (`unbarred`), and they are listed on their own line, never matched or mismatched."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -34,6 +36,7 @@ class Decided:
     requested: Decimal
     approved: Decimal
     limit: str | None
+    bar_decided: bool = True  # False: sent outside a bar decision, so bar_ts is only the check time
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class ParityReport:
     backtest: int
     matched: int
     mismatches: list[Mismatch] = field(default_factory=list)
+    unbarred: list[Decided] = field(default_factory=list)  # paper entries not decided on a bar: listed, not compared
 
     @property
     def clean(self) -> bool:
@@ -77,10 +81,11 @@ class ParityReport:
         return out
 
 
-def from_journal(rows: Iterable[Journaled]) -> list[Decided]:
-    """Paper's side: the journal's replayable rows at stage 'submit'."""
+def from_journal(rows: Iterable[Journaled], unbarred: Collection[str] = ()) -> list[Decided]:
+    """Paper's side: the journal's replayable rows at stage 'submit'. unbarred: the intent_ids whose order row has no
+    signal.bar (sent outside a bar decision)."""
     return [Decided(r.strategy, r.bar_ts, r.decision.outcome, r.decision.requested_qty, r.decision.approved_qty,
-                    r.decision.limit_hit) for r in rows if r.stage == "submit"]
+                    r.decision.limit_hit, r.intent_id not in unbarred) for r in rows if r.stage == "submit"]
 
 
 def from_backtest(decisions: Iterable[dict]) -> list[Decided]:
@@ -105,6 +110,7 @@ def compare(paper: list[Decided], backtest: list[Decided], start: datetime | Non
     """Every decision on either side between start and end (bar closes, inclusive), matched on (strategy, bar_ts).
     Quantities are compared exactly: both sides size on the same step, so any difference is a real one."""
     p, b = _within(paper, start, end), _within(backtest, start, end)
+    unbarred, p = [r for r in p if not r.bar_decided], [r for r in p if r.bar_decided]
     pk, bk = _keyed(p), _keyed(b)
     matched, out = 0, []
     for key in sorted(pk.keys() | bk.keys()):
@@ -121,7 +127,7 @@ def compare(paper: list[Decided], backtest: list[Decided], start: datetime | Non
                     out.append(Mismatch(*key, what, x, y))
                 else:
                     matched += 1
-    return ParityReport(len(p), len(b), matched, out)
+    return ParityReport(len(p), len(b), matched, out, unbarred)
 
 
 def adverse_bp(side: int, expected: Decimal, fill: Decimal) -> float:
