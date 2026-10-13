@@ -22,9 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import make_url
-
-from sleeve_fund.start_check import FAIL, Section, check_books, read_only_store
+from sleeve_fund.start_check import FAIL, Section, check_books, journal_kind, read_only_store
 
 RECON_HOUR = 1  # UTC: 02:00 UK in summer time, after the day's last marks and clear of the evening's work
 
@@ -58,8 +56,8 @@ def run(folder: Path, url: str, now: datetime) -> tuple[bool, Path, list[str]]:
         lines = [f"  FAIL  the comparison couldn't run: {type(exc).__name__}: {exc}"]
         fails = [f"the comparison couldn't run: {type(exc).__name__}"]
     ok = not fails
-    where = make_url(url).render_as_string(hide_password=True)
-    page = [f"{'PASS' if ok else 'FAIL'}", f"Nightly recon {now:%Y-%m-%d %H:%M} UTC, journal {where}, read-only", "",
+    page = [f"{'PASS' if ok else 'FAIL'}", f"Nightly recon {now:%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, "
+            "read-only", "",
             "Dashboard against the journal:", *lines]
     path = record_path(folder, now)
     folder.mkdir(parents=True, exist_ok=True)

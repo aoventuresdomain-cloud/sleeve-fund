@@ -33,7 +33,7 @@ def test_a_matching_journal_writes_a_dated_pass_record(tmp_path):
     ok, path, fails = nightly_recon.run(tmp_path / "recon", url, NIGHT)
     assert ok and not fails and path.name == "recon-2026-10-14.txt"
     page = _record(tmp_path / "recon")
-    assert page.startswith("PASS\nNightly recon 2026-10-14 01:05 UTC")
+    assert page.startswith("PASS\nNightly recon 2026-10-14 01:05 UTC, SQLite journal, read-only")
     assert "  PASS  s1: position 0.1 vs journal 0.1; cash 3,997.00 vs journal 3,997.00" in page
 
 

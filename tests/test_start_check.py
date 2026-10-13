@@ -101,7 +101,18 @@ def test_it_is_strictly_read_only_no_writes_and_no_network(tmp_path, monkeypatch
 
 def test_a_check_that_cannot_run_fails(tmp_path, capfd):
     assert start_check.main(["--db", f"sqlite:///{tmp_path}/missing.db"]) == 1
-    assert capfd.readouterr().out.startswith("Start check: FAIL")
+    out = capfd.readouterr().out
+    assert out.startswith("Start check: FAIL") and "FileNotFoundError" in out
+    assert str(tmp_path) not in out  # the error's text (a path, a host) never reaches the public log
+
+
+def test_the_page_names_the_journal_kind_never_its_address(tmp_path, capfd):
+    """The workflow's log is public: no host, user, database name or path."""
+    url, _ = _journal(tmp_path)
+    assert start_check.main(["--db", url]) == 0
+    out = capfd.readouterr().out
+    assert "SQLite journal, read-only" in out and str(tmp_path) not in out and "j.db" not in out
+    assert start_check.journal_kind("postgresql://sleeve:pw@db:5432/sleeve_fund") == "Postgres"
 
 
 def test_an_archived_strategy_still_in_the_book_is_checked(tmp_path):

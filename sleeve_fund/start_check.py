@@ -60,6 +60,12 @@ def read_only_engine(url: str) -> Engine:
     raise ValueError("the journal URL is neither SQLite nor Postgres")
 
 
+def journal_kind(url: str) -> str:
+    """Which journal was read, without its address: the page goes to a public workflow log, so no host, user or
+    database name."""
+    return "Postgres" if make_url(url).get_backend_name() in ("postgres", "postgresql") else "SQLite"
+
+
 def read_only_store(url: str):
     """The Store's readers on the read-only engine; its constructor would create tables. The caller disposes of
     store.engine."""
@@ -180,8 +186,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     engine = store.engine
     sections = [check_keys(env, engine), check_venues(engine), check_books(store)]
     ok = not any(s.failed for s in sections)
-    where = make_url(url).render_as_string(hide_password=True)
-    out = [f"Start check: {'PASS' if ok else 'FAIL'}", f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, journal {where}, read-only",
+    out = [f"Start check: {'PASS' if ok else 'FAIL'}",
+           f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
            ""]
     for s in sections:
         out.append(f"{s.title}: {'FAIL' if s.failed else 'PASS'}")
@@ -200,7 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ok, page = run(args.db)
     except Exception as exc:  # noqa: BLE001 - a check that can't run is a fail, never a pass
-        print(f"Start check: FAIL\n\nThe check couldn't run: {type(exc).__name__}: {exc}")
+        # The error's type only: its text can carry the database's host or a path, and the page is public.
+        print(f"Start check: FAIL\n\nThe check couldn't run: {type(exc).__name__}. Run it on the server for the "
+              "detail.")
         return 1
     print(page, end="")
     return 0 if ok else 1
