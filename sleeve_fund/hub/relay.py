@@ -33,6 +33,13 @@ VENUE_QUIET_SECONDS = 60  # no trade or quote for this long: the heartbeat says 
 BAR_GRACE_SECONDS = 2  # a minute's bar is built this long after the minute ends; a trade later than that is late
 
 
+def late_since_path(late_path):
+    """Beside the late-trade counts: {pair: [ns the hub began counting them, ns of this write]} (HUB-LATE-01). The
+    second is when the counts were last brought up to date, so a report read after the hub stopped doesn't count the
+    time since as covered."""
+    return late_path.with_name(late_path.stem + "-since.json")
+
+
 class Minutes:
     """Per instrument, the 1-minute bars under way, built from trades by their venue time. A minute is keyed by its
     close: a trade at 12:00:59.9 is in the minute closing 12:01, one at exactly 12:01:00 in the next (the venue's
@@ -166,6 +173,8 @@ class HubRelay(DataActor):
         self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
         # Per instrument, [trades that arrived after their minute's bar was built, all trades], written to
         # late_path every REFRESH_SECONDS as {pair: [late, total]} for the parity report (scripts/hub_parity.py).
+        # They start from nothing each time the hub starts, so beside them goes when each began counting (the
+        # relay's subscription, _since): the report then says how long the counts cover (HUB-LATE-01).
         self.late: dict[str, list[int]] = {}
         self.late_path = None
 
@@ -243,12 +252,15 @@ class HubRelay(DataActor):
         if self.late_path is None:
             return
         counts = {self.pairs.get(iid, iid): n for iid, n in self.late.items()}
-        try:
-            tmp = self.late_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(counts))
-            tmp.replace(self.late_path)
-        except OSError as exc:
-            self.log.warning(f"hub: can't write {self.late_path}: {exc}")
+        now = time.time_ns()
+        since = {self.pairs.get(iid, iid): [self._since[iid], now] for iid in self.late if iid in self._since}
+        for path, data in ((late_since_path(self.late_path), since), (self.late_path, counts)):
+            try:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data))
+                tmp.replace(path)
+            except OSError as exc:
+                self.log.warning(f"hub: can't write {path}: {exc}")
 
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
