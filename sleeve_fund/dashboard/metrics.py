@@ -16,7 +16,8 @@ STALE = timedelta(minutes=3)
 def sleeve_summary(store: Store, s: Sleeve) -> dict:
     series = store.equity_series(s.name, limit=100_000)
     prof = risk_profile(s.risk_profile)
-    fills = store.fills(s.name, limit=10_000)
+    fills = store.fills(s.name, limit=10_000)  # the trades below; the counts and fees are over every fill (CASH-2)
+    n_fills, fees = store.fill_totals(s.name)
     out = {
         "sleeve": s,
         "profile": prof,
@@ -31,14 +32,14 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         "room": s.starting_balance * prof.max_drawdown,  # what it can lose before the drawdown halt
         "exposure": 0.0,
         "points": len(series),
-        "fills": len(fills),
-        "fees": sum(f["fee"] for f in fills),
+        "fills": n_fills,
+        "fees": fees,
         "pnl": 0.0,
         # Closed trips after fees (and a perpetual's funding), paired as the Trades tab pairs them: on a perpetual a sell from flat opens a
         # short, so the header, the Trades tab and the G2 checklist count the same trips (round 11, M11-4).
         "trades": trade_stats(trades(list(reversed(fills)), markets.is_perp(s.params),
-                                     store.funding(s.name, limit=100_000) if markets.is_perp(s.params) else None,
-                                     store.insurance(s.name) if markets.is_perp(s.params) else None)),
+                                     store.funding(s.name, limit=None) if markets.is_perp(s.params) else None,
+                                     store.insurance(s.name, limit=None) if markets.is_perp(s.params) else None)),
         "healthy": bool(s.heartbeat_at and utcnow() - s.heartbeat_at < STALE),
         # Funding settled on a perpetual: + received, - paid. Already in its equity and P&L.
         "funding": store.funding_total(s.name) if markets.is_perp(s.params) else 0.0,
@@ -70,6 +71,6 @@ def costs(pnl: float, fees: float, funding: float) -> dict:
     """Fees and funding paid, the P&L before them, and the share of that gross P&L they took (UI v2, item 7).
     pnl is after both; funding is + received, - paid, so funding received lowers the cost. The share is of the
     gross P&L's size, so a loss's costs read as a share too; None while there is no gross P&L."""
-    paid = fees - funding
+    paid = float(fees) - float(funding)  # fees and funding are exact Decimals from the journal; this is display
     gross = pnl + paid
     return {"costs": paid, "gross_pnl": gross, "cost_share": paid / abs(gross) if gross else None}
