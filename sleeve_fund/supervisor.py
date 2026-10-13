@@ -183,7 +183,11 @@ def check_quote_places(s: Sleeve, account: str) -> str | None:
     from nautilus_trader.model import Currency
 
     quote = s.instrument.split("/")[-1].split("-")[0].upper()
-    places = Currency.from_str(quote).precision  # as the engine holds it (one it doesn't list it holds to 8)
+    try:  # as the engine holds it; one it doesn't list would be made up at 8, so it is refused (F-WED1-2)
+        places = Currency.from_str(quote, strict=True).precision
+    except ValueError:
+        raise ValueError(f"its quote currency {quote} is not one the engine lists, so the places its fills are held "
+                         f"to are unknown; it can't run on any account until it is listed") from None
     if places >= FILL_PLACES:
         return None
     why = _test_account_reason(account, getattr(s, "venue", None))
