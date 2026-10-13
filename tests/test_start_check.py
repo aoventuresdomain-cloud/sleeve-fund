@@ -2,6 +2,7 @@
 and a proof that it writes nothing and calls nothing."""
 
 import hashlib
+import os
 import socket
 from datetime import UTC, datetime, timedelta
 
@@ -101,3 +102,54 @@ def test_it_is_strictly_read_only_no_writes_and_no_network(tmp_path, monkeypatch
 def test_a_check_that_cannot_run_fails(tmp_path, capfd):
     assert start_check.main(["--db", f"sqlite:///{tmp_path}/missing.db"]) == 1
     assert capfd.readouterr().out.startswith("Start check: FAIL")
+
+
+def test_an_archived_strategy_still_in_the_book_is_checked(tmp_path):
+    """FE MUST 1: archived but still holding, it stays in the dashboard's book (previous_book keeps it until flat), so
+    its disagreeing mark fails rather than being skipped."""
+    url, store = _journal(tmp_path, mark_qty=0.2)
+    store.set_desired_state("s1", "stopped")
+    store.archive("s1")
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "  FAIL  s1: position 0.2 vs journal 0.1" in page
+
+
+def test_a_mark_whose_equity_disagrees_fails_though_position_and_cash_match(tmp_path):
+    """FE MUST 2: Book, P&L and Return show the mark's equity column, so it must equal the journal's cash plus its
+    position at the mark's price."""
+    url, store = _journal(tmp_path)
+    store.record_equity("s1", equity=4_000.0 - 3.0 + 6_000.0 + 1.0, cash=3_997.0, qty=0.1, price=60_000.0,
+                        benchmark=10_000.0, ts=T0 + timedelta(minutes=2))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "but equity 9,998.00 vs journal 9,997.00" in page
+
+
+def test_a_wiped_out_isolated_margin_mark_floored_at_zero_is_a_note(tmp_path):
+    url, store = _journal(tmp_path)
+    store.record_equity("s1", equity=0.0, cash=3_997.0, qty=0.1, price=-50_000.0, benchmark=10_000.0,
+                        ts=T0 + timedelta(minutes=2))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert ok and "equity 0.00, floored from -1,003.00" in page
+
+
+def test_nothing_compared_is_a_fail_not_a_vacuous_pass(tmp_path):
+    """FE FOLLOW-UP: every Strategy with fills had a fill after its latest mark, so nothing was checked."""
+    url, store = _journal(tmp_path)
+    store.record_fill("s1", side="SELL", qty=0.1, price=61_000.0, fee=3.0, order_id="o2", trade_id="t2",
+                      ts=T0 + timedelta(minutes=2))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "  NOTE  s1: a fill landed after its latest mark" in page
+    assert "  FAIL  nothing was compared: s1 had a fill after the latest mark" in page
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="Postgres only: TEST_DATABASE_URL")
+def test_postgres_read_only_engine_refuses_a_write():
+    """HoQA F-SC-1: the Postgres path (default_transaction_read_only) pinned in CI."""
+    engine = start_check.read_only_engine(os.environ["TEST_DATABASE_URL"])
+    with pytest.raises(Exception, match="read-only|ReadOnlySqlTransaction"), engine.begin() as c:
+        c.execute(text("CREATE TABLE start_check_probe (x int)"))
+    engine.dispose()

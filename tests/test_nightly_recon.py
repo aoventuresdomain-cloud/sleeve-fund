@@ -46,6 +46,10 @@ def test_pin_a_dashboard_that_disagrees_with_the_journal_fails(tmp_path):
 
 def test_pin_a_fill_newer_than_the_last_mark_is_a_note_not_a_fail(tmp_path):
     url, store = _journal(tmp_path)
+    store.create_sleeve(name="s0", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE")  # one compared: not every Strategy was skipped
+    store.record_equity("s0", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
+                        ts=T0 + timedelta(minutes=1))
     store.record_fill("s1", side="SELL", qty=0.1, price=61_000.0, fee=3.0, order_id="o2", trade_id="t2",
                       ts=T0 + timedelta(minutes=2))
     store.engine.dispose()

@@ -5,8 +5,10 @@ round. One page, pass or fail:
    The demo mirror's demo and testnet keys are allowed (sleeve_fund.mirror, demo hosts only).
 2. Venues. Only the paper account exists and every Strategy runs on it. A live account set up, or a Strategy assigned
    to one, fails.
-3. Books. For every Strategy the dashboard shows, its open position and cash (the latest equity mark, which the
-   dashboard reads) match the journal (fills, the source of truth) within the reconcile's tolerances.
+3. Books. For every Strategy the dashboard's book counts, its open position and cash (the latest equity mark, which
+   the dashboard reads) match the journal (fills, the source of truth) within the reconcile's tolerances, and so does
+   the mark's equity, which Book, P&L and Return show. If every Strategy with fills had a fill after its latest mark,
+   nothing was compared and the check fails.
 
 Strictly read-only. It opens the database read-only (SQLite mode=ro; Postgres default_transaction_read_only), never
 the Store's own engine, and imports nothing that places an order or opens a network connection.
@@ -110,12 +112,17 @@ def check_venues(engine: Engine) -> Section:
 
 
 def check_books(store) -> Section:
-    """The dashboard's position and cash (book.sleeve_extras reads the latest equity mark) against the journal."""
+    """The dashboard's figures against the journal, for exactly the Strategies the dashboard's book counts
+    (app.current_sleeves: every one but an earlier book's, store.previous_book, which holds the reset runs; an archived
+    Strategy still holding stays in the book and is checked). Position and cash come from the latest equity mark
+    (book.sleeve_extras); Book, P&L and Return from that mark's own equity column (metrics.sleeve_summary), which must
+    be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes)."""
     sec = Section("Dashboard against the journal")
-    archived, runs = store.archived(), store.reset_runs()
-    checked = 0
+    earlier = store.previous_book()
+    checked = compared = 0
+    late_with_fills = []
     for s in store.sleeves():
-        if s.name in archived or s.name in runs:
+        if s.name in earlier:
             continue
         checked += 1
         book = store.journal_book(s.name, s.starting_balance)
@@ -129,20 +136,38 @@ def check_books(store) -> Section:
             continue
         fills = store.fills(s.name, limit=1)
         if fills and fills[0]["ts"] > last["ts"]:
+            late_with_fills.append(s.name)
             sec.add(NOTE, f"{s.name}: a fill landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
                           "again after the next mark")
             continue
+        compared += 1
         # The reconcile's tolerances (SleeveRuntime.reconcile): a cent per fill for cash, float steps for the qty.
         cash_tol = 0.01 * (1 + 2 * book["fills"])
         scale = max(abs(float(last["qty"])), abs(float(book["qty"])))
         qty_tol = max(1e-8, (2 + book["fills"]) * math.ulp(scale))
         d_qty = float(Decimal(repr(float(last["qty"]))) - Decimal(repr(float(book["qty"]))))
         d_cash = float(last["cash"]) - float(book["cash"])
+        price, equity = float(last["price"]), float(last["equity"])
+        want = float(book["cash"]) + float(book["qty"]) * price
+        equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
         what = (f"{s.name}: position {last['qty']:.12g} vs journal {book['qty']:.12g}; cash {last['cash']:,.2f} vs "
                 f"journal {book['cash']:,.2f} ({book['fills']} fills)")
-        sec.add(PASS if abs(d_qty) <= qty_tol and abs(d_cash) <= cash_tol else FAIL, what)
+        if abs(d_qty) > qty_tol or abs(d_cash) > cash_tol:
+            sec.add(FAIL, what)
+        elif equity == 0.0 and want < 0:
+            # Isolated margin: a Strategy wiped out can't lose more than it had, so its mark is floored at zero.
+            sec.add(NOTE, f"{what}; equity 0.00, floored from {want:,.2f}: its isolated margin is wiped out")
+        elif abs(equity - want) > equity_tol:
+            sec.add(FAIL, f"{what}; but equity {equity:,.2f} vs journal {want:,.2f} (its cash plus its position at "
+                          f"{price:,.2f}): the Book and P&L shown are wrong")
+        else:
+            sec.add(PASS, f"{what}; equity {equity:,.2f}")
     if not checked:
         sec.add(NOTE, "no Strategy to compare")
+    elif not compared and late_with_fills:
+        # Every Strategy with a book was skipped: nothing was actually checked, which is not a pass.
+        sec.add(FAIL, f"nothing was compared: {', '.join(late_with_fills)} had a fill after the latest mark; run "
+                      "again after the next mark")
     return sec
 
 
