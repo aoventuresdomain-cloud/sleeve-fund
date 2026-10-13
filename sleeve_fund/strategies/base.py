@@ -3082,7 +3082,8 @@ class LongFlatStrategy(Strategy):
                     signal["resting_note"] = note
                     self._note("resting_entry_no_gtd", note, level="info")
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
-                                             price=px, time_in_force=tif, expire_time=expires, post_only=True,
+                                             price=px, time_in_force=tif, post_only=True,
+                                             expire_time=None if expires is None else _ns(expires),
                                              reduce_only=reduce)
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
         else:
