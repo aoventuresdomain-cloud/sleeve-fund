@@ -172,6 +172,7 @@ def test_past_the_ttl_an_unacked_order_is_told_once_as_not_cancelled_and_nothing
     assert not [e for e in _alerts(store, "supervisor_error")]
     assert _res(store, rid).released_at is None
 
+
 def test_a_halt_tells_a_holder_it_cant_close_at_most_system_flattens_times_then_says_so_once(monkeypatch):
     """HoQA F229-5: a holder whose flatten never closes it (less than the venue's smallest order, say) is told at most
     SYSTEM_FLATTENS times this halt, then one alert says the PM must close it; the halt still blocks its entries."""

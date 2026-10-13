@@ -963,7 +963,10 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     margin = qty * entry / 3  # aggressive: 3x
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     x = margin + trips[-1]["fees"]  # X: the margin plus the entry and liquidation fees
-    assert res.equity.min() > 0 and trips[-1]["pnl"] - trips[-1]["funding"] == pytest.approx(-x, abs=0.01)
+    # LIQ-FUND-1 (Advisor 17:45 UK, 13 Oct; HoE-approved expectation change): funding paid since the fill counts inside
+    # the margin, never on top of it, so the price loss plus the funding paid is the margin, to the cent.
+    price_loss = -(trips[-1]["pnl"] - trips[-1]["funding"] + trips[-1]["fees"])
+    assert res.equity.min() > 0 and price_loss - trips[-1]["funding"] == pytest.approx(margin, abs=0.01)
     assert trips[-1]["insurance"] == 0.0
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}

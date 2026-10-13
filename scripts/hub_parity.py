@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from sleeve_fund.history import HistoryStore
-from sleeve_fund.parity import canon_sample, late_counts, markdown, markdown_sample, run, window
+from sleeve_fund.parity import canon_sample, late_counts, late_since, markdown, markdown_sample, run, window
 from sleeve_fund.venues import venue
 
 
@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     late = late_counts(store, profile.name, args.late)
     start, end = window(args.hours)
-    results = run(store, profile, pairs, start, end, args.tolerance, late)
+    results = run(store, profile, pairs, start, end, args.tolerance, late, late_since(store, profile.name, args.late))
     report = markdown(profile.label, results)
     print(report)
     kept = True

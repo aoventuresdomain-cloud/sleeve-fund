@@ -22,6 +22,12 @@ VOLUME_TOLERANCE = 0.001  # relative: venues revise volume by tiny amounts as la
 # Late trades (reaching the hub after their minute was built) above this share of an instrument's trades over the
 # window: the Independent Quant Advisor's trigger to widen the hub's grace (P1-1-DELAY, 17:05 UK).
 LATE_ALERT_RATE = 0.0005
+# The hub's counts start from nothing at each hub start: a share counted over less than this proves nothing either way
+# (HUB-LATE-01; the Advisor's rule is per instrument over 24 h).
+LATE_PROVEN_HOURS = 24
+# Nor does one over too few trades: with none late in n, the 95% upper bound is 3/n, under LATE_ALERT_RATE only from
+# this many trades (PE2, HUB-LATE-COVER). A quiet instrument can count 24 h with fewer.
+LATE_PROVEN_TRADES = 6_000
 
 
 @dataclass
@@ -43,6 +49,8 @@ class Parity:
     # venue's record. The P1-1-DELAY acceptance reads this, since the store itself then matches the venue.
     replaced: int = 0
     late_trades: tuple[int, int] | None = None  # (late, total) from the hub, when it reports them
+    late_since: pd.Timestamp | None = None  # when the hub began counting them (its last start); None: not reported
+    late_until: pd.Timestamp | None = None  # when it last wrote them; None: not reported (counted to the report's end)
 
     @property
     def ok(self) -> bool:
@@ -78,8 +86,9 @@ def store_minutes(store: HistoryStore, venue: str, pair: str, start: pd.Timestam
 
 def compare(pair: str, ours: pd.DataFrame, theirs: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
             price_tolerance: float = 0.0, provenance: list[dict] | None = None,
-            late_trades: tuple[int, int] | None = None) -> Parity:
-    p = Parity(pair, start, end, late_trades=late_trades)
+            late_trades: tuple[int, int] | None = None, late_since: pd.Timestamp | None = None,
+            late_until: pd.Timestamp | None = None) -> Parity:
+    p = Parity(pair, start, end, late_trades=late_trades, late_since=late_since, late_until=late_until)
     common = ours.index.intersection(theirs.index)
     p.both = len(common)
     p.venue_only = list(theirs.index.difference(ours.index))
@@ -123,6 +132,27 @@ def _runs(minutes: list[pd.Timestamp]) -> str:
     return shown + (f" and {len(out) - 8} more runs" if len(out) > 8 else "")
 
 
+def _late_window(p: Parity) -> str:
+    hours = late_hours(p)
+    if hours is None:
+        return ", counting window unknown: not proven"
+    return f" over {hours:.1f} h" + ("" if _late_unproven(p) is None else ": not proven")
+
+
+def _late_unproven(p: Parity) -> str | None:
+    """Why the late share isn't proven either way, or None when it is: counted over at least LATE_PROVEN_HOURS and
+    LATE_PROVEN_TRADES trades."""
+    hours = late_hours(p)
+    if hours is None:
+        return "for an unknown time (the hub didn't say when it began)"
+    since = f"for {hours:.1f} h, since {p.late_since:%d %b %H:%M} (the hub's last start)"
+    if hours < LATE_PROVEN_HOURS:
+        return f"{since}: under {LATE_PROVEN_HOURS} h"
+    if p.late_trades[1] < LATE_PROVEN_TRADES:
+        return f"{since}, over {p.late_trades[1]:,} trades: under {LATE_PROVEN_TRADES:,} trades"
+    return None
+
+
 def markdown(venue: str, results: list[Parity]) -> str:
     start, end = results[0].start, results[0].end
     lines = [f"# Hub bar parity: {venue}", "",
@@ -133,7 +163,8 @@ def markdown(venue: str, results: list[Parity]) -> str:
              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for p in results:
         late = "not reported" if p.late_trades is None else (
-            f"{p.late_trades[0]} of {p.late_trades[1]} ({p.late_trades[0] / max(p.late_trades[1], 1):.3%})")
+            f"{p.late_trades[0]} of {p.late_trades[1]} ({p.late_trades[0] / max(p.late_trades[1], 1):.3%})"
+            + _late_window(p))
         lines.append(f"| {p.pair} | {'match' if p.ok else 'DIFFERS'} | {p.both} | {len(p.venue_only)} | "
                      f"{len(p.store_only)} | {p.price_diffs} | {p.volume_diffs} | {p.worst_price:g} | {p.refilled} | "
                      f"{p.conflicts} | {p.replaced} | {late} |")
@@ -141,6 +172,9 @@ def markdown(venue: str, results: list[Parity]) -> str:
         if p.late_trades is not None and p.late_trades[0] > LATE_ALERT_RATE * p.late_trades[1]:
             lines += ["", (f"**{p.pair}**: LATE TRADES ABOVE {LATE_ALERT_RATE:.2%} "
                            f"({p.late_trades[0] / p.late_trades[1]:.3%}): the trigger to widen the hub's grace.")]
+    for p in results:
+        if p.late_trades is not None and (why := _late_unproven(p)) is not None:
+            lines += ["", f"**{p.pair}**: late trades counted {why}, so the late share is not proven."]
     for p in results:
         if p.venue_only or p.store_only:
             lines += ["", f"**{p.pair}**: missing in store: {_runs(p.venue_only)}. Store only: {_runs(p.store_only)}."]
@@ -195,8 +229,38 @@ def late_counts(store, venue_name: str, path=None) -> dict | None:
     return {k: tuple(v) for k, v in json.loads(path.read_text()).items()}
 
 
+def late_since(store, venue_name: str, path=None) -> dict:
+    """When the hub began counting each instrument's late trades and when it last wrote them, {pair: (UTC timestamp,
+    UTC timestamp or None)}: the file beside the counts (relay.late_since_path; a file with the start alone, as first
+    written, has no last write). Empty when the hub doesn't write it, so every share reads as not proven."""
+    import json
+    from pathlib import Path
+
+    from sleeve_fund.hub.relay import late_since_path
+
+    path = late_since_path(Path(path) if path is not None else store.root / f"hub-late-{venue_name}.json")
+    if not path.exists():
+        return {}
+    out = {}
+    for k, v in json.loads(path.read_text()).items():
+        since, until = (v, None) if isinstance(v, int) else v
+        out[k] = (pd.Timestamp(int(since), unit="ns", tz="UTC"),
+                  None if until is None else pd.Timestamp(int(until), unit="ns", tz="UTC"))
+    return out
+
+
+def late_hours(p: Parity) -> float | None:
+    """How many hours the late counts cover: from when the hub began counting to when it last wrote them, or the
+    report's end if sooner (PE2: a hub that stopped long before the report counted nothing since). None when the hub
+    didn't say when it began."""
+    if p.late_since is None:
+        return None
+    end = p.end if p.late_until is None else min(p.end, p.late_until)
+    return max((end - p.late_since) / pd.Timedelta("1h"), 0.0)
+
+
 def run(store: HistoryStore, profile, pairs: list[str], start: pd.Timestamp, end: pd.Timestamp,
-        price_tolerance: float = 0.0, late: dict | None = None) -> list[Parity]:
+        price_tolerance: float = 0.0, late: dict | None = None, late_since: dict | None = None) -> list[Parity]:
     if profile.minute_loader is None or profile.minute_cursor_at is None:
         raise ValueError(f"{profile.label} has no 1-minute history loader")
     out = []
@@ -204,7 +268,7 @@ def run(store: HistoryStore, profile, pairs: list[str], start: pd.Timestamp, end
         theirs = venue_minutes(profile.minute_loader, pair, start, end, profile.minute_cursor_at)
         ours = store_minutes(store, profile.name, pair, start, end)
         out.append(compare(pair, ours, theirs, start, end, price_tolerance, store.provenance(profile.name, pair),
-                           (late or {}).get(pair)))
+                           (late or {}).get(pair), *(late_since or {}).get(pair, (None, None))))
     return out
 
 
