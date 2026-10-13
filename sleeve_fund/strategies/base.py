@@ -1303,7 +1303,7 @@ class LongFlatStrategy(Strategy):
         if self._margin:  # the liquidation price set when it was entered or last added to (_set_liq), if journaled
             # Filled entries only: a later entry that never filled (an expired post-only) must not hide the held
             # entry's price (CR #146).
-            recent, fills = store.orders(name, limit=200), store.fills(name, limit=500)
+            recent, fills = store.orders(name, limit=200), store.fills(name, limit=None)  # every fill: F242-3
             filled = {f["order_id"] for f in fills}
             held = next((o for o in recent if o.get("intent") == "entry" and o.get("side") == opened
                          and o["order_id"] in filled), None)
@@ -1312,9 +1312,8 @@ class LongFlatStrategy(Strategy):
                           and o.get("intent") in OPENING_INTENTS and o["order_id"] in filled
                           and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
             self._liq_px = fixed["signal"]["position_liquidation_px"] if fixed is not None else None
-            if fixed is not None:  # and the funding its margin has taken or been credited since (LIQ-FUND-1)
-                at = max(pd_ts(f["ts"]) for f in fills if f["order_id"] == fixed["order_id"])
-                self._liq_from = int(at.value)
+            if fixed is not None:  # and the funding its margin has taken or been credited since it opened (LIQ-FUND-1)
+                self._liq_from = self._position_opened(fills)
                 self._liq_funded = sum(float(r["amount"]) for r in store.funding(name, limit=None)
                                        if int(pd_ts(r["ts"]).value) > self._liq_from)
         if entry is None:
@@ -3327,14 +3326,29 @@ class LongFlatStrategy(Strategy):
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
 
+    def _position_opened(self, fills: list[dict]) -> int:
+        """When the position held now opened (ns): its first fill since the journal was last flat or went through
+        flat, so an add keeps the funding taken before it after a restart too (F242-1, CR). Fills newest first."""
+        half, pos, opened = self._lot() / 2, 0.0, None
+        for f in reversed(fills):
+            q = float(f["qty"]) * (1 if f["side"] == "BUY" else -1)
+            if abs(pos) < half or (pos > 0) != (pos + q > 0):
+                opened = f["ts"]  # from flat, or through it: this fill opened the side held after it
+            pos += q
+        return int(pd_ts(opened).value)
+
     def _set_liq(self, order_id: str, since: int | None = None) -> None:
         """After a perp entry or add fills: the position's liquidation price, journaled on that order beside the
         decision's own estimate from the close (liquidation_px), which stays as it was decided. Funding up to the fill
         is settled before it (on_order_filled), so the margin's funding counts afresh from `since`: the fill, or for a
-        bars-only resting fill the bar's open, as the settlements inside the bar after it are charged (_fund_opened_in_bar)."""
+        bars-only resting fill the bar's open, as the settlements inside the bar after it are charged (_fund_opened_in_bar).
+        Only a position opened from flat (or through it) starts counting afresh: an add or a later part-fill keeps the
+        funding its margin has taken since it opened, as the venue's isolated margin does, and _liq_now applies it to the
+        whole position (F242-1). _track_entry clears it when the position goes flat or flips."""
         _, cash, qty, _ = self._mark()
         self._liq_px = self._liq_from_entry(cash, qty) if qty else None
-        self._liq_funded, self._liq_from = 0.0, since
+        if self._liq_from is None:
+            self._liq_funded, self._liq_from = 0.0, since
         if self._liq_px is not None and self.runtime is not None and not self._backtest:
             self.runtime.store.merge_order_signal(order_id, {"position_liquidation_px": round(self._liq_px, 8)})
 
