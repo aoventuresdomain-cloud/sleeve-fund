@@ -33,6 +33,7 @@ from sleeve_fund.store import (
 from sleeve_fund.store import _aware
 
 T = datetime(2026, 10, 13, 9, tzinfo=timezone.utc)
+RAL_KIND = "reset_after_liquidation"
 MIGRATION = Path(store_mod.__file__).parent / "migrations" / "versions" / "0015_orphan_guard_cancel.py"
 
 
@@ -267,7 +268,7 @@ def test_0015_stops_on_a_command_of_unknown_kind_and_changes_nothing(engine):
     from alembic import command
 
     with engine.begin() as conn:
-        command.upgrade(schema._config(conn), "0013")
+        command.upgrade(schema._config(conn), "0014")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, starting_balance, created_at, "
                           "updated_at, desired_state, status, status_reason, risk_profile, params, warmup_bars) "
@@ -278,8 +279,11 @@ def test_0015_stops_on_a_command_of_unknown_kind_and_changes_nothing(engine):
     with pytest.raises(Exception, match="legacy_thing"):
         schema.migrate(engine, log=lambda _: None)
     with engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0013"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0014"
     assert "order_id" not in {c["name"] for c in inspect(engine).get_columns("commands")}
+    with engine.begin() as conn:  # to head, so teardown's drop_all finds every constraint the code names
+        conn.execute(text("DELETE FROM commands WHERE command = 'legacy_thing'"))
+    schema.migrate(engine, log=lambda _: None)
 
 
 def test_0015_migrated_commands_equal_create_alls(engine, tmp_path):
@@ -302,3 +306,27 @@ def test_0015_migrated_commands_equal_create_alls(engine, tmp_path):
     assert {"commands_kind", "commands_cancel_order", "commands_not_found_cancel"} <= set(migrated[1])
     assert ("commands_cancel_open", ("order_id",), True) in migrated[2]
     assert "gate_decisions_order_id" in {i["name"] for i in inspect(engine).get_indexes("gate_decisions")}
+
+
+def test_0015_keeps_a_reset_keyed_to_its_command_when_it_rebuilds_commands(engine):
+    """0014's events.command_id references commands; 0015's batch rebuild of commands (SQLite) must keep that row
+    and its key valid."""
+    from alembic import command
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0014")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, starting_balance, created_at, "
+                          "updated_at, desired_state, status, status_reason, risk_profile, params, warmup_bars) "
+                          "SELECT 's', 'buy_and_hold', 'BTC/USDT-PERP', 'b', 1000, :t, :t, 'stopped', 'stopped', '', "
+                          "'balanced', '{}', 0"), {"t": T})
+        cid = conn.execute(text("INSERT INTO commands (sleeve, command, reason, created_at, applied_at) VALUES "
+                                "('s', 'reset_after_liquidation', 'x', :t, :t) RETURNING id"), {"t": T}).scalar()
+        conn.execute(text("INSERT INTO events (sleeve, ts, level, kind, message, command_id) VALUES "
+                          "('s', :t, 'info', 'liquidation_reset', 'reset', :c)"), {"t": T, "c": cid})
+    schema.migrate(engine, log=lambda _: None)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT command_id FROM events WHERE kind = 'liquidation_reset'")).scalar() == cid
+        assert conn.execute(text("SELECT command FROM commands WHERE id = :c"), {"c": cid}).scalar() == RAL_KIND
+        if engine.dialect.name == "sqlite":
+            assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []

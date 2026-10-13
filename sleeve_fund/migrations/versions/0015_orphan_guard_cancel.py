@@ -13,7 +13,7 @@ lists them (never deletes: PM rule), as 0008 and 0013 do. Each step is skipped w
 that shape first (create_all).
 
 Revision ID: 0015
-Revises: 0013 (0014, FE's F217-3, is reserved and not merged: the PR that merges second re-chains, per the register)
+Revises: 0014
 Create Date: 2026-10-13 15:30:00.000000
 """
 
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 
 
 revision = '0015'
-down_revision = '0013'
+down_revision = '0014'
 branch_labels = None
 depends_on = None
 
