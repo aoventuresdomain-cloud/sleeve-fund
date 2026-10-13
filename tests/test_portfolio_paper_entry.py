@@ -20,22 +20,22 @@ from sleeve_fund.store import Store, gate_decisions_t, gate_reservations_t
 END = STD_T0.to_pydatetime() + timedelta(hours=1)  # marked through the whole run
 
 
-def _gated(store, equity=D(20_000)) -> Store:
-    paper = Store(engine=store.engine, portfolio_gate=True)  # the same journal, as paper opens it
+def _gated(journal, equity=D(20_000)) -> Store:
+    paper = Store(engine=journal.engine, portfolio_gate=True)  # the same journal, as paper opens it
     DbLedger(paper, lambda: None).set_state(PortfolioState(mark_ts=END, equity=equity, hwm=equity, day=END.date(),
                                                            day_start_equity=equity))
     return paper
 
 
-def _decisions(store) -> list:
+def _decisions(journal) -> list:
     d, r = gate_decisions_t, gate_reservations_t
-    with store.engine.connect() as c:
+    with journal.engine.connect() as c:
         return list(c.execute(select(d.c.id, d.c.order_id, d.c.outcome, r.c.release_reason)
                               .outerjoin(r, r.c.decision_id == d.c.id).order_by(d.c.id)))
 
 
-def test_a_paper_entry_is_checked_its_order_holds_the_reservation_and_its_fill_releases_it(tmp_path, store,
-                                                                                          monkeypatch):  # noqa: F811
+def test_a_paper_entry_is_checked_its_order_holds_the_reservation_and_its_fill_releases_it(
+        tmp_path, store, monkeypatch):  # noqa: F811
     paper = _gated(store)
     run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)]), monkeypatch)
     entries = [o for o in _orders(paper) if o["intent"] == "entry"]
@@ -80,8 +80,8 @@ def test_a_gated_entry_still_resting_at_the_next_bar_close_is_cancelled_and_its_
     assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]
 
 
-def test_a_gated_entry_is_cancelled_at_the_next_close_even_when_that_bar_is_not_decided_on(tmp_path, store,
-                                                                                           monkeypatch):  # noqa: F811
+def test_a_gated_entry_is_cancelled_at_the_next_close_even_when_that_bar_is_not_decided_on(
+        tmp_path, store, monkeypatch):  # noqa: F811
     """CR W2-1: the next bar held, gapped or refused as stale still closes the bar the entry may rest into, so the
     cancel runs before those checks return."""
     from sleeve_fund.strategies.base import LongFlatStrategy
