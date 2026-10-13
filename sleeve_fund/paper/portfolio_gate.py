@@ -35,10 +35,11 @@ NEVER_GATED = frozenset({"exit", "stop_loss", "take_profit", "pm_flatten", "risk
 
 
 def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tuple[Holding, ...]:
-    """Every strategy's open position as the book's Holdings: its journal quantity (fills, the source of truth) at its
-    latest mark, measured to the stop its entry journaled, or with none by the stopless measure from the daily ATR
-    (`atr_pct(sleeve)`, the history store's by default). Leverage is the strategy's profile cap on a perpetual, None
-    on spot. Raises ValueError when a stopless position's ATR isn't known: the check then fails closed."""
+    """Every strategy's open position as the book's Holdings, archived ones still holding included: its journal
+    quantity (fills, the source of truth) at its latest mark, measured to the stop its entry journaled, or with none
+    by the stopless measure from the daily ATR (`atr_pct(sleeve)`, the history store's by default). Leverage is the
+    strategy's profile cap on a perpetual, None on spot. Raises ValueError when a stopless position's ATR isn't known:
+    the check then fails closed."""
     from sleeve_fund import markets, risk
     from sleeve_fund.open_risk import _journal_stop, history_atr_pct
 
@@ -47,11 +48,12 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
         def atr_pct(s):
             return history_atr_pct(s.venue or "", s.instrument, now)
     out = []
-    archived = store.archived()
     from sleeve_fund.supervisor import outside_fund_book
 
+    # Every Strategy whose journal holds a position counts, whatever its status: one archived while still holding is
+    # on the dashboard's book until flat, so it is in the gate's figures too (Advisor 14 Oct 00:15 UK, F229-6).
     for s in store.sleeves():
-        if s.name in archived or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
+        if outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
         book = store.journal_book(s.name, s.starting_balance)
         qty = to_decimal(book["qty"], "qty")
