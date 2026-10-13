@@ -231,3 +231,4 @@ def test_the_acceptance_run_is_seeded_and_never_passes_without_the_double_fee_pa
     one = rt.acceptance(plain, weighted, states, fams, folds, None, seed=11, draws=30)
     two = rt.acceptance(plain, weighted, states, fams, folds, None, seed=11, draws=30)
     assert one == two and one.seed == 11 and one.result == rt.NOT_JUDGED
+
