@@ -137,7 +137,14 @@ DEFAULT_VENUE = "KRAKEN"
 RESEARCH_VENUE = "BINANCE"
 
 
+# orders.venue and accounts.venue hold a venue's name in 16 characters (store.py); a longer one would fail every
+# order insert on Postgres (CR F-P24-a), so it is refused when the venue is registered.
+VENUE_NAME_MAX = 16
+
+
 def register(profile: VenueProfile) -> VenueProfile:
+    if len(profile.name) > VENUE_NAME_MAX:
+        raise ValueError(f"venue name {profile.name!r} is over {VENUE_NAME_MAX} characters, the width orders store")
     VENUES[profile.name] = profile
     return profile
 
