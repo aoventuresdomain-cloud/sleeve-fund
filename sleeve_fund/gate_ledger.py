@@ -120,7 +120,10 @@ class DbLedger:
 
     @contextmanager
     def using(self, conn: Connection) -> Iterator[None]:
-        """Ledger calls inside join `conn`'s transaction: a fill, reject or cancel and its release commit together."""
+        """Ledger calls inside join `conn`'s transaction: a fill, reject or cancel and its release commit together. An
+        entry check never runs in here (it fails closed as lock_error, CR F219-4), and the strategy's sleeves row must
+        already be committed: on Postgres an audit write in here takes its own transaction, which can't see rows this
+        one created (CR F228-1, FE note 13 Oct)."""
         loc = self._local
         if getattr(loc, "conn", None) is not None:
             raise RuntimeError("using() inside the ledger's lock or another using(): one transaction at a time")
