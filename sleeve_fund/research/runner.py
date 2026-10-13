@@ -10,6 +10,7 @@ import importlib
 import math
 
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,9 @@ class BacktestResult:
     # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
     # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
     open_risk_binds: int = 0
+    # A perpetual's positions whose stop was held at half the way to the liquidation price at least once, because a
+    # level loosened past it or funding moved the price nearer (STOP-LOOSEN-1).
+    stops_clamped: int = 0
     # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
     open_risk_max: float = 0.0
     # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
@@ -503,6 +507,7 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         first_touch=touched,
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
+        stops_clamped=strategy.stops_clamped,
         open_risk_max=strategy.open_risk_max,
         paper_refusal=paper_refusal(plan.strategy_name, plan.params, plan.risk_profile),
         portfolio_gate=dict(strategy.portfolio_gate),
@@ -708,10 +713,14 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
         entry = fills.at[coid, "commissions"]
         moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
         first, ccy = moneys[0].split()
-        fee = round(fee_paid[coid], 2) if fee_paid and coid in fee_paid else round(float(first) - spread, 2)
+        # CASH-3: an 8-place currency shows the fee at 8 dp half up, as the journal books it, so the price carries
+        # only the spread; a currency of fewer places (USD, test only) keeps the cent and its carry.
+        places = 8 if Currency.from_str(ccy).precision >= 8 else 2
+        exact = fee_paid[coid] if fee_paid and coid in fee_paid else float(first) - spread
+        fee = float(Decimal(repr(exact)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
         moved = float(first) - fee  # the spread, and whatever rounding left in the charge
         fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
-        fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
+        fills.at[coid, "commissions"] = [f"{fee:.{places}f} {ccy}", *moneys[1:]]
     return fills
 
 

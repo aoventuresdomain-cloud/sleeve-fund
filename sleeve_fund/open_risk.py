@@ -107,6 +107,8 @@ def history_atr_pct(venue: str, pair: str, now: datetime, history=None) -> float
 
     try:
         daily = (history or HistoryStore()).read(venue, pair, 1440, start=now - timedelta(days=ATR_WINDOW + 2))
+        if daily.empty:  # stored, but none of it in the window: the store gives a frame without a time index
+            return None
         value = daily_atr_pct(daily[daily.index <= pd.Timestamp(now)])
     except (KeyError, OSError, ValueError):
         return None

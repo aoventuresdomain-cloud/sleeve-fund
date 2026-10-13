@@ -372,13 +372,11 @@ def _approved(store, strategy="a", qty="0.1", oid="o-1"):
     return rid
 
 
-@cell("W2", "there is no paper GateFn and the order row carries no reservation")
 def test_w2a_an_approved_entrys_order_row_carries_its_reservation(store):
     rid = _approved(store)
     assert rid is not None and order_reservation(store, "o-1") == rid
 
 
-@cell("W2", "book_fill and update_order don't touch the reservation")
 def test_w2b_fills_reduce_and_reject_or_cancel_release_the_reservation(store):
     rid = _approved(store)
     store.book_fill(
@@ -414,9 +412,6 @@ def test_w2b_fills_reduce_and_reject_or_cancel_release_the_reservation(store):
         assert _res(store, g.checked.reservation).release_reason == reason
 
 
-@cell(
-    "W2", "nothing cancels an unfilled resting entry at the strategy's next bar close"
-)
 def test_w2f_an_unfilled_resting_entry_is_cancelled_at_the_next_bar_close_and_its_reservation_released(
     store,
 ):
@@ -446,9 +441,6 @@ def test_w2f_an_unfilled_resting_entry_is_cancelled_at_the_next_bar_close_and_it
     assert {o["order_id"]: o["status"] for o in store.orders()}["o-1"] == "canceled"
 
 
-@cell(
-    "W2", "book_fill doesn't reduce the reservation, so there's no shared transaction"
-)
 def test_w2c_a_failed_reservation_write_leaves_the_fill_unbooked(store, monkeypatch):
     from sleeve_fund.gate_ledger import DbLedger
 
@@ -475,14 +467,12 @@ def test_w2c_a_failed_reservation_write_leaves_the_fill_unbooked(store, monkeypa
     ) == D("0.1")
 
 
-@cell("W2", "there is no paper GateFn")
 def test_w2d_a_check_never_marks_the_book(store):
     portfolio_pass(store, T0, EQ)
     paper_gate(store)("a", _entry_intent(), _ns(T0 + timedelta(seconds=30)))
     assert _state(store).marked_at.replace(tzinfo=UTC) == T0
 
 
-@cell("W2", "there is no paper GateFn")
 @pytest.mark.parametrize(
     "what",
     ["exit", "stop_loss", "take_profit", "pm_flatten", "risk_halt", "liquidation"],
