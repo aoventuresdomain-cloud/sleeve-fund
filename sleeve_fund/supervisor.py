@@ -105,6 +105,14 @@ SUB_8DP_TEST_ACCOUNTS = {("paper", "KRAKEN"): "the hub-fed USD test Strategies a
 FILL_PLACES = 8
 
 
+def is_test_currency_account(account: str, venue: str | None) -> bool:
+    """Whether (account, venue) is a named test account allowed under 8 places (SUB_8DP_TEST_ACCOUNTS): its results
+    are never Strategy evidence (CCY-8DP-UI keys the PM's views on this, not on a copy of the list)."""
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    return (account, (venue or DEFAULT_VENUE).upper()) in SUB_8DP_TEST_ACCOUNTS
+
+
 def check_quote_places(s: Sleeve, account: str) -> str | None:
     """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account not named in
     SUB_8DP_TEST_ACCOUNTS; returns the warning to log when it is named there; None when the currency holds 8."""
@@ -118,12 +126,11 @@ def check_quote_places(s: Sleeve, account: str) -> str | None:
         return None
     venue = (getattr(s, "venue", None) or DEFAULT_VENUE).upper()
     held = f"{places} places"
-    allowed = SUB_8DP_TEST_ACCOUNTS.get((account, venue))
-    if allowed is None:
+    if not is_test_currency_account(account, venue):
         raise ValueError(f"its quote currency {quote} is held to {held}, and fills are booked to {FILL_PLACES}; only "
                          f"named test accounts may run on it, and account {account} on {venue} is not one")
     return (f"Test account: its quote currency {quote} is held to {held}, under the {FILL_PLACES} fills are booked "
-            f"to, which only {allowed} may do. Its results are not Strategy evidence")
+            f"to, which only {SUB_8DP_TEST_ACCOUNTS[(account, venue)]} may do. Its results are not Strategy evidence")
 
 
 def true_up_stopped(store: Store, s: Sleeve, now: datetime | None = None) -> int:

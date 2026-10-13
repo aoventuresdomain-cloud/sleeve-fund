@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sleeve_fund.store import Store
-from sleeve_fund.supervisor import SUB_8DP_TEST_ACCOUNTS, Supervisor, check_quote_places
+from sleeve_fund.supervisor import SUB_8DP_TEST_ACCOUNTS, Supervisor, check_quote_places, is_test_currency_account
 
 
 def _s(instrument, venue="KRAKEN"):
@@ -55,3 +55,9 @@ def test_the_supervisor_starts_the_test_strategy_with_a_warning_and_refuses_a_li
     assert sup._refused("usd-live") is True
     assert store.sleeve("usd-live").desired_state == "stopped"
     assert "is not one" in store.last_event("usd-live", ("start_refused",))["message"]
+
+
+def test_the_pm_views_helper_names_the_same_accounts_as_the_start_check():
+    """CCY-8DP-UI (FE) keys on this helper, not a copy of the list."""
+    assert is_test_currency_account("paper", "kraken") and is_test_currency_account("paper", None)
+    assert not is_test_currency_account("paper", "BINANCE") and not is_test_currency_account("desk-live", "KRAKEN")
