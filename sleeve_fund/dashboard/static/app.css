@@ -866,9 +866,6 @@ details.change .grid2 { gap: 12px 18px; }
 .study-foot button { flex: none; }
 .sheet-backdrop { display: none; }
 table.results .settings { display: block; color: var(--faint); font-size: 11.5px; white-space: normal; max-width: 60ch; }
-.collect-form { padding: 12px 18px 16px; border-top: 1px solid var(--line); }
-.collect-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.collect-row input { width: 12em; }
 .history-msgs { padding: 0 18px; }
 @media (max-width: 900px) {
   .dev { grid-template-columns: minmax(0, 1fr); }
@@ -890,8 +887,6 @@ table.results .settings { display: block; color: var(--faint); font-size: 11.5px
   .study-foot { position: sticky; bottom: 0; flex-direction: column; align-items: stretch; background: var(--panel); margin: 0 -16px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }
   .study-foot button { justify-content: center; width: 100%; padding: 10px 12px; }
   body.sheet-open { overflow: hidden; }
-  .collect-row select { flex: 1 1 100%; }
-  .collect-row input { flex: 1; min-width: 0; }
 }
 /* Result page: the verdict first, four figures, then the cost ladder; the full sheet below. */
 .result-head .crumb { margin: 0 0 2px; font-size: 12.5px; }

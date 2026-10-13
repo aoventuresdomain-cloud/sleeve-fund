@@ -1066,7 +1066,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         trades it (review round 8, R8-M6)."""
         form = dict((await request.form()).items())
         pair = str(form.get("instrument", "")).strip().upper()
-        # From a study's "Not stored: Collect", the answer shows in that study; else on the History tab.
+        # Asked from a study (from=study), the answer shows in that study; else on the History tab.
         tab = "development" if form.get("from") == "study" else "history"
 
         def page_(**kw):
