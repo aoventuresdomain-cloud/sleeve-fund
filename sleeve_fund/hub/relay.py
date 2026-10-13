@@ -34,9 +34,11 @@ BAR_GRACE_SECONDS = 2  # a minute's bar is built this long after the minute ends
 
 
 def late_since_path(late_path):
-    """Beside the late-trade counts: {pair: [ns the hub began counting them, ns of this write]} (HUB-LATE-01). The
-    second is when the counts were last brought up to date, so a report read after the hub stopped doesn't count the
-    time since as covered."""
+    """Beside the late-trade counts: {pair: [ns the hub began counting them, ns of this write, ns counted, grace s]}
+    (HUB-LATE-01, HUB-LATE-PERSIST). The second is when the counts were last brought up to date, so a report read after
+    the hub stopped doesn't count the time since as covered; the third is the time the hub was running while it counted
+    them, summed over its restarts, so the time it was down isn't counted as covered either; the fourth is the grace the
+    counts were taken under."""
     return late_path.with_name(late_path.stem + "-since.json")
 
 
@@ -173,10 +175,12 @@ class HubRelay(DataActor):
         self._since: dict[str, int] = {}  # when the relay subscribed to each instrument
         # Per instrument, [trades that arrived after their minute's bar was built, all trades], written to
         # late_path every REFRESH_SECONDS as {pair: [late, total]} for the parity report (scripts/hub_parity.py).
-        # They start from nothing each time the hub starts, so beside them goes when each began counting (the
-        # relay's subscription, _since): the report then says how long the counts cover (HUB-LATE-01).
+        # These are this run's; the file carries on from what earlier runs wrote (HUB-LATE-PERSIST: every deploy
+        # restarts the hub, so counts that started afresh would rarely reach the report's 24 h). Beside them goes
+        # when each began counting and how long the hub ran while it did: the report then says what they cover.
         self.late: dict[str, list[int]] = {}
         self.late_path = None
+        self._carried: dict[str, tuple[list[int], list[int]]] | None = None  # earlier runs': read at the first write
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
                last_close: dict[str, int] | None = None, discover=None, late_path=None) -> "HubRelay":
@@ -248,12 +252,39 @@ class HubRelay(DataActor):
             if inst is not None:  # sent to each client on connecting, so paper needs no venue connection of its own
                 self.definitions[iid] = inst.to_dict()
 
+    def _load_late(self) -> dict[str, tuple[list[int], list[int]]]:
+        """Per pair, what earlier runs of the hub counted: ([late, total], [began, last write, ns counted, grace s]).
+        Counts taken under another grace, or written before the hub kept the time it counted (an older file), are
+        left behind: the counts start afresh (HUB-LATE-PERSIST)."""
+        try:
+            counts = json.loads(self.late_path.read_text()) if self.late_path.exists() else {}
+            since_path = late_since_path(self.late_path)
+            windows = json.loads(since_path.read_text()) if since_path.exists() else {}
+        except (OSError, ValueError) as exc:
+            self.log.warning(f"hub: can't read the late counts kept, counting afresh: {exc}")
+            return {}
+        out = {}
+        for pair, n in counts.items():
+            w = windows.get(pair)
+            if isinstance(w, list) and len(w) == 4 and w[3] == BAR_GRACE_SECONDS and len(n) == 2:
+                out[pair] = ([int(n[0]), int(n[1])], [int(x) for x in w])
+        return out
+
     def _write_late(self) -> None:
         if self.late_path is None:
             return
-        counts = {self.pairs.get(iid, iid): n for iid, n in self.late.items()}
+        if self._carried is None:  # before the first write replaces them
+            self._carried = self._load_late()
         now = time.time_ns()
-        since = {self.pairs.get(iid, iid): [self._since[iid], now] for iid in self.late if iid in self._since}
+        counts = {pair: list(n) for pair, (n, _) in self._carried.items()}
+        since = {pair: list(w) for pair, (_, w) in self._carried.items()}
+        for iid, (late, total) in self.late.items():
+            pair = self.pairs.get(iid, iid)
+            (n0, n1), w = self._carried.get(pair, ([0, 0], None))
+            counts[pair] = [n0 + late, n1 + total]
+            if iid in self._since:
+                began, counted = (self._since[iid], 0) if w is None else (w[0], w[2])
+                since[pair] = [began, now, counted + max(now - self._since[iid], 0), BAR_GRACE_SECONDS]
         for path, data in ((late_since_path(self.late_path), since), (self.late_path, counts)):
             try:
                 tmp = path.with_suffix(".tmp")

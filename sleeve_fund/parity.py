@@ -49,8 +49,10 @@ class Parity:
     # venue's record. The P1-1-DELAY acceptance reads this, since the store itself then matches the venue.
     replaced: int = 0
     late_trades: tuple[int, int] | None = None  # (late, total) from the hub, when it reports them
-    late_since: pd.Timestamp | None = None  # when the hub began counting them (its last start); None: not reported
+    late_since: pd.Timestamp | None = None  # when the hub began counting them (kept over restarts); None: not reported
     late_until: pd.Timestamp | None = None  # when it last wrote them; None: not reported (counted to the report's end)
+    # how long the hub ran while it counted them, over its restarts; None: not reported (from late_since on)
+    late_counted: pd.Timedelta | None = None
 
     @property
     def ok(self) -> bool:
@@ -87,8 +89,9 @@ def store_minutes(store: HistoryStore, venue: str, pair: str, start: pd.Timestam
 def compare(pair: str, ours: pd.DataFrame, theirs: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
             price_tolerance: float = 0.0, provenance: list[dict] | None = None,
             late_trades: tuple[int, int] | None = None, late_since: pd.Timestamp | None = None,
-            late_until: pd.Timestamp | None = None) -> Parity:
-    p = Parity(pair, start, end, late_trades=late_trades, late_since=late_since, late_until=late_until)
+            late_until: pd.Timestamp | None = None, late_counted: pd.Timedelta | None = None) -> Parity:
+    p = Parity(pair, start, end, late_trades=late_trades, late_since=late_since, late_until=late_until,
+               late_counted=late_counted)
     common = ours.index.intersection(theirs.index)
     p.both = len(common)
     p.venue_only = list(theirs.index.difference(ours.index))
@@ -145,7 +148,8 @@ def _late_unproven(p: Parity) -> str | None:
     hours = late_hours(p)
     if hours is None:
         return "for an unknown time (the hub didn't say when it began)"
-    since = f"for {hours:.1f} h, since {p.late_since:%d %b %H:%M} (the hub's last start)"
+    began = "the hub's last start" if p.late_counted is None else "while the hub ran"
+    since = f"for {hours:.1f} h, since {p.late_since:%d %b %H:%M} ({began})"
     if hours < LATE_PROVEN_HOURS:
         return f"{since}: under {LATE_PROVEN_HOURS} h"
     if p.late_trades[1] < LATE_PROVEN_TRADES:
@@ -230,9 +234,10 @@ def late_counts(store, venue_name: str, path=None) -> dict | None:
 
 
 def late_since(store, venue_name: str, path=None) -> dict:
-    """When the hub began counting each instrument's late trades and when it last wrote them, {pair: (UTC timestamp,
-    UTC timestamp or None)}: the file beside the counts (relay.late_since_path; a file with the start alone, as first
-    written, has no last write). Empty when the hub doesn't write it, so every share reads as not proven."""
+    """When the hub began counting each instrument's late trades, when it last wrote them and how long it ran while it
+    counted them, {pair: (UTC timestamp, UTC timestamp or None, Timedelta or None)}: the file beside the counts
+    (relay.late_since_path; a file with the start alone, as first written, has no last write, and one from before
+    HUB-LATE-PERSIST no time counted). Empty when the hub doesn't write it, so every share reads as not proven."""
     import json
     from pathlib import Path
 
@@ -243,19 +248,24 @@ def late_since(store, venue_name: str, path=None) -> dict:
         return {}
     out = {}
     for k, v in json.loads(path.read_text()).items():
-        since, until = (v, None) if isinstance(v, int) else v
+        since, until, counted = (v, None, None) if isinstance(v, int) else (*v, None, None)[:3]
         out[k] = (pd.Timestamp(int(since), unit="ns", tz="UTC"),
-                  None if until is None else pd.Timestamp(int(until), unit="ns", tz="UTC"))
+                  None if until is None else pd.Timestamp(int(until), unit="ns", tz="UTC"),
+                  None if counted is None else pd.Timedelta(int(counted), unit="ns"))
     return out
 
 
 def late_hours(p: Parity) -> float | None:
     """How many hours the late counts cover: from when the hub began counting to when it last wrote them, or the
-    report's end if sooner (PE2: a hub that stopped long before the report counted nothing since). None when the hub
-    didn't say when it began."""
+    report's end if sooner (PE2: a hub that stopped long before the report counted nothing since). When the hub kept
+    them over restarts, the time it ran while counting, less any after the report's end: the time it was down
+    counted nothing (HUB-LATE-PERSIST). None when the hub didn't say when it began."""
     if p.late_since is None:
         return None
     end = p.end if p.late_until is None else min(p.end, p.late_until)
+    if p.late_counted is not None:
+        after = p.late_until - end if p.late_until is not None else pd.Timedelta(0)
+        return max((p.late_counted - after) / pd.Timedelta("1h"), 0.0)
     return max((end - p.late_since) / pd.Timedelta("1h"), 0.0)
 
 
@@ -268,7 +278,7 @@ def run(store: HistoryStore, profile, pairs: list[str], start: pd.Timestamp, end
         theirs = venue_minutes(profile.minute_loader, pair, start, end, profile.minute_cursor_at)
         ours = store_minutes(store, profile.name, pair, start, end)
         out.append(compare(pair, ours, theirs, start, end, price_tolerance, store.provenance(profile.name, pair),
-                           (late or {}).get(pair), *(late_since or {}).get(pair, (None, None))))
+                           (late or {}).get(pair), *(late_since or {}).get(pair, (None, None, None))))
     return out
 
 

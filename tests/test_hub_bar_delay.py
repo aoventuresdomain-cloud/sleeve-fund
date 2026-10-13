@@ -159,36 +159,119 @@ def test_the_parity_report_flags_an_instrument_whose_late_trades_pass_the_widen_
     assert "**BTC/USDT**: LATE" not in md and "**SOL/USDT**: LATE" not in md
 
 
-def test_a_hub_restart_starts_the_late_count_afresh_and_the_report_says_how_long_it_covers(tmp_path):
-    """HUB-LATE-01: the counts start from nothing at each hub start, so the hub writes when it began counting and the
-    parity report shows that window; under 24 h the late share is not proven, however clean it looks."""
+H = 3600 * 10**9
+
+
+def _clock(monkeypatch, at: list[int]):
+    """The relay's wall clock, read from at[0]: the time each write is stamped with."""
+    import time
+    import types
+
+    monkeypatch.setattr("sleeve_fund.hub.relay.time", types.SimpleNamespace(time_ns=lambda: at[0], time=time.time))
+
+
+def test_a_hub_restart_carries_the_late_counts_on_and_the_report_counts_only_the_time_it_ran(tmp_path, monkeypatch):
+    """HUB-LATE-PERSIST: every deploy restarts the hub, so the counts carry on from what the last run wrote, keeping
+    when counting began. The time covered is the time the hub ran while counting, summed over its runs: 20 h, then
+    10 h down, then 6 h is 26 h covered, not the 36 h since counting began."""
     from sleeve_fund.hub.relay import late_since_path
     from sleeve_fund.parity import Parity, late_counts, late_since, markdown
 
     path = tmp_path / "hub-late-BINANCE.json"
     store = type("S", (), {"root": tmp_path})()
-    first, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 - 30 * 3600 * 10**9)
+    now = [T0 + 20 * H]
+    _clock(monkeypatch, now)
+    first, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0)
     first.late_path = path
     first.on_trade(_trade(T0 + 1 * MS))
     first.on_trade(_trade(T0 - 2 * MINUTE_NS))  # its minute already stored: late
     first._write_late()
     assert late_counts(store, "BINANCE") == {"BTC/USDT": (1, 2)}
-    (since, until), = late_since(store, "BINANCE").values()
-    assert since == pd.Timestamp(T0 - 30 * 3600 * 10**9, unit="ns", tz="UTC") and until is not None
+    assert late_since(store, "BINANCE")["BTC/USDT"] == (
+        pd.Timestamp(T0, unit="ns", tz="UTC"), pd.Timestamp(T0 + 20 * H, unit="ns", tz="UTC"), pd.Timedelta("20h"))
 
-    restarted, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 + 5 * MINUTE_NS)  # a deploy restarts the hub
+    now[0] = T0 + 36 * H
+    restarted, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 + 30 * H)  # a deploy restarts the hub, 10 h on
     restarted.late_path = path
-    restarted.on_trade(_trade(T0 + 5 * MINUTE_NS + 1 * MS))
+    restarted.on_trade(_trade(T0 + 30 * H + 1 * MS))
     restarted._write_late()
-    assert late_counts(store, "BINANCE") == {"BTC/USDT": (0, 1)}
-    since, _ = late_since(store, "BINANCE")["BTC/USDT"]
-    assert since == pd.Timestamp(T0 + 5 * MINUTE_NS, unit="ns", tz="UTC") and late_since_path(path).exists()
+    restarted._write_late()  # each write brings this run's counts up to date, never adding them twice
+    assert late_counts(store, "BINANCE") == {"BTC/USDT": (1, 3)}
+    since, until, counted = late_since(store, "BINANCE")["BTC/USDT"]
+    assert since == pd.Timestamp(T0, unit="ns", tz="UTC") and counted == pd.Timedelta("26h")
+    assert late_since_path(path).exists()
 
-    end = pd.Timestamp(T0 + 15 * MINUTE_NS, unit="ns", tz="UTC")
-    md = markdown("the venue", [Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 1),
-                                       late_since=since)])
-    assert "0 of 1 (0.000%) over 0.2 h: not proven" in md
-    assert "**BTC/USDT**: late trades counted for 0.2 h" in md and "the late share is not proven" in md
+    end = pd.Timestamp(T0 + 40 * H, unit="ns", tz="UTC")
+    md = markdown("the venue", [Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(1, 30_000),
+                                       late_since=since, late_until=until, late_counted=counted)])
+    assert "1 of 30000 (0.003%) over 26.0 h |" in md and "**BTC/USDT**: late trades counted" not in md
+    short = Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(1, 30_000), late_since=since,
+                   late_until=until, late_counted=pd.Timedelta("16h"))
+    assert "late trades counted for 16.0 h, since 05 Oct 12:00 (while the hub ran): under 24 h" in markdown(
+        "the venue", [short])
+
+
+def test_counts_taken_under_another_grace_or_by_an_older_hub_start_afresh(tmp_path, monkeypatch):
+    """A grace change makes earlier counts a different measure, and a file from before HUB-LATE-PERSIST has no time
+    counted: either way the hub starts counting afresh from its own start rather than mix them."""
+    import json
+
+    from sleeve_fund.hub.relay import late_since_path
+    from sleeve_fund.parity import late_counts, late_since
+
+    path = tmp_path / "hub-late-BINANCE.json"
+    store = type("S", (), {"root": tmp_path})()
+    now = [T0 + 2 * H]
+    _clock(monkeypatch, now)
+    for kept in ([T0 - 50 * H, T0 - H, 49 * H, BAR_GRACE_SECONDS + 1], [T0 - 50 * H, T0 - H]):
+        path.write_text(json.dumps({"BTC/USDT": [7, 9_000]}))
+        late_since_path(path).write_text(json.dumps({"BTC/USDT": kept}))
+        r, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0)
+        r.late_path = path
+        r.on_trade(_trade(T0 + 1 * MS))
+        r._write_late()
+        assert late_counts(store, "BINANCE") == {"BTC/USDT": (0, 1)}
+        assert late_since(store, "BINANCE")["BTC/USDT"] == (
+            pd.Timestamp(T0, unit="ns", tz="UTC"), pd.Timestamp(T0 + 2 * H, unit="ns", tz="UTC"), pd.Timedelta("2h"))
+
+
+def test_unreadable_late_counts_start_afresh_and_say_so(tmp_path, monkeypatch):
+    """A file cut short (the disk filled mid-write) never stops the hub: it counts afresh and logs why."""
+    from sleeve_fund.parity import late_counts
+
+    path = tmp_path / "hub-late-BINANCE.json"
+    path.write_text('{"BTC/USDT": [7, 9')
+    _clock(monkeypatch, [T0 + H])
+    r, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0)
+    r.late_path = path
+    warned = []
+    monkeypatch.setattr(type(r), "log", property(lambda self: type("L", (), {"warning": warned.append})()))
+    r.on_trade(_trade(T0 + 1 * MS))
+    r._write_late()
+    assert late_counts(type("S", (), {"root": tmp_path})(), "BINANCE") == {"BTC/USDT": (0, 1)}
+    assert any("can't read the late counts kept" in w for w in warned)
+
+
+def test_an_instrument_not_relayed_since_the_restart_keeps_its_counts_and_its_last_write(tmp_path, monkeypatch):
+    """The counts of an instrument this run hasn't subscribed to yet stay as written, last write and all, so the
+    report doesn't count the time since as covered."""
+    from sleeve_fund.parity import late_counts, late_since
+
+    path = tmp_path / "hub-late-BINANCE.json"
+    store = type("S", (), {"root": tmp_path})()
+    now = [T0 + 3 * H]
+    _clock(monkeypatch, now)
+    first, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0)
+    first.late_path = path
+    first.on_trade(_trade(T0 + 1 * MS))
+    first._write_late()
+    now[0] = T0 + 9 * H
+    restarted, _ = _relay(last_close={BTC: T0 - MINUTE_NS}, since=T0 + 8 * H)
+    restarted.late_path = path
+    restarted._write_late()  # nothing traded yet this run
+    assert late_counts(store, "BINANCE") == {"BTC/USDT": (0, 1)}
+    assert late_since(store, "BINANCE")["BTC/USDT"] == (
+        pd.Timestamp(T0, unit="ns", tz="UTC"), pd.Timestamp(T0 + 3 * H, unit="ns", tz="UTC"), pd.Timedelta("3h"))
 
 
 def test_a_late_share_counted_over_24_hours_is_reported_without_the_not_proven_mark():
@@ -227,3 +310,13 @@ def test_a_day_with_too_few_trades_to_show_the_bar_is_not_proven():
     md = markdown("the venue", [quiet])
     assert "0 of 5000 (0.000%) over 26.0 h: not proven" in md
     assert "over 5,000 trades: under 6,000 trades, so the late share is not proven" in md
+
+
+def test_time_counted_after_the_report_ends_is_not_counted_as_covered():
+    """A report read up to a point before the hub's last write covers less: the time after its end comes off."""
+    from sleeve_fund.parity import Parity, late_hours
+
+    end = pd.Timestamp("2026-10-14 15:00", tz="UTC")
+    p = Parity("BTC/USDT", end - pd.Timedelta("132h"), end, late_trades=(0, 200_000),
+               late_since=end - pd.Timedelta("40h"), late_until=end + pd.Timedelta("3h"), late_counted=pd.Timedelta("30h"))
+    assert late_hours(p) == 27.0
