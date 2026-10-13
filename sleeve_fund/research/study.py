@@ -201,6 +201,9 @@ class StudyResult:
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+    # The probability of backtest overfitting (research.pbo, R4) over the sensitivity grid and every other counted
+    # setting of the idea family, with its variant count.
+    pbo: object = None
 
     @property
     def compare_returns(self) -> pd.Series:
@@ -593,17 +596,18 @@ def run_study(
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
            fees: FeeSchedule | None = None, slippage: float = 0.0, oos: bool = False, trade_from=None,
            feed: pd.DataFrame | None = None, flip: bool = False,
-           count_from: pd.Timestamp | None = None) -> BacktestResult:
+           count_from: pd.Timestamp | None = None, family: bool = False) -> BacktestResult:
         """One run. oos: an out-of-sample window or the holdout, on oos_exec_prices, flat until trade_from (a bar's
         close time). feed: these execution bars instead. flip: a first_touch rule's ambiguous candles resolve the
         other way (R2-G1); count_from: its report counts only the candles closing from then on (a window's test
-        candles)."""
+        candles). family: a setting counted for this idea before, re-run for PBO (R4): params already hold the exits
+        it was tried with, and what it raises or rests is its own, not this study's."""
         done[0] += 1
         if progress is not None:
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
         params = {**params, **market}
-        if not benchmark:
+        if not benchmark and not family:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
             params = {**params, "position_cap_pct": position_cap}
@@ -618,6 +622,8 @@ def run_study(
                            exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
                            half_spread=series.plus(slippage) if series is not None else half_spread + slippage,
                            first_touch_flip=flip, first_touch_count_from=count_from)
+        if family:
+            return res
         if not benchmark:
             labels.extend(x for x in res.labels if x not in labels)
             resting[0] = resting[0] or any(d.get("intent") in RESTING_INTENTS for d in res.decisions.values())
@@ -701,9 +707,11 @@ def run_study(
 
     rows, ladders = [], []
     full_default = None
-    for params in combos:
+    grid_returns = {}  # every configuration's daily net returns, discarded ones too: what PBO is fed (R4)
+    for i, params in enumerate(combos):
         res = bt(spec.name, research, params)
-        m = summary(daily_returns(res.equity))
+        grid_returns[i] = daily_returns(res.equity)
+        m = summary(grid_returns[i])
         log(params, "sensitivity", m["sharpe"], research)
         rungs = cost_ladder(params)
         ladders.append(rungs)
@@ -715,6 +723,7 @@ def run_study(
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
     sensitivity = pd.DataFrame(rows)
+    overfit = _overfit(grid_returns, [{**p, **exits} for p in combos], register, spec, research, bt)
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
     sharpes = [r["sharpe"] if math.isfinite(r["sharpe"]) else -math.inf for r in rows]
     if rows and max(sharpes) > -math.inf:
@@ -858,6 +867,7 @@ def run_study(
         full_period=full_default,
         full_period_benchmark=bench,
         sensitivity=sensitivity,
+        pbo=overfit,
         folds=folds,
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
@@ -1152,6 +1162,49 @@ def _one_way(result: StudyResult, ledger: IdeaLedger, fold_runs: list, bt, minut
     result.spot_check = {"window": window, "seed": seed, "gap": round(gap, 2)}
     if -gap > tolerance:
         result.one_way = "void"
+
+
+def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: IdeaSpec, research: pd.DataFrame, bt):
+    """R4's PBO (Advisor 13 Oct 16:50): the sensitivity grid plus every other counted setting of the idea family in the
+    trials register, each re-run on this study's research period (never the holdout) and fee model, as daily net
+    returns. Ablation and portfolio rows don't count there (trials._counted), so they stay out. A counted setting that
+    can't be re-run is listed and labels the result partial. A family of one pre-registered setting has no selection
+    (TrialsRegister.no_selection, Advisor 13 Oct 18:05)."""
+    import json
+
+    from sleeve_fund.research.pbo import pbo
+
+    columns = {f"grid {i}": r for i, r in grid_returns.items()}
+    partial = []
+    if register is not None:
+        from sleeve_fund.research.pbo import no_selection
+        from sleeve_fund.research.trials import legacy_idea_hash
+
+        if why := register.no_selection(legacy_idea_hash(spec.name)):
+            return no_selection(why)
+        seen = {json.dumps(s, sort_keys=True) for s in grid_settings}
+        for t in register._counted(legacy_idea_hash(spec.name)):
+            try:
+                settings = json.loads(t["settings"]) if isinstance(t["settings"], str) else t["settings"]
+                if t["status"] == "failed" and set(settings) == {"params"}:  # trials.failed_row wraps them
+                    settings = settings["params"]
+                key = json.dumps(settings, sort_keys=True)
+            except (TypeError, ValueError, AttributeError) as e:
+                partial.append(f"trial {t['id']}: its settings can't be read ({e})")
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                res = bt(spec.name, research, settings, family=True)
+            except Exception as e:  # noqa: BLE001 - any failure is listed, never fatal to the study
+                partial.append(f"trial {t['id']}: {type(e).__name__}: {e}")
+                continue
+            if res.handler_errors:
+                partial.append(f"trial {t['id']}: the strategy raised errors on re-run")
+                continue
+            columns[f"trial {t['id']}"] = daily_returns(res.equity)
+    return pbo(pd.DataFrame(columns), partial=tuple(partial))
 
 
 def _window_trips(trips: list[dict], test_start) -> dict:
