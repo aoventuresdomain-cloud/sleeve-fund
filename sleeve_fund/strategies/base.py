@@ -738,6 +738,7 @@ class LongFlatStrategy(Strategy):
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
+        self._gtd_refused: str | None = None  # og1: the venue refused a good-till-date entry this run (its reason)
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
@@ -972,6 +973,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
+        self._reconcile_resting()  # og3: before anything here can decide, let alone send, a new entry
         self.resume_cycle()  # before the warm-up, which decides the candles since on the model's own state
         self._plan_resume()
         if self.preload:
@@ -2976,6 +2978,14 @@ class LongFlatStrategy(Strategy):
         batch, name = self._portfolio
         batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
 
+    @staticmethod
+    def _gtd_refusal(order, event) -> bool:
+        """og1: whether the venue refused a good-till-date order for its expiry (not for its price or size)."""
+        if order is None or order.time_in_force != TimeInForce.GTD:
+            return False
+        why = str(getattr(event, "reason", "") or "").lower().replace(" ", "").replace("-", "")
+        return any(w in why for w in ("gtd", "goodtilldate", "goodtill", "expire", "expiry"))
+
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
         the venue's minimum lead on a short bar, or good-till-cancelled with the backstop note on a venue without it."""
@@ -2986,9 +2996,26 @@ class LongFlatStrategy(Strategy):
             lead = venue(str(self._cfg.instrument_id.venue)).gtd_min_lead
         except ValueError:  # a venue with no profile (a test's): no good-till-date assumed, the backstops cover it
             lead = None
+        if self._gtd_refused is not None:  # it refused one this run: good-till-cancelled from now on, and why
+            from sleeve_fund.paper.orphan_guard import NO_GTD_NOTE
+
+            return TimeInForce.GTC, None, f"{NO_GTD_NOTE}. The venue refused the good-till-date: {self._gtd_refused}"
         return resting_entry_order(gtd_supported=lead is not None, decision_close=_utc(self._deciding[0]),
                                    bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
                                    now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
+
+    def _reconcile_resting(self) -> None:
+        """ORPHAN-GUARD og3 at a paper start: every gated entry the journal still has open from before is asked to
+        cancel, the venue's open ones sent their cancel, the rest answered "not found" (a sandbox's orders end with its
+        process); entries stay blocked (CHOKE: Resting entry) until each is confirmed. Its owner is marked up again."""
+        if self._paper_gated() is None:
+            return
+        from sleeve_fund.paper.orphan_guard import restart_reconcile
+
+        rt = self.runtime
+        venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
+        restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
+                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))))
 
     def _paper_gated(self):
         """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a
@@ -3124,7 +3151,7 @@ class LongFlatStrategy(Strategy):
             self._sent.append(order.client_order_id)
             self.submit_order(order)
             if maker:
-                self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
+                self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal, "deciding": self._deciding}
         if self.runtime is not None and coid not in self._kept:
             self.runtime.on_timing(coid, sent=self.clock.timestamp_ns())
         if maker:
@@ -4850,6 +4877,19 @@ class LongFlatStrategy(Strategy):
                 and self._pending_exit is None):
             self._stop_rejected(coid, str(getattr(event, "reason", "") or ""))
         info = self._maker.pop(coid, None)
+        if info is not None and self._gtd_refusal(order, event):
+            # og1 (Advisor 13 Oct): the venue refused even the clamped expiry. The entry goes again through the gate,
+            # good-till-cancelled with the backstop note, never at market and never dropped for its expiry.
+            self._cancel_alert(coid)
+            self._gtd_refused = str(getattr(event, "reason", "") or "refused")
+            was, self._deciding = self._deciding, info.get("deciding")  # still its own decision bar's entry
+            try:
+                self._send_entry(order.side, order.quantity.as_decimal(), info["reason"], info["signal"],
+                                 what=info["intent"])
+            finally:
+                self._deciding = was
+            self._resume_exit(coid)
+            return
         if info is not None:  # e.g. the price moved and a post-only order would have taken liquidity
             self._cancel_alert(coid)
             if self._pending_exit is None:

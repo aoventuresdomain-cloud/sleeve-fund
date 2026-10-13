@@ -124,7 +124,7 @@ def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], se
     owner_up(store, name, now)
     for c in store.open_cancels(name):  # asked while it was down, and the venue no longer has it: "not found"
         if c["order_id"] not in venue_open:
-            cancel_confirmed(store, c["order_id"], not_found=True)
+            cancel_confirmed(store, c["order_id"], not_found=True, at=now)
     asked = []
     mine = {r["order_id"] for r in gated_open(store, name)}
     for oid in venue_open:
@@ -183,18 +183,18 @@ def settle_cancels(store, now: datetime) -> None:
                 pass
 
 
-def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=None) -> str | None:
-    """The venue's answer to a cancel the journal holds open: Store.apply_cancel. A "not found" for an order that the
-    journal shows filled is a fill (Advisor 06:20 UK): nothing is released as 'cancel', and og5 closes it."""
+def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=None,
+                     at: datetime | None = None) -> str | None:
+    """The venue's answer to a cancel the journal holds open: Store.apply_cancel, stamped `at` (the answering
+    process's clock; by default the supervisor's last pass). A "not found" for an order that the journal shows filled
+    is a fill (Advisor 06:20 UK): nothing is released as 'cancel', and og5 closes it."""
     open_ = [c for c in store.open_cancels() if c["order_id"] == order_id]
     if not open_:  # its own process's cancel (the bar-close cancel): the order's end settles its reservation (W2)
         store.update_order(order_id, status="expired" if not_found else "canceled")
         return "applied"
-    import inspect
-
-    at = store.__dict__.get("_supervisor_now")  # the supervisor's clock, which confirm_cancels' quiet window runs on
-    kw = {"at": at} if at is not None and "at" in inspect.signature(store.apply_cancel).parameters else {}
-    got = store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled", **kw)
+    if at is None:
+        at = store.__dict__.get("_supervisor_now")  # the supervisor's clock, which confirm_cancels' quiet window runs on
+    got = store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled", at=at)
     if got in ("filled", "partly_filled"):  # a fill, not a cancel: og5 closes what filled while its owner was down
         close_orphans(store, utcnow_(), close)
     return got
