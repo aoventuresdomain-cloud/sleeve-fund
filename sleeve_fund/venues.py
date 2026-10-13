@@ -13,6 +13,7 @@ import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from typing import Callable
 
@@ -78,6 +79,9 @@ class VenueProfile:
     core_pairs: tuple[str, ...] = ()
     # Instruments a form suggests on this venue (any other can still be typed); its core list when empty
     instrument_hints: tuple[str, ...] = ()
+    # How far ahead a good-till-date order must expire for the venue to take it; None: it takes no good-till-date
+    # orders (ORPHAN-GUARD og1 then sends good-till-cancelled and journals that only the backstops cover it)
+    gtd_min_lead: timedelta | None = None
     # A market data hub (sleeve_fund.hub) feeds paper here: every bar is built from its minutes, so the venue's
     # own candles (EXTERNAL bar specs) aren't offered until slower bars are built from minutes (v2 P1-4)
     hub: bool = False
@@ -522,6 +526,10 @@ def _binance_data_client() -> tuple:
                                                                environment=BinanceEnvironment.LIVE)
 
 
+# USD-M futures take a GTD order only if it expires more than 600 s ahead (the published goodTillDate rule).
+# ORPHAN-GUARD og1 clamps a short bar's expiry past it; the testnet drill confirms the figure (HoQA, 13 Oct).
+BINANCE_GTD_MIN_LEAD = timedelta(seconds=600)
+
 BINANCE = register(VenueProfile(
     name="BINANCE",
     label="Binance USD-M perpetuals",
@@ -539,6 +547,7 @@ BINANCE = register(VenueProfile(
     # BTC and ETH perpetuals trade a cent or less apart; 0.01% half spread is cautious for them, light for small ones.
     assumed_half_spread=0.0001,
     perpetual=True,
+    gtd_min_lead=BINANCE_GTD_MIN_LEAD,
     symbol=lambda pair: f"{binance_symbol(pair)}-PERP",
     funding_loader=binance_funding,
     stats_loaders=BINANCE_STATS,

@@ -471,7 +471,10 @@ class Supervisor:
         else:
             self._flatten_told.clear()
             self._halt_tells.clear()
-        sweep(led, now, self._order_live, self._cancel_order, is_acked=self._order_acked)
+        # No cancel yet (None): the owner cancels its own entries at its next bar close, and the supervisor's cancel of
+        # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
+        # kept and alerted on as not cancelled, never released blind.
+        sweep(led, now, self._order_live, None, is_acked=self._order_acked)
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
@@ -517,10 +520,6 @@ class Supervisor:
     def _order_acked(self, order_id: str) -> bool:
         """Whether the venue has acked the order (resting or part filled): its reservation then lives with it."""
         return self.ledger.order_status(order_id) in ("accepted", "partially_filled")
-
-    def _cancel_order(self, order_id: str) -> None:
-        raise NotImplementedError("asking a strategy's process to cancel one order comes with the paper gate (P2-1b "
-                                  "W2)")
 
     def check_keys(self) -> None:
         """Tell the dashboard which live accounts have their venue's key on this server (presence only)."""

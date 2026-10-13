@@ -120,7 +120,10 @@ class DbLedger:
 
     @contextmanager
     def using(self, conn: Connection) -> Iterator[None]:
-        """Ledger calls inside join `conn`'s transaction: a fill, reject or cancel and its release commit together."""
+        """Ledger calls inside join `conn`'s transaction: a fill, reject or cancel and its release commit together. An
+        entry check never runs in here (it fails closed as lock_error, CR F219-4), and the strategy's sleeves row must
+        already be committed: on Postgres an audit write in here takes its own transaction, which can't see rows this
+        one created (CR F228-1, FE note 13 Oct)."""
         loc = self._local
         if getattr(loc, "conn", None) is not None:
             raise RuntimeError("using() inside the ledger's lock or another using(): one transaction at a time")
@@ -254,10 +257,17 @@ class DbLedger:
         return conn.execute(q.with_for_update() if for_update else q).first()
 
     def attach_order(self, reservation_id: int, order_id: str) -> None:
+        """Tie the reservation to the order that holds it. Refused (ValueError) when it is no longer held (the sweep
+        released it between the check and the send) or already holds another order: inside the order's own write
+        (Store.record_order), so that order is never written, or sent, holding no room in the book (QT2 w2-adv-1, 2)."""
+        d = gate_decisions_t
         with self._tx() as conn:
-            if self._active(conn, reservation_id) is not None:
-                conn.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == reservation_id)
-                             .values(order_id=order_id))
+            if self._active(conn, reservation_id) is None:
+                raise ValueError(f"reservation {reservation_id} is no longer held, so order {order_id} can't hold it")
+            held = conn.execute(select(d.c.order_id).where(d.c.id == reservation_id)).scalar()
+            if held not in (None, order_id):
+                raise ValueError(f"reservation {reservation_id} already holds order {held}, not {order_id}")
+            conn.execute(update(d).where(d.c.id == reservation_id).values(order_id=order_id))
 
     def cancel_sent(self, reservation_id: int, at: datetime) -> None:
         r = gate_reservations_t
