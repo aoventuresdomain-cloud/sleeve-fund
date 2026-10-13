@@ -52,7 +52,8 @@ def test_each_strategys_sub_ledger_is_its_step_a_pnl_and_the_saving_is_the_books
                Funding("B", "BTC", T + 1, D("0.0001"), D(100), D("0.01"))]
     s = shadow(fills, funding, mark, half, TAKER)
     assert s.strategy_cash() == {"A": fills[0].cash - D("0.02"), "B": fills[1].cash + D("0.01")}  # step A, line for line
-    assert s.saving() == {"crossed": D("0.2"), "fee": D("0.1")}  # funding is linear in the position: nothing saved
+    assert s.saving() == {"crossed": D("0.2"), "fee": D("0.1")}  # funding has no saving line (Advisor 20:25 UK)
+    assert s.account_funding == D("-0.01")  # the net unit's: what the two sub-ledgers' funding sums to
     assert all(r["kind"] != "residual" for r in s.book)
     rec = reconcile(sum(s.strategy_cash().values()), sum(s.saving().values()), s.account, D(10_000))
     assert rec["amount"] == 0 and not rec["block"]
@@ -72,14 +73,29 @@ def test_bars_and_instruments_are_netted_apart():
                                                              (T + 60, "BTC", D(-1))]
 
 
-def test_the_net_positions_funding_differs_only_by_each_accounts_rounding():
-    """0.3 x 0.0001 x 100 per Strategy rounds to the cent apart; the account rounds the net once: the difference is a
-    book line, never a Strategy's."""
+def test_the_net_positions_funding_differs_only_by_rounding_and_that_goes_to_the_residual():
+    """0.333 x 0.0001 x 100 per Strategy rounds to the cent apart; the account rounds the net once. Advisor 20:25 UK:
+    no funding saving line; the sub-ledgers' funding reconciles to the account's and the difference is residual."""
     fills = [alone("A", "0.333"), alone("B", "0.333")]
     funding = [Funding(n, "BTC", T + 1, D("0.0001"), D(100), D("-0.00")) for n in ("A", "B")]  # each rounded to 0.00
     s = shadow(fills, funding, mark, half, TAKER, funding_quantum=D("0.01"))
-    assert s.saving().get("funding") == D("-0.01")  # 0.666 x 0.01 = 0.00666 rounds to 0.01 paid once
+    assert "funding" not in s.saving() and s.account_funding == D("-0.01")  # 0.00666 rounds to 0.01 paid once
     assert s.strategy_cash()["A"] == fills[0].cash
+    rec = reconcile(sum(s.strategy_cash().values()), sum(s.saving().values()), s.account, D(10_000))
+    assert rec["amount"] == D("-0.01") and not rec["block"]  # 0.01 bp of the account, inside the 5 bp
+
+
+def test_sub_ledgers_plus_saving_plus_residual_are_the_account_to_the_cent():
+    """Advisor 13 Oct 20:25 UK: the identity the book's page rests on."""
+    fills = [alone("A", "2.5"), alone("B", "-1.25"), alone("C", "0.4"), alone("A", "-1", ts=T + 60),
+             alone("B", "1", ts=T + 60)]
+    funding = [Funding(n, "BTC", T + 30, D("0.0001"), D(100), a) for n, a in (("A", D("-0.03")), ("B", D("0.01")),
+                                                                              ("C", D("-0.00")))]
+    s = shadow(fills, funding, mark, half, TAKER, funding_quantum=D("0.01"))
+    sub, saving = sum(s.strategy_cash().values()), sum(s.saving().values())
+    rec = reconcile(sub, saving, s.account, D(10_000))
+    cent = D("0.01")
+    assert (sub + saving + rec["amount"]).quantize(cent) == s.account.quantize(cent)
 
 
 @pytest.mark.parametrize(("residual", "block"), [(D("4.99"), False), (D("5.01"), True)])

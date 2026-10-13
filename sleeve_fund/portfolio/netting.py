@@ -7,13 +7,19 @@ sub-ledger is its own step A fills, fees and funding, booked as it traded alone 
 saves goes to book-level lines, never to a Strategy:
 - crossed: the price the crossing intents didn't pay (the spread both sides of a cross would have crossed alone);
 - fee: the fees on volume that crossed inside the account instead of going to the venue;
-- funding: what the net position pays against the sum of the virtual ones. Funding is linear in the position, so it is
-  zero but for each account's rounding: netting saves margin and fees, not funding;
 - residual: what is left when the sub-ledgers and those lines don't sum to the account (§2.5). Above RESIDUAL_BP of the
   account's equity it is alerted and blocks new entries on that venue (reconcile()).
 
-The net order is priced with step A's own fill model for a market order (instruments.taker_slippage, the venue's taker
-fee): the decision mark moved by the slippage against the net side. A bar whose intents fully cross sends nothing.
+Funding has no saving line (Advisor 13 Oct 20:25 UK): it is linear in the position, so the net position pays what the
+virtual ones do but for each account's rounding (a baseline settlement for a missing rate, which both sides pay, is
+not linear: there the account pays less than its Strategies when they are opposed, and that shows in the residual). The account pays the net position's funding, the sub-ledgers carry
+their own, and any difference is part of the residual, under the same 5 bp rule. Netting saves fees, spread and margin;
+the margin is shown as information only, never as P&L.
+
+A bar whose intents all go one way crosses nothing: the account sends what step A sent, at step A's own prices and fees,
+and nothing is saved. Where intents cross, the net order is priced with step A's own fill model for a market order
+(ScheduleFeeModel: the decision mark moved by the half spread against the net side, the venue's taker fee). A bar whose
+intents fully cross sends nothing.
 
 Money and quantities are exact Decimals (sleeve_fund.money): a float is refused, as in portfolio.limits."""
 
@@ -25,8 +31,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from itertools import combinations
 
-from sleeve_fund.instruments import taker_slippage
-from sleeve_fund.money import money
+from sleeve_fund.money import money, scale
 
 RESIDUAL_BP = Decimal(5)  # §2.5: a residual above this many basis points of the account's equity alerts and blocks
 ZERO = Decimal(0)
@@ -57,7 +62,8 @@ class Fill:
 @dataclass(frozen=True)
 class Funding:
     """One step A funding line: what a Strategy's virtual position in `instrument` paid (negative) or was credited at
-    the settlement `ts`, at `rate` on `mark`."""
+    the settlement `ts`, at `rate` on `mark`. both_pay: a settlement charged at the baseline for a missing rate, which
+    every side pays and none receives (Advisor 6 Oct, D9): the account then pays it on its net position's size."""
 
     strategy: str
     instrument: str
@@ -65,6 +71,7 @@ class Funding:
     rate: Decimal
     mark: Decimal
     amount: Decimal
+    both_pay: bool = False
 
     def __post_init__(self) -> None:
         for name in ("rate", "mark", "amount"):
@@ -93,13 +100,14 @@ class NetOrder:
 @dataclass(frozen=True)
 class Shadow:
     """Step B beside step A: the net orders, each Strategy's sub-ledger rows (its step A lines, kind fill, fee or
-    funding) and the book-level lines (kind crossed, fee, funding), all as cash amounts, plus the account's cash move
-    those orders and the net position's funding make."""
+    funding) and the book-level saving lines (kind crossed or fee), all as cash amounts, plus the account's cash move
+    those orders and the net position's funding make (account_funding, its funding part)."""
 
     orders: tuple[NetOrder, ...]
     sub_ledger: tuple[dict, ...]
     book: tuple[dict, ...]
     account: Decimal
+    account_funding: Decimal = ZERO
 
     def strategy_cash(self) -> dict[str, Decimal]:
         out: dict[str, Decimal] = defaultdict(lambda: ZERO)
@@ -118,7 +126,8 @@ def net_orders(fills: Iterable[Fill], mark: Callable[[str, int], Decimal], half_
                taker: Decimal) -> tuple[NetOrder, ...]:
     """The bar's intents per instrument as one net order each (§2.2), in time then instrument order. mark(instrument,
     ts): the decision mark step A's market orders fill from; half_spread(instrument, ts): the half spread its fill model
-    used there (taker_slippage applies the floor)."""
+    charged a market order there. Only a bar whose intents cross is repriced; one whose intents all go one way is what
+    step A sent (its volume-weighted price, its fees: a stop's or a target's own booking stays as it was)."""
     taker = money(taker, "taker")
     groups: dict[tuple[int, str], list[Fill]] = defaultdict(list)
     for f in fills:
@@ -127,16 +136,22 @@ def net_orders(fills: Iterable[Fill], mark: Callable[[str, int], Decimal], half_
     for (ts, instrument), group in sorted(groups.items()):
         net = sum((f.qty for f in group), ZERO)
         crossed = (sum((abs(f.qty) for f in group), ZERO) - abs(net)) / 2
-        m = money(mark(instrument, ts), "mark")
-        if net:
-            slip = taker_slippage(half_spread(instrument, ts))
+        if not crossed:
+            price, fee = sum((f.qty * f.price for f in group), ZERO) / net, sum((f.fee for f in group), ZERO)
+        elif net:
+            m, slip = money(mark(instrument, ts), "mark"), _ratio(half_spread(instrument, ts))
             price = m * (1 + slip) if net > 0 else m * (1 - slip)
             fee = abs(net) * price * taker
         else:
-            price, fee = m, ZERO
+            price, fee = money(mark(instrument, ts), "mark"), ZERO
         out.append(NetOrder(instrument, ts, net, crossed, price, fee,
                             tuple(sorted({f.strategy for f in group}))))
     return tuple(out)
+
+
+def _ratio(r) -> Decimal:
+    """A half spread as a Decimal: as given when exact, else through money.scale (the one float-to-Decimal door)."""
+    return r if isinstance(r, Decimal) else scale(1, r)
 
 
 def shadow(fills: Iterable[Fill], funding: Iterable[Funding], mark: Callable[[str, int], Decimal],
@@ -144,7 +159,8 @@ def shadow(fills: Iterable[Fill], funding: Iterable[Funding], mark: Callable[[st
            funding_quantum: Decimal = Decimal("0.00000001")) -> Shadow:
     """Step B in shadow over a step A run's fills and funding (§2.3, §2.6). Each Strategy's sub-ledger is its own step A
     lines; the account trades the net orders and pays funding on the net position (rate x position x mark, rounded to
-    `funding_quantum` as the venue books it); the differences are the book's saving lines."""
+    `funding_quantum` as the venue books it). What the net orders save is the book's lines; what the net position's
+    funding differs from the sub-ledgers' is left to reconcile()'s residual."""
     fills, funding = list(fills), list(funding)
     orders = net_orders(fills, mark, half_spread, taker)
     sub: list[dict] = []
@@ -174,15 +190,11 @@ def shadow(fills: Iterable[Fill], funding: Iterable[Funding], mark: Callable[[st
         settlements[(r.ts, r.instrument)].append(r)
     positions = _positions(fills)
     for (ts, instrument), rows in sorted(settlements.items()):
-        pos = positions(instrument, ts)
-        rate, m = rows[0].rate, rows[0].mark
-        paid = (-rate * pos * m).quantize(funding_quantum)
-        net_funding += paid
-        alone = sum((r.amount for r in rows), ZERO)
-        if paid != alone:
-            book.append({"instrument": instrument, "ts": ts, "kind": "funding", "amount": paid - alone})
+        rate, m, pos = rows[0].rate, rows[0].mark, positions(instrument, ts)
+        owed = -abs(rate * pos * m) if rows[0].both_pay else -rate * pos * m
+        net_funding += owed.quantize(funding_quantum)
     account = sum((o.cash for o in orders), ZERO) + net_funding
-    return Shadow(orders, tuple(sub), tuple(book), account)
+    return Shadow(orders, tuple(sub), tuple(book), account, net_funding)
 
 
 def _positions(fills: list[Fill]) -> Callable[[str, int], Decimal]:
