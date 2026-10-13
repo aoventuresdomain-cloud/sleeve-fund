@@ -54,12 +54,20 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # Reason codes (Advisor 7 Oct 00:20; QA pins them): stable, and listed in this order when several apply. Callers key
 # off the codes, never the words. Each cause's text for the PM starts with its label, gives the figure where there is
 # one, and says what alone clears it; no venue names.
-CODES = ("liquidated", "drawdown_halt", "halted", "daily_pause", "retired", "winding_down", "stopped", "paused",
-         "exits_only", "stale_data", "degraded_candle", "funding_missing")
+CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
+         "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
+         "portfolio_stale")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
-          "daily_pause": "Daily loss pause", "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
+          "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
+          "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
-          "degraded_candle": "Degraded candle", "funding_missing": "No funding rate"}
+          "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
+          "portfolio_stale": "Portfolio unchecked"}
+# The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
+# reason starts with, which the label already says.
+PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
+                   "pause": ("portfolio_pause", "Portfolio paused for the day: "),
+                   "portfolio_state_stale": ("portfolio_stale", "")}
 # The engine's holds (SleeveRuntime.holds) by key: a code, or an older key for one.
 HOLD_CODES = {"data": "degraded_candle", "stale": "stale_data", "funding": "funding_missing"}
 RESUMABLE = ("drawdown_halt", "halted")  # the halts the PM's Resume clears
@@ -167,12 +175,13 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
-                  since: datetime | None = None) -> tuple[bool, Why | None]:
+                  since: datetime | None = None, portfolio: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
-    candle, no funding rate). The why lists every cause that applies (Advisor 00:20). The engine checks every order
+    candle, no funding rate). `portfolio`: the whole fund's block (portfolio_block), which no Start or Resume of one
+    strategy clears. The why lists every cause that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
     causes = []
@@ -183,6 +192,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(halt)
     if archived:
         causes.append(RETIRED)
+    if portfolio is not None:
+        causes.append(portfolio)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -299,7 +310,41 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     held = None if starting else held_causes(open_block(store, name, now))
     sleeve = store.sleeve(name)
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
-                         holds=held or None, starting=starting, since=_halted_since(store, name, sleeve))
+                         holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
+                         portfolio=portfolio_block(store, now))
+
+
+def portfolio_block(store, now: datetime | None = None) -> Why | None:
+    """The whole fund's reason nothing opens (v2 P2-2: halted, paused for the day, or its book's mark older than 60 s),
+    as a CHOKE cause, or None. In force on every paper or live journal (Store.portfolio_gate, which their startup
+    requires): one with no state row has never been marked, so it is stale and blocks entries, with an alert (fail
+    closed, Advisor 8 Oct 06:10 UK). Only the journal's mode decides, never the row being absent.
+    Read without the gate lock, which every tick, fill check and dashboard read would otherwise queue on; the lock is
+    taken only to tell a stale spell once. A state that can't be read is stale, never an error out of CHOKE (CR
+    F229-2)."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import block_reason, entry_block, stale_untold
+
+    if not getattr(store, "portfolio_gate", False):
+        return None
+    now = now or utcnow()
+    try:
+        led = DbLedger(store, _no_positions)
+        st = led.state()
+        hit = block_reason(st, now)
+        if hit is not None and hit[0] == "portfolio_state_stale" and stale_untold(st):
+            hit = entry_block(led, now)
+    except Exception as exc:  # noqa: BLE001 - fail closed: unchecked limits open nothing
+        return _cause("portfolio_stale", f"No new entries: the portfolio's state couldn't be read "
+                      f"({type(exc).__name__}: {exc}), so the portfolio limits can't be checked")
+    if hit is None:
+        return None
+    code, lead = PORTFOLIO_CODES[hit[0]]
+    return _cause(code, hit[1].removeprefix(lead))
+
+
+def _no_positions():
+    raise RuntimeError("CHOKE reads the portfolio's state only, never the book")
 
 
 def _halted_since(store, name: str, sleeve) -> datetime | None:
@@ -498,7 +543,8 @@ class SleeveRuntime:
         blocked, why = blocked_state(state, self.now(),
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
-                                     holds=self.holds, since=_halted_since(self.store, self.name, state))
+                                     holds=self.holds, since=_halted_since(self.store, self.name, state),
+                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()))
         self._episode(why if blocked else None)
         return blocked, why
 
@@ -557,11 +603,11 @@ class SleeveRuntime:
         The process checks the row as Store.command does (ral_refusal; QA-193-F4: a row with no noted incident, from a
         restored backup or a script, is refused, not carried out). The command is marked applied only after
         liquidation_reset is journaled (QA-193-F3): a failure in between leaves it pending and the incident unspent,
-        so the restart takes it again. One journaled but not yet marked (its incident answered by the newest
-        liquidation_reset) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
+        so the restart takes it again. One journaled but not yet marked (a liquidation_reset carries its command_id,
+        F217-3) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
         a halt still standing is lifted. Any other RAL with nothing to reset is ignored as before, and lapses nothing."""
         liq = liquidation_event(self.store, self.name)
-        if liq is None and self._ral_journaled(cmd):
+        if liq is None and (reset := self.store.reset_for_command(cmd["id"])) is not None:
             # The process died after journaling this reset and before marking it applied: finish it from the journal,
             # never journal it twice or call it ignored. Lift the halt only when it is the liquidation's (its reason,
             # as clearing_action reads it) and no halt has been journaled since the reset (a reconciliation mismatch
@@ -570,7 +616,6 @@ class SleeveRuntime:
             self.peak, self._day_open = equity, equity
             self.wiped_out, self.liquidated = False, None
             if self.status == "halted":
-                reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
                 kept = self._lift_the_liquidations_halt(after_id=reset["id"])
                 self.store.event(self.name, "info", "ral_finished",  # events.kind is String(32)
                                  "reset after liquidation finished after a restart; "
@@ -589,7 +634,7 @@ class SleeveRuntime:
             return
         old = self.peak
         self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
-                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
+                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now(), command_id=cmd["id"])
         self._lapse_resets_before(cmd)
         self.peak, self._day_open = equity, equity
         self.wiped_out, self.liquidated = False, None
@@ -618,14 +663,6 @@ class SleeveRuntime:
 
     def _status_reason(self) -> str:
         return self.store.sleeve(self.name).status_reason or ""
-
-    def _ral_journaled(self, cmd: dict) -> bool:
-        """True when the newest liquidation_reset answers this command's incident (ral_words names it): the reset was
-        journaled and the process died before marking the command applied."""
-        if cmd.get("incident") is None:
-            return False
-        last = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
-        return last is not None and f"answering incident #{cmd['incident']} (" in last["message"]
 
     def _lapse_resets_before(self, cmd: dict) -> None:
         for request in self.store.pending_resets():
