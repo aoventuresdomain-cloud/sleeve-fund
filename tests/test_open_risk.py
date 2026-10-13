@@ -143,6 +143,9 @@ def test_a_gated_paper_entry_with_no_stop_and_no_daily_atr_is_refused_as_a_warni
     from test_replay import START
 
     monkeypatch.setattr(gate, "MARK_STALE", timedelta(days=1))  # one mark covers the replay
+    # The recorded pair quotes in USD on the hub-fed venue's paper account, a test account outside the fund's book
+    # (F229-6) that the gate never sees; this pin is about a Strategy the gate does see.
+    monkeypatch.setattr("sleeve_fund.supervisor.outside_fund_book", lambda store, s: False)
     store = Store.in_memory(portfolio_gate=True)
     marked, book = pd.Timestamp(START, tz="UTC").to_pydatetime(), Decimal(20_000)
     DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=marked, equity=book, hwm=book, day=marked.date(),

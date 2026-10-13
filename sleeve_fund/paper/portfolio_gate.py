@@ -48,8 +48,10 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
             return history_atr_pct(s.venue or "", s.instrument, now)
     out = []
     archived = store.archived()
+    from sleeve_fund.supervisor import outside_fund_book
+
     for s in store.sleeves():
-        if s.name in archived:
+        if s.name in archived or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
         book = store.journal_book(s.name, s.starting_balance)
         qty = to_decimal(book["qty"], "qty")
