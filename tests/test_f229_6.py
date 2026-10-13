@@ -83,19 +83,29 @@ def _gate_of(store, name):
 T_MARK = datetime(2026, 10, 14, 9, 0, tzinfo=UTC)
 
 
-def _archived_holder(tmp_path) -> Store:
-    """usdt (BTC perp, balanced: 2x) bought 0.1 at 60,000 with a 1% stop, marked, then stopped and archived holding."""
-    store = Store(f"sqlite:///{tmp_path}/h.db", portfolio_gate=True)
+def _holder(tmp_path, side="BUY", db="h") -> Store:
+    """usdt (BTC perp, balanced: 2x) entered 0.1 at 60,000 with a 1% stop and marked, still running."""
+    store = Store(f"sqlite:///{tmp_path}/{db}.db", portfolio_gate=True)
     store.create_sleeve(name="usdt", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
-    store.record_order("usdt", order_id="e1", side="BUY", qty=0.1, intent="entry", reason="r",
+    store.record_order("usdt", order_id="e1", side=side, qty=0.1, intent="entry", reason="r",
                        signal={"stop_frac": 0.01}, ts=T_MARK)
-    store.record_fill("usdt", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="e1", trade_id="t1", ts=T_MARK)
-    store.record_equity("usdt", equity=10_000.0, cash=4_000.0, qty=0.1, price=60_000.0, benchmark=10_000.0,
-                        ts=T_MARK + timedelta(minutes=1))
+    store.record_fill("usdt", side=side, qty=0.1, price=60_000.0, fee=0.0, order_id="e1", trade_id="t1", ts=T_MARK)
+    qty = 0.1 if side == "BUY" else -0.1
+    store.record_equity("usdt", equity=10_000.0, cash=10_000.0 - qty * 60_000.0, qty=qty, price=60_000.0,
+                        benchmark=10_000.0, ts=T_MARK + timedelta(minutes=1))
+    return store
+
+
+def _put_away_holding(store) -> Store:
     store.set_desired_state("usdt", "stopped")
     store.archive("usdt")
     return store
+
+
+def _archived_holder(tmp_path, side="BUY") -> Store:
+    """The same position, then stopped and archived still holding."""
+    return _put_away_holding(_holder(tmp_path, side))
 
 
 def _atr(s):
@@ -161,3 +171,46 @@ def _holder_of(store, h):
     names = [s.name for s in store.sleeves() if s.instrument.startswith(h.underlying + "/")]
     assert len(names) == 1
     return names[0]
+
+
+@pytest.mark.parametrize("side, sign", [("BUY", 1), ("SELL", -1)])
+def test_a1_an_archived_holding_counts_as_the_same_position_held_by_a_running_strategy(tmp_path, side, sign):
+    """HoQA A1: long and short, the archived Strategy's figures equal the running one's."""
+    from sleeve_fund import open_risk
+
+    running = _holder(tmp_path, side, db="run")
+    archived = _archived_holder(tmp_path, side)
+    assert running.sleeve("usdt").status != "archived" and "usdt" in archived.archived()
+    run_h, arch_h = (portfolio_gate.fund_holdings(st, atr_pct=_atr) for st in (running, archived))
+    assert run_h == arch_h and len(arch_h) == 1
+    book = Book(Decimal(10_000), arch_h)
+    assert (book.gross(), book.net("BTC"), book.margin(), book.open_risk()) == (6_000, sign * 6_000, 3_000, 60)
+    assert open_risk.book_open_risk(running, _atr) == open_risk.book_open_risk(archived, _atr)
+    assert open_risk.account_book(running, "x", 0.0, _atr) == open_risk.account_book(archived, "x", 0.0, _atr)
+
+
+def test_a2_an_entry_that_breaches_open_risk_only_with_that_holding_is_trimmed(tmp_path):
+    """HoQA A2, the open-risk cell: 430 elsewhere plus a 50 entry is inside 5% of 10,000; the holding's 60 is not."""
+    store = _archived_holder(tmp_path)
+    others = (Holding("ETH", Decimal(1_000), Decimal(100), Decimal(430)),)
+    entry = Intent("XRP", 1, Decimal(1), Decimal(100), Decimal(20), Decimal(50), Decimal("0.001"), Decimal("0.001"))
+    held = portfolio_gate.fund_holdings(store, atr_pct=_atr)
+    without = decide(Book(Decimal(10_000), others), entry, PORTFOLIO)
+    counted = decide(Book(Decimal(10_000), (*held, *others)), entry, PORTFOLIO)
+    assert without.outcome == "approved"
+    assert counted.outcome == "trimmed" and counted.limit_hit == "open_risk" and counted.approved_qty == Decimal("0.2")
+
+
+def test_a3_a_flat_archived_run_put_away_by_a_reset_adds_nothing(tmp_path):
+    """HoQA A3: a reset's run is archived and flat, with its reset_runs row left behind; it adds nothing."""
+    from sleeve_fund import open_risk
+
+    store = _holder(tmp_path)
+    store.record_fill("usdt", side="SELL", qty=0.1, price=60_000.0, fee=0.0, order_id="x1", trade_id="t2",
+                      ts=T_MARK + timedelta(minutes=2))
+    store.set_desired_state("usdt", "stopped")
+    store.request_reset("usdt", "Test finished")
+    run = store.split_run(store.pending_reset("usdt"))
+    assert run in store.reset_runs() and run in store.archived()
+    assert portfolio_gate.fund_holdings(store, atr_pct=_atr) == ()
+    assert open_risk.book_open_risk(store, _atr) == [] and open_risk.account_book(store, "x", 0.0, _atr)[1] == 0
