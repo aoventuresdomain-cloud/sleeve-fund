@@ -2497,6 +2497,7 @@ class LongFlatStrategy(Strategy):
             self._end_late_run()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        self._wind_bars.append((bar.high.as_double(), bar.low.as_double(), self._last_close))  # warm-up bars too
         if self.pessimistic and self._exec_type is None:
             self._levels_in_bar(bar)
             if self._stopped_in_entry_bar(bar):
@@ -2784,9 +2785,8 @@ class LongFlatStrategy(Strategy):
         """Paper, at each decision bar's close while the PM winds the strategy down (sleeve_fund.lifecycle): place
         its one wind-down stop if it holds and has none, then lifecycle_due: the 75% notice, retire once flat, or
         the deadline's flatten through the exit path, sent again each bar until flat. True if an exit was sent."""
-        self._wind_bars.append((bar.high.as_double(), bar.low.as_double(), bar.close.as_double()))
         rt = self.runtime
-        if rt is None or rt.backtest or rt.lifecycle != lifecycle.WINDING_DOWN:
+        if rt is None or rt.lifecycle != lifecycle.WINDING_DOWN:  # a research backtest's is always active
             return False
         now = rt.now()
         side = self._pos_side()

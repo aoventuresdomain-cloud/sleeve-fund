@@ -562,7 +562,7 @@ class SleeveRuntime:
         """P2-6 at a bar close (lifecycle.due): the 75% notice, retire once flat, or the deadline's flatten as
         (intent, reason) for the engine to send through its exit path, on stale data too and again each bar until
         flat. None when there is nothing to send."""
-        if self.backtest or self.lifecycle != lifecycle.WINDING_DOWN:
+        if self.lifecycle != lifecycle.WINDING_DOWN:  # a research backtest's is always active: it has no PM
             return None
         self._wind_checked = now
         act = lifecycle.due(self.lifecycle, self.wind_started, self.wind_deadline, now, flat=flat,
@@ -594,7 +594,7 @@ class SleeveRuntime:
 
     def wind_down_overdue(self, now: datetime) -> bool:
         """Paper: past the deadline with no bar close for over a bar (a stale feed), so the tick flattens instead."""
-        return (not self.backtest and self.lifecycle == lifecycle.WINDING_DOWN and self.wind_deadline is not None
+        return (self.lifecycle == lifecycle.WINDING_DOWN and self.wind_deadline is not None
                 and now >= self.wind_deadline
                 and (self._wind_checked is None or now - self._wind_checked > self.bar_length + WIND_GRACE))
 
