@@ -57,7 +57,7 @@ from hypothesis.errors import InvalidArgument
 from paper_scenarios import NAME, PARAMS, replay_into
 from sleeve_fund import markets
 from sleeve_fund.store import FINISHED_ORDER_STATUSES, Store, replay_book
-from test_long_short import _meta
+from test_long_short import _meta as _usd_meta
 
 settings.register_profile("ci", derandomize=True, report_multiple_bugs=False, max_examples=15, deadline=None,
                           print_blob=True,
@@ -67,18 +67,26 @@ settings.register_profile("nightly", max_examples=500, report_multiple_bugs=Fals
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "ci"))
 
 START = 10_000.0
+# The account currency every run trades in (DA, PROP-INV 13 Oct). Paper and live accounts settle in an 8-dp currency
+# (CCY-8DP: a fill refused below 8 dp outside the USD test accounts), so a restart's balance (node.py, Money) carries
+# the journal's cash exactly. On the 2-dp USD test account it is rounded to the cent at every restart: that, not the
+# fills, was the up-to-half-a-cent I1 drift HALF_CENT_A_FILL allowed for (traced on 3acd016: 0.49 cents after one
+# restart with 4 fills and none since).
+QUOTE = "USDT"
 CENT = 0.01  # "to the cent": strictly less than one cent apart
 # I1's bound until CASH-ONE-PATH (HoQA 7 Oct, ruling (a)): the engine books each fill's cash to the cent (a margin
 # account's realised P&L rounded half away from zero), the journal unrounded, so they drift by up to half a cent a
 # fill. Both nightly failures were traced to exactly that (prop-inv/revision-2.md). Strict (I1_STRICT, CENT) again,
 # and this bound removed, once money.fill_cash lands: test_prop_inv_i1_strict_on_the_soak_examples then XPASSes.
+# Strict since the runs trade in QUOTE (DA 13 Oct): the drift was the USD test account's cent-rounded restart balance.
 HALF_CENT_A_FILL = 0.005
-I1_STRICT = False
+I1_STRICT = True
 DRIFT = {"cents": 0.0, "fills": 0, "where": ""}  # the largest I1 drift seen in this run, reported at the end
 # R-I5-3 (HoQA 7 Oct, FOLLOW-UP to CASH-ONE-PATH): the same fill after a restart can be charged a fee a cent apart
 # (one order's second fill: 0.16 straight through, 0.15 restarted). I5 compares cash before fees strictly and lets each
 # fill's fee after k differ by up to a cent until money.fill_cash quantises fees per fill the same way across a restart.
-FEE_STRICT = False
+# Strict since the runs trade in QUOTE (DA 13 Oct): an 8-dp account charges a fill's fee unrounded, restarted or not.
+FEE_STRICT = True
 FEE_DRIFT = {"cents": 0.0, "fills": 0}  # the largest fee difference I5 saw, reported at the end
 # R-I5-4 (QA Tester 2, 7 Oct; the sizing INFO HoQA noted): after a restart the simulated venue holds the position at the
 # price it was put back at, not the journal's entry, so an entry after k can size apart from A's: 17 lots (1.02 cents of
@@ -119,6 +127,14 @@ def _legs(s):
     return legs + [(0, s["gap"]), (3, 0.0)] if s["gap"] is not None else legs
 
 
+def _meta(balance, params):
+    """test_long_short._meta in the account currency (QUOTE)."""
+    meta = _usd_meta(balance, params)
+    meta["balances"] = [f"{balance:.8f} {QUOTE}"]
+    meta["sleeve"]["instrument"] = f"BTC/{QUOTE}"
+    return meta
+
+
 def _restart_meta(store, params, i):
     """The recorded session's header as the paper node opens a restart (sleeve_fund/paper/node.py): from the journal,
     a perp's margin account with the cash it had when the position opened, a spot account with its cash and coins."""
@@ -127,9 +143,9 @@ def _restart_meta(store, params, i):
         return meta
     book = store.journal_book(NAME, START)
     if params.get("market") == "perp":
-        meta["balances"] = [f"{book['cash'] + book['qty'] * (book['entry_px'] or 0.0):.2f} USD"]
+        meta["balances"] = [f"{book['cash'] + book['qty'] * (book['entry_px'] or 0):.8f} {QUOTE}"]
     else:
-        meta["balances"] = [f"{book['cash']:.2f} USD"] + ([f"{book['qty']:.8f} BTC"] if book["qty"] > 0 else [])
+        meta["balances"] = [f"{book['cash']:.8f} {QUOTE}"] + ([f"{book['qty']:.8f} BTC"] if book["qty"] > 0 else [])
     return meta
 
 
@@ -159,7 +175,7 @@ def _record_prices(path, meta, prices, hours, first=0, at=None, sizes=None):
     from sleeve_fund.paper.recorder import Recorder
     from sleeve_fund.venues import venue
 
-    inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=1)
+    inst = venue("KRAKEN").instrument("BTC", QUOTE, price_precision=1)
     rec = Recorder(path)
     rec.meta = meta
     rec.start(inst)
@@ -248,6 +264,7 @@ def _check(store, where, expected_funding=None):
     assert all(isinstance(f["fee"], (int, float, Decimal)) and f["fee"] >= 0 for f in fills), (where, "I3 fee")
     ids = [f["trade_id"] for f in fills]
     assert len(ids) == len(set(ids)), (where, "I3 a fill booked twice", sorted(i for i in ids if ids.count(i) > 1))
+    _check_cash_reader(store, where, fills, _aware(last["ts"]))
     # I4: at most once per settlement and kind, and (with the stub) the schedule's amount at the schedule's times
     rows = sorted(((_aware(r["ts"]), r["amount"], r["kind"]) for r in store.funding(NAME, limit=100_000)),
                   key=lambda r: (r[0], r[2]))
@@ -263,6 +280,28 @@ def _check(store, where, expected_funding=None):
         _event(f"I4 funding settlements charged: {min(len(want), 2)}{'+' if len(want) >= 2 else ''}")
         bad = {ts: (got[ts], want[ts]) for ts in want if abs(got[ts] - want[ts]) > 1e-6}
         assert bad == {}, (where, "I4 funding amount", bad)
+
+
+def _check_cash_reader(store, where, fills, mark):
+    """I6 (CASH-2, the one cash reader) and I8 (no float money), exactly, not to the cent:
+    - strategy_cash_pnl over the whole journal is the journal's cash change (journal_book from zero), and at the mark
+      it is the fills, funding and insurance stamped at or before it, each row summed as written (Decimal);
+    - its windows add up: up to the mark plus after it is the whole;
+    - every cash figure the store reads back is a Decimal."""
+    rows = {t: [(_aware(x["ts"]), Decimal(str(x["amount"]))) for x in read(NAME, limit=None)]
+            for t, read in (("funding", store.funding), ("insurance", store.insurance))}
+    whole, upto, after = (store.strategy_cash_pnl(NAME), store.strategy_cash_pnl(NAME, at=mark),
+                          store.strategy_cash_pnl(NAME, since=mark))
+    book = store.journal_book(NAME, 0)
+    figures = {"whole": whole, "at the mark": upto, "after the mark": after, "journal cash": book["cash"],
+               "funding total": store.funding_total(NAME), "insurance total": store.insurance_total(NAME)}
+    assert all(isinstance(v, Decimal) for v in figures.values()), (where, "I8 float money", figures)
+    assert whole == book["cash"], (where, "I6 the cash reader is not the journal's cash", whole, book["cash"])
+    want = replay_book([f for f in fills if _aware(f["ts"]) <= mark], 0,
+                       sum((a for ts, a in rows["funding"] if ts <= mark), Decimal(0)),
+                       sum((a for ts, a in rows["insurance"] if ts <= mark), Decimal(0)))["cash"]
+    assert upto == want, (where, "I6 the cash reader at the mark", upto, want)
+    assert upto + after == whole, (where, "I6 windows do not add up", upto, after, whole)
 
 
 def _session(r):
@@ -287,20 +326,11 @@ def test_prop_inv_money_invariants_hold_after_every_step(r):
     _session(r)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="FOLLOW-UP (HoQA 7 Oct), two causes. (1) I1 cent "
-                   "drift: the engine books each fill's cash in whole cents, the journal unrounded, so marks drift up "
-                   "to half a cent per fill (spot gap: 1.35 cents after 6 fills); fixed in CASH-ONE-PATH by "
-                   "money.fill_cash, used by replay_book. (2) after a liquidation the marks sit off (IR-1, P1-GLC-3)")
-@settings(phases=(Phase.explicit, Phase.generate))  # a known failure: no shrinking in CI
 @given(_run_of(gaps=True))
 def test_prop_inv_with_liquidation_gaps(r):
-    """Held to the strict I1 (under 1 cent), as before the bound: it XPASSes only once both causes are fixed."""
-    global I1_STRICT
-    I1_STRICT = True
-    try:
-        _session(r)
-    finally:
-        I1_STRICT = False
+    """Held to the strict I1 (under 1 cent). Green since the runs trade in QUOTE (DA 13 Oct): both causes HoQA saw on
+    7 Oct (the cent drift, and the marks after a liquidation, IR-1) were the USD test account's cent rounding."""
+    _session(r)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -322,14 +352,8 @@ def _largest_drift():
                       stacklevel=1)
 
 
-_I1_XFAIL = pytest.mark.xfail(strict=True, raises=AssertionError, reason="FOLLOW-UP until CASH-ONE-PATH "
-                              "money.fill_cash: I1 under 1 cent on the nightly soak's shrunk examples (1.15 and 1.20 "
-                              "cents, the engine's per-fill cent rounding). XPASS once it lands: then I1 goes back to "
-                              "under 1 cent and HALF_CENT_A_FILL goes")
-
-
 # every_step passes since R-I5-4 (the restored position's closes round as the venue's straight through)
-@pytest.mark.parametrize("soak", ["every_step", pytest.param("kill_A", marks=_I1_XFAIL)])
+@pytest.mark.parametrize("soak", ["every_step", "kill_A"])  # kill_A since the runs trade in QUOTE (DA 13 Oct)
 def test_prop_inv_i1_strict_on_the_soak_examples(soak, monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "I1_STRICT", True)
     if soak == "every_step":
@@ -338,9 +362,7 @@ def test_prop_inv_i1_strict_on_the_soak_examples(soak, monkeypatch):
         _kill_and_restart(True, [(5, 0.0), (2, 0.012), (2, -0.012), (2, -0.025)], 6, through_a_lock=False)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="R-I5-3 FOLLOW-UP until CASH-ONE-PATH money.fill_cash "
-                   "quantises each fill's fee the same way across a restart: the stop's second fill is charged 0.16 "
-                   "straight through and 0.15 after a restart (0.1553 owed), so final cash is a cent apart")
+# R-I5-3: green since the runs trade in QUOTE (DA 13 Oct), each fee charged unrounded straight through and restarted
 def test_prop_inv_r_i5_3_fee_across_a_restart(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "FEE_STRICT", True)
     _kill_and_restart(False, [(5, 0.0), (5, 0.025), (2, -0.025), (3, -0.025)], 8, through_a_lock=False)

@@ -1624,12 +1624,12 @@ class Store:
             return _rows(c.execute(q))
 
     def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
-        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
-        q = select(func.sum(funding_t.c.amount)).where(funding_t.c.sleeve == sleeve)
+        """Funding booked to the strategy's cash, all of it or (before) only what settled before then. Exact on either
+        database, as strategy_cash_pnl (PROP-INV I6): SQLite's own sum would be a float's."""
+        w = funding_t.c.sleeve == sleeve
         if before is not None:
-            q = q.where(funding_t.c.ts < before)
-        with self.engine.connect() as c:
-            return to_decimal(c.execute(q).scalar() or 0)
+            w &= funding_t.c.ts < before
+        return self._exact_total(funding_t.c.amount, w)
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
                          trade_id: str | None = None, ts: datetime | None = None) -> str:
@@ -1660,12 +1660,19 @@ class Store:
             return _rows(c.execute(q))
 
     def insurance_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
-        """What the venue's insurance fund covered, all of it or (before) only what it covered before then."""
-        q = select(func.sum(insurance_t.c.amount)).where(insurance_t.c.sleeve == sleeve)
+        """What the venue's insurance fund covered, all of it or (before) only what it covered before then. Exact on
+        either database, as funding_total."""
+        w = insurance_t.c.sleeve == sleeve
         if before is not None:
-            q = q.where(insurance_t.c.ts < before)
+            w &= insurance_t.c.ts < before
+        return self._exact_total(insurance_t.c.amount, w)
+
+    def _exact_total(self, col, where) -> Decimal:
+        """Σ col over the rows `where` picks, as a Decimal: Postgres' NUMERIC sum, or row by row on SQLite."""
         with self.engine.connect() as c:
-            return to_decimal(c.execute(q).scalar() or 0)
+            if self.engine.dialect.name == "postgresql":
+                return to_decimal(c.execute(select(func.sum(col)).where(where)).scalar() or 0)
+            return sum((to_decimal(a) for a in c.execute(select(col).where(where)).scalars()), Decimal(0))
 
     def strategy_cash_pnl(self, sleeve: str, since: datetime | None = None, at: datetime | None = None) -> Decimal:
         """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
