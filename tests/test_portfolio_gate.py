@@ -202,6 +202,32 @@ def test_3_percent_down_on_the_day_pauses_entries_until_the_next_midnight():
     assert ledger.state().day_start_equity == D(19_400) and entry_block(ledger, midnight) is None
 
 
+def test_f220_3_at_midnight_the_old_days_final_mark_then_the_new_days_start_then_decisions():
+    """Advisor (8 Oct): the daily pause does not carry over. At 00:00 UTC the old day's final mark comes first, still
+    measured from the old day's start and never pausing again (a pause ending as it starts, with a second alert); the
+    new day starts from that mark; a decision from 00:00 on sees neither the old day's pause nor its start."""
+    midnight = datetime(2026, 10, 8, tzinfo=timezone.utc)
+    ledger = _marked(at=midnight - timedelta(seconds=15))  # the day starts at 20,000
+    assert mark_book(ledger, D(19_400), midnight - timedelta(seconds=5), PORTFOLIO) == "pause"  # 3% down
+    assert ledger.state().paused_until == midnight
+    ledger.equity = D(19_300)
+    assert mark_book(ledger, D(19_300), midnight, PORTFOLIO) is None  # (1) the old day's final mark, 3.5% down
+    st = ledger.state()
+    assert (st.day_start_equity, st.paused_until) == (D(20_000), midnight)
+    assert [k for k, *_ in ledger.alerts] == ["portfolio_pause"]  # once for the day, not again at 00:00
+    assert entry_block(ledger, midnight) is None  # (3) a decision at 00:00, before the new day's first mark
+    assert check_order(ledger, "a", _buy("0.01"), PORTFOLIO, midnight).decision.outcome == "approved"
+    assert mark_book(ledger, D(19_300), midnight + timedelta(seconds=5), PORTFOLIO) is None  # (2) the new day
+    st = ledger.state()
+    assert (st.day, st.day_start_equity) == (midnight.date(), D(19_300)) and entry_block(ledger, midnight) is None
+    assert check_order(ledger, "b", _buy("0.01"), PORTFOLIO, midnight + timedelta(seconds=6)).decision.outcome == (
+        "approved")
+    # the new day pauses on its own loss only: 3% of 19,300 is 579
+    assert mark_book(ledger, D(18_722), midnight + timedelta(seconds=10), PORTFOLIO) is None
+    assert mark_book(ledger, D(18_721), midnight + timedelta(seconds=15), PORTFOLIO) == "pause"
+    assert ledger.state().paused_until == midnight + timedelta(days=1)
+
+
 def test_a_deposit_is_not_a_gain_and_a_withdrawal_not_a_loss():
     ledger = _marked()
     apply_flow(ledger, D(-1_000))
