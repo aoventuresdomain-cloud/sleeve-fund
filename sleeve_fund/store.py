@@ -70,6 +70,10 @@ LEVELS = ("info", "warning", "error")
 
 metadata = MetaData()
 TS = DateTime(timezone=True)
+LEG = "~2"  # a two-leg Strategy's second leg row: "<name>~2" (P2-8)
+# "parent IS NOT NULL" is needed: with a NULL parent the second term is NULL, and a CHECK passes on NULL.
+LEG_NAME = ("(parent IS NULL AND name NOT LIKE '%~%') "
+            "OR (parent IS NOT NULL AND name = parent || '~2' AND parent NOT LIKE '%~%')")
 
 sleeves_t = Table(
     "sleeves",
@@ -90,6 +94,10 @@ sleeves_t = Table(
     Column("heartbeat_at", TS),
     Column("created_at", TS, nullable=False),
     Column("updated_at", TS, nullable=False),
+    # P2-8 two legs (DA, 0022): a two-leg Strategy's second leg is its own row, "<name>~2", whose parent is the first.
+    # The CHECK holds the shape on both engines: "~" only as that suffix, one level, at most one leg.
+    Column("parent", String(64), ForeignKey("sleeves.name", name="sleeves_parent_fk", ondelete="RESTRICT")),
+    CheckConstraint(LEG_NAME, name="sleeves_leg_name"),
 )
 
 equity_t = Table(
@@ -274,7 +282,10 @@ orders_t = Table(
     Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
+    # P2-8 (DA, 0022): one id for every order of a two-leg trade, across both leg rows; none for a single leg.
+    Column("parent_trade_id", String(64)),
     Index("orders_sleeve_ts", "sleeve", "ts"),
+    Index("orders_parent_trade_id", "parent_trade_id"),
 )
 # When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
 # and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
@@ -864,6 +875,7 @@ class Sleeve:
     created_at: datetime
     updated_at: datetime
     venue: str | None = None  # None: the default venue (sleeve_fund.venues.DEFAULT_VENUE)
+    parent: str | None = None  # P2-8: on a two-leg Strategy's second leg row, the first leg's name
 
     @classmethod
     def from_row(cls, row, venue: str | None = None) -> "Sleeve":
