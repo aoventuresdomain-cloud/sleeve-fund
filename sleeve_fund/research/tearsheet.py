@@ -100,7 +100,7 @@ def _row(label: str, s: dict, b: dict | None) -> str:
 def _idea(r: StudyResult) -> str:
     from sleeve_fund.research.trials import legacy_idea_hash
 
-    return legacy_idea_hash(r.spec.name)
+    return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
 
 
 def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:

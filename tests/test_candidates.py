@@ -19,6 +19,7 @@ from sleeve_fund.research.candidates import (
     PmOverride,
     idea_hash,
     log_override,
+    record_candidate,
     validate_candidate,
 )
 from sleeve_fund.research.trials import TrialsRegister, trial_row
@@ -292,7 +293,26 @@ def protected_uses(source: str) -> list[str]:
     """What a module does that an optimiser may not: import a protected module, open a file for writing, or write to
     the database directly. Each as a short line."""
     out = []
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    # Names bound to the candidates module itself, so rebinding its budget or editable keys can be caught (CR F236-2).
+    door = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
+            if a.name == "sleeve_fund.research.candidates"} | {
+        a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "sleeve_fund.research"
+        for a in n.names if a.name == "candidates"}
+
+    def on_door(target) -> bool:
+        while isinstance(target, ast.Attribute):
+            if ast.unparse(target.value) in door:
+                return True
+            target = target.value
+        return False
+
+    for node in ast.walk(tree):
+        targets = (node.targets if isinstance(node, ast.Assign) else
+                   [node.target] if isinstance(node, ast.AugAssign | ast.AnnAssign) else
+                   node.targets if isinstance(node, ast.Delete) else [])
+        if any(on_door(t) for t in targets):
+            out.append("rebinds the candidates module")
         names = []
         if isinstance(node, ast.Import):
             names = [a.name for a in node.names]
@@ -304,6 +324,11 @@ def protected_uses(source: str) -> list[str]:
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
             if name in ("add_trials", "add_holdout_lock", "decide", "event", "execute", "write_text", "write_bytes"):
                 out.append(f"calls {name}")
+            # A count anywhere but record_candidate is filed under the wrong idea (CR F236-1).
+            if isinstance(fn, ast.Attribute) and name in ("record", "record_failed", "preregister"):
+                out.append(f"calls {name}")
+            if name in ("setattr", "delattr") and node.args and ast.unparse(node.args[0]) in door:
+                out.append("rebinds the candidates module")
             if name == "open":
                 modes = [a.value for a in node.args[1:2] if isinstance(a, ast.Constant)]
                 modes += [k.value.value for k in node.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant)]
@@ -343,6 +368,76 @@ def test_r6_6_no_code_path_from_a_candidate_to_paper():
              if "Candidate" in p.read_text(encoding="utf-8") and p.name != "candidates.py"]
     assert users == []
     guard = protected_uses((ROOT / "sleeve_fund/research/candidates.py").read_text(encoding="utf-8"))
-    assert [u for u in guard if not u.startswith("calls ")] == []  # it logs the PM's override and alerts; nothing more
-    assert guard == ["calls decide", "calls event"]
+    assert [u for u in guard if not u.startswith("calls ")] == []  # it counts, logs the override and alerts; no more
+    assert guard == ["calls decide", "calls event", "calls record"]  # record: record_candidate's one row (F236-1)
     assert json.dumps(PARENT)  # a candidate is plain data
+
+
+# --- F236-1/2: every count of a candidate lands under its own idea; nothing rebinds the door ----------------------
+
+RETUNED = {"exits": {"time_stop": {"bars": 7}, "stop": {"level": "dc.lower"}}}
+
+
+def test_f236_1_a_study_of_a_candidate_counts_towards_its_ideas_budget(tmp_path, instrument):
+    """CR F236-1, HoE: a study writes rows keyed by the model's name unless told the candidate's idea; told it, every
+    setting it tries is one of that idea's configurations, so the budget binds."""
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import grid, run_study
+    from sleeve_fund.strategies.trend_filter import SPEC
+
+    reg = _register(Store(f"sqlite:///{tmp_path}/t.db"))
+    cand = validate_candidate(PARENT, _with(**RETUNED), register=reg)
+    assert candidates.configurations(reg, cand.idea_hash) == set()
+    r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), instrument, dataset="syn",
+                  ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True, holdout_days=0, train_days=730,
+                  test_days=365, register=reg, idea_hash=cand.idea_hash)
+    tried = candidates.configurations(reg, cand.idea_hash)
+    assert r.idea_hash == cand.idea_hash and len(tried) == len(grid(SPEC.param_grid))
+    nxt = validate_candidate(PARENT, _with(exits={"time_stop": {"bars": 8}, "stop": {"level": "dc.lower"}}),
+                             register=reg)
+    assert nxt.configuration == len(tried) + 1
+
+
+def test_f236_1_record_candidate_files_the_row_under_the_candidate_and_logs_the_override(tmp_path):
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    reg = _register(store)
+    for bars in range(1, BUDGET_PER_IDEA + 1):
+        _tried(reg, _with(exits={"time_stop": {"bars": bars}, "stop": {"level": "dc.lower"}}))
+    ok = PmOverride(by="pm", reason="Wider stop range asked for.", at=datetime(2026, 10, 13, tzinfo=UTC))
+    past = validate_candidate(PARENT, _with(exits={"time_stop": {"bars": 99}, "stop": {"level": "dc.lower"}}),
+                              register=reg, override=ok)
+    row = {"name": "dip", "family": "rule-builder", "settings": {}, "dataset": "d", "stage": "in_sample",
+           "source": "optimiser", "sharpe": 0.4}
+    tid = record_candidate(reg, past, **row)
+    (t,) = [t for t in store.trials(past.idea_hash) if t["id"] == tid]
+    assert (t["definition_hash"], t["idea_hash"]) == (past.definition_hash, past.idea_hash)
+    assert past.definition_hash in candidates.configurations(reg, past.idea_hash)
+    (d,) = store.decisions(action="budget_override")
+    assert f"trial {tid}" in d["reason"]
+    with pytest.raises(ValueError, match="keyed by the candidate itself; idea_hash"):
+        record_candidate(reg, past, idea_hash="elsewhere", **row)
+
+
+def test_f236_1_an_ablation_is_filed_under_its_parents_idea_by_default():
+    reg = _register()
+
+    def score(defn, one_x):
+        from sleeve_fund.research.ablation import Score
+        return Score(0.0, 0.0, 0.0, 1, 0.5)
+
+    ablate(PARENT, score, register=reg, dataset="d", family="rule-builder")  # no idea given
+    rows = [r for r in reg.store.rows if r["kind"] == "ablation"]
+    assert rows and {r["idea_hash"] for r in rows} == {idea_hash(PARENT)}
+    with pytest.raises(ValueError, match="is an ablation variant"):
+        validate_candidate(PARENT, remove(PARENT, "long.entry[1]")[1], register=reg)
+
+
+def test_f236_2_the_scan_catches_an_optimiser_rebinding_the_door_or_counting_around_it():
+    bad = ("from sleeve_fund.research import candidates\nimport sleeve_fund.research.candidates as door\n"
+           "candidates.BUDGET_PER_IDEA = 99\ndoor.EDITABLE += ('costs',)\nsetattr(candidates, 'EDITABLE', ())\n"
+           "def go(register, c):\n    register.record(idea_hash='x')\n")
+    assert protected_uses(bad) == ["calls record", "rebinds the candidates module"]
+    ok = ("from sleeve_fund.research import candidates\nbudget = candidates.BUDGET_PER_IDEA\n"
+          "def go(register, c, row):\n    candidates.record_candidate(register, c, **row)\n")
+    assert protected_uses(ok) == []

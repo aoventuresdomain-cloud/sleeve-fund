@@ -21,7 +21,11 @@ A candidate is refused when:
   uses, as every trial does;
 - its idea has used its budget of BUDGET_PER_IDEA configurations, counted by the trials register, unless the PM's
   override is given (Advisor 18:20 Q4: sensitivity grid included, ablations not). The override goes in the PM's
-  decision log right after the configuration's trial row (log_override, DA 13 Oct)."""
+  decision log right after the configuration's trial row (log_override, DA 13 Oct).
+
+A candidate's evaluations count under its own idea (CR F236-1): record_candidate() writes its row, a study takes
+run_study(idea_hash=candidate.idea_hash), and an ablation is filed under its parent's idea (ablation.ablate). The
+scan in tests/test_candidates.py refuses an optimiser that records any other way, or rebinds anything here."""
 
 from __future__ import annotations
 
@@ -213,6 +217,19 @@ def validate_candidate(parent: dict, candidate: dict, *, register, new_idea: New
     return Candidate(definition=candidate, definition_hash=cand_hash, idea_hash=idea, parent_hash=parent_hash,
                      new_idea=new_idea, override=override if number > BUDGET_PER_IDEA else None,
                      configuration=number)
+
+
+def record_candidate(register, candidate: Candidate, **trial) -> str:
+    """The one way an evaluation of a candidate is counted outside a study (CR F236-1): a trials row under the
+    candidate's own idea and definition, which configurations() and the lineage check read, then the PM's override,
+    if any, in the decision log. trial: the rest of the row, as TrialsRegister.record takes it. A study counts a
+    candidate's runs under its idea with run_study(idea_hash=candidate.idea_hash). Returns the row's id."""
+    keyed = sorted(k for k in ("definition_hash", "idea_hash") if k in trial)
+    if keyed:
+        raise ValueError(f"a candidate's row is keyed by the candidate itself; {', '.join(keyed)} can't be given")
+    trial_id = register.record(definition_hash=candidate.definition_hash, idea_hash=candidate.idea_hash, **trial)
+    log_override(register.store, candidate, trial_id)
+    return trial_id
 
 
 def log_override(store, candidate: Candidate, trial_id: str) -> None:

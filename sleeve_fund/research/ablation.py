@@ -253,12 +253,18 @@ def _delta(score: Score, against: Score) -> dict:
 Evaluate = Callable[[dict, bool], Score]
 
 
-def ablate(defn: dict, evaluate: Evaluate, *, register=None, dataset: str = "", idea_hash: str = "",
+def ablate(defn: dict, evaluate: Evaluate, *, register=None, dataset: str = "", idea_hash: str | None = None,
            family: str = "", venue: str | None = None) -> AblationReport:
     """Run the base and every ablatable variant through evaluate(definition, one_x) and report each against the
     base, in path order. register: a TrialsRegister to record each variant that ran in, as kind 'ablation' under
-    idea_hash and family (the parent's); the base is the parent's own row and is not recorded again."""
+    idea_hash and family (the parent's); the base is the parent's own row and is not recorded again. idea_hash
+    defaults to the parent's structural idea (candidates.idea_hash), the key R6's lineage check reads (CR F236-1);
+    an empty one is refused when recording."""
     check_definition(defn)
+    if register is not None and idea_hash is None:
+        from sleeve_fund.research.candidates import idea_hash as structural
+
+        idea_hash = structural(defn)
     parent = definition_hash(defn, venue)
     name = defn.get("name") or parent
     plan = [(p, *remove(defn, p)) for p in units(defn)]
@@ -280,7 +286,7 @@ def ablate(defn: dict, evaluate: Evaluate, *, register=None, dataset: str = "", 
         rows.append(row)
     report = AblationReport(name, parent, base, base_1x, rows)
     if register is not None:
-        record(report, register, dataset=dataset, idea_hash=idea_hash, family=family)
+        record(report, register, dataset=dataset, idea_hash=idea_hash or "", family=family)
     return report
 
 
