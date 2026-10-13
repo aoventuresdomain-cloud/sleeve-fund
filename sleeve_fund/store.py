@@ -8,7 +8,7 @@ runs. Tables are plain and typed so reports and BI tools can query them directly
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 import json
 import math
@@ -38,6 +38,8 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    case,
+    inspect,
     insert,
     or_,
     select,
@@ -46,6 +48,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import DropConstraint
 
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
@@ -122,6 +125,9 @@ fills_t = Table(
     Index("fills_sleeve_order_trade", "sleeve", "order_id", "trade_id", unique=True),
 )
 
+FUNDING_CHARGE_KINDS = ("settled", "baseline")  # the kinds that charge a settlement: one of them per settlement
+FUNDING_CHARGES = "kind IN ('settled', 'baseline')"
+
 # A perpetual's funding, exchanged at each funding time while a position is held (sleeve_fund.markets):
 # amount is what the strategy received (negative: paid), in the quote currency, booked to cash.
 funding_t = Table(
@@ -139,6 +145,11 @@ funding_t = Table(
     Column("kind", String(16), nullable=False, server_default="settled"),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
+    # CASH-1: a settlement is charged once (settled or baseline, never both), and reversed or trued up at most once.
+    # The key is the settlement time, so a second process or a restart that forgot it is refused by the database.
+    Index("funding_once", "sleeve", "ts", "kind", unique=True),
+    Index("funding_charged_once", "sleeve", "ts", unique=True, sqlite_where=text(FUNDING_CHARGES),
+          postgresql_where=text(FUNDING_CHARGES)),
 )
 
 # A perpetual's loss past the bankruptcy price, which the venue's insurance fund takes under isolated margin
@@ -151,7 +162,12 @@ insurance_t = Table(
     Column("ts", TS, nullable=False),
     Column("price", EXACT, nullable=False),
     Column("amount", EXACT, nullable=False),
+    # CASH-1: the fill that left the strategy flat below zero; one credit for it. Null on rows before 0013.
+    Column("order_id", String(64)),
+    Column("trade_id", String(64)),
     Index("insurance_sleeve_ts", "sleeve", "ts"),
+    Index("insurance_once", "sleeve", "order_id", "trade_id", unique=True, sqlite_where=text("order_id IS NOT NULL"),
+          postgresql_where=text("order_id IS NOT NULL")),
 )
 
 # The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
@@ -181,8 +197,26 @@ events_t = Table(
     Column("level", String(8), nullable=False),
     Column("kind", String(32), nullable=False),
     Column("message", Text, nullable=False),
+    # The command a liquidation_reset carries out (F217-3): one reset per command, so a retry after a crash reads
+    # whether its own reset was journaled from this key, never from the message's wording. NULL on every other row.
+    Column("command_id", Integer, ForeignKey("commands.id", ondelete="RESTRICT", use_alter=True,
+                                             name="events_command_id_fkey")),
     Index("events_ts", "ts"),
+    Index("events_command_once", "command_id", unique=True, postgresql_where=text("command_id IS NOT NULL"),
+          sqlite_where=text("command_id IS NOT NULL")),
 )
+
+
+def _unless_dropping_an_absent_fk(ddl, target, bind, **_kw) -> bool:
+    """drop_all drops a use_alter FK by name before its table, and Postgres refuses a name that isn't there: a
+    database built to a revision before 0014 has events without it. Skip that one drop then; adding it always runs."""
+    if not isinstance(ddl, DropConstraint):
+        return True
+    return any(fk["name"] == target.name for fk in inspect(bind).get_foreign_keys(target.table.name))
+
+
+next(c for c in events_t.foreign_key_constraints if c.name == "events_command_id_fkey").ddl_if(
+    callable_=_unless_dropping_an_absent_fk)
 
 commands_t = Table(
     "commands",
@@ -763,6 +797,14 @@ def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     funding, insurance = D(funding, "funding"), D(insurance, "insurance")
     return {"cash": cash + funding + insurance, "qty": qty, "entry_px": entry, "fills": n,
             "funding": funding, "insurance": insurance, "entry_fees": fees}
+
+
+def fill_cash(side: str, qty, price, fee) -> Decimal:
+    """What one fill moved the strategy's cash by, as replay_book books it: a buy pays qty * price and the fee, a sell
+    receives qty * price less the fee."""
+    D = to_decimal
+    leg = D(qty, "qty") * D(price, "price")
+    return (-leg if side == "BUY" else leg) - D(fee, "fee")
 
 
 def is_backtest(name: str | None) -> bool:
@@ -1448,11 +1490,23 @@ class Store:
                             .where(signal_state_t.c.sleeve == sleeve)).first()
         return None if row is None else {"ts": _aware(row[0]), "payload": json.loads(row[1])}
 
-    def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None) -> None:
+    def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None,
+              command_id: int | None = None) -> None:
+        """`command_id`: only on a liquidation_reset, the command it carries out (unique: a second raises)."""
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
+        if command_id is not None and kind != LIQUIDATION_RESET:
+            raise ValueError("only a liquidation_reset names the command it carries out")
         with self.engine.begin() as c:
-            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message,
+                                              command_id=command_id))
+
+    def reset_for_command(self, command_id: int) -> dict | None:
+        """The liquidation_reset journaled for this command (F217-3), else None."""
+        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == LIQUIDATION_RESET)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def equity_series(self, sleeve: str, limit: int = 5000) -> list[dict]:
         q = select(equity_t).where(equity_t.c.sleeve == sleeve).order_by(equity_t.c.ts.desc(), equity_t.c.id.desc())
@@ -1534,13 +1588,42 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> None:
+                       ts: datetime | None = None, kind: str = "settled") -> str:
+        """Book a funding movement once (CASH-1): "new" when written; "same" when this settlement already holds it
+        (a second process, a restart); "differs" when it holds another figure, or the other charge kind, which raises
+        an error event and moves nothing. Only "new" moved cash."""
         qty, price, amount = _exact(qty=qty, price=price, amount=amount)
-        with self.engine.begin() as c:
-            c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
-                                                amount=amount, kind=kind))
+        ts = ts or utcnow()
+        key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
+        key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
+        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
+                                                      amount=amount, kind=kind),
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        if booked == "differs":
+            self.event(sleeve, "error", "funding_conflict",
+                       f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
+                       "different figures. The booked entry is kept and nothing moved; check the venue's record "
+                       "before trusting this strategy's book", ts=ts)
+        return booked
 
-    def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
+    def _book_once(self, table, key, values: dict, same) -> str:
+        """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        for _ in range(2):
+            try:
+                with self.engine.begin() as c:
+                    row = c.execute(select(table).where(key)).first()
+                    if row is not None:
+                        return "same" if same(row) else "differs"
+                    c.execute(insert(table).values(**values))
+                    return "new"
+            except IntegrityError:
+                continue
+        raise RuntimeError(f"a {table.name} row of {values.get('sleeve')} could not be booked or read")
+
+    def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
+        """Newest first: the last `limit` rows, or all of them with limit=None, as a check that must see every
+        settlement reads them (CASH-1)."""
         q = select(funding_t).where(funding_t.c.sleeve == sleeve).order_by(funding_t.c.ts.desc()).limit(limit)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -1553,12 +1636,30 @@ class Store:
         with self.engine.connect() as c:
             return to_decimal(c.execute(q).scalar() or 0)
 
-    def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
+    def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
+                         trade_id: str | None = None, ts: datetime | None = None) -> str:
+        """Book the insurance fund's credit for the fill (order_id, trade_id) that left the strategy flat below zero,
+        once (CASH-1): "new", "same" or "differs", as record_funding. A credit that names no fill could not be
+        refused the second time, so it is refused now (CR F226-2); only rows from before 0013 are unkeyed."""
         price, amount = _exact(price=price, amount=amount)
-        with self.engine.begin() as c:
-            c.execute(insurance_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), price=price, amount=amount))
+        if not order_id or not trade_id:
+            raise ValueError(f"an insurance credit for {sleeve} must name the fill it covers (order_id and trade_id)")
+        # Up to the cent, here in the one write path so no caller can skip it: it exists to bring equity back to zero
+        # or above (Advisor 8 Oct 04:10, ruling 3)
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        ts = ts or utcnow()
+        key = ((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
+               & (insurance_t.c.trade_id == trade_id))
+        booked = self._book_once(insurance_t, key, dict(sleeve=sleeve, ts=ts, price=price, amount=amount,
+                                                        order_id=order_id, trade_id=trade_id),
+                                 lambda row: stored(row.amount) == stored(amount))
+        if booked == "differs":
+            self.event(sleeve, "error", "insurance_conflict",
+                       f"The insurance credit for order {order_id} (trade {trade_id}) arrived again as {amount:,.2f}. "
+                       "The booked credit is kept and nothing moved", ts=ts)
+        return booked
 
-    def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
+    def insurance(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -1570,6 +1671,45 @@ class Store:
             q = q.where(insurance_t.c.ts < before)
         with self.engine.connect() as c:
             return to_decimal(c.execute(q).scalar() or 0)
+
+    def strategy_cash_pnl(self, sleeve: str, since: datetime | None = None, at: datetime | None = None) -> Decimal:
+        """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
+        counted. That is each fill's cash leg less its fee, plus funding and the insurance fund's cover. since None
+        is from the first row and at None is to the last; a row at `at` counts and a row at `since` does not, so
+        consecutive windows add up to the whole. Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose
+        own sum would be a float's."""
+        def window(t):
+            w = t.c.sleeve == sleeve
+            if since is not None:
+                w &= t.c.ts > since
+            if at is not None:
+                w &= t.c.ts <= at
+            return w
+
+        f = fills_t.c
+        with self.engine.connect() as c:
+            if self.engine.dialect.name == "postgresql":
+                leg = case((f.side == "BUY", -(f.qty * f.price)), else_=f.qty * f.price) - f.fee
+                sums = [select(func.sum(leg)).where(window(fills_t)),
+                        select(func.sum(funding_t.c.amount)).where(window(funding_t)),
+                        select(func.sum(insurance_t.c.amount)).where(window(insurance_t))]
+                return sum((to_decimal(c.execute(q).scalar() or 0) for q in sums), Decimal(0))
+            total = sum((fill_cash(*r) for r in c.execute(select(f.side, f.qty, f.price, f.fee)
+                                                          .where(window(fills_t)))), Decimal(0))
+            for t in (funding_t, insurance_t):
+                total += sum((to_decimal(a) for a in c.execute(select(t.c.amount).where(window(t))).scalars()),
+                             Decimal(0))
+            return total
+
+    def fill_totals(self, sleeve: str) -> tuple[int, Decimal]:
+        """Every fill the strategy has and the fees they paid, uncapped (CASH-2), exact as strategy_cash_pnl."""
+        with self.engine.connect() as c:
+            if self.engine.dialect.name == "postgresql":
+                n, fees = c.execute(select(func.count(), func.sum(fills_t.c.fee))
+                                    .where(fills_t.c.sleeve == sleeve)).one()
+                return n, to_decimal(fees or 0)
+            fees = list(c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars())
+            return len(fees), sum((to_decimal(x) for x in fees), Decimal(0))
 
     def fills_after(self, sleeve: str, fill_id: int, limit: int = 500) -> list[dict]:
         """A strategy's fills with ids above fill_id, oldest first."""
@@ -2265,7 +2405,7 @@ class Store:
         if not took:
             return False
         c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIQUIDATION_RESET,
-                                          message=here["words"]))
+                                          message=here["words"], command_id=command_id))
         if here["mark"] is not None:
             c.execute(insert(equity_t).values(sleeve=sleeve, ts=now, **here["mark"]))
         c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
