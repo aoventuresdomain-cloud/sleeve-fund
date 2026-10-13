@@ -316,6 +316,16 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.fees import resolve
 
         store = Store(portfolio_gate=True)
+        from sleeve_fund.paper.orphan_guard import INSTANCE_LOCK, duplicate_refused, instance_lock
+
+        # One process per strategy (Advisor 13 Oct 18:10 UK): a second one would double its orders and positions, so
+        # it stops here, before it connects to market data or the venue. Held for the process's life: a restart may
+        # also release what the process before it left only once that one is gone (17:55), which a free lock proves.
+        lock = instance_lock(args.db_sleeve)
+        if lock is None:
+            return duplicate_refused(store, args.db_sleeve)
+        store.event(args.db_sleeve, "info", INSTANCE_LOCK, f"this process (pid {os.getpid()}) runs the strategy: it "
+                    "holds its single-instance lock")
         assert_portfolio_gate(store)
         row = store.sleeve(args.db_sleeve)
         quote = resolve(getattr(row, "venue", None), store)
@@ -323,12 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.queued import QueuedStore
 
         runtime = SleeveRuntime(QueuedStore(store), sleeve.name)  # journal writes off the decision path
-        from sleeve_fund.paper.orphan_guard import instance_lock
-
-        # Held for the process's life: a restart may release what the process before it left only once that one is
-        # gone (Advisor 13 Oct 17:55 UK), and a free lock proves it.
-        runtime.instance_lock = instance_lock(sleeve.name)
-        runtime.sole_instance = runtime.instance_lock is not None
+        runtime.instance_lock, runtime.sole_instance = lock, True
         perp = markets.terms(sleeve.params, sleeve.venue)
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
                     f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "

@@ -229,3 +229,116 @@ def test_og3_with_no_owner_down_a_restart_releases_only_once_its_lock_proves_the
     for fh in (old, mine):
         if fh is not None:
             fh.close()
+
+
+def test_a_second_process_for_a_strategy_is_refused_before_it_connects_and_alerts_once(tmp_path, monkeypatch):
+    """Advisor 13 Oct 18:10 UK: while one process holds the strategy's lock, a second start places no order: it stops
+    before it connects to market data or the venue, journals "duplicate refused" and alerts once."""
+    from sleeve_fund.paper import node, orphan_guard as og
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/dup.db")
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    store = Store()
+    store.create_sleeve(name="dup", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=1000)
+    built = []
+    monkeypatch.setattr(node, "build_node", lambda *a, **k: built.append(1) or (_ for _ in ()).throw(AssertionError))
+    first = og.instance_lock("dup")  # the strategy's own process, running
+    assert first is not None
+    assert node.main(["--db-sleeve", "dup"]) == og.EXIT_DUPLICATE
+    assert node.main(["--db-sleeve", "dup"]) == og.EXIT_DUPLICATE
+    assert built == [] and store.orders("dup") == []  # never connected, nothing placed
+    told = [e for e in store.events("dup", limit=100) if e["kind"] == og.DUPLICATE_REFUSED]
+    assert len(told) == 1 and "Duplicate refused" in told[0]["message"]
+    first.close()
+
+
+def test_a_refused_duplicates_exit_never_hands_the_running_process_entries_to_the_supervisor(tmp_path):
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.paper.orphan_guard import EXIT_DUPLICATE, down_since
+    from sleeve_fund.store import Store
+
+    class Dup:
+        pid, returncode = 4243, EXIT_DUPLICATE
+        poll = lambda self: EXIT_DUPLICATE  # noqa: E731
+
+    store = Store(f"sqlite:///{tmp_path}/sv.db", portfolio_gate=True)
+    store.create_sleeve(name="s", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=1000)
+    sv = sup.Supervisor(store)
+    sv.procs["s"] = sup.Proc(popen=Dup())
+    sv.step()
+    assert down_since(store, "s") is None
+
+
+def test_og3_outside_the_process_a_leftover_the_venue_no_longer_lists_blocks_until_its_lookup(jstore):
+    """HoQA og3-adv-1b: after a restart on a venue outside the process, a gated entry still open in the journal that
+    the venue doesn't list may have filled while it was down: unknown, so it is held as a "not found" and blocks that
+    strategy (only) until the venue's lookup settles it."""
+    from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.paper.runtime import entry_blocked
+
+    rid = og.qa_resting_entry(jstore, "a", "o-left", CLOSE)
+    now = CLOSE + timedelta(minutes=20)
+    og.restart_reconcile(jstore, "a", now, venue_open=[], in_process=None)
+    (c,) = jstore.open_cancels("a")
+    assert c["order_id"] == "o-left" and c["not_found_at"] is not None
+    assert entry_blocked(jstore, "a", now + timedelta(seconds=1))[0]
+    assert not entry_blocked(jstore, "b", now + timedelta(seconds=1))[0]
+    og.venue_lookup(jstore, "o-left", terminal="canceled", fills=[], at=now + timedelta(minutes=1))
+    assert _reason(jstore, rid) == "cancel" and not entry_blocked(jstore, "a", now + timedelta(minutes=2))[0]
+
+
+def _open_cancel(store, name="s1"):
+    """A gated entry left resting for `name`, its cancel asked and answered "not found": unconfirmed."""
+    from sleeve_fund.paper import orphan_guard as og
+
+    og.qa_resting_entry(store, name, "o-rest", CLOSE)
+    og.owner_down(store, name, CLOSE + timedelta(minutes=10), "crash")
+    og.supervisor_pass(store, CLOSE + timedelta(minutes=10, seconds=5))
+    og.cancel_confirmed(store, "o-rest", not_found=True)
+    assert store.open_cancels(name)
+
+
+def test_f241_3_a_strategy_reset_is_refused_while_a_cancel_is_open_and_runs_once_the_venue_settles_it(tmp_path):
+    """CR F241-3 (HoE MUST): split_run would put the open cancel away with the run and lift the fresh run's entry block
+    while its order may still rest. So the reset is refused, saying why; asked again once settled, it runs."""
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
+    store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    _open_cancel(store)
+    store.set_desired_state("s1", "stopped")
+    store.request_reset("s1", "Test finished")
+    sv = sup.Supervisor(store, python="true")
+    sv.reset_pending()
+    assert store.pending_reset("s1") is None and not store.reset_runs() and store.open_cancels("s1")
+    assert store.last_event("s1", ("reset_refused",))["message"].endswith(sup.OPEN_CANCEL_REFUSAL)
+    og.venue_lookup(store, "o-rest", terminal="canceled", fills=[], at=CLOSE + timedelta(hours=3))
+    store.request_reset("s1", "Again, now settled")
+    sv.reset_pending()
+    assert store.pending_reset("s1") is None and len(store.reset_runs()) == 1
+
+
+def test_f241_3_a_book_reset_or_a_reset_after_liquidation_never_lifts_an_open_cancels_block(tmp_path):
+    """The other resets don't move the cancel (no split_run): the book reset is refused while the entry rests, and a
+    reset after liquidation leaves the cancel, and the block, as they were."""
+    from sleeve_fund.paper.runtime import entry_blocked
+    from sleeve_fund.store import BookResetRefused, Store
+
+    store = Store(f"sqlite:///{tmp_path}/b.db", portfolio_gate=True)
+    store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    _open_cancel(store)
+    with pytest.raises(BookResetRefused):
+        store.book_reset("PM resets the book")
+    store.event("s1", "error", "liquidation", "Liquidated: the price 80,000 gapped through 81,000")
+    store.event("s1", "error", "incident", "Liquidation: the half-liquidation stop did not protect the position")
+    iid = store.last_event("s1", ("incident",))["id"]
+    store.write_incident_note(iid, author="Head of Engineering", why_stop_did_not_protect="QA gap")
+    store.command("s1", "reset_after_liquidation", "PM read the incident", actor="PM", incident=iid)
+    assert store.open_cancels("s1") and entry_blocked(store, "s1", CLOSE + timedelta(hours=3))[0]

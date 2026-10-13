@@ -156,7 +156,27 @@ def instance_lock(name: str, root=None):
     except BlockingIOError:
         fh.close()
         return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"{os.getpid()}\n")  # who holds it, for a person checking
+    fh.flush()
     return fh
+
+
+EXIT_DUPLICATE = 75  # a paper process refused because another holds its strategy's lock (EX_TEMPFAIL)
+DUPLICATE_REFUSED, INSTANCE_LOCK = "duplicate_refused", "instance_lock"
+
+
+def duplicate_refused(store, name: str) -> int:
+    """A second process for `name` stops before it connects to anything (Advisor 13 Oct 18:10 UK): journalled and
+    alerted once while it lasts (until a process takes the lock again). Returns its exit code."""
+    import os
+
+    last = store.last_event(name, (DUPLICATE_REFUSED, INSTANCE_LOCK))
+    if last is None or last["kind"] != DUPLICATE_REFUSED:
+        store.event(name, "error", DUPLICATE_REFUSED, f"Duplicate refused: another process already runs this strategy "
+                    f"(it holds its lock), so this one (pid {os.getpid()}) stopped before placing anything")
+    return EXIT_DUPLICATE
 
 
 def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], send=None,
@@ -200,6 +220,12 @@ def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], se
                 sandbox_ended(store, name, oid, down, now)
             close_orphans(store, now)  # before owner_up: what filled after it went down is an orphan
     owner_up(store, name, now)
+    if in_process is None:  # a leftover the venue no longer lists may have filled: unknown until its lookup (og6)
+        asking = {c["order_id"] for c in store.open_cancels(name)}
+        for r in gated_open(store, name):
+            if r["order_id"] not in venue_open and r["order_id"] not in asking:
+                store.request_cancel(name, r["order_id"], "not listed by the venue after the restart: its state is "
+                                     "unknown until the venue's lookup")
     for c in store.open_cancels(name):  # asked while it was down, and the venue no longer has it: "not found"
         if c["order_id"] not in venue_open:
             cancel_confirmed(store, c["order_id"], not_found=True, at=now)

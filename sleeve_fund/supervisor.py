@@ -39,6 +39,9 @@ from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
 
+OPEN_CANCEL_REFUSAL = ("a resting entry's cancel is still waiting for the venue to confirm how it ended, so it can't be "
+                       "reset now (the order may still rest, or fill): reset it again once that is settled")
+
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
@@ -273,6 +276,12 @@ class Supervisor:
                 self.store.refuse_reset(req, liquidation.REFUSAL)
                 self._undo_reset_start(req)
                 continue
+            if self.store.open_cancels(name):
+                # F241-3: the reset would put the cancel away with the run (split_run) and lift the fresh run's entry
+                # block while its order may still be resting, or fill.
+                self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
+                self._undo_reset_start(req)
+                continue
             s = self.store.sleeve(name)
             pending = self.store.pending_commands(name)
             book = self.store.journal_book(name, s.starting_balance)
@@ -331,7 +340,8 @@ class Supervisor:
                 proc.crashes += 1
                 delay = min(MAX_BACKOFF, 10 * 2 ** (proc.crashes - 1))
                 proc.next_start = now + timedelta(seconds=delay)
-                self._owner_down(sleeve.name, f"crash, exit code {code}")
+                if code != orphan_guard.EXIT_DUPLICATE:  # a refused duplicate: the strategy's own process still runs
+                    self._owner_down(sleeve.name, f"crash, exit code {code}")
                 if sleeve.status in ("paused", "halted"):
                     # A crash must not lift a pause or a halt: the status (and a pause's end time) stays, and
                     # the restarted process keeps it (review round 10, B10-3). The crash is in the events.
