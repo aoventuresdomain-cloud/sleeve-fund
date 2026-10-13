@@ -122,6 +122,9 @@ def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], se
     cancel (journaled, idempotent); entries stay blocked (resting_block) until each cancel is confirmed. send(order_id)
     sends the cancel to the venue. Returns the ids asked."""
     owner_up(store, name, now)
+    for c in store.open_cancels(name):  # asked while it was down, and the venue no longer has it: "not found"
+        if c["order_id"] not in venue_open:
+            cancel_confirmed(store, c["order_id"], not_found=True)
     asked = []
     mine = {r["order_id"] for r in gated_open(store, name)}
     for oid in venue_open:
@@ -142,6 +145,7 @@ def supervisor_pass(store, now: datetime, send=None, close=None) -> list[str]:
     - og4/og4b: an entry still resting past its bar's close + 2 min alerts once (its process may be dead).
     - og5: a dead owner's entry that filled anyway is closed once, through the exit path (close_orphans).
     send(order_id) sends a cancel to the venue; close(name, side, qty, order_id) sends the closing order."""
+    store.__dict__["_supervisor_now"] = now  # the venue's answers between passes are stamped on this clock
     asked = []
     told = {e["message"].split(" ", 1)[0] for e in _events_of(store, ORPHANED)}
     for r in gated_open(store):
@@ -186,7 +190,11 @@ def cancel_confirmed(store, order_id: str, *, not_found: bool = False, close=Non
     if not open_:  # its own process's cancel (the bar-close cancel): the order's end settles its reservation (W2)
         store.update_order(order_id, status="expired" if not_found else "canceled")
         return "applied"
-    got = store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled")
+    import inspect
+
+    at = store.__dict__.get("_supervisor_now")  # the supervisor's clock, which confirm_cancels' quiet window runs on
+    kw = {"at": at} if at is not None and "at" in inspect.signature(store.apply_cancel).parameters else {}
+    got = store.apply_cancel(open_[0]["id"], "not_found" if not_found else "cancelled", **kw)
     if got in ("filled", "partly_filled"):  # a fill, not a cancel: og5 closes what filled while its owner was down
         close_orphans(store, utcnow_(), close)
     return got
