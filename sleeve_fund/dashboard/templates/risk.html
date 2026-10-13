@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {# Where the header's total size comes from (UP-1). #}
-{% macro size_title(size) %}{% if size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
+{% macro size_title(size) %}{% if size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
 {% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}

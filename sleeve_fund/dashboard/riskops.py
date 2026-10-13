@@ -77,13 +77,15 @@ def gate_size(store: Store, book: dict) -> dict:
     """The book's total size (long + short) and net, x book, as the portfolio's entry gate reads them (UP-1): the
     fund's last mark and every position and live reservation it counts (paper.portfolio_gate, decide()'s "gross").
     Before the supervisor has marked the fund the gate reads nothing (it refuses entries as stale), so the figures
-    are the strategies' own marks, and `source` says so. tone: "" under NEAR_LIMIT of the limit, "warn" from it,
+    are the strategies' own marks, and `source` says so ("marks"; "unreadable" when the gate's book couldn't be
+    read, which is printed). tone: "" under NEAR_LIMIT of the limit, "warn" from it,
     "loss" at the limit, where the gate takes nothing more that raises total size. Display only."""
     from sleeve_fund.paper.portfolio_gate import PaperGate
     from sleeve_fund.risk import PORTFOLIO
 
     limit = PORTFOLIO.gross
     total = net = None
+    source = "gate"
     try:
         gate = PaperGate(store)
         if gate.ledger.state().equity is not None:
@@ -92,11 +94,13 @@ def gate_size(store: Store, book: dict) -> dict:
             if equity > 0:
                 total = sum((abs(h.notional) for h in held), Decimal(0)) / equity
                 net = sum((h.notional for h in held), Decimal(0)) / equity
-    except Exception:  # noqa: BLE001 - a book the gate can't read is shown from the strategies' marks
+    except Exception as exc:  # noqa: BLE001 - a book the gate can't read is shown from the strategies' marks
+        print(f"risk page: can't read the entry gate's book, showing the strategies' marks: {exc!r}")
         total = net = None
-    source = "gate"
+        source = "unreadable"
     if total is None:
-        total, net, source = Decimal(repr(book["exposure_pct"])), Decimal(repr(book["net_pct"])), "marks"
+        total, net = Decimal(repr(book["exposure_pct"])), Decimal(repr(book["net_pct"]))
+        source = "marks" if source == "gate" else source
     cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
     tone = "loss" if total >= cap else "warn" if total >= cap * Decimal(repr(NEAR_LIMIT)) else ""
     total, net = float(total), float(net)

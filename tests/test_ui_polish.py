@@ -78,6 +78,20 @@ def test_up1_before_the_fund_is_marked_the_header_says_it_reads_the_strategies_m
     assert (size["source"], size["total"], size["net"], size["tone"]) == ("marks", 0.24, -0.16, "")
 
 
+def test_up1_a_gate_book_that_cant_be_read_says_so_not_that_the_fund_has_no_mark(tmp_path, monkeypatch):
+    from sleeve_fund.dashboard.riskops import gate_size
+    from sleeve_fund.paper import portfolio_gate
+
+    store, _ = _gated_store(tmp_path, monkeypatch, {"BTC": 9_000})
+
+    def down(*_a, **_k):
+        raise OSError("database down")
+
+    monkeypatch.setattr(portfolio_gate, "PaperGate", down)
+    size = gate_size(store, BOOK)
+    assert (size["source"], size["total"], size["net"]) == ("unreadable", 0.24, -0.16)
+
+
 def test_up1_the_risk_header_shows_net_and_total_size_against_its_limit(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
